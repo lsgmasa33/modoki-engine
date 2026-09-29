@@ -9,7 +9,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import ContextMenu, { type ContextMenuItem } from '../../components/ContextMenu';
 import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
-import { backendFetch } from '../../backend/editorBackend';
+import { callBackend } from '../../backend/editorBackend';
 import {
   useBufferedValue, parseNumber, clampRange, Tooltip, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER,
 } from '../fields';
@@ -117,52 +117,47 @@ export async function writeMetaConditional(path: string, meta: unknown, ifMatch?
     } catch { /* reported above — a missing toast host must not swallow the refusal */ }
     return { ok: false, conflict: false, error: 'the document was built on a failed .meta.json read' };
   }
-  try {
-    const res = await backendFetch('/api/write-meta', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      // `rendererWrite` exempts this from the sidecar PARK GATE (#872). §8's REQUIRES_SAVE rule is
-      // an AGENT-surface rule and this route is shared: every caller of this helper loads through
-      // `readMetaPreferringPark` and calls `metaWrittenToDisk` afterwards, so the document being
-      // posted ALREADY CONTAINS the parked edit and this write is what legitimately retires it.
-      // Without the flag the gate refused a human's Sprite Editor save and `writeMetaConditional`
-      // misreported the 409 below as "the file changed on disk". The flag asserts something about
-      // the calling PROCESS — a renderer write is never blind to a registry it owns.
-      body: JSON.stringify({ path, meta, rendererWrite: true, ...(ifMatch !== undefined ? { ifMatch } : {}) }),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      // A 409 is the precondition doing its job, not a malfunction — say so at a level that does
-      // not read as an error the user must report, and name the remedy.
-      if (res.status === 409) {
-        console.warn(`[Inspector] /api/write-meta REFUSED for ${path}: the file changed on disk since it was read. The edit is still pending — reopen the asset to see the current values.`);
-        return { ok: false, conflict: true, error: 'the .meta.json changed on disk since this edit was based on it' };
-      }
-      console.error(`[Inspector] /api/write-meta failed for ${path}: ${res.status} ${text}`);
-      return { ok: false, conflict: false, error: `HTTP ${res.status}` };
+  // Read by the one reader (#1824): the route's own sentence on every refusal, and `conflict` from the route's
+  // `reason` rather than guessed from the status — this used to answer `HTTP <n>` and call EVERY 409 "changed on disk".
+  const a = await callBackend('/api/write-meta', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    // `rendererWrite` exempts this from the sidecar PARK GATE (#872). §8's REQUIRES_SAVE rule is
+    // an AGENT-surface rule and this route is shared: every caller of this helper loads through
+    // `readMetaPreferringPark` and calls `metaWrittenToDisk` afterwards, so the document being
+    // posted ALREADY CONTAINS the parked edit and this write is what legitimately retires it.
+    // Without the flag the gate refused a human's Sprite Editor save and `writeMetaConditional`
+    // misreported the 409 below as "the file changed on disk". The flag asserts something about
+    // the calling PROCESS — a renderer write is never blind to a registry it owns.
+    body: JSON.stringify({ path, meta, rendererWrite: true, ...(ifMatch !== undefined ? { ifMatch } : {}) }),
+  });
+  if (!a.ok) {
+    // A precondition 409 is the compare-and-swap doing its job, not a malfunction — say so at a level that does not
+    // read as an error the user must report, and name the remedy.
+    if (a.conflict) {
+      console.warn(`[Inspector] /api/write-meta REFUSED for ${path}: the file changed on disk since it was read. The edit is still pending — reopen the asset to see the current values.`);
+      return { ok: false, conflict: true, error: 'the .meta.json changed on disk since this edit was based on it' };
     }
-    // ⚠️ `res.ok` means the write LANDED. Nothing that happens while extracting the baseline may
-    // downgrade that verdict — an exception here used to fall through to the outer `catch` and
-    // report a successful write as a FAILURE, which re-parks the entry, tells the human their save
-    // failed, and makes the retry 409 against the file this very call just advanced. The body is
-    // therefore read inside its own guard, and a missing/!unparsable one costs only the baseline
-    // (the caller then keeps its previous one and conflicts LOUDLY next time rather than writing
-    // against a hash nobody vouched for — the rule `flushDirtyAssets` already follows).
-    let sha256: string | undefined;
-    try {
-      const body = typeof res.json === 'function' ? await res.json() : null;
-      if (typeof body?.sha256 === 'string') sha256 = body.sha256;
-    } catch { /* no baseline from this reply; the write still landed */ }
-    return { ok: true, conflict: false, ...(sha256 !== undefined ? { sha256 } : {}) };
-  } catch (e) {
-    console.error(`[Inspector] /api/write-meta network error for ${path}:`, e);
-    return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
+    console.error(`[Inspector] /api/write-meta ${a.status ? `refused (HTTP ${a.status})` : 'network error'} for ${path}: ${a.error}`);
+    return { ok: false, conflict: false, error: a.error };
   }
+  // ⚠️ An ok answer means the write LANDED. Nothing about the body may downgrade that verdict — the reader answers an
+  // unparseable 2xx as a success with an empty body, which costs only the baseline (the caller then keeps its previous
+  // one and conflicts LOUDLY next time rather than writing against a hash nobody vouched for — the rule
+  // `flushDirtyAssets` already follows). It once threw here, which re-parked a landed write and reported it failed.
+  return { ok: true, conflict: false, ...(typeof a.body.sha256 === 'string' ? { sha256: a.body.sha256 } : {}) };
 }
 
-/** Boolean form, kept for the eight explicit-action writers that already branch on it. Collapses
- *  `writeMetaConditional` — one fetch implementation, two shapes. */
-export function writeMetaOrWarn(path: string, meta: unknown): Promise<boolean> {
-  return writeMetaConditional(path, meta).then((r) => r.ok);
+/** Boolean form, kept for the explicit-action writers that already branch on it. Collapses
+ *  `writeMetaConditional` — one fetch implementation, two shapes.
+ *
+ *  `onRefused` hands a refusal's reason to a caller that states it (#1824, R4): the boolean stays, because several
+ *  source-scanning guards key on these call sites by name, and an object return would be silently truthy at every
+ *  `if (await writeMetaOrWarn(…))`. */
+export function writeMetaOrWarn(path: string, meta: unknown, onRefused?: (error: string) => void): Promise<boolean> {
+  return writeMetaConditional(path, meta).then((r) => {
+    if (!r.ok) onRefused?.(r.error ?? 'the .meta.json write was refused');
+    return r.ok;
+  });
 }
 
 export function NumberField({ label, value, onChange, step = 0.1, readOnly = false, wide = false, overrideColor = false, hint, mixed = false, dataUiId }: {

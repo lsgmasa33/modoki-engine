@@ -225,6 +225,18 @@ describe('save-all Save As whose copy FAILS after a dirty base was written (#141
     expect(err?.message).toContain(`scene ${BASE}`);
   });
 
+  // #1824: the copy's refusal reaches the agent WITH the route's reason — `writeSceneCopy` answered a bare `null` for
+  // every refusal. Mutation: drop `error: written.refused` from saveSceneAs's write-failed result — red.
+  it('names the route\'s reason for a refused copy', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-save-as')) return { ok: false, status: 403, json: async () => ({ error: '/elsewhere/copy.scene.json is outside this project\'s asset roots' }) } as unknown as Response;
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err?.message).toContain('is outside this project\'s asset roots');
+  });
+
   it('is PARTIAL and says the base landed — not "Nothing was written"', async () => {
     const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
     expect(err).toMatchObject({ code: 'PARTIAL' });

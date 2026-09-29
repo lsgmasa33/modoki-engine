@@ -44,10 +44,11 @@ import {
 } from '../../runtime/scene/entityCreateSpecs';
 // Backend-IO + create-prefab flow shared with the Assets panel (editor-panels
 // F6/F7): new prefab files must land under a *real* writable asset root —
-// virtual tree nodes like "/" aren't writable. firstWritableAssetRoot + root
+// virtual tree nodes like "/" aren't writable. readWritableAssetRoot + root
 // matching live in assetOps/assetRoots so the flat-project "/assets" prefix
 // can't be forgotten in one copy again (#29).
-import { firstWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { readWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { reportGestureRefusal } from '../backend/refusalChannel';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { confirmReplaceAsset, confirmInEditor } from '../utils/saveDialog';
 
@@ -1105,10 +1106,12 @@ export default function Hierarchy() {
   // root's /prefabs; Assets: the drop-target folder).
   const handleCreatePrefab = useCallback(async (entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    const root = await firstWritableAssetRoot();
-    if (!root) { console.error('[Hierarchy] No writable asset root for prefab'); return; }
+    const found = await readWritableAssetRoot();
+    // Said on screen, as the Assets panel's drop already says it (#1824, ruling FA): a Create Prefab that did nothing.
+    if (!found.ok) { reportGestureRefusal(`Create Prefab failed — the asset roots could not be read: ${found.error}`); return; }
+    if (!found.root) { useEditorStore.getState().showToast('Create Prefab failed — this project has no writable asset root.', 'warn'); return; }
     const safeName = (entity.name || 'Entity').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const savePath = `${root}/prefabs/${safeName}.prefab.json`;
+    const savePath = `${found.root}/prefabs/${safeName}.prefab.json`;
     // The path is derived from the entity's NAME, so it can land on an existing prefab — asked,
     // and a Replace keeps that prefab's guid (#1264).
     const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`, confirmReplaceAsset);

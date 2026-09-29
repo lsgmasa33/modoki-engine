@@ -2,10 +2,12 @@
  *  Tracks generated files in the model's .meta.json for cleanup on delete. */
 
 import * as THREE from 'three';
-import { backendFetch, writeAssetFile, jsonFileBody, readWriteRefusal } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
+import { reportBackgroundRefusal } from '../backend/refusalChannel';
+import { reimportAsset, reimportProblem } from '../panels/assetViews/reimportAsset';
 // The orphan-prune goes through the shared delete wrapper rather than a hand-rolled fetch (#884);
 // `skinPrefab.ts` already reaches into panels/assetOps for the same helper.
-import { deleteAssetFile } from '../panels/assetOps';
+import { trashAssetFile } from '../panels/assetOps';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
 import { loadModelTemplates, getTemplatesForModel, invalidateMaterial, invalidateMeshAsset } from '../../runtime/loaders/meshTemplateCache';
@@ -442,7 +444,8 @@ async function extractTextures(
         // model without it — no dangling ref (the `texturePaths.set` below is skipped too, so
         // registerExtractedTextures never sees it), but exactly the silently-incomplete import
         // the abort policy exists to prevent.
-        if (!writeRes.ok) throw new ImportWriteAborted(texPath, `failed to write ${texPath}: ${(await readWriteRefusal(writeRes)).error}`);
+        const texWritten = await readBackendAnswer(writeRes);
+        if (!texWritten.ok) throw new ImportWriteAborted(texPath, `failed to write ${texPath}: ${texWritten.error}`);
         texturePaths.set(tex.uuid, texPath);
         textureFiles.push(texPath);
         textureSettings.set(texPath, seedTextureSettings(tex, suffix));
@@ -473,7 +476,6 @@ async function registerExtractedTextures(
       ? existingMeta.id
       : undefined;
     const guid = sidecarGuid ?? getGuidForPath(texPath) ?? newGuid();
-    registerAsset(guid, texPath, 'texture');
     if (!sidecarGuid) {
       // Seed the `texture` block (colorspace/wrap) from the source Three texture so
       // the conversion pipeline reads non-color maps (normal/rough/metal) as linear
@@ -485,17 +487,26 @@ async function registerExtractedTextures(
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           path: texPath,
+          // Built from `readMeta`, which prefers the park, so this write retires it — the park gate's exemption, as
+          // `writeMetaConditional` claims it (#872). Without it a parked edit refused this write (#1824 census).
+          rendererWrite: true,
           meta: {
             ...existingMeta,
             id: guid,
             ...(seeded ? { texture: { ...(existingMeta.texture as object ?? {}), ...seeded } } : {}),
           },
         }),
-      }).catch(() => null);
+      });
+      // The sidecar carries the guid just registered, so a refused write ABORTS, like the texture write above (#311):
+      // it used to be discarded (`.catch(() => null)`, `!ok` silent), leaving the guid on nothing (#1824).
+      const texMeta = await readBackendAnswer(res);
+      if (!texMeta.ok) throw new ImportWriteAborted(texPath, `failed to write ${texPath}.meta.json: ${texMeta.error}`);
       // #845 close-out: this write just committed whatever `readMeta` read above — drop that
       // park, unless something newer landed while the write was in flight (see pendingMeta.ts).
-      if (res?.ok) metaWrittenToDisk(texPath, pendingRef);
+      metaWrittenToDisk(texPath, pendingRef);
     }
+    // Registered only once the sidecar that carries the guid is on disk (#311's rule; #1824 made its write abortable).
+    registerAsset(guid, texPath, 'texture');
     // Drop any in-memory texture for this path — re-import may have produced
     // fresh bytes (PNG → KTX2 variants) and a stale cache entry would survive
     // the next scene load via the refcount path's "already cached" short-circuit.
@@ -755,6 +766,7 @@ async function importRiggedModel(
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       path: glbPath,
+      rendererWrite: true, // built from a park-preferring read — see the texture sidecar write above
       meta: {
         ...existingMeta,
         id: glbGuid,
@@ -763,11 +775,14 @@ async function importRiggedModel(
         generated: { ...prevGenerated, materials: matFiles, textures: textureFiles },
       },
     }),
-  }).catch(() => null);
+  });
+  // A refused sidecar write aborts: it holds `glbGuid`, which the rig is about to be spawned against (#311, #1824).
+  const rigMeta = await readBackendAnswer(metaRes);
+  if (!rigMeta.ok) throw new ImportWriteAborted(glbPath, `failed to write ${glbPath}.meta.json: ${rigMeta.error}`);
   // #845 close-out: this write just committed whatever `readMeta` read above (a lot of async
   // texture/material work happened in between) — drop that park, unless something newer landed
   // while it was in flight (see pendingMeta.ts).
-  if (metaRes?.ok) metaWrittenToDisk(glbPath, pendingRef);
+  metaWrittenToDisk(glbPath, pendingRef);
 
   // Auto-fit: scale the bind-pose bbox to ~2 units tall (FBX is often 100× / cm)
   // unless the caller passed an explicit scale.
@@ -839,16 +854,14 @@ async function importRiggedModel(
   // meta. NEVER mutates the source GLB. Non-blocking so import stays responsive;
   // the editor preview keeps the raw GLB this session, and the dev middleware +
   // production build both serve the derived variant once it exists.
-  void backendFetch('/api/reimport', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: glbPath }),
-  })
-    .then(async (res) => {
-      const r = await res.json().catch(() => ({}));
-      if (r.errors?.length) console.warn(`[Import] Rigged GLB derive warnings for ${glbPath}: ${r.errors.join('; ')}`);
-      else console.log(`[Import] Derived optimized rigged variant for ${glbPath}`);
-    })
-    .catch((e) => console.warn(`[Import] Rigged GLB derive request failed: ${e}`));
+  //
+  // Read by the one reader (#1824): this read only `errors`, so a refusal carrying `error` alone logged "Derived".
+  // Background work the import started itself — console only, with the reason (ruling FA).
+  void reimportAsset(glbPath).then((r) => {
+    const problem = reimportProblem(r);
+    if (problem) reportBackgroundRefusal(`[Import] the optimized rigged variant of ${glbPath} was not derived: ${problem}`);
+    else console.log(`[Import] Derived optimized rigged variant for ${glbPath}`);
+  }).catch((e) => reportBackgroundRefusal(`[Import] the optimized rigged variant of ${glbPath} was not derived: ${e}`));
 
   console.log(`[Import] Imported rigged "${prefix}" — ${rig.clipNames.length} clip(s), scale ${scale.toFixed(3)}`);
   return root.id();
@@ -863,8 +876,11 @@ async function importRiggedModel(
  *  Nothing is spawned before the last guarded write, so an abort leaves NO stray entities in
  *  the scene; the caller's `deleteEntity(rootId)` cleanup is unreachable and unneeded. Files
  *  written before the failure DO stay on disk (rollback was considered and rejected) — they are
- *  regenerable outputs a re-import overwrites, and crucially nothing in the manifest points at
- *  the file that failed, because every `registerAsset` now runs only after its write landed. */
+ *  regenerable outputs a re-import overwrites. A generated file's guid registers only after its OWN write landed, but the
+ *  MODEL's guid registers before the textures, meshes and materials that reference it are written, and its sidecar is
+ *  the last write (abortable since #1824). So any abort after that registration — a generated-file write or the sidecar
+ *  — leaves the model's guid registered for this session, with any generated file already written pointing at it. On a
+ *  re-import that is the same mapping; on a first import it lasts until a successful re-import. */
 export async function importModel(
   modelPath: string,
   prefix: string,
@@ -877,9 +893,9 @@ export async function importModel(
   } catch (e) {
     if (!(e instanceof ImportWriteAborted)) throw e;
     console.error(
-      `[modelImport] Import of "${modelPath}" ABORTED — ${e.message}. No entities were spawned and ` +
-      'nothing was registered for that file. Earlier generated files remain on disk and will be ' +
-      'overwritten by a successful re-import.',
+      `[modelImport] Import of "${modelPath}" ABORTED — ${e.message}. No entities were spawned. Files written ` +
+      'before the failure remain on disk, and the model\'s own guid stays registered for this session; a successful ' +
+      're-import overwrites them.',
     );
     // The toast used to hard-code "a file could not be written" — false since #784 phase C2b,
     // where `readAssetJsonOrAbort` started throwing `ImportWriteAborted` for a READ-side refusal
@@ -1051,13 +1067,18 @@ async function importModelInner(
   };
   const metaRes = await backendFetch('/api/write-meta', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: glbPath, meta }),
+    // `rendererWrite`: built from a park-preferring read — see the texture sidecar write above.
+    body: JSON.stringify({ path: glbPath, meta, rendererWrite: true }),
   });
+  // A refused sidecar write aborts, as a network failure here always has (#311, #1824): it holds `glbGuid`, and a
+  // refusal used to fall through silently to the prune and the spawn.
+  const glbMeta = await readBackendAnswer(metaRes);
+  if (!glbMeta.ok) throw new ImportWriteAborted(glbPath, `failed to write ${glbPath}.meta.json: ${glbMeta.error}`);
   // #845 close-out: this write just committed whatever `readMeta` read above (texture/mesh/material
   // extraction ran in between) — drop that park, unless something newer landed while it was in
-  // flight (see pendingMeta.ts). Deliberately NOT wrapped in a `.catch` — same as before this
-  // change, a network failure here propagates and aborts the import; it does not silently degrade.
-  if (metaRes.ok) metaWrittenToDisk(glbPath, pendingRef);
+  // flight (see pendingMeta.ts). Deliberately NOT wrapped in a `.catch` — a network failure here
+  // propagates and aborts the import; it does not silently degrade.
+  metaWrittenToDisk(glbPath, pendingRef);
 
   // Prune orphans: files the previous import wrote into `generated.*` but
   // the current import didn't regenerate (source GLB changed shape, a mesh
@@ -1088,10 +1109,10 @@ async function importModelInner(
     // FIFTH consumer of /api/delete-asset and the last one still reading nothing at all: a bare
     // `.catch(() => {})` discarded the Response, so a refusal was invisible AND the "Pruned N"
     // line below claimed work that had not happened — while `generated` had ALREADY been rewritten
-    // to the new list, so nothing would ever try to prune that file again. `deleteAssetFile` now
-    // reports the outcome rather than the HTTP status, which is what makes counting possible.
-    // Still best-effort: it never throws, and a failed prune must not fail the import.
-    const trashOne = (p: string) => deleteAssetFile(p);
+    // to the new list, so nothing would ever try to prune that file again. `trashAssetFile` now
+    // reports the outcome (and the route's reason, #1824) rather than the HTTP status, which is what makes counting
+    // possible. Still best-effort: it never throws, and a failed prune must not fail the import.
+    const trashOne = (p: string) => trashAssetFile(p).then((r) => ({ path: p, r }));
     const outcomes = await Promise.all([
       ...orphanMeshes.map(trashOne),
       ...orphanMaterials.map(trashOne),
@@ -1103,10 +1124,11 @@ async function importModelInner(
       // Count the ones that GENUINELY went, and say so only about those. A maybe-absent sidecar
       // answers false too (a lone missing path is a 404), so the shortfall is reported as "not
       // confirmed" rather than as a failure — the honest claim for a best-effort prune.
-      const stuck = outcomes.filter((ok) => !ok).length;
+      const stuck = outcomes.flatMap(({ path, r }) => (r.ok ? [] : [`${path}: ${r.error}`]));
       console.log(`[Import] Pruned ${total} orphan files (${orphanMeshes.length} meshes, ${orphanMaterials.length} materials, ${orphanTextures.length} textures) → OS Trash`);
-      if (stuck > 0) {
-        console.warn(`[Import] ${stuck} of ${outcomes.length} prune delete(s) were not confirmed — those files may still be on disk, and the model's \`generated\` list no longer names them, so nothing will retry.`);
+      if (stuck.length > 0) {
+        // Background work the editor started itself: console only, with each reason (#1824, ruling FA).
+        reportBackgroundRefusal(`[Import] ${stuck.length} of ${outcomes.length} prune delete(s) were not confirmed — those files may still be on disk, and the model's \`generated\` list no longer names them, so nothing will retry.\n${stuck.join('\n')}`);
       }
     }
   }

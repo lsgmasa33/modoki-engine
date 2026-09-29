@@ -13,7 +13,7 @@ import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { writeAssetFile, writeAssetFileGuarded, writeSceneCopy, jsonFileBody } from '../backend/editorBackend';
+import { writeAssetFile, writeAssetFileGuarded, saveSceneCopy, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
 import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
@@ -1185,7 +1185,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
     ...(others.failed.length ? { failed: others.failed } : {}),
   };
   if (others.failed.length) return { saved: false, path: target, reason: 'write-failed', ...othersReport };
-  const written = await writeSceneCopy(target, content, from, [...sceneManager.getLoadedScenes().values()].map((e) => e.path));
+  const written = await saveSceneCopy(target, content, from, [...sceneManager.getLoadedScenes().values()].map((e) => e.path));
   if (written === 'same-file') {
     // `target` is the open scene's own file under another spelling (`%20`, `./`, a `/@fs/` form) —
     // the classifier compares strings, the disk does not. A plain save, to `from` as captured: a
@@ -1194,9 +1194,10 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
     return { ...(await writePrimaryScene(from, content, sceneId, entityCount, savedAtEditVersion)), ...othersReport };
   }
   if (written === 'target-loaded') return { saved: false, path: target, reason: 'target-loaded', ...othersReport };
-  if (!written) {
-    console.error(`[Editor] Failed to save scene as ${target}`);
-    return { saved: false, path: target, reason: 'write-failed', ...othersReport };
+  if ('refused' in written) {
+    // The route's reason reaches the SaveResult (#1824): an agent's save_all({path}) answered `write-failed` with no text.
+    console.error(`[Editor] Failed to save scene as ${target}: ${written.refused}`);
+    return { saved: false, path: target, reason: 'write-failed', error: written.refused, ...othersReport };
   }
   // Also drops an overwritten scene's old id — `registerAsset` evicts the guid that owned the path —
   // so what referenced it no longer resolves (the accepted cost), rather than resolving to the copy.
@@ -1234,7 +1235,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
  *
  *  ⚠️ Recorded by `writePrimaryScene` ONLY — the open scene saved to its own file. A base scene written through the
  *  scene that loads it (`saveOtherLoadedScenes`) and a first save / Save As (`writeNewAssetDocument`,
- *  `writeSceneCopy`) are not, deliberately: the undo of an Apply in that base, run later from the base itself, must
+ *  `saveSceneCopy`) are not, deliberately: the undo of an Apply in that base, run later from the base itself, must
  *  REFUSE rather than write its snapshot over an edit made through the other scene. Its report calls that an outside
  *  change, which from the base's own history it is. Do not "complete" this map without that case in mind. */
 const lastWrittenScene = new Map<string, string>();

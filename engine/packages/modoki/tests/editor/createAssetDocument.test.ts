@@ -313,3 +313,19 @@ describe('a NEW file inside a folder typed in another case (#1273 close-out revi
     expect(r).toEqual({ outcome: 'created', path: TYPED, guid: FRESH });
   });
 });
+
+/** #1824 — only the create-only precondition means "something is there". The prefab FORMAT gate's 409 names another
+ *  reason and is a failed write with the route's sentence — it used to read as "exists", which offered the human a
+ *  Replace over a file this build may not write. Mutation: treat every 409 as exists again — red. */
+describe('a 409 that names another reason is a failed write (#1824)', () => {
+  it('reports the route\'s reason and asks nothing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 409,
+      json: async () => ({ ok: false, reason: 'prefab-format-too-new', error: 'x.prefab.json was written by a newer build (prefab format 6; this build writes 5)' }),
+    }) as unknown as Response));
+    let asked = false;
+    const r = await writeNewAssetDocument(PATH, doc, { confirmReplace: async () => { asked = true; return true; } });
+    expect(r).toMatchObject({ outcome: 'failed', status: 409, error: 'x.prefab.json was written by a newer build (prefab format 6; this build writes 5)' });
+    expect(asked).toBe(false);
+  });
+});

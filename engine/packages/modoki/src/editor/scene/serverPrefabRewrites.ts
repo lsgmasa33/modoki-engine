@@ -14,7 +14,7 @@
  *  Separate from `prefabCommit.ts` only because it reads the prefab-edit session and the scene record, and
  *  `prefabEdit.ts` already imports the commit: kept here, the graph stays acyclic. */
 
-import { repairPrefabMemberPaths, type MemberPathRepair, type MemberPathRewrite } from '../backend/editorBackend';
+import { requestMemberPathRepair, type MemberPathRepair, type MemberPathRewrite } from '../backend/editorBackend';
 import { seatCaches, parsePrefabBytes } from './prefabCommit';
 import { adoptRewrittenEditBaseline } from './prefabEdit';
 import { adoptRewrittenSceneBytes, getCurrentScenePath } from './serialize';
@@ -78,10 +78,11 @@ function liveSceneFiles(): Set<string> {
 }
 
 /** THE way to run the member-path repair (#1437) from the editor: the route, then its rewrites adopted. Resolves to what
- *  the route did, or null when it could not (already logged). */
-export async function repairMemberPathsEverywhere(prefab: string, before: unknown, opts: RepairOptions): Promise<MemberPathRepair | null> {
-  const repair = await repairPrefabMemberPaths(prefab, before);
-  if (repair) {
+ *  the route did, or `{error}` with the route's reason when it could not (#1824 — this was `null`; every caller now
+ *  reads the union, and the undo/redo ones report it into the step). */
+export async function repairMemberPathsEverywhere(prefab: string, before: unknown, opts: RepairOptions): Promise<MemberPathRepair | { error: string }> {
+  const repair = await requestMemberPathRepair(prefab, before);
+  if (!('error' in repair)) {
     const live = opts.liveWorldRepaired;
     adoptServerPrefabRewrites(repair.written, { liveWorldRepaired: typeof live === 'function' ? live() : live });
   }

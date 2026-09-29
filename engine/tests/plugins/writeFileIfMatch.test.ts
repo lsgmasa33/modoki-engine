@@ -82,7 +82,9 @@ describe('/api/write-file — ifMatch precondition', () => {
     const res = (await post('/api/write-file', { path: '/a.atlas.json', content: '{"members":["x"]}\n', ifMatch: sha256('{"members":[]}\n') }, makeCtx())) as { status?: number; body: unknown };
 
     expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ ok: false, conflict: true, reason: 'if-match' });
+    // R1 (#1824): a sentence in `error` — the client states `error` first, and a bare `if-match` token reached a
+    // person. Mutation: drop `error` from ifMatchRefusal's refusal — red.
+    expect(res.body).toMatchObject({ ok: false, conflict: true, reason: 'if-match', error: 'the file changed on disk since the caller read it, so nothing was written' });
     expect(fs.readFileSync(abs, 'utf-8')).toBe('{"members":["changed-on-disk"]}\n');
   });
 
@@ -90,7 +92,7 @@ describe('/api/write-file — ifMatch precondition', () => {
     const res = (await post('/api/write-file', { path: '/never-existed.json', content: '{}', ifMatch: sha256('anything') }, makeCtx())) as { status?: number; body: unknown };
 
     expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ ok: false, conflict: true, reason: 'if-match' });
+    expect(res.body).toMatchObject({ ok: false, conflict: true, reason: 'if-match', error: 'the file is gone from disk since the caller read it, so nothing was written' });
     expect(fs.existsSync(path.join(projectRoot, 'never-existed.json'))).toBe(false);
   });
 

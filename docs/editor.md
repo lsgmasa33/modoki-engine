@@ -707,8 +707,8 @@ How it is wired, and why in that order:
   renderer there is no modal.
 - The **backend** is the guard, because the agent route never goes through the Assets panel. The
   **four** human seams (F2/context rename, drag-into-folder, clipboard **cut**, folder rename) call
-  `assetEditorHoldMessage()` only to say WHY, since `moveFileToStatus` keeps `{ok, status}` and
-  discards the body. A **copy** is not gated — it leaves the held asset where it is.
+  `assetEditorHoldMessage()` to name the editor before any request is made; since #1824 `moveAsset`
+  also carries the route's own reason for any refusal. A **copy** is not gated — it leaves the held asset where it is.
 - **`/api/delete-asset` shares the gate** (`heldAssetEditorRefusal`), because it is the same
   mechanism and worse — it destroys the modal's edits AND the file. It honours that route's own
   escapes (`rendererWrite`, `discardUnsaved:true`): an explicit discard is a caller accepting the
@@ -2545,9 +2545,9 @@ let four real call sites hide from the original bug report's grep).
 one for every refusal: `{error, options}` for a path outside the asset roots, the prefab gates' 409s
 with `error`, a 500's `{error}`, the transport's 400/413/token 403, and the preconditions' 409s with
 `reason` only. The two wrappers used to read `res.ok` (and a 409's `reason`) and nothing else, so ten
-callers reported a bare "failed" that a human or an agent could only guess at. **`readWriteRefusal`**
-(same file) is the ONE reader: `error` is the body's `error`, else its `reason`, else
-`the write was refused (HTTP <status>)`, never empty; `conflict` is `if-match`, `if-none-match` or
+callers reported a bare "failed" that a human or an agent could only guess at. **`readBackendAnswer`**
+(same file; #1811's `readWriteRefusal`, widened to every route by #1824 — [refusal-reporting.md](./refusal-reporting.md)) is the ONE reader: `error` is the body's `error`, else its `reason`, else
+`the request was refused (HTTP <status>)`, never empty; `conflict` is `if-match`, `if-none-match` or
 `prefab-mark-lowered` — the one answer `prefabCommit`'s `post()` and both wrappers share (the
 wrappers once called `prefab-mark-lowered` a failure while `post()` called it a conflict). The
 contracts are `writeAssetFile → {ok:true} | {ok:false, error, options?}` and
@@ -3860,8 +3860,9 @@ OS trash; the partial case was not reported at all. `makeDeleteUndo` now restore
 ### An undo/redo that discards a failed filesystem op — the whole class (#308)
 
 ⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,
-`deleteAssetFile`, `moveFileTo`, `createFolderApi` and `duplicateAssetFile`
-**never throw** — they catch and resolve `false`. (`mutateScene` — then in `SceneAssetView`, since
+`trashAssetFile`, `moveAsset`, `createAssetFolder` and `duplicateAssetFile` (named `deleteAssetFile`, `moveFileTo`
+and `createFolderApi` before #1824, when they answered a bare boolean)
+**never throw** — they catch and resolve a refusal (`{ok:false, error}`, the route's reason, since #1824). (`mutateScene` — then in `SceneAssetView`, since
 #831 in `scene/pendingBaseScene.ts` — was the one exception: it resolved `{ok:false}` for an HTTP
 error but let a network-level rejection escape,
 straight out of an undo closure and into the both-stacks-lost path below. It now catches too.) So ignoring the return value is silent *by
@@ -3879,9 +3880,8 @@ bookkeeping** (see below), so a throw is now survivable — but the entry is sti
 throw still costs the user their way back. The bar is unchanged, and is #291's — report, let the
 stack pop, keep editor state consistent with disk:
 
-- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. (What it does NOT do yet is reach
-  the step's result, so an agent's `undo` reads `did:true`: #1823, designed in
-  [refusal-reporting.md](./refusal-reporting.md) as Owner B.) `console.error` naming the
+- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. (Since #1823 it also reaches the step's
+  result, so an agent's `undo` answers `PARTIAL`: [refusal-reporting.md](./refusal-reporting.md) U1–U3.) `console.error` naming the
   direction, the action's label and the paths, always. That log is the user's only hand-recovery
   path, which is why it names paths rather than saying "the operation failed".
 - **A toast on top, for a collision only.** `/api/move-file` never clobbers: it answers **409
@@ -3889,10 +3889,10 @@ stack pop, keep editor state consistent with disk:
   403/404/5xx otherwise. A 409 is user-CAUSED and user-FIXABLE (they recreated something at the old
   name), so it is worth interrupting them for — the console is not a place anyone is looking. A
   backend failure is not actionable, so it stays console-only.
-- **`moveFileToStatus`** (`panels/assetOps.ts`) exists so that distinction is *measured* rather than
-  guessed. `moveFileTo` deliberately stays a bare boolean: every existing call site uses it as
-  `if (await moveFileTo(…))`, and an object return is always truthy — widening it in place would
-  silently disarm each of those guards while typechecking cleanly.
+- **`moveAsset`** (`panels/assetOps.ts`) answers `{ok:false, status, error}`, so that distinction is *measured*
+  rather than guessed, and the report names the route's reason (#1824). It replaced `moveFileTo`/`moveFileToStatus`
+  under a NEW name on purpose: `moveFileTo` was a boolean used as `if (await moveFileTo(…))`, and an object return is
+  always truthy — widening it in place would have silently disarmed each of those guards while typechecking cleanly.
 - **Gate the dependent state, don't just log it.** The log is for the user; the gate is what keeps
   the editor honest. Folder rename was an ACTIVE DESYNC rather than a no-op — `setPendingFolders`
   ran unconditionally while only the binding remap was gated, so a failed undo remapped the client

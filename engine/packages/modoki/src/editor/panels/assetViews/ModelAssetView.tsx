@@ -35,6 +35,8 @@ import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
 import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -260,14 +262,9 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       }
 
       // 1. Server-side bake (Stage A fixups + Stage B LOD simplification).
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[Inspector] Model convert failed:', summary.errors ?? summary);
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Converting ${name} failed: ${problem}`);
 
       // 2. Browser-side regen of .mesh.json / .mat.json / texture sidecars.
       //    `importModel` spawns entities as a side effect; for a GLB we seed the
@@ -643,7 +640,14 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
         // row is mounted on. It can only have been seeded by a ModelAssetView mounted on that
         // generated asset (a re-run over an existing one), which is exactly the case that would
         // otherwise 409.
-        () => writeMetaWholesale(glbPath, { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } }),
+        // A refused meta write stops the sequence with the route's reason (#1824): the GLB's sidecar carries the guid
+        // just registered, so going on would leave that guid on a file whose sidecar says otherwise.
+        async () => {
+          let why = 'the .meta.json write was refused';
+          if (!(await writeMetaWholesale(glbPath, { id: modelGuid, generated: { meshes: [meshJsonPath], materials: [], textures: [] } }, (e) => { why = e; }))) {
+            throw new Error(`write .meta.json failed: ${why}`);
+          }
+        },
       );
 
       onDone();

@@ -3,7 +3,7 @@
 // no-raw-fetch('/api/...') lint parity rule. Failures degrade to defaults — a settings
 // read never blocks the panel or Play.
 
-import { backendFetch, backendPostJson } from '../backend/editorBackend';
+import { backendFetch, postBackend } from '../backend/editorBackend';
 
 export interface AiSettings {
   /** Auto-open the Tier-2 @contact journal watch when the GameView enters Play. */
@@ -26,11 +26,12 @@ export async function fetchAiSettings(signal?: AbortSignal): Promise<AiSettings>
   } catch { return _cached ?? {}; }
 }
 
-/** Shallow-merge a patch into the persisted settings; returns the merged result. */
-export async function saveAiSettings(patch: AiSettings): Promise<AiSettings> {
-  try {
-    const res = await backendPostJson('/api/ai-settings', patch);
-    if (!res.ok) return _cached ?? {};
-    return _cached = (await res.json()) as AiSettings;
-  } catch { return _cached ?? {}; }
+/** Shallow-merge a patch into the persisted settings: the merged result, or the route's refusal.
+ *
+ *  ⚠️ It used to answer the CACHED settings on a refusal, which read to its caller as a save (#1824, a false success).
+ *  Renamed with the return type, so no caller can keep reading the old shape as if it saved. */
+export async function saveAiSettingsPatch(patch: AiSettings): Promise<{ ok: true; settings: AiSettings } | { ok: false; error: string }> {
+  const a = await postBackend('/api/ai-settings', patch);
+  if (!a.ok) return { ok: false, error: a.error };
+  return { ok: true, settings: _cached = a.body as AiSettings };
 }

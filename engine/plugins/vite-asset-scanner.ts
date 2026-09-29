@@ -272,6 +272,21 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
   }
 }
 
+/** A refusal a STREAMING route decides before its work starts (#1824, R1 of docs/refusal-reporting.md): open the stream
+ *  and send it as the final `FAILED:<title>\n<detail>` status, the way `/api/toolchain/install` and `/api/build`'s job
+ *  lock already do. A JSON 400/500 before the SSE headers is a body an `EventSource` cannot read — the dialogs showed
+ *  "Connection lost." and the reason reached nobody; `modoki_build`/`modoki_ota_publish` read the same `FAILED:`
+ *  (`consumeBuildStream`) and relay it as `REFUSED_BY_OP` naming this title. One code changed with the move: "gcloud not
+ *  found" was a 500, which the MCP read as `NOT_AVAILABLE_HERE`; a stream status carries no code, so it is now
+ *  `REFUSED_BY_OP` with the same sentence (close-out review, accepted: the sentence names the remedy). */
+function refuseBeforeStream(res: { setHeader(k: string, v: string): unknown; write(c: string): unknown; end(): unknown }, title: string, detail: string): void {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  try { res.write(`event: status\ndata: ${JSON.stringify(`FAILED:${title}\n${detail}`)}\n\n`); } catch { /* client disconnected */ }
+  res.end();
+}
+
 /** Atomic write: tmp file + rename. Same pattern as `plugins/meta-sidecar.ts`,
  *  inlined here because this writer handles documents other than sidecars
  *  (JSON-asset `id` stamping) — not to avoid a circular import; this module
@@ -2144,7 +2159,7 @@ export function assetScannerPlugin(): Plugin {
         const isApiRoute = req.url?.startsWith('/api/') ?? false;
         // Exact-match the SSE routes (bare OR with a query) so a sibling like
         // `/api/build-status` is NOT swallowed by a prefix match, and a query-less
-        // `/api/build` still reaches its handler (which 400s) instead of falling
+        // `/api/build` still reaches its handler (which refuses) instead of falling
         // through to SPA HTML. Keep identical to the dedicated handlers below. (D5)
         const sseRoutes = ['/api/build', '/api/add-native-target', '/api/toolchain/install', '/api/ota/publish'];
         if ((isApiRoute && !isSseRoute(req.url!, sseRoutes)) || req.url === '/assets.manifest.json') {
@@ -2243,8 +2258,7 @@ export function assetScannerPlugin(): Plugin {
           const url = new URL(req.url, 'http://localhost');
           const platform = url.searchParams.get('platform') as NativePlatform | null;
           if (platform !== 'ios' && platform !== 'android') {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: 'platform must be ios or android' }));
+            refuseBeforeStream(res, 'Invalid request', 'platform must be ios or android');
             return;
           }
           res.setHeader('Content-Type', 'text/event-stream');
@@ -2429,8 +2443,7 @@ export function assetScannerPlugin(): Plugin {
           const url = new URL(req.url, 'http://localhost');
           const platform = url.searchParams.get('platform');
           if (!isValidBuildPlatform(platform)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: 'platform must be ios, android, web, or playable' }));
+            refuseBeforeStream(res, 'Invalid build request', 'platform must be ios, android, web, or playable');
             return;
           }
           // #370. An ABSENT variant is `debug` — every caller that predates release builds must keep
@@ -2439,14 +2452,12 @@ export function assetScannerPlugin(): Plugin {
           // param there would report a "release web build" that is the ordinary one.
           const variantParse = parseBuildVariant(url.searchParams.get('variant'));
           if (!variantParse.ok) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: variantParse.message }));
+            refuseBeforeStream(res, 'Invalid build request', variantParse.message);
             return;
           }
           const variant = variantParse.variant;
           if (variant === 'release' && platform !== 'ios' && platform !== 'android') {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `variant=release applies to ios and android only, not ${platform}` }));
+            refuseBeforeStream(res, 'Invalid build request', `variant=release applies to ios and android only, not ${platform}`);
             return;
           }
           const isRelease = variant === 'release';
@@ -3409,7 +3420,7 @@ export function assetScannerPlugin(): Plugin {
           // THE publish-request check — the same `otaPublishPreflight` `ota-publish.mjs` runs (#827):
           // enabled, the four tainted inputs, the bundle identity, the publish TARGET and the signing
           // key. `ota-publish.mjs` (spawned below) runs it again, so this copy exists only to answer
-          // with a clean HTTP 400 before the SSE stream opens and a multi-minute build starts. It
+          // with a clean refusal (a `FAILED:` status, #1824) before a multi-minute build starts. It
           // matches the script's verdict because it is the same function over the same inputs — the
           // RAW `ota` block (`readRawOtaBlock`), NOT `cfg.ota`: merging coerces, and a merged block let
           // a malformed `ota.subgames` past this 400 into a build the script then refused. The
@@ -3447,8 +3458,7 @@ export function assetScannerPlugin(): Plugin {
               'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
               mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${cfg.ota.publicKey}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
             };
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: why[r.refusal] }));
+            refuseBeforeStream(res, 'OTA publish refused', why[r.refusal]);
             return;
           }
           // The CHECKED values — narrowed by the preflight, used from here on.
@@ -3457,20 +3467,18 @@ export function assetScannerPlugin(): Plugin {
           // authoritative check is ota-publish.mjs's, against what the build actually stamps into
           // subgame.json. This one compares the same number from the config it is stamped from
           // (vite.config.ts reads the sub-game's own ota.engineApi), so it cannot refuse anything
-          // that check would allow. It exists only to answer with a 400 before a multi-minute build.
+          // that check would allow. It exists only to refuse before a multi-minute build.
           let subgameDir: string | undefined;
           if (target.kind === 'subgame') {
             const resolved = otaResolveSubgameDir(target.id, buildCwd, projectRoot, (dir) => findGamesEntry(dir) !== null);
             if (!resolved.ok) {
-              res.statusCode = 400;
-              res.end(JSON.stringify({ error: resolved.error }));
+              refuseBeforeStream(res, 'OTA publish refused', resolved.error);
               return;
             }
             subgameDir = resolved.dir;
             const subgameEngineApi = loadProjectConfig(subgameDir).ota.engineApi;
             if (subgameEngineApi !== cfg.ota.engineApi) {
-              res.statusCode = 400;
-              res.end(JSON.stringify({ error: `Sub-game "${target.id}" would be built against engine API ${subgameEngineApi} (its own ota.engineApi), but this shell's ota.engineApi is ${cfg.ota.engineApi}. A device loads a sub-game only when the two are EXACTLY equal, so every device would refuse this bundle. Align the two before publishing.` }));
+              refuseBeforeStream(res, 'OTA publish refused', `Sub-game "${target.id}" would be built against engine API ${subgameEngineApi} (its own ota.engineApi), but this shell's ota.engineApi is ${cfg.ota.engineApi}. A device loads a sub-game only when the two are EXACTLY equal, so every device would refuse this bundle. Align the two before publishing.`);
               return;
             }
           }
@@ -3481,19 +3489,16 @@ export function assetScannerPlugin(): Plugin {
           // late refusal here was a wasted build with nothing the dialog could do about it.
           const tree = readGitProvenance(subgameDir ?? projectRoot);
           if (tree.commit === null || tree.dirty !== false) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({
-              error: tree.commit === null || tree.dirty === null
+            refuseBeforeStream(res, 'OTA publish refused',
+              tree.commit === null || tree.dirty === null
                 ? 'git could not report this project\'s tree (not in a git repository, or git is unavailable), so a publish could not record which source it ships. OTA publishing from the editor needs a committed git tree.'
-                : 'The repository has uncommitted changes (outside native ios/ and android/ folders), so no commit would reproduce what this publish ships. Commit them, then publish. (Only the ota-publish.mjs command line can publish an unclean build, with --allow-unclean-build.)',
-            }));
+                : 'The repository has uncommitted changes (outside native ios/ and android/ folders), so no commit would reproduce what this publish ships. Commit them, then publish. (Only the ota-publish.mjs command line can publish an unclean build, with --allow-unclean-build.)');
             return;
           }
           const user = loadProjectUserConfig(projectRoot);
           const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
           if (!gcloudDir) {
-            res.statusCode = 500;
-            res.end(JSON.stringify({ error: 'gcloud not found — install the Google Cloud SDK and run `gcloud auth login`, or set its path in Project Settings.' }));
+            refuseBeforeStream(res, 'gcloud not found', 'install the Google Cloud SDK and run `gcloud auth login`, or set its path in Project Settings.');
             return;
           }
 

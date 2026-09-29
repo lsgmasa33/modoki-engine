@@ -30,6 +30,8 @@ import { AssetRefField } from '../AssetRefField';
 import { inputStyle } from '../fields';
 import { reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 const DEFAULT_DOC = DEFAULT_ATLAS_DOC;
 
@@ -281,14 +283,9 @@ export function AtlasAssetView({ path, name }: { path: string; name: string }) {
     setPacking(true);
     setImportStatus(true, `Packing ${name}...`);
     try {
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[AtlasAssetView] pack failed:', summary.errors ?? summary);
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Packing ${name} failed: ${problem}`);
       refreshAssets();          // re-scan panel; the watcher broadcast re-registers the block
       setBlockVersion((v) => v + 1);
       markScene2DDirty();       // refresh on-screen packed sprites to the new page

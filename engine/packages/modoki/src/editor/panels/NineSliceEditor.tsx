@@ -403,7 +403,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     }
     // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
     // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
-    const persisted = await writeMetaOrWarn(path, nextMeta);
+    let refusedWhy: string | undefined; // the route's reason, for the dialog (#1824)
+    const persisted = await writeMetaOrWarn(path, nextMeta, (e) => { refusedWhy = e; });
     if (!persisted) {
       // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
       // for a reason that has nothing to do with the edit — a dev-server blip — and the user has
@@ -411,7 +412,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // false, so a later Cancel still reverts the live preview. `writeMetaOrWarn` has already
       // logged the status + body; this line names the dialog, since that one is tagged
       // `[Inspector]` for every caller.
-      const refusal: SaveRefusal = { kind: 'write-failed' };
+      const refusal: SaveRefusal = { kind: 'write-failed', ...(refusedWhy ? { error: refusedWhy } : {}) };
       console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
       setSaveRefusal(refusal);
       return;

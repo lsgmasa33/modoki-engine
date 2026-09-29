@@ -17,10 +17,11 @@
  *  reporting — a fix that made the guard chatty and permissive would be worse than the silence. */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Only `fetch` is stubbed (#1824): the code under test reads its answer through the real `readBackendAnswer`, and a
+// module mock of the backend would have to restate that reader to stay green. `backendFetch(url, init)` is
+// `fetch(url, init)` same-origin, so the stub sees the same arguments the module mock did.
 const backendFetch = vi.fn();
-vi.mock('../../packages/modoki/src/editor/backend/editorBackend', () => ({
-  backendFetch: (...a: unknown[]) => backendFetch(...a),
-}));
+vi.stubGlobal('fetch', backendFetch);
 
 const showToast = vi.fn();
 vi.mock('../../packages/modoki/src/editor/store/editorStore', () => ({

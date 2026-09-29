@@ -103,7 +103,8 @@ describe('A-1: /api/write-file ifNoneMatch — a create cannot overwrite', () =>
     write('/m/probe.mat.json', '{"id":"old"}\n');
     const r = await post('/api/write-file', { path: '/m/probe.mat.json', content: '{"id":"new"}\n', ifNoneMatch: '*' });
     expect(r.status).toBe(409);
-    expect(r.body).toMatchObject({ ok: false, conflict: true, reason: 'if-none-match' });
+    // R1 (#1824): the sentence names the file that is there. Mutation: drop `error` from the if-none-match refusal — red.
+    expect(r.body).toMatchObject({ ok: false, conflict: true, reason: 'if-none-match', error: expect.stringMatching(/probe\.mat\.json is already there, and this write only creates/) });
     expect(fs.readFileSync(abs('/m/probe.mat.json'), 'utf-8')).toBe('{"id":"old"}\n');
   });
 

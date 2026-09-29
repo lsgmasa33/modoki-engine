@@ -39,8 +39,8 @@ export type SaveRefusal =
    *  missing its GUID. Retrying Save cannot help — the base document is the problem. */
   | { kind: 'meta-never-read' }
   /** The read was fine and the POST failed (dev server down, 500). The edit is intact and pressing
-   *  Save again is exactly the right move. */
-  | { kind: 'write-failed' };
+   *  Save again is exactly the right move. `error` is the route's reason when it gave one (#1824). */
+  | { kind: 'write-failed'; error?: string };
 
 /** The sentence shown IN the dialog, beside the Save button that did nothing.
  *
@@ -53,8 +53,9 @@ export function saveRefusalMessage(refusal: SaveRefusal): string {
         + 'strip its ID and break every reference to it. Close and reopen this dialog once the dev '
         + 'server responds; your edit is still here until you do.';
     case 'write-failed':
-      return '⚠ Not saved — the write failed (see the console for the server\'s reason). Your edit '
-        + 'is intact and the dialog is staying open, so press Save again.';
+      // The route's own sentence when it gave one (#1824) — "see the console" only when there is none.
+      return `⚠ Not saved — ${refusal.error ? `the write was refused: ${refusal.error}.` : 'the write failed (see the console for the server\'s reason).'} `
+        + 'Your edit is intact and the dialog is staying open, so press Save again.';
   }
 }
 

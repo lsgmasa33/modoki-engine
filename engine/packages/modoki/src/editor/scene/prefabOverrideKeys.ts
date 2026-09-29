@@ -317,7 +317,8 @@ export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'member
   const noun = skipped.every((x) => x.key.startsWith('~moved.')) ? 'move' : 'change';
   if (skipped.length) parts.push(`${skipped.length} ${noun}${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
   if (result.memberPathsChanged) {
-    if (result.fileRepair === null) parts.push('references to the moved members in other files could NOT be repaired — see the console');
+    // The route's reason, when it refused the repair (#1824) — this said "see the console".
+    if (result.fileRepair && 'failed' in result.fileRepair) parts.push(`references to the moved members in other files could NOT be repaired: ${result.fileRepair.error}`);
     else {
       if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);
       // #1784: left rather than written over a change that landed while the repair ran.

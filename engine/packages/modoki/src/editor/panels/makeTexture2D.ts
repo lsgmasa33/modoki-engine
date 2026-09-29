@@ -15,6 +15,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { deriveSettingsForType, type TextureImportSettings } from '../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
 import { flushPendingMetaFor, writeMetaWholesale } from '../scene/pendingMeta';
+import { reimportAsset, reimportProblem } from './assetViews/reimportAsset';
 import { useEditorStore } from '../store/editorStore';
 
 /** #901: this action has NO panel of its own — it fires from the SpritePicker's list of spriteless
@@ -103,16 +104,21 @@ export async function makeTexture2D(path: string): Promise<boolean> {
   const updatedMeta = { ...meta, type: '2d', texture: deriveSettingsForType('2d', carried) };
   // #874: writeMetaWholesale IS the write plus the forget-on-success — see its docblock for why
   // that pairing lives in one function rather than at each of the three call sites.
-  const wrote = await writeMetaWholesale(path, updatedMeta);
-  if (!wrote) return false;
+  let refusedWhy = 'the .meta.json write was refused';
+  const wrote = await writeMetaWholesale(path, updatedMeta, (e) => { refusedWhy = e; });
+  if (!wrote) {
+    // The route's reason on screen (#1824, ruling FA): nothing was converted and the row says only "failed".
+    refuseWithToast(`[SpritePicker] ${path} was not converted — its .meta.json write was refused: ${refusedWhy}`,
+      `${path.split('/').pop()} was not converted to 2D: ${refusedWhy}`);
+    return false;
+  }
 
-  const res = await backendFetch('/api/reimport', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
-  });
-  const summary = await res.json().catch(() => ({}));
-  if (!res.ok || (summary.errors && summary.errors.length)) {
-    console.error(`[SpritePicker] texture re-import failed for ${path}:`, summary.errors ?? summary);
+  // Read by the one reader (#1824): a refusal carrying only `error` used to pass as a re-import, and the reason
+  // reached only the console. The meta write above has landed, so say what did not.
+  const problem = reimportProblem(await reimportAsset(path));
+  if (problem) {
+    refuseWithToast(`[SpritePicker] texture re-import failed for ${path}: ${problem}`,
+      `${path.split('/').pop()} is now typed 2D, but its re-import failed: ${problem}`);
     return false;
   }
 

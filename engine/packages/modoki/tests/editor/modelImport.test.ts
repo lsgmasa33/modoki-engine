@@ -52,7 +52,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
 
 // Track files written via writeAssetFile (uses fetch /api/write-file)
 let writtenFiles: { path: string; content: string }[] = [];
-let writtenMeta: { path: string; meta: any } | null = null;
+let writtenMeta: { path: string; meta: any; rendererWrite?: unknown } | null = null;
+/** A `/api/write-meta` refusal to answer instead of the default success (#1824). */
+let refuseMeta: { status: number; body: unknown } | null = null;
 
 // Mock fetch for file writes and meta writes
 /** #311: make the write for the first path matching this substring fail, so a test can drive
@@ -69,7 +71,8 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
   }
   if (url === '/api/write-meta') {
     const body = JSON.parse(opts.body);
-    writtenMeta = { path: body.path, meta: body.meta };
+    if (refuseMeta) { const { status, body: reply } = refuseMeta; return { ok: false, status, json: async () => reply }; }
+    writtenMeta = { path: body.path, meta: body.meta, rendererWrite: body.rendererWrite };
     return { ok: true };
   }
   // ⚠️ A MISSING SIDECAR IS A 200 WITH `{}` — the route (`editorBackendRouter.ts`'s
@@ -151,6 +154,7 @@ beforeEach(() => {
   writtenFiles = [];
   writtenMeta = null;
   failWriteMatching = null;
+  refuseMeta = null;
   mockTemplates = new Map();
   loadGLBResult = new Map();
   mockPostprocessor = {};
@@ -704,5 +708,30 @@ describe('#311 — a failed write aborts the import', () => {
     expect(rootId).not.toBe(0);
     expect(writtenFiles.some((f) => f.path.includes('.mat.json'))).toBe(true);
     expect(allRegisteredPaths().some((p) => p.includes('.mat.json'))).toBe(true);
+  });
+});
+
+/** #1824 — the model's own sidecar write (id, postprocessor, generated list) is read by the one reader. */
+describe('#1824 — the static GLB sidecar write', () => {
+  // It is built from a park-preferring read, so it retires any parked settings edit: without `rendererWrite` the park
+  // gate answered 409, and since the write became abortable that 409 would fail every import of a model with a parked
+  // edit. Mutation: drop `rendererWrite: true` from the static sidecar POST — red.
+  it('declares itself a renderer write, so the park gate does not refuse it', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    await importModel('/assets/models/island.glb', 'island');
+    expect(writtenMeta).toMatchObject({ path: '/assets/models/island.glb', rendererWrite: true });
+  });
+
+  // It holds the guid every generated file references: a refused write ABORTS, with the route's reason in the toast
+  // (it used to fall through to the prune and the spawn). Mutation: drop `if (!glbMeta.ok) throw` — red.
+  it('a refused sidecar write aborts the import and names the route\'s reason', async () => {
+    const { importModel } = await getModule();
+    addTemplate('ground_mesh', mockMaterial({ name: 'grass', color: 0x00ff00 }));
+    refuseMeta = { status: 400, body: { code: 'REFUSED_BY_OP', error: 'island.glb.meta.json was written by a newer build' } };
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await expect(importModel('/assets/models/island.glb', 'island')).resolves.toBe(0);
+    // The route's sentence reaches the abort report. Mutation: drop `: ${glbMeta.error}` from the abort — red.
+    expect(err.mock.calls.map((c) => String(c[0])).join('\n')).toContain('island.glb.meta.json was written by a newer build');
   });
 });

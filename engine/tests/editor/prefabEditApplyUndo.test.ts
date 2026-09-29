@@ -33,8 +33,8 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   return {
   ...real,
   // `duringRepair` runs inside the undo's member-path repair — its rebuild's one await before the restore (#1750 T3).
-  repairPrefabMemberPaths: async (...args: unknown[]) => {
-    const out = await (real.repairPrefabMemberPaths as (...a: unknown[]) => Promise<unknown>)(...args);
+  requestMemberPathRepair: async (...args: unknown[]) => {
+    const out = await (real.requestMemberPathRepair as (...a: unknown[]) => Promise<unknown>)(...args);
     const f = sm.duringRepair; sm.duringRepair = null; f?.();
     return out;
   },

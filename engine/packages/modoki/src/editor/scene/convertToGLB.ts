@@ -20,7 +20,7 @@
  */
 
 import * as THREE from 'three';
-import { backendFetch, readWriteRefusal } from '../backend/editorBackend';
+import { backendFetch, readBackendAnswer } from '../backend/editorBackend';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { getModelPostprocessor } from '../../runtime/loaders/modelPostprocessorRegistry';
 
@@ -475,9 +475,8 @@ export async function convertSourceToGLB(sourcePath: string, postprocessorId = '
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: glbPath, content: arrayBufferToBase64(glb), encoding: 'base64' }),
   });
-  if (!res.ok) {
-    throw new Error(`[convertToGLB] Failed to write ${glbPath}: ${(await readWriteRefusal(res)).error}`);
-  }
+  const written = await readBackendAnswer(res);
+  if (!written.ok) throw new Error(`[convertToGLB] Failed to write ${glbPath}: ${written.error}`);
 
   console.log(`[convertToGLB] ${fileName} → ${baseName}.glb (${(glb.byteLength / 1024).toFixed(0)} KB)`);
   return glbPath;

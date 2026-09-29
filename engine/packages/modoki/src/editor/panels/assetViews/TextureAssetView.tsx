@@ -4,7 +4,6 @@
  *  Apply runs the conversion + reloads. */
 
 import { useState, useEffect, useCallback } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_WEBP_QUALITY, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveTextureType, deriveSettingsForType, variantsToEmit, resolveWebpQuality, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat, type TextureType, type TextureCacheInfo } from '../../../runtime/loaders/textureSettings';
 import { invalidateTexture } from '../../../runtime/loaders/textureResolver';
@@ -21,6 +20,8 @@ import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
 import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -304,14 +305,9 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       // parked edit has not reached disk yet, so without this the conversion would bake the OLD
       // settings while the UI already shows the new ones — see pendingMeta.ts's header.
       await flushPendingMetaFor(path);
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[Inspector] Texture convert failed:', summary.errors ?? summary);
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Converting ${name} failed: ${problem}`);
       await loadMeta();
       invalidateTexture(path);
       refreshAssets();

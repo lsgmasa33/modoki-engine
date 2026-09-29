@@ -110,9 +110,11 @@ async function restoreSnapshot(
         // cache, which the adopt seats (#1751) — and the live world after this undo is that snapshot, so its files' records
         // follow the rewrite. Only while it is still THAT world, asked once the route has returned, by the same test as
         // the check below (close-out review): a world that replaced it was loaded from the pre-repair bytes.
-        await repairMemberPathsEverywhere(prefab.id, repairFrom, {
+        const repaired = await repairMemberPathsEverywhere(prefab.id, repairFrom, {
           liveWorldRepaired: () => currentSceneKey() === key && getCurrentWorld() === world && !isSceneLoadSwapping() && sceneManager.getNext() === null,
         });
+        // A post-write miss is a shortfall of this step (#1823), now with the route's reason (#1824).
+        if ('error' in repaired) reportUndoFailure({ direction, label, detail: `member refs in other files were not repaired: ${repaired.error}` });
       }
       // Still THAT world? An Exit swaps a real scene in under the edit world's undo (#1573 close-out re-review), where
       // loading the synthetic world would leave it under a real path for `saveScene` to write into that file. Every
@@ -196,7 +198,10 @@ async function restoreSnapshot(
   // files on disk were repaired for the apply's paths and must follow the prefab that is on disk now.
   // No live world is known to hold this repair (the one here now was loaded from the files before it), so no record of a
   // live file moves, and every rewritten scene's stack is marked stale as the watcher would (#1751).
-  if (committed.worldLeft && repairFrom && prefab.id) await repairMemberPathsEverywhere(prefab.id, repairFrom, { liveWorldRepaired: false });
+  if (committed.worldLeft && repairFrom && prefab.id) {
+    const repaired = await repairMemberPathsEverywhere(prefab.id, repairFrom, { liveWorldRepaired: false });
+    if ('error' in repaired) reportUndoFailure({ direction, label, detail: `member refs in other files were not repaired: ${repaired.error}` });
+  }
   if (!restored) return false;
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
   useEditorStore.getState().selectEntity(id || null);

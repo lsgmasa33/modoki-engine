@@ -6,7 +6,8 @@
 // otherwise (it's watch-gated to keep the journal from being dominated by contacts).
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchAiSettings, saveAiSettings } from './aiSettingsModel';
+import { fetchAiSettings, saveAiSettingsPatch } from './aiSettingsModel';
+import { reportGestureRefusal } from '../backend/refusalChannel';
 
 export default function AiCaptureSection(): React.ReactElement {
   const [onLaunch, setOnLaunch] = useState(false);
@@ -24,7 +25,15 @@ export default function AiCaptureSection(): React.ReactElement {
 
   const toggle = useCallback((next: boolean) => {
     setOnLaunch(next); // optimistic
-    void saveAiSettings({ captureContactOnLaunch: next });
+    // A refused save says why (#1824, ruling FA) and puts the box back to what the backend HOLDS — re-read, not assumed
+    // `!next`, which two refused toggles in a row would leave inverted (close-out review). It used to stay ticked over
+    // a setting that was never written.
+    void saveAiSettingsPatch({ captureContactOnLaunch: next }).then(async (r) => {
+      if (r.ok) return;
+      reportGestureRefusal(`The capture setting was not saved: ${r.error}`);
+      const held = await fetchAiSettings();
+      if (mounted.current) setOnLaunch(!!held.captureContactOnLaunch);
+    });
   }, []);
 
   return (

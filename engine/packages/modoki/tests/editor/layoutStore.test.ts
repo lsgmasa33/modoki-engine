@@ -5,16 +5,16 @@
  *  CSS, every panel, SceneView/Three/Pixi). Covers the DECISIONS: the
  *  `loadInitialModel` precedence ladder, the `toModel`/`normalizeTabTitles`
  *  self-heal, auto-dock bookkeeping, and the round-trip/degrade behaviour of the
- *  read/write helpers. backendFetch is mocked so no dev server is needed. */
+ *  read/write helpers. `fetch` is stubbed so no dev server is needed. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Model } from 'flexlayout-react';
 import type { IJsonModel } from 'flexlayout-react';
 
+// Only `fetch` is stubbed (#1824): the layout writes read their answer through the real `readBackendAnswer`.
+// `backendFetch(url, init)` is `fetch(url, init)` same-origin, so the stub sees the same arguments.
 const backendFetch = vi.fn();
-vi.mock('../../src/editor/backend/editorBackend', () => ({
-  backendFetch: (...args: unknown[]) => backendFetch(...args),
-}));
+vi.stubGlobal('fetch', backendFetch);
 
 // This jsdom env doesn't provide localStorage (same gap newScene.test.ts works
 // around) — back it with a tiny in-memory store.
@@ -39,7 +39,7 @@ import {
   LAYOUT_KEY, LAYOUT_NAME_KEY, AUTODOCK_KEY,
   autoDockedPanels, markAutoDocked,
   saveLayout, loadLayout, currentLayoutName,
-  writeLayoutJson, writeLayout, downloadLayoutJson, readLayout,
+  saveLayoutJson, saveLayoutFile, downloadLayoutJson, readLayout,
   toModel, normalizeTabTitles, loadInitialModel, clearStoredLayout, orderLayoutChoices,
   takeLayoutResetFlag, LAYOUT_RESET_KEY, _resetLayoutLoadMemoForTests,
 } from '../../src/editor/utils/layoutStore';
@@ -112,12 +112,12 @@ describe('saveLayout / loadLayout / currentLayoutName', () => {
   });
 });
 
-describe('readLayout / writeLayoutJson', () => {
+describe('readLayout / saveLayoutJson', () => {
   it('readLayout returns parsed JSON on an ok response', async () => {
     backendFetch.mockResolvedValueOnce(okJson(minimalModel()));
     const result = await readLayout('foo');
     expect(result).toMatchObject({ layout: expect.any(Object) });
-    expect(backendFetch).toHaveBeenCalledWith(expect.stringContaining('/api/layout?name=foo'));
+    expect(String(backendFetch.mock.calls[0][0])).toContain('/api/layout?name=foo');
   });
   it('readLayout degrades to null on a non-ok response', async () => {
     backendFetch.mockResolvedValueOnce(notOk());
@@ -127,22 +127,23 @@ describe('readLayout / writeLayoutJson', () => {
     backendFetch.mockRejectedValueOnce(new Error('network down'));
     expect(await readLayout('foo')).toBeNull();
   });
-  it('writeLayoutJson resolves true on an ok response', async () => {
+  it('saveLayoutJson answers ok on an ok response', async () => {
     backendFetch.mockResolvedValueOnce(okJson({}));
-    expect(await writeLayoutJson('foo', { a: 1 })).toBe(true);
+    expect(await saveLayoutJson('foo', { a: 1 })).toEqual({ ok: true });
   });
-  it('writeLayoutJson degrades to false on a non-ok response', async () => {
-    backendFetch.mockResolvedValueOnce(notOk());
-    expect(await writeLayoutJson('foo', {})).toBe(false);
+  // #1824: the route's reason reaches the caller (it was a bare `false`). Mutation: answer `{ok:false, error:''}`.
+  it('saveLayoutJson carries the route\'s reason on a refusal', async () => {
+    backendFetch.mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'invalid layout name' }) });
+    expect(await saveLayoutJson('foo', {})).toEqual({ ok: false, error: 'invalid layout name' });
   });
-  it('writeLayoutJson degrades to false when fetch throws', async () => {
+  it('saveLayoutJson refuses with the error when fetch throws', async () => {
     backendFetch.mockRejectedValueOnce(new Error('boom'));
-    expect(await writeLayoutJson('foo', {})).toBe(false);
+    expect(await saveLayoutJson('foo', {})).toEqual({ ok: false, error: 'boom' });
   });
-  it('writeLayout serializes the model and calls writeLayoutJson', async () => {
+  it('saveLayoutFile serializes the model and calls saveLayoutJson', async () => {
     backendFetch.mockResolvedValueOnce(okJson({}));
     const m = Model.fromJson(minimalModel());
-    expect(await writeLayout('foo', m)).toBe(true);
+    expect(await saveLayoutFile('foo', m)).toEqual({ ok: true });
     const body = JSON.parse((backendFetch.mock.calls[0][1] as RequestInit).body as string);
     expect(body.name).toBe('foo');
     expect(body.content).toMatchObject({ layout: expect.any(Object) });

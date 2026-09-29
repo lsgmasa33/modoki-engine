@@ -1148,7 +1148,7 @@ that was also losing `Animator.clips`.
   trash overtook is not seated (#1669, the token below). A WRITE is `commitPrefabWrite` (prefabCommit.ts, #1692), never a
   cache set. A write that does not land is a `conflict` or carries a reason in `error` (#1776), the one channel a refusal travels
   in whoever produced it: the route's own (`/api/write-file` refuses a path outside the asset roots with `{error,
-  options}`, where it once sent an empty body), else `the write was refused (HTTP <status>)`. The agent `create` refuses
+  options}`, where it once sent an empty body), else `the request was refused (HTTP <status>)`. The agent `create` refuses
   with it (and the route's `options`), and `createPrefabFromEntity` returns it as `refused`, which both panels toast, as it
   does its other refusals (an unreadable file it would replace, a tree that cannot be serialized); before, all of these
   reached the human as a bare `null` the panels only logged. The cache lets the serialize loop and the

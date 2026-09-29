@@ -15,6 +15,8 @@
  * seam — see the Phase 1 exit criteria.
  */
 
+import { failureDetail } from './failureBody';
+
 /** Base URL the editor backend is reachable at. Empty string = same-origin
  *  (Vite dev server / browser). The Electron host overrides it via a global the
  *  preload script sets. */
@@ -117,48 +119,40 @@ export function postWriteFile(
  *  `content` is the scene as serialized (`jsonFileBody`). Resolves to the copy's new guid and the
  *  path the disk spells it with; `'same-file'` when `filePath` resolves to `openPath`'s own file, or
  *  `'target-loaded'` to another of `loadedPaths` (nothing written either way — the backend compares
- *  the files the DISK resolves, which a client string compare cannot); or null when the write was
- *  refused or failed. */
-export async function writeSceneCopy(filePath: string, content: string, openPath: string, loadedPaths: readonly string[]): Promise<{ guid: string; path: string } | 'same-file' | 'target-loaded' | null> {
-  try {
-    const res = await backendFetch('/api/scene-save-as', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content, openPath, loadedPaths }),
-    });
-    if (res.status === 409) {
-      const j = await res.json().catch(() => ({})) as { sameFile?: boolean; targetLoaded?: boolean };
-      return j.sameFile ? 'same-file' : j.targetLoaded ? 'target-loaded' : null;
-    }
-    if (!res.ok) return null;
-    const j = await res.json() as { guid?: string; path?: string };
-    return typeof j.guid === 'string' ? { guid: j.guid, path: typeof j.path === 'string' ? j.path : filePath } : null;
-  } catch { return null; }
+ *  the files the DISK resolves, which a client string compare cannot); or `{refused}` with the route's
+ *  reason when the write was refused or failed (#1824 — this was a bare `null`, so a wrongKind 409, a 403
+ *  and a 500 all reached an agent's `save_all` as `write-failed` with no text). Renamed with the shape, so
+ *  no `if (!written)` survives reading every refusal as a success. */
+export async function saveSceneCopy(filePath: string, content: string, openPath: string, loadedPaths: readonly string[]): Promise<{ guid: string; path: string } | 'same-file' | 'target-loaded' | { refused: string; code?: string }> {
+  const a = await postBackend('/api/scene-save-as', { path: filePath, content, openPath, loadedPaths });
+  if (!a.ok) {
+    const b = (a.body ?? {}) as { sameFile?: unknown; targetLoaded?: unknown };
+    if (a.status === 409 && b.sameFile) return 'same-file';
+    if (a.status === 409 && b.targetLoaded) return 'target-loaded';
+    return { refused: a.error, ...(a.code ? { code: a.code } : {}) };
+  }
+  return typeof a.body.guid === 'string'
+    ? { guid: a.body.guid, path: typeof a.body.path === 'string' ? a.body.path : filePath }
+    : { refused: 'the route answered without the copy\'s guid' };
 }
 
 /** The bytes (base64) a file dropped into the Assets panel is written as at `dest` (#1713): a JSON asset with an
  *  identity of its own, decided by the backend exactly as `modoki_import_file` decides it (`/api/import-identity`
- *  → `importedAssetBytes`); anything else unchanged, without a round trip. Null when the backend could not answer — the
- *  caller must NOT fall back to the dropped bytes, which carry the source's id: written as they are, a copy of an asset
- *  already in the project claims its guid, and the scanner's heal keeps it for whichever path sorts first.
+ *  → `importedAssetBytes`); anything else unchanged, without a round trip. `{error}` with the route's reason when the
+ *  backend could not answer (#1824 — it was a console line and `null`) — the caller must NOT fall back to the dropped
+ *  bytes, which carry the source's id: written as they are, a copy of an asset already in the project claims its guid,
+ *  and the scanner's heal keeps it for whichever path sorts first.
  *
  *  `claimed` is ONE batch's decided ids, shared across its calls and grown by each (#1713 close-out re-review): the
  *  batch writes through `/api/write-file`, which rebuilds no manifest, so the backend cannot see the batch's earlier
  *  files — two carrying one unused id would otherwise both keep it. */
-export async function importedFileContent(dest: string, content: string, claimed: Set<string> = new Set()): Promise<string | null> {
-  if (!dest.toLowerCase().endsWith('.json')) return content;
-  try {
-    const res = await backendPostJson('/api/import-identity', { path: dest, content, claimed: [...claimed] });
-    const j = await res.json().catch(() => ({})) as { content?: unknown; id?: unknown; error?: unknown };
-    if (!res.ok || typeof j.content !== 'string') {
-      console.error(`[Assets] ${dest} was not imported: no identity from the backend (${String(j.error ?? res.status)})`);
-      return null;
-    }
-    if (typeof j.id === 'string') claimed.add(j.id);
-    return j.content;
-  } catch (e) {
-    console.error(`[Assets] ${dest} was not imported: no identity from the backend`, e);
-    return null;
-  }
+export async function importedFileBytes(dest: string, content: string, claimed: Set<string> = new Set()): Promise<{ content: string } | { error: string }> {
+  if (!dest.toLowerCase().endsWith('.json')) return { content };
+  const a = await postBackend('/api/import-identity', { path: dest, content, claimed: [...claimed] });
+  if (!a.ok) return { error: `no identity from the backend: ${a.error}` };
+  if (typeof a.body.content !== 'string') return { error: 'no identity from the backend: the answer carried no content' };
+  if (typeof a.body.id === 'string') claimed.add(a.body.id);
+  return { content: a.body.content };
 }
 
 /** One file `/api/prefab-member-paths` rewrote (#1751): the bytes it wrote, and the bytes it held before. */
@@ -170,67 +164,111 @@ export interface MemberPathRepair { rewritten: string[]; held: string[]; changed
 
 /** After a prefab changed from `before` in a way that moved member PATHS (#1437: an applied move),
  *  re-point the member refs stored in every OTHER scene and prefab file that uses it
- *  (`/api/prefab-member-paths`). `null` when the backend could not do it (the reason is in the console).
+ *  (`/api/prefab-member-paths`). `{error}` with the route's reason when the backend could not do it (#1824 — it was
+ *  `null`, with the reason only in the console, so an agent's Apply reply said `fileRepair: {failed:true}` and no more).
  *
  *  ⚠️ The transport only. The route marks its writes as the editor's own, so no watcher event brings the client's
  *  caches along (#1751): call it through `repairMemberPathsEverywhere` (serverPrefabRewrites.ts), which adopts
  *  `written`. */
-export async function repairPrefabMemberPaths(prefab: string, before: unknown): Promise<MemberPathRepair | null> {
-  try {
-    const res = await backendPostJson('/api/prefab-member-paths', { prefab, before });
-    const j = await res.json().catch(() => ({})) as { rewritten?: unknown; held?: unknown; changed?: unknown; written?: unknown; error?: unknown };
-    if (!res.ok) { console.error(`[Prefab] member refs in other files were NOT repaired: ${String(j.error ?? res.status)}`); return null; }
-    const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
-    // Decoded, never cast: a row missing a field is dropped rather than seated as `undefined`.
-    const written = (Array.isArray(j.written) ? j.written : []).filter((w): w is MemberPathRewrite => {
-      const r = w as Partial<MemberPathRewrite> | null;
-      return !!r && typeof r.path === 'string' && (r.type === 'scene' || r.type === 'prefab')
-        && typeof r.text === 'string' && typeof r.prior === 'string' && (r.guid === undefined || typeof r.guid === 'string');
-    });
-    const out = { rewritten: list(j.rewritten), held: list(j.held), changed: list(j.changed), written };
-    // Said HERE, once, for every caller (apply, undo, redo): a held document's own save would write its old
-    // refs back, and nothing else tells the user which files those are.
-    if (out.held.length) console.warn(`[Prefab] member refs NOT repaired in ${out.held.join(', ')}: open with unsaved edits. Their refs to the moved members will dangle once saved.`);
-    if (out.changed.length) console.warn(`[Prefab] member refs NOT repaired in ${out.changed.join(', ')}: the file changed on disk while the repair ran, so it was left as it is. Its refs to the moved members may dangle.`);
-    return out;
-  } catch (e) {
-    console.error('[Prefab] member refs in other files were NOT repaired:', e);
-    return null;
-  }
+export async function requestMemberPathRepair(prefab: string, before: unknown): Promise<MemberPathRepair | { error: string }> {
+  const a = await postBackend('/api/prefab-member-paths', { prefab, before });
+  if (!a.ok) { console.error(`[Prefab] member refs in other files were NOT repaired: ${a.error}`); return { error: a.error }; }
+  const j = a.body as { rewritten?: unknown; held?: unknown; changed?: unknown; written?: unknown };
+  const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  // Decoded, never cast: a row missing a field is dropped rather than seated as `undefined`.
+  const written = (Array.isArray(j.written) ? j.written : []).filter((w): w is MemberPathRewrite => {
+    const r = w as Partial<MemberPathRewrite> | null;
+    return !!r && typeof r.path === 'string' && (r.type === 'scene' || r.type === 'prefab')
+      && typeof r.text === 'string' && typeof r.prior === 'string' && (r.guid === undefined || typeof r.guid === 'string');
+  });
+  const out = { rewritten: list(j.rewritten), held: list(j.held), changed: list(j.changed), written };
+  // Said HERE, once, for every caller (apply, undo, redo): a held document's own save would write its old
+  // refs back, and nothing else tells the user which files those are.
+  if (out.held.length) console.warn(`[Prefab] member refs NOT repaired in ${out.held.join(', ')}: open with unsaved edits. Their refs to the moved members will dangle once saved.`);
+  if (out.changed.length) console.warn(`[Prefab] member refs NOT repaired in ${out.changed.join(', ')}: the file changed on disk while the repair ran, so it was left as it is. Its refs to the moved members may dangle.`);
+  return out;
 }
 
-/** Why `/api/write-file` refused a write, read the ONE way every client caller reads it (#1811).
+// ── The one reader of a route's answer (#1824, Owner A of docs/refusal-reporting.md) ──────────────
+//
+// Every write route states why it refused, in its body. Before #1824 each client wrapper read the answer for itself —
+// `res.ok`, a status, sometimes one field — so the route's reason reached neither the human nor the agent, and two
+// wrappers (`reimportPaths`, `saveAiSettings`) counted a refusal as done. #1811 built this for `/api/write-file`
+// alone (`readWriteRefusal`); this is that reader widened to every route, and the ONE place the verdict and the
+// reason are decided on the client.
+
+/** A route's refusal, as every client wrapper reads it.
  *
- *  The route states a reason for every refusal — `{error, options}` for a path outside the asset roots, the prefab
- *  gates' 409 with `error`, a 500's `{error}`, the transport's 400/413/token 403 — and the precondition 409s carry only
- *  `reason`. The two shared wrappers used to read `res.ok` (and a 409's `reason`) and nothing else, so ten callers
- *  reported a bare "failed" to a person or an agent who could only guess why. `error` is the body's `error`, else its
- *  `reason`, else the HTTP status; it is never empty.
- *
- *  `conflict`: the file is not the one the caller expected, so the step must refuse rather than report a failure —
- *  an if-match or if-none-match precondition, or `prefab-mark-lowered` (#1774: the file's localId mark rose past what
- *  this write was raised to, so it is not the file the caller read). The prefab FORMAT gate's 409 is a failed write,
- *  not a conflict: nothing about the file changed, this build just may not write it. */
-export interface WriteRefusal { conflict: boolean; error: string; options?: string[] }
+ *  - `error`: the body's `error`, else its `reason`, else its `errors`, else the HTTP status. Never empty — a caller
+ *    states it as it is (R3).
+ *  - `code`: the body's §5 code, RELAYED, never invented (`codeFromBody`'s rule). Absent when the route named none.
+ *  - `reason`: the body's machine token (`if-match`, `unsaved`, …), for a caller that branches on it.
+ *  - `conflict`: the file is not the one the caller expected, so a step must refuse rather than report a failure — an
+ *    if-match or if-none-match precondition, or `prefab-mark-lowered` (#1774: the file's localId mark rose past what
+ *    this write was raised to, so it is not the file the caller read). The prefab FORMAT gate's 409 is a failed
+ *    write, not a conflict: nothing about the file changed, this build just may not write it.
+ *  - `status`: the HTTP status; 0 when the request never got an answer (the fetch threw).
+ *  - `body`: the parsed body, or null — for the few callers that read a route-specific field off a refusal. */
+export interface BackendRefusal {
+  ok: false; status: number; error: string; code?: string; reason?: string; conflict: boolean; options?: string[]; body: unknown;
+}
+
+/** What `readBackendAnswer` reads: a `Response`, or anything shaped like its three members that matter — a test stub or
+ *  an injected `post` need not build a real `Response`. */
+export type BackendResponse = Pick<Response, 'ok' | 'status'> & { json?: () => Promise<unknown> };
+
+/** What `readBackendAnswer` answers: the route did it (with its body — a partial success's notes, `errors`, `failed`,
+ *  `held`, ride in it), or it refused (`BackendRefusal`). */
+export type BackendAnswer = { ok: true; status: number; body: Record<string, unknown> } | BackendRefusal;
 
 const CONFLICT_REASONS: ReadonlySet<unknown> = new Set(['if-match', 'if-none-match', 'prefab-mark-lowered']);
 
-/** Read a refused `/api/write-file` answer (`res.ok` false). */
-export async function readWriteRefusal(res: Response): Promise<WriteRefusal> {
+/** Read any route's answer (R2 + R3).
+ *
+ *  `verdict: 'body'` (the default, for a MUTATING route, where `ok` is a success flag): a non-2xx is a refusal, and
+ *  so is a 2xx whose body `failureDetail` flags — `ok:false`, or `errors`/`error` without an explicit `ok:true`. An
+ *  explicit `ok:true` with notes is a success. This is the agent side's `isFailureBody` rule; both read the one
+ *  definition in `failureBody.ts`.
+ *
+ *  `verdict: 'status'`: only the HTTP status decides. For a READ whose `ok:false` is the answer (`validate-prefab`,
+ *  `diagnose`), exactly as the agent side's `getJson` leaves such a read un-opted — passing it through the body rule
+ *  would turn an honest negative answer into a refusal.
+ *
+ *  A 2xx body that cannot be parsed is a success with an empty body: the route did answer 2xx, and the pre-#1824
+ *  wrappers assumed exactly that (a delete whose reply is unreadable still happened). */
+export async function readBackendAnswer(res: BackendResponse, opts?: { verdict?: 'body' | 'status' }): Promise<BackendAnswer> {
   // Inside a `then`, so a body that cannot be read at all (no JSON, a stub without `json`) is a null body, not a throw.
-  const body = await Promise.resolve().then(() => res.json()).catch(() => null) as { error?: unknown; reason?: unknown; options?: unknown } | null;
-  const why = typeof body?.error === 'string' && body.error ? body.error : typeof body?.reason === 'string' ? body.reason : '';
+  const parsed: unknown = await Promise.resolve().then(() => res.json?.()).catch(() => null);
+  const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  const detail = opts?.verdict === 'status' ? null : failureDetail(body);
+  if (res.ok && detail === null) return { ok: true, status: res.status, body: body ?? {} };
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const errors = Array.isArray(body?.errors) ? body.errors.filter((e): e is string => typeof e === 'string') : [];
+  const reason = str(body?.reason);
+  const code = str(body?.code);
   const options = Array.isArray(body?.options) ? body.options.filter((o): o is string => typeof o === 'string') : [];
+  const error = (res.ok ? detail : null) || str(body?.error) || reason || errors.join('; ')
+    || `the request was refused (HTTP ${res.status})`;
   return {
-    conflict: res.status === 409 && CONFLICT_REASONS.has(body?.reason),
-    error: why || `the write was refused (HTTP ${res.status})`,
-    ...(options.length ? { options } : {}),
+    ok: false, status: res.status, error, conflict: res.status === 409 && CONFLICT_REASONS.has(reason), body,
+    ...(code ? { code } : {}), ...(reason ? { reason } : {}), ...(options.length ? { options } : {}),
   };
 }
 
-/** The refusal for a write that never got an answer (the fetch threw). */
-export function thrownWriteRefusal(e: unknown): WriteRefusal {
-  return { conflict: false, error: e instanceof Error ? e.message : String(e) };
+/** The refusal for a request that never got an answer (the fetch threw). */
+export function thrownRefusal(e: unknown): BackendRefusal {
+  return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e), conflict: false, body: null };
+}
+
+/** `backendFetch` + `readBackendAnswer`, with a thrown fetch read as a refusal (`status` 0) — the shape a wrapper
+ *  wants when it has nothing else to do with the `Response`. */
+export async function callBackend(path: string, init?: RequestInit, opts?: { verdict?: 'body' | 'status' }): Promise<BackendAnswer> {
+  try { return await readBackendAnswer(await backendFetch(path, init), opts); } catch (e) { return thrownRefusal(e); }
+}
+
+/** `callBackend` for a JSON POST — the shape of almost every command route. */
+export function postBackend(path: string, body: unknown, opts?: { verdict?: 'body' | 'status' }): Promise<BackendAnswer> {
+  return callBackend(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts);
 }
 
 /** What `writeAssetFile` answers: landed, or refused with the route's reason. */
@@ -246,12 +284,9 @@ export type WriteOutcome = { ok: true } | { ok: false; error: string; options?: 
  *  through here — see `tests/architecture/clientJsonWriteSeam.test.ts`'s EXEMPT ledger for which
  *  and why. A refusal carries the route's reason (#1811): the caller states it, never a bare "failed". */
 export async function writeAssetFile(filePath: string, content: string, encoding?: 'base64'): Promise<WriteOutcome> {
-  let r: WriteRefusal;
-  try {
-    const res = await postWriteFile(filePath, content, encoding);
-    if (res.ok) return { ok: true };
-    r = await readWriteRefusal(res);
-  } catch (e) { r = thrownWriteRefusal(e); }
+  let r: BackendAnswer;
+  try { r = await readBackendAnswer(await postWriteFile(filePath, content, encoding)); } catch (e) { r = thrownRefusal(e); }
+  if (r.ok) return { ok: true };
   return { ok: false, error: r.error, ...(r.options ? { options: r.options } : {}) };
 }
 
@@ -265,19 +300,18 @@ export type GuardedWriteOutcome =
  *  the editor wrote earlier: `ifMatch` (the sha256 of the bytes it must hold) or `createOnly` (nothing may be there).
  *  A three-way answer rather than a boolean, because the caller does opposite things with the two misses: a
  *  `'conflict'` means the file is someone else's now and the step must refuse, while `'failed'` is a transport or
- *  server error, with the route's reason (#1811). What counts as a conflict is `readWriteRefusal`'s one answer, the
+ *  server error, with the route's reason (#1811). What counts as a conflict is `readBackendAnswer`'s one answer, the
  *  same one `prefabCommit`'s writes read. */
 export async function writeAssetFileGuarded(
   filePath: string, content: string,
   opts: { encoding?: 'base64' } & ({ ifMatch: string } | { createOnly: true }),
 ): Promise<GuardedWriteOutcome> {
-  let r: WriteRefusal;
+  let r: BackendAnswer;
   try {
-    const res = await postWriteFile(filePath, content, opts.encoding,
-      'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true });
-    if (res.ok) return { result: 'ok' };
-    r = await readWriteRefusal(res);
-  } catch (e) { r = thrownWriteRefusal(e); }
+    r = await readBackendAnswer(await postWriteFile(filePath, content, opts.encoding,
+      'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true }));
+  } catch (e) { r = thrownRefusal(e); }
+  if (r.ok) return { result: 'ok' };
   if (r.conflict) return { result: 'conflict', error: r.error };
   return { result: 'failed', error: r.error, ...(r.options ? { options: r.options } : {}) };
 }

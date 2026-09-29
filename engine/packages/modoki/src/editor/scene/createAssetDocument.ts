@@ -23,7 +23,7 @@
 import { newGuid, getAssetEntry } from '../../runtime/loaders/assetManifest';
 import { classifyJsonAssetPath } from '../../runtime/loaders/assetTypeClassifier';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { backendFetch, postWriteFile, readWriteRefusal } from '../backend/editorBackend';
+import { backendFetch, postWriteFile, readBackendAnswer, thrownRefusal, type BackendAnswer } from '../backend/editorBackend';
 import { classifyExistingDocumentId } from './prefab';
 import { assetWrittenToDisk } from './dirtyAssets';
 
@@ -63,22 +63,24 @@ export async function writeNewAssetDocument(
   const firstBody = build(fresh, false, null);
   if (firstBody == null) return { outcome: 'failed', path };
   const first = await post(path, firstBody, true);
-  if (first instanceof Error) return { outcome: 'failed', path, error: first.message };
   if (first.ok) {
     // The route's spelling of what it wrote: a create inside a folder typed in another case lands in
     // the folder that exists, and the caller registers `path` (#1273 close-out review).
-    const written = (await answeredPath(first, 'path')) ?? path;
+    const written = answeredPath(first.body, 'path') ?? path;
     assetWrittenToDisk(written);
     return { outcome: 'created', path: written, guid: fresh };
   }
-  if (first.status !== 409) return { outcome: 'failed', path, status: first.status, ...refusalFields(await readWriteRefusal(first)) };
+  // Only the create-only precondition means "something is there" (#1824): a 409 that names ANOTHER reason — the
+  // prefab format gate's — is a failed write with the route's reason, not an offer to replace a file. A 409 naming
+  // no reason at all still reads as "exists", which is what a route too old to name one meant.
+  if (first.status !== 409 || (first.reason !== undefined && first.reason !== 'if-none-match')) return { outcome: 'failed', path, ...(first.status ? { status: first.status } : {}), ...refusalFields(first) };
   // ⚠️ From here on, the path is the one the ROUTE says is there, not the one we asked for (#1273).
   // The create-only check is case-insensitive wherever the filesystem is, so `enemy.prefab.json`
   // conflicts with `Enemy.prefab.json` — and every step below keys on an exact path: the kind check
   // and the kept guid read the manifest, the Replace names the file to the human, and the replacing
   // write, the parked-edit drop and the caller's registration must all land on the asset that exists
   // rather than mint a second spelling of it. A route too old to answer keeps the requested spelling.
-  const at = (await answeredPath(first, 'existingPath')) ?? path;
+  const at = answeredPath(first.body, 'existingPath') ?? path;
   const existingType = opts.kind ? otherAssetKindAt(at, opts.kind) : undefined;
   if (existingType) return { outcome: 'wrongKind', path: at, existingType };
   if (!opts.confirmReplace) return { outcome: 'exists', path: at };
@@ -101,8 +103,7 @@ export async function writeNewAssetDocument(
   const body = build(guid, keptId != null, previousContent);
   if (body == null) return { outcome: 'failed', path: at };
   const second = await post(at, body, false);
-  if (second instanceof Error) return { outcome: 'failed', path: at, error: second.message };
-  if (!second.ok) return { outcome: 'failed', path: at, status: second.status, ...refusalFields(await readWriteRefusal(second)) };
+  if (!second.ok) return { outcome: 'failed', path: at, ...(second.status ? { status: second.status } : {}), ...refusalFields(second) };
   assetWrittenToDisk(at);
   return { outcome: 'replaced', path: at, guid, previousContent };
 }
@@ -170,11 +171,9 @@ export async function existingAssetPath(path: string): Promise<string | null> {
 
 /** The on-disk path `/api/write-file` names in `field` — `path` on a write, `existingPath` on a
  *  create-only 409 — if it names one. */
-async function answeredPath(res: Response, field: 'path' | 'existingPath'): Promise<string | undefined> {
-  try {
-    const value = ((await res.json()) as Record<string, unknown>)[field];
-    return typeof value === 'string' && value ? value : undefined;
-  } catch { return undefined; }
+function answeredPath(body: unknown, field: 'path' | 'existingPath'): string | undefined {
+  const value = body && typeof body === 'object' ? (body as Record<string, unknown>)[field] : undefined;
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 /** A refused write's reason and options, as a failed outcome carries them (#1811). */
@@ -182,9 +181,9 @@ function refusalFields(r: { error: string; options?: string[] }): { error: strin
   return { error: r.error, ...(r.options ? { options: r.options } : {}) };
 }
 
-/** The route's answer, or the error that stopped the request reaching it. */
-async function post(path: string, content: string, createOnly: boolean): Promise<Response | Error> {
-  try { return await postWriteFile(path, content, undefined, { createOnly }); } catch (e) { return e instanceof Error ? e : new Error(String(e)); }
+/** The route's answer, read by the one reader — a request that never reached it is a refusal with `status` 0. */
+async function post(path: string, content: string, createOnly: boolean): Promise<BackendAnswer> {
+  try { return await readBackendAnswer(await postWriteFile(path, content, undefined, { createOnly })); } catch (e) { return thrownRefusal(e); }
 }
 
 async function readText(path: string): Promise<string | null> {

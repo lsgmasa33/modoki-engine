@@ -9,7 +9,7 @@
 import { createWorld } from 'koota';
 import { getTraitByName, seedRng, rngNext } from '@modoki/engine/runtime';
 import { pushAction } from '@modoki/engine/editor';
-import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveFileTo, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
+import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
 import { makeDeleteUndo, makeRenameUndo, snapshotFromBytes, type DeleteResult } from '../../../packages/modoki/src/editor/panels/assetUndo';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
 import {
@@ -460,7 +460,8 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const base = `R${Math.floor(u[1] * 100)}`;
       const plan = planRename(path, base, prefabFiles(st));
       if (!plan.ok) return 'noop';
-      if (!(await moveFileTo(path, plan.toPath))) { st.note = 'move refused'; return 'refused'; }
+      const moved = await moveAsset(path, plan.toPath);
+      if (!moved.ok) { st.note = `move refused: ${moved.error}`; return 'refused'; }
       applyAssetPathMoves([{ from: path, to: plan.toPath, name: plan.base }]);
       pushAction(makeRenameUndo({ originalPath: path, originalName: path.split('/').pop()!.replace(/\.prefab\.json$/, ''), toPath: plan.toPath, newName: plan.base, refresh: () => {} }));
       return 'done';

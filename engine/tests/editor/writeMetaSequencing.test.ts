@@ -26,10 +26,11 @@ const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readFileSync(path.join(EDITOR, rel), 'utf-8');
 
 // ── The runtime half: the write is a promise that resolves only after the POST settles. ──
+// Only `fetch` is stubbed (#1824): the code under test reads its answer through the real `readBackendAnswer`, and a
+// module mock of the backend would have to restate that reader to stay green. `backendFetch(url, init)` is
+// `fetch(url, init)` same-origin, so the stub sees the same arguments the module mock did.
 const backendFetch = vi.fn();
-vi.mock('../../packages/modoki/src/editor/backend/editorBackend', () => ({
-  backendFetch: (...a: unknown[]) => backendFetch(...a),
-}));
+vi.stubGlobal('fetch', backendFetch);
 
 const { writeMetaOrWarn } = await import('../../packages/modoki/src/editor/panels/assetViews/widgets');
 

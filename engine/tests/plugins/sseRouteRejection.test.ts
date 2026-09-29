@@ -43,6 +43,8 @@ vi.mock('../../plugins/addNativeTarget', async (importOriginal) => {
 const stubs = vi.hoisted(() => ({
   healRejects: null as Error | null,
   buildNumbersThrows: null as Error | null,
+  /** An OTA preflight refusal to answer instead of the default pass (#1824). */
+  otaRefusal: null as string | null,
 }));
 
 vi.mock('../../plugins/healNativeProject', () => ({
@@ -94,7 +96,9 @@ vi.mock('../../scripts/ota/publishPreflight.mjs', async (importOriginal) => {
   return {
     ...real,
     readRawOtaBlock: () => ({ ok: true, ota: {} }),
-    otaPublishPreflight: () => ({ ok: true, target: { kind: 'self' }, version: 'v1', bucket: 'gs://fixture-bucket/ota' }),
+    otaPublishPreflight: () => (stubs.otaRefusal
+      ? { ok: false, refusal: stubs.otaRefusal }
+      : { ok: true, target: { kind: 'self' }, version: 'v1', bucket: 'gs://fixture-bucket/ota' }),
   };
 });
 vi.mock('../../scripts/ota/buildStamp.mjs', async (importOriginal) => {
@@ -190,6 +194,7 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
   stubs.healRejects = null;
   stubs.buildNumbersThrows = null;
+  stubs.otaRefusal = null;
   projectRoot = fs.realpathSync(makeScratchDir('modoki-sse-reject-'));
   home = makeScratchDir('modoki-sse-home-');
   fs.writeFileSync(path.join(projectRoot, 'game.ts'), 'export const game = {};');
@@ -271,6 +276,35 @@ describe('#1259: a rejection in an SSE route ends the stream with FAILED', () =>
     expect(last).toContain('no-such-tmp-dir');
     // It got there by way of the build step, not a refusal before it.
     expect(res.statuses()).toContain('Verifying bucket CORS...');
+  });
+});
+
+/** #1824 (R1) — a refusal decided BEFORE the work starts goes in the stream as `FAILED:<title>\n<why>`, not as a JSON
+ *  400/500 before the SSE headers: an EventSource cannot read that body, so the dialogs showed "Connection lost." and
+ *  the reason reached nobody. One case per route that had one. Mutation: restore any one route's
+ *  `res.statusCode = 400; res.end(JSON.stringify({error}))` — its row goes red on the content type. */
+describe('#1824: a refusal before the stream opens is sent IN it', () => {
+  it.each([
+    ['/api/build?platform=nonsense', 'FAILED:Invalid build request\nplatform must be ios, android, web, or playable'],
+    ['/api/build?platform=web&variant=release', 'FAILED:Invalid build request\nvariant=release applies to ios and android only, not web'],
+    ['/api/add-native-target?platform=web', 'FAILED:Invalid request\nplatform must be ios or android'],
+  ])('%s', async (url, status) => {
+    const { res, next } = drive(url);
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.getHeader('Content-Type')).toBe('text/event-stream');
+    expect(res.statusCode).toBe(200);
+    expect(res.statuses()).toEqual([status]);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('/api/ota/publish: a preflight refusal is the publish\'s FAILED, and nothing is built', async () => {
+    stubs.otaRefusal = 'not-enabled';
+    spawned.length = 0;
+    const { res } = drive('/api/ota/publish?version=v1');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.getHeader('Content-Type')).toBe('text/event-stream');
+    expect(res.statuses()).toEqual(['FAILED:OTA publish refused\nota.enabled is false for this project — turn it on in Project Settings first.']);
+    expect(spawned).toEqual([]);
   });
 });
 

@@ -6,17 +6,18 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../../src/editor/backend/editorBackend', () => ({ backendFetch: vi.fn() }));
 vi.mock('../../src/editor/panels/assetViews/widgets', () => ({ writeMetaOrWarn: vi.fn() }));
 vi.mock('../../src/runtime/loaders/textureResolver', () => ({ invalidateTexture: vi.fn() }));
 
-import { backendFetch } from '../../src/editor/backend/editorBackend';
 import { writeMetaOrWarn } from '../../src/editor/panels/assetViews/widgets';
 import { invalidateTexture } from '../../src/runtime/loaders/textureResolver';
 import { makeTexture2D, textureRefCount } from '../../src/editor/panels/makeTexture2D';
 import { deriveSettingsForType } from '../../src/runtime/loaders/textureSettings';
 
-const mockedBackendFetch = vi.mocked(backendFetch);
+// Only the transport is stubbed (#1824): the re-import is read by the real `readBackendAnswer`, so a module mock of the
+// backend would assert the mock's shape rather than the verdict. `backendFetch` targets `fetch(path, init)` same-origin.
+const mockedBackendFetch = vi.fn();
+vi.stubGlobal('fetch', mockedBackendFetch);
 const mockedWriteMetaOrWarn = vi.mocked(writeMetaOrWarn);
 const mockedInvalidateTexture = vi.mocked(invalidateTexture);
 
@@ -47,7 +48,7 @@ describe('makeTexture2D', () => {
       textureCache: { a: 1 },
       type: '2d',
       texture: deriveSettingsForType('2d'),
-    });
+    }, expect.any(Function));
     const reimportCall = mockedBackendFetch.mock.calls.find((c) => c[0] === '/api/reimport')!;
     expect(JSON.parse((reimportCall[1] as RequestInit).body as string)).toEqual({ path: '/assets/rock.png' });
     expect(mockedInvalidateTexture).toHaveBeenCalledWith('/assets/rock.png');

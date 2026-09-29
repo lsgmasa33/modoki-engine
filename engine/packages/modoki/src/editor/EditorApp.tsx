@@ -54,7 +54,7 @@ import {
   panelLabel, LAYOUT_NAME_KEY,
   autoDockedPanels, markAutoDocked,
   saveLayout, currentLayoutName,
-  writeLayoutJson, writeLayout, downloadLayoutJson, readLayout,
+  saveLayoutJson, saveLayoutFile, downloadLayoutJson, readLayout,
   loadInitialModel, clearStoredLayout, orderLayoutChoices,
 } from './utils/layoutStore';
 
@@ -100,6 +100,7 @@ import { buildMenuSpec, handleMenuAction } from './menuSpec';
 import { isModalOpen, subscribeOverlays } from './input/focusScope';
 import { suppressesGameInput } from './input/gameInputGate';
 import { ModalShell } from './components/ModalShell';
+import { reportGestureRefusal, reportBackgroundRefusal } from './backend/refusalChannel';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -216,8 +217,10 @@ export default function EditorApp() {
     saveLayout(model);
     const name = currentLayoutName();
     if (name) {
-      const ok = await writeLayout(name, model);
-      console.log(ok ? `[Editor] Layout saved → ${name}` : `[Editor] Failed to write "${name}" — saved to localStorage only`);
+      const wrote = await saveLayoutFile(name, model);
+      // A gesture: the refusal goes on screen with the route's reason (#1824, ruling FA).
+      if (wrote.ok) console.log(`[Editor] Layout saved → ${name}`);
+      else reportGestureRefusal(`Layout "${name}" was saved in this browser only — the file was not written: ${wrote.error}`);
     } else {
       console.log('[Editor] Layout saved (localStorage — use "Save Layout As..." to name it)');
     }
@@ -233,7 +236,8 @@ export default function EditorApp() {
     if (!model) return;
     const name = sanitizeLayoutName(rawName);
     if (!name) return; // empty or the reserved 'autosave' name → reject
-    if (!(await writeLayout(name, model))) { console.error(`[Editor] Failed to save layout → ${name}`); return; }
+    const wrote = await saveLayoutFile(name, model);
+    if (!wrote.ok) { reportGestureRefusal(`Layout "${name}" was not saved: ${wrote.error}`); return; }
     localStorage.setItem(LAYOUT_NAME_KEY, name);
     saveLayout(model);
     setLayoutName(name);
@@ -420,7 +424,8 @@ export default function EditorApp() {
       saveLayout(m);
       // Also persist a durable "last session" layout so Load Layout always has a
       // recovery point — no "Save Layout As" required first.
-      void writeLayout(AUTOSAVE_NAME, m);
+      // Background work: a refusal is the console's, with the route's reason (#1824, ruling FA).
+      void saveLayoutFile(AUTOSAVE_NAME, m).then((w) => { if (!w.ok) reportBackgroundRefusal(`[Editor] the layout autosave was not written: ${w.error}`); });
     }, 1000);
   }, [publishOpenPanels]);
 
@@ -925,7 +930,8 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
         const parsed = JSON.parse(await file.text());
         if (!isLayoutJson(parsed)) { console.error('[Editor] Not a valid layout file (missing "layout")'); return; }
         const name = deriveLayoutBaseName(file.name);
-        if (!(await writeLayoutJson(name, parsed))) { console.error('[Editor] Failed to import layout'); return; }
+        const wrote = await saveLayoutJson(name, parsed);
+        if (!wrote.ok) { reportGestureRefusal(`Layout "${name}" was not imported: ${wrote.error}`); return; }
         await load(name);
       } catch (e) {
         console.error('[Editor] Failed to read layout file:', e);

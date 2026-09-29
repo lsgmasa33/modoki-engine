@@ -583,14 +583,14 @@ export async function readMetaPreferringPark(
  *  nothing holds a baseline for, so advancing would buy a hash that is stale or unused. Revisit it
  *  if a caller appears that writes and then sits. Leaving the OLD hash remains the one actively
  *  wrong option of the three. */
-export async function writeMetaWholesale(path: string, meta: unknown): Promise<boolean> {
+export async function writeMetaWholesale(path: string, meta: unknown, onRefused?: (error: string) => void): Promise<boolean> {
   // ⚠️ NO TAG CHECK HERE — it moved to `writeMetaConditional`, the single POST implementation
   // (#880 close-out review, finding 1). A copy here would be a second guard on one endpoint, and
   // that duplication is precisely what left the FOURTH door open: the tag was consumed in three
   // places while `writeMetaOrWarn` — which `SpriteEditor.save` and `NineSliceEditor.save` call
   // directly — consumed it nowhere, and those two were safe only by hand-rolling their own
   // `metaLoadedRef`. Guarding the endpoint covers all of them at once.
-  const wrote = await writeMetaOrWarn(path, meta);
+  const wrote = await writeMetaOrWarn(path, meta, onRefused);
   if (wrote) forgetMetaBaseline(path);
   return wrote;
 }

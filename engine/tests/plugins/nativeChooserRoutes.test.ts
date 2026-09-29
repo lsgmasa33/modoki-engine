@@ -68,6 +68,14 @@ describe('/api/save-dialog through ctx.nativeChooser', () => {
     expect(String(r.body.error)).toMatch(/boom/);
   });
 
+  // R1 (#1824): the token moved to `reason` and `error` is a sentence — a reader that states `error` put the bare token
+  // on screen. Mutation: answer `{error: 'outside-asset-roots'}` again — red.
+  it('a file chosen outside the roots answers the token in `reason` and a sentence in `error`', async () => {
+    const outside = path.join(tmp, 'elsewhere', 'x.scene.json');
+    const r = await post(makeCtx(chooserReturning({ path: outside })), '/api/save-dialog', {});
+    expect(r.body).toEqual({ reason: 'outside-asset-roots', error: `${outside} is outside this project's asset roots`, abs: outside });
+  });
+
   it('a host without a panel is {unsupported} (the renderer then prompts in-app)', async () => {
     const r = await post(makeCtx(chooserReturning({ unsupported: true })), '/api/save-dialog', {});
     expect(r.body).toEqual({ unsupported: true });

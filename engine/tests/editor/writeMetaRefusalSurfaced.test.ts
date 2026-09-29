@@ -28,10 +28,11 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Only `fetch` is stubbed (#1824): the code under test reads its answer through the real `readBackendAnswer`, and a
+// module mock of the backend would have to restate that reader to stay green. `backendFetch(url, init)` is
+// `fetch(url, init)` same-origin, so the stub sees the same arguments the module mock did.
 const backendFetch = vi.fn();
-vi.mock('../../packages/modoki/src/editor/backend/editorBackend', () => ({
-  backendFetch: (url: string, init?: unknown) => backendFetch(url, init),
-}));
+vi.stubGlobal('fetch', backendFetch);
 
 const showToast = vi.fn();
 vi.mock('../../packages/modoki/src/editor/store/editorStore', () => ({
@@ -140,5 +141,26 @@ describe('ACCEPT SIDE — a properly-read document is written in SILENCE', () =>
       expect(String(text), 'a 500 must not carry the re-read remedy').not.toMatch(/reselect/i);
     }
     err.mockRestore();
+  });
+});
+
+/** #1824 — a 409 is a CONFLICT only when the route says so (`reason:'if-match'`): `writeMetaConditional` called every
+ *  409 "changed on disk", a guess that sent a human to reopen an asset over a refusal reopening cannot fix. A 409 with
+ *  another reason is a failure carrying the route's own sentence. Mutation: branch on `a.status === 409` — red. */
+describe('a 409 that is not the if-match precondition is not a conflict (#1824)', () => {
+  it('fails with the route\'s sentence, not "changed on disk"', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    backendFetch.mockResolvedValue({
+      ok: false, status: 409, json: async () => ({ ok: false, reason: 'sidecar-too-new', error: 'a.png.meta.json was written by a newer build' }),
+    });
+    const r = await writeMetaConditional(PATH, stampMetaReadPath({ id: 'guid-1' }, PATH));
+    expect(r).toEqual({ ok: false, conflict: false, error: 'a.png.meta.json was written by a newer build' });
+  });
+
+  it('the if-match 409 is still the conflict', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    backendFetch.mockResolvedValue({ ok: false, status: 409, json: async () => ({ ok: false, conflict: true, reason: 'if-match', error: 'the file changed on disk since the caller read it, so nothing was written' }) });
+    const r = await writeMetaConditional(PATH, stampMetaReadPath({ id: 'guid-1' }, PATH), 'h');
+    expect(r.conflict).toBe(true);
   });
 });

@@ -102,7 +102,13 @@ vi.mock('../../src/runtime/traits', () => ({
 // Backend IO: record meta + file writes; everything else is a soft no-op.
 let writtenMeta: any[] = [];
 let writtenFiles: any[] = [];
-const mockFetch = vi.fn(async (url: string, opts?: any) => {
+/** One refusal to answer instead of the default success, for the #1824 cases below. */
+let refuseRoute: { url: string; status: number; body: unknown } | null = null;
+const defaultFetch = async (url: string, opts?: any) => {
+  if (refuseRoute && url === refuseRoute.url) {
+    const { status, body } = refuseRoute;
+    return { ok: false, status, json: async () => body, text: async () => JSON.stringify(body) } as any;
+  }
   // ⚠️ A MISSING SIDECAR IS A 200 WITH `{}` — the route (`editorBackendRouter.ts`'s
   // `/api/read-meta`) 404s only when the ASSET FILE is absent; an asset with no sidecar gets
   // `readMetaSidecar`'s `{}` at 200. Answering non-ok here says "the read FAILED", which since
@@ -112,16 +118,19 @@ const mockFetch = vi.fn(async (url: string, opts?: any) => {
   if (url === '/api/write-file') { writtenFiles.push(JSON.parse(opts.body)); return { ok: true } as any; }
   if (url === '/api/reimport') return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
   return { ok: true, json: async () => ({}), text: async () => '{}' } as any;
-});
+};
+const mockFetch = vi.fn(defaultFetch);
 vi.stubGlobal('fetch', mockFetch);
 
 import { importModel } from '../../src/editor/scene/modelImport';
+import { useEditorStore } from '../../src/editor/store/editorStore';
 
 function traitOf(e: SpawnedEntity, name: string) { return e._traits[name]; }
 
 describe('importModel — rigged (SkinnedModel) path', () => {
   beforeEach(() => {
-    spawned = []; nextId = 1; entityIndex.clear(); writtenMeta = []; writtenFiles = [];
+    spawned = []; nextId = 1; entityIndex.clear(); writtenMeta = []; writtenFiles = []; refuseRoute = null;
+    useEditorStore.setState({ toast: null });
     ensureRiggedModelLoaded.mockClear(); invalidateRiggedModel.mockClear();
     testWorld = {
       spawn: (...traits: any[]) => {
@@ -236,5 +245,53 @@ describe('importModel — rigged (SkinnedModel) path', () => {
     await importModel('/games/x/assets/hero.glb', 'hero');
     const secondId = JSON.parse(writtenFiles.find((f) => f.path === matPath).content).id;
     expect(secondId).toBe(firstId);
+  });
+});
+
+/** #1824 — the rigged import's two backend refusals, read by the one reader. */
+describe('importModel — rigged: a refusal is stated on its own channel (#1824)', () => {
+  beforeEach(() => {
+    spawned = []; nextId = 1; entityIndex.clear(); writtenMeta = []; writtenFiles = []; refuseRoute = null;
+    useEditorStore.setState({ toast: null });
+    mockFetch.mockImplementation(defaultFetch); // a case above replaces it for good
+    testWorld = {
+      spawn: (...traits: any[]) => {
+        const id = nextId++;
+        const byName: Record<string, any> = {};
+        for (const t of traits) if (t && t._trait) byName[t._trait] = t;
+        const e: SpawnedEntity = { id: () => id, has: () => false, _traits: byName };
+        spawned.push(e);
+        return e;
+      },
+      query: () => ({ updateEach: () => {} }),
+    };
+  });
+
+  // The derived-variant re-import is BACKGROUND work the import starts itself (ruling FA): its refusal is the console's,
+  // with the route's reason, and never a toast. It used to read only `errors`, so a refusal carrying `error` alone
+  // logged "Derived optimized rigged variant". Mutation: send it through `reportGestureRefusal` — the toast
+  // expectation goes red; read only `errors` again — the warn expectation goes red.
+  it('a refused derive re-import is logged with the route\'s reason, and raises no toast', async () => {
+    refuseRoute = { url: '/api/reimport', status: 409, body: { ok: false, code: 'REQUIRES_SAVE', error: 'hero.glb has unsaved import settings — save them first' } };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rootId = await importModel('/games/x/assets/hero.glb', 'hero');
+    expect(rootId).toBeTruthy(); // the import itself landed; only the background derive was refused
+    await vi.waitFor(() => expect(warn.mock.calls.map((c) => String(c[0])).join('\n'))
+      .toContain('was not derived: hero.glb has unsaved import settings — save them first'));
+    expect(useEditorStore.getState().toast).toBeNull();
+    warn.mockRestore();
+  });
+
+  // The GLB's sidecar carries the guid the rig is spawned against: a refused write ABORTS (#311's policy) and the
+  // import's toast names the route's reason. It used to be `.catch(() => null)` with `!ok` silent — the rig spawned
+  // against a guid on nothing. Mutation: drop the `if (!rigMeta.ok) throw` — rootId is non-zero and this goes red.
+  it('a refused rig sidecar write aborts the import with the route\'s reason', async () => {
+    // The shape the route really sends for a too-new sidecar: 400 REFUSED_BY_OP (`SidecarTooNewError`), not a 409.
+    refuseRoute = { url: '/api/write-meta', status: 400, body: { code: 'REFUSED_BY_OP', error: 'hero.glb.meta.json was written by a newer build' } };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await importModel('/games/x/assets/hero.glb', 'hero')).toBe(0);
+    expect(spawned.filter((e) => e._traits.SkinnedModel)).toHaveLength(0);
+    expect(useEditorStore.getState().toast?.message).toContain('hero.glb.meta.json was written by a newer build');
+    vi.restoreAllMocks();
   });
 });

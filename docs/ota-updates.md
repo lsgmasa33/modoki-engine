@@ -599,7 +599,8 @@ carries **no version-collision guard of its own** — that decision belongs enti
 what happened when the route had a second, weaker one). It DOES run the publish-request
 check itself — **`otaPublishPreflight` (`engine/scripts/ota/publishPreflight.mjs`, #827)**: enabled,
 the four tainted inputs, the bundle identity and publish target, and the signing key — as a fast
-HTTP 400 before the SSE stream opens and the multi-minute build starts. `ota-publish.mjs` runs the
+refusal before the multi-minute build starts — sent IN the stream as a `FAILED:OTA publish refused` status, since
+a JSON 400 before the SSE headers is a body the dialog's `EventSource` cannot read (#1824). `ota-publish.mjs` runs the
 SAME function, so the route's early answer can never refuse anything the script would allow, and a
 check added there refuses on both. Only the refusal WORDING is per side; each side keys its messages
 by `OTA_PUBLISH_REFUSALS`, and `publishPreflight.test.ts` holds both maps to the full list.
@@ -644,7 +645,7 @@ things that are not obvious:
   `ota-publish.mjs` reads `subgame.json`'s `engineApi`, refuses a `--engine-api` that disagrees with
   it, and refuses a stamped value that differs from the shell project's `ota.engineApi`
   (`otaSubgameEngineApi`, `ota/publishGuards.mjs`). The route passes no `--engine-api` for a
-  sub-game, logs the stamped value before uploading, and answers 400 up front when the sub-game's
+  sub-game, logs the stamped value before uploading, and refuses up front (a `FAILED:` status, #1824) when the sub-game's
   config already disagrees with the shell's. The dialog states the value the sub-game must equal.
   Before this, a hand publish could stamp a manifest contradicting its own module, which every
   device refused while the publish reported success.
@@ -700,7 +701,7 @@ The signed manifest proves *this is exactly the bundle we published*; before #90
 - **The publish refuses anything not provably clean** — a missing or malformed stamp, `dirty: true`,
   or a tree git could not answer for (`null`: not a repository, git missing). Unknown is never clean.
   The refusal runs under the build claim and before any upload. `/api/ota/publish` asks the same
-  question (`readGitProvenance`) BEFORE its multi-minute build and CORS rewrite and answers 400, since
+  question (`readGitProvenance`) BEFORE its multi-minute build and CORS rewrite and refuses (a `FAILED:` status), since
   a late refusal there was a wasted build the dialog could do nothing about.
 - **`--allow-unclean-build` is CLI-only** (owner, 2026-09-13). It publishes anyway and the manifest
   records `forced: true` plus whatever the stamp did establish. The editor dialog and
@@ -936,8 +937,8 @@ questions, recorded so they are not re-opened by accident.
   re-exports it unchanged for its existing callers/tests) — this is NOT another #577 (that
   duplicate ran a DIFFERENT, weaker decision procedure FIRST and refused a case the real one
   allowed; this is the identical pure function over the identical inputs, so the route's copy
-  can never refuse anything the script would allow — it stays only for a fast HTTP 400 before
-  the SSE stream). `otaPublishBundleNameAllowed` (replaced by `otaPublishTarget` in #837) was
+  can never refuse anything the script would allow — it stays only for a fast refusal before
+  the build). `otaPublishBundleNameAllowed` (replaced by `otaPublishTarget` in #837) was
   deliberately **not** ported — it was a strict equality guard, correct only because the route then
   always built a plain shell `dist/`; porting it into the CLI verbatim would refuse the sub-game publish the route sends
   people here for. `ota-publish.mjs` instead gained a NEW guard, `otaBundleDistKindRefusal`

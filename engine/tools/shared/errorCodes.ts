@@ -4,7 +4,12 @@
  *  Split out of `mcpResult.ts` (#1561) so the agent bridge — which ships to devices — can ask the
  *  same question without importing the MCP result formatter: `engine/app` imports `tools/shared` by
  *  value only for small, dependency-free modules (`bridgeHelpers.ts`' #648 note). `mcpResult.ts`
- *  re-exports both, so the servers' imports are unchanged. Keep this file import-free. */
+ *  re-exports both, so the servers' imports are unchanged. Keep this file import-free, but for ONE import:
+ *  the verdict rule itself (`failureDetail`), which lives in the package so the editor client reads replies by the
+ *  same rule (#1824) — the package cannot import `tools/shared`, so the dependency points this way. That file is
+ *  itself import-free (`failureBodyIsALeaf.test.ts`), so this module stays dependency-free for the device bridge. */
+
+import { failureDetail } from '../../packages/modoki/src/editor/backend/failureBody.js';
 
 /** The CLOSED set of failure codes. Extend deliberately — a new code is a claim that the caller
  *  should react differently, so if the reaction is the same as an existing code, reuse it. */
@@ -69,19 +74,9 @@ export function codeFromBody(body: unknown, fallback: ErrorCode): ErrorCode {
  * code enforced. Same bug class, one layer down.)
  */
 export function isFailureBody(body: unknown): string | null {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const b = body as { ok?: unknown; errors?: unknown; error?: unknown; reason?: unknown };
-  if (b.ok === true) return null; // the route says it succeeded — believe its explicit verdict
-  const errors = Array.isArray(b.errors) ? b.errors.filter((e) => typeof e === 'string') : [];
-  const hasError = typeof b.error === 'string' && b.error !== '';
-  // `reason` too: the journal/watch capture ops answer a refusal as `{ok:false, reason:'…'}`, and
-  // reading only `error` demoted their one useful sentence to "the operation reported ok:false".
-  const hasReason = typeof b.reason === 'string' && b.reason !== '';
-  if (b.ok !== false && errors.length === 0 && !hasError) return null;
-  const detail = errors.length ? errors.join('; ')
-    : hasError ? (b.error as string)
-      : hasReason ? (b.reason as string)
-        : 'the operation reported ok:false';
+  // The rule is `failureDetail`'s (the package leaf above), shared with the editor client's reader (#1824).
+  const detail = failureDetail(body);
+  if (detail === null) return null;
   // Keep the whole body: callers diagnose with `changed`/`warnings`/`hint` — notably the
   // scene-mutate `hint` that explains an unsaved live-world entity.
   return `${detail}\n\nfull response: ${JSON.stringify(body)}`;

@@ -11,7 +11,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
-import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_ENV_SETTINGS, ENV_MAX_SIZES, resolveEnvSettings, type EnvImportSettings, type EnvMaxSize, type EnvCacheInfo } from '../../../runtime/core/environmentSettings';
 import { invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
@@ -24,6 +23,8 @@ import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -109,15 +110,9 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       // overwrite its fresh write at the next Cmd+S. See pendingMeta.ts's header.
       await flushPendingMetaFor(path);
       setImportStatus(true, settings.format === 'ultrahdr' ? `Encoding UltraHDR for ${name}...` : `Downscaling ${name}...`);
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[Inspector] Environment convert failed:', summary.errors ?? summary);
-        useEditorStore.getState().showToast(`Converting ${name} failed — see the console.`, 'warn');
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Converting ${name} failed: ${problem}`);
       await loadMeta();
       invalidateEnvironment(path);
       refreshAssets();

@@ -515,7 +515,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
    *  semantic: one refusal is a warning naming the path, and an explicit re-save is the human
    *  choosing to overwrite. */
   it('a 409 does not wedge the path — the next save is unconditional and lands', async () => {
-    const sent = stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
+    const sent = stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true, reason: 'if-match' } });
     await readMetaPreferringPark(TEX);
     parkAsPanel(TEX, { texture: { format: 'webp' } });
 
@@ -545,7 +545,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
    *  The wedge stays closed because both read the same map: the path is still parked, and the next
    *  Cmd+S conflicts ONCE through the batch flush, which does tell the human, and drops it there. */
   it('flushPendingMetaFor KEEPS the baseline on a conflict — its result reaches no UI', async () => {
-    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
+    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true, reason: 'if-match' } });
     await readMetaPreferringPark(TEX);
     parkAsPanel(TEX, { texture: { format: 'webp' } });
 
@@ -561,7 +561,7 @@ describe('ifMatch — an external change is refused, not clobbered (#845 phase 2
    *  failure as a conflict so `toastForSave` can say the retry will overwrite rather than wording
    *  it like a retryable blip. */
   it('flushPendingMeta marks a 409 as a CONFLICT, distinguishably from a plain failure', async () => {
-    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true } });
+    stubWithHeader('BEFORE', { status: 409, body: { ok: false, conflict: true, reason: 'if-match' } });
     await readMetaPreferringPark(TEX);
     parkAsPanel(TEX, { texture: { format: 'webp' } });
 
@@ -821,7 +821,7 @@ describe('only a read that feeds a panel may move the baseline', () => {
       if (body.ifMatch !== undefined && body.ifMatch !== disk.sha) {
         return {
           ok: false, status: 409, headers: { get: () => null },
-          text: async () => '', json: async () => ({ ok: false, conflict: true }),
+          text: async () => '', json: async () => ({ ok: false, conflict: true, reason: 'if-match' }),
         } as unknown as Response;
       }
       disk.sha = 'W';
@@ -1224,7 +1224,7 @@ describe('a wholesale editor write does not leave a stale baseline (#874)', () =
       if (body.ifMatch !== undefined && body.ifMatch !== state.sha) {
         return {
           ok: false, status: 409, headers: { get: () => null },
-          text: async () => '', json: async () => ({ ok: false, conflict: true }),
+          text: async () => '', json: async () => ({ ok: false, conflict: true, reason: 'if-match' }),
         } as unknown as Response;
       }
       state.sha += '+';

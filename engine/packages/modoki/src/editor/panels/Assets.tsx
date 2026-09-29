@@ -1,7 +1,7 @@
 /** Assets — browse project assets by category or folder structure */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { backendFetch, jsonFileBody, importedFileContent } from '../backend/editorBackend';
+import { backendFetch, jsonFileBody, importedFileBytes } from '../backend/editorBackend';
 import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
@@ -21,13 +21,14 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
 // "serialize entity → write prefab → tag instance → push undo" flow.
 import {
-  deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
+  trashAssetFile, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
-  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createFolderApi, moveFileTo, createPrefabFromEntity, firstWritableAssetRoot,
+  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createAssetFolder, moveAsset, createPrefabFromEntity, readWritableAssetRoot,
   reimportTargets, planImports, writeDroppedImport, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
+import { reportGestureRefusal, reportBackgroundRefusal, fileNameOf, refusedItemsText } from '../backend/refusalChannel';
 import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
 import {
   makeDeleteUndo, makeDuplicateUndo,
@@ -39,6 +40,7 @@ import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBin
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
+import { reimportAsset, reimportProblem } from './assetViews/reimportAsset';
 import { openAssetInEditor } from './openAssetInEditor';
 import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
 import { confirmDiscardUnsaved } from '../scene/unsavedGate';
@@ -297,7 +299,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 // into `planFilesDropMoves`, which left two independent computations of one destination — they
 // agreed, but the day one grew a collision-suffix rule (as `pastePathIn` already has) the other
 // becomes a lie and `makeFilesDropUndo` moves back from a path the file is not at. Deleted; the
-// drop loop calls `assetOps.moveFileTo(from, to)` with the destination the planner derived.
+// drop loop calls `assetOps.moveAsset(from, to)` with the destination the planner derived.
 
 // Convertible model SOURCES (kept alongside the GLB they bake into). They share
 // the 'model' type with GLB/glTF but aren't the canonical asset, so they get a
@@ -859,13 +861,14 @@ export default function Assets() {
   // Iterate file-by-file on the client so the progress modal can name the file
   // currently being converted — makes hangs visible (the slow file is in the
   // bar) and gives a real step/total bar instead of an indeterminate animation.
-  const reimport = useCallback(async (target: string, recursive: boolean) => {
+  const reimport = useCallback(async (target: string, recursive: boolean, channel: 'gesture' | 'background' = 'gesture') => {
     const targets = reimportTargets(assets, target, recursive);
     try {
       const summary = await reimportPaths(
         targets.map((a) => ({ path: a.path, type: a.type })),
         setImportStatus,
         `Re-importing ${target === '/' ? 'all assets' : target}…`,
+        channel,
       );
       if (!summary.errors.length) console.log('[Assets] Re-import:', summary);
     } finally {
@@ -904,7 +907,8 @@ export default function Assets() {
         // and a model with a sibling prefab is skipped — so the chain converges and
         // never re-imports.
         for (const m of models) await importModelWithMeta(m.path, m.name, refresh);
-        for (const t of textures) await reimport(t.path, false);
+        // Import-on-add is background work — nobody clicked for these (#1824, ruling FA): a failure is the console's.
+        for (const t of textures) await reimport(t.path, false, 'background');
       } catch (e) {
         console.error('[Assets] auto-import failed:', e);
       } finally {
@@ -1117,8 +1121,9 @@ export default function Assets() {
       // for a transport throw too, where the request may well have reached the server and deleted —
       // and "nothing was deleted" about files that ARE gone is the precise over-claim the route's
       // own comment refuses to make. Same correction as the folder toast below.
+      // The route's reason when it gave one (#1824); "did not complete" stays the claim, for the reason above.
       console.error(`[Assets] Delete did not complete for: ${allPaths.join(', ')}`);
-      useEditorStore.getState().showToast('Could not move to the Trash — the delete did not complete (see console)', 'warn');
+      reportGestureRefusal(`Could not move to the Trash — the delete did not complete: ${del.error ?? 'see the console'}`);
     }
     if (!del.ok) return;
     // ⚠️ Everything below acts on what ACTUALLY went, not on what was requested. A file the OS
@@ -1158,7 +1163,8 @@ export default function Assets() {
   const performDuplicate = useCallback(async (asset: AssetEntry, taken: Set<string>): Promise<DupResult | null> => {
     const toPath = duplicatePathFor(asset.path, taken);
     const dup = await duplicateAsset(asset.path, toPath);
-    if (!dup.ok) { console.error(`[Assets] Failed to duplicate ${asset.path}`); return null; }
+    // A human Duplicate of an asset with unsaved edits is refused by the route by design — say why (#1824, FA).
+    if (!dup.ok) { reportGestureRefusal(`Could not duplicate ${fileNameOf(asset.path)}: ${dup.error}`); return null; }
     taken.add(toPath);
     console.log(`[Assets] Duplicated ${asset.path} → ${toPath}`);
     // The copy's hash rides into the undo, which trashes the copy only while it still holds these bytes (#1679).
@@ -1187,13 +1193,13 @@ export default function Assets() {
       return;
     }
     const { toPath, base: safe } = plan;
-    // #1362: the backend refuses this move while a texture editor holds unsaved edits on it, and
-    // `moveFileTo` keeps only ok/false — so say WHY here rather than letting the rename look like a
-    // no-op. The refusal itself stays server-side; this is the message, not the guard.
+    // #1362: the backend refuses this move while a texture editor holds unsaved edits on it. `moveAsset` now carries
+    // the route's reason too (#1824); this pre-flight names the editor before any request is made. The refusal itself
+    // stays server-side; this is the message, not the guard.
     const held = assetEditorHoldMessage([asset.path]);
     if (held) { useEditorStore.getState().showToast(held, 'warn'); return; }
-    const ok = await moveFileTo(asset.path, toPath);
-    if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
+    const moved = await moveAsset(asset.path, toPath);
+    if (!moved.ok) { reportGestureRefusal(`Could not rename ${fileNameOf(asset.path)}: ${moved.error}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
     // …and an open editor bound to it, or its next autosave FORKS the asset: the write goes
     // to the old path, re-creating the file you renamed away from, while the renamed file
@@ -1254,19 +1260,17 @@ export default function Assets() {
     const inside = assets.filter((a) => a.path === folderPath || a.path.startsWith(folderPath + '/'));
     const results: DeleteResult[] = [];
     for (const a of inside) { const r = await collectDeletion(a); if (r) results.push(r); }
-    const ok = await deleteAsset(folderPath); // trashes files + the dir shell in one call
+    const trashed = await trashAssetFile(folderPath); // trashes files + the dir shell in one call
     // ⚠️ `ok` only became trustworthy in #884 — it was the HTTP status, and a folder the OS
     // refused answers 200, so this guard could not fire and the branch below pruned the tree,
     // unbound the editors and refreshed for a folder still on disk. It gets the same toast as
     // the file path: a locked folder is something the human can fix and retry.
-    if (!ok) {
-      console.error(`[Assets] Failed to delete folder ${folderPath}`);
-      // ⚠️ Does NOT claim the folder is still on disk. `deleteAssetFile` resolves false for a 404
-      // (the folder was already gone — a stale panel after a branch switch or a Finder delete) and
-      // for a network error, as well as for a real OS refusal, and the boolean cannot tell them
-      // apart. The message says what is certainly true — the delete did not complete — and sends
-      // them to the console for the status.
-      useEditorStore.getState().showToast(`Could not delete "${folderName}" — the delete did not complete (see console)`, 'warn');
+    if (!trashed.ok) {
+      console.error(`[Assets] Failed to delete folder ${folderPath} (HTTP ${trashed.status})`);
+      // ⚠️ Does NOT claim the folder is still on disk. `trashAssetFile` refuses a 404 (the folder was already gone — a
+      // stale panel after a branch switch or a Finder delete) and a network error as well as a real OS refusal. The
+      // message says what is certainly true — the delete did not complete — and the route's own reason (#1824).
+      reportGestureRefusal(`Could not delete "${folderName}" — the delete did not complete: ${trashed.error}`);
       return;
     }
     // Prune any client-side folder state for this subtree.
@@ -1338,18 +1342,23 @@ export default function Assets() {
       if (cutHeld) { useEditorStore.getState().showToast(cutHeld, 'warn'); return; }
     }
     const done: PasteMove[] = [];
+    // Each item the route refused, with its reason (#1824): the loop used to skip them silently.
+    const refused: string[] = [];
     for (const from of clipboard.paths) {
       const to = pastePathIn(targetFolder, from, taken);
       if (to === from) continue; // cut into same folder — no-op
       taken.add(to);
       if (clipboard.op === 'cut') {
-        if (await moveFileTo(from, to)) done.push({ from, to });
+        const moved = await moveAsset(from, to);
+        if (moved.ok) done.push({ from, to }); else refused.push(`${fileNameOf(from)}: ${moved.error}`);
       } else {
         // The copy's hash rides into the undo (`PasteMove.sha256`, #1679).
         const dup = await duplicateAsset(from, to);
         if (dup.ok) done.push({ from, to, sha256: dup.sha256, sidecar: dup.sidecar });
+        else refused.push(`${fileNameOf(from)}: ${dup.error}`);
       }
     }
+    if (refused.length) reportGestureRefusal(`Paste skipped ${refusedItemsText(refused)}`, refused.join('\n'));
     if (done.length === 0) return;
     const op = clipboard.op;
     if (op === 'cut') setClipboard(null);
@@ -1371,8 +1380,8 @@ export default function Assets() {
     let path = `${norm}/${name}`;
     let n = 2;
     while (isTaken(path)) { name = `New Folder ${n}`; path = `${norm}/${name}`; n++; }
-    const ok = await createFolderApi(path);
-    if (!ok) { console.error(`[Assets] Failed to create folder under ${parentFolder}`); return; }
+    const made = await createAssetFolder(path);
+    if (!made.ok) { reportGestureRefusal(`Could not create a folder under ${parentFolder}: ${made.error}`); return; }
     setPendingFolders((prev) => new Set(prev).add(path));
     // Expand the WHOLE ancestor chain down to the new folder's parent — not just
     // the immediate parent — so a folder created in a deep target (e.g.
@@ -1406,8 +1415,8 @@ export default function Assets() {
     // the thing the user named, so a silent no-op is baffling here.
     const heldFolder = assetEditorHoldMessage([node.path]);
     if (heldFolder) { useEditorStore.getState().showToast(heldFolder, 'warn'); return; }
-    const ok = await moveFileTo(node.path, newPath);
-    if (!ok) { console.error(`[Assets] Failed to rename folder ${node.path}`); return; }
+    const moved = await moveAsset(node.path, newPath);
+    if (!moved.ok) { reportGestureRefusal(`Could not rename folder ${node.path}: ${moved.error}`); return; }
     const oldPath = node.path;
     // The remap itself is the seam's now (#867). What stays here is the gesture's own nicety:
     // keep the renamed folder OPEN, which belongs to renaming rather than to the repair.
@@ -1548,7 +1557,8 @@ export default function Assets() {
     const taken = new Set(assets.map((a) => a.path));
     const plan = planImports(list.map((f) => f.name), target, taken);
     const imported: { path: string; content: string; convert: boolean }[] = [];
-    const claimed = new Set<string>(); // the ids this batch decided on — see importedFileContent
+    const claimed = new Set<string>(); // the ids this batch decided on — see importedFileBytes
+    const refused: string[] = []; // each file not imported, with why — said once, on screen (#1824, ruling FA)
     setImportStatus(true, `Importing ${list.length} file(s)…`, 0, list.length);
     try {
       for (let i = 0; i < list.length; i++) {
@@ -1557,27 +1567,29 @@ export default function Assets() {
         setImportStatus(true, file.name, i, list.length);
         // A JSON asset's identity is decided BEFORE the write (#1713), as modoki_import_file decides it — and these
         // are the bytes the redo re-writes, so it never brings the source's id back.
-        const content = await importedFileContent(dest, await fileToBase64(file), claimed);
-        if (content === null) continue; // said by importedFileContent
+        const bytes = await importedFileBytes(dest, await fileToBase64(file), claimed);
+        if ('error' in bytes) { refused.push(`${file.name}: ${bytes.error}`); continue; }
+        const content = bytes.content;
         // Only into an EMPTY path (#1784): `dest` was planned against the listing, not the disk.
         const wrote = await writeDroppedImport(dest, content);
-        if (wrote.result === 'taken') { console.error(`[Assets] ${file.name} was not imported: a file appeared at ${dest} since the panel listed the folder, and it was left as it is. Drop it again to import it as a copy.`); continue; }
-        if (wrote.result === 'failed') { console.error(`[Assets] Failed to import ${file.name}: ${wrote.error}`); continue; }
+        if (wrote.result === 'taken') { refused.push(`${file.name}: a file appeared at ${dest} since the panel listed the folder, and it was left as it is — drop it again to import it as a copy`); continue; }
+        if (wrote.result === 'failed') { refused.push(`${file.name}: ${wrote.error}`); continue; }
         imported.push({ path: dest, content, convert });
         setImportStatus(true, file.name, i + 1, list.length);
       }
     } finally {
       setImportStatus(false);
     }
+    if (refused.length) reportGestureRefusal(`Not imported: ${refusedItemsText(refused)}`, refused.join('\n'));
     if (!imported.length) return;
     console.log(`[Assets] Imported ${imported.length} file(s) → ${target}`);
     // Convert any freshly-imported textures/models through the asset pipeline.
+    // A follow-up the import started itself, so a failed convert is background work: the console, with the route's
+    // reason (#1824, ruling FA) — it used to be discarded outright. The file itself did land.
     for (const f of imported) {
       if (f.convert) {
-        await backendFetch('/api/reimport', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: f.path, recursive: false }),
-        }).catch(() => {});
+        const problem = reimportProblem(await reimportAsset(f.path, { recursive: false }));
+        if (problem) reportBackgroundRefusal(`[Assets] ${f.path} was imported but not converted: ${problem}`);
       }
     }
     // The baseline the undo's precondition expects (#1679): a JSON file the scanner re-stamps is read back once that
@@ -1608,7 +1620,12 @@ export default function Assets() {
     // in category view wrote nothing (#1776, observed). Everything else (serialize → write → register/cache/tag → undo
     // descriptor) is shared with the Hierarchy flow via createPrefabFromEntity (F7); only refresh() is layered on here.
     const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const folder = targetFolder ?? (await firstWritableAssetRoot().then((root) => root && `${root}/prefabs`));
+    let folder = targetFolder;
+    if (!folder) {
+      const root = await readWritableAssetRoot();
+      if (!root.ok) { reportGestureRefusal(`Create Prefab failed — the asset roots could not be read: ${root.error}`); return; }
+      folder = root.root ? `${root.root}/prefabs` : undefined;
+    }
     if (!folder) { useEditorStore.getState().showToast('Create Prefab failed — this project has no writable asset root.', 'warn'); return; }
     const savePath = `${folder}/${safeName}.prefab.json`;
 
@@ -1647,16 +1664,18 @@ export default function Assets() {
     const dropHeld = assetEditorHoldMessage(planned.map((m) => m.from));
     if (dropHeld) { useEditorStore.getState().showToast(dropHeld, 'warn'); return; }
     const moves: DropMove[] = [];
+    const refused: string[] = [];
     for (const m of planned) {
-      // `moveFileTo(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the
+      // `moveAsset(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the
       // destination, and letting the mover derive its own would be two independent computations
       // of one value. They agree today; the day `moveFile` grows a collision-suffix rule (as
       // `pastePathIn` already has) the planner's `to` silently becomes a lie, and
       // `makeFilesDropUndo` would move back from a path the file is not at — the forking bug.
-      const ok = await moveFileTo(m.from, m.to);
-      if (!ok) { console.warn(`[Assets] Could not move ${m.from} → ${m.to}`); continue; }
+      const moved = await moveAsset(m.from, m.to);
+      if (!moved.ok) { refused.push(`${fileNameOf(m.from)}: ${moved.error}`); continue; }
       moves.push(m);
     }
+    if (refused.length) reportGestureRefusal(`Could not move ${refusedItemsText(refused)}`, refused.join('\n'));
     if (moves.length === 0) return;
     console.log(`[Assets] Moved ${moves.length} item(s) → ${targetFolder}`);
     // Drag-drop into a folder is a MOVE like any other, so a bound editor must follow it

@@ -34,16 +34,17 @@ the code is right and this section is stale: fix it in the same change.
    - the human's Cmd+Z, menu and toolbar, through `runUndoCommand` (`undo/undoCommand.ts`)
    - the agent's `undo`/`redo` op, `undoOrRefuse` (`app/editor/agentEditorOps.ts`)
 
-**The agent side already has hop 2's reader, with one distinction the client's must keep.** The MCP
-servers decide success with `isFailureBody` and relay the code with `codeFromBody`
-(`engine/tools/shared/errorCodes.ts`), and `agentBridge.ts` imports both. But `isFailureBody` is not
-run on every answer. The modoki server's `getJson` (`engine/tools/modoki-mcp/src/context.ts`) runs it
-only when the call opts in (`checkFailure`), for a GET whose `ok` is a success flag. On a read like
-`diagnose`, `validate_scene` or `/api/validate-prefab`, `ok:false` *is the answer*, not a refusal. The
-editor client is the half without a reader. `@modoki/engine` cannot import `tools/shared`:
-its build is rooted at `packages/modoki/src`, as `EntityResolveCode`'s comment in
-`runtime/scene/sceneMutate.ts` explains. So the client grew its own readers, one per wrapper. Only
-`/api/write-file`'s reader (`readWriteRefusal`, #1811) is shared.
+**Hop 2 has one reader on each side, and ONE rule under both (#1824).** The rule, "does this body say the operation
+did not happen", is `failureDetail` in `editor/backend/failureBody.ts`, an import-free leaf of the package. The agent
+side's `isFailureBody` (`engine/tools/shared/errorCodes.ts`) imports it: `@modoki/engine` cannot import
+`tools/shared` (its build is rooted at `packages/modoki/src`, as `EntityResolveCode`'s comment in
+`runtime/scene/sceneMutate.ts` explains), so the dependency points the other way. `errorCodes.ts` is value-imported by
+both MCP bundles and the device-shipped `agentBridge.ts`, which is why the leaf must stay import-free
+(`engine/tests/tools/failureBodyIsALeaf.test.ts` pins that, and runs a corpus of real route bodies through both readers).
+The client's reader is **`readBackendAnswer`** (`editor/backend/editorBackend.ts`), with `callBackend`/`postBackend`
+around it. Both keep one distinction: `isFailureBody` runs only when the call opts in (`getJson`'s `checkFailure`), and
+`readBackendAnswer` takes `verdict:'status'` for a read, because on `diagnose`, `validate_scene` or
+`/api/validate-prefab` `ok:false` *is the answer*, not a refusal.
 
 ### Invariants
 
@@ -54,14 +55,14 @@ because it goes stale.
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| R1 | Every refusal a route sends carries a non-empty `error`: a sentence a person can act on. A machine token goes in `reason`, and a § 5 class goes in `code`. | The shared refusal builders in `editorBackendRouter.ts` (`unsavedRefusal`, `wrongKindRefusal`, `outsideAssetRoots`), and each host's `{error}` for 400/403/404/413/500. | `ifMatchRefusal` (the if-match 409 of `/api/write-file` and `/api/write-meta`) and `/api/write-file`'s if-none-match 409 carry `reason` only. `/api/save-dialog`'s 200 `{error:'outside-asset-roots'}` holds a token, not a sentence (its one caller, `chooseNewAssetPath` (`editor/utils/saveDialog.ts`), branches on the token and puts its own sentence on screen, so nobody is misled today). The pre-stream refusals of `/api/build` (its validation 400s) and `/api/ota/publish` are JSON bodies that an `EventSource` cannot read, so the dialog shows "Connection lost." `/api/toolchain/install` and `/api/build`'s job-lock refusal already open the stream first and send `FAILED:<reason>`, which is the shape to copy. |
-| R2 | On a mutating route, where `ok` is a success flag, success and refusal are decided one way: `isFailureBody`'s. A non-2xx is a refusal. A 2xx is a refusal when its body says `ok:false`, or carries `errors` or an `error` without `ok:true`. A 2xx with `ok:true` and notes (`errors`, `failed`, `held`, `repairFailed`) is a partial success, not a refusal. A read whose `ok:false` is its answer is outside this rule (see above). | Agent side: `isFailureBody`, opted into per call. Editor client: **none**. Each wrapper decides for itself. | **False successes:** `reimportPaths` (`panels/assetViews/reimport.ts`) reads only `errors`, so a 404/409/422/503/500 that carries none is counted as re-imported and its caches are evicted. `importRiggedModel`'s derived-variant re-import (`scene/modelImport.ts`) does the same. `saveAiSettings` (`panels/aiSettingsModel.ts`) returns the cached settings on a refusal, which reads as a save. |
-| R3 | A refusal's reason is read one way: the body's `error`, else `reason`, else its `errors`, else `HTTP <status>`. It is never empty. `code`, `options` and a precondition `conflict` travel with it. | `readWriteRefusal` (`editor/backend/editorBackend.ts`), for `/api/write-file` only. | Every other wrapper: `deleteAssetFile`, `deleteAssetFiles`, `duplicateAssetFileReport`, `createFolderApi`, `moveFileToStatus`/`moveFileTo`, `firstWritableAssetRoot` (`panels/assetOps.ts`); `writeMetaConditional` (`panels/assetViews/widgets.tsx`), which answers `HTTP <n>` and calls every 409 "changed on disk"; `writeSceneCopy`, `importedFileContent`, `repairPrefabMemberPaths` (`editorBackend.ts`); `writeLayoutJson` (`utils/layoutStore.ts`); `makeTexture2D`; `writeCollisionMeshAssets`; the re-import in the Texture, Font, Audio, Video, Atlas, Model and Environment asset views; and `modelImport.ts`'s three `/api/write-meta` posts. |
-| R4 | A wrapper hands the reason to its caller as data. It does not log it and then return a bare boolean, `null` or `{ok:false}`. | The `/api/write-file` wrappers since #1811: `writeAssetFile` answers `{ok:false, error, options?}`, and `writeAssetFileGuarded` answers `'conflict'` or `'failed'` with the error. | The same list as R3. The "console, then `null`" shape (`importedFileContent`, `repairPrefabMemberPaths`, `duplicateAssetFileReport`) hides the most, because the log looks like handling. |
-| R5 | The caller states the reason to whoever asked. **An agent** gets the route's `code`, relayed and never invented (`codeFromBody`'s rule), plus its `error`. **A human gesture** puts the reason on screen, not only in the console (#901, #1577). Which widget says it is the caller's choice: the channel is local, as it is in format-versioning.md. | Each caller. | Results thrown away: the post-import convert in `Assets.tsx` (`.catch(() => {})`), paste's cut and copy skips, `TextureBatchView`/`ModelBatchView`, all nine callers of `flushPendingMetaFor`, `BuildSupportDialog`'s toolchain settings, the layout autosave, and `writeCollisionMeshAssets`' meta write. For an agent, Apply to Prefab's result simply lacks `fileRepair` when `repairPrefabMemberPaths` failed. Human refusals that reach only the console: Duplicate or Paste of an asset with unsaved edits (`/api/duplicate-asset`'s unsaved gate refuses the human path by design), folder create/rename/delete, and a layout save. |
+| R1 | Every refusal a route sends carries a non-empty `error`: a sentence a person can act on. A machine token goes in `reason`, and a § 5 class goes in `code`. A streaming route states a refusal IN the stream, as its final `FAILED:<title>\n<why>` status. | The shared refusal builders in `editorBackendRouter.ts` (`unsavedRefusal`, `wrongKindRefusal`, `outsideAssetRoots`, and `ifMatchRefusal`, which gained its sentence in #1824), and each host's `{error}` for 400/403/404/413/500. For the SSE routes, `refuseBeforeStream` (`vite-asset-scanner.ts`, #1824). | None known. Closed in #1824: the if-match and if-none-match 409s carry a sentence beside their token; `/api/save-dialog`'s outside-the-roots answer moved its token to `reason` (`chooseNewAssetPath` reads either); `/api/build`, `/api/add-native-target` and `/api/ota/publish` send their pre-stream refusals in the stream, where a JSON 400 had shown the dialog "Connection lost." |
+| R2 | On a mutating route, where `ok` is a success flag, success and refusal are decided one way: `isFailureBody`'s. A non-2xx is a refusal. A 2xx is a refusal when its body says `ok:false`, or carries `errors` or an `error` without `ok:true`. A 2xx with `ok:true` and notes (`errors`, `failed`, `held`, `repairFailed`) is a partial success, not a refusal. A read whose `ok:false` is its answer is outside this rule (see above). | `failureDetail` (`editor/backend/failureBody.ts`), read by `isFailureBody` (agent side, opted into per call) and by `readBackendAnswer` (client, `verdict:'body'` by default). | None known. #1824 closed the three false successes: `reimportPaths` (a refusal is not re-imported and its caches are not evicted), `importRiggedModel`'s derived-variant re-import, and `saveAiSettings` (now `saveAiSettingsPatch`). |
+| R3 | A refusal's reason is read one way: the body's `error`, else `reason`, else its `errors`, else `HTTP <status>`. It is never empty. `code`, `options` and a precondition `conflict` travel with it. | `readBackendAnswer` (`editor/backend/editorBackend.ts`), for every route (#1824; #1811's `readWriteRefusal` was its `/api/write-file`-only first form). | None known in the census. A new wrapper that reads `res.ok` or a status for itself is a bypass: read the answer with `readBackendAnswer`/`callBackend`/`postBackend`. |
+| R4 | A wrapper hands the reason to its caller as data. It does not log it and then return a bare boolean, `null` or `{ok:false}`. | Every census wrapper since #1824. Those whose return type changed were RENAMED (`trashAssetFile`, `createAssetFolder`, `moveAsset`, `readWritableAssetRoot`, `saveSceneCopy`, `importedFileBytes`, `requestMemberPathRepair`, `saveAiSettingsPatch`, `saveLayoutJson`/`saveLayoutFile`); `writeMetaOrWarn`/`writeMetaWholesale` keep their booleans and take an `onRefused(reason)` callback, because source-scanning guards key on their call sites by name. | None known. The "console, then `null`" shape hides the most, because the log looks like handling: a wrapper answers its reason as data. |
+| R5 | The caller states the reason to whoever asked. **An agent** gets the route's `code`, relayed and never invented (`codeFromBody`'s rule), plus its `error`. **A human gesture** puts the route's sentence on screen, not only in the console (#901, #1577; **owner ruling FA, 2026-09-29**: a direct gesture the backend refuses toasts, `'warn'`). **Background work** states it in the console only, now with the reason: the layout autosave, the post-import convert, the Assets panel's import-on-add (`reimportPaths(…, 'background')` — it runs for whatever lands on disk, an agent's import or a `git pull` included), the model-import prune and rigged derive, the callers of `flushPendingMetaFor`. **Inside an undo or redo step** it goes in the step's report (U3), which Owner B's per-step toast carries. Which widget says it is the caller's choice where the caller owns one (a modal's in-flow notice, `saveRefusal.ts`); otherwise `reportGestureRefusal`/`reportBackgroundRefusal` (`editor/backend/refusalChannel.ts`), whose names say which kind of work the call site is. | Each caller. FA's four census examples, each now on screen: a Duplicate or Paste of an asset with unsaved edits (`/api/duplicate-asset` refuses the human path by design), a folder create or move refused (it exists, or an editor holds it: 423), a re-import Apply refused (409 unsaved edit, 404 no manifest asset), and an AI-settings save refused (which read as saved). | None known. |
 | U1 | An undo or redo step's outcome reaches `UndoStepResult`, the one result every trigger reads. The outcome is one of: applied; **applied in part** (`shortfall`); refused, with nothing applied; threw; **dropped** (`dropped`). | `runStep` / `undoStep` (`undo/undoManager.ts`): a throw since #1681; since #1823 (Owner B), every `reportUndoFailure` made inside the step's window (`undo/stepWindow.ts`) as `shortfall`, and a world swap under the step as `dropped`. | **Target misses found before anything is written** are not shortfalls: they are refusals, owned by `require` ([prefabs.md](./prefabs.md) I19, work-ai3). Until it lands, `writeTraitFieldWithUndo` and the rest of the I19 "silent no-op" list still answer `did:true`. A miss found AFTER a write is a shortfall and reports today (Create Prefab's redo rebuild and undo untag). `baseSceneUndo.ts`'s two reports are probably unreachable (SceneAssetView's `write` returns true since #831). |
 | U2 | The agent's undo/redo reply says what the human is told. | `undoOrRefuse` (`app/editor/agentEditorOps.ts`): `PARTIAL` + `entry:'moved'` for a shortfall, `PARTIAL` + `entry:'dropped'` for a drop or a throw, `REFUSED_BY_OP` + `entry:'dropped'` for a refusal. The human gets one toast per step that fell short (`reportStepShortfall`, owner ruling F1 2026-09-29). `runSequential` (`undo/compositeAction.ts`) keeps each sub's class: all refused is a refusal, anything else a `CompositeStepError` naming each sub. | A dropped step's human side is still only a `console.warn`: a world switch waits for steps (`beginWorldSwitch`), so the drop is a backstop. |
-| U3 | A shortfall report names the reason the step's helper had. | `reportUndoFailure`'s `detail`. Since #1823, `makeModelImportUndo`, `createPrefabFromEntity` and `makeRigPrefabAsset` name the write's `error`, and `makeDeleteUndo`'s collision line names the write failure its partial branch no longer reaches. | Every site whose helper had already dropped the reason (R4) cannot name it: `deleteAssetFiles`, `moveFileToStatus`, `createFolderApi`, `duplicateAssetFileReport`, `importedFileContent`. Owner A fixes those. |
+| U3 | A shortfall report names the reason the step's helper had. | `reportUndoFailure`'s `detail`. Since #1823, `makeModelImportUndo`, `createPrefabFromEntity` and `makeRigPrefabAsset` name the write's `error`, and `makeDeleteUndo`'s collision line names the write failure its partial branch no longer reaches. | None known: since #1824 the asset helpers carry the route's reason, and the undo reports name it (`because(...)` in `assetUndo.ts`; `trashDoc`'s tail in `prefabCommit.ts`). |
 
 ### Steps are serialized against each other, not against the rest of the editor
 
@@ -123,13 +124,15 @@ Every member fits a rule above, and none needs a new rule.
 - **Adjacent, owned elsewhere: only the raw-id fallback.** #1827 (work-ai3's study) owns the five creation-type undos that fall back to a raw ECS id and delete the wrong entity. That is an identity bug, not a reporting one. **The silent `ref.resolve()` early returns are NOT in #1827** (`writeTraitFieldWithUndo` and about six more in `entityActions.ts`). They are U1 bypasses, "did nothing, answered `did:true`", so they join #1823: each needs one line that reports, and Owner B carries the rest.
 - **Ejected:** #1661. Apply skips an `applyExcluded` key without a `skipped` entry. That is an in-process skip list, with no transport and no step.
 
-## Verdict: missing owners (Owner B built 2026-09-29, #1823; Owner A next, #1824)
+## Verdict: missing owners (both BUILT 2026-09-29: Owner B #1823, Owner A #1824)
 
 **The model is right.** Where an owner exists, the rule holds: `/api/write-file` since #1811, and a
 throwing step since #1681. Every open member is a site that answers the owner's question for itself.
 Two owners are missing.
 
-**Owner A: one reader of any route's answer.** It widens `readWriteRefusal` into a route-agnostic reader
+**Owner A: one reader of any route's answer. BUILT (#1824, work-qa, 2026-09-29)** as `readBackendAnswer` over the one
+`failureDetail` rule (above), which answered the "one definition or two" question below with ONE: the package holds the
+leaf and `errorCodes.ts` imports it. The design as proposed: it widens `readWriteRefusal` into a route-agnostic reader
 in `editorBackend.ts`. It returns:
 - `{ok:true, body}`, with a partial success's notes kept, or
 - `{ok:false, error, code?, reason?, conflict, status, options?, body}`
@@ -204,7 +207,29 @@ The agent's reply (above) is decided by § 5 either way.
   claims, which is the same kind of loss.
 - **Pick: (b).** It reverses a recorded ruling, which is why it is the owner's call.
 
+**FA (#1824). Does a direct human gesture the backend refuses say why on screen?** #291/#308's console-only rule was
+written for undo; the census found direct gestures whose refusal was actionable and reached only the console (the four
+in R5). **Owner ruling, 2026-09-29: (b)** — a direct gesture toasts the route's sentence, background work stays
+console-only with the reason, and undo-internal failures go through Owner B's step toast. This narrows #291/#308 for
+direct gestures only. `refusalChannel.test.ts` and `modelImportRigged.test.ts` pin both sides (a background caller
+routed through the gesture helper goes red).
+
 ## Gotchas for the fix
+
+- **Test a wrapper by stubbing `fetch`, not by mocking `editorBackend`.** A module mock of the backend has to restate
+  the reader to stay green, so it asserts the mock rather than the verdict — and it breaks the moment the code under
+  test starts calling `callBackend`/`postBackend` (#1824 moved seven suites to `vi.stubGlobal('fetch', …)`).
+  `backendFetch(path, init)` is `fetch(path, init)` same-origin, so a stub sees the same arguments.
+- **A new static import can bypass a test's partial mocks.** `makeTexture2D` importing `reimport.ts` pulled in the batch
+  loop's cache invalidators, and through them the runtime loaders, which three `AssetRefField` suites mock partially.
+  One-asset callers import `reimportAsset.ts` instead, which imports only the backend seam.
+- **A stream status carries no § 5 code.** Moving a pre-stream refusal into the stream changed one agent-visible code:
+  `/api/ota/publish`'s "gcloud not found" was a 500, which the MCP read as `NOT_AVAILABLE_HERE`, and is now
+  `REFUSED_BY_OP` (`consumeBuildStream` maps every `FAILED:` to it). Accepted in the #1824 close-out: the sentence names
+  the remedy. A future refusal that needs a different code in-stream needs a protocol field, not a wording convention.
+- **Some wrappers could not be renamed.** `writeMetaOrWarn`/`writeMetaWholesale` are named by the source-scanning guards
+  (`metaMergeNotClobber`, `wholesaleMetaWriteProvenance`, `writeMetaSequencing`), so they keep their booleans and take
+  `onRefused(reason)`. A new caller that needs the reason passes the callback.
 
 - **Changing a wrapper from a boolean to an object disarms its callers silently.** `tsc --strict`
   accepts `if (await moveFileTo(…))` when the call returns an object (checked 2026-09-29), and no lint

@@ -206,7 +206,7 @@ describe('creating an ordinary document kind', () => {
     const r = await create({ kind: 'material', path: '/assets/materials/nope.mat.json' });
     expect(r.ok).toBe(false);
     expect(r.code).toBe('REFUSED_BY_OP');
-    expect(String(r.error)).toMatch(/failed to write .*: the write was refused \(HTTP 403\)/);
+    expect(String(r.error)).toMatch(/failed to write .*: the request was refused \(HTTP 403\)/);
     expect(r.guid).toBeUndefined();
   });
 

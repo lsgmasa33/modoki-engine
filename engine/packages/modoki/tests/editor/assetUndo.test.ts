@@ -2,8 +2,8 @@
  *  (editor-panels missing test #5, extended by #308). Extracted from Assets.tsx
  *  (F6, then #308) so the snapshot/GUID-sidecar restore + failure-reporting
  *  logic is testable without rendering the panel. The builders go through the
- *  shared assetOps backend wrappers (writeAssetFile / deleteAssetFile[s] /
- *  duplicateAssetFile / createFolderApi / moveFileToStatus), which post to
+ *  shared assetOps backend wrappers (writeAssetFile / trashAssetFile / deleteAssetFiles /
+ *  duplicateAssetFile / createAssetFolder / moveAsset), which post to
  *  /api/* via the editor backendFetch → global fetch; we stub fetch and
  *  assert the requests. */
 
@@ -18,7 +18,7 @@ import {
 import { COLLISION_STATUS } from '../../src/editor/undo/undoFailure';
 import { pushAction, undoStep, _resetHistoryContexts } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
-import { deleteAssetFile, deleteAssetFiles } from '../../src/editor/panels/assetOps';
+import { trashAssetFile, deleteAssetFiles, moveAsset, createAssetFolder, duplicateAssetFileReport } from '../../src/editor/panels/assetOps';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
 import {
@@ -1010,16 +1010,17 @@ describe('makeFileImportUndo (#308 follow-up B)', () => {
  *  `ok:true` + `failed` when some did. Both wrappers looked only at `res.ok`, so a delete that
  *  deleted nothing came back as a success — and every caller that carefully checks the boolean
  *  (the #308 undo/redo closures, the folder delete) was checking the wrong thing. */
-describe('deleteAssetFile — the boolean is the outcome, not the status (#884)', () => {
+describe('trashAssetFile — the verdict is the outcome, not the status (#884), and carries the reason (#1824)', () => {
   it('is FALSE for a refused delete, which answers HTTP 200', async () => {
     // The regression in one line: this used to be `true`.
-    respondNext('/api/delete-asset', { ok: false, trashed: 0, failed: ['/assets/locked.png'] });
-    expect(await deleteAssetFile('/assets/locked.png')).toBe(false);
+    respondNext('/api/delete-asset', { ok: false, trashed: 0, failed: ['/assets/locked.png'], error: 'the OS refused to trash /assets/locked.png' });
+    // #1824: the route's reason rides out. Mutation: have trashAssetFile answer `{ok:false, error:''}` — this goes red.
+    expect(await trashAssetFile('/assets/locked.png')).toEqual({ ok: false, status: 200, error: 'the OS refused to trash /assets/locked.png' });
   });
 
   it('ACCEPT SIDE: is TRUE for an ordinary delete', async () => {
     respondNext('/api/delete-asset', { ok: true, trashed: 1, missing: [], failed: [] });
-    expect(await deleteAssetFile('/assets/a.png')).toBe(true);
+    expect(await trashAssetFile('/assets/a.png')).toEqual({ ok: true });
   });
 
   it('is TRUE for an UNPARSEABLE body — the trash already happened', async () => {
@@ -1031,7 +1032,7 @@ describe('deleteAssetFile — the boolean is the outcome, not the status (#884)'
       statusOverrides.pop();
       return { ok: true, status: 200, json: async () => { throw new Error('not json'); } } as any;
     });
-    expect(await deleteAssetFile('/assets/a.png')).toBe(true);
+    expect(await trashAssetFile('/assets/a.png')).toEqual({ ok: true });
   });
 });
 
@@ -1216,8 +1217,50 @@ describe('the step report (#1823)', () => {
   it('a model-import undo whose trash failed names the reason the write gave (U3)', async () => {
     spyConsole('error');
     pushAction(makeModelImportUndo({ assetName: 'Rig', prefabPath: '/assets/models/rig.prefab.json', content: '{"id":"p1","entities":[]}' }));
-    failNext('/api/delete-asset', 500);
+    // #1824: the route's own sentence reaches the report. Mutation: drop the `: ${res.error}` tail in prefabCommit's
+    // trashDoc — this goes red.
+    statusOverrides.push({ url: '/api/delete-asset', status: 500, ok: false, body: { error: 'EACCES: permission denied' } });
     const r = await undoStep('undo');
-    expect(r.shortfall?.details).toEqual(['prefab "/assets/models/rig.prefab.json" was not trashed: /assets/models/rig.prefab.json could not be trashed']);
+    expect(r.shortfall?.details).toEqual(['prefab "/assets/models/rig.prefab.json" was not trashed: /assets/models/rig.prefab.json could not be trashed: EACCES: permission denied']);
+  });
+});
+
+/** #1824 — each asset wrapper hands the route's reason to its caller as data (R4), instead of a bare boolean, `null`,
+ *  `{ok, status}` or a console line. One test per wrapper, each against a refusal body the route really sends. */
+describe('the asset wrappers carry the route\'s reason (#1824)', () => {
+  const refuseNext = (url: string, status: number, body: unknown) => statusOverrides.push({ url, status, ok: false, body });
+
+  // Mutation: have moveAsset answer `{ok, status}` without `error` — the toEqual goes red.
+  it('moveAsset: a 423 held-by-an-editor refusal keeps its sentence and its status', async () => {
+    refuseNext('/api/move-file', 423, { error: 'the texture editor holds unsaved edits on /assets/a.png', code: 'REFUSED_BY_OP' });
+    expect(await moveAsset('/assets/a.png', '/assets/b.png')).toEqual({ ok: false, status: 423, code: 'REFUSED_BY_OP', error: 'the texture editor holds unsaved edits on /assets/a.png' });
+  });
+
+  it('createAssetFolder: a refusal carries its sentence; a success is just ok', async () => {
+    refuseNext('/api/create-folder', 403, { error: '/x is outside this project\'s asset roots' });
+    expect(await createAssetFolder('/x/New Folder')).toEqual({ ok: false, status: 403, error: '/x is outside this project\'s asset roots' });
+    expect(await createAssetFolder('/assets/New Folder')).toEqual({ ok: true });
+  });
+
+  // The human Duplicate of a dirty source: refused by design, and the reason used to reach only the console.
+  it('duplicateAssetFileReport: the unsaved gate\'s reason and code reach the caller', async () => {
+    refuseNext('/api/duplicate-asset', 409, { error: '/assets/a.mat.json has unsaved edits — save it first', code: 'REQUIRES_SAVE', reason: 'unsaved' });
+    expect(await duplicateAssetFileReport('/assets/a.mat.json', '/assets/a copy.mat.json'))
+      .toEqual({ ok: false, status: 409, code: 'REQUIRES_SAVE', error: '/assets/a.mat.json has unsaved edits — save it first' });
+  });
+
+  // Mutation: drop `error: a.error` from deleteAssetFiles' refused answer.
+  it('deleteAssetFiles: a non-2xx refusal carries its error', async () => {
+    refuseNext('/api/delete-asset', 500, { error: 'trash: no such command' });
+    expect(await deleteAssetFiles(['/assets/a.png'])).toMatchObject({ ok: false, trashed: 0, failed: [], error: 'trash: no such command' });
+  });
+
+  // U3: a step's report names why. Mutation: drop `${because(moved)}` from makeRenameUndo's undo detail.
+  it('a rename undo whose move was refused names the route\'s reason in the step report', async () => {
+    spyConsole('error');
+    pushAction(makeRenameUndo({ originalPath: '/assets/a.png', originalName: 'a', toPath: '/assets/b.png', newName: 'b', refresh: vi.fn() }));
+    refuseNext('/api/move-file', 423, { error: 'the texture editor holds unsaved edits on /assets/b.png' });
+    const r = await undoStep('undo');
+    expect(r.shortfall?.details).toEqual(['"/assets/b.png" did not move back to "/assets/a.png" (the texture editor holds unsaved edits on /assets/b.png)']);
   });
 });

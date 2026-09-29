@@ -148,7 +148,7 @@ export async function chooseNewAssetPath(
   opts: SaveAssetDialogOpts,
 ): Promise<{ path: string; confirmReplace: (path: string) => Promise<boolean> } | null> {
   const { defaultName, ext, defaultFolder, prompt } = opts;
-  let res: { path?: string; existingPath?: string; cancelled?: boolean; unsupported?: boolean; error?: string };
+  let res: { path?: string; existingPath?: string; cancelled?: boolean; unsupported?: boolean; error?: string; reason?: string };
   try {
     res = await backendFetch('/api/save-dialog', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -168,7 +168,8 @@ export async function chooseNewAssetPath(
     const panelChecked = res.existingPath ?? res.path;
     return { path, confirmReplace: (p) => (p === panelChecked ? Promise.resolve(true) : confirmReplaceAsset(p)) };
   }
-  if (res.error === 'outside-asset-roots') {
+  // The token is `reason` since #1824 (`error` is the sentence); a backend from before that sent it as `error`.
+  if (res.reason === 'outside-asset-roots' || res.error === 'outside-asset-roots') {
     await alertInEditor('Outside the project', 'Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
     return null;
   }

@@ -619,12 +619,21 @@ function rebuildManifestInline(ctx: BackendContext): boolean {
   try { ctx.rebuildManifest(); return true; } catch { return false; }
 }
 
-function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: false; conflict: true; reason: string } | null {
+function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: false; conflict: true; reason: string; error: string } | null {
   if (expected === undefined) return null;
   let currentBytes: Buffer | null;
   try { currentBytes = fs.readFileSync(absPath); } catch { currentBytes = null; }
   const currentHash = currentBytes === null ? null : crypto.createHash('sha256').update(stripUtf8Bom(currentBytes)).digest('hex');
-  if (currentHash === null || currentHash !== expected) return { ok: false, conflict: true, reason: 'if-match' };
+  // `error` is the sentence (R1 of docs/refusal-reporting.md, #1824): the client reads it before `reason`, and a bare
+  // `if-match` token was what reached a person. `reason` stays the machine token every caller branches on.
+  if (currentHash === null || currentHash !== expected) {
+    return {
+      ok: false, conflict: true, reason: 'if-match',
+      error: currentHash === null
+        ? 'the file is gone from disk since the caller read it, so nothing was written'
+        : 'the file changed on disk since the caller read it, so nothing was written',
+    };
+  }
   return null;
 }
 
@@ -3819,7 +3828,9 @@ async function describeUnresolvedAgainstLiveWorld(
       if ('canceled' in outcome) return json({ cancelled: true });
       if ('error' in outcome) return json({ error: `save dialog failed: ${outcome.error}` }, 500);
       const reply = saveDialogReply(ctx, outcome.path);
-      if (!reply) return json({ error: 'outside-asset-roots', abs: outcome.path });
+      // `reason` is the token the caller branches on, `error` the sentence a person reads (R1, #1824): `error` held the
+      // token, which any reader that states `error` would have put on screen as it was.
+      if (!reply) return json({ reason: 'outside-asset-roots', error: `${outcome.path} is outside this project's asset roots`, abs: outcome.path });
       return json(reply);
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -4845,7 +4856,12 @@ async function describeUnresolvedAgainstLiveWorld(
         // (#1273). `existsSync` is case-insensitive on APFS/NTFS, so `enemy.prefab.json` 409s over
         // `Enemy.prefab.json` — and a caller that then asked the manifest about its OWN spelling found
         // no asset, no kind to refuse, and replaced a prefab with a scene. Null for a `/@fs` path.
-        return json({ ok: false, conflict: true, reason: 'if-none-match', existingPath: ctx.absToAssetUrl(absPath, { onDisk: true }) }, 409);
+        const existingPath = ctx.absToAssetUrl(absPath, { onDisk: true });
+        return json({
+          ok: false, conflict: true, reason: 'if-none-match', existingPath,
+          // The sentence (R1, #1824) — the client reads `error` first; `reason` stays the token callers branch on.
+          error: `${existingPath ?? 'a file'} is already there, and this write only creates, so nothing was written`,
+        }, 409);
       }
       // Materialize the exact bytes once so the self-write guard can fingerprint
       // them (the F9 late-rename fallback) and we write the identical buffer.

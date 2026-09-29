@@ -16,11 +16,12 @@ import { expectInOrder } from '@modoki/engine/testing/inOrder';
 const FILE = path.join(__dirname, '../../packages/modoki/src/editor/panels/assetViews/ModelAssetView.tsx');
 
 describe('ModelAssetView re-import: the prefab refusal precedes every write (#1678)', () => {
-  // Mutation: move the `existingPrefab?.kind === 'refuse'` block below the `/api/reimport` fetch — red.
-  it('classify, then refuse-and-return, then /api/reimport, then importModel', () => {
+  // Mutation: move the `existingPrefab?.kind === 'refuse'` block below the `reimportAsset(path)` bake — red.
+  it('classify, then refuse-and-return, then the re-import, then importModel', () => {
     const code = readScannedSource(FILE).code;
     const refuse = "existingPrefab?.kind === 'refuse'";
-    const bake = "'/api/reimport'";
+    // The bake is `reimportAsset(` since #1824 (the one /api/reimport call, on the reader).
+    const bake = 'await reimportAsset(path)';
     expectInOrder(code, ['await classifyExistingPrefabId(prefabPath)', refuse, bake, 'await importModel('], 'ModelAssetView re-import');
     // The refusal RETURNS: nothing between it and the bake may fall through.
     expect(code.slice(code.indexOf(refuse), code.indexOf(bake))).toMatch(/setImportError\([^;]*;\s*return;/);

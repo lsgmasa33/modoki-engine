@@ -11,8 +11,9 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { backendFetch, backendEventSource } from '../backend/editorBackend';
+import { backendFetch, postBackend, backendEventSource } from '../backend/editorBackend';
 import { ModalShell } from '../components/ModalShell';
+import { reportGestureRefusal } from '../backend/refusalChannel';
 
 interface GuideLink { label: string; url: string }
 interface GuideDoc { id: string; title: string; steps: string[]; links?: GuideLink[]; canAutoInstall: boolean }
@@ -189,12 +190,10 @@ export default function BuildSupportDialog() {
     // Optimistic: reflect immediately, then persist + re-detect (a swapped source can
     // flip a tool present↔missing).
     setData((d) => (d ? { ...d, allowSystemToolchain: allow } : d));
-    try {
-      await backendFetch('/api/toolchain/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ allowSystemToolchain: allow }),
-      });
-    } catch { /* best-effort */ }
+    // A refused save says why, on screen (#1824, ruling FA) — it was discarded as "best-effort", and the refresh below
+    // then quietly put the box back. The refresh still runs: it shows what the backend actually holds.
+    const saved = await postBackend('/api/toolchain/settings', { allowSystemToolchain: allow });
+    if (!saved.ok) reportGestureRefusal(`The toolchain setting was not saved: ${saved.error}`);
     refresh();
   }, [refresh]);
 

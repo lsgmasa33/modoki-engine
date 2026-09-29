@@ -649,7 +649,7 @@ describe('makeFilesDropUndo carries prefix in BOTH directions (#867)', () => {
     clearDirtyAssets();
     // The undo/redo closures move files through the backend; this suite is about the PathMoves
     // they hand the repair, so the move itself is stubbed as succeeding.
-    vi.spyOn(assetOps, 'moveFileToStatus').mockResolvedValue({ ok: true, status: 200 });
+    vi.spyOn(assetOps, 'moveAsset').mockResolvedValue({ ok: true });
   });
   afterEach(() => { vi.restoreAllMocks(); clearDirtyAssets(); });
 

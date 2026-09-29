@@ -10,15 +10,16 @@
  *  from this call. Each `registerAsset` below now runs ONLY after its own write is confirmed. */
 
 import { MESH_FORMAT_VERSION } from '../../../runtime/traits';
-import { jsonFileBody } from '../../backend/editorBackend';
+import { jsonFileBody, readBackendAnswer, type BackendResponse } from '../../backend/editorBackend';
 
 export interface CollisionMeshWriteResult {
   ok: boolean;
 }
 
 export interface CollisionMeshWriteDeps {
-  /** POST a file write, returning at least `{ ok, status }` (matches `backendFetch`'s Response). */
-  post: (path: string, content: string, encoding?: string) => Promise<{ ok: boolean; status: number }>;
+  /** POST a file write, answering its `Response` (`postWriteFile`) — read by the one reader, so a refusal throws
+   *  with the route's reason (#1824), not only its status. */
+  post: (path: string, content: string, encoding?: string) => Promise<BackendResponse>;
   registerAsset: (id: string, path: string, type: 'model' | 'mesh') => void;
 }
 
@@ -51,14 +52,14 @@ export async function writeCollisionMeshAssets(
 ): Promise<void> {
   const { glbPath, glbBase64, meshJsonPath, meshName, modelGuid, meshGuid } = input;
 
-  const glbRes = await deps.post(glbPath, glbBase64, 'base64');
-  if (!glbRes.ok) throw new Error(`write GLB failed (${glbRes.status})`);
+  const glbRes = await readBackendAnswer(await deps.post(glbPath, glbBase64, 'base64'));
+  if (!glbRes.ok) throw new Error(`write GLB failed: ${glbRes.error}`);
   deps.registerAsset(modelGuid, glbPath, 'model');
 
   await writeMeta();
 
   const meshAsset = { id: meshGuid, version: MESH_FORMAT_VERSION, model: modelGuid, mesh: meshName, postprocessor: 'none', material: '' };
-  const meshRes = await deps.post(meshJsonPath, jsonFileBody(meshAsset));
-  if (!meshRes.ok) throw new Error(`write .mesh.json failed (${meshRes.status})`);
+  const meshRes = await readBackendAnswer(await deps.post(meshJsonPath, jsonFileBody(meshAsset)));
+  if (!meshRes.ok) throw new Error(`write .mesh.json failed: ${meshRes.error}`);
   deps.registerAsset(meshGuid, meshJsonPath, 'mesh');
 }

@@ -1869,7 +1869,7 @@ describe('applying a move inside the instance re-parents the row and every ref f
   });
 
   // F3 (P3-a review): what the disk repair did reaches the caller, and a file left unrepaired is named.
-  // Mutations: drop `fileRepair` from the result; drop the held warning in repairPrefabMemberPaths.
+  // Mutations: drop `fileRepair` from the result; drop the held warning in requestMemberPathRepair.
   it('the file repair\'s outcome is reported: rewritten, held (named in a warning), or failed', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
@@ -1884,7 +1884,9 @@ describe('applying a move inside the instance re-parents the row and every ref f
       reparentEntity(idAt('Holder/OuterRoot/Panel/Button'), idAt('Holder/OuterRoot'));
       repairReply = { status: 503, body: { ok: false, error: 'no renderer' } };
       vi.spyOn(console, 'error').mockImplementation(() => {});
-      expect((await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['~moved.3']))).fileRepair).toBeNull();
+      // The route's reason rides into the result (#1824) — it was a bare `null`. Mutation: answer `{failed:true}` without
+      // `error` in prefab.ts's fileRepair — this goes red.
+      expect((await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['~moved.3']))).fileRepair).toEqual({ failed: true, error: 'no renderer' });
     } finally { vi.restoreAllMocks(); }
   });
 
@@ -1920,7 +1922,7 @@ describe('applying a move inside the instance re-parents the row and every ref f
       .toBe('Apply to Prefab: 1 move was not applied: its new parent was added in this scene.');
     expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: ['/p.prefab.json'] } }))
       .toContain('/p.prefab.json were not repaired');
-    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: null })).toContain('could NOT be repaired');
+    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { failed: true, error: 'no renderer' } })).toContain('could NOT be repaired: no renderer');
     // #1784: a file the route left because it changed while the repair ran. Mutation: drop the `changed` line in
     // applyOutcomeNotice — the notice is null.
     expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: [], changed: ['/h.prefab.json'] } }))
@@ -1937,7 +1939,7 @@ describe('applying a move inside the instance re-parents the row and every ref f
     expect(notice).toBe('Apply to Prefab refused: "x.prefab.json" was written by a newer build (prefab format 6; this build writes 5).');
     expect(notice).not.toContain('move');
     // …and it wins over anything else the result happens to carry, because nothing else happened.
-    expect(applyOutcomeNotice({ refused: 'r', skipped: [{ key: 'k', reason: 'why' }], memberPathsChanged: true, fileRepair: null }))
+    expect(applyOutcomeNotice({ refused: 'r', skipped: [{ key: 'k', reason: 'why' }], memberPathsChanged: true, fileRepair: { failed: true, error: 'e' } }))
       .toBe('Apply to Prefab refused: r.');
   });
 

@@ -4,7 +4,8 @@
  *  the browser-side caches for every freshly-baked asset kind that holds one, so the
  *  LIVE viewport rebinds the new variant without a manual scene reload. */
 
-import { backendFetch } from '../../backend/editorBackend';
+import { reportGestureRefusal, reportBackgroundRefusal, refusedItemsText } from '../../backend/refusalChannel';
+import { reimportAsset } from './reimportAsset';
 import { REIMPORT_INVALIDATORS, type ReimportableAssetKind } from '../../../runtime/loaders/reimportInvalidation';
 import { flushPendingMetaFor } from '../../scene/pendingMeta';
 
@@ -19,6 +20,10 @@ export async function reimportPaths(
   items: ReimportItem[],
   setImportStatus: SetImportStatus,
   label: string,
+  /** Who asked (#1824, ruling FA): `'gesture'` — a Re-import the human clicked — toasts the failures; `'background'`
+   *  — the Assets panel's import-on-add, which runs for whatever appears on disk (an agent's import, a git pull, a
+   *  model's extracted textures) — states them in the console only. */
+  channel: 'gesture' | 'background' = 'gesture',
 ): Promise<ReimportSummary> {
   const summary: ReimportSummary = { converted: 0, errors: [] };
   if (items.length === 0) {
@@ -41,13 +46,13 @@ export async function reimportPaths(
       // next Cmd+S. Flushing first makes both a single-asset Apply and this shared batch loop see
       // the same disk truth the panel does. A no-op when nothing is parked for `a.path`.
       await flushPendingMetaFor(a.path);
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: a.path, recursive: false }),
-      });
-      const r = await res.json().catch(() => ({}));
-      if (Array.isArray(r.errors) && r.errors.length > 0) summary.errors.push(...r.errors);
-      else { if (typeof r.converted === 'number') summary.converted += r.converted; reimported.push(a); }
+      const r = await reimportAsset(a.path, { recursive: false });
+      // A refusal is NOT a re-import (#1824): it names its reason, and its caches are not evicted.
+      // The route's own text often already names the path (a failed bake answers `errors:['<path>: <why>']`), so it is
+      // prefixed only when it does not — a toast reading "a.png: a.png: boom" was the close-out review's finding.
+      if (!r.ok) summary.errors.push(r.error.startsWith(a.path) ? r.error : `${a.path}: ${r.error}`);
+      else if (r.errors.length > 0) summary.errors.push(...r.errors);
+      else { summary.converted += r.converted; reimported.push(a); }
     } catch (e) {
       summary.errors.push(`${a.path}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -72,6 +77,12 @@ export async function reimportPaths(
     if (!Object.hasOwn(REIMPORT_INVALIDATORS, a.type)) continue;
     REIMPORT_INVALIDATORS[a.type as ReimportableAssetKind](a.path);
   }
-  if (summary.errors.length) console.error('[reimport] errors:', summary.errors);
+  // A human's Re-import states the failures on screen with their reasons, background work in the console (#1824,
+  // ruling FA); the batch views used to discard the summary entirely.
+  if (summary.errors.length) {
+    const text = `Re-import did not fully apply — ${refusedItemsText(summary.errors)}`;
+    if (channel === 'gesture') reportGestureRefusal(text, summary.errors.join('\n'));
+    else reportBackgroundRefusal(`[Assets] ${text}\n${summary.errors.join('\n')}`);
+  }
   return summary;
 }

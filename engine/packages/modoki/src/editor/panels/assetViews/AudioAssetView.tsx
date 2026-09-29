@@ -5,7 +5,6 @@
  *  decoded waveform. */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import {
   DEFAULT_AUDIO_SETTINGS, AUDIO_FORMATS, AUDIO_BITRATES, AUDIO_SAMPLE_RATES, OPUS_SAMPLE_RATES, AUDIO_BIT_DEPTHS,
@@ -23,6 +22,8 @@ import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -97,14 +98,9 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       // #845: `/api/reimport` reads the settings off DISK — flush any still-parked edit first, or
       // the conversion would bake the OLD settings while the UI already shows the new ones.
       await flushPendingMetaFor(path);
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[Inspector] Audio convert failed:', summary.errors ?? summary);
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Converting ${name} failed: ${problem}`);
       await loadMeta();
       invalidateAudio(path);
       refreshAssets();

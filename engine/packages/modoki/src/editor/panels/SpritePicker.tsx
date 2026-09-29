@@ -129,8 +129,8 @@ export function SpritePicker({ anchor, assets, onPick, onClear, onClose }: {
     // The HMR asset-manifest bump (`assetsVersion`) is not guaranteed in every
     // host, so this explicit refresh stays as the belt-and-braces trigger.
     if (ok) refreshAssets();
-    // A failure has to be VISIBLE here. `makeTexture2D` only console.errors, and on a
-    // reimport failure the meta write has already landed — so the row's `textureType`
+    // A failure has to be VISIBLE here, on the row too. `makeTexture2D` toasts a failed re-import's
+    // reason (#1824), but on a reimport failure the meta write has already landed — so the row's `textureType`
     // flips to '2d' on the next scan and this button is replaced by the inert
     // "re-import in Inspector" text. Without this the button the user just clicked would
     // simply vanish, which reads as success.

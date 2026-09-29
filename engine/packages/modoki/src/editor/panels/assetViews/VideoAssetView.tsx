@@ -29,6 +29,8 @@ import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
+import { reimportAsset, reimportProblem } from './reimportAsset';
+import { reportGestureRefusal } from '../../backend/refusalChannel';
 
 const DELIVERY_LABELS: Record<VideoDelivery, string> = {
   bundled: 'Bundled — ships in the build',
@@ -157,14 +159,9 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
       // #845: `/api/reimport` reads the settings off DISK — flush any still-parked edit first, or
       // the conversion would run against the OLD settings while the UI already shows the new ones.
       await flushPendingMetaFor(path);
-      const res = await backendFetch('/api/reimport', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
-      });
-      const summary = await res.json().catch(() => ({}));
-      if (!res.ok || (summary.errors && summary.errors.length)) {
-        console.error('[Inspector] Video convert failed:', summary.errors ?? summary);
-      }
+      // The route's reason, on screen (#1824, ruling FA): a refused Apply used to reach only the console.
+      const problem = reimportProblem(await reimportAsset(path));
+      if (problem) reportGestureRefusal(`Converting ${name} failed: ${problem}`);
       await loadMeta();
       refreshAssets();
     } finally {

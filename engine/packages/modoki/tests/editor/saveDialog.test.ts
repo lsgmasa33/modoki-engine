@@ -69,8 +69,13 @@ describe('chooseNewAssetPath — the chosen path', () => {
     expect(await saveAssetDialog(opts)).toBe('/games/x/assets/Walk.ANIM.JSON');
   });
 
-  it('tells the user in the IN-APP notice and returns null on outside-asset-roots (#1594)', async () => {
-    backendFetch.mockResolvedValue(jsonResponse({ error: 'outside-asset-roots' }));
+  // The route's shape since #1824 (`reason` is the token, `error` a sentence), and the older `{error: token}` — both
+  // must reach the notice. Mutation: branch on `res.error` alone again — the first row goes red.
+  it.each([
+    [{ reason: 'outside-asset-roots', error: '/tmp/x.scene.json is outside this project\'s asset roots' }],
+    [{ error: 'outside-asset-roots' }],
+  ])('tells the user in the IN-APP notice and returns null on outside-asset-roots (#1594) — %j', async (reply) => {
+    backendFetch.mockResolvedValue(jsonResponse(reply));
     const p = saveAssetDialog(opts);
     await tick();
     // The editor's own modal, not a native alert: an agent can see and answer it (#1594).

@@ -23,7 +23,7 @@
 import {
   preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, type PrefabFile,
 } from './prefab';
-import { postWriteFile, jsonFileBody, readWriteRefusal } from '../backend/editorBackend';
+import { postWriteFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
 import { deleteAssetFiles } from '../panels/assetOps';
 import { sha256OfWritten, sha256OfBytes } from '../utils/contentHash';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -408,7 +408,9 @@ async function trashDoc(path: string, expected: PrefabExpectation, pre: { ifMatc
   if (typeof hash !== 'string') return hash;
   const res = await deleteAssetFiles([path], { ifMatch: { [path]: hash } });
   if (res.conflicts?.length) return { ok: false, conflict: true };
-  return res.ok && res.failed.length === 0 ? { ok: true } : { ok: false, error: `${path} could not be trashed` };
+  if (res.ok && res.failed.length === 0) return { ok: true };
+  // The route's reason when it gave one (#1824): an agent's refusal names it, not only "could not be trashed".
+  return { ok: false, error: `${path} could not be trashed${!res.ok && res.error ? `: ${res.error}` : ''}` };
 }
 
 /** `crypto.subtle` exists only in a secure context; nothing has been written when it is missing. */
@@ -425,20 +427,18 @@ async function hashBytes(bytes: Uint8Array): Promise<string | Landed> {
 
 async function post(path: string, content: string, pre: { createOnly?: boolean; ifMatch?: string }, name: string | undefined): Promise<Landed> {
   try {
-    const res = await postWriteFile(path, content, undefined, pre);
-    if (res.ok) {
-      const body = await res.json().catch(() => null) as { path?: unknown } | null;
-      const written = typeof body?.path === 'string' && body.path ? body.path : path;
+    const r = await readBackendAnswer(await postWriteFile(path, content, undefined, pre));
+    if (r.ok) {
+      const written = typeof r.body.path === 'string' && r.body.path ? r.body.path : path;
       console.log(`[Prefab] Wrote "${name}" → ${written}`);
       return { ok: true, path: written };
     }
     // READ THE BODY (#1468 close-out review F5): the format gate answers 409 with its reason in `error`, and it is the
-    // one thing only the human can act on. `readWriteRefusal` is the one reader (#1811): it says which 409s are a
+    // one thing only the human can act on. `readBackendAnswer` is the one reader (#1811, #1824): it says which 409s are a
     // conflict (if-match, if-none-match, and `prefab-mark-lowered`, #1774 — the fallback re-reads the file and raises
     // from it), and never answers without a reason (#1776: the route's empty 403 reached the agent as a bare ok:false).
     // Not logged here: every caller reports its own failure, once, in its own words (an undo's #308 report, Apply's
     // refusal, the prefab-edit save's warnings) — a second line here doubled each one.
-    const r = await readWriteRefusal(res);
     return { ok: false, ...(r.conflict ? { conflict: true } : { error: r.error, ...(r.options ? { options: r.options } : {}) }) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

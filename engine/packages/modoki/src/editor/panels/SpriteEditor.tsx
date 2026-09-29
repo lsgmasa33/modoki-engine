@@ -729,14 +729,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     }
     // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
     // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
-    const persisted = await writeMetaOrWarn(path, nextMeta);
+    let refusedWhy: string | undefined; // the route's reason, for the dialog (#1824)
+    const persisted = await writeMetaOrWarn(path, nextMeta, (e) => { refusedWhy = e; });
     // The save IS the new baseline — otherwise the modal stays dirty after writing and the move
     // gate keeps refusing over work that is already on disk.
     if (persisted) baselineDigestRef.current = spriteSheetDigest(sprites, { grid, alphaThreshold });
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
-      const refusal: SaveRefusal = { kind: 'write-failed' };
+      const refusal: SaveRefusal = { kind: 'write-failed', ...(refusedWhy ? { error: refusedWhy } : {}) };
       console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
       setSaveRefusal(refusal);
       return;

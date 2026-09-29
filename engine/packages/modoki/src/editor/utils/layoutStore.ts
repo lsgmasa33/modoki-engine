@@ -20,7 +20,7 @@
 import { Model, TabNode, Actions } from 'flexlayout-react';
 import type { IJsonModel } from 'flexlayout-react';
 
-import { backendFetch } from '../backend/editorBackend';
+import { backendFetch, postBackend } from '../backend/editorBackend';
 import { AUTOSAVE_NAME, sanitizeExportFileName } from './layoutNames';
 
 /** Default layout — a capture of the owner's working arrangement, rendered on a
@@ -175,20 +175,20 @@ export function currentLayoutName(): string | null {
   return localStorage.getItem(LAYOUT_NAME_KEY);
 }
 
+/** What a layout write answers: written, or refused with the route's reason (#1824 — it was a boolean, and every
+ *  caller logged a bare "Failed"). Renamed from `writeLayoutJson`/`writeLayout` with the shape, so no truthiness test
+ *  of the old boolean survives. */
+export type LayoutWriteOutcome = { ok: true } | { ok: false; error: string };
+
 /** Write raw layout JSON to <project>/.modoki/layouts/<name>.layout.json. */
-export async function writeLayoutJson(name: string, content: unknown): Promise<boolean> {
-  try {
-    const res = await backendFetch('/api/layout', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, content }),
-    });
-    return res.ok;
-  } catch { return false; }
+export async function saveLayoutJson(name: string, content: unknown): Promise<LayoutWriteOutcome> {
+  const a = await postBackend('/api/layout', { name, content });
+  return a.ok ? { ok: true } : { ok: false, error: a.error };
 }
 
 /** Write a layout to <project>/.modoki/layouts/<name>.layout.json. */
-export function writeLayout(name: string, model: Model): Promise<boolean> {
-  return writeLayoutJson(name, model.toJson());
+export function saveLayoutFile(name: string, model: Model): Promise<LayoutWriteOutcome> {
+  return saveLayoutJson(name, model.toJson());
 }
 
 

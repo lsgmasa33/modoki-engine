@@ -580,7 +580,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
 
     // The renderer's own DELETES must say so too (#1215). The route gates the agent path on unsaved
     // work; without `rendererWrite` the human deleting a file they have a parked edit on gets a 409,
-    // and `deleteAssetFile` reports it only as `false`. Checked per CALL, not per file: each POST
+    // and the human is refused an ordinary delete. Checked per CALL, not per file: each POST
     // to the route must carry the flag within its own request body, so a second call added without
     // it cannot hide behind the first.
     for (const file of [

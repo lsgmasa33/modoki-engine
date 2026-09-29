@@ -19,14 +19,20 @@ import type { UndoAction } from '../undo/undoManager';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import {
   writeAssetFile, deleteAssetFiles, duplicateAssetFileReport,
-  createFolderApi, moveFileToStatus,
+  createAssetFolder, moveAsset,
 } from './assetOps';
-import { writeAssetFileGuarded, backendFetch, importedFileContent } from '../backend/editorBackend';
+import { writeAssetFileGuarded, backendFetch, importedFileBytes } from '../backend/editorBackend';
 import { sha256OfBytes } from '../utils/contentHash';
 import type { AssetEntry } from '../utils/assetPaths';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
 import type { PathMove } from '../utils/assetPaths';
 import { reportUndoFailure, COLLISION_STATUS, UndoRefusedError, fileChangedRefusal, expectedHash } from '../undo/undoFailure';
+
+/** A failed helper's reason as a report's parenthetical (#1824, U3 of docs/refusal-reporting.md): a step's report names
+ *  WHY, not only what, now that the asset helpers carry the route's reason instead of a bare boolean. */
+function because(r: { ok: boolean; error?: string }): string {
+  return r.ok || !r.error ? '' : ` (${r.error})`;
+}
 
 // Extensions we know are UTF-8 text — everything else is treated as binary so
 // the delete-undo snapshot round-trips bytes through base64 instead of
@@ -246,7 +252,7 @@ export function makeDeleteUndo(
       // disk, refresh() re-listed them, and redo read as a no-op (#291).
       // Reported into the step (#1823), not only to the console.
       if (!res.ok) {
-        reportUndoFailure({ direction: 'Redo', label, detail: `nothing was trashed — the files are still on disk: ${allPaths.join(', ')}` });
+        reportUndoFailure({ direction: 'Redo', label, detail: `nothing was trashed${because(res)} — the files are still on disk: ${allPaths.join(', ')}` });
       } else if (res.failed.length > 0) {
         // ⚠️ A PARTIAL refusal is `ok:true`, so the check above cannot see it — the very defect
         // #884 fixed in `executeDeletion`, left standing on this half until the close-out review
@@ -333,7 +339,8 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
     label,
     undo: async () => {
       const copies = results.filter(({ toPath }) => !undone.has(toPath)).map(({ toPath }) => toPath);
-      const deleted = await trashCopies(copies, shaOf, sidecarOf); // primary files actually trashed — safe to unbind
+      const trashed = await trashCopies(copies, shaOf, sidecarOf);
+      const deleted = trashed.trashed; // primary files actually trashed — safe to unbind
       const failed = copies.filter((p) => !deleted.includes(p));
       for (const p of deleted) undone.add(p);
       // The copy can be OPEN by now (duplicate → double-click the copy → ⌘Z), and a bound
@@ -343,7 +350,7 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
       // copies that actually got trashed are unbound — one still on disk is still a live file.
       unbindDeletedAssetEditors(deleted);
       if (failed.length > 0) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed: ${failed.join(', ')}` });
+        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed${trashed.error ? ` (${trashed.error})` : ''}: ${failed.join(', ')}` });
       }
       refresh();
     },
@@ -354,7 +361,7 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
         // The route refuses a destination that is already occupied (409 "Destination exists"), so a redo never
         // lands on a file made at that path since — that half needed no new precondition.
         const r = await duplicateAssetFileReport(asset.path, toPath);
-        if (r.ok) { undone.delete(toPath); shaOf.set(toPath, r.sha256); sidecarOf.set(toPath, r.sidecar); } else failed.push(toPath);
+        if (r.ok) { undone.delete(toPath); shaOf.set(toPath, r.sha256); sidecarOf.set(toPath, r.sidecar); } else failed.push(`${toPath}${because(r)}`);
       }
       if (failed.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, detail: `not re-copied: ${failed.join(', ')}` });
@@ -367,7 +374,8 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
 /** Trash the copies a Duplicate or a copy-Paste made, in ONE request, each only while it holds the bytes the route
  *  reported writing (#1679) — a copy edited since (duplicate → open the copy → edit → save → Cmd+Z) is the user's
  *  work now. One mismatch trashes nothing and REFUSES the step (`fileChangedRefusal`, the #1664 shape), so there is
- *  no half-undone batch to describe. Resolves to the copies actually trashed.
+ *  no half-undone batch to describe. Resolves to the copies actually trashed, and the route's reason when it refused
+ *  the request (#1824).
  *
  *  Drops BOTH halves of each copy's sidecar pair: the committed `.meta.json` (import settings + the GUID the copy
  *  created) and the gitignored machine-local `.meta.local.json` (byte stats) — dropping only the committed half left
@@ -381,8 +389,8 @@ export function makeDuplicateUndo(results: DupResult[], refresh: () => void): Un
 async function trashCopies(
   copies: string[], shaOf: ReadonlyMap<string, string | undefined>,
   sidecarOf: ReadonlyMap<string, Record<string, unknown> | undefined>,
-): Promise<string[]> {
-  if (copies.length === 0) return [];
+): Promise<{ trashed: string[]; error?: string }> {
+  if (copies.length === 0) return { trashed: [] };
   const unknown = copies.filter((p) => shaOf.get(p) === undefined);
   if (unknown.length > 0) {
     throw new UndoRefusedError(
@@ -395,9 +403,9 @@ async function trashCopies(
   const ifSettings = settingsExpectations(copies.filter((p) => !isTextAsset(p)).map((p) => [`${p}.meta.json`, sidecarOf.get(p)]));
   const res = await deleteAssetFiles(paths, { ifMatch, ifSettings });
   if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
-  if (!res.ok) return [];
+  if (!res.ok) return { trashed: [], ...(res.error ? { error: res.error } : {}) };
   const failed = new Set(res.failed);
-  return copies.filter((p) => !failed.has(p));
+  return { trashed: copies.filter((p) => !failed.has(p)) };
 }
 
 /** Build the undo/redo for a single-asset rename (Assets.tsx `handleRename`, #308). The
@@ -418,25 +426,25 @@ export function makeRenameUndo(params: {
   return {
     label,
     undo: async () => {
-      const { ok, status } = await moveFileToStatus(toPath, originalPath);
-      if (ok) {
+      const moved = await moveAsset(toPath, originalPath);
+      if (moved.ok) {
         applyAssetPathMoves([{ from: toPath, to: originalPath, name: originalName }]);
       } else {
         reportUndoFailure({
-          direction: 'Undo', label, userFixable: status === COLLISION_STATUS,
-          detail: `"${toPath}" did not move back to "${originalPath}"`,
+          direction: 'Undo', label, userFixable: moved.status === COLLISION_STATUS,
+          detail: `"${toPath}" did not move back to "${originalPath}"${because(moved)}`,
         });
       }
       refresh();
     },
     redo: async () => {
-      const { ok, status } = await moveFileToStatus(originalPath, toPath);
-      if (ok) {
+      const moved = await moveAsset(originalPath, toPath);
+      if (moved.ok) {
         applyAssetPathMoves([{ from: originalPath, to: toPath, name: newName }]);
       } else {
         reportUndoFailure({
-          direction: 'Redo', label, userFixable: status === COLLISION_STATUS,
-          detail: `"${originalPath}" did not move to "${toPath}"`,
+          direction: 'Redo', label, userFixable: moved.status === COLLISION_STATUS,
+          detail: `"${originalPath}" did not move to "${toPath}"${because(moved)}`,
         });
       }
       refresh();
@@ -446,9 +454,9 @@ export function makeRenameUndo(params: {
 
 /** Undo/redo for deleting an EMPTY folder (Assets.tsx `handleDeleteFolder`'s `else` branch,
  *  #308) — the folder held no assets, so there is nothing to snapshot; undo just recreates
- *  the (empty) folder shell and redo re-trashes it. Neither `createFolderApi` nor
- *  `deleteAssetFile` distinguishes a collision from any other failure, so this is always
- *  console-only (never `userFixable`). */
+ *  the (empty) folder shell and redo re-trashes it. Neither `createAssetFolder` nor
+ *  `trashEmptyFolder` distinguishes a collision from any other failure, so this is never
+ *  `userFixable`; the report names the route's reason (#1824). */
 export function makeEmptyFolderDeleteUndo(params: {
   folderPath: string;
   folderName: string;
@@ -459,27 +467,28 @@ export function makeEmptyFolderDeleteUndo(params: {
   return {
     label,
     undo: async () => {
-      const ok = await createFolderApi(folderPath);
-      if (!ok) reportUndoFailure({ direction: 'Undo', label, detail: `folder "${folderPath}" was not recreated` });
+      const made = await createAssetFolder(folderPath);
+      if (!made.ok) reportUndoFailure({ direction: 'Undo', label, detail: `folder "${folderPath}" was not recreated${because(made)}` });
       refresh();
     },
     redo: async () => {
       // Only while it is still EMPTY (#1679): the undo recreated a shell, and whatever was put in it since is not
       // this entry's to trash. A refusal leaves the folder and everything in it (`fileChangedRefusal`).
-      const ok = await trashEmptyFolder(folderPath);
-      if (!ok) reportUndoFailure({ direction: 'Redo', label, detail: `folder "${folderPath}" was not removed` });
+      const trashed = await trashEmptyFolder(folderPath);
+      if (!trashed.ok) reportUndoFailure({ direction: 'Redo', label, detail: `folder "${folderPath}" was not removed${because(trashed)}` });
       refresh();
     },
   };
 }
 
 /** Trash a folder this entry created, only while it holds nothing but OS litter (`ifEmpty`, #1679). A folder with
- *  anything in it REFUSES the step (`fileChangedRefusal`) and stays, contents and all. Resolves `false` on a plain
- *  failure, for the caller's #308 report. */
-async function trashEmptyFolder(folderPath: string): Promise<boolean> {
+ *  anything in it REFUSES the step (`fileChangedRefusal`) and stays, contents and all. A plain failure answers
+ *  `ok:false` with the route's reason, for the caller's #308 report (#1824). */
+async function trashEmptyFolder(folderPath: string): Promise<{ ok: boolean; error?: string }> {
   const res = await deleteAssetFiles([folderPath], { ifEmpty: [folderPath] });
   if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
-  return res.ok && res.failed.length === 0;
+  if (!res.ok) return { ok: false, error: res.error };
+  return res.failed.length === 0 ? { ok: true } : { ok: false, error: 'the OS refused to trash it' };
 }
 
 /** Undo/redo for the "New Folder" action (Assets.tsx `createFolder`, #308 — found in
@@ -513,15 +522,15 @@ export function makeNewFolderUndo(params: {
     undo: async () => {
       // Only while it is still EMPTY (#1679): New Folder → drop files into it (Finder, or a copy that is not its own
       // undo entry) → Cmd+Z here used to trash the folder with them inside.
-      const ok = await trashEmptyFolder(path);
-      if (ok) { setPendingFolders(prune); setExpanded(prune); }
-      else reportUndoFailure({ direction: 'Undo', label, detail: `folder "${path}" still exists on disk` });
+      const trashed = await trashEmptyFolder(path);
+      if (trashed.ok) { setPendingFolders(prune); setExpanded(prune); }
+      else reportUndoFailure({ direction: 'Undo', label, detail: `folder "${path}" still exists on disk${because(trashed)}` });
       refresh();
     },
     redo: async () => {
-      const ok = await createFolderApi(path);
-      if (ok) setPendingFolders((p) => new Set(p).add(path));
-      else reportUndoFailure({ direction: 'Redo', label, detail: `folder "${path}" was not recreated` });
+      const made = await createAssetFolder(path);
+      if (made.ok) setPendingFolders((p) => new Set(p).add(path));
+      else reportUndoFailure({ direction: 'Redo', label, detail: `folder "${path}" was not recreated${because(made)}` });
       refresh();
     },
   };
@@ -544,26 +553,26 @@ export function makeFolderRenameUndo(params: {
   return {
     label,
     undo: async () => {
-      const { ok, status } = await moveFileToStatus(newPath, oldPath);
-      if (ok) {
+      const moved = await moveAsset(newPath, oldPath);
+      if (moved.ok) {
         // (`expanded`/`pendingFolders` are remapped by applyAssetPathMoves itself now — #867.)
         applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]);
       } else {
         reportUndoFailure({
-          direction: 'Undo', label, userFixable: status === COLLISION_STATUS,
-          detail: `folder "${newPath}" did not move back to "${oldPath}"`,
+          direction: 'Undo', label, userFixable: moved.status === COLLISION_STATUS,
+          detail: `folder "${newPath}" did not move back to "${oldPath}"${because(moved)}`,
         });
       }
       refresh();
     },
     redo: async () => {
-      const { ok, status } = await moveFileToStatus(oldPath, newPath);
-      if (ok) {
+      const moved = await moveAsset(oldPath, newPath);
+      if (moved.ok) {
         applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]);
       } else {
         reportUndoFailure({
-          direction: 'Redo', label, userFixable: status === COLLISION_STATUS,
-          detail: `folder "${oldPath}" did not move to "${newPath}"`,
+          direction: 'Redo', label, userFixable: moved.status === COLLISION_STATUS,
+          detail: `folder "${oldPath}" did not move to "${newPath}"${because(moved)}`,
         });
       }
       refresh();
@@ -580,7 +589,7 @@ export type PasteMove = { from: string; to: string; sha256?: string; sidecar?: R
  *  item whose move/copy failed (`done` only holds what actually landed) — this only needs to
  *  handle the REVERSE direction failing, which the old closures silently dropped one item at
  *  a time. Failures are collected and reported as ONE message naming every skipped path,
- *  not one console line per item. Only the cut branch can collide (`moveFileToStatus`); the
+ *  not one console line per item. Only the cut branch can collide (`moveAsset`); the
  *  copy branch refuses a copy edited since instead (`trashCopies`, #1679). */
 export function makePasteUndo(params: {
   op: 'cut' | 'copy';
@@ -610,9 +619,9 @@ export function makePasteUndo(params: {
       for (const { from, to } of done) {
         if (undone.has(to)) continue; // already undone by an earlier partial pass
         if (op === 'cut') {
-          const { ok, status } = await moveFileToStatus(to, from);
-          if (ok) { back.push({ from: to, to: from }); undone.add(to); }
-          else { failed.push(`${to} → ${from}`); if (status === COLLISION_STATUS) collision = true; }
+          const moved = await moveAsset(to, from);
+          if (moved.ok) { back.push({ from: to, to: from }); undone.add(to); }
+          else { failed.push(`${to} → ${from}${because(moved)}`); if (moved.status === COLLISION_STATUS) collision = true; }
         } else {
           copies.push(to);
         }
@@ -621,7 +630,7 @@ export function makePasteUndo(params: {
       if (copies.length > 0) {
         const trashed = await trashCopies(copies, shaOf, sidecarOf);
         for (const to of copies) {
-          if (trashed.includes(to)) { undone.add(to); deletedCopies.push(to); } else failed.push(to);
+          if (trashed.trashed.includes(to)) { undone.add(to); deletedCopies.push(to); } else failed.push(`${to}${trashed.error ? ` (${trashed.error})` : ''}`);
         }
       }
       if (op === 'cut') applyAssetPathMoves(back);
@@ -641,12 +650,12 @@ export function makePasteUndo(params: {
       for (const { from, to } of done) {
         if (!undone.has(to)) continue; // already in the redone state — nothing to move/copy
         if (op === 'cut') {
-          const { ok, status } = await moveFileToStatus(from, to);
-          if (ok) { fwd.push({ from, to }); undone.delete(to); }
-          else { failed.push(`${from} → ${to}`); if (status === COLLISION_STATUS) collision = true; }
+          const moved = await moveAsset(from, to);
+          if (moved.ok) { fwd.push({ from, to }); undone.delete(to); }
+          else { failed.push(`${from} → ${to}${because(moved)}`); if (moved.status === COLLISION_STATUS) collision = true; }
         } else {
           const r = await duplicateAssetFileReport(from, to);
-          if (r.ok) { undone.delete(to); shaOf.set(to, r.sha256); sidecarOf.set(to, r.sidecar); } else failed.push(`${from} → ${to}`);
+          if (r.ok) { undone.delete(to); shaOf.set(to, r.sha256); sidecarOf.set(to, r.sidecar); } else failed.push(`${from} → ${to}${because(r)}`);
         }
       }
       if (op === 'cut') applyAssetPathMoves(fwd);
@@ -663,7 +672,7 @@ export function makePasteUndo(params: {
 
 /** One item a drag-drop move landed on (Assets.tsx `handleFilesDrop`). `to`/`from` are
  *  explicit full paths (already resolved by the panel's folder-relative `moveFile`), so
- *  undo/redo can call `moveFileToStatus` directly without recomputing a destination folder.
+ *  undo/redo can call `moveAsset` directly without recomputing a destination folder.
  *
  *  ⚠️ `prefix` travels with the move in BOTH directions (#867). It marks the moved thing as a
  *  FOLDER, so the repair reaches everything under it; a folder drag whose undo dropped the flag
@@ -691,9 +700,9 @@ export function makeFilesDropUndo(params: {
       let collision = false;
       for (const m of moves) {
         if (undone.has(m.to)) continue; // already moved back by an earlier partial pass
-        const { ok, status } = await moveFileToStatus(m.to, m.from);
-        if (ok) { back.push({ from: m.to, to: m.from, prefix: m.prefix }); undone.add(m.to); }
-        else { failed.push(`${m.to} → ${m.from}`); if (status === COLLISION_STATUS) collision = true; }
+        const moved = await moveAsset(m.to, m.from);
+        if (moved.ok) { back.push({ from: m.to, to: m.from, prefix: m.prefix }); undone.add(m.to); }
+        else { failed.push(`${m.to} → ${m.from}${because(moved)}`); if (moved.status === COLLISION_STATUS) collision = true; }
       }
       applyAssetPathMoves(back);
       if (failed.length > 0) {
@@ -707,9 +716,9 @@ export function makeFilesDropUndo(params: {
       let collision = false;
       for (const m of moves) {
         if (!undone.has(m.to)) continue; // already at its destination — nothing to move
-        const { ok, status } = await moveFileToStatus(m.from, m.to);
-        if (ok) { fwd.push({ from: m.from, to: m.to, prefix: m.prefix }); undone.delete(m.to); }
-        else { failed.push(`${m.from} → ${m.to}`); if (status === COLLISION_STATUS) collision = true; }
+        const moved = await moveAsset(m.from, m.to);
+        if (moved.ok) { fwd.push({ from: m.from, to: m.to, prefix: m.prefix }); undone.delete(m.to); }
+        else { failed.push(`${m.from} → ${m.to}${because(moved)}`); if (moved.status === COLLISION_STATUS) collision = true; }
       }
       applyAssetPathMoves(fwd);
       if (failed.length > 0) {
@@ -838,7 +847,7 @@ export function makeFileImportUndo(params: {
       for (const p of deleted) onDisk.delete(p);
       unbindDeletedAssetEditors(deleted);
       if (failed.size > 0) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed: ${[...failed].join(', ')}` });
+        reportUndoFailure({ direction: 'Undo', label, detail: `still on disk, not trashed${because(res)}: ${[...failed].join(', ')}` });
       }
       refresh();
     },
@@ -852,8 +861,9 @@ export function makeFileImportUndo(params: {
       const claimed = new Set<string>();
       for (const f of imported) {
         if (onDisk.has(f.path)) continue; // still on disk from before — nothing to redo
-        const content = await importedFileContent(f.path, bytesOf.get(f.path)!, claimed);
-        if (content === null) { failed.push(f.path); continue; }
+        const bytes = await importedFileBytes(f.path, bytesOf.get(f.path)!, claimed);
+        if ('error' in bytes) { failed.push(`${f.path} (${bytes.error})`); continue; }
+        const content = bytes.content;
         bytesOf.set(f.path, content);
         const w = await writeAssetFileGuarded(f.path, content, { encoding: 'base64', createOnly: true });
         if (w.result === 'ok') wrote.push(f.path);

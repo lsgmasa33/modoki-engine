@@ -112,7 +112,7 @@ describe('a refused prefab write carries a reason to every caller (#1776)', () =
   it('post(): a refusal whose body is {} still fails with a reason — the HTTP status', async () => {
     const r = await quietly(() => commitPrefabWrite(OUTSIDE, doc, { expected: null }));
     expect(r.ok).toBe(false);
-    expect(r.error).toBe('the write was refused (HTTP 403)');
+    expect(r.error).toBe('the request was refused (HTTP 403)');
   });
 
   it("post(): the body's own reason wins over the status", async () => {
@@ -129,7 +129,7 @@ describe('a refused prefab write carries a reason to every caller (#1776)', () =
 
   it('the agent create over a {} body still names a reason', async () => {
     const err = await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: ensureGuid(src), path: OUTSIDE })).catch((e: Error) => e);
-    expect((err as Error).message).toContain('the write was refused (HTTP 403)');
+    expect((err as Error).message).toContain('the request was refused (HTTP 403)');
   });
 
   it("the human Create Prefab returns the reason as `refused`, which the panels toast", async () => {

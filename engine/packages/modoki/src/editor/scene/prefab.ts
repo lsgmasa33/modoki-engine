@@ -5391,7 +5391,7 @@ export interface ApplyResult {
   /** What the repair of the OTHER files on disk did, when `memberPathsChanged`: the files rewritten, the ones
    *  left because an asset view holds them unsaved, the ones left because they changed on disk while the repair ran
    *  (`changed`, #1784), or `null` when the backend could not do it at all. */
-  fileRepair?: { rewritten: string[]; held: string[]; changed?: string[] } | null;
+  fileRepair?: { rewritten: string[]; held: string[]; changed?: string[] } | { failed: true; error: string };
   /** Selected keys the apply could not write, each with the reason: a move it cannot express yet, a key
    *  naming no member, a tag it cannot add or a tag spelled as a field (#1491). Not every unwritable key
    *  lands here — a field the trait does not persist, or a key whose member or trait is gone, is still
@@ -6635,7 +6635,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).
   const promotedGuids = snapshotPromotedGuids(promotedRows, promotedRefRows);
   const rootGuid = guidForEntityId(rootInstanceId);
-  let fileRepair: Omit<MemberPathRepair, 'written'> | null | undefined;
+  let fileRepair: Omit<MemberPathRepair, 'written'> | { failed: true; error: string } | undefined;
   // ONE step (#1692): the write only over the document this Apply read (I10), both caches, this refresh, then a rebase
   // of every other frame of the source still built from the old document — all in the world the Apply began in (I11).
   // Several files are ONE step (#1692's `commitPrefabWrites`): U13's second file, or an override on an enclosing prefab,
@@ -6697,7 +6697,8 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
         const repair = await repairMemberPathsEverywhere(prefabId, oldPrefab, { liveWorldRepaired: true });
         // What was repaired, not the bytes: `written` is for the adopt above, and carried into the result it reached
         // every MCP Apply reply as two full copies of each rewritten file (the live gate, #1751).
-        fileRepair = repair && { rewritten: repair.rewritten, held: repair.held, changed: repair.changed };
+        // A repair the route refused reaches the agent's Apply reply WITH its reason (#1824), not as a bare failure.
+        fileRepair = 'error' in repair ? { failed: true, error: repair.error } : { rewritten: repair.rewritten, held: repair.held, changed: repair.changed };
       }
     },
   });

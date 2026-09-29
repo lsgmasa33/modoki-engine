@@ -101,3 +101,21 @@ describe('writeCollisionMeshAssets', () => {
     expect(glbWriteCall[1]).toBe(INPUT.glbBase64);
   });
 });
+
+/** #1824 — each write is read by the one reader, so a refusal names the route's reason, and a refused sidecar write
+ *  stops the sequence instead of being ignored. */
+describe('writeCollisionMeshAssets carries the route\'s reason (#1824)', () => {
+  // Mutation: throw `write GLB failed (${status})` again — the reason drops out and this goes red.
+  it('a refused GLB write throws with the route\'s sentence', async () => {
+    const deps = makeDeps({ post: vi.fn(async () => ({ ok: false, status: 403, json: async () => ({ error: '/x is outside this project\'s asset roots' }) })) });
+    await expect(writeCollisionMeshAssets(INPUT, deps, noopWriteMeta)).rejects.toThrow('write GLB failed: /x is outside this project\'s asset roots');
+  });
+
+  // The caller's meta step throws on a refusal (ModelAssetView); the sequence must stop there, before the .mesh.json.
+  it('a writeMeta step that throws stops the sequence before the .mesh.json write', async () => {
+    const deps = makeDeps();
+    await expect(writeCollisionMeshAssets(INPUT, deps, async () => { throw new Error('write .meta.json failed: newer build'); }))
+      .rejects.toThrow('write .meta.json failed: newer build');
+    expect(deps.registerCalls).toEqual([['model-guid', INPUT.glbPath, 'model']]);
+  });
+});

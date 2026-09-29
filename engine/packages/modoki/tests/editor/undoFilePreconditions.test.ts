@@ -345,6 +345,7 @@ describe('the prior-bytes read and the hash (close-out review)', () => {
 describe('makeDuplicateUndo / makePasteUndo (copy)', () => {
   async function duplicate(from: string, to: string) {
     const r = await duplicateAssetFileReport(from, to);
+    if (!r.ok) throw new Error(`premise: the duplicate landed — ${r.error}`);
     expect(r.ok).toBe(true);
     return { asset: A(from), toPath: to, sha256: r.sha256, sidecar: r.sidecar };
   }
@@ -380,6 +381,7 @@ describe('makeDuplicateUndo / makePasteUndo (copy)', () => {
   it('an edited pasted copy refuses the undo', async () => {
     route.put('/assets/t.png', 'PNG');
     const r = await duplicateAssetFileReport('/assets/t.png', '/b/t.png');
+    if (!r.ok) throw new Error(`premise: the duplicate landed — ${r.error}`);
     const action = makePasteUndo({ op: 'copy', done: [{ from: '/assets/t.png', to: '/b/t.png', sha256: r.sha256 }], refresh: vi.fn() });
     route.put('/b/t.png', 'PAINTED');
     await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
@@ -405,6 +407,7 @@ describe('a binary\'s committed sidecar carries its IMPORT SETTINGS as a precond
   async function duplicated() {
     route.put(PNG, 'PNG'); route.put(`${PNG}.meta.json`, '{"id":"t","texture":{"maxSize":512}}'); // never baked
     const r = await duplicateAssetFileReport(PNG, COPY);
+    if (!r.ok) throw new Error(`premise: the duplicate landed — ${r.error}`);
     return makeDuplicateUndo([{ asset: A(PNG), toPath: COPY, sha256: r.sha256, sidecar: r.sidecar }], vi.fn());
   }
 
@@ -437,6 +440,7 @@ describe('a binary\'s committed sidecar carries its IMPORT SETTINGS as a precond
   it('a pasted copy whose import settings were edited refuses the undo', async () => {
     route.put(PNG, 'PNG'); route.put(`${PNG}.meta.json`, '{"id":"t"}');
     const r = await duplicateAssetFileReport(PNG, '/b/t.png');
+    if (!r.ok) throw new Error(`premise: the duplicate landed — ${r.error}`);
     const action = makePasteUndo({ op: 'copy', done: [{ from: PNG, to: '/b/t.png', sha256: r.sha256, sidecar: r.sidecar }], refresh: vi.fn() });
     route.put('/b/t.png.meta.json', JSON.stringify({ ...sidecarOf('/b/t.png'), texture: { srgb: false } }));
     await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
