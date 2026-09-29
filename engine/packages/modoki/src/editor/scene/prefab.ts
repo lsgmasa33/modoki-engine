@@ -5965,6 +5965,9 @@ async function planApply(
       if (!expected || stale.length) { outerRefusal ||= expected ? staleFramesRefusal(stale) : `Prefab "${src}" is not loaded`; return null; }
       const doc = JSON.parse(JSON.stringify(expected)) as PrefabFile;
       doc.version = PREFAB_FORMAT_VERSION;
+      // v8 states its mark (#1774): a file that had none gets it from its rows here, or the enclosing write claimed v8
+      // without one (#1797). The frame's own document gets its mark where its rows are planned.
+      advanceLocalIdCounter(doc);
       const before = JSON.parse(JSON.stringify(expected)) as PrefabFile;
       // An id-less file gets its id HERE, on both sides, as the frame's own document does above (#1729): minted by the
       // write alone, the undo put `before` back with no id, the next write minted another, and redo always refused.

@@ -98,6 +98,95 @@ The bugs cluster where the table above shows no owner, or an owner that operatio
 
 The verdict, the per-bug table and the proposed owners are on #1683.
 
+### The randomized round-trip test (#1789)
+
+Reviews read one path at a time, but most prefab bugs live in combinations of an operation, a nesting depth, and an
+interleaving with undo, save, reload or a missing file. `engine/tests/editor/prefabFuzz.test.ts` covers those combinations
+mechanically:
+- It runs seeded op lists through the entry points the Hierarchy, Inspector, Apply dialog, Assets panel and prefab edit call.
+- Everything under it is real, not stood in for: the backend router over a scratch directory, `SceneManager`'s load, both
+  caches, the undo stack, and the watcher's reload handler.
+- After every step it checks what can be read off a world and its files: I4, I5, I6, I7, I8, I15, I16, I18 and both
+  validators.
+- Every save→reload must be the identity, and a second save must write the same bytes.
+- Each run ends by undoing to the start and redoing to the end.
+
+The test's header lists what it cannot see (no concurrency, a simulated watcher, one scene, no Play). Read it before
+concluding that an area is covered.
+
+**How to use it.**
+- **`npm run verify`** runs fixed seeds, in a few seconds.
+- **`MODOKI_PREFAB_FUZZ=<n>`** hunts n seeds (optional `_SEED`, `_LEN`). It shrinks each distinct failure to a minimal op
+  list, prints it as a paste-ready `MODOKI_PREFAB_FUZZ_REPLAY='…'`, and ends with an op/route coverage tally.
+- **`MODOKI_PREFAB_FUZZ_DUMP=<dir>`** writes every compared state while a replay runs.
+- An op's choices resolve against the world when it runs, so a list stays runnable as the shrinker drops ops.
+- The shrinker keeps only a list that fails with the same signature. A replay can still slide onto a different bug with the
+  same signature, so **re-run the minimized repro on the unchanged tree** before you attribute it to a change.
+- A run's guids come from a hash of its op list, so a list's first run is the same guid for guid in any process, and a
+  fresh-process replay reproduces the hunt's run.
+
+**KNOWN_OPEN** (`prefabFuzz/knownOpen.ts`) is how verify stays green while a found bug is open.
+- Each entry names its issue.
+- It either stops a seed at that bug, with a predicate on the check AND the op shape that reaches it, or tolerates it with a
+  named normalization.
+- It carries a repro that a self-test must still see fail. Fixing the bug turns that self-test red, which removes the entry.
+- A predicate sees only the ops before the failure, and keys on what the failure SHOWS (the I7 detail says whether the
+  holders are rows of one frame; an identity failure says whether an entity was lost or changed guid), not on the op
+  list alone. Op-list predicates claimed a fixed bug's regression in every verify seed. Two later reviews each planted
+  an undo/redo regression that such a predicate swallowed with the whole file green. So the routes that key on an
+  entity (#1793, #1794, #1796's re-tag, #1820's paste, #1826, #1830) also ask whether it is the one their mechanism's op
+  touched. The runner records the guids each drop, paste, detach and Create Prefab introduced or covered, and hands
+  them to the stop with the failure (`touched`). The stop asks it about the ONE node the diff is about: the entry named
+  in `/entities/<guid>`, or the first guid of a node gone or new. It does not ask about every guid the detail names,
+  because a diff inside a dropped entry names the drop in its path whichever node moved.
+  - #1793 also needs its node to have MOVED, meaning it is still on the other side of the diff, or its own top-level
+    entry re-parented. A redo that loses or replaces the node's guid is a different regression. A node list is
+    diffed by node identity, and a scene's top-level entries by guid, not by index: by index, a lost entry read as its
+    neighbour shifting slot.
+  - A walk failure carries the walk's console lines, where a refusal names its file.
+  - A route with no such key keeps a self-tested repro and no stop (#1819's placeholder-root route, #1820's gained
+    entity, #1827's raw-id deletion).
+  - Other entries key on the detail's text and the op order: #1792's frame shape, #1805's lost entity or placeholder of
+    a deleted prefab, #1800's component mark.
+  - Accepted limit: a regression in the drop path itself, which misplaces the dropped node, has #1793's own symptom on
+    #1793's own node, so #1793's stop claims it. Other seeds still turn verify red for the drop regressions the
+    reviews planted.
+- A self-test holds the reject side. No other issue's entry claims an entry's repro. A set of generic failures on
+  untouched entities must go unclaimed after lists that end in each op a stop keys "last" on, and after lists that
+  leave out each op a stop keys "no …" on. Those failures are #1777's shape, values and marks, a lost, gained or
+  placeholder'd entity of a live prefab, the reviews' planted regressions, and a re-tag refusal for another tree.
+- Hunt mode, not verify, reports a seed as a known route, not a finding, when a stop claims both its shrunk list's
+  failure (same signature) and the seed's own failure judged against the shrunk op order. A 40-op list often hides
+  the op order a route's stop keys on. The content keys stay the seed's own, and the replay is printed.
+
+**What the hunts found:** #1792 to #1796, #1798, #1800, #1805, #1807 to #1809, #1812's route, #1817 to #1822 and #1826
+to #1830, each observed and minimized. #1817 is a crash: a prefab-edit save writes a file that contains itself. #1827
+is an undo that deletes an unrelated entity: after a world swap it falls back to a raw ECS id. #1797 was a one-line
+fix. Its repro, and those of #1807 and #1812 (fixed on work-ai), are regression cases. Many of the later findings
+need the undo stack to survive a reload, which the harness did not do at first: a run's first reload emptied it.
+The diagnoses found two harness defects that review had not: that history key, and an end walk that judged a
+restored fixture as the editor's own old-version write.
+
+**Re-finds (a known fixed bug put back, measured 2026-09-29).** The generator's weights were NOT tuned against these.
+Four generator changes came from reading the coverage tally. Three of them were not made for any re-find. The fourth,
+the directed move-then-Apply branch, was added precisely so that #1751 F1's route is reached, so that re-find is by
+construction. The four: Remove Component draws only from
+entities that have a component (it was a no-op 97% of the time); reparent has a same-frame branch; an outside edit's
+merged row numbers at or above the file's mark; and 20% of Applies first move a frame member under another member (the
+only way `/api/prefab-member-paths` is called, 0 calls in 400 seeds before it). A re-find counts only if its seed passes
+on the unmutated tree and its minimized repro does too.
+
+| Bug | Found | Where |
+|---|---|---|
+| #1756 | in the verify seeds | seed 2, step 17 (I7); 5-op repro |
+| #1446 | in the verify seeds | seed 2, step 22; 5-op repro |
+| #1709 | in the verify seeds | seed 2, step 19; 4-op repro |
+| #1774 | a 150-seed hunt | seed 118 (I4, a localId re-bound); 4-op repro. Not re-found before the harness kept the undo stack across a reload |
+| #1751 F1 | a 150-seed hunt | seed 156; 9-op repro, through the directed move-then-Apply branch only |
+| #1737 | a 150-seed hunt, not isolated | seed 101 fails only with the fix taken out, but its repro shrank onto an open marks bug |
+| #1777 | not re-found | reusing a number needs a hand edit below the mark, or #1782's positional rebuilders |
+| #1741 | unreachable | a base scene's Apply undo; the harness has one scene |
+
 ## Unity parity
 
 The top note makes Unity the reference for every prefab design choice. This matrix measures how far Modoki is
@@ -1854,9 +1943,15 @@ the file.**
   vanished on the refresh). Both read every prefab a file EXPANDS (`expandedPrefabRefs`:
   rows, and the reference nodes rows add, in `added` or `nestedStructure`), never trait
   data — a spawner trait's `prefab` field is not nesting. A SCENE may hold such a nesting; only a file may not. A `_stack` of
-  prefab GUIDs in the instantiate path is the backstop (an on-disk cycle can never
-  hang the loader). Because a prefab can never transitively contain itself,
-  refreshing every instance of one source is order-independent.
+  prefab GUIDs in the instantiate path is meant as the backstop. Because a prefab is meant never to contain itself
+  transitively, refreshing every instance of one source is order-independent. Both hold only once #1817 (below) is
+  fixed.
+  ⚠️ **Open, #1817 (a crash, found by #1789's fuzzer): neither layer reaches a reference node folded into a nested
+  row.** Drop the edited prefab under a member of a nested row, or under a layer-added node, in prefab edit, then save.
+  The save guard checks only self-rooted instance roots, `expandedPrefabRefs` does not walk `members`, and both
+  `spawnNestedInstance`s (editor and loader) drop `_stack`. So the file IS written with itself inside, and the save and
+  every later load of a scene holding it overflow the stack. Until that is fixed, "an on-disk cycle cannot hang the
+  loader" is false.
 - **Apply-to-prefab refresh preserves placement**: `refreshInstances` tears down
   and re-instantiates each instance under its *original* parent, so a nested
   instance (or any instance parented to a non-root entity) is not detached to the
