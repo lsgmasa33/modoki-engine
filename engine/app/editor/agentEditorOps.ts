@@ -58,7 +58,7 @@ import {
   restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, partOfInstanceRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
-  collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys, effectiveDefaults, DEFAULT_OVERRIDES_NOTE, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, placedPrefabPath, placedPrefabRefusal, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
@@ -3506,7 +3506,11 @@ export function registerEditorAgentOps(): void {
       // What applying EVERY key at its default does (#1736): ONE dry run of that Apply, so an effect that exists only across
       // keys (two frames writing one template field — a conflict; U13's reverts) is said here as the dialog says it. Another
       // target's effect: `apply` with `dryRun: true`.
-      const plan = await previewApply(ctx.rootInstanceId, new Set([...keys.all, ...keys.nested]));
+      // Every key but the root's default overrides at their default targets, as `apply` without `keys` takes them (#1831,
+      // Unity's Apply All).
+      const leave = effectiveDefaults(keys.defaultOverrides, Object.fromEntries(Object.entries(targets).map(([k, t]) => [k, t.defaultTarget])),
+        ctx.source, (g) => (isGuid(g) ? resolveRef(g) : undefined));
+      const plan = await previewApply(ctx.rootInstanceId, new Set([...keys.all, ...keys.nested].filter((k) => !leave.has(k))));
       // Keyed by key, without the target: that is `targets[key].defaultTarget` already, and a guid per key crossed the
       // response cap at 100 nested keys (#1736: 61.5k chars, against 53.6k before and a 60k cap).
       const effects = Object.fromEntries(plan.effects.map((e) => {
@@ -3525,6 +3529,8 @@ export function registerEditorAgentOps(): void {
         ...(keys.unaddressableAdded > 0
           ? { note: `${keys.unaddressableAdded} added subtree(s) have no guid yet and are NOT listed in keys.added — save the scene (modoki_save_all) to make them addressable.` }
           : {}),
+        // `keys.defaultOverrides` ARE in `keys.all`, but `effects` above and an apply/revert without `keys` leave them.
+        ...(leave.size ? { defaultOverridesNote: DEFAULT_OVERRIDES_NOTE } : {}),
       };
     }
     if (which === 'apply' || which === 'revert') {
@@ -3592,8 +3598,30 @@ export function registerEditorAgentOps(): void {
         }
         keySet = new Set(p.keys);
       } else {
-        keySet = new Set(actOn); // omitted ⇒ act on everything
+        // Omitted ⇒ act on everything but the root's default overrides (#1831): "Using Apply All or Revert All on a Prefab
+        // instance will not affect default overrides" (Unity). Named in `keys` — or given its own entry in `targets` — one
+        // is acted on like any other. Default-ness is decided at the key's TARGET (`effectiveDefaults`): a nested
+        // instance's root placement sent into the prefab that contains it is an ordinary override there (Unity). Revert
+        // has no target, and `targets` is Apply's alone: a revert handed apply's parameters must not revert the placement.
+        const namedInTargets = new Set(verb === 'apply' ? Object.keys(p.targets ?? {}).map((k) => canonicalOverrideKey(k, prefab)) : []);
+        const defaultTargets = verb === 'apply' ? applyTargetOptions(ctx.rootInstanceId, prefab, available.defaultOverrides) : new Map() as ReturnType<typeof applyTargetOptions>;
+        const leave = effectiveDefaults(available.defaultOverrides,
+          Object.fromEntries(available.defaultOverrides.map((k) => [k, verb === 'apply' ? p.target ?? defaultTargets.get(k)?.defaultTarget : undefined])),
+          ctx.source, (g) => (isGuid(g) ? resolveRef(g) : undefined));
+        keySet = new Set(actOn.filter((k) => !leave.has(k) || namedInTargets.has(canonicalOverrideKey(k, prefab))));
+        // What is left to DO: Apply cannot write a template-excluded field (below), so a root in a Hierarchy folder whose
+        // other overrides are all default overrides has nothing to apply either (review: it answered "nothing was written
+        // — it may have stopped being a prefab instance").
+        const excludedSet = new Set(verb === 'apply' ? available.applyExcluded : []);
+        if (keySet.size < actOn.length && [...keySet].every((k) => excludedSet.has(k))) {
+          throw new OpRefusal('REFUSED_BY_OP',
+            `prefab ${verb}: this instance's only ${verb === 'apply' ? 'applicable ' : ''}overrides are its root's default overrides (${actOn.filter((k) => !keySet.has(k)).join(', ')}). ${DEFAULT_OVERRIDES_NOTE}`,
+            { options: actOn.filter((k) => !excludedSet.has(k)) });
+        }
       }
+      // What an omitted `keys` left out, reported rather than dropped without a word.
+      const defaultsLeft = p.keys ? [] : actOn.filter((k) => !keySet.has(k));
+      const defaultsOut = defaultsLeft.length ? { defaultOverridesLeft: defaultsLeft, defaultOverridesNote: DEFAULT_OVERRIDES_NOTE } : {};
 
       if (which === 'apply') {
         // Some override keys are REVERTABLE but not APPLYABLE: a field kept out of a written
@@ -3636,7 +3664,7 @@ export function registerEditorAgentOps(): void {
         if (p.dryRun) {
           const plan = await previewApply(ctx.rootInstanceId, keySet, asked);
           return {
-            ok: true, dryRun: true, source: ctx.source,
+            ok: true, dryRun: true, source: ctx.source, ...defaultsOut,
             effects: plan.effects.map(effectOut),
             ...(plan.conflicts.length ? { conflicts: plan.conflicts } : {}),
             written: plan.files.map((f) => f.source),
@@ -3671,7 +3699,7 @@ export function registerEditorAgentOps(): void {
         const skippedKeys = [...excluded, ...notWritten.map((x) => x.key)];
         const applied = [...keySet].filter((k) => !skippedKeys.includes(k));
         return {
-          ok: true, source: result.source, appliedKeys: applied,
+          ok: true, source: result.source, appliedKeys: applied, ...defaultsOut,
           // skippedReason speaks for the excluded FIELDS only; every other key Apply did not write (a move it
           // cannot express, a tag it cannot add — #1491) carries its own reason in notWritten.
           ...(skippedKeys.length > 0 ? { skippedKeys } : {}),
@@ -3699,7 +3727,7 @@ export function registerEditorAgentOps(): void {
         throw new Error(`prefab revert: revertOverridesSelective returned nothing for entity ${entityId} — it stopped being a prefab instance, or the prefab source could not be re-loaded for the rebuild (see the editor console for the [Prefab] warning).`);
       }
       // revert is live-only — the prefab FILE is untouched, matching instantiate/detach.
-      return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], saved: false };
+      return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], ...defaultsOut, saved: false };
     }
     // ── Prefab-edit mode (#125) ──
     // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a

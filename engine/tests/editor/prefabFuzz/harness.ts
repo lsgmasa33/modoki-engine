@@ -291,6 +291,23 @@ export function placeholderGuids(): Set<string> {
   return new Set(getAllEntities().filter((e) => e.guid && unresolvedRefOf(findEntity(e.id) as never)).map((e) => e.guid!));
 }
 
+const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
+
+/** The guids a live Missing Prefab placeholder's RECORD holds (the nodes the scene added under it, its rows) that name no
+ *  live entity: what a respawn as a placeholder took in instead of spawning. A delete's undo does that in the SAME world
+ *  (hunt seed 6356): a scene entity moved under an instance of a trashed prefab comes back inside the placeholder's
+ *  record, not live, so the stack's entries recorded against it refuse (owner ruling R). */
+export function swallowedGuids(): Set<string> {
+  const all = getAllEntities();
+  const live = new Set(all.map((e) => e.guid).filter(Boolean));
+  const out = new Set<string>();
+  for (const e of all) {
+    const ref = e.guid ? unresolvedRefOf(findEntity(e.id) as never) : undefined;
+    for (const g of ref ? JSON.stringify(ref.record).match(GUID_RE) ?? [] : []) if (!live.has(g)) out.add(g);
+  }
+  return out;
+}
+
 /** Every nested row a live frame's record says its expansion could NOT expand (#1790 ruling D, #1812: the child prefab
  *  was not there to expand), keyed `<frame root guid>:<localId>`. A world swap that adds one has dropped the rows that
  *  nested frame held, as the loader does by design when the prefab is gone (#1849). */

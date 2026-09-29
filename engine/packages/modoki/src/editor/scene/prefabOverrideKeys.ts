@@ -239,6 +239,12 @@ export interface InstanceOverrideListing {
    *  Real overrides: reverting one is meaningful (reset this instance's folder back to the base). But Apply `continue`s
    *  past them without counting them, so a surface offering Apply must not offer these (`listingFor`, #1661). */
   applyExcluded: string[];
+  /** The instance ROOT's DEFAULT OVERRIDES (Unity's `PrefabUtility.IsDefaultOverride`, #1831 hub ruling "copy Unity"):
+   *  its name, sibling order, local position and rotation, and a UI root's layout rect ({@link isDefaultOverrideField}).
+   *  Listed like any other key and applied or reverted when named ALONE, but Apply All and Revert All leave them out
+   *  ({@link effectiveDefaults}): "Using Apply All or Revert All on a Prefab instance will not affect default overrides". A
+   *  subset of `entities`' keys. */
+  defaultOverrides: string[];
   /** Count of added subtrees that could NOT be given an addressable key because the live
    *  entity has no guid yet (`EntityAttributes.guid` is minted lazily — an entity created in
    *  this session and never saved has `''`).
@@ -252,13 +258,39 @@ export interface InstanceOverrideListing {
   unaddressableAdded: number;
 }
 
+/** Unity's default overrides, as Modoki's fields (#1831). Unity: the root GameObject's name, and the root Transform's
+ *  localPosition, localRotation (+ its Euler hint) and rootOrder — NOT its scale — plus, on a RectTransform root,
+ *  anchoredPosition, sizeDelta, anchorMin/Max and pivot. Modoki stores rotation as Euler, and a UI entity has no
+ *  Transform: its rect is `UIAnchor` (the anchor mode is anchorMin/Max, the insets are anchoredPosition, the pivot is the
+ *  pivot) plus `UIElement`'s size (sizeDelta) and rotation (the UI root's localRotation). */
+const DEFAULT_OVERRIDE_FIELDS: ReadonlySet<string> = new Set([
+  'EntityAttributes.name', 'EntityAttributes.sortOrder',
+  'Transform.x', 'Transform.y', 'Transform.z', 'Transform.rx', 'Transform.ry', 'Transform.rz',
+  'UIAnchor.anchor', 'UIAnchor.pivotX', 'UIAnchor.pivotY',
+  'UIAnchor.top', 'UIAnchor.topUnit', 'UIAnchor.left', 'UIAnchor.leftUnit',
+  'UIAnchor.right', 'UIAnchor.rightUnit', 'UIAnchor.bottom', 'UIAnchor.bottomUnit',
+  'UIElement.width', 'UIElement.widthUnit', 'UIElement.height', 'UIElement.heightUnit', 'UIElement.rotation',
+]);
+
+/** Is `trait.field` one of Unity's default overrides WHEN it is on an instance's root? Only there: the same field on a
+ *  member is an ordinary override, and so is a nested instance's root edited from the outer instance, which Unity says
+ *  "is not a default override if applying to A, but is if applying to B" (`PrefabUtility.GetApplyTargets`) — the nested
+ *  key applies into the outer prefab by default. */
+export function isDefaultOverrideField(trait: string, field: string): boolean {
+  return DEFAULT_OVERRIDE_FIELDS.has(`${trait}.${field}`);
+}
+
 export function collectInstanceOverrideListing(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideListing {
   const { entities, addedTags } = collectInstanceOverrideTree(rootInstanceId, prefab);
   const applyExcluded: string[] = [];
+  const defaultOverrides: string[] = [];
   for (const e of entities) {
     for (const t of e.traits) {
       const meta = getTraitByName(t.trait);
-      for (const f of t.fields) if (meta && isTemplateExcludedField(meta, f.field)) applyExcluded.push(f.key);
+      for (const f of t.fields) {
+        if (meta && isTemplateExcludedField(meta, f.field)) applyExcluded.push(f.key);
+        if (e.ecsId === rootInstanceId && isDefaultOverrideField(t.trait, f.field)) defaultOverrides.push(f.key);
+      }
     }
   }
 
@@ -316,7 +348,7 @@ export function collectInstanceOverrideListing(rootInstanceId: number, prefab: P
     for (const k of own) nested.push(nestedKeyRef(prefab, chain, k, getCachedPrefabSync));
   }
 
-  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, unaddressableAdded };
+  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, defaultOverrides, unaddressableAdded };
 }
 
 /** What a surface offering `mode` lists: Apply leaves out the fields it cannot write (#1661) — listed, they were
@@ -339,6 +371,36 @@ export function listingKeys(l: InstanceOverrideListing): string[] {
     ...l.addedTags.map((n) => n.key), ...l.moved.map((n) => n.key), ...l.nested,
   ];
 }
+
+/** Is `key` a default override when applied to `target`? Only where it is the ROOT of what it is applied to (#1831
+ *  review): Unity — the position of a nested prefab B "is not a default override if applying to A, but is if applying to
+ *  B" (`PrefabUtility.GetApplyTargets`). `target` is an apply target as the surfaces spell it: `'instance'` or `'frame'`
+ *  (for the listed instance's own root rows, both its own prefab), a prefab guid or path, or undefined for Revert, which
+ *  has no target and acts on the instance against its own prefab. `resolve` maps a guid to its path. */
+export function isDefaultOverrideAt(
+  key: string, defaults: ReadonlySet<string>, target: string | undefined, ownSource: string,
+  resolve: (guid: string) => string | undefined,
+): boolean {
+  if (!defaults.has(key)) return false;
+  return target === undefined || target === 'instance' || target === 'frame' || target === ownSource || resolve(ownSource) === target;
+}
+
+/** The listing's default overrides that ARE default overrides at their chosen targets (`choice`: key → target; a key
+ *  with none — Revert, or no pick yet — is at its own prefab): what Apply All and Revert All leave out (#1831, Unity).
+ *  The ONE set every surface reads — the dialog's initial check, its group checkboxes and badges, the agent op's omitted
+ *  `keys` and its `overrides` preview, the fuzzer's Apply All — so none of them can disagree about a key. */
+export function effectiveDefaults(
+  defaultOverrides: readonly string[], choice: Readonly<Record<string, string | undefined>>, ownSource: string,
+  resolve: (guid: string) => string | undefined,
+): Set<string> {
+  const all = new Set(defaultOverrides);
+  return new Set(defaultOverrides.filter((k) => isDefaultOverrideAt(k, all, choice[k], ownSource, resolve)));
+}
+
+/** What every surface says about a default override it left out of an Apply All or a Revert All. */
+export const DEFAULT_OVERRIDES_NOTE = "The instance root's name, sort order, position, rotation and UI rect are default overrides, as in Unity: "
+  + 'Apply All and Revert All leave them at the instance\'s own prefab. Name one in `keys` or `targets` (or check its own row '
+  + 'in the dialog) to apply or revert it; sent by `target` into a prefab that contains the instance, it is an ordinary override.';
 
 // ── Flat key enumeration, for a caller that only needs the key SET — the agent `prefab overrides` / apply / revert op ──
 
@@ -366,6 +428,9 @@ export interface InstanceOverrideKeys {
   /** {@link InstanceOverrideListing.applyExcluded} — a subset of `fields`, and in `all`: surfacing the set is what lets
    *  the agent's apply report honestly instead of echoing the caller's request back as `appliedKeys`. */
   applyExcluded: string[];
+  /** {@link InstanceOverrideListing.defaultOverrides} — a subset of `fields`, and in `all`: the agent op leaves them out
+   *  of an apply or revert whose `keys` it was not given (#1831, Unity's Apply All / Revert All). */
+  defaultOverrides: string[];
   /** {@link InstanceOverrideListing.unaddressableAdded}. */
   unaddressableAdded: number;
 }
@@ -381,7 +446,7 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   return {
     fields, added, removedEntities, removedTraits, addedTags, moved,
     all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
-    nested: l.nested, applyExcluded: l.applyExcluded, unaddressableAdded: l.unaddressableAdded,
+    nested: l.nested, applyExcluded: l.applyExcluded, defaultOverrides: l.defaultOverrides, unaddressableAdded: l.unaddressableAdded,
   };
 }
 

@@ -5,7 +5,7 @@ import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/edito
 import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
-import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, worldTree, type Fixture } from './harness';
+import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
 import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory } from './checks';
 import type { FuzzBackend } from './backend';
@@ -66,7 +66,9 @@ async function setupNest(f: Fixture): Promise<void> {
  *    (owner ruling R, #1819, 2026-09-29): an undo against it refuses and is dropped, by design. Or the swap left a NESTED
  *    frame of a missing prefab unexpanded (#1790 ruling D: the loader records the row and spawns nothing under it), so
  *    the entities the stack recorded inside it are gone rather than placeholders: `require` refuses them the same way
- *    ("is no longer in the scene"), and it is the same ruling (#1849; work-ai3 hunt seeds 6191, 6356).
+ *    ("is no longer in the scene"), and it is the same ruling (#1849; work-ai3 hunt seeds 6191, 6356). Or, in the walk to
+ *    the ends, a same-world step (a delete's undo) respawned a placeholder whose record took in an entity the segment had
+ *    live (#1831, seed 6356).
  *  - `assetDelete`: a Move to Trash of a prefab something the walk must restore still REFERENCES — the scene at the
  *    segment's start or now, or a prefab file then or now (`trashedPrefabReferenced`). It is not undoable (#1868, owner
  *    ruling D2; Unity: "You cannot undo the delete assets action."), so the file stays gone for the walk, and the stack's
@@ -77,7 +79,8 @@ async function setupNest(f: Fixture): Promise<void> {
  *    redo's refusal reads as one in a clean segment — a false finding a hunt would show, never a hidden one. */
 export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'assetDelete';
 
-interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: TaintCause | null }
+/** `live`: every guid the segment has had live (its start, and after each step) — what the stack's entries can name. */
+interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: TaintCause | null; live: Set<string> }
 
 /** Across the process, per cause: how many ops tainted a segment, and how many checks a taint turned off (keyed
  *  `<cause>: <check>`, attributed to the segment's FIRST cause). The hunt prints both. */
@@ -104,8 +107,37 @@ const prefabBytes = (be: FuzzBackend) => {
   return out;
 };
 
+/** {@link RunState.lastPrefabs}, brought up to date: each prefab the editor holds now, by document id. */
+function recordPrefabs(st: RunState): void {
+  for (const [p, t] of prefabBytes(st.be)) {
+    let id: string | undefined;
+    try { id = (JSON.parse(t) as { id?: string }).id; } catch { /* unreadable: not a document to restore */ }
+    if (id) st.lastPrefabs!.set(id, [p, t]);
+  }
+}
+
+function noteLive(seg: Segment): void {
+  if (!editing()) for (const e of getAllEntities()) if (e.guid) seg.live.add(e.guid);
+}
+
+/** Owner ruling R, reached in the SAME world (hunt seed 6356): a step that respawned a Missing Prefab placeholder whose
+ *  record took in an entity the segment had live. That entity is no longer in the scene, so an undo recorded against it
+ *  refuses, by design. `before`: {@link swallowedGuids} before the step. */
+function swallowedRecorded(seg: Segment, before: ReadonlySet<string>): boolean {
+  return !editing() && newlySwallowed(seg.live, before, swallowedGuids());
+}
+
+/** The decision itself, pure: a guid a placeholder swallowed during the step (`now`, not `before`) that the segment had
+ *  live. Neither half alone: a placeholder that took in only guids nothing live ever had (a template row's, an asset's),
+ *  or one already swallowed before the step, does not taint, and a taint forgives every refusal after it. */
+export function newlySwallowed(live: ReadonlySet<string>, before: ReadonlySet<string>, now: ReadonlySet<string>): boolean {
+  return [...now].some((g) => !before.has(g) && live.has(g));
+}
+
 async function segmentHere(be: FuzzBackend): Promise<Segment> {
-  return { scene: editing() ? null : await serializeScene(), prefabs: prefabBytes(be), tainted: null };
+  const seg: Segment = { scene: editing() ? null : await serializeScene(), prefabs: prefabBytes(be), tainted: null, live: new Set() };
+  noteLive(seg);
+  return seg;
 }
 
 /** An Assets file op leaves undo (#1868, owner ruling D2), so the walk to the segment's start cannot put it back: the
@@ -154,8 +186,10 @@ async function undoIdentity(be: FuzzBackend, seg: Segment, created: readonly str
   const end = { scene: await serializeScene(), prefabs: prefabBytes(be) };
   let steps = 0;
   for (; steps < 400; steps++) {
+    const swallowedBefore = editing() ? new Set<string>() : swallowedGuids();
     const r = await undoStep('undo');
     await settle();
+    if (swallowedRecorded(seg, swallowedBefore)) taint(seg, 'rulingR');
     if (r.failed && !r.failed.refused) return { check: 'undo threw', detail: `${r.failed.label}: ${r.failed.error}` };
     if (r.refused || r.failed) {
       if (seg.tainted) { skipped(seg, 'undo refusal forgiven (rest of the walk not run)'); return null; }
@@ -202,8 +236,8 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   const trace: string[] = [];
   consoleErrors.length = 0;
   const f = await startRun(be, setupNest, JSON.stringify(ops));
-  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, prefabBytes: new Map(), created: [] };
-  for (const [p, t] of be.snapshot()) if (p.endsWith('.prefab.json')) st.prefabBytes!.set(p, t);
+  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, lastPrefabs: new Map(), created: [] };
+  recordPrefabs(st);
   const history: LocalIdHistory = new Map();
   /** Every file content the run has had, at any path: a write of one of these is a verbatim carry (an undo's restore, a
    *  move), which I15 exempts. */
@@ -258,7 +292,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (errors.length) return fail(i, label, { check: 'console.error', detail: errors[0].slice(0, 300) });
 
     const after = be.snapshot();
-    for (const [p, t] of after) if (p.endsWith('.prefab.json')) st.prefabBytes!.set(p, t);
+    recordPrefabs(st);
     for (const [p, t] of after) {
       if (before.get(p) === t) continue;
       // A write the editor made of content no file in the run has had before.
@@ -286,16 +320,20 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     }
     // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
     // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
-    // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap:
-    // a same-world op that makes a placeholder (a duplicate or paste of one, a delete's undo, a drop whose nested
-    // reference is missing) changes no recorded entity's kind, and tainting there would hide a false refusal for the
-    // rest of the segment (#1819 close-out review). The per-step I6/I7 checks run either way.
+    // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap
+    // here: a same-world placeholder (a duplicate or paste of one, a drop whose nested reference is missing) changes no
+    // recorded entity's kind, and tainting there would hide a false refusal for the rest of the segment (#1819 close-out
+    // review). The one same-world exception, a delete's undo whose placeholder swallows an entity the segment had live,
+    // is taken in the WALK (`swallowedRecorded`, hunt seed 6356). ⚠️ Known limit: an `undo` op here reaching it reads as
+    // a refusal in a clean segment: a false finding a hunt would show, never a hidden one (no seed reaches it, so it is
+    // not built). The per-step I6/I7 checks run either way.
     // ⚠️ Taken BEFORE the op's own refusal is judged (#1862): one `undo` op runs up to three steps, so its first step can
     // swap (an Apply's undo reloads its snapshot) and its second refuse on what that swap left unexpanded — ruling R inside
     // one op, which judged first read as a refusal in a clean segment (seed 6191). Sound either way round: a refused step
     // changes nothing, so every swap this op made came before its refusal.
     const swapped = getCurrentWorld() !== worldBefore;
     if (swapped && ([...placeholderGuids()].some((g) => !placeholdersBefore.has(g)) || [...unexpandedRows()].some((k) => !unexpandedBefore.has(k)))) taint(seg, 'rulingR');
+    noteLive(seg);
     if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {
       if (seg.tainted) skipped(seg, `${op.kind} op refusal forgiven`);
       else failures.push({ check: `${op.kind} refused in a clean segment`, detail: st.note ?? '' });

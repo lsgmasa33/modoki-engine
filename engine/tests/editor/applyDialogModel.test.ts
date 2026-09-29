@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
   applyPress, queuedPress, shownPlan, previewRequestKey, staysOpen,
-  previewWorldKey, subscribePreviewWorld,
+  previewWorldKey, subscribePreviewWorld, groupToggle, groupState, retargetChecks,
 } from '../../packages/modoki/src/editor/panels/applyDialogModel';
 import { pushAction, clearHistory, undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
@@ -149,6 +149,42 @@ describe('applyDialogModel', () => {
     // Mutation: `hasChoice` answers `>= 1` — a single-target move shows a picker with one entry.
     expect([hasChoice(options, 'a.Transform.x'), hasChoice(options, '~moved.b')]).toEqual([true, false]);
     expect(chosenOption(setTarget(initialTargets(options), options, 'a.Transform.x', DOOR), options, 'a.Transform.x')?.name).toBe('Door');
+  });
+
+  it('#1831: checking a group leaves the root\'s default overrides, unless they are all it holds; unchecking clears them', () => {
+    const defaults = new Set(['r.Transform.x', 'r.Transform.rx']);
+    const tf = ['r.Transform.x', 'r.Transform.sx', 'r.Transform.rx'];
+    // Mutation: check every key of the group — the root's Transform checkbox checks x, which Apply All leaves.
+    expect([...groupToggle(new Set(), tf, defaults, 'on')]).toEqual(['r.Transform.sx']);
+    // Mutation: check only the rest — a component holding only default overrides gets a checkbox that does nothing.
+    expect([...groupToggle(new Set(), ['r.Transform.x', 'r.Transform.rx'], defaults, 'on')]).toEqual(['r.Transform.x', 'r.Transform.rx']);
+    // Mutation: uncheck only the rest — "leave this component out" leaves a checked x in, to be applied (review #5).
+    expect([...groupToggle(new Set(['r.Transform.x', 'r.Transform.sx', 'a.T.y']), tf, defaults, 'off')]).toEqual(['a.T.y']);
+  });
+
+  it('#1831: a group reads over what checking it checks, and "mixed" (never "off") while a default override in it is checked', () => {
+    const defaults = new Set(['r.Transform.x']);
+    const tf = ['r.Transform.x', 'r.Transform.sx'];
+    expect(groupState(new Set(['r.Transform.sx']), tf, defaults)).toBe('on'); // as it starts
+    // Mutation: `return 'off'` when none of the rest is on — the x the user checked hides under an "off" box (review #5).
+    expect(groupState(new Set(['r.Transform.x']), tf, defaults)).toBe('mixed');
+    expect(groupState(new Set(), tf, defaults)).toBe('off');
+    expect(groupState(new Set(['r.Transform.x']), ['r.Transform.x'], defaults)).toBe('on');
+  });
+
+  it('#1831: a target change checks a default override it turns ordinary, unchecks one it turns back, and keeps every other check', () => {
+    const OWN = 'p-guid'; const OUTER = 'o-guid';
+    const none = (): undefined => undefined;
+    const d = ['r.Transform.x'];
+    // Mutation: ignore the target (`isDefaultOverrideAt` true for any) — sending the nested root's placement to the
+    // OUTER prefab leaves it unchecked, though Unity: it "is not a default override if applying to A" (review #2).
+    expect([...retargetChecks(new Set(['m.T.y']), d, { 'r.Transform.x': OWN }, { 'r.Transform.x': OUTER }, OWN, none)]).toEqual(['m.T.y', 'r.Transform.x']);
+    expect([...retargetChecks(new Set(['r.Transform.x']), d, { 'r.Transform.x': OUTER }, { 'r.Transform.x': OWN }, OWN, none)]).toEqual([]);
+    // Mutation: re-set every default override from the new target — "Apply all to" its own prefab unchecks an x the user
+    // checked on purpose (second review #3).
+    expect([...retargetChecks(new Set(['r.Transform.x']), d, { 'r.Transform.x': OWN }, { 'r.Transform.x': OWN }, OWN, none)]).toEqual(['r.Transform.x']);
+    // A path spelling of the own prefab is the own prefab.
+    expect([...retargetChecks(new Set(), d, { 'r.Transform.x': OUTER }, { 'r.Transform.x': '/p.prefab.json' }, OWN, (g) => (g === OWN ? '/p.prefab.json' : undefined))]).toEqual([]);
   });
 
   it('the request carries the CHECKED keys\' targets only', () => {

@@ -23,15 +23,18 @@ import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideListing, listingFor, listingKeys, applyOutcomeNotice,
+  collectInstanceOverrideListing, listingFor, listingKeys, effectiveDefaults, applyOutcomeNotice,
   type EntityOverrideNode, type InstanceOverrideListing,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
 import {
-  initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, filesWritten, toApplyTargets, rowView, applyBlocked,
+  initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, groupToggle, groupState, retargetChecks, filesWritten, toApplyTargets, rowView, applyBlocked,
   applyPress, queuedPress, shownPlan, type KeptPress, previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice,
 } from './applyDialogModel';
+
+/** The dialog's targets are prefab guids, as is the instance's source: no path to resolve. */
+const noResolve = (): undefined => undefined;
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
 // of this file (predating the extraction) doesn't need a wholesale rename.
@@ -40,7 +43,7 @@ type EntityNode = EntityOverrideNode;
 type LoadState =
   | { kind: 'loading' }
   | { kind: 'error'; message: string }
-  | ({ kind: 'ready' } & InstanceOverrideListing);
+  | ({ kind: 'ready'; source: string } & InstanceOverrideListing);
 
 function stringifyValue(v: unknown): string {
   if (typeof v === 'number') {
@@ -186,13 +189,17 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       // cannot write (#1661) and takes the nested instances' own edits (U14, #1693); Revert the reverse.
       const listing = listingFor(collectInstanceOverrideListing(rootInstanceId, prefab), mode);
       if (cancelled) return;
-      const allKeys = new Set(listingKeys(listing));
-      setChecked(allKeys);
-      const opts = mode === 'apply' ? applyTargetOptions(rootInstanceId, prefab, [...allKeys]) : new Map<string, KeyTargets>();
+      const allKeys = listingKeys(listing);
+      const opts = mode === 'apply' ? applyTargetOptions(rootInstanceId, prefab, allKeys) : new Map<string, KeyTargets>();
+      const choice0 = initialTargets(opts);
+      // Checked to start is the dialog's Apply All / Revert All, which leaves the root's default overrides alone at their
+      // default target (#1831, Unity): listed, unchecked, each applied or reverted only by its own checkbox.
+      const leave = effectiveDefaults(listing.defaultOverrides, choice0, source, noResolve);
+      setChecked(new Set(allKeys.filter((k) => !leave.has(k))));
       setTargetOpts(opts);
-      setChoice(initialTargets(opts));
+      setChoice(choice0);
       setCollapsed(new Set());
-      setLoadState({ kind: 'ready', ...listing });
+      setLoadState({ kind: 'ready', source, ...listing });
     })();
     return () => { cancelled = true; };
   }, [active, subject]);
@@ -227,21 +234,11 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       return out;
     });
   };
-  const toggleMany = (keys: string[], next: 'on' | 'off') => {
-    setChecked((prev) => {
-      const out = new Set(prev);
-      for (const k of keys) {
-        if (next === 'on') out.add(k); else out.delete(k);
-      }
-      return out;
-    });
-  };
-  const stateOf = (keys: string[]): 'on' | 'off' | 'mixed' => {
-    let on = 0;
-    for (const k of keys) if (checked.has(k)) on++;
-    if (on === 0) return 'off';
-    if (on === keys.length) return 'on';
-    return 'mixed';
+  /** A target change, from a row's picker or "Apply all to …": the new choice, and the default overrides it turns into
+   *  ordinary overrides (checked) or back into default overrides (unchecked); every other check stays (#1831). */
+  const retarget = (next: TargetChoice) => {
+    if (loadState.kind === 'ready') setChecked((c) => retargetChecks(c, loadState.defaultOverrides, choice, next, loadState.source, noResolve));
+    setChoice(next);
   };
   const toggleCollapsed = (id: string) => {
     setCollapsed((prev) => {
@@ -330,7 +327,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         {hasChoice(targetOpts, key) && (
           <select
             value={o.target}
-            onChange={(e) => setChoice((c) => setTarget(c, targetOpts, key, e.target.value))}
+            onChange={(e) => retarget(setTarget(choice, targetOpts, key, e.target.value))}
             data-ui-id={`prefab.dialog.target.${key}`} data-ui-kind="select" data-ui-label={`target of ${key}`}
             style={{ background: '#22223a', color: '#ddd', border: '1px solid #444', fontFamily: 'monospace', fontSize: 11, marginRight: 6 }}
           >
@@ -368,11 +365,13 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const INDENT = 16;
 
   if (!active) return null;
+  // The root's default overrides AT their current targets (#1831): what the checkboxes, their states and the badge read.
+  const defaultOverrides = loadState.kind === 'ready' ? effectiveDefaults(loadState.defaultOverrides, choice, loadState.source, noResolve) : new Set<string>();
   const renderEntityNode = (fnode: ForestNode<EntityNode>): React.ReactElement => {
     const e = fnode.node;
     const d = fnode.depth;
     const entityKeys = e.traits.flatMap((t) => t.fields.map((f) => f.key));
-    const entityState = stateOf(entityKeys);
+    const entityState = groupState(checked, entityKeys, defaultOverrides);
     const entityCollapsed = collapsed.has(`e:${e.localId}`);
     return (
       <div key={e.localId} style={{ marginBottom: 4 }}>
@@ -381,14 +380,14 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             onClick={() => toggleCollapsed(`e:${e.localId}`)}
             style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
           >{entityCollapsed ? '▸' : '▾'}</span>
-          <TriCheckbox state={entityState} onChange={(next) => toggleMany(entityKeys, next)}
+          <TriCheckbox state={entityState} onChange={(next) => setChecked((c) => groupToggle(c, entityKeys, defaultOverrides, next))}
             dataUiId={`prefab.dialog.entity.${e.localId}`} dataUiLabel={e.name} />
           <span style={{ color: '#ddd', fontWeight: 'bold' }}>{e.name}</span>
           <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {e.localId}</span>
         </div>
         {!entityCollapsed && e.traits.map((t) => {
           const traitKeys = t.fields.map((f) => f.key);
-          const traitState = stateOf(traitKeys);
+          const traitState = groupState(checked, traitKeys, defaultOverrides);
           const traitCollapsed = collapsed.has(`e:${e.localId}:t:${t.trait}`);
           return (
             <div key={t.trait}>
@@ -397,7 +396,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   onClick={() => toggleCollapsed(`e:${e.localId}:t:${t.trait}`)}
                   style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
                 >{traitCollapsed ? '▸' : '▾'}</span>
-                <TriCheckbox state={traitState} onChange={(next) => toggleMany(traitKeys, next)}
+                <TriCheckbox state={traitState} onChange={(next) => setChecked((c) => groupToggle(c, traitKeys, defaultOverrides, next))}
                   dataUiId={`prefab.dialog.entity.${e.localId}.trait.${t.trait}`} dataUiLabel={t.trait} />
                 <span style={{ color: '#5dade2' }}>{t.trait}</span>
               </div>
@@ -409,6 +408,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                     dataUiId={`prefab.dialog.item.${f.key}`} dataUiLabel={f.field}
                   />
                   <span style={{ color: '#bbb', minWidth: 110 }}>{f.field}</span>
+                  {defaultOverrides.has(f.key) && (
+                    <span title="A default override (as in Unity): Apply All and Revert All leave it. Check it here to apply or revert it."
+                      style={{ color: '#888', fontSize: 10, marginRight: 6 }}>default</span>
+                  )}
                   {isRevert ? (
                     <>
                       <span style={{ color: '#888', textDecoration: 'line-through' }}>{stringifyValue(f.current)}</span>
@@ -448,7 +451,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             Apply all to{' '}
             <select
               value=""
-              onChange={(e) => { if (e.target.value) setChoice((c) => setAllTargets(c, targetOpts, targetOpts.keys(), e.target.value)); }}
+              onChange={(e) => {
+                if (!e.target.value || loadState.kind !== 'ready') return;
+                retarget(setAllTargets(choice, targetOpts, targetOpts.keys(), e.target.value));
+              }}
               data-ui-id="prefab.dialog.target.all" data-ui-kind="select" data-ui-label="apply all to"
               style={{ background: '#22223a', color: '#ddd', border: '1px solid #444', fontFamily: 'monospace', fontSize: 11 }}
             >

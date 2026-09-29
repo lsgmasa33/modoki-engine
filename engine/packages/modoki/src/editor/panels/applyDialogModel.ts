@@ -12,8 +12,51 @@ import type { KeyTargets, ApplyTargetOption } from '../scene/prefabApplyOptions'
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
 import type { ApplyPreview, ApplyResult } from '../scene/prefabApply';
 import { describeEffect } from '../scene/prefabApplyEffects';
+import { effectiveDefaults } from '../scene/prefabOverrideKeys';
 import { getEditVersion, subscribeUndo } from '../undo/undoManager';
 import { getRunMode, onRunModeChange } from '../../runtime/core/playState';
+
+/** What checking an entity's or a component's checkbox checks (#1831): its keys WITHOUT the instance root's default
+ *  overrides (`defaultOverrides`: `effectiveDefaults`, at their current targets), as Unity applies a component's other properties and leaves those — or, when the group holds nothing else,
+ *  the default overrides themselves, since the checkbox would otherwise do nothing. A default override's own row always
+ *  toggles it: that is the per-property route Apply All and Revert All leave to the user. UNchecking a group clears every
+ *  key in it, a checked default override included: that is how a component is left out. */
+export function groupToggle(checked: ReadonlySet<string>, keys: readonly string[], defaultOverrides: ReadonlySet<string>, next: 'on' | 'off'): Set<string> {
+  const out = new Set(checked);
+  if (next === 'off') { for (const k of keys) out.delete(k); return out; }
+  const rest = keys.filter((k) => !defaultOverrides.has(k));
+  for (const k of rest.length ? rest : keys) out.add(k);
+  return out;
+}
+
+/** A group checkbox's state, read over the keys checking it would check — so a component whose ordinary fields are all
+ *  checked reads "on" while its default overrides sit unchecked, as they start — but "mixed", not "off", while a default
+ *  override inside it is checked on its own: "off" would hide a key that is going to be applied (#1831 review). */
+export function groupState(checked: ReadonlySet<string>, keys: readonly string[], defaultOverrides: ReadonlySet<string>): 'on' | 'off' | 'mixed' {
+  const rest = keys.filter((k) => !defaultOverrides.has(k));
+  const over = rest.length ? rest : keys;
+  const on = over.filter((k) => checked.has(k)).length;
+  if (on === 0) return keys.some((k) => checked.has(k)) ? 'mixed' : 'off';
+  return on === over.length ? 'on' : 'mixed';
+}
+
+/** `checked` after a target change (#1831 review): a key that STOPS being a default override (a nested instance's root
+ *  placement sent into the prefab that contains it) is checked, as Apply All to there takes it, and one that BECOMES one
+ *  is unchecked. Every other key keeps what the user set — "Apply all to" the target a checked default override already
+ *  has leaves it checked. The same for a row's own picker and for "Apply all to …". */
+export function retargetChecks(
+  checked: ReadonlySet<string>, defaultOverrides: readonly string[], before: TargetChoice, after: TargetChoice,
+  ownSource: string, resolve: (guid: string) => string | undefined,
+): Set<string> {
+  const was = effectiveDefaults(defaultOverrides, before, ownSource, resolve);
+  const now = effectiveDefaults(defaultOverrides, after, ownSource, resolve);
+  const out = new Set(checked);
+  for (const k of defaultOverrides) {
+    if (was.has(k) && !now.has(k)) out.add(k);
+    if (!was.has(k) && now.has(k)) out.delete(k);
+  }
+  return out;
+}
 
 /** key → the chosen target (a prefab guid). */
 export type TargetChoice = Readonly<Record<string, string>>;

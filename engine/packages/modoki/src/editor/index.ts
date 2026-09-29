@@ -110,7 +110,7 @@ export { commitPrefabWrite, commitPrefabWrites, prefabTextIsDocument, type Prefa
 // silently drift from each other (see prefabOverrideKeys.ts's header comment).
 export {
   fieldKey, addedKey, removedEntityKey, removedTraitKey, canonicalOverrideKey,
-  collectInstanceOverrideFields, collectInstanceOverrideKeys,
+  collectInstanceOverrideFields, collectInstanceOverrideKeys, effectiveDefaults, isDefaultOverrideAt, DEFAULT_OVERRIDES_NOTE,
   type FieldNode, type TraitNode, type EntityOverrideNode, type InstanceOverrideKeys,
 } from './scene/prefabOverrideKeys';
 export { applyTargetOptions, checkApplyTargets, type ApplyTargetOption, type KeyTargets } from './scene/prefabApplyOptions';

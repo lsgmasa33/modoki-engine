@@ -25,9 +25,9 @@ import {
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, createEntityWithUndo, planReparent, applyReparent,
   type EntityClipboard,
 } from '../../../packages/modoki/src/editor/undo/entityActions';
-import { collectInstanceOverrideKeys } from '../../../packages/modoki/src/editor/scene/prefabOverrideKeys';
+import { collectInstanceOverrideKeys, effectiveDefaults } from '../../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyTargetOptions } from '../../../packages/modoki/src/editor/scene/prefabApplyOptions';
-import { initialTargets, setAllTargets, toApplyTargets, applyBlocked } from '../../../packages/modoki/src/editor/panels/applyDialogModel';
+import { initialTargets, setAllTargets, toApplyTargets, applyBlocked, groupToggle, retargetChecks } from '../../../packages/modoki/src/editor/panels/applyDialogModel';
 import { applyToPrefabWithUndo } from '../../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../../../packages/modoki/src/editor/undo/revertPrefabUndo';
 import { undoStep, breakUndoCoalescing } from '../../../packages/modoki/src/editor/undo/undoManager';
@@ -37,7 +37,6 @@ import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCre
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
-import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, getCurrentWorld, type Fixture } from './harness';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import type { FuzzBackend } from './backend';
@@ -108,9 +107,11 @@ export interface RunState {
   /** What the round trip inside a save→reload op measured; the checks read it. `restored`: the same saved file reloaded
    *  with every deleted prefab put back, when the run deleted one (#1805). */
   roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> };
-  /** The last bytes the run saw at every prefab path (the runner records them after each step): what a deleted prefab's
-   *  restore puts back. */
-  prefabBytes?: Map<string, string>;
+  /** Every prefab DOCUMENT the run has seen, by id: the last path it had and the text the editor last held for it — the
+   *  file, or the document an undo parked for Save (#1868). The runner records them after each step. What a deleted
+   *  prefab's restore puts back: the document the live world was built on (hunt seed 7023: an Apply's undo is memory-only,
+   *  so its file still held the applied value), at the path it had last (7078: renamed, then trashed). */
+  lastPrefabs?: Map<string, [string, string]>;
   /** Set by an executor when an op could not run (nothing to choose, or the editor refused as the UI would show). */
   note?: string;
   /** Set by a prefab edit: whether it wrote the prefab (a discard changes no file the scene's undo cannot see). */
@@ -159,19 +160,12 @@ const pick = <T,>(u: number, arr: readonly T[]): T | undefined => (arr.length ? 
 const meta = (name: string) => getTraitByName(name)!;
 const noSelect = () => {};
 
-/** Every prefab DOCUMENT the run has seen that is in no file now (by id), with the last path and bytes it had. */
+/** Every prefab DOCUMENT the run has seen that is in no file now (by id), with the last path and text it had. One whose
+ *  last path another file holds now is left out: restored there, it would overwrite that file. */
 function deletedPrefabs(st: RunState): Array<[string, string]> {
   const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
   const present = new Set([...st.be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')).map(([, t]) => idOf(t)));
-  const out = new Map<string, [string, string]>();
-  for (const [p, t] of st.prefabBytes ?? []) {
-    const id = idOf(t);
-    if (!id || present.has(id) || st.be.read(p) !== undefined) continue;
-    // The path the manifest names for it wins over whichever path the map happened to list last (a rename and its undo
-    // leave both): restored elsewhere, the reload looks for it at the manifest's path and misses (close-out re-review).
-    if (!out.has(id) || resolveGuidToPath(id) === p) out.set(id, [p, t]);
-  }
-  return [...out.values()];
+  return [...(st.lastPrefabs ?? new Map<string, [string, string]>())].filter(([id, [p]]) => !present.has(id) && st.be.read(p) === undefined).map(([, entry]) => entry);
 }
 
 /** Prefab files on disk, sorted. */
@@ -225,12 +219,14 @@ function selectKeys(root: number, prefab: PrefabFile, mode: 'apply' | 'revert', 
   const keys = collectInstanceOverrideKeys(root, prefab);
   const all = mode === 'apply' ? [...keys.all, ...keys.nested] : [...keys.all];
   if (all.length === 0) return new Set();
-  if (u < 0.45) return new Set(all);
+  // The dialog's Apply All / Revert All: what it checks to start, which leaves the root's default overrides at their
+  // default target, the instance's own prefab (#1831). A later "Apply all to" re-checks them (`retargetChecks`, below).
+  if (u < 0.45) { const leave = effectiveDefaults(keys.defaultOverrides, {}, prefab.id ?? '', () => undefined); return new Set(all.filter((k) => !leave.has(k))); }
   const one = pick(u2, all)!;
   if (u < 0.7) {
-    // One component: every field key of the same member and trait (`<member>.<Trait>.<field>`).
+    // One component, as its checkbox toggles it: every field key of the same member and trait (`<member>.<Trait>.<field>`).
     const m = /^(.*)\.([A-Za-z0-9]+)\.[^.]+$/.exec(one);
-    if (m) return new Set(all.filter((k) => k.startsWith(`${m[1]}.${m[2]}.`)));
+    if (m) return groupToggle(new Set(), all.filter((k) => k.startsWith(`${m[1]}.${m[2]}.`)), new Set(keys.defaultOverrides), 'on');
   }
   return new Set([one]);
 }
@@ -396,7 +392,17 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         // guid made the choice differ between replays (review).
         const targets = [...new Set([...opts.values()].flatMap((t) => t.options.map((o) => o.target)))];
         const t = pick(u[4], targets);
-        if (t) choice = setAllTargets(choice, opts, sel, t);
+        if (t) {
+          choice = setAllTargets(choice, opts, sel, t);
+          // As the dialog: a default override that is an ordinary override at `t` (a nested instance's root placement sent
+          // into the prefab that contains it) is checked, and takes `t` (#1831). Its targets are read apart from `opts`,
+          // so the pick above draws from the same list it always did and recorded replays keep their meaning.
+          const defaults = collectInstanceOverrideKeys(root, prefab).defaultOverrides;
+          const dOpts = applyTargetOptions(root, prefab, defaults);
+          const d0 = initialTargets(dOpts);
+          const d1 = setAllTargets(d0, dOpts, defaults, t);
+          for (const k of retargetChecks(sel, defaults, d0, d1, source, () => undefined)) if (!sel.has(k)) { sel.add(k); choice = { ...choice, [k]: d1[k]! }; }
+        }
       }
       const targets = toApplyTargets(choice, sel);
       const preview = await previewApply(root, new Set(sel), targets);

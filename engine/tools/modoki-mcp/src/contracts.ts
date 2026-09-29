@@ -455,7 +455,9 @@ const DECLS: Record<string, Decl> = {
       + "member's minted nodeGuid (its localId only when the prefab predates format 5), so a key "
       + 'listed before a template re-save still names the same member after it; a localId-spelled '
       + 'key is still accepted. `apply`/`revert` act on ALL current overrides when '
-      + '`keys` is omitted, and throw (never a silent ok:true) if ANY given key matches no '
+      + "`keys` is omitted, except the instance root's default overrides at its own prefab (`keys.defaultOverrides`, "
+      + "Unity's IsDefaultOverride: acted on when named in `keys` or apply's `targets`, or sent by `target` into a "
+      + 'containing prefab; reported as `defaultOverridesLeft`), and throw (never a silent ok:true) if ANY given key matches no '
       + 'override — a partial apply/revert would read as a success. An EXPLICIT empty `keys` '
       + 'array is refused rather than treated as omitted: a caller-side filter that matched '
       + 'nothing means "act on nothing", and falling through to "act on everything" is the '

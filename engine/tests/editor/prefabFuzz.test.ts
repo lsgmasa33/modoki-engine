@@ -74,7 +74,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
-import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, rebaseForFileOp, trashedPrefabReferenced, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -155,6 +155,13 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'document, and refuses before anything respawns when a saved prefab edit dropped a row it would bring back (or that '
       + 'row\'s parent) — a member the prefab no longer has (`survivingFrameRows`). A refusal in a segment nothing outside '
       + 'the stack touched still fails, as "undo refused in a clean segment"',
+  },
+  {
+    pattern: /^\[undo\] Redo of "Instantiate "[^"]*"" did not fully apply — the prefab could not be instantiated — its file was most likely deleted since the undo\. No instance was created\./,
+    why: '#308: an Instantiate\'s redo after its prefab was trashed (not undoable, #1868 owner ruling D2) creates nothing and '
+      + 'says why, by design (`prefabInstantiateUndo.ts`), instead of reporting a silent success (hunt seed 7293). '
+      + '⚠️ The editor prints this text for ANY null respawn, so an Instantiate redo failing with its file present would be '
+      + 'forgiven too (#1831 review, not observed): the allowlist matches lines, not causes',
   },
 ];
 
@@ -420,16 +427,29 @@ describe('#1789 prefab fuzz', () => {
     expect(signature({ check: 'op threw', detail: 'reload: superseded | at x' })).not.toBe(signature({ check: 'op threw', detail: 'Cannot read x | at y' }));
   });
 
+  it('harness: the swallow taint (#1831, seed 6356) fires only for a guid swallowed in the step that the segment had live', () => {
+    const live = new Set(['r']);
+    // Mutation: drop `live.has(g)` — a placeholder holding a template row's or an asset's guid taints the segment, and
+    // every refusal after it is forgiven (review #3).
+    expect(newlySwallowed(live, new Set(), new Set(['row-guid']))).toBe(false);
+    // Mutation: drop `!before.has(g)` — a placeholder that swallowed `r` steps ago taints every later step.
+    expect(newlySwallowed(live, new Set(['r']), new Set(['r']))).toBe(false);
+    expect(newlySwallowed(live, new Set(), new Set(['row-guid', 'r']))).toBe(true);
+  });
+
   it('harness: the allowlist takes the lines it names (as the runs printed them) and not their neighbours', () => {
     // #1679's Create Prefab refusal, and #1774's route-side mark log.
     expect(expectedError('[undo] Undo of "Save prefab "R"" was REFUSED — /fuzz/r1c6d877e0000/prefabs/R.prefab.json is not what this step left there (changed on disk since, or another file now at that path), so nothing was written or trashed. The entry was dropped from the history; nothing was applied.')).toBe(true);
     expect(expectedError('[Prefab] /var/folders/nt/T/modoki-prefab-fuzz-V2kGoU/r2c7497320000/prefabs/H.prefab.json holds a localId high-water mark of 5, and this write would lower it to 4. Refusing — a number below the mark may have belonged to a deleted member')).toBe(true);
     // #1868's in-memory refusal of an Apply's undo, as the G1 M2 replay printed it.
     expect(expectedError('[undo] Undo of "Apply to Prefab" was REFUSED — /fuzz/r4a793a230000/prefabs/H.prefab.json changed since this step (a prefab-edit save, another write, or an outside change), so it was left as it is. The entry was dropped from the history; nothing was applied.')).toBe(true);
+    // #308's redo of an Instantiate whose prefab was trashed, as hunt seed 7293 printed it.
+    expect(expectedError('[undo] Redo of "Instantiate "P"" did not fully apply — the prefab could not be instantiated — its file was most likely deleted since the undo. No instance was created.')).toBe(true);
     // Neighbours that are findings: Create Prefab's undo that did not fully apply (#1795), and a refusal that is not the
     // Create Prefab one (another step's, which is not allowed at all).
     expect(expectedError('[undo] Undo of "Save prefab "M"" did not fully apply — 1 prefab link the tree had before could not be put back')).toBe(false);
     expect(expectedError('[undo] Undo of "Rename" was REFUSED — /fuzz/r0/prefabs/R.prefab.json is not what this step left there')).toBe(false);
+    expect(expectedError('[undo] Redo of "Instantiate "P"" did not fully apply — 2 members could not be put back')).toBe(false);
     // The cycle line's follow-up is allowed only right after the cycle line.
     expect(expectedError('[PrefabEdit] cannot save "O" — serialize produced no prefab')).toBe(false);
   });
