@@ -11,7 +11,7 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, type EntityClipboard } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { placePrefabFromPath } from '../scene/prefabPlace';
@@ -27,7 +27,8 @@ import { prefabEditRefusal } from '../scene/prefabEditRefusal';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
-import { diffSiblingSorts } from '../undo/reorderSiblingsUndo';
+import { planCollidingDrop } from '../undo/reorderSiblingsUndo';
+import { placeholderWriteRefusal, entityNameOf } from '../undo/placeholderGate';
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
@@ -368,6 +369,11 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             // neighbors collide (e.g. legacy entities all have sortOrder 0), renumber
             // siblings first so we can compute a unique midpoint.
             const targetParent = entity.parentId;
+            // Refused before the renumber below can push an entry of its own (`siblingDropRefusal`): a reparent refusal
+            // goes on to `requestReparent`, which reports it as it always has; a placeholder's reorder is said here.
+            const dropRefused = siblingDropRefusal(id, targetParent);
+            if (dropRefused?.kind === 'reparent') { onReparent(id, targetParent); return; }
+            if (dropRefused?.kind === 'placeholder') { reportWriteRefusal(dropRefused.reason); return; }
             const loSort = zone === 'before' ? prevSiblingSort : entity.sortOrder;
             const hiSort = zone === 'before' ? entity.sortOrder : nextSiblingSort;
             const collides = loSort !== null && hiSort !== null && loSort === hiSort;
@@ -387,20 +393,26 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
                 // undo). Previously a raw writeTraitField loop bypassed undo, so
                 // Cmd+Z left every sibling rewritten (Hierarchy F1). Pushed before
                 // the reparent so undo peels reparent → renumber in order.
-                const changes = diffSiblingSorts(
-                  siblings.map((s, i) => ({ id: s.id, oldSort: s.sortOrder, newSort: i * 10 })),
-                );
+                // A sibling whose save cannot keep a sortOrder (a Missing Prefab placeholder inside an instance, #1818)
+                // keeps its value, and the rest are numbered around it. The whole placement is decided before anything is
+                // written (`planCollidingDrop`), so a drop it refuses leaves no renumber entry behind.
+                const plan = planCollidingDrop(siblings.map((s) => ({
+                  id: s.id, sortOrder: s.sortOrder, fixed: !!placeholderWriteRefusal(s.id, 'EntityAttributes', 'sortOrder'),
+                })), entity.id, zone === 'before' ? 'before' : 'after');
+                if ('stuck' in plan) {
+                  reportWriteRefusal(`Can't place it here: "${entityNameOf(plan.stuck) || 'Missing Prefab'}" is a Missing Prefab inside this instance, and its place in the order can't be saved, so there is no room to place anything beside it. Restore the prefab and reload the scene to reorder them.`);
+                  return;
+                }
                 // The override marks it writes and puts back are `makeSortOrderRenumberAction`'s (#1709).
-                const action = changes.length ? makeSortOrderRenumberAction(changes) : null;
+                const action = plan.changes.length ? makeSortOrderRenumberAction(plan.changes) : null;
                 if (action) {
                   action.redo(); // apply the renumber now
                   pushAction(action); // make it undoable
                 }
+                newSort = plan.newSort;
+              } else {
+                newSort = zone === 'before' ? entity.sortOrder - 5 : entity.sortOrder + 5;
               }
-              const flat = getAllEntities();
-              const updatedEntity = flat.find(e => e.id === entity.id);
-              const updatedSort = updatedEntity?.sortOrder ?? 0;
-              newSort = zone === 'before' ? updatedSort - 5 : updatedSort + 5;
             } else {
               newSort = zone === 'before'
                 ? ((prevSiblingSort ?? entity.sortOrder - 2) + entity.sortOrder) / 2

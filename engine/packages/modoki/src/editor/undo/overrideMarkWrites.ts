@@ -26,6 +26,7 @@ import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../runtime/
 import { collectComparableTraits, getOverrideValues, getCachedPrefabSync, instanceBase, baseTokenResolver } from '../scene/prefab';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
+import { entityRef, buildGuidIndex, requireWith } from './entityRef';
 
 interface MemberPi { source?: string; localId?: number; rootInstanceId?: number }
 
@@ -96,23 +97,35 @@ export function writeTraitFieldMarked(entityId: number, meta: TraitMeta, field: 
 export function makeSortOrderRenumberAction(changes: SiblingSortChange[], label = 'Renumber siblings'): UndoAction | null {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return null;
-  return makeReorderSiblingsAction(
-    changes, (id, sort) => writeTraitFieldMarked(id, attrMeta, 'sortOrder', sort), label,
-    restorableSortOrderWrite(changes.map((c) => c.id)),
+  // Each sibling by guid, every one required before the first write (#1827, I19): the raw ids it held named, after a
+  // world swap, whatever entities hold them now, and the renumber wrote `sortOrder` and its mark onto those.
+  const refs = changes.map((c) => entityRef(c.id));
+  let live = new Map<number, number>();
+  const pin = () => {
+    const idx = buildGuidIndex();
+    live = new Map(changes.map((c, i) => [c.id, requireWith(refs[i], idx)]));
+  };
+  const at = (id: number) => live.get(id) ?? id;
+  const restore = restorableSortOrderWrite(changes.map((c) => c.id));
+  const inner = makeReorderSiblingsAction(
+    changes, (id, sort) => writeTraitFieldMarked(at(id), attrMeta, 'sortOrder', sort), label,
+    (id, sort) => restore(id, sort, at(id)),
   );
+  return { ...inner, undo: () => { pin(); inner.undo(); }, redo: () => { pin(); inner.redo(); } };
 }
 
 /** The UNDO of a `sortOrder` rewrite on `ids`: a writer that restores the value AND the `sortOrder` mark each entity
  *  has now (call it before the rewrite). Re-reconciling on the way back would drop a stored override that happened to
- *  equal the base, and the save would lose it (#1709 close-out review). */
-function restorableSortOrderWrite(ids: readonly number[]): (id: number, sort: number) => void {
+ *  equal the base, and the save would lose it (#1709 close-out review). Called with the id it was built with (the
+ *  key of the mark it took) and the id that entity lives at now. */
+function restorableSortOrderWrite(ids: readonly number[]): (id: number, sort: number, liveId?: number) => void {
   const attrMeta = getTraitByName('EntityAttributes');
   const was = new Map(ids.map((id) => [id, markStateOf(id, 'EntityAttributes', ['sortOrder'])]));
-  return (id, sort) => {
+  return (id, sort, liveId = id) => {
     if (!attrMeta) return;
-    writeTraitField(id, attrMeta, 'sortOrder', sort);
+    writeTraitField(liveId, attrMeta, 'sortOrder', sort);
     const state = was.get(id);
-    if (state) putMarkState(id, 'EntityAttributes', state);
+    if (state) putMarkState(liveId, 'EntityAttributes', state);
   };
 }
 

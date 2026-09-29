@@ -27,8 +27,11 @@ import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/cor
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
+import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
-import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type EntityRef } from './entityRef';
+import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
+import { placeholderWriteRefusal, placeholderWriteRefusalAny, isMissingPrefabPlaceholder, isUnderPrefabInstance, placeholderRefusalWords, entityNameOf } from './placeholderGate';
+import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
@@ -50,13 +53,50 @@ function markFieldOverrideIfInstance(entityId: number, meta: TraitMeta, field: s
 export function assignFreshSortOrder(newId: number, parentId: number): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return;
+  // A copy of a Missing Prefab placeholder saved as an added node keeps the copied value (#1818): its save cannot keep a
+  // `sortOrder`, so a fresh one would show an order the reload undoes. The gate says which placeholders those are.
+  if (placeholderWriteRefusal(newId, 'EntityAttributes', 'sortOrder')) return;
   const siblings = getAllEntities().filter((e) => e.parentId === parentId && e.id !== newId);
   const nextSort = siblings.length > 0 ? Math.max(...siblings.map((e) => e.sortOrder)) + 1 : 0;
   writeTraitFieldMarked(newId, attrMeta, 'sortOrder', nextSort);
 }
 
-/** Write a field with undo tracking */
-export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field: string, value: unknown) {
+/** Why the Hierarchy's sibling drop of `moverId` under `targetParent` must not run, decided BEFORE its renumber writes
+ *  anything, so a refused drop leaves no renumber entry behind (#1818 close-out re-review). `reparent`: the reparent's
+ *  own refusal (self-parent, cycle, prefab edit: `planReparent`), which the caller leaves to `requestReparent` to report
+ *  as it always has. `placeholder`: a Missing Prefab placeholder reordered inside its own instance, whose save cannot
+ *  keep the order (`reparentEntity` refuses it too). */
+export function siblingDropRefusal(moverId: number, targetParent: number): { kind: 'reparent' } | { kind: 'placeholder'; reason: string } | null {
+  if (planReparent(moverId, targetParent).kind === 'refused') return { kind: 'reparent' };
+  const ea = getTraitByName('EntityAttributes');
+  const parent = ea ? Number((readTraitData(moverId, ea) as { parentId?: number } | null)?.parentId ?? 0) : 0;
+  const reason = parent === targetParent ? placeholderWriteRefusal(moverId, 'EntityAttributes', 'sortOrder') : null;
+  return reason ? { kind: 'placeholder', reason } : null;
+}
+
+/** Say a write was refused before it changed anything (#1818): the console for the record, and a toast, since the
+ *  Inspector or the Hierarchy that asked shows no error of its own. Returns `reason` so a writer can hand it on (the
+ *  agent ops reply with it). */
+export function reportWriteRefusal(reason: string): string {
+  console.error(`[entityActions] refused: ${reason}`);
+  try { useEditorStore.getState().showToast(reason, 'warn'); } catch { /* no store (a headless caller): the log stands */ }
+  return reason;
+}
+
+/** A gesture that writes `trait` LIVE while it runs and commits at its end (a gizmo, collider-point or UI-handle drag):
+ *  the placeholder gate's refusal for it (#1818, I21), reported, or null. A Missing Prefab placeholder keeps the
+ *  entry's root traits (a Transform among them), so the gizmo can drag one, and its save writes the kept record's values
+ *  back over the drag. A refused caller puts the live values back to where the gesture started and pushes no entry. */
+export function placeholderGestureRefusal(ids: readonly number[], trait: string): string | null {
+  const refused = placeholderWriteRefusalAny(ids, trait);
+  return refused ? reportWriteRefusal(refused) : null;
+}
+
+/** Write a field with undo tracking. Returns the refusal's words when the placeholder gate refuses it (#1818), else
+ *  null. */
+export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field: string, value: unknown): string | null {
+  const refused = placeholderWriteRefusal(entityId, meta.name, field);
+  if (refused) return reportWriteRefusal(refused);
   let oldValue: unknown;
   if (meta.category === 'tag') {
     const entity = findEntity(entityId);
@@ -80,14 +120,16 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
   const ref = entityRef(entityId);
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}`,
-    undo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); },
-    redo: () => { const id = ref.resolve(); if (id == null) return; writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); },
+    // `require` (I19): a target a world swap removed, or turned into a placeholder, refuses rather than reading as done.
+    undo: () => { const id = ref.require(); writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); },
+    redo: () => { const id = ref.require(); writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); },
     coalesceKey: fieldCoalesceKey(meta, field, [entityId]),
     detail: editDetail([ref], meta, field, [oldValue], [value]),
     affectedScenes,
   });
   // Animation record mode: key this field at the playhead (no-op unless recording).
   notifyFieldEdited(entityId, meta.name, field, value);
+  return null;
 }
 
 /** Write one field to the same trait across many entities, captured as a single
@@ -95,8 +137,12 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
  *  individually so undo restores them even when they differed (mixed values).
  *  Only the named field is touched — other (possibly mixed) fields are left
  *  per-entity as they were. */
-export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMeta, field: string, value: unknown) {
-  if (entityIds.length === 0) return;
+export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMeta, field: string, value: unknown): string | null {
+  if (entityIds.length === 0) return null;
+  // One refusal for the whole selection (#1818): skipping the placeholder would write the rest as one entry the user
+  // did not ask for.
+  const refused = placeholderWriteRefusalAny(entityIds, meta.name, field);
+  if (refused) return reportWriteRefusal(refused);
   const oldValues = entityIds.map((id) => {
     if (meta.category === 'tag') {
       const entity = findEntity(id);
@@ -113,14 +159,16 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
   const suffix = entityIds.length > 1 ? ` (${entityIds.length})` : '';
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}${suffix}`,
-    undo: () => { const idx = buildGuidIndex(); refs.forEach((r, i) => { const id = resolveWith(r, idx); if (id != null) { writeTraitField(id, meta, field, oldValues[i]); putMarkState(id, meta.name, oldMarks[i]!); } }); },
-    redo: () => { const idx = buildGuidIndex(); refs.forEach((r) => { const id = resolveWith(r, idx); if (id != null) { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); } }); },
+    // Every ref required before the first write (I19): one missing entity refuses the whole entry, never half of it.
+    undo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, oldValues[i]); putMarkState(id, meta.name, oldMarks[i]!); }); },
+    redo: () => { const ids = requireAll(refs); ids.forEach((id) => { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); }); },
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
     affectedScenes,
   });
   // Animation record mode: key each edited entity's field at the playhead.
   entityIds.forEach((id) => notifyFieldEdited(id, meta.name, field, value));
+  return null;
 }
 
 /** Write the same trait field across many entities where the NEW value is derived
@@ -133,8 +181,10 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
 export function writeTraitFieldPerEntityWithUndo(
   entityIds: number[], meta: TraitMeta, field: string,
   compute: (oldValue: unknown, id: number) => unknown, label: string,
-) {
-  if (entityIds.length === 0) return;
+): string | null {
+  if (entityIds.length === 0) return null;
+  const refused = placeholderWriteRefusalAny(entityIds, meta.name, field); // #1818, as above
+  if (refused) return reportWriteRefusal(refused);
   const entries = entityIds.map((id) => {
     // readTraitDataFull: `compute` derives the new value from the old, so an off-meta
     // field (Animator `clips` bank, etc.) MUST read its real value here — with the curated
@@ -144,24 +194,25 @@ export function writeTraitFieldPerEntityWithUndo(
     const oldValue = data ? data[field] : undefined;
     return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id), oldMarks: markStateOf(id, meta.name, [field]) };
   }).filter((e) => !Object.is(e.oldValue, e.newValue));
-  if (entries.length === 0) return;
+  if (entries.length === 0) return null;
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   // Resolve by guid each invocation (incl. the immediate apply) so redo survives a rebuild.
   const applyAll = () => {
-    const idx = buildGuidIndex();
-    entries.forEach(({ ref, newValue }) => { const id = resolveWith(ref, idx); if (id != null) { writeTraitField(id, meta, field, newValue); markFieldOverrideIfInstance(id, meta, field); } });
+    const ids = requireAll(entries.map((e) => e.ref)); // I19, as above
+    entries.forEach(({ newValue }, i) => { writeTraitField(ids[i], meta, field, newValue); markFieldOverrideIfInstance(ids[i], meta, field); });
   };
   applyAll();
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
-    undo: () => { const idx = buildGuidIndex(); entries.forEach(({ ref, oldValue, oldMarks }) => { const id = resolveWith(ref, idx); if (id != null) { writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); } }); },
+    undo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ oldValue, oldMarks }, i) => { writeTraitField(ids[i], meta, field, oldValue); putMarkState(ids[i], meta.name, oldMarks); }); },
     redo: applyAll,
     coalesceKey: fieldCoalesceKey(meta, field, entityIds),
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
     affectedScenes,
   });
   entries.forEach(({ id, newValue }) => notifyFieldEdited(id, meta.name, field, newValue));
+  return null;
 }
 
 /** Write SEVERAL fields of one trait per-entity as a SINGLE undo entry. `compute`
@@ -178,8 +229,8 @@ export function writeTraitFieldsPerEntityWithUndo(
   entityIds: number[], meta: TraitMeta,
   compute: (oldFull: Record<string, unknown> | null, id: number) => Record<string, unknown>,
   label: string,
-) {
-  if (entityIds.length === 0) return;
+): string | null {
+  if (entityIds.length === 0) return null;
   const entries = entityIds.map((id) => {
     const full = readTraitDataFull(id, meta);
     const patch = compute(full, id);
@@ -187,14 +238,21 @@ export function writeTraitFieldsPerEntityWithUndo(
     for (const k of Object.keys(patch)) oldValues[k] = full ? full[k] : undefined;
     return { id, ref: entityRef(id), oldValues, patch, oldMarks: markStateOf(id, meta.name, Object.keys(patch)) };
   }).filter((e) => Object.keys(e.patch).length > 0);
-  if (entries.length === 0) return;
+  if (entries.length === 0) return null;
+  // #1818, as above — per field, since the patch decides which fields this write touches.
+  for (const e of entries) {
+    for (const field of Object.keys(e.patch)) {
+      const refused = placeholderWriteRefusal(e.id, meta.name, field);
+      if (refused) return reportWriteRefusal(refused);
+    }
+  }
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   const writeMany = (id: number, values: Record<string, unknown>) => {
     for (const [field, value] of Object.entries(values)) { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); }
   };
   const applyAll = () => {
-    const idx = buildGuidIndex();
-    entries.forEach(({ ref, patch }) => { const id = resolveWith(ref, idx); if (id != null) writeMany(id, patch); });
+    const ids = requireAll(entries.map((e) => e.ref)); // I19
+    entries.forEach(({ patch }, i) => writeMany(ids[i], patch));
   };
   applyAll();
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
@@ -202,17 +260,17 @@ export function writeTraitFieldsPerEntityWithUndo(
     label: `${label}${suffix}`,
     // Raw writes plus the old marks: `writeMany` would MARK the old values, saving an undone edit as an override (#1709).
     undo: () => {
-      const idx = buildGuidIndex();
-      entries.forEach(({ ref, oldValues, oldMarks }) => {
-        const id = resolveWith(ref, idx); if (id == null) return;
-        for (const [field, value] of Object.entries(oldValues)) writeTraitField(id, meta, field, value);
-        putMarkState(id, meta.name, oldMarks);
+      const ids = requireAll(entries.map((e) => e.ref)); // I19
+      entries.forEach(({ oldValues, oldMarks }, i) => {
+        for (const [field, value] of Object.entries(oldValues)) writeTraitField(ids[i], meta, field, value);
+        putMarkState(ids[i], meta.name, oldMarks);
       });
     },
     redo: applyAll,
     affectedScenes,
   });
   entries.forEach(({ id, patch }) => { for (const [field, value] of Object.entries(patch)) notifyFieldEdited(id, meta.name, field, value); });
+  return null;
 }
 
 /** Keys of `values` the trait actually declares. A clipboard entry captured before a
@@ -240,23 +298,22 @@ export function addTraitToEntitiesWithUndo(
   entityIds: number[], meta: TraitMeta,
   values?: Record<string, unknown>,
   label = `Add ${meta.name}`,
-) {
+): string | null {
   const refused = traitWriteRefusal(meta.name); // #1454: callers hide the action; this is the one seam they share
-  if (refused) { console.error(`[entityActions] ${refused}`); return; }
+  if (refused) { console.error(`[entityActions] ${refused}`); return refused; }
   const targets = entityIds.filter((id) => {
     const e = findEntity(id);
     return !!e && !e.has(meta.trait);
   });
-  if (targets.length === 0) return;
+  if (targets.length === 0) return null;
+  const onPlaceholder = placeholderWriteRefusalAny(targets, meta.name); // #1818: the save would drop the component
+  if (onPlaceholder) return reportWriteRefusal(onPlaceholder);
   const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
   const oldMarks = targets.map((id) => marksOf(id));
   const apply = () => {
-    const idx = buildGuidIndex();
-    refs.forEach((r) => {
-      const id = resolveWith(r, idx);
-      if (id == null) return;
+    requireAll(refs).forEach((id) => { // I19: every target, before the first add
       // Clone per entity AND per apply: without it, redo would re-seat the same
       // object on every target and they'd share one array.
       findEntity(id)?.add(initial ? meta.trait(cloneTraitValues(initial)) : meta.trait());
@@ -268,8 +325,7 @@ export function addTraitToEntitiesWithUndo(
     markUIDirty(); markStructureDirty();
   };
   const revert = () => {
-    const idx = buildGuidIndex();
-    refs.forEach((r, i) => { const id = resolveWith(r, idx); if (id != null) { findEntity(id)?.remove(meta.trait); putBackMarks(id, oldMarks[i]!); } });
+    requireAll(refs).forEach((id, i) => { findEntity(id)?.remove(meta.trait); putBackMarks(id, oldMarks[i]!); });
     markUIDirty(); markStructureDirty();
   };
   apply();
@@ -287,14 +343,15 @@ export function addTraitToEntitiesWithUndo(
       for (const [field, value] of Object.entries(initial)) notifyFieldEdited(id, meta.name, field, value);
     });
   }
+  return null;
 }
 
 /** Remove a component trait from every selected entity that has it, as a single
  *  undo entry. Each entity's trait data is snapshotted so undo restores the
  *  original values. No-op if none carry the trait. */
-export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: TraitMeta) {
+export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: TraitMeta): string | null {
   const refused = traitRemoveRefusal(meta.name); // #1454, as above
-  if (refused) { console.error(`[entityActions] ${refused}`); return; }
+  if (refused) { console.error(`[entityActions] ${refused}`); return refused; }
   const targets: { ref: EntityRef; data: Record<string, unknown> | null }[] = [];
   for (const id of entityIds) {
     const e = findEntity(id);
@@ -307,16 +364,16 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
       targets.push({ ref: entityRef(id), data: full ? cloneTraitValues(full) : null });
     }
   }
-  if (targets.length === 0) return;
+  if (targets.length === 0) return null;
+  const onPlaceholder = placeholderWriteRefusalAny(entityIds.filter((id) => findEntity(id)?.has(meta.trait)), meta.name); // #1818
+  if (onPlaceholder) return reportWriteRefusal(onPlaceholder);
   const affectedScenes = resolveAffectedScenes(entityIds);
   const apply = () => {
-    const idx = buildGuidIndex();
-    targets.forEach((t) => { const id = resolveWith(t.ref, idx); if (id != null) findEntity(id)?.remove(meta.trait); });
+    requireAll(targets.map((t) => t.ref)).forEach((id) => findEntity(id)?.remove(meta.trait)); // I19
     markUIDirty(); markStructureDirty();
   };
   const revert = () => {
-    const idx = buildGuidIndex();
-    targets.forEach((t) => { const id = resolveWith(t.ref, idx); if (id != null) findEntity(id)?.add(meta.trait((t.data ?? {}) as Record<string, unknown>)); });
+    requireAll(targets.map((t) => t.ref)).forEach((id, i) => findEntity(id)?.add(meta.trait((targets[i].data ?? {}) as Record<string, unknown>)));
     markUIDirty(); markStructureDirty();
   };
   apply();
@@ -326,6 +383,7 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     redo: apply,
     affectedScenes,
   });
+  return null;
 }
 
 /** Paste copied trait values onto every selected entity that ALREADY carries the
@@ -612,10 +670,38 @@ function rootGuidOf(snap: EntitySnapshot): string {
   return ea && ea.data !== true ? ((ea.data as Record<string, unknown>).guid as string) || '' : '';
 }
 
-/** Resolve a snapshot's root guid to the current live id, or null. */
-function findByRootGuid(guid: string): number | null {
-  if (!guid) return null;
-  return buildGuidIndex().get(guid) ?? null;
+/** The name in a snapshot's root traits ('' if none): what a refusal calls a deleted entity. */
+function snapshotNameOf(snap: EntitySnapshot): string {
+  const ea = snap.traits.find((t) => t.data !== true && t.meta.name === 'EntityAttributes');
+  return ea && ea.data !== true ? String((ea.data as Record<string, unknown>).name ?? '') : '';
+}
+
+/** Every durable guid a snapshot tree respawns with. */
+function snapshotGuids(snap: EntitySnapshot, out: Set<string> = new Set()): Set<string> {
+  const g = durableGuidOf(snap.traits);
+  if (g) out.add(g);
+  for (const c of snap.children) snapshotGuids(c, out);
+  return out;
+}
+
+/** A delete's undo, before it respawns anything (#1819, I19/I20): every instance root a respawned member links back
+ *  to, outside what the undo itself respawns, must still be a live INSTANCE root. After a world swap it can be gone,
+ *  or a Missing Prefab placeholder (no `PrefabInstance`), and relinking a member to it leaves a member whose root is
+ *  not an instance, which the next reload drops (I6). Throws `UndoRefusedError`, so nothing has been respawned yet. */
+function requireRootLinks(links: readonly { guid: string; rootGuid: string }[], respawned: ReadonlySet<string>, renamed?: ReadonlyMap<string, string>): void {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta || !links.length) return;
+  const idx = buildGuidIndex();
+  for (const { rootGuid } of links) {
+    if (respawned.has(rootGuid)) continue;
+    let g = rootGuid;
+    for (let hops = 0; renamed?.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
+    const root = idx.get(g);
+    const ref = root != null ? entityRef(root, false) : null;
+    if (!ref) throw new UndoRefusedError(`The prefab instance (${rootGuid}) a deleted member belongs to is no longer in the scene, so its members would come back linked to nothing.`, 'the prefab instance its members belong to is no longer in the scene');
+    // `require` names the placeholder case in its own words; the check covers a root that is plain now (detached).
+    ref.require({ kind: 'entity', check: (id) => (findEntity(id)?.has(piMeta.trait) ? null : 'is no longer a prefab instance, so its deleted members cannot be linked back to it') });
+  }
 }
 
 // ── Create with undo ──
@@ -660,14 +746,17 @@ export function createEntityWithUndo(
   ensureGuid(currentId);
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
+  const selfRef = entityRef(currentId);
   const parentRef = parentId ? entityRef(parentId) : null;
   // Resolved AFTER adoptParentScene: a create under a base entity dirties that base, not the primary.
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label,
-    undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
-    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
+    // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
+    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
+    // The parent is required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses.
+    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
@@ -725,13 +814,15 @@ export function createEntitySubtreeWithUndo(
   let currentId = rootId;
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
+  const selfRef = entityRef(currentId);
   const parentRef = parentId ? entityRef(parentId) : null;
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label,
-    undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
-    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
+    // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
+    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
+    redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
@@ -776,15 +867,17 @@ export function duplicateEntity(
     return id;
   };
   let currentId = spawnCopy(parentId);
+  const selfRef = entityRef(currentId); // the copy's fresh guid, minted by copySnapshot
   // Resolved from the COPY, after spawn — its sourceScene mirrors the source's
   // (respawnFromSnapshot copies EntityAttributes verbatim, sourceScene included).
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label: 'Duplicate Entity',
-    undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
+    // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
+    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
     redo: () => {
-      currentId = spawnCopy(parentRef?.resolve() ?? 0);
+      currentId = spawnCopy(parentRef ? parentRef.require() : 0);
       selectEntity(currentId);
     },
     kind: '!duplicate',
@@ -835,7 +928,6 @@ export function pasteEntityCopy(
   // prefab nests it in itself — the clipboard outlives the world, so it can carry one copied from a scene.
   assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: getCachedPrefabSync, scaffold: isScaffoldSnapshot(snapshot) });
   const copy = copySnapshot(snapshot);
-  const guid = rootGuidOf(copy);
   const parentRef = parentId ? entityRef(parentId) : null;
   const spawn = (p: number): number => {
     const id = respawnFromSnapshot(copy, p);
@@ -844,12 +936,14 @@ export function pasteEntityCopy(
     return id;
   };
   let currentId = spawn(parentId);
+  const selfRef = entityRef(currentId);
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label: 'Paste Entity',
-    undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
-    redo: () => { currentId = spawn(parentRef?.resolve() ?? 0); selectEntity(currentId); },
+    // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
+    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
+    redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0); selectEntity(currentId); },
     affectedScenes,
   });
   return currentId;
@@ -885,7 +979,7 @@ export function deleteEntitiesWithUndo(
     return false;
   };
 
-  const snaps: { snapshot: EntitySnapshot; guid: string; parentRef: EntityRef | null }[] = [];
+  const snaps: { snapshot: EntitySnapshot; guid: string; name: string; parentRef: EntityRef | null }[] = [];
   for (const id of entityIds) {
     if (isDescendantOfSelected(id)) continue;
     // Mint+persist a guid BEFORE snapshotting (a delete target may be guid-less)
@@ -900,7 +994,7 @@ export function deleteEntitiesWithUndo(
         break;
       }
     }
-    snaps.push({ snapshot, guid: rootGuidOf(snapshot), parentRef: parentId ? entityRef(parentId) : null });
+    snaps.push({ snapshot, guid: rootGuidOf(snapshot), name: snapshotNameOf(snapshot), parentRef: parentId ? entityRef(parentId) : null });
   }
   if (snaps.length === 0) return;
 
@@ -910,22 +1004,41 @@ export function deleteEntitiesWithUndo(
   // Members moved out of an instance deleted here are unlinked by the delete (#1437); undo relinks them. And a
   // member deleted as its own target beside its root's subtree may respawn first: undo re-points it (#1437).
   const rootLinks = captureRootLinks(collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), snaps.map(s => s.snapshot.id)));
+  const respawnedGuids = new Set<string>();
+  for (const s of snaps) snapshotGuids(s.snapshot, respawnedGuids);
   let detached: DetachedMember[] = snaps.flatMap(s => deleteEntity(s.snapshot.id));
   setSelection?.([]);
 
   _pushAction({
     label: snaps.length > 1 ? `Delete ${snaps.length} Entities` : 'Delete Entity',
     undo: () => {
-      const liveIds = snaps.map(s => respawnFromSnapshot(s.snapshot, s.parentRef?.resolve() ?? 0));
-      restoreRootLinks(rootLinks);
+      // Every ref first (I19): a parent or an instance root that is gone refuses before anything respawns. Through the
+      // rename the delete's frame-ending made (a promoted member keeps a new guid until `relinkDetachedMembers` below
+      // takes it back), since the refs were taken before it.
+      const idx = buildGuidIndex();
+      const renames = renamesOf(detached);
+      const parents = snaps.map(s => (s.parentRef ? requireWith(s.parentRef, idx, undefined, renames) : 0));
+      requireRootLinks(rootLinks, respawnedGuids, renames);
+      requireDetachedMembers(detached, idx, renames, respawnedGuids);
+      const liveIds = snaps.map((s, i) => respawnFromSnapshot(s.snapshot, parents[i]));
+      // The relink FIRST: it reverses the frame-ending's guid rename, and `restoreRootLinks` finds each root by the guid
+      // it had before that rename. The other way round a renamed root was skipped, and its respawned member kept the
+      // snapshot's raw `rootInstanceId`, stale after a world swap (#1819 close-out re-review). The relink reads no link.
       relinkDetachedMembers(detached);
+      restoreRootLinks(rootLinks);
       setSelection?.(liveIds);
     },
     redo: () => {
-      // Resolve each entity by its (restored) root guid — robust across rebuild + id reuse.
+      // Resolve each entity by its (restored) root guid — robust across rebuild + id reuse. All of them before the first
+      // delete (I19): a target that is gone refuses the redo rather than deleting the rest and reading as done.
       const idx = buildGuidIndex();
+      const ids = snaps.map(s => {
+        const id = s.guid ? idx.get(s.guid) : undefined;
+        if (id == null) throw new UndoRefusedError(`"${s.name}" (${journalRefOf(s.guid, s.snapshot.id)}) is no longer in the scene, so there is nothing to delete again.`, `"${s.name}" is no longer in the scene`);
+        return id;
+      });
       detached = [];
-      snaps.forEach(s => { const id = idx.get(s.guid); if (id) detached.push(...deleteEntity(id)); });
+      ids.forEach(id => detached.push(...deleteEntity(id)));
       setSelection?.([]);
     },
     kind: '!delete',
@@ -934,33 +1047,11 @@ export function deleteEntitiesWithUndo(
   });
 }
 
+/** Delete one entity as one undo entry: `deleteEntitiesWithUndo` with a single target, so the two cannot drift. It
+ *  had its own body, which captured no root links (a member deleted as its own target came back holding its dead
+ *  root's raw id, #1827's `carryEntityIdFields` row) and whose redo no-opped on a miss. */
 export function deleteEntityWithUndo(entityId: number): void {
-  // Mint+persist a guid BEFORE snapshotting so the snapshot carries it (the
-  // entity may be guid-less) — undo respawns it, redo re-finds it by guid.
-  ensureGuid(entityId);
-  const snapshot = snapshotEntity(entityId);
-  if (!snapshot) return;
-  const originalParentId = (() => {
-    for (const { meta, data } of snapshot.traits) {
-      if (meta.name === 'EntityAttributes' && data !== true) return (data as Record<string, unknown>).parentId as number || 0;
-    }
-    return 0;
-  })();
-  const guid = rootGuidOf(snapshot);
-  const parentRef = originalParentId ? entityRef(originalParentId) : null;
-  // Resolve BEFORE deleting — same reasoning as deleteEntitiesWithUndo above.
-  const affectedScenes = resolveAffectedScenes([entityId]);
-  let detached = deleteEntity(entityId); // #1437: see deleteEntitiesWithUndo
-  _pushAction({
-    label: 'Delete Entity',
-    // undo respawns from the snapshot (carries the guid); redo re-resolves the
-    // live entity by that guid — robust to ID reuse and a world rebuild.
-    undo: () => { respawnFromSnapshot(snapshot, parentRef?.resolve() ?? 0); relinkDetachedMembers(detached); },
-    redo: () => { const id = findByRootGuid(guid); detached = id != null ? deleteEntity(id) : []; },
-    kind: '!delete',
-    journalPayload: { entities: [journalRefOf(guid, entityId)] },
-    affectedScenes,
-  });
+  deleteEntitiesWithUndo([entityId]);
 }
 
 // ── Reparent with undo ──
@@ -1177,6 +1268,14 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const oldFolder = ((findEntity(entityId)?.get(attrMeta.trait as never) as { editorFolder?: string } | undefined)?.editorFolder) || '';
 
   const parentChanged = oldParentId !== newParentId;
+  // A Missing Prefab placeholder that lands inside an instance is saved as an added node, which keeps no `sortOrder`
+  // (#1818, `PLACEHOLDER_ENTRY_ONLY_FIELDS`), and the load spawns a node placeholder at 0 (`spawnUnresolvedReference`
+  // sets none). So the move puts it at 0, where the reload will, rather than at the dropped position or its old entry
+  // order, and a reorder alone is refused, named.
+  if (isMissingPrefabPlaceholder(entityId) && isUnderPrefabInstance(newParentId, entityId)) {
+    if (!parentChanged) { reportWriteRefusal(placeholderRefusalWords(entityNameOf(entityId))); return false; }
+    newSortOrder = 0;
+  }
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
   if (!parentChanged && !orderChanged) return false;
 
@@ -1332,9 +1431,15 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   _pushAction({
     label,
     undo: () => {
-      const id = ref.resolve(); if (id == null) return;
+      // The mover and its old parent, both required before the first write (I19): a parent that is gone refuses
+      // rather than putting the mover at the scene root. Through the promotion's rename, which `undoDetach` reverses
+      // only after this: both refs were taken before it, and either one can be a member it renamed (#1447).
+      const idx = buildGuidIndex();
+      const renames = detaching ? renamesOf(orphans, new Map(renamed)) : undefined;
+      const id = requireWith(ref, idx, undefined, renames);
+      const parent = oldParentRef ? requireWith(oldParentRef, idx, undefined, renames) : 0;
       if (detaching) undoDetach(); // re-tag the detached members first, and take back a promotion's rename
-      writeTraitField(id, attrMeta!, 'parentId', oldParentRef?.resolve() ?? 0);
+      writeTraitField(id, attrMeta!, 'parentId', parent);
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
       if (savedOldLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
@@ -1342,8 +1447,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       markStructureDirty();
     },
     redo: () => {
-      const id = ref.resolve(); if (id == null) return;
-      writeTraitField(id, attrMeta!, 'parentId', newParentRef?.resolve() ?? 0);
+      const id = ref.require();
+      writeTraitField(id, attrMeta!, 'parentId', newParentRef ? newParentRef.require() : 0);
       // As the original action: only a move that SET a sortOrder writes it. Re-writing the unchanged value marked
       // would re-reconcile a mark the move never touched and drop a stored override equal to the base.
       if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
@@ -1561,25 +1666,34 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   const oldParentRef = oldParentId ? entityRef(oldParentId) : null;
   const newParentRef = newParentId ? entityRef(newParentId) : null;
 
-  const applyStamps = () => {
+  // Every entity of the moved tree and the parent it goes under, required before the first write (I19): a member or a
+  // parent that is gone refuses the step, rather than stamping part of the tree or landing the root at the scene root.
+  // `minted` translates a rekeyed guid, for the undo, which runs while those entities still carry the rekey's guid.
+  const requireMove = (parentRef: EntityRef | null, minted?: ReadonlyMap<string, string>): { ids: number[]; parent: number } => {
     const idx = buildGuidIndex();
-    for (const { ref } of perEntity) {
-      const id = resolveWith(ref, idx); if (id != null) writeTraitField(id, attrMeta, 'sourceScene', targetScene);
-    }
-    const rid = resolveWith(rootRef, idx); if (rid == null) return;
-    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', newParentRef?.resolve() ?? 0);
+    const ids = perEntity.map(({ ref }) => {
+      const now = minted?.get(ref.guid);
+      if (!now) return requireWith(ref, idx);
+      const id = idx.get(now);
+      if (id == null) throw new UndoRefusedError(`"${ref.name}" (${now}) is no longer in the scene.`, `"${ref.name}" is no longer in the scene`);
+      return id;
+    });
+    return { ids, parent: parentChanged && parentRef ? parentRef.require() : 0 };
+  };
+  const applyStamps = () => {
+    const { ids, parent } = requireMove(newParentRef);
+    for (const id of ids) writeTraitField(id, attrMeta, 'sourceScene', targetScene);
+    const rid = ids[0];
+    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', parent);
     writeTraitFieldMarked(rid, attrMeta, 'sortOrder', newSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
     if (newLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, newLocal[f]);
     if (oldLocal && newLocal) markCompensatedTransform(rid, oldLocal, newLocal);
   };
-  const undoStamps = () => {
-    const idx = buildGuidIndex();
-    for (const { ref, prevSourceScene } of perEntity) {
-      const id = resolveWith(ref, idx); if (id != null) writeTraitField(id, attrMeta, 'sourceScene', prevSourceScene);
-    }
-    const rid = resolveWith(rootRef, idx); if (rid == null) return;
-    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', oldParentRef?.resolve() ?? 0);
+  const undoStamps = ({ ids, parent }: { ids: number[]; parent: number }) => {
+    perEntity.forEach(({ prevSourceScene }, i) => writeTraitField(ids[i], attrMeta, 'sourceScene', prevSourceScene));
+    const rid = ids[0];
+    if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', parent);
     writeTraitField(rid, attrMeta, 'sortOrder', oldSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
     if (oldLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, oldLocal[f]);
@@ -1630,8 +1744,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   _pushAction({
     label: opts?.label ?? (targetScene ? `Promote "${rootInfo.name}" → ${targetLabel}` : `Demote "${rootInfo.name}" → ${targetLabel}`),
     undo: () => {
+      const target = requireMove(oldParentRef, new Map(rekeyPairs.map((p) => [p.oldGuid, p.newGuid])));
       undoRekeys();
-      undoStamps();
+      undoStamps(target);
       markStructureDirty(); markUIDirty();
       if (fromScene) markSceneDirty(fromScene);
       if (targetScene) markSceneDirty(targetScene);

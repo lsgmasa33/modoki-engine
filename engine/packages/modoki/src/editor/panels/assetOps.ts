@@ -17,7 +17,11 @@ import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, call
 import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, type PrefabFile } from '../scene/prefab';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
-import { entityRef } from '../undo/entityRef';
+import { entityRef, isInstanceRootCheck } from '../undo/entityRef';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { resolveRef } from '../../runtime/loaders/assetManifest';
+import { isGuid } from '../../runtime/core/assetRefRules';
 import { reportUndoFailure, fileChangedRefusal } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
 import { dirtyAssetEditorHolds } from '../store/editorStore';
@@ -729,6 +733,11 @@ export async function createPrefabFromEntity(
     // Each half is ONE `commitPrefabWrite` (#1692): its rebuild puts this tree's links back (or on), and its rebase
     // then brings every OTHER instance of a replaced prefab onto the document the file now holds.
     undo: async () => {
+      // The tree this step tagged, asked BEFORE the file is trashed or restored (#1795's second route, I19/I20): after a
+      // world swap it can be gone, or a Missing Prefab placeholder (this prefab trashed, the scene reloaded) whose scene
+      // entry still names the file. Trashing first and finding that out after left the scene naming a file that was no
+      // longer there, with nothing unlinked. Asked only while the tree is tagged: an untagged tree has no link to undo.
+      if (tagged) ref.require({ check: (id) => isInstanceRootCheck(id) ?? (instanceSourceIs(id, guid, savePath) ? null : `is no longer an instance of ${savePath}`) });
       // ⚠️ A replace is RESTORED, never trashed: the path held a prefab before this action, and deleting it is
       // exactly how the original was lost (#1264). Same shape as skinPrefab.ts's update undo. Verbatim: the bytes
       // that were there, not a re-serialization of them.
@@ -739,8 +748,8 @@ export async function createPrefabFromEntity(
           unstamp();
           // By the document's own guid (#1807): the manifest can still map it to a renamed path an undo just moved back.
           const id = ref.resolve();
-          // A miss here comes AFTER the file was trashed, so it is a shortfall of a step that applied in part (#1823).
-          // `require` (docs/prefabs.md I19, #1795's second route) moves this check before the trash, making it a refusal.
+          // `require` above refused a tree that was gone or a placeholder before the trash. A miss HERE is a world swap
+          // that landed during the write, so it is a shortfall of a step that applied in part (#1823).
           if (id != null) untagEntityTreeAsInstance(id, savePath, prefab);
           else reportUndoFailure({ direction: 'Undo', label, detail: `the entity linked to ${savePath} no longer exists, so nothing was unlinked` });
           if (priorLinks) reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
@@ -769,6 +778,9 @@ export async function createPrefabFromEntity(
       // Over exactly what the undo left there: the restored bytes after a replace, nothing after a create — a prefab
       // created there since (by hand, or another Create Prefab) is somebody else's. An undo that did NOT apply (it
       // reported and returned) left `content` itself, so the redo rewrites only that.
+      // The tree it tags, asked BEFORE the file is written (I19): a tree that is gone, or a placeholder now, refuses the
+      // redo rather than writing a prefab nothing links.
+      ref.require();
       const committed = await commitPrefabWrite(savePath, prefab, {
         expected: fileHoldsContent ? content : replaced ? previousContent : null,
         bytes: content,
@@ -803,6 +815,15 @@ export async function createPrefabFromEntity(
     },
   };
   return { savePath, prefab, action, runtimeExcluded };
+}
+
+/** Whether instance root `id` is an instance of the prefab with document guid `guid` (or, where the manifest could not
+ *  resolve it, the raw `path` it was tagged with). */
+function instanceSourceIs(id: number, guid: string, path: string): boolean {
+  const meta = getTraitByName('PrefabInstance');
+  const source = meta ? (readTraitData(id, meta)?.source as string | undefined) : undefined;
+  // `resolveRef` only for a guid: handed an internal path it logs a loud refusal (GUID-only refs) and answers nothing.
+  return !!source && (source === guid || source === path || (isGuid(source) && resolveRef(source) === path));
 }
 
 /** The unsaved-work staleness a `/api/unused-assets` answer disclosed, or `null` when it disclosed

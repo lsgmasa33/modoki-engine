@@ -89,6 +89,7 @@ import { pushAction, subscribeUndo } from '../undo/undoManager';
 import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
 import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D, virtualDragDelta, groupMemberFields } from '../scene/multiTransform';
 import { entityRef, journalRefOf } from '../undo/entityRef';
+import { placeholderGestureRefusal } from '../undo/entityActions';
 import { notifyFieldEdited } from '../animation/recording';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
@@ -1224,6 +1225,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     function commitPoints(entityId: number, colMeta: { trait: unknown }, beforeStr: string, afterPts: Pt[]) {
       const afterStr = serializeColliderPoints(afterPts);
       if (afterStr === beforeStr) { setPointsLive(entityId, colMeta, beforeStr); return; }
+      // A Missing Prefab placeholder's save drops the edit (#1818): put the points back, and push nothing.
+      if (placeholderGestureRefusal([entityId], 'Collider2D')) { setPointsLive(entityId, colMeta, beforeStr); return; }
       const oldMarks = markStateOf(entityId, 'Collider2D', ['points']); // put back by the undo (#1709)
       setPointsLive(entityId, colMeta, afterStr);
       markOverrideIfInstance(entityId, 'Collider2D', 'points');
@@ -1231,8 +1234,9 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const ref = entityRef(entityId);
       pushAction({
         label: 'Edit Collider2D.points',
-        undo: () => { const id = ref.resolve(); if (id != null) { setPointsLive(id, colMeta, beforeStr); putMarkState(id, 'Collider2D', oldMarks); } },
-        redo: () => { const id = ref.resolve(); if (id != null) { setPointsLive(id, colMeta, afterStr); markOverrideIfInstance(id, 'Collider2D', 'points'); } },
+        // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
+        undo: () => { const id = ref.require(); setPointsLive(id, colMeta, beforeStr); putMarkState(id, 'Collider2D', oldMarks); },
+        redo: () => { const id = ref.require(); setPointsLive(id, colMeta, afterStr); markOverrideIfInstance(id, 'Collider2D', 'points'); },
       });
     }
 
@@ -1706,6 +1710,12 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         groupDragRef.current = null;
         const mode = useEditorStore.getState().gizmoMode;
         const recFields = mode === 'translate' ? ['x', 'y'] : mode === 'rotate' ? ['x', 'y', 'rz'] : ['x', 'y', 'sx', 'sy'];
+        // A Missing Prefab placeholder's save drops the drag (#1818): put every member back, and push nothing.
+        if (placeholderGestureRefusal(g.members.map((m) => m.id), 'Transform')) {
+          for (const m of g.members) { const cur = findEntity(m.id)?.get(Transform); if (cur) findEntity(m.id)!.set(Transform, { ...cur, ...m.local }); }
+          mark2DDirty(); fireDirtyListeners();
+          return;
+        }
         const actions = g.members.map((m) => {
           const tf = findEntity(m.id)?.get(Transform);
           if (!tf) return null;
@@ -1714,7 +1724,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           for (const k of recFields) notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
-            trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
+            trait: Transform, resolve: () => ref.require(), findEntity, before: { ...m.local }, after,
             entityGuid: journalRefOf(ref.guid, m.id), markFields: recFields,
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
@@ -1726,7 +1736,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       e.preventDefault();
       const { entityId, localStart } = dragRef.current;
       const tf = findEntity(entityId)?.get(Transform);
-      if (tf) {
+      if (tf && placeholderGestureRefusal([entityId], 'Transform')) { // #1818, as the group above
+        findEntity(entityId)!.set(Transform, { ...tf, ...localStart });
+        mark2DDirty(); fireDirtyListeners();
+      } else if (tf) {
         const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
         // before = the LOCAL transform at drag start (startTransform is world now).
         const before = { ...localStart };
@@ -1741,7 +1754,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         // on save. The builder also takes the marks back on undo (#1709).
         pushAction(buildTransformUndoAction({
           label: `Transform "${entityDisplayName(eid)}"`,
-          trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
+          trait: Transform, resolve: () => ref.require(), findEntity, before, after,
           entityGuid: journalRefOf(ref.guid, eid), markFields: moved,
         }));
         // Record mode: a gizmo drag writes Transform via direct entity.set (above),
@@ -3292,6 +3305,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         // member's position too (orbit/spread), so record mode must capture x/y/z as well.
         const recFields = mode === 'translate' ? ['x', 'y', 'z']
           : mode === 'rotate' ? ['x', 'y', 'z', 'rx', 'ry', 'rz'] : ['x', 'y', 'z', 'sx', 'sy', 'sz'];
+        // A Missing Prefab placeholder's save drops the drag (#1818): put every member back, and push nothing.
+        if (placeholderGestureRefusal(groupDrag.members.map((m) => m.id), 'Transform')) {
+          for (const m of groupDrag.members) { const cur = findEntity(m.id)?.get(Transform); if (cur) findEntity(m.id)!.set(Transform, { ...cur, ...m.before }); }
+          fireDirtyListeners();
+          groupDrag = null;
+          return;
+        }
         const actions = groupDrag.members.map((m) => {
           const tf = findEntity(m.id)?.get(Transform);
           if (!tf) return null;
@@ -3301,7 +3321,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           for (const k of recFields) notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]);
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
-            trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
+            trait: Transform, resolve: () => ref.require(), findEntity, before: m.before, after,
             entityGuid: journalRefOf(ref.guid, m.id), markFields: recFields,
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
@@ -3314,6 +3334,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (gizmoEntityId === null || !gizmoDragStart) return;
       const tf = findEntity(gizmoEntityId)?.get(Transform);
       if (!tf) return;
+      if (placeholderGestureRefusal([gizmoEntityId], 'Transform')) { // #1818, as the group above
+        findEntity(gizmoEntityId)!.set(Transform, { ...tf, ...gizmoDragStart });
+        fireDirtyListeners();
+        gizmoDragStart = null;
+        gizmoProxyScaleStart = null;
+        return;
+      }
       const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const before = { ...gizmoDragStart };
       const eid = gizmoEntityId;
@@ -3331,7 +3358,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const recFields = mode === 'translate' ? ['x', 'y', 'z'] : mode === 'rotate' ? ['rx', 'ry', 'rz'] : ['sx', 'sy', 'sz'];
       pushAction(buildTransformUndoAction({
         label: `Transform "${entityDisplayName(eid)}"`,
-        trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
+        trait: Transform, resolve: () => ref.require(), findEntity, before, after,
         entityGuid: journalRefOf(ref.guid, eid), markFields: recFields,
       }));
       for (const k of recFields) notifyFieldEdited(eid, 'Transform', k, (after as Record<string, number>)[k]);

@@ -13,6 +13,8 @@ import { pushAction } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
 import { entityRef } from './entityRef';
 import { useEditorStore } from '../store/editorStore';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import {
   revertOverridesSelective, rebuildInstanceFromCapture, preloadNestedPrefabsForSubtree,
   type RevertResult,
@@ -29,13 +31,23 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
   const ref = entityRef(result.newRootId);
   useEditorStore.getState().selectEntity(result.newRootId);
   const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes } = result;
+  // Both directions rebuild an instance ROOT of `source` (I20). After a world swap its guid can name a Missing Prefab
+  // placeholder (the prefab was deleted), and rebuilding from the capture expanded a second instance on the
+  // placeholder's guid beside it (#1819, I7). `require` refuses that, and a root that is gone, before anything changes.
+  const expect = {
+    check: (id: number) => {
+      const meta = getTraitByName('PrefabInstance');
+      const pi = meta ? readTraitData(id, meta) as { source?: string; rootInstanceId?: number } | null : null;
+      return pi && pi.rootInstanceId === id && pi.source === source ? null : `is no longer an instance of ${source}`;
+    },
+  };
   const rebuildTo = async (overrides: RevertResult['fullOverrides'], structure: RevertResult['fullStructure']) => {
-    const cur = ref.resolve(); if (cur == null) return;
+    const cur = ref.require(expect);
     // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO warning on a miss, so a cold cache
     // silently resets a nested instance's per-copy overrides to the child prefab base (#1284). undoManager awaits
     // undo/redo under its own mutex, so awaiting here is supported rather than merely tolerated.
     await preloadNestedPrefabsForSubtree(cur);
-    const after = ref.resolve(); if (after == null) return;
+    const after = ref.require(expect); // asked again: the await above can span a world swap
     const id = rebuildInstanceFromCapture(after, source, prefab, overrides, structure);
     // Refused BEFORE anything was rebuilt, as Apply's undo refuses (#1664): `runStep` drops the entry (#310) and, since
     // nothing changed, dirties nothing and toasts the reason rather than a bare "FAILED".

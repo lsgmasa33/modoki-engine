@@ -4877,8 +4877,13 @@ export function reattachPrefabInstance(
     const live = entry.ref.resolve();
     const entity = live == null ? undefined : findEntity(live);
     if (!entity) { unresolvedEntries.push(entry); continue; }
+    // A root that no longer resolves is not relinked (#1827, I19): the snapshot's `rootInstanceId` is a raw id from the
+    // world the Detach ran in, and after a swap it names whatever entity holds that id now. Counted as unresolved, and
+    // asked of the world below, as a member miss is. (Detach's undo refuses a miss before it gets here,
+    // `requireDetachedLinks`; Create Prefab's undo tolerates one, #1272.)
     const root = entry.rootRef.resolve();
-    const restored = root == null ? entry.data : { ...entry.data, rootInstanceId: root };
+    if (root == null) { unresolvedEntries.push(entry); continue; }
+    const restored = { ...entry.data, rootInstanceId: root };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
     else entity.add(PrefabInstanceMeta.trait(restored));
     // The frame's record goes back with its links (#1665 close-out): the restored localIds index the document the

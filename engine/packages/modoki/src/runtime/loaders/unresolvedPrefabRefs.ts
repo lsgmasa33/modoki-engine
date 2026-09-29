@@ -87,12 +87,28 @@ export const channelsOf = (record: Record<string, unknown>): Record<string, unkn
   return out;
 };
 
+/** The `EntityAttributes` fields of a placeholder that its writers take from the LIVE entity rather than the record
+ *  (#1818, I21): what the Hierarchy can change on it. `name` and `guid` ride identity beside these. The editor's write
+ *  gate (`editor/undo/placeholderGate.ts`) lets exactly these through, so an edit it allows is one the save keeps.
+ *  ⚠️ `sortOrder` and `isActive` are carried by the ENTRY shape only (`asSceneEntry`): a reference node keeps its
+ *  root's order and active flag as an override on the prefab's root row, which a placeholder cannot name without its
+ *  prefab. The gate refuses them on a placeholder the save writes as a node (`placeholderWrittenAsNode`). */
+export const PLACEHOLDER_ENTRY_ONLY_FIELDS = ['sortOrder', 'isActive'] as const;
+export const PLACEHOLDER_PLACEMENT_FIELDS = ['parentId', 'editorFolder', ...PLACEHOLDER_ENTRY_ONLY_FIELDS] as const;
+type EntryOnlyField = (typeof PLACEHOLDER_ENTRY_ONLY_FIELDS)[number];
+
+/** What a live placeholder's `sortOrder` / `isActive` load as when the record does not state them: the trait's
+ *  defaults, which a pass-1 spawn leaves. A save writes them only when the record states them or the live value
+ *  differs, so a save with no edit writes the bytes it read (#1722). */
+const PLACEMENT_DEFAULTS: Readonly<Record<EntryOnlyField, unknown>> = { sortOrder: 0, isActive: true };
+
 /** The record as a TOP-LEVEL scene entry, identity and placement from the live placeholder. An entry record is
  *  returned whole, with only those replaced; a node record (a reference node dragged to the scene root) keeps its
- *  channels and gets the minimal `PrefabInstance` a written root carries. */
+ *  channels and gets the minimal `PrefabInstance` a written root carries. `live.order` carries the Hierarchy's
+ *  `sortOrder` and `isActive` (#1818), written in place of the record's own so the key order holds. */
 export function asSceneEntry(
   kind: 'entry' | 'node', record: Record<string, unknown>, source: string,
-  live: { name: string; guid?: string; placement: Record<string, unknown> },
+  live: { name: string; guid?: string; placement: Record<string, unknown>; order?: Readonly<Record<EntryOnlyField, unknown>> },
 ): Record<string, unknown> {
   const traits: Record<string, unknown> = kind === 'entry' && record.traits && typeof record.traits === 'object'
     ? { ...(record.traits as Record<string, unknown>) }
@@ -102,6 +118,11 @@ export function asSceneEntry(
   delete ea.parentId;
   delete ea.editorFolder;
   Object.assign(ea, live.placement);
+  if (live.order) {
+    for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+      if (k in ea || live.order[k] !== PLACEMENT_DEFAULTS[k]) ea[k] = live.order[k];
+    }
+  }
   if (Object.keys(ea).length) traits.EntityAttributes = ea;
   else delete traits.EntityAttributes;
   const base = kind === 'entry' ? { ...record } : { prefab: source, ...channelsOf(record) };

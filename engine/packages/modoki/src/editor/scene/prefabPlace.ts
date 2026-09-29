@@ -12,6 +12,7 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
 import { instantiatePrefabInstance, type PrefabFile } from './prefab';
+import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';
 
@@ -36,6 +37,9 @@ export async function placePrefabFromPath(path: string, opts: {
   onRemoved?: () => void;
 }): Promise<number | null> {
   const parentId = opts.parentId ?? 0;
+  // The parent by guid, for the redo (#1793): the raw id it held named, after a rebuild (reopen, Play→Stop, Apply),
+  // whatever entity holds that id now, and the redo parented the instance under it, or under itself.
+  const parentRef = parentId ? entityRef(parentId) : null;
   try {
     // Taken BEFORE the fetch: a write landing during the fetch is inside the read too (#1752).
     const readAt = capturePrefabRead(path);
@@ -53,7 +57,9 @@ export async function placePrefabFromPath(path: string, opts: {
         const again = capturePrefabRead(path);
         const p = await readPrefabFile(path);
         if (!p) return null;
-        const id = await instantiatePrefabInstance(p, path, parentId, again);
+        // Required after the read, right before the spawn: a parent that is gone, or is a placeholder now, refuses the
+        // redo (owner ruling R) rather than landing the instance at the scene root or under another entity.
+        const id = await instantiatePrefabInstance(p, path, parentRef ? parentRef.require() : 0, again);
         opts.onPlaced?.(id);
         return id;
       },

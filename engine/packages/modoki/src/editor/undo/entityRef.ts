@@ -13,9 +13,19 @@
  *  why writing it live (not just into the closure) is load-bearing.
  *
  *  Falls back to the raw id ONLY when the entity genuinely has no guid (no
- *  EntityAttributes trait — an un-guidable bare entity); that fallback is valid
- *  within the same world only, matching the pre-existing selectionRestore
- *  behavior for guid-less entities. */
+ *  EntityAttributes trait — an un-guidable bare entity), and only in the World the
+ *  ref was taken in: ids are handed out again after a world swap, so a raw id held
+ *  across one names whatever entity took it (the held-entity rule, #1221).
+ *
+ *  **`require` owns a miss (#1819, #1827, #1793; I19 and I20 in docs/prefabs.md).**
+ *  `resolve` answers null and leaves the caller to decide, and the callers decided
+ *  differently: a silent no-op reported as done, the scene root, or a raw id that named
+ *  an unrelated entity after a swap. An undo or redo step asks `require` for every ref
+ *  it NEEDS before it changes anything; a miss, or a target that has changed KIND
+ *  (an instance a swap turned into a Missing Prefab placeholder), throws
+ *  `UndoRefusedError`, so `runStep` drops the entry (#310) and toasts why. A ref whose
+ *  miss the step has shown to be harmless keeps `resolve` (#1272's prior links), and so
+ *  do readers that may drop a miss (selection). */
 
 import { type World } from 'koota';
 import { getCurrentWorld, getGuidIndex, findEntityByGuid, indexEntityGuid, rebuildGuidIndexSync } from '../../runtime/core/ecs/world';
@@ -23,14 +33,36 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData, writeTraitField, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { durableGuid } from '../../runtime/core/assetRefRules';
+import { UndoRefusedError } from './undoFailure';
+import { isMissingPrefabPlaceholder, entityNameOf, placeholderRefusalWords } from './placeholderGate';
+
+/** What KIND of thing a ref's entity is, as far as an undo step cares (I20): a live entity, or a Missing Prefab
+ *  placeholder standing in for a reference the load could not expand. A world swap can turn one into the other under
+ *  the same guid. */
+export type EntityKind = 'entity' | 'placeholder';
+
+/** What a step expects of its target when it runs: the kind (default: the kind the ref was taken as, which is the kind
+ *  every editor step's forward half leaves, since no step turns an entity into a placeholder or back), and optionally a
+ *  finer check of the step's own, which returns the refusal's words or null. */
+export interface RefExpect {
+  kind?: EntityKind;
+  check?: (id: number) => string | null;
+}
 
 export interface EntityRef {
   /** Captured stable guid, or '' when the entity is un-guidable. */
   readonly guid: string;
   /** Capture-time id — fallback for un-guidable entities + diagnostics. */
   readonly rawId: number;
+  /** The entity's name when the ref was taken: what a refusal calls it once it is gone. */
+  readonly name: string;
+  /** The kind the entity was when the ref was taken. */
+  readonly kind: EntityKind;
   /** Current live ECS id, or null if the entity is gone. */
   resolve(): number | null;
+  /** The live id, or a throw of `UndoRefusedError` when the entity is gone or is not what `expect` says (I19, I20).
+   *  For a step that must not act on anything else: ask it for every ref the step needs, BEFORE the first write. */
+  require(expect?: RefExpect): number;
 }
 
 /** Read the entity's `EntityAttributes.guid`; if empty, mint one and WRITE it to
@@ -104,15 +136,113 @@ export function journalRefOf(guid: string | null | undefined, id: number): strin
 export function entityRef(entityId: number, mint = true): EntityRef {
   const guid = mint ? ensureGuid(entityId) : readGuid(entityId);
   const rawId = entityId;
-  return {
+  const world = getCurrentWorld();
+  const ref: EntityRef = {
     guid,
     rawId,
+    name: entityNameOf(entityId),
+    kind: isMissingPrefabPlaceholder(entityId) ? 'placeholder' : 'entity',
     resolve(): number | null {
       if (guid) { const id = idForGuid(guid); return id || null; }
-      // un-guidable: raw-id fallback, valid only within the same world.
-      return findEntity(rawId) ? rawId : null;
+      // un-guidable: raw-id fallback, valid only within the world it was taken in.
+      return rawIdIn(rawId, world);
+    },
+    require(expect?: RefExpect): number {
+      return requireResolved(ref, ref.resolve(), expect);
     },
   };
+  _refWorlds.set(ref, world);
+  return ref;
+}
+
+/** The World each ref was taken in, for `resolveWith`/`resolveRefs`, which resolve a ref against an index. */
+const _refWorlds = new WeakMap<EntityRef, World>();
+
+/** `rawId` while `world` is still the live one and holds it, else null. */
+function rawIdIn(rawId: number, world: World | undefined): number | null {
+  if (world !== undefined && world !== getCurrentWorld()) return null;
+  return findEntity(rawId) ? rawId : null;
+}
+
+/** The refusal for `ref` resolved to `id`, or `id` itself: `require`'s one body, shared by `requireWith`. */
+function requireResolved(ref: EntityRef, id: number | null, expect?: RefExpect): number {
+  const label = `"${ref.name || ref.guid || `id:${ref.rawId}`}"`;
+  if (id == null) {
+    throw new UndoRefusedError(
+      `${label} (${journalRefOf(ref.guid, ref.rawId)}) is no longer in the scene, so the step would act on nothing, or on whatever holds its place now.`,
+      `${label} is no longer in the scene`,
+    );
+  }
+  const want = expect?.kind ?? ref.kind;
+  const now: EntityKind = isMissingPrefabPlaceholder(id) ? 'placeholder' : 'entity';
+  if (now !== want) {
+    const words = now === 'placeholder'
+      ? placeholderRefusalWords(entityNameOf(id) || ref.name)
+      : `${label} is not a Missing Prefab any more (its prefab was restored and the scene reloaded), and this step was recorded against the placeholder`;
+    throw new UndoRefusedError(`${words}.`, words);
+  }
+  const why = expect?.check?.(id);
+  if (why) throw new UndoRefusedError(`${label} ${why}.`, `${label} ${why}`);
+  return id;
+}
+
+/** A `RefExpect.check` for a step whose forward half left its target an instance ROOT (Create Prefab's undo): the
+ *  refusal's words when entity `id` is not one now, else null. Revert's undo asks the finer "an instance of THIS
+ *  source" itself. */
+export function isInstanceRootCheck(id: number): string | null {
+  const meta = getTraitByName('PrefabInstance');
+  const pi = meta ? readTraitData(id, meta) as { rootInstanceId?: number } | null : null;
+  return pi && pi.rootInstanceId === id ? null : 'is no longer a prefab instance root';
+}
+
+/** `require` against a prebuilt guid→id index (`buildGuidIndex`): for a closure that requires many refs.
+ *
+ *  `renamed` (old guid → new guid) is for an undo that runs while a guid rename its own forward step made is still in
+ *  force, and reverses it only later in the step: a Detach-on-move promotion renames members (#1447), and the undo takes
+ *  the rename back AFTER it has asked for its refs, which were taken before the rename. Followed transitively (a → b → c,
+ *  two promotions in turn). */
+export function requireWith(ref: EntityRef, index: Map<string, number>, expect?: RefExpect, renamed?: ReadonlyMap<string, string>): number {
+  if (!ref.guid || !renamed?.size) return requireResolved(ref, resolveWith(ref, index), expect);
+  let g = ref.guid;
+  for (let hops = 0; renamed.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
+  return requireResolved(ref, index.get(g) ?? null, expect);
+}
+
+/** Each detached member an undo relinks (`relinkDetachedMembers`), required live and not a Missing Prefab placeholder
+ *  before anything is written (I19, I20). The relink itself skips a member it cannot find, and would put
+ *  `PrefabInstance` back onto a placeholder: an orphan the frame-ending promoted and a world swap later made one. Found
+ *  through `renamed`, like every ref taken before the rename. */
+export function requireDetachedMembers(
+  members: readonly { guid: string }[], index: Map<string, number>, renamed?: ReadonlyMap<string, string>,
+  /** Guids the step itself brings back before it relinks (a delete's own targets): absent now, and not a miss. */
+  respawned?: ReadonlySet<string>,
+): void {
+  for (const m of members) {
+    if (!m.guid || respawned?.has(m.guid)) continue;
+    let g = m.guid;
+    for (let hops = 0; renamed?.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
+    const id = index.get(g);
+    if (id == null) {
+      throw new UndoRefusedError(`A member this step relinks (${m.guid}) is no longer in the scene, so it cannot be linked back.`, 'a member it links back is no longer in the scene');
+    }
+    if (isMissingPrefabPlaceholder(id)) {
+      const words = placeholderRefusalWords(entityNameOf(id));
+      throw new UndoRefusedError(`${words}.`, words);
+    }
+  }
+}
+
+/** The old → new guid renames a set of `DetachedMember`s carries (`renamed` pairs, in the order they were applied), for
+ *  `requireWith`. */
+export function renamesOf(members: readonly { renamed?: readonly (readonly [string, string])[] }[], into: Map<string, string> = new Map()): Map<string, string> {
+  for (const m of members) for (const [a, b] of m.renamed ?? []) into.set(a, b);
+  return into;
+}
+
+/** Every ref in `refs` required against one index, in order: the ids, or the first refusal. Asked BEFORE the step
+ *  writes, so a refusal leaves nothing half-applied. */
+export function requireAll(refs: readonly EntityRef[], expect?: RefExpect, index: Map<string, number> = buildGuidIndex()): number[] {
+  return refs.map((r) => requireWith(r, index, expect));
 }
 
 /** One-pass guid→id index for a world. Build ONCE per undo/redo invocation that
@@ -137,7 +267,7 @@ export function buildGuidIndex(world: World = getCurrentWorld()): Map<string, nu
  *  entries and would break the alignment. */
 export function resolveWith(ref: EntityRef, index: Map<string, number>): number | null {
   if (ref.guid) { const id = index.get(ref.guid); return id ?? null; }
-  return findEntity(ref.rawId) ? ref.rawId : null;
+  return rawIdIn(ref.rawId, _refWorlds.get(ref));
 }
 
 /** Resolve a batch of refs to live ids, dropping any that no longer resolve.
@@ -146,7 +276,7 @@ export function resolveRefs(refs: EntityRef[], index?: Map<string, number>): num
   const idx = index ?? buildGuidIndex();
   const ids: number[] = [];
   for (const r of refs) {
-    const id = r.guid ? (idx.get(r.guid) ?? 0) : (findEntity(r.rawId) ? r.rawId : 0);
+    const id = r.guid ? (idx.get(r.guid) ?? 0) : (rawIdIn(r.rawId, _refWorlds.get(r)) ?? 0);
     if (id) ids.push(id);
   }
   return ids;

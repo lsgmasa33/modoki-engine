@@ -169,7 +169,8 @@ export {
 
 // C7: agents must address entities by GUID (runtime ids are reassigned on every scene
 // hot-reload), so the ops that CREATE entities have to be able to hand one back.
-export { ensureGuid, entityRef, type EntityRef } from './undo/entityRef';
+export { ensureGuid, entityRef, isInstanceRootCheck, type EntityRef } from './undo/entityRef';
+export { placeholderWriteRefusal, isMissingPrefabPlaceholder } from './undo/placeholderGate';
 
 // The agent prefab ops (engine/app/editor/agentEditorOps.ts) must push the SAME undo
 // entries as the Hierarchy/Assets/Inspector paths — otherwise an agent-instantiated

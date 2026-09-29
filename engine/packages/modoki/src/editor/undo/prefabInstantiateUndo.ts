@@ -128,9 +128,9 @@ export function makePrefabInstantiateAction(opts: {
     label: opts.label,
     // The scene the new instance belongs to: a base, when it was dropped under a base entity (#1429).
     affectedScenes: resolveAffectedScenes([opts.initialId]),
-    // Resolve by guid; fall back to the last-known id if it can't (remove is safe
-    // to call on a stale/dead id — a no-op — matching the original contract).
-    undo: () => { opts.remove(currentRef.resolve() ?? currentRef.rawId); },
+    // By guid only (#1827, I19): the raw id it used to fall back to names, after a world swap, whatever entity holds
+    // that id now, and the undo deleted it. A root that is gone, or has become a placeholder, refuses.
+    undo: () => { opts.remove(currentRef.require()); },
     redo: async () => {
       // A respawn REFUSED because the prefab was written while it was read (#1752): nothing was spawned, and the step is
       // DROPPED with its notice (`UndoRefusedError`, #1664's contract) rather than left on the redo stack. The file it

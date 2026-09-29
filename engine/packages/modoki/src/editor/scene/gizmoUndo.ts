@@ -21,7 +21,9 @@ export interface TransformUndoOptions {
   /** The Transform trait token passed to entity.has/get/set. */
   trait: unknown;
   /** Re-resolve the entity id from a guid-stable ref INSIDE the closures — a captured
-   *  koota handle/raw id goes stale on delete/restore or a Play→Stop world rebuild. */
+   *  koota handle/raw id goes stale on delete/restore or a Play→Stop world rebuild. The editor passes the ref's
+   *  `require`, which THROWS `UndoRefusedError` on a miss or a changed kind (#1819, I19): a null here is a no-op, which
+   *  reads as done. */
   resolve: () => number | null;
   findEntity: (id: number) => UndoEntity | null | undefined;
   /** Only the Transform fields the drag changed, at drag start. */
@@ -38,6 +40,9 @@ export interface TransformUndoOptions {
    *  saved as an override pinned at the old pose (#1709). Omit to mark nothing. */
   markFields?: readonly string[];
 }
+
+/** Each built action's resolver, so a group can ask every member before it moves any. */
+const _resolvers = new WeakMap<UndoAction, () => number | null>();
 
 /** Build the undo action. `undo`/`redo` MERGE their field set onto the LIVE transform
  *  (not replace it) so an unrelated field changed between the drag and the undo isn't
@@ -63,6 +68,7 @@ export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction
     fireDirtyListeners();
   };
   const action: UndoAction = { label, undo: () => apply(before, marks?.before), redo: () => apply(after, marks?.after) };
+  _resolvers.set(action, resolve);
   if (entityGuid) {
     action.kind = '!transform';
     // Only the fields this gizmo mode changed — a translate reports {x,y,z}, a
@@ -77,10 +83,13 @@ export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction
  *  (gizmos: one-undo-per-drag, extended to N members). Journalled as a single `!transform`
  *  carrying every member's guid + before/after so Percept still perceives the group edit. */
 export function buildGroupTransformUndoAction(label: string, actions: UndoAction[]): UndoAction {
+  // Every member resolved before the first one moves (I19): a `require` that refuses on the third member must not leave
+  // the first two moved under an entry that is then dropped.
+  const precheck = () => { for (const a of actions) _resolvers.get(a)?.(); };
   const combined: UndoAction = {
     label,
-    undo: () => { for (const a of actions) a.undo(); },
-    redo: () => { for (const a of actions) a.redo(); },
+    undo: () => { precheck(); for (const a of actions) a.undo(); },
+    redo: () => { precheck(); for (const a of actions) a.redo(); },
   };
   const members = actions.map((a) => a.journalPayload).filter(Boolean) as Record<string, unknown>[];
   if (members.length) {

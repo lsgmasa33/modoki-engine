@@ -20,7 +20,7 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
 import { liveGuidOf } from '../debug/liveLifecycle';
-import { setEditorParentWrite } from '../debug/liveMutate';
+import { setEditorParentWrite, setEditorWriteGate } from '../debug/liveMutate';
 import { describeTopModal, type ModalDescription } from '../debug/modalShells';
 import {
   resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields, ALSO_DELETED_CAP,
@@ -58,7 +58,7 @@ import {
   applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
-  pushAction, makePrefabInstantiateAction, entityRef, assetDocAction,
+  pushAction, makePrefabInstantiateAction, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
@@ -973,6 +973,12 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             fields = converted.fields;
           }
           const entity = findEntity(id);
+          // A Missing Prefab placeholder keeps only its placement through a save (#1818, I21): an add, or a field its
+          // writer does not carry, is refused here with the reason, before anything in this op is applied.
+          const onPlaceholder = entity && !entity.has(meta.trait)
+            ? placeholderWriteRefusal(id, meta.name)
+            : Object.keys(fields).map((f) => placeholderWriteRefusal(id, meta.name, f)).find((r) => r) ?? null;
+          if (onPlaceholder) { errors.push(`${where}: ${onPlaceholder} — nothing was applied to entity ${id}`); continue; }
           if (Object.keys(fields).length === 0) {
             // No fields → tag presence, mirroring sceneMutate.ts (don't clobber existing data;
             // re-tagging an existing trait is a genuine no-op, not a change).
@@ -1042,6 +1048,8 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           const meta = allTraitsList.find((t) => t.name === op.trait);
           if (!meta) { errors.push(`${where}: unknown trait '${op.trait}'`); continue; }
           const entity = findEntity(id);
+          const onPlaceholder = entity?.has(meta.trait) ? placeholderWriteRefusal(id, meta.name) : null; // #1818, as setTrait
+          if (onPlaceholder) { errors.push(`${where}: ${onPlaceholder} — nothing was applied to entity ${id}`); continue; }
           if (entity?.has(meta.trait)) { removeTraitFromEntitiesWithUndo([id], meta); changed++; }
           // Removing an absent trait is a genuine no-op, not an error (mirrors sceneMutate.ts).
         } else if (op.op === 'addEntity') {
@@ -1323,6 +1331,9 @@ export function registerEditorAgentOps(): void {
     apply: (id, parentId) => applyReparent(id, parentId).ok,
     savedNote: 'live world only, not saved yet: each parent change went through the editor\'s reparent and is one undo entry (Cmd+Z / modoki_history undo).',
   });
+  // …and every set-traits write asks the placeholder gate first (#1818): a raw write on a Missing Prefab placeholder
+  // showed live and was dropped by the next save.
+  setEditorWriteGate((id, trait, field) => placeholderWriteRefusal(id, trait, field ?? undefined));
 
   // ── State read ──
   registerAgentOp('editor-state', () => readEditorState());
@@ -3082,7 +3093,8 @@ export function registerEditorAgentOps(): void {
           const readAgain = capturePrefabRead(path);
           const again = await getPrefabSource(path);
           if (!again) return null;
-          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? (parentRef.resolve() ?? 0) : 0, readAgain);
+          // Required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses the redo.
+          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? parentRef.require() : 0, readAgain);
           return id;
         },
         remove: (id) => { deleteEntity(id); },
@@ -3247,7 +3259,10 @@ export function registerEditorAgentOps(): void {
         pushAction({
           label,
           undo: () => {
-            const id = ref.resolve(); if (id == null) return;
+            // Its target is the instance root this op tagged (I20): after a world swap it can be gone, or a Missing Prefab
+            // placeholder (the prefab trashed and the scene reloaded), and untagging and relinking one reached into a
+            // tree that is not the one tagged. `require` refuses both before anything changes (#1795's agent twin).
+            const id = ref.require({ check: isInstanceRootCheck });
             // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
             // snapshotted one line before the tag and addresses each member by the guid it held then,
             // so reattaching ahead of this would resolve nothing (#1461).
@@ -3261,12 +3276,12 @@ export function registerEditorAgentOps(): void {
             if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${unresolved} prior prefab link(s) could not be put back — no longer addressable` });
           },
           redo: async () => {
-            const id = ref.resolve(); if (id == null) return;
+            const id = ref.require(); // I19: a target that is gone refuses, rather than reading as done
             // tagEntityTreeAsInstance re-runs planPrefabRows, the FLATTEN reader (#1284): cold,
             // the re-planned rows drop the nested instance, planMatchesFile then disagrees with
             // the file written warm, and the redo tags nothing at all.
             await preloadNestedPrefabsForSubtree(id);
-            const after = ref.resolve(); if (after == null) return;
+            const after = ref.require(); // asked again: the await above can span a world swap
             ({ guidRemap, undoKept } = tagCreatedPrefab(after, landedPath, prefab)); // undo reverses THIS run's rename
 
           },

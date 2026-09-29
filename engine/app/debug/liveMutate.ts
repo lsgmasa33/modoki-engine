@@ -355,6 +355,35 @@ function guardEditorParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutat
   return null;
 }
 
+/** Editor-only (#1818): why writing `trait` (`field`, or the whole trait when null: a tag, or an add) on entity `id`
+ *  would be dropped by the next save, or null. Installed by `agentEditorOps.ts` as the editor's placeholder gate
+ *  (`placeholderWriteRefusal`): a Missing Prefab placeholder saves only its kept record and its placement, so a raw
+ *  write here showed live and was gone on reload. Unset on a device, which saves nothing. */
+export type EditorWriteGate = (id: number, trait: string, field: string | null) => string | null;
+let _editorWriteGate: EditorWriteGate | null = null;
+
+/** Editor-only: install the write gate. Returns the one it replaced. */
+export function setEditorWriteGate(gate: EditorWriteGate | null): EditorWriteGate | null {
+  const was = _editorWriteGate;
+  _editorWriteGate = gate;
+  return was;
+}
+
+/** Every target and write asked BEFORE any write, so a refused one refuses the whole call. A write that ADDS the trait
+ *  (the entity lacks it) is asked as an add. */
+function guardEditorWriteGate(ids: number[], writes: ParsedWrite[]): LiveMutateFailure | null {
+  if (!_editorWriteGate) return null;
+  for (const id of ids) {
+    const entity = findEntity(id);
+    for (const w of writes) {
+      const adds = w.field === null || !entity?.has(w.meta.trait);
+      const refused = _editorWriteGate(id, w.trait, adds ? null : w.field);
+      if (refused) return { ok: false, error: `set key "${w.field === null ? w.trait : `${w.trait}.${w.field}`}" on entity ${id}: ${refused} — nothing was applied.` };
+    }
+  }
+  return null;
+}
+
 /** The per-field refusals every generic write path shares (`fieldWriteRefusal`, #1757): a write of
  *  `EntityAttributes.sourceScene` is a scene move, which a field write cannot carry. Judged per target
  *  against its own current value, so writing back what an entity already has still passes. */
@@ -424,6 +453,8 @@ export function applyLiveMutate(
   if (stampRefusal) return stampRefusal;
   const editorParentRefusal = guardEditorParentWrite(ids, writes);
   if (editorParentRefusal) return editorParentRefusal;
+  const gateRefusal = guardEditorWriteGate(ids, writes);
+  if (gateRefusal) return gateRefusal;
   const parentHook = _editorParentWrite;
   let reparented = false;
   const isParent = (w: ParsedWrite) => w.trait === 'EntityAttributes' && w.field === 'parentId';

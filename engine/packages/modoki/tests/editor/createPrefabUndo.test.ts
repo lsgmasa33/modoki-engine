@@ -92,14 +92,23 @@ vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => ({
 }));
 vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ replaceCachedPrefab: vi.fn(), invalidatePrefab: vi.fn(), getPrefabRevision: () => 0 }));
 
-/** Set to make the tree unresolvable (a world rebuild with the subtree gone), for the #1679 flag case. */
-const refState = vi.hoisted(() => ({ gone: false }));
+/** Set to make the tree unresolvable, for the #1679 flag case. `gone` is a world swap that lands DURING the step's write,
+ *  after `require` has passed (the in-rebuild miss, a #1823 shortfall); `refused` is one that landed before it, which
+ *  `require` refuses (#1795's second route — its real-world case is in engine/tests/editor/prefabCommit.test.ts). */
+// `Refused` is the real UndoRefusedError, set once the file has imported it: the factory cannot import it itself, since
+// undoFailure's import graph reaches this very mock and the factory would wait on its own result.
+const refState = vi.hoisted(() => ({ gone: false, refused: false, Refused: Error as new (m: string, t: string) => Error }));
 vi.mock('../../src/editor/undo/entityRef', () => ({
-  entityRef: (id: number) => ({ resolve: () => (refState.gone ? null : id), rawId: id }),
+  entityRef: (id: number) => ({
+    resolve: () => (refState.gone ? null : id), rawId: id,
+    require: () => { if (refState.refused) throw new refState.Refused('gone', 'gone'); return id; },
+  }),
+  isInstanceRootCheck: () => null,
 }));
 
 import { createPrefabFromEntity } from '../../src/editor/panels/assetOps';
 import { UndoRefusedError } from '../../src/editor/undo/undoFailure';
+refState.Refused = UndoRefusedError;
 import { createHash } from 'node:crypto';
 
 // Which /api/* routes should fail this test. Everything else answers ok.
@@ -160,6 +169,7 @@ beforeEach(() => {
   reattachSpy.mockReturnValue(0); // links restored cleanly unless a test says otherwise
   runtimeExcludedFixture = 0;
   refState.gone = false;
+  refState.refused = false;
 });
 // Restored in afterEach, NOT inline: a failing assertion skips the rest of the body, so
 // an inline restore never runs and the stub leaks into every later test.
@@ -548,6 +558,20 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     await replaced.redo(); expect(onDisk.get(P)).toBe(applied);
     await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
+  });
+
+  // #1795's second route (I19): the tagged tree is asked for BEFORE the file moves. Mutation: drop the
+  // `if (tagged) ref.require(...)` line from the undo — the file is trashed first.
+  it('an undo whose tree `require` refuses leaves the file on disk and asks the route for nothing; the redo refuses before it writes', async () => {
+    const action = await makeAction();
+    const bytes = onDisk.get(P);
+    mockFetch.mockClear();
+    refState.refused = true;
+    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(onDisk.get(P)).toBe(bytes);
+    expect(mockFetch).not.toHaveBeenCalled();
+    await expect(action.redo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('which bytes the FILE holds is its own flag: a redo that wrote but found no tree to tag, then a failed undo, does not refuse the next redo', async () => {

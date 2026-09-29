@@ -4,7 +4,7 @@
 import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/editor/undo/undoManager';
 import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefab';
-import { getAllEntities } from '@modoki/engine/runtime';
+import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
 import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory, type Tolerate } from './checks';
@@ -142,6 +142,8 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     const op = all[i];
     const label = i < ops.length ? describeOp(op) : 'final save→reload';
     const before = be.snapshot();
+    const placeholdersBefore = editing() ? new Set<string>() : placeholderGuids();
+    const worldBefore = getCurrentWorld();
     st.note = undefined;
     st.roundTrip = undefined;
     st.prefabEditSaved = undefined;
@@ -193,6 +195,14 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (failures.length) return fail(i, label, failures[0]);
 
     if (op.kind === 'outsideEdit' && outcome === 'done') seg.tainted = 'an outside edit';
+    // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
+    // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
+    // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap:
+    // a same-world op that makes a placeholder (a duplicate or paste of one, a delete's undo, a drop whose nested
+    // reference is missing) changes no recorded entity's kind, and tainting there would hide a false refusal for the
+    // rest of the segment (#1819 close-out review). The per-step I6/I7 checks run either way.
+    const swapped = getCurrentWorld() !== worldBefore;
+    if (swapped && [...placeholderGuids()].some((g) => !placeholdersBefore.has(g))) seg.tainted = 'a world swap expanded a Missing Prefab placeholder (ruling R)';
     if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) seg.tainted = 'a prefab edit save';
     if (raised.length) seg.tainted = `a watcher reload (${raised.join(', ')})`;
     // The stack was reset (a reload, a scene open): a new segment starts here.

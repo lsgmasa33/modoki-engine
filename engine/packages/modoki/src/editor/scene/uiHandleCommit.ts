@@ -10,6 +10,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { pushAction } from '../undo/undoManager';
 import { entityRef } from '../undo/entityRef';
+import { placeholderGestureRefusal } from '../undo/entityActions';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes } from './sceneDirty';
 import { reconcileOverrideMarks, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
@@ -45,6 +46,8 @@ export function commitUIHandleDrag(
   const meta = getTraitByName(trait);
   if (!meta) return;
   const changed = Object.keys(after).filter((k) => !Object.is(before[k], after[k]));
+  // A Missing Prefab placeholder's save drops the drag (#1818): put the values back, and push nothing.
+  if (placeholderGestureRefusal([entityId], trait)) { writeUIHandleValues(entityId, trait, { ...before }); return; }
   // Marks are untouched since the drag started (its live writes are raw), so this is the state the undo restores.
   const oldMarks = markStateOf(entityId, trait, changed);
   reconcileOverrideMarks(entityId, meta, changed);
@@ -53,8 +56,9 @@ export function commitUIHandleDrag(
   const b = { ...before }, a = { ...after };
   pushAction({
     label,
-    undo: () => { const id = ref.resolve(); if (id != null) { writeUIHandleValues(id, trait, b); putMarkState(id, trait, oldMarks); } },
-    redo: () => { const id = ref.resolve(); if (id != null) { writeUIHandleValues(id, trait, a); putMarkState(id, trait, newMarks); } },
+    // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
+    undo: () => { const id = ref.require(); writeUIHandleValues(id, trait, b); putMarkState(id, trait, oldMarks); },
+    redo: () => { const id = ref.require(); writeUIHandleValues(id, trait, a); putMarkState(id, trait, newMarks); },
     // Without it the scene the member belongs to was never marked dirty, so a save could skip it.
     affectedScenes: resolveAffectedScenes([entityId]),
   });

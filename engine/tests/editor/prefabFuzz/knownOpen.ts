@@ -24,14 +24,8 @@ export interface KnownOpen {
   tolerate?: keyof Tolerate;
 }
 
-/** A node in an instance's node list (own / added / children, or a template-added key's record) that the redo put
- *  somewhere else: missing where the end state held it, or present where it held none. Never a trait diff. */
-const DROP_NODE_MOVED = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(parentLocalId|own)":.* vs undefined$|undefined vs \[?\{"(parentLocalId|own)":)|^\/entities\/[0-9a-f]{8}-[0-9a-f-]{27}(\/traits\/EntityAttributes\/parentId: "[^"]+" vs "[^"]+"$|: (\{.* vs undefined$|undefined vs \{))/;
-
 /** Create Prefab's redo refused to tag the tree it rewrote because a reload reordered its siblings (#1796's route). */
 const POSITIONAL_RETAG = /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \((".*" was written at localId \d+, but sits where row \d+ was written|row \d+ changed between a nested reference and a plain member)\)/;
-
-const UNDO_IDENTITY = /^(undo to the start|redo to the end) does not restore the scene$/;
 
 /** The entity a round-trip diff is on (`/<guid>/…`). */
 const subjectGuid = (f: StepFailure) => /^\/([0-9a-f]{8}-[0-9a-f-]{27})(\/|:)/.exec(f.detail)?.[1];
@@ -68,12 +62,6 @@ const positionalRetagRedo = (f: StepFailure, ops: readonly Op[]): boolean => f.c
 /** A node in a node list (or a template-added key's record, or a slot) that differs across the redo walk. */
 const NODE_LIST_DIFF = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(parentLocalId|own)":.* vs undefined$|undefined vs \[?\{"(parentLocalId|own)":)|\/(own|added|children)(\/\d+)+\/guid: "[^"]+" vs "[^"]+"$/;
 
-/** #1793: the drop's redo lands under the raw parent id it captured. */
-const KNOWN_OPEN_1793 = (f: StepFailure, ops: readonly Op[]): boolean => ((f.check === 'redo to the end does not restore the scene' && f.op === 'undo/redo to the ends' && DROP_NODE_MOVED.test(f.detail)
-    && (f.moved === true || /\/traits\/EntityAttributes\/parentId: /.test(f.detail)) && touchedBy(f, 'drop', diffSubject(f)))
-  || (f.check === 'redo threw' && /Instantiate/.test(f.detail) && /Maximum call stack/.test(f.detail)))
-  && ops.some((o) => o.kind === 'instantiate' && o.u[1] >= 0.4);
-
 /** #1794: a Detach, a rebuild (a reload, or a prefab-edit visit), then its undo as the last op; the next save→reload finds
  *  the member's marks differ. Never a component's mark (#1800, #1822). */
 const detachMarks = (f: StepFailure, ops: readonly Op[]): boolean => f.check === 'save→reload is not the identity'
@@ -84,26 +72,10 @@ const detachMarks = (f: StepFailure, ops: readonly Op[]): boolean => f.check ===
     return d >= 0 && r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'undo');
   })();
 
-/** #1819: an edit whose undo cannot reach its target, because a world swap folded it into a placeholder's kept record —
- *  the record still holds the edit after the undo walk. */
 /** The suffix a round-trip difference carries when it was measured with the run's deleted prefabs RESTORED (#1805,
  *  `checkRoundTrip`): the same difference, seen through the stricter comparison — optional, so a route with no deletion
  *  keeps matching. */
 const RESTORED = String.raw`( \(with the deleted prefab restored\))?`;
-
-const PLACEHOLDER_KEPT_EDIT = /^\/entities\/[^/]+\/(added\/\d+\/)*members\/\/[^:]+\/(traits|added|a\+k-[^/:]+): undefined vs [[{]/;
-const placeholderEditUndo = (f: StepFailure, ops: readonly Op[]): boolean => UNDO_IDENTITY.test(f.check) && f.op === 'undo/redo to the ends'
-  && PLACEHOLDER_KEPT_EDIT.test(f.detail) && !ops.some((o) => o.kind === 'detach') && (() => {
-    const t = ops.findIndex((o) => o.kind === 'trashPrefab'); const w = ops.findIndex((o, i) => i > t && o.kind === 'prefabEdit');
-    return t >= 0 && w >= 0 && ops.slice(0, w).some((o) => ['editField', 'addComponent', 'removeComponent', 'addChild'].includes(o.kind));
-  })();
-
-/** #1819: an undo recorded against an instance, run after a trash and a world swap turned it into a placeholder. */
-const placeholderUndo = (f: StepFailure, ops: readonly Op[]): boolean => ((f.check === 'I7 duplicate guid' && /different top-level roots; not rows of one frame/.test(f.detail))
-  || f.check === 'I6 member names no live root') && /^(undo|redo)/.test(f.op) && (() => {
-    const t = ops.findIndex((o) => o.kind === 'trashPrefab'); const w = ops.findIndex((o, i) => i > t && o.kind === 'prefabEdit');
-    return t >= 0 && w >= 0 && ops.slice(0, w).some((o) => o.kind === 'revert' || o.kind === 'delete');
-  })();
 
 export const KNOWN_OPEN: KnownOpen[] = [
   {
@@ -120,88 +92,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     // which a predicate keyed on the op list alone swallowed, is not claimed.
     stops: (f, ops) => f.check === 'I7 duplicate guid' && /not rows of one frame/.test(f.detail) && f.op.startsWith('revert')
       && ops.some((o) => o.kind === 'reparent' || o.kind === 'detach' || o.kind === 'createPrefab'),
-  },
-  {
-    issue: 1793,
-    what: 'the Hierarchy drop redo respawns under the raw parentId it captured',
-    repro: [
-      { kind: 'addChild', u: [0.10074071935378015, 0.028060921700671315, 0.7381888588424772, 0.07076097163371742, 0.48960428941063583, 0.8733981365803629, 0.6133775096386671, 0.42650880897417665] },
-      { kind: 'saveReload', u: [0.5627734144218266, 0.658590353326872, 0.20640674652531743, 0.20616899570450187, 0.6343548579607159, 0.5095381010323763, 0.7855825365986675, 0.2228345947805792] },
-      { kind: 'delete', u: [0.8534152032807469, 0.004220895003527403, 0.012713729869574308, 0.5877229287289083, 0.543377417139709, 0.7120547322556376, 0.8890753472223878, 0.011987897567451] },
-      { kind: 'createPrefab', u: [0.39224287075921893, 0.34542759554460645, 0.5703704461921006, 0.651647862745449, 0.640527063049376, 0.906829692190513, 0.5833610829431564, 0.11566608608700335] },
-      { kind: 'instantiate', u: [0.5398968369700015, 0.5591946570202708, 0.3965801652520895, 0.8199710526969284, 0.7236331920139492, 0.3989574590232223, 0.5845813890919089, 0.9010130369570106] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && DROP_NODE_MOVED.test(f.detail),
-    // A drop under a parent (instantiate's u[1] >= 0.4) before the failure, then the redo walk. What renumbers the world
-    // between them can be any rebuild, and every run ends with one (the final save→reload). Keyed on what the redo shows:
-    // a node the end state held in a node list (the drop, respawned elsewhere) is missing — never a trait diff (review:
-    // keyed on the check alone, this claimed a redo that lost an override). The redo that throws is the dead-id branch
-    // of the same mechanism (a stack overflow in the instantiate undo's subtree walk).
-    stops: (f, ops) => KNOWN_OPEN_1793(f, ops),
-  },
-  {
-    issue: 1793,
-    what: "the same, where the redone drop lands inside a tree Create Prefab saved, whose redo then refuses to tag",
-    repro: [
-      { kind: 'instantiate', u: [0.536669387947768, 0.6350903764832765, 0.16291079157963395, 0.6589401110541075, 0.06732470379211009, 0.28064573951996863, 0.814664434408769, 0.09242976340465248] },
-      { kind: 'duplicate', u: [0.1208830603864044, 0.1635916270315647, 0.13143340032547712, 0.8468647501431406, 0.23493050667457283, 0.5173707250505686, 0.24668535101227462, 0.9065328275319189] },
-      { kind: 'instantiate', u: [0.7415995926130563, 0.9059424293227494, 0.6720692184753716, 0.09967420063912868, 0.9266807311214507, 0.75157764647156, 0.5515890922397375, 0.413286124356091] },
-      { kind: 'createPrefab', u: [0.4479338226374239, 0.27541221934370697, 0.9265035709831864, 0.5260013118386269, 0.39644129923544824, 0.46983038261532784, 0.2828926555812359, 0.9987726588733494] },
-      { kind: 'duplicate', u: [0.6731960822362453, 0.6350430566817522, 0.7874502844642848, 0.569269162369892, 0.3572055655531585, 0.6255097249522805, 0.7987854916136712, 0.40314554143697023] },
-      { kind: 'prefabEdit', u: [0.42861639079637825, 0.054919869638979435, 0.11251235730014741, 0.25302259996533394, 0.5110977506265044, 0.6065081746783108, 0.19385989173315465, 0.17463909462094307], inner: [] },
-      { kind: 'instantiate', u: [0.8633103484753519, 0.7312443025875837, 0.2811007387936115, 0.9838384159374982, 0.2525151225272566, 0.22980506089515984, 0.1260009352117777, 0.912312442669645] },
-      { kind: 'duplicate', u: [0.27535659074783325, 0.4235336270648986, 0.865512638585642, 0.7019412482623011, 0.7961306441575289, 0.866034438367933, 0.18822620552964509, 0.03233868605457246] },
-    ],
-    reproduces: (f) => f.check === 'console.error' && /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \(\d+ rows now vs \d+ written\)/.test(f.detail),
-    // A drop under a parent and a Create Prefab, no trash (with a trash it is #1795's placeholder route).
-    stops: (f, ops) => f.check === 'console.error' && (f.op === 'undo/redo to the ends' || /^redo\(/.test(f.op))
-      && /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \(\d+ rows now vs \d+ written\)/.test(f.detail)
-      && ops.some((o) => o.kind === 'createPrefab') && ops.some((o) => o.kind === 'instantiate' && o.u[1] >= 0.4) && !ops.some((o) => o.kind === 'trashPrefab'),
-  },
-  {
-    issue: 1793,
-    what: "the same, where the redone drop lands under another member (a node gained there)",
-    repro: [
-      { kind: 'createPrefab', u: [0.4756804835051298, 0.9059161539189517, 0.2702726419083774, 0.04173311730846763, 0.3559492980130017, 0.7170560555532575, 0.7191443415358663, 0.3863689487334341] },
-      { kind: 'apply', u: [0.0984069409314543, 0.7538809631951153, 0.9942104765214026, 0.13992764917202294, 0.5408165806438774, 0.9048162957187742, 0.8538481199648231, 0.10714701632969081] },
-      { kind: 'instantiate', u: [0.5284241682384163, 0.6892916776705533, 0.5348713435232639, 0.20216689840890467, 0.11103156278841197, 0.7996803736314178, 0.7371482730377465, 0.5829197440762073] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && DROP_NODE_MOVED.test(f.detail),
-    stops: (f, ops) => KNOWN_OPEN_1793(f, ops),
-  },
-  {
-    issue: 1793,
-    what: "the same, where the respawned drop takes another node's slot in a node list",
-    repro: [
-      { kind: 'addChild', u: [0.7145716946106404, 0.5561756328679621, 0.5099239049013704, 0.6244862840976566, 0.7335275961086154, 0.6134859917219728, 0.23060267022810876, 0.7317334439139813] },
-      { kind: 'createPrefab', u: [0.21342101460322738, 0.1870845491066575, 0.8912742179818451, 0.07492860639467835, 0.7403424200601876, 0.2867176430299878, 0.9215701427310705, 0.31814626371487975] },
-      { kind: 'saveReload', u: [0.6422297023236752, 0.8505626353435218, 0.2529598572291434, 0.9410491364542395, 0.9856884707696736, 0.3246399243362248, 0.683646138291806, 0.12626319588162005] },
-      { kind: 'instantiate', u: [0.23157899221405387, 0.6794504942372441, 0.18278003903105855, 0.240608187392354, 0.0013917970936745405, 0.7093260157853365, 0.2822195577900857, 0.96261520171538] },
-      { kind: 'undo', u: [0.09050807449966669, 0.6558327882084996, 0.3099635324906558, 0.6077217403799295, 0.5417213151231408, 0.20162267237901688, 0.8052350806538016, 0.4917391324415803] },
-      { kind: 'addChild', u: [0.6238473090343177, 0.5287783958483487, 0.6110795557033271, 0.11876990180462599, 0.2796090093906969, 0.9069117002654821, 0.912856874987483, 0.44095068075694144] },
-      { kind: 'reparent', u: [0.8635704338084906, 0.907134655630216, 0.9837169637903571, 0.9309531296603382, 0.16331519768573344, 0.6003672608640045, 0.9272804129868746, 0.046366722555831075] },
-      { kind: 'prefabEdit', u: [0.14680528966709971, 0.6739758297335356, 0.7129750931635499, 0.254939271369949, 0.9860867182724178, 0.09944728901609778, 0.03289157245308161, 0.5044709760695696], inner: [] },
-      { kind: 'trashPrefab', u: [0.645055967150256, 0.3555994192138314, 0.4762186794541776, 0.02507166936993599, 0.45181857072748244, 0.64018270582892, 0.5068258126266301, 0.3847066070884466] },
-      { kind: 'instantiate', u: [0.19409324880689383, 0.9259697603993118, 0.5660134558565915, 0.9067194813396782, 0.20263959048315883, 0.7811750741675496, 0.004530955571681261, 0.8311343181412667] },
-      { kind: 'instantiate', u: [0.22969491896219552, 0.35693361377343535, 0.7506059226579964, 0.8251728769391775, 0.9540188987739384, 0.3535843987483531, 0.5003614285960793, 0.2983123888261616] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene',
-    stops: (f, ops) => KNOWN_OPEN_1793(f, ops),
-  },
-  {
-    issue: 1793,
-    what: "the same, where the respawned drop shifts the top-level entities",
-    repro: [
-      { kind: 'detach', u: [0.09200233151204884, 0.4978172762785107, 0.8711860135663301, 0.9882726897485554, 0.4086105620954186, 0.26161185512319207, 0.09985085763037205, 0.7580608306452632] },
-      { kind: 'cut', u: [0.3569653546437621, 0.02168582985177636, 0.6318808461073786, 0.040972903836518526, 0.10015158797614276, 0.28511395188979805, 0.04311187658458948, 0.37725126929581165] },
-      { kind: 'paste', u: [0.7133683976717293, 0.7894542491994798, 0.3840922354720533, 0.6534743243828416, 0.949433326954022, 0.21257702424190938, 0.6325942415278405, 0.1245825260411948] },
-      { kind: 'saveReload', u: [0.38046945980750024, 0.047217794228345156, 0.22895032935775816, 0.34555352735333145, 0.033765289932489395, 0.4782737318892032, 0.9830439805518836, 0.8440993558615446] },
-      { kind: 'instantiate', u: [0.17357664229348302, 0.836304823635146, 0.3443488501943648, 0.5612517131958157, 0.7548945001326501, 0.2683266291860491, 0.23483543982729316, 0.915401702048257] },
-      { kind: 'cut', u: [0.4678339713718742, 0.61683215550147, 0.5234560901299119, 0.4106190758757293, 0.4732466072309762, 0.5263875990640372, 0.09380397107452154, 0.2719819906633347] },
-      { kind: 'paste', u: [0.12226695870049298, 0.7349859543610364, 0.6576325534842908, 0.5577748806681484, 0.08136803284287453, 0.040631324518471956, 0.204928963445127, 0.797939523588866] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && /^\/entities\/[0-9a-f]{8}-[0-9a-f-]{27}\/traits\/EntityAttributes\/parentId: /.test(f.detail),
-    stops: (f, ops) => KNOWN_OPEN_1793(f, ops),
   },
   {
     issue: 1794,
@@ -229,26 +119,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     ],
     reproduces: (f) => f.check === 'save→reload is not the identity' && /\/marks\//.test(f.detail),
     stops: detachMarks,
-  },
-  {
-    issue: 1795,
-    what: "Create Prefab's undo against a tree a world swap re-expanded as a Missing Prefab placeholder trashes the file the scene names",
-    repro: [
-      { kind: 'trashPrefab', u: [0.7206, 0.8358, 0.2251, 0.7701, 0.6414, 0.4093, 0.0235, 0.3128] },
-      { kind: 'prefabEdit', u: [0.5902, 0.2545, 0.0586, 0.1319, 0.8827, 0.4678, 0.2631, 0.1415], inner: [] },
-      { kind: 'createPrefab', u: [0.8449, 0.6267, 0.0149, 0.1407, 0.4933, 0.2333, 0.3549, 0.3216] },
-      { kind: 'prefabEdit', u: [0.3871, 0.5004, 0.0544, 0.7359, 0.5348, 0.7957, 0.3886, 0.1663], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail),
-    // The second route (comment on #1795): a trashed prefab, then a world swap (prefab edit), then a Create Prefab whose
-    // undo or redo runs against the placeholder. Keyed on the two lines that say so; the "rows now vs written" wording
-    // keeps it off #1796's positional re-tag, which says "was written at localId" or "changed between".
-    stops: (f, ops) => f.check === 'console.error' && (f.op === 'undo/redo to the ends' || /^(undo|redo)\(/.test(f.op))
-      && (/^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail)
-        || /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \(\d+ rows now vs \d+ written\)/.test(f.detail))
-      && ops.some((o) => o.kind === 'createPrefab') && (() => {
-        const t = ops.findIndex((o) => o.kind === 'trashPrefab'); return t >= 0 && ops.slice(t + 1).some((o) => o.kind === 'prefabEdit');
-      })(),
   },
   {
     issue: 1796,
@@ -410,100 +280,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     })(),
   },
   {
-    issue: 1818,
-    what: "an Inspector edit on a Missing Prefab placeholder shows live, and the save writes the kept record verbatim",
-    repro: [
-      { kind: 'trashPrefab', u: [0.251, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.954, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
-      { kind: 'addComponent', u: [0, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined${RESTORED}$`).test(f.detail),
-    // A trashed prefab, a world swap that makes the placeholder, then a component added. Keyed on a whole component the
-    // reload lost, never an entity.
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`^\/[^/]+\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined${RESTORED}$`).test(f.detail)
-      && (() => {
-        const t = ops.findIndex((o) => o.kind === 'trashPrefab'); const w = ops.findIndex((o, i) => i > t && o.kind === 'prefabEdit');
-        return t >= 0 && w >= 0 && ops.slice(w + 1).some((o) => o.kind === 'addComponent');
-      })(),
-  },
-  {
-    issue: 1818,
-    what: "the same writer drops a placeholder's sortOrder a Hierarchy gesture set (Duplicate)",
-    repro: [
-      { kind: 'trashPrefab', u: [0.1, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.1, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
-      { kind: 'duplicate', u: [0.15, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+${RESTORED}$`).test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`^\/[^/]+\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+${RESTORED}$`).test(f.detail) && (() => {
-      const t = ops.findIndex((o) => o.kind === 'trashPrefab');
-      const w = ops.findIndex((o, i) => i > t && ['prefabEdit', 'saveReload', 'outsideEdit'].includes(o.kind));
-      return t >= 0 && w >= 0 && ops.slice(w + 1).some((o) => ['duplicate', 'paste', 'reparent'].includes(o.kind));
-    })(),
-  },
-  {
-    issue: 1819,
-    what: "a scene undo recorded against an instance runs against the Missing Prefab placeholder a world swap re-expanded it as",
-    repro: [
-      { kind: 'revert', u: [0.3511497532017529, 0.012670567957684398, 0.46970928786322474, 0.6648742232937366, 0.9818382884841412, 0.614271926227957, 0.988015036098659, 0.5841556487139314] },
-      { kind: 'trashPrefab', u: [0.1, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.5, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
-      { kind: 'undo', u: [0.5, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'I7 duplicate guid' && /different top-level roots; not rows of one frame/.test(f.detail),
-    // Two routes: Revert's undo spawns a second instance on the placeholder's guid (I7), Delete's undo restores members
-    // whose root is the placeholder (I6). A Revert or Delete, then a trash and a world swap, then the undo. Disjoint from
-    // #1792, whose failing op is the revert itself.
-    stops: (f, ops) => placeholderUndo(f, ops),
-  },
-  {
-    issue: 1819,
-    what: "the same, through Delete's undo: members restored under the placeholder root (I6)",
-    repro: [
-      { kind: 'trashPrefab', u: [0.564, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'delete', u: [0.686, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.99, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
-      { kind: 'undo', u: [0.1, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'I6 member names no live root' && /^(undo|redo)/.test(f.op),
-    // Delete's route, claimed by the same stop.
-    stops: (f, ops) => placeholderUndo(f, ops),
-  },
-  {
-    issue: 1819,
-    what: "the same, through a field edit's undo: its target does not resolve and it reports success having done nothing",
-    repro: [
-      { kind: 'editField', u: [0.9796891720034182, 0.23118928470648825, 0.8521646368317306, 0.5933850177098066, 0.9363153059966862, 0.46753835841082036, 0.38651481945998967, 0.924117068760097] },
-      { kind: 'trashPrefab', u: [0.09160058596171439, 0.9653133898973465, 0.5251444848254323, 0.14914855733513832, 0.10175600508227944, 0.8862450474407524, 0.23216438991948962, 0.9334844422992319] },
-      { kind: 'prefabEdit', u: [0.8881433825008571, 0.9885712193790823, 0.7237701204139739, 0.027423259802162647, 0.4221728721167892, 0.49895594269037247, 0.8632127209566534, 0.3873697053641081], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && PLACEHOLDER_KEPT_EDIT.test(f.detail),
-    stops: (f, ops) => placeholderEditUndo(f, ops),
-  },
-  {
-    issue: 1819,
-    what: "the same, through Delete's undo of an added node: its parent became the placeholder, so it lands at the root",
-    repro: [
-      { kind: 'delete', u: [0.62, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'trashPrefab', u: [0.3, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.1, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && /^\/entities\/[0-9a-f]{8}-[0-9a-f-]{27}: undefined vs \{/.test(f.detail),
-    // No stop: a top-level entry gained by an undo says nothing about a placeholder parent by itself (the review of
-    // entity-identity diffing found a generic gained entry claimable by the op shape alone). Self-tested repro only.
-  },
-  {
-    issue: 1819,
-    what: "the same, through Add Child's undo (the child stays in the kept record)",
-    repro: [
-      { kind: 'addChild', u: [0.42997664655558765, 0.9901395693887025, 0.8573861042968929, 0.351486035855487, 0.12494081328622997, 0.12548391707241535, 0.6611704928800464, 0.9193278399761766] },
-      { kind: 'trashPrefab', u: [0.09337501158006489, 0.27066205465234816, 0.6804431919008493, 0.7805610729847103, 0.6948331138119102, 0.6576268649660051, 0.2520267250947654, 0.5680687197018415] },
-      { kind: 'prefabEdit', u: [0.9155996430199593, 0.8407363444566727, 0.9690347339492291, 0.22356510814279318, 0.47766409651376307, 0.721751298289746, 0.3306460517924279, 0.9674016057979316], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && PLACEHOLDER_KEPT_EDIT.test(f.detail),
-    stops: placeholderEditUndo,
-  },
-  {
     issue: 1820,
     what: "a paste of an instance copied before its template changed respawns the stale frame, and nothing rebases it",
     repro: [
@@ -604,44 +380,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       && lastOp(ops) === 'apply' && touchedBy(f, 'drop', subjectGuid(f))
       && (() => { const n = ops.findIndex((o) => o.kind === 'instantiate' && o.u[1] >= 0.4); return n >= 0 && ops.slice(n + 1).some((o) => o.kind === 'apply'); })(),
   },
-  {
-    issue: 1827,
-    what: "an Instantiate or Paste undo whose guid no longer resolves after a world swap falls back to the raw ECS id and deletes whatever holds it",
-    repro: [
-      { kind: 'removeComponent', u: [0.7308414850849658, 0.11567534902133048, 0.848587361164391, 0.787630746839568, 0.7113146656192839, 0.3873164844699204, 0.9128336061257869, 0.36134594422765076] },
-      { kind: 'instantiate', u: [0.9548506285063922, 0.27003602869808674, 0.11935152229852974, 0.3853158338461071, 0.8323814605828375, 0.7989177156705409, 0.11269795312546194, 0.3089376366697252] },
-      { kind: 'apply', u: [0.12287110020406544, 0.05943365744315088, 0.24781434866599739, 0.3723465271759778, 0.2909893386531621, 0.9141282250639051, 0.5124099575914443, 0.6358611001633108] },
-      { kind: 'undo', u: [0.40309701883234084, 0.12515778234228492, 0.11249637953005731, 0.4787011307198554, 0.9712785759475082, 0.3228068328462541, 0.5649044967722148, 0.43929144088178873] },
-      { kind: 'instantiate', u: [0.8346606260165572, 0.8866690865252167, 0.7850938416086137, 0.020686337258666754, 0.6102396890055388, 0.8041137782856822, 0.3622960189823061, 0.18157163984142244] },
-      { kind: 'trashPrefab', u: [0.6130347338039428, 0.3288127388805151, 0.8532239398919046, 0.8729194402694702, 0.7349629334639758, 0.13135315827094018, 0.9492790035437793, 0.21047820406965911] },
-      { kind: 'prefabEdit', u: [0.9011082218494266, 0.7135820589028299, 0.7668768686708063, 0.31017256062477827, 0.27789436001330614, 0.6631764196790755, 0.13236475456506014, 0.17098554223775864], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && /^\/entities\/[0-9a-f]{8}-[0-9a-f-]{27}: \{.* vs undefined$/.test(f.detail),
-    // No stop: the entry this undo deletes is an unrelated one (whatever holds the recycled ECS id), so nothing in the
-    // failure ties it to the undo that deleted it — keyed on the op shape it claimed any lost top-level entry (review).
-    // Self-tested repro only; a hunt reports it by signature.
-  },
-
-  {
-    issue: 1827,
-    what: "the same, where the swap is a prefab-edit save that deleted the drop's parent row (no trash)",
-    repro: [
-      { kind: 'instantiate', u: [0.1, 0.5, 0.2647058823529412, 0, 0, 0, 0, 0] },
-      { kind: 'delete', u: [0.1388888888888889, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'createPrefab', u: [0.99, 0.9, 0, 0, 0, 0, 0, 0] },
-      { kind: 'instantiate', u: [0.7, 0.5, 0.7666666666666667, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.7, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.3, 0, 0, 0, 0, 0, 0, 0] }] },
-    ],
-    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail),
-    // The only symptom a tainted segment shows: the NEXT undo's line. Disjoint from #1795 (a trash) by its op shape.
-    stops: (f, ops) => f.check === 'console.error' && f.op === 'undo/redo to the ends'
-      && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back — that entity is no longer addressable|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail)
-      && !ops.some((o) => o.kind === 'trashPrefab') && ops.some((o) => o.kind === 'createPrefab') && (() => {
-        const n = ops.findIndex((o) => o.kind === 'instantiate' && o.u[1] >= 0.4);
-        return n >= 0 && ops.slice(n + 1).some((o) => o.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((x) => x.kind === 'delete'));
-      })(),
-  },
-
   {
     issue: 1829,
     what: "an Apply that removes a component from a template row leaves a partial override of it marked on the overridden fields only",

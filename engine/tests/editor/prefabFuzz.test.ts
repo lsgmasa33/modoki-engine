@@ -110,6 +110,22 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'still fails, as "undo/redo refused in a clean segment" (that is how #1821 is caught)',
   },
   {
+    pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — "[^"]*"( \([^)]*\))? (is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again)/,
+    why: 'owner ruling R (#1819, #1827, #1793, 2026-09-29): an undo or redo whose target no longer resolves, or has become '
+      + 'a Missing Prefab placeholder, refuses before any change and is dropped (`require`, entityRef.ts), and says so. A '
+      + 'refusal in a segment where no placeholder was expanded and nothing outside the stack touched still fails, as '
+      + '"undo/redo refused in a clean segment"',
+  },
+  {
+    pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance \(\S+\) a deleted member belongs to is no longer in the scene/,
+    why: 'the same ruling, for a delete\'s undo whose members\' instance root is gone (`requireRootLinks`)',
+  },
+  {
+    pattern: /^\[entityActions\] refused: "[^"]*" is a Missing Prefab now/,
+    why: '#1818 (I21): an edit the placeholder\'s save would drop is refused where it is made (`placeholderWriteRefusal`), '
+      + 'and says so; the op reports "refused"',
+  },
+  {
     pattern: /^\[Prefab\] \S+\.prefab\.json holds a localId high-water mark of \d+, and this write would lower it to \d+\. Refusing/,
     why: '#1774 (04bc35008): the ROUTE logs its mark refusal, and the commit treats it as a conflict it re-reads past '
       + '(prefabCommit writeDoc: sameDocument ignores the mark) and lands. The fuzzer hears it only because the router runs '

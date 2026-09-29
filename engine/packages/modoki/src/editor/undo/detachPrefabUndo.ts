@@ -8,7 +8,7 @@
 
 import { pushAction } from './undoManager';
 import { reportUndoFailure } from './undoFailure';
-import { entityRef } from './entityRef';
+import { entityRef, buildGuidIndex, requireWith, renamesOf, requireDetachedMembers, isInstanceRootCheck } from './entityRef';
 import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefab';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
@@ -47,6 +47,36 @@ export function detachPrefabMenuItem(id: number, disabled: boolean, onClick: () 
   return { label: 'Detach Prefab', onClick, disabled: disabled || !!refused, ...(refused ? { title: refused.reason } : {}) };
 }
 
+/** Detach's undo, before it puts back any link (#1819, I19/I20): every entity the snapshot relinks, and every root it
+ *  names, must still be live and PLAIN, which is what the Detach left them. After a world swap one can be gone, a
+ *  Missing Prefab placeholder, or an instance again; putting `PrefabInstance` back on it would make a placeholder an
+ *  instance of a prefab that does not load, or re-link a member under a root that is not the one it was stripped from.
+ *  Throws `UndoRefusedError`. */
+export function requireDetachedLinks(detached: DetachSnapshot): void {
+  const pi = getTraitByName('PrefabInstance');
+  const check = (id: number) => (pi && findEntity(id)?.has(pi.trait) ? 'is a prefab instance again, so its detached links cannot be put back' : null);
+  const idx = buildGuidIndex();
+  // Through the rename the Detach's frame-ending made (a promoted orphan's members, #1447): `reattachPrefabInstance`
+  // reverses it only when it relinks the orphans, after this, and every ref here was taken before it.
+  const renames = renamesOf(detached.orphans);
+  // Plain is what the Detach left the entities it STRIPPED, each asked as its own link's `ref`. A root OUTSIDE that set
+  // (by capture-time id, which a guid-less root has too) is one the Detach left an instance: an owned nested root the
+  // frame-ending promoted (#1447), or a stored root it left alone. It must still be an instance root of the link's
+  // source; a root that turned plain, or into another prefab's instance, would be relinked over.
+  const stripped = new Set(detached.links.map((l) => l.ref.rawId));
+  for (const link of detached.links) {
+    requireWith(link.ref, idx, { kind: 'entity', check }, renames);
+    if (stripped.has(link.rootRef.rawId)) continue;
+    const source = link.data.source as string | undefined;
+    requireWith(link.rootRef, idx, {
+      kind: 'entity',
+      check: (id) => isInstanceRootCheck(id)
+        ?? ((pi && (readTraitData(id, pi) as { source?: string } | null)?.source) === source ? null : `is no longer an instance of ${source}`),
+    }, renames);
+  }
+  requireDetachedMembers(detached.orphans, idx, renames);
+}
+
 /** Detach instance `rootId` and record one undo entry. Returns the detach's snapshot; nothing is recorded when it
  *  stripped no link (`rootId` is not an instance). Throws `detachRefusal`'s reason for a member. `logTag` prefixes the warning an unresolved link gives. */
 export function detachPrefabInstanceWithUndo(rootId: number, label: string, logTag: string): DetachSnapshot {
@@ -62,13 +92,14 @@ export function detachPrefabInstanceWithUndo(rootId: number, label: string, logT
   pushAction({
     label,
     undo: async () => {
+      requireDetachedLinks(snapshot);
       const unresolved = await reattachDetachedInstance(snapshot);
       // Reported, never discarded — that silence is what hid #1272 for as long as it did. Into the step (#1823), so
       // the undo answers PARTIAL rather than `did:true`.
       if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${logTag} ${unresolved} prefab link(s) could not be put back — no longer addressable` });
     },
     redo: () => {
-      const id = ref.resolve(); if (id == null) return;
+      const id = ref.require(); // I19: a root that is gone refuses, rather than reading as detached
       const again = detachPrefabInstance(id);
       if (again.links.length) snapshot = again;
     },

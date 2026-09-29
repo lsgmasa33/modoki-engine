@@ -13,10 +13,10 @@ import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, 
 import { makeDeleteUndo, makeRenameUndo, snapshotFromBytes, type DeleteResult } from '../../../packages/modoki/src/editor/panels/assetUndo';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
 import {
-  instantiatePrefabInstance, getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, staleInstanceRefusal,
+  getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, staleInstanceRefusal,
   type PrefabFile,
 } from '../../../packages/modoki/src/editor/scene/prefab';
-import { makePrefabInstantiateAction } from '../../../packages/modoki/src/editor/undo/prefabInstantiateUndo';
+import { placePrefabFromPath } from '../../../packages/modoki/src/editor/scene/prefabPlace';
 import { detachPrefabInstanceWithUndo } from '../../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import {
   duplicateEntity, clipEntity, cutSourceId, pasteEntityCopy, deleteEntitiesWithUndo, writeTraitFieldWithUndo,
@@ -32,8 +32,6 @@ import { undoStep, breakUndoCoalescing } from '../../../packages/modoki/src/edit
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../../packages/modoki/src/editor/scene/prefabEdit';
 import { saveScene, loadSceneReporting } from '../../../packages/modoki/src/editor/scene/serialize';
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
-import { parseAssetJson, isMissingAsset } from '../../../packages/modoki/src/runtime/loaders/assetFetch';
-import { deleteEntity } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
@@ -169,22 +167,12 @@ async function editRefusable(gesture: () => Outcome | Promise<Outcome>, st: RunS
 
 /** A prefab dropped into the Hierarchy, as `Hierarchy.tsx`'s drop handler does it: read the file, instantiate, push. */
 async function dropPrefab(path: string, parentId: number): Promise<Outcome> {
-  let prefab: PrefabFile;
-  try { prefab = await parseAssetJson(await fetch(path), path) as PrefabFile; } catch (e) { if (isMissingAsset(e)) return 'noop'; throw e; }
-  // A prefab-edit refusal throws out of here before anything is pushed, as `placePrefabFromPath` toasts it.
-  const currentId = await instantiatePrefabInstance(prefab, path, parentId);
-  // Pushed whatever the instantiate returned, as the Hierarchy's drop does.
-  pushAction(makePrefabInstantiateAction({
-    label: `Instantiate "${prefab.name}"`,
-    initialId: currentId,
-    respawn: async () => {
-      let p: PrefabFile;
-      try { p = await parseAssetJson(await fetch(path), path) as PrefabFile; } catch (e) { if (isMissingAsset(e)) return null; throw e; }
-      return instantiatePrefabInstance(p, path, parentId);
-    },
-    remove: (id) => { deleteEntity(id); },
-  }));
-  return currentId ? 'done' : 'refused';
+  // The Hierarchy's own drop (`placePrefabFromPath`), not a copy of it: a copy kept the raw parent id after the drop
+  // itself stopped holding one (#1793), and the harness would have gone on reproducing a bug the editor no longer has.
+  const gone = await fetch(path).then((r) => !r.ok, () => true);
+  if (gone) return 'noop';
+  const id = await placePrefabFromPath(path, { tag: 'fuzz', parentId });
+  return id ? 'done' : 'refused';
 }
 
 /** `Hierarchy.tsx`'s `requestReparent`, with the scene-move modal answered "Move". */
@@ -300,16 +288,15 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (!e) return 'noop';
       const field = pick(u[1], TRANSFORM_FIELDS)!;
       const value = Math.round(u[2] * 20 - 10);
-      writeTraitFieldWithUndo(e.id, meta('Transform'), field, value);
-      return 'done';
+      // A refusal is the placeholder gate's (#1818): the save would drop the edit.
+      return writeTraitFieldWithUndo(e.id, meta('Transform'), field, value) ? 'refused' : 'done';
     }
     case 'addComponent': {
       const e = pick(u[0], ents);
       if (!e) return 'noop';
       const name = pick(u[1], ADDABLE.filter((t) => !e.traits.includes(t)));
       if (!name) return 'noop';
-      addTraitToEntitiesWithUndo([e.id], meta(name));
-      return 'done';
+      return addTraitToEntitiesWithUndo([e.id], meta(name)) ? 'refused' : 'done';
     }
     case 'removeComponent': {
       // Drawn from the entities that HAVE a removable component: drawing any entity first left this a no-op 97% of the
@@ -318,8 +305,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (!e) return 'noop';
       const name = pick(u[1], REMOVABLE.filter((t) => e.traits.includes(t)));
       if (!name) return 'noop';
-      removeTraitFromEntitiesWithUndo([e.id], meta(name));
-      return 'done';
+      return removeTraitFromEntitiesWithUndo([e.id], meta(name)) ? 'refused' : 'done';
     }
     case 'addChild': {
       const parent = u[0] < 0.25 ? 0 : (pick(u[1], ents)?.id ?? 0);

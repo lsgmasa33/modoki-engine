@@ -37,7 +37,8 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { buildPrefabEditScene, applyEditWorldMoves } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { recoverTemplateKey as recoverTemplateKeyFrom, type KeyRecoveryNode } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
-import { undo, redo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, undoStep, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView, legacySceneView } from './memberRowView';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -2923,6 +2924,95 @@ describe('leaving the outermost instance cuts only the links the move splits (#1
       expect(piOf(idAt('Shelf/MidRoot'))?.parentLocalId).toBe(0);
     } finally {
       for (const k of [MID, OUTER3]) { prefabs.delete(k); setPrefabCache(k, null); }
+    }
+  });
+
+  // #1819 close-out review: `require` asked for the mover and its old parent BEFORE `undoDetach` reversed the promotion's
+  // rename, so an old parent the promotion renamed read as gone and the undo was REFUSED (and dropped). The rename fires
+  // for a member with no durable keyed row: INNER as a pre-v5 document. The same for a delete of the mover under that
+  // parent. Mutation: pass no rename map to `requireWith` in reparentEntity's undo (or deleteEntitiesWithUndo's) — the
+  // undo refuses with '"Leaf" is no longer in the scene'.
+  it('undo through a promotion that RENAMED the old parent (pre-v5 member): reparent and delete both put the mover back', async () => {
+    const MID = 'aaaaaaaa-0000-4000-8000-0000000000f4';
+    const OUTER3 = 'aaaaaaaa-0000-4000-8000-0000000000f5';
+    const v4 = { id: INNER, version: 4, rootLocalId: 1, entities: innerDoc.entities.map(({ nodeGuid: _n, ...r }) => r) };
+    const midDoc = { id: MID, rootLocalId: 1, entities: [row(1, 'MidRoot', 0), row(2, 'Nested', 1, { prefab: INNER })] };
+    const outer3 = { id: OUTER3, rootLocalId: 1, entities: [row(1, 'Outer3Root', 0), row(2, 'Panel', 1), row(3, 'Mid', 2, { prefab: MID })] };
+    for (const [k, d] of [[INNER, v4], [MID, midDoc], [OUTER3, outer3]] as const) { prefabs.set(k, d); setPrefabCache(k, d as never); }
+    const scene3 = {
+      id: 'o3r', version: 1, name: 'O3', resources: [],
+      entities: [
+        { id: 1, prefab: OUTER3, guid: ROOT_B, traits: { EntityAttributes: { name: 'Outer3Root', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+        { id: 2, traits: { EntityAttributes: { name: 'Shelf', parentId: 0, guid: SHELF } } },
+      ],
+    } as unknown as SceneData;
+    try {
+      await load(scene3);
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot'), idAt('Outer3Root/Panel/InnerRoot/Leaf'));
+      const leaf = guidAt('Outer3Root/Panel/InnerRoot/Leaf');
+      reparentEntity(idAt('Outer3Root/Panel/InnerRoot/Leaf/MidRoot'), idAt('Shelf'));
+      expect(guidAt('Outer3Root/Panel/InnerRoot/Leaf')).not.toBe(leaf); // precondition: the promotion renamed Leaf
+      const r = await undoStep('undo');
+      expect(r.failed).toBeNull();
+      expect(r.did).toBe(true);
+      expect(treePaths().has(guidAt('Outer3Root/Panel/InnerRoot/Leaf/MidRoot'))).toBe(true);
+
+      // The delete: MidRoot under Leaf, deleted, and undone, through the same rename.
+      clearHistory();
+      await load(scene3);
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot'), idAt('Outer3Root/Panel/InnerRoot/Leaf'));
+      deleteEntitiesWithUndo([idAt('Outer3Root/Panel/InnerRoot/Leaf/MidRoot')]);
+      const d = await undoStep('undo');
+      expect(d.failed).toBeNull();
+      expect(treePaths().has(guidAt('Outer3Root/Panel/InnerRoot/Leaf/MidRoot'))).toBe(true);
+    } finally {
+      for (const k of [MID, OUTER3]) { prefabs.delete(k); setPrefabCache(k, null); }
+      prefabs.set(INNER, innerDoc); setPrefabCache(INNER, innerDoc as never);
+    }
+  });
+
+  // #1819 close-out re-review: Detach's undo asked for its links (`requireDetachedLinks`) before `reattachPrefabInstance`
+  // reversed the frame-ending's rename of a promoted orphan's members, so a renamed member read as gone and the undo was
+  // refused. Mutation: pass no rename map in `requireDetachedLinks` — '"Leaf" is no longer in the scene'.
+  it('Detach\'s undo through a promoted orphan\'s member rename (pre-v5) relinks instead of refusing', async () => {
+    const MID = 'aaaaaaaa-0000-4000-8000-0000000000f6';
+    const OUTER3 = 'aaaaaaaa-0000-4000-8000-0000000000f7';
+    const v4 = { id: INNER, version: 4, rootLocalId: 1, entities: innerDoc.entities.map(({ nodeGuid: _n, ...r }) => r) };
+    const midDoc = { id: MID, rootLocalId: 1, entities: [row(1, 'MidRoot', 0), row(2, 'Nested', 1, { prefab: INNER })] };
+    const outer3 = { id: OUTER3, rootLocalId: 1, entities: [row(1, 'Outer3Root', 0), row(2, 'Panel', 1), row(3, 'Mid', 2, { prefab: MID })] };
+    for (const [k, d] of [[INNER, v4], [MID, midDoc], [OUTER3, outer3]] as const) { prefabs.set(k, d); setPrefabCache(k, d as never); }
+    try {
+      await load({
+        id: 'o3d', version: 1, name: 'O3', resources: [],
+        entities: [
+          { id: 1, prefab: OUTER3, guid: ROOT_B, traits: { EntityAttributes: { name: 'Outer3Root', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+          { id: 2, traits: { EntityAttributes: { name: 'Shelf', parentId: 0, guid: SHELF } } },
+        ],
+      } as unknown as SceneData);
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot/Leaf'), idAt('Outer3Root/Panel/MidRoot'));
+      reparentEntity(idAt('Outer3Root/Panel/MidRoot/InnerRoot'), idAt('Outer3Root/Panel'));
+      clearHistory();
+      const leaf = guidAt('Outer3Root/Panel/MidRoot/Leaf');
+      detachPrefabInstanceWithUndo(idAt('Outer3Root/Panel/MidRoot'), 'Detach prefab', '[test]');
+      expect(guidAt('Outer3Root/Panel/MidRoot/Leaf')).not.toBe(leaf); // precondition: the frame-ending renamed Leaf
+      const r = await undoStep('undo');
+      expect(r.failed?.error ?? null).toBeNull();
+      expect(r.did).toBe(true);
+      expect(piOf(idAt('Outer3Root/Panel/MidRoot'))).toBeDefined();
+      // Refuse side (close-out re-review): the promoted InnerRoot, a link's root OUTSIDE what the Detach stripped, must
+      // still be an instance root. Turned plain behind the stack's back, the undo refuses rather than relinking over it.
+      // Mutation: drop the outside-root `require` in `requireDetachedLinks`.
+      await undoStep('redo');
+      const inner = idAt('Outer3Root/Panel/InnerRoot');
+      [...getCurrentWorld().entities].find((x) => x.id() === inner)!.remove(getTraitByName('PrefabInstance')!.trait);
+      const refused = await undoStep('undo');
+      expect(refused.failed?.refused).toBe(true);
+      expect(refused.failed?.error).toMatch(/InnerRoot" is no longer a prefab instance root/);
+    } finally {
+      for (const k of [MID, OUTER3]) { prefabs.delete(k); setPrefabCache(k, null); }
+      prefabs.set(INNER, innerDoc); setPrefabCache(INNER, innerDoc as never);
     }
   });
 

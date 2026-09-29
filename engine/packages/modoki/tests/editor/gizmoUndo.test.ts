@@ -144,4 +144,22 @@ describe('buildGroupTransformUndoAction', () => {
     expect((group.journalPayload as { entities: string[] }).entities).toEqual(['g-a', 'g-b']);
     expect((group.journalPayload as { members: unknown[] }).members).toHaveLength(2);
   });
+
+  // #1819 (I19): a member whose `require` refuses must refuse the whole group BEFORE any member moves — the entry is then
+  // dropped, and a first member already moved would be a change no history entry holds. Mutation: drop `precheck()` from
+  // the group's undo/redo — A moves, then B throws.
+  it('a member that refuses refuses the group before any member moves; all present, every member moves', () => {
+    const a = fakeEntity({ x: 0 }), b = fakeEntity({ x: 10 });
+    let bGone = false;
+    const actions = [
+      buildTransformUndoAction({ label: 'A', trait: TRAIT, resolve: () => 1, findEntity: () => a, before: { x: 0 }, after: { x: 3 } }),
+      buildTransformUndoAction({ label: 'B', trait: TRAIT, resolve: () => { if (bGone) throw new Error('refused: B is gone'); return 2; }, findEntity: () => b, before: { x: 10 }, after: { x: 13 } }),
+    ];
+    const group = buildGroupTransformUndoAction('Transform 2 entities', actions);
+    group.redo(); // accept
+    expect([a.value.x, b.value.x]).toEqual([3, 13]);
+    bGone = true;
+    expect(() => group.undo()).toThrow(/B is gone/);
+    expect(a.value.x).toBe(3); // untouched
+  });
 });

@@ -405,9 +405,11 @@ async function serializeSceneScoped(opts?: {
       const parentGuid = guidForId(info.parentId);
       if (parentGuid) placement.parentId = parentGuid;
       if (info.editorFolder) placement.editorFolder = info.editorFolder;
-      const live = eaMeta ? findEntity(info.id)?.get(eaMeta.trait) as { guid?: string } | undefined : undefined;
+      const live = eaMeta ? findEntity(info.id)?.get(eaMeta.trait) as { guid?: string; sortOrder?: number; isActive?: boolean } | undefined : undefined;
       const guid = durableGuid(live?.guid) || mintedGuids.get(info.id);
-      entities.push(asSceneEntry(unresolved.kind, unresolved.record, unresolved.source, { name: info.name, guid, placement }) as unknown as SerializedEntity);
+      // The Hierarchy's reorder and Activate land on the placeholder, and its writer keeps them (#1818).
+      const order = { sortOrder: live?.sortOrder ?? 0, isActive: live?.isActive ?? true };
+      entities.push(asSceneEntry(unresolved.kind, unresolved.record, unresolved.source, { name: info.name, guid, placement, order }) as unknown as SerializedEntity);
       continue;
     }
 

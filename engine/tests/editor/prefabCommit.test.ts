@@ -108,7 +108,7 @@ import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
-import { undo, redo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, undoStep, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { writeTraitFieldWithUndo } from '@modoki/engine/editor';
@@ -510,5 +510,38 @@ describe('several prefab files as ONE step (#1692, for #1693)', () => {
     expect(route.disk.get(X_PATH)).toBe(restoredOverMark(localIdCounter(xNext())));
     expect(route.disk.get(Y_PATH)).toBe(jsonFileBody(yDoc('raced in')));
     expect(getCachedPrefabSync(X)?.entities.some((e) => e.name === 'XD')).toBe(false);
+  });
+});
+
+describe('Create Prefab\'s undo asks require before it trashes the file (#1795\'s second route, ruling R)', () => {
+  const N_PATH = '/assets/prefabs/N.prefab.json';
+  /** A plain entity P at the root, made into prefab N through the real Create Prefab, its undo entry pushed. */
+  const createN = async () => {
+    const p = createEntityWithUndo('Add P', 0, [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name: 'P' } }], () => {})!;
+    const res = await quietly(() => createPrefabFromEntity(p, N_PATH, 'Create Prefab "N"', async () => true));
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`precondition: Create Prefab landed, got ${JSON.stringify(res)}`);
+    pushAction(res.action);
+    expect(route.disk.has(N_PATH)).toBe(true);
+    return res.prefab;
+  };
+
+  // Mutation: remove the `if (tagged) ref.require(...)` line from the undo — the file is trashed although the scene's
+  // entry for P, now a Missing Prefab placeholder, still names it.
+  it('refused, with the file left on disk, once a world swap made the tree a Missing Prefab placeholder', async () => {
+    await createN();
+    const saved = JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
+    await quietly(() => load(saved)); // N is on disk but in no cache the loader reads: P reloads as a placeholder
+    const r = await quietly(() => undoStep('undo'));
+    expect(r.failed?.refused).toBe(true);
+    expect(r.failed?.error).toMatch(/is a Missing Prefab now/);
+    expect(route.disk.has(N_PATH)).toBe(true);
+  });
+
+  it('(accept) in the same world the undo trashes the file and unlinks P', async () => {
+    await createN();
+    expect((await quietly(() => undoStep('undo'))).did).toBe(true);
+    expect(route.disk.has(N_PATH)).toBe(false);
+    const p = getAllEntities().find((e) => e.name === 'P')!;
+    expect(readTraitData(p.id, getTraitByName('PrefabInstance')!)).toBeNull();
   });
 });
