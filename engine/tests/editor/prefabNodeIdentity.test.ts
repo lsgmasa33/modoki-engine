@@ -50,7 +50,7 @@ const ent = (id: number, name: string, parentId: number | string, guid: string) 
  *  other member with it — and `planPrefabRows`' positional branch then hands that number to the
  *  next survivor. A nested child would cascade and prove nothing about reuse. */
 const scene = (): SceneData => ({
-  id: 'node-identity', version: 1, name: 'N', resources: [],
+  id: 'node-identity', version: 8, name: 'N', resources: [],
   entities: [
     ent(1, 'Holder', 0, HOLDER),
     ent(2, 'Root', HOLDER, ROOT),
@@ -180,7 +180,7 @@ describe('a prefab row carries a minted node identity (#1468)', () => {
     prefabs.set(PREFAB, file);
     setPrefabCache(PREFAB, file as never);
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
     } as unknown as SceneData);
     expect(piOf('Label').nodeGuid).toBe(rowOf(file, 'Label').nodeGuid);
@@ -201,7 +201,7 @@ describe('a prefab row carries a minted node identity (#1468)', () => {
     prefabs.set(PREFAB, v4);
     setPrefabCache(PREFAB, v4 as never);
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Old', parentId: 0 } } }],
     } as unknown as SceneData);
     expect(piOf('Leaf').nodeGuid).toBe('');          // nothing invented at load

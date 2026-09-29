@@ -125,7 +125,7 @@ const withUi = (traits: Record<string, unknown>, refs: string[]) =>
  *  instance of INNER under Panel (which Create Prefab turns into an OWNED nested row). Holder's refs aim
  *  at whatever is passed — used to point them at members that are about to be swallowed by the prefab. */
 const baseScene = (holderRefs: string[] = []): SceneData => ({
-  id: 'create-window', version: 1, name: 'C', resources: [],
+  id: 'create-window', version: 8, name: 'C', resources: [],
   entities: [
     { id: 1, traits: withUi({ EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } }, holderRefs) },
     { id: 2, traits: { EntityAttributes: { name: 'Root', parentId: HOLDER, guid: ROOT }, Transform: { x: 0, y: 0, z: 0 } } },

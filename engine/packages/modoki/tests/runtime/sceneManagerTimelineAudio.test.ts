@@ -66,7 +66,7 @@ beforeEach(async () => {
     tracks: [{ id: 'track-audio', type: 'audio', cues: [{ t: 1, clip: SFX_GUID }] }],
   };
   fetchResponses['/sceneT.json'] = {
-    version: 6,
+    version: 8,
     resources: [{ type: 'timeline', path: TL_GUID }],
     entities: [{ id: 300, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'T1', parentId: 0 } } }],
   };

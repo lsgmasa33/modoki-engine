@@ -174,6 +174,23 @@ interface OverlayState {
   autoHeight: boolean;
 }
 
+/** The part of `el`'s on-screen box that no clipping ancestor cuts away, or null when none is left.
+ *  The same walk as `visibleClipRect` (app/debug/domResolve.ts), which this package cannot import:
+ *  every ancestor whose overflow is not `visible` clips, and a fixed one ends the walk. */
+function visiblePart(el: Element): { l: number; t: number; r: number; b: number } | null {
+  const own = el.getBoundingClientRect();
+  let l = own.left, t = own.top, r = own.right, b = own.bottom;
+  for (let p = el.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+    const cs = getComputedStyle(p);
+    if ([cs.overflow, cs.overflowX, cs.overflowY].some((o) => o && o !== 'visible')) {
+      const c = p.getBoundingClientRect();
+      l = Math.max(l, c.left); t = Math.max(t, c.top); r = Math.min(r, c.right); b = Math.min(b, c.bottom);
+    }
+    if (cs.position === 'fixed') break;
+  }
+  return r > l && b > t ? { l, t, r, b } : null;
+}
+
 export function UIResizeOverlay({ entityId }: { entityId: number }) {
   const [state, setState] = useState<OverlayState | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -184,10 +201,23 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
   // handle at fraction (fx,fy) of the entity's logical rect maps on screen to the SAME
   // fraction of the entity's on-screen rect — fractions are scale-invariant. So we read
   // the entity element's live getBoundingClientRect (already viewport px, borders folded
-  // in) and place handles at er.left+er.width·fx / er.top+er.height·fy. This component is
+  // in), and a handle's geometric point is er.left+er.width·fx / er.top+er.height·fy. This component is
   // only mounted for the selected UI entity in UI mode, so registration is self-gated;
   // return [] when the frame/element isn't in the DOM. entityId in deps → re-register on
   // selection change.
+  //
+  // Each handle's `owner` is its own GRAB DIV (#1726), so `computeHandles` hit-tests the thing a
+  // press has to land on. Anything drawn over it, such as the move arrows of an element narrower or
+  // shorter than the arrows, is a cover, and `drag_handle` refuses it. The div's clip ancestors
+  // include the preview frame's `overflow:hidden`, so a handle past the frame is `clipped` and
+  // refused too. Before this the handles had no owner and were never checked: one lying outside the
+  // Scene view was pressed onto an Assets row.
+  //
+  // The aim is the centre of the div's VISIBLE part, not the handle's geometric point: its rect
+  // clipped by every clipping ancestor, meaning the frame and, above it, the zoomed Scene viewport.
+  // An element filling the frame puts its handles ON the frame edge, where that point hits the
+  // neighbouring panel, while half of each div is drawn inside and a human grabs that half. A div
+  // wholly clipped keeps its raw point, and that is refused.
   useEffect(() => {
     const unreg = registerHandleProvider((): InteractionHandle[] => {
       const frame = document.querySelector('[data-ui-preview-frame]') as HTMLElement | null;
@@ -199,19 +229,24 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       const uiEl = readUIElement(entityId);
       const autoWidth = uiEl ? uiEl.width === 0 : false;
       const autoHeight = uiEl ? uiEl.height === 0 : false;
-      return HANDLES.map((h) => {
+      return HANDLES.flatMap((h): InteractionHandle[] => {
+        const grab = frame.querySelector(`[data-ui-resize-handle="${h.id}"]`);
+        if (!grab) return []; // not drawn yet, so there is nothing to press
         // A handle on an auto-sized axis is drawn disabled (drag is a no-op there).
         const onXAxis = h.fx !== 0.5, onYAxis = h.fy !== 0.5;
         const disabled = (onXAxis && autoWidth) || (onYAxis && autoHeight);
-        return {
+        const v = visiblePart(grab);
+        const aim = v ? { x: (v.l + v.r) / 2, y: (v.t + v.b) / 2 } : { x: er.left + er.width * h.fx, y: er.top + er.height * h.fy };
+        return [{
           id: `ui:${h.id}`,
           kind: 'resize-handle',
           editor: 'ui-resize',
-          x: er.left + er.width * h.fx,
-          y: er.top + er.height * h.fy,
+          x: aim.x,
+          y: aim.y,
           label: h.id,
           meta: { entityId, guid: guidOfEntityId(entityId), handle: h.id, fx: h.fx, fy: h.fy, disabled },
-        };
+          owner: grab,
+        }];
       });
     });
     return unreg;
@@ -664,14 +699,13 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       </>}
       {/* Resize handles */}
       {HANDLES.map(h => {
-        const isAutoAxis = (
-          (h.id.includes('l') || h.id.includes('r')) && isAutoWidth
-        ) || (
-          (h.id.includes('t') || h.id.includes('b')) && isAutoHeight
-        );
+        // Keyed on fx/fy, as the provider's `disabled` is. Matching letters in the id disabled every
+        // handle under an auto width, since every id contains the `r` of "resize".
+        const isAutoAxis = (h.fx !== 0.5 && isAutoWidth) || (h.fy !== 0.5 && isAutoHeight);
         return (
           <div
             key={h.id}
+            data-ui-resize-handle={h.id}
             onPointerDown={e => handlePointerDown(e, h.id)}
             style={{
               position: 'absolute',

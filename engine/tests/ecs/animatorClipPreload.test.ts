@@ -33,7 +33,7 @@ function fadeInClip(id: string) {
  *  Animator whose only clip starts at opacity 0, not playing (the timeline starts it later). */
 function stagedScene(clipGuid: string) {
   return {
-    id: newGuid(), version: 1, resources: [],
+    id: newGuid(), version: 8, resources: [],
     entities: [{
       id: 1, name: 'Staged',
       traits: {

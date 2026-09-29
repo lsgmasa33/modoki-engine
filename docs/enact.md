@@ -640,10 +640,23 @@ The handle shape carries three fields that make chrome addressing robust:
 
   The rule is enforced by `engine/tests/architecture/handleProviderOwner.test.ts` — a SOURCE guard,
   because these providers live inside panel mount effects that cannot be invoked without a real
-  viewport. One provider is deliberately exempt and the guard asserts it stays that way:
-  **`UIResizeOverlay`**, whose 8 handles sit ON the entity element but are driven by sibling overlay
-  divs drawn over it, so owning the entity element would report every handle as occluded by its own
-  grab affordance. Wiring it needs the overlay divs themselves, which the provider does not hold.
+  viewport. **No provider is exempt.** The last one was **`UIResizeOverlay`** (#1726). Each of its
+  8 handles now names its own GRAB DIV (`data-ui-resize-handle`) as owner, because that div is what a
+  press has to land on. Two other choices each lie in one direction:
+  - The entity element would report every handle as covered by its own grab div.
+  - The preview frame would report a handle as clean when the overlay's move arrows are drawn over
+    it (any element narrower or shorter than the arrows), and the press would move the element
+    instead of resizing it.
+
+  The div's clip ancestors include the frame's `overflow:hidden`, so a handle past the device frame
+  is `clipped` and refused. Unowned, such a handle was pressed on whatever lay under it: an Assets
+  row, once, which started a native drag that left mouse input dead for the rest of the session.
+  The aim is the centre of the div's VISIBLE part, meaning the part every clipping ancestor leaves
+  (the frame and, when zoomed, the Scene viewport above it), not the handle's geometric point. An
+  element filling the frame puts its handles ON the frame edge, where that point hits the
+  neighbouring panel while half the div is drawn inside. Measured on a full-frame view, 7 of 8
+  handles were `clipped` when aimed at the point. A div wholly outside the frame keeps its point and
+  stays refused.
 
 ### What's tagged today
 

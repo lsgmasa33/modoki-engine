@@ -59,12 +59,12 @@ beforeEach(async () => {
   for (const k of Object.keys(fetchResponses)) delete fetchResponses[k];
 
   fetchResponses['/sceneA.json'] = {
-    version: 6,
+    version: 8,
     resources: [],
     entities: [{ id: 1, traits: { Transform: { x: 1 }, EntityAttributes: { name: 'A1', parentId: 0 } } }],
   };
   fetchResponses['/sceneB.json'] = {
-    version: 6,
+    version: 8,
     resources: [],
     entities: [{ id: 2, traits: { Transform: { x: 2 }, EntityAttributes: { name: 'B1', parentId: 0 } } }],
   };

@@ -4,7 +4,8 @@
  *  scaffold, and "About"). `SCENE_FORMAT_VERSION` is the version stamped into newly
  *  created SCENE JSON; older files are upgraded by the migration chain in
  *  `runtime/loaders/loadSceneFile.ts` (each `migrateVNtoVN+1` step). Bump
- *  SCENE_FORMAT_VERSION in lockstep with adding a new migration there.
+ *  SCENE_FORMAT_VERSION in lockstep with adding a new migration there. The chain starts at
+ *  `MIN_READABLE_SCENE_FORMAT_VERSION`; anything older is refused, not loaded.
  *
  *  ⚠️ **`PREFAB_FORMAT_VERSION` now lives HERE, and that REVERSES a recorded decision.** This
  *  docblock used to say the prefab constant belonged in `editor/scene/prefab.ts` "because prefab
@@ -77,6 +78,13 @@ export const ENGINE_VERSION = '0.1.0';
 // restating — and so pinning — everything beside it. Required for the REFUSE reason v14-v16 were: an older build
 // would ignore the new channels and drop them on its next save.
 export const SCENE_FORMAT_VERSION = 17;
+
+/** The oldest scene format this build reads; an older scene, or one with no `version` at all, is
+ *  REFUSED. No released editor ever wrote a scene below v8: the first tag, v0.1.0, wrote 8, and v8
+ *  itself landed the day after the initial commit. So the v3→v8 steps had no population, and they
+ *  were deleted (#1769) rather than extended to walk `overrides`/`added` as they should have. A
+ *  versionless scene can only predate v3, so it goes the same way. */
+export const MIN_READABLE_SCENE_FORMAT_VERSION = 8;
 
 /** The version stamped into newly written PREFAB JSON. Moved here from `editor/scene/prefab.ts`
  *  by #1468 — see the reversal note at the top of this file for why the editor-only premise no

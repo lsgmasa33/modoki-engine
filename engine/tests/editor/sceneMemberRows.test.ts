@@ -47,7 +47,7 @@ const ent = (id: number, name: string, parentId: number | string, guid: string) 
 /** Root with three FLAT children — flat so deleting the FIRST one renumbers the other two without
  *  taking either with it, which is what makes derivation give a different answer. */
 const authored = (): SceneData => ({
-  id: 'member-rows', version: 1, name: 'M', resources: [],
+  id: 'member-rows', version: 8, name: 'M', resources: [],
   entities: [
     ent(1, 'Holder', 0, HOLDER),
     ent(2, 'Root', HOLDER, ROOT),
@@ -116,7 +116,7 @@ async function placedInstance(): Promise<{ template: PrefabFile; scene: { entiti
   await load(authored());
   const template = makeTemplate();
   await load({
-    id: 's', version: 1, name: 'S', resources: [],
+    id: 's', version: 8, name: 'S', resources: [],
     entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
   } as unknown as SceneData);
   const scene = await serializeScene() as unknown as { entities: unknown[] };
@@ -213,7 +213,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     prefabs.set(PREFAB, v5);
     setPrefabCache(PREFAB, v5 as never);
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, members: { [`/${LEAF_NODE}`]: { guid: MINE, name: 'Leaf' } }, traits: { EntityAttributes: { name: 'T', parentId: 0 } } }],
     } as unknown as SceneData);
     expect(guidOf('Leaf')).toBe(MINE);
@@ -290,7 +290,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     const key = `/${'ffffffff-0000-4000-8000-0000000000d2'}/${INNER_NODE}`;
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, members: { [key]: { guid: KEPT, name: 'Inner' } }, traits: { EntityAttributes: { name: 'T', parentId: 0 } } }],
     } as unknown as SceneData);
     expect(warn.mock.calls.map((c) => String(c[0])).some((m) => m.includes('name no node the template still declares'))).toBe(false);
@@ -323,7 +323,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // halves of this rule mutated green. The member is what the rule is about.
     const CHILD = 'ffffffff-0000-4000-8000-0000000000f1';
     await load({
-      id: 'r7', version: 1, name: 'R', resources: [],
+      id: 'r7', version: 8, name: 'R', resources: [],
       entities: [
         ent(1, 'Holder', 0, HOLDER),
         ent(2, 'Root', HOLDER, ROOT),
@@ -334,7 +334,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     const child = createPrefabFrom('Badge', CHILD);   // Badge → an instance of CHILD, with Pip inside
     const outer = createPrefabFrom('Root', PREFAB);   // …and a nested reference row of PREFAB
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
     } as unknown as SceneData);
     const nestedRow = outer.entities.find((e) => e.prefab === CHILD)!;
@@ -364,7 +364,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // `template` flag the rest of it uses, and this is the assertion that the gate is not decorative.
     const CHILD = 'ffffffff-0000-4000-8000-0000000000e1';
     await load({
-      id: 'tpl', version: 1, name: 'T', resources: [],
+      id: 'tpl', version: 8, name: 'T', resources: [],
       entities: [
         ent(1, 'Holder', 0, HOLDER),
         ent(2, 'Root', HOLDER, ROOT),
@@ -536,7 +536,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     prefabs.set(PREFAB, v4);
     setPrefabCache(PREFAB, v4 as never);
     await load({
-      id: 's', version: 1, name: 'S', resources: [],
+      id: 's', version: 8, name: 'S', resources: [],
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Old', parentId: 0 } } }],
     } as unknown as SceneData);
     const scene = await serializeScene() as unknown as { entities: unknown[] };

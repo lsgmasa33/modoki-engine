@@ -15,12 +15,6 @@ const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, s
 const EntityAttributes = trait({ name: '', isActive: true, sortOrder: 0, parentId: 0, layer: '' as '' | '3d' | '2d' | 'ui', guid: '' });
 const Renderable3D = trait({ mesh: '', material: '', isVisible: true });
 const PlayerProfile = trait({ score: 0, level: 1 });
-// v3/v4 UI traits — registered only so the v3→v4→v5 UI migration test can prove
-// they were actually deleted (getTraitByName must resolve them for entity.has(...)
-// to mean anything); the real registry does not carry them post-v5.
-const UIStyle = trait({});
-const UIText = trait({});
-const UIContent = trait({});
 
 // ── GLTFLoader mock (for acquireMesh transitive model load) ─────────────
 
@@ -58,11 +52,8 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => {
     { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: { type: 'string' }, isActive: { type: 'boolean' }, sortOrder: { type: 'number' }, parentId: { type: 'number', entityId: { onMissing: 'root' } }, layer: { type: 'string' }, guid: { type: 'string' } } },
     { name: 'Renderable3D', trait: Renderable3D, category: 'component', fields: { mesh: { type: 'string' }, material: { type: 'string' }, isVisible: { type: 'boolean' } } },
     { name: 'PlayerProfile', trait: PlayerProfile, category: 'component', fields: { score: { type: 'number' }, level: { type: 'number' } } },
-    { name: 'UIStyle', trait: UIStyle, category: 'component', fields: {} },
-    { name: 'UIText', trait: UIText, category: 'component', fields: {} },
-    { name: 'UIContent', trait: UIContent, category: 'component', fields: {} },
     { name: 'Persistent', trait: null as any, category: 'tag', fields: {} }, // patched in beforeEach
-    { name: 'UIElement', trait: null as any, category: 'component', fields: {} }, // patched in beforeEach — real trait, for the v3→v5 UI migration test
+    { name: 'UIElement', trait: null as any, category: 'component', fields: {} }, // patched in beforeEach
     { name: 'RenderableUI', trait: null as any, category: 'tag', fields: {} }, // patched in beforeEach
   ];
   return {
@@ -109,7 +100,7 @@ global.fetch = vi.fn(async (url: string) => {
 
 function defineSceneA() {
   fetchResponses['/sceneA.json'] = {
-    version: 6,
+    version: 8,
     resources: [
       { type: 'material', path: M('/materials/m1.mat.json') },
       { type: 'material', path: M('/materials/m2.mat.json') },
@@ -126,7 +117,7 @@ function defineSceneA() {
 function defineSceneB_sharedM2() {
   // Scene B reuses m2 from scene A, adds m4 + m5
   fetchResponses['/sceneB.json'] = {
-    version: 6,
+    version: 8,
     resources: [
       { type: 'material', path: M('/materials/m4.mat.json') },
       { type: 'material', path: M('/materials/m5.mat.json') },
@@ -363,84 +354,38 @@ describe('SceneManager — basic load', () => {
     worldBefore.destroy();
   });
 
-  /** #807 — `collectSceneResourceRefs` used to end with `sceneData.version =
-   *  Math.max(sceneData.version ?? 6, 6)`, raising a v3 scene's version straight to 6
-   *  BEFORE `loadSceneFile`'s migration ladder ever ran on that same object. That made
-   *  `migrateSceneData` (v3→v4, `>= 4`), `migrateV4toV5` (v4→v5, `>= 5`) and
-   *  `migrateV5toV6` (v5→v6, `>= 6`) all no-ops — a genuinely old scene loaded with its
-   *  pre-migration shape intact instead of being reshaped.
-   *
-   *  Driven through `SceneManager.loadScene`, not `loadSceneFile` directly — the whole
-   *  point of the defect is that only the `SceneManager`-driven path mutated `version`
-   *  ahead of the ladder, so `loadSceneFile.test.ts`'s existing v3→v4/v4→v5/v5→v6
-   *  coverage passed even with the bug in place and could not have caught it.
-   *
-   *  Asserts the actual RESHAPING (v3's separate `UIStyle`/`UIText`/`UIContent` traits
-   *  merged into `UIElement`), not merely that the final version reached
-   *  `SCENE_FORMAT_VERSION` — that would be true with or without the fix. */
-  it('a v3 scene loaded through SceneManager actually runs the v3→v4→v5 UI migration', async () => {
-    fetchResponses['/v3ui.json'] = {
-      version: 3,
-      resources: [],
-      entities: [
-        {
-          id: 500,
-          traits: {
-            EntityAttributes: { name: 'Label', parentId: 0, layer: 'ui' },
-            RenderableUI: true,
-            // Stripped by migrateSceneData (v3→v4) because this entity carries RenderableUI.
-            Transform: { x: 5, y: 5 },
-            // v3/v4 shape: a bare UIElement plus separate style/text/content traits.
-            UIElement: { width: 100, height: 20 },
-            UIStyle: {
-              fontSize: 24, fontWeight: 'bold', textColor: 0xff0000, textAlign: 'center',
-              backgroundColor: 0x112233,
-            },
-            UIContent: { text: 'Hello' },
-          },
-        },
-      ],
+  /** #1769 — a scene below `MIN_READABLE_SCENE_FORMAT_VERSION` is refused by `SceneManager`'s OWN
+   *  gate, before `collectSceneResourceRefs` acquires anything. `loadSceneFile`'s gate would refuse
+   *  it too, but only after this path had fetched the scene's resources. So the assertion that
+   *  tells the two gates apart is the resource that was never fetched, not the rejection. */
+  it('a scene below the minimum readable version is refused through SceneManager before its resources are fetched', async () => {
+    const { MIN_READABLE_SCENE_FORMAT_VERSION } = await import('../../src/runtime/core/version');
+    defineSceneA();
+    fetchResponses['/tooOld.json'] = {
+      version: MIN_READABLE_SCENE_FORMAT_VERSION - 1,
+      resources: [{ type: 'material', path: M('/materials/m5.mat.json') }],
+      entities: [{ id: 900, traits: {
+        Transform: { x: 99 }, EntityAttributes: { name: 'Ancient', parentId: 0 },
+        Renderable3D: { mesh: '', material: M('/materials/m5.mat.json') },
+      } }],
     };
     const { sceneManager } = await getSceneManager();
-    await sceneManager.loadScene('/v3ui.json');
 
+    await sceneManager.loadScene('/sceneA.json');
+    const beforeWorld = sceneManager.getCurrent();
     const { getCurrentWorld } = await getWorld();
-    const { UIElement } = await import('../../src/runtime/traits/UIElement');
-    const world = getCurrentWorld();
+    const worldBefore = getCurrentWorld();
 
-    let found: any = null;
-    world.query(EntityAttributes, UIElement).updateEach(([ea, el]: any[]) => {
-      if (ea.name === 'Label') found = { ea, el };
-    });
-    expect(found).not.toBeNull();
+    await expect(sceneManager.loadScene('/tooOld.json')).rejects.toMatchObject({ name: 'SceneFormatRefusedError', reason: 'too-old' });
 
-    // migrateSceneData (v3→v4) moved these from UIStyle into UIText; migrateV4toV5
-    // (v4→v5) then merged UIText/UIStyle/UIContent onto UIElement itself.
-    expect(found.el.fontSize).toBe(24);
-    expect(found.el.fontWeight).toBe('bold');
-    expect(found.el.textColor).toBe(0xff0000);
-    expect(found.el.textAlign).toBe('center');
-    expect(found.el.backgroundColor).toBe(0x112233);
-    expect(found.el.text).toBe('Hello');
+    expect(Object.keys(fetchCalls).filter((u) => u.endsWith('/materials/m5.mat.json'))).toEqual([]);
+    expect(sceneManager.getCurrent()).toEqual(beforeWorld);
+    expect(getCurrentWorld()).toBe(worldBefore);
+    let ancientCount = 0;
+    getCurrentWorld().query(EntityAttributes).updateEach(([ea]: any[]) => { if (ea.name === 'Ancient') ancientCount++; });
+    expect(ancientCount).toBe(0);
 
-    // The separate v3/v4 traits must be gone — folded into UIElement, not merely copied.
-    let entity: any = null;
-    world.query(EntityAttributes).updateEach((_c: any[], e: any) => {
-      const attrs = e.get(EntityAttributes);
-      if (attrs.name === 'Label') entity = e;
-    });
-    // Transform is stripped by migrateSceneData (v3→v4) for RenderableUI entities —
-    // asserting it isolates the v3→v4 rung: without it, this test can't tell "both
-    // rungs ran" from "only v4→v5 ran" (fontSize etc. reach UIElement either way).
-    expect(entity.has(Transform)).toBe(false);
-    const { getTraitByName } = await import('../../src/runtime/core/ecs/traitRegistry');
-    for (const traitName of ['UIStyle', 'UIText', 'UIContent'] as const) {
-      const meta = getTraitByName(traitName);
-      expect(meta).toBeDefined();
-      expect(entity.has(meta!.trait)).toBe(false);
-    }
-
-    world.destroy();
+    worldBefore.destroy();
   });
 
   it('loads from opts.preloaded without fetching the scene path', async () => {
@@ -469,7 +414,7 @@ describe('SceneManager — basic load', () => {
     // The dev-server / agent-bridge caller reuses this parsed object for
     // validate-then-load; loadScene must not silently rewrite its resources/version.
     const preloaded = {
-      version: 6,
+      version: 8,
       resources: [] as string[],
       entities: [
         { id: 1, traits: { Transform: { x: 1 }, EntityAttributes: { name: 'Pre', parentId: 0 } } },
@@ -483,7 +428,7 @@ describe('SceneManager — basic load', () => {
     // but only on its OWN shallow clone — the caller's object is untouched.
     expect(preloaded.resources).toBe(resourcesRef); // not reassigned
     expect(preloaded.resources).toEqual([]);        // not appended-to
-    expect(preloaded.version).toBe(6);              // not bumped
+    expect(preloaded.version).toBe(8);              // not bumped
   });
 
   it('after load, the current world contains the scene entities', async () => {
@@ -646,15 +591,15 @@ describe('SceneManager — persistent entities', () => {
   it('does NOT shadow a scene root with the carried root\'s guid: both spawn (#1863, the Unity rule)', async () => {
     // Define a scene whose root carries the same Persistent guid as our runtime entity
     fetchResponses['/sceneWithDuplicate.json'] = {
-      version: 6,
+      version: 8,
       resources: [],
       entities: [
         // The scene file's "Player" with matching guid — should be excluded
         { id: 50, traits: {
           Transform: { x: 0 },
-          EntityAttributes: { name: 'Player', parentId: 0 },
+          EntityAttributes: { name: 'Player', parentId: 0, guid: 'test-guid-player' },
           PlayerProfile: { score: 0, level: 1 },
-          Persistent: { guid: 'test-guid-player' },
+          Persistent: true,
         } },
         // An unrelated entity that should still be loaded
         { id: 51, traits: {
@@ -799,14 +744,14 @@ describe('SceneManager — persistent entities', () => {
     // Regression test: the old name-based filter would shadow any "Player"
     // root. The new guid-based filter only shadows when guids match.
     fetchResponses['/sceneWithSameNameDiffGuid.json'] = {
-      version: 6,
+      version: 8,
       resources: [],
       entities: [
         { id: 50, traits: {
           Transform: { x: 0 },
-          EntityAttributes: { name: 'Player', parentId: 0 },
+          EntityAttributes: { name: 'Player', parentId: 0, guid: 'different-guid' }, // different from runtime
           PlayerProfile: { score: 0, level: 1 },
-          Persistent: { guid: 'different-guid' }, // different from runtime
+          Persistent: true,
         } },
         { id: 51, traits: {
           Transform: { x: 5 },

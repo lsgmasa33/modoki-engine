@@ -158,7 +158,7 @@ const withUi = (traits: Record<string, unknown>, refs: string[]) =>
 /** A legacy scene: Holder → a GUID-LESS top-level OUTER instance, whose root and members all derive
  *  from Holder; refs on Holder aim at members. */
 const legacyScene = (holderRefs: string[], rootRefs: string[] = []): SceneData => ({
-  id: 'dup-legacy', version: 1, name: 'L', resources: [],
+  id: 'dup-legacy', version: 8, name: 'L', resources: [],
   entities: [
     { id: 1, traits: withUi({ EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } }, holderRefs) },
     { id: 2, prefab: OUTER, traits: withUi({ EntityAttributes: { name: 'OuterRoot', parentId: HOLDER }, Transform: { x: 0, y: 0, z: 0 } }, rootRefs) },
@@ -168,7 +168,7 @@ const legacyScene = (holderRefs: string[], rootRefs: string[] = []): SceneData =
 /** The scene: Holder → an OUTER instance (own guid) carrying an added INNER under Button. The added
  *  node carries its OWN guid; the guid-less variant is covered by the #1349 block below. */
 const scene = (holderRefs: string[], rootRefs: string[] = []): SceneData => ({
-  id: 'dup-scene', version: 1, name: 'S', resources: [],
+  id: 'dup-scene', version: 8, name: 'S', resources: [],
   entities: [
     { id: 1, traits: withUi({ EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER } }, holderRefs) },
     {

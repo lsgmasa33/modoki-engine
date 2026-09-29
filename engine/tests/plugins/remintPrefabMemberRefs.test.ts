@@ -49,7 +49,7 @@ const outerDoc = {
  *  guid of its own (its members derive from ROOT) and one with its own guid (they derive from it). */
 function baseScene(refs: string[]): SceneData {
   return {
-    id: 'scene-asset', version: 1, name: 'S', resources: [],
+    id: 'scene-asset', version: 8, name: 'S', resources: [],
     entities: [
       {
         id: 1, prefab: OUTER, guid: ROOT,
@@ -390,7 +390,7 @@ describe('members the loader anchors above the instance root follow too (#1339)'
   const inst = (extra: Record<string, unknown>) =>
     ({ id: 20, traits: { EntityAttributes: { name: 'I', parentId: 10 }, Transform: { x: 0, y: 0, z: 0 } }, ...extra });
   const sceneWith = (entities: unknown[], refs: string[]): SceneData =>
-    ({ id: 's', version: 1, name: 'S', resources: [], entities: [...entities, ui(refs)] }) as unknown as SceneData;
+    ({ id: 's', version: 8, name: 'S', resources: [], entities: [...entities, ui(refs)] }) as unknown as SceneData;
   const uiRefs = (scene: SceneData): string[] =>
     ((scene.entities.at(-1)!.traits as { UIAction: { bindings: { target: string }[] } }).UIAction.bindings).map((b) => b.target);
 

@@ -43,7 +43,7 @@ function json(body: unknown): Response {
 
 function scene(entityTraits: Record<string, unknown>) {
   return {
-    id: newGuid(), version: 1, resources: [],
+    id: newGuid(), version: 8, resources: [],
     entities: [{
       id: 1, name: 'Subject',
       traits: { EntityAttributes: { name: 'Subject', guid: newGuid() }, Transform: {}, ...entityTraits },
@@ -260,7 +260,7 @@ describe('#1162 — spriteanim / rig2d / animset / particle defs are preloaded a
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       await expect(sceneManager.loadScene('/assets/scenes/preload-fail.scene.json', { preloaded: {
-        id: newGuid(), version: 1, resources: [],
+        id: newGuid(), version: 8, resources: [],
         entities: [
           { id: 1, name: 'A', traits: { EntityAttributes: { name: 'A', guid: newGuid() }, Transform: {}, Renderable2D: { sprite: AUTHORED_SPRITE }, SpriteAnimator: { clipSet: guids.sa } } },
           { id: 2, name: 'B', traits: { EntityAttributes: { name: 'B', guid: newGuid() }, Transform: {}, SkinnedSprite2D: { rig: guids.rig } } },

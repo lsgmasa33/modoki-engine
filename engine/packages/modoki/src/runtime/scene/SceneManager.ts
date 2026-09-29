@@ -131,12 +131,11 @@ import {
   loadSceneFile,
   collectResourceRefsFromEntities,
   instantiatePrefabIntoWorld,
-  SceneFormatRefusedError,
+  assertSceneFormatReadable,
   type SceneData,
   type SceneResourceRef,
   type SceneEntityEntry,
 } from '../loaders/loadSceneFile';
-import { classifyFormatVersion } from '../core/formatVersion';
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId, type ManagerStartupError,
@@ -554,19 +553,16 @@ class SceneManagerImpl implements SceneManager {
         // prefab walk, not what it passed) and a bumped `version`.
         // ⚠️ The shallow clone protects the TOP LEVEL ONLY, and this comment used to
         // claim more than that ("the migration chain likewise reassigns whole
-        // fields"). That is false: `migrateSceneData` does `delete styleObj[f]` and
-        // `delete entry.traits.Transform`, and `migrateV4toV5` does
-        // `Object.assign(el, src)` — deep edits on the very entry objects a shallow
-        // clone SHARES with the caller. #807 widened the exposure by making those
-        // rungs reachable through here at all (they were skipped while
-        // `collectSceneResourceRefs` stamped the version to 6 first).
+        // fields"). That is false: `migrateV8toV9`'s `renameRenderableActiveToVisibleDeep`
+        // rewrites trait objects in place — deep edits on the very entry objects a
+        // shallow clone SHARES with the caller.
         // Latent, not live: all FIVE production `preloaded` callers were checked —
         // `agentBridge` passes a freshly-parsed object, `applyPrefabUndo` passes a
         // `clone(scene)`, and `timelinePreview`/`playMode`/`prefabEdit` all build
         // theirs at `SCENE_FORMAT_VERSION` (the first two via `serializeScene`, and
         // `prefabEdit` via `buildPrefabEditScene`, which stamps it itself), so
         // no ladder rung runs on a caller-owned document today. A caller that ever
-        // passes a genuinely pre-v6 object it intends to keep needs a deep clone,
+        // passes an older-format object it intends to keep needs a deep clone,
         // not this one. Enumerate with
         // `grep -rn "preloaded:" --include='*.ts' engine/` before trusting this list —
         // it said "four" once and `playMode.ts` was the one it missed.
@@ -700,7 +696,7 @@ class SceneManagerImpl implements SceneManager {
       for (const ref of toLoadRefs) {
         const sceneData = ref === primaryRef ? data : rawSceneCache.get(ref.path)!;
         // Classify HERE, before `collectSceneResourceRefs`, for ONE reason: it must
-        // refuse a too-new/unreadable scene before that method acquires its
+        // refuse an unreadable-format scene before that method acquires its
         // resources — walking and fetching the whole transitive prefab chain — and
         // before entities are spawned for a scene that is going to be refused
         // anyway (#784 phase C adversarial review, finding 1).
@@ -708,29 +704,14 @@ class SceneManagerImpl implements SceneManager {
         // unconditional mutators (`assignSyntheticEntityIds` /
         // `stripLegacyCameraFrameShowGizmo`). That reason was written here and is
         // FALSE: all three live inside `loadSceneFile`, whose own
-        // `classifyFormatVersion` runs ahead of them for every caller, so deleting
+        // `assertSceneFormatReadable` runs ahead of them for every caller, so deleting
         // this early classify would still refuse the scene before any of them
         // touched it. Stated so the next reader does not check the cited hazard,
         // find it does not exist, and delete this call as cargo cult.
         // `loadSceneFile`'s own classification stays in place as the backstop for
-        // every other caller (tests, tools, future direct callers) — both route
-        // through the same `classifyFormatVersion` and the same
-        // `SceneFormatRefusedError`, so the two sites cannot disagree on the verdict.
-        const verdict = classifyFormatVersion(sceneData, SCENE_FORMAT_VERSION);
-        if (verdict.kind === 'too-new') {
-          throw new SceneFormatRefusedError(
-            `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
-            `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
-            'too-new',
-          );
-        }
-        if (verdict.kind === 'unreadable') {
-          throw new SceneFormatRefusedError(
-            `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
-            `The file may be corrupt or hand-edited incorrectly.`,
-            'unreadable',
-          );
-        }
+        // every other caller (tests, tools, future direct callers) — both call the same
+        // `assertSceneFormatReadable`, so the two sites cannot disagree on the verdict.
+        assertSceneFormatReadable(sceneData);
         const sid = sceneIdByPath.get(ref.path)!;
         const refs = await bootSpanAsync(
           'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller, enteredGeneration), ref.path);
@@ -1408,14 +1389,11 @@ class SceneManagerImpl implements SceneManager {
     // FORMAT fact, not a place to note that a manifest was collected. Deleted the
     // `sceneData.version = Math.max(sceneData.version ?? 6, 6)` raise that used to
     // sit here (#807) — it ran before `loadSceneFile`'s migration ladder on this
-    // same object, so a v3/v4/v5 scene got stamped straight to 6 and the
-    // `migrateSceneData`/`migrateV4toV5`/`migrateV5toV6` rungs became no-ops.
-    // Safe to delete outright: `migrateV5toV6` only synthesizes `resources` when
-    // `!data.resources`, and `allRefs` is already assigned above, so removing the
-    // raise costs that rung nothing; the numeric-coercion half it also
-    // incidentally provided is handled upstream by `classifyFormatVersion`
-    // (`loadScene`'s caller loop, above) refusing `too-new`/`unreadable` before
-    // this method ever runs.
+    // same object, so an older scene got stamped straight to 6 and the ladder's
+    // early rungs became no-ops. The numeric-coercion half it also incidentally
+    // provided is handled upstream by `assertSceneFormatReadable` (`loadScene`'s
+    // caller loop, above), which refuses an unreadable-format scene before this
+    // method ever runs.
     sceneData.resources = allRefs;
     return allRefs;
   }

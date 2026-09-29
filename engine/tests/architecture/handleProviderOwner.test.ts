@@ -32,28 +32,11 @@ const SRC_ROOTS = [
   join(__dirname, '../../app'),
 ];
 
-/** Handle literals that deliberately stay unchecked, each with the reason it would LIE if wired.
- *
- *  ⚠️ **Keyed `<file>::<kind>` and pardoning ONE literal each (#1123).** This was a
- *  `Record<fileSuffix, reason>`, and the enforcement was INVERTED: an exempt file had to have every
- *  literal LACK `owner:`. That is exact against a stale exemption — wiring the handle turns it red
- *  immediately, better than most guards manage — but it is **perverse under a PARTIAL fix**. A file
- *  with two literals that wires one goes RED, so the cheapest way to stay green is to wire neither;
- *  and a SECOND, unrelated unowned literal added to that file passed silently, which is the grain
- *  defect. Measured 2026-09-12 on work-ai2: 21 literals, exactly one without `owner:`.
- *
- *  The ledger gets both directions without the perversity: wiring the exempt literal makes its row
- *  over-blessed ("blesses 1, found 0"), and a new unowned literal anywhere — including in this same
- *  file — is unexcused. */
-const EXEMPT = [
-  {
-    item: "engine/packages/modoki/src/editor/panels/UIResizeOverlay.tsx::'resize-handle'",
-    reason: 'the 8 resize handles sit ON the entity element but are DRIVEN by sibling overlay divs '
-      + 'drawn on top of it; owning the entity element would report every handle as occluded by '
-      + 'its own grab affordance. Wiring it needs the overlay divs themselves, which the provider '
-      + 'does not hold. (One LITERAL, inside a HANDLES.map() that yields the 8 runtime handles.)',
-  },
-] as const;
+/** No handle literal is exempt. The last one, UIResizeOverlay's resize handles, was wired to its
+ *  preview frame in #1726: it had been excused because owning the ENTITY element would report every
+ *  handle as covered by its own grab div, but the frame holds both. A future exemption goes back in
+ *  as an `exempt` row keyed `<file>::<kind>` with the reason wiring it would LIE (#1123 on why a row
+ *  pardons one literal, not a file). */
 
 /** The `kind` a literal declares — what distinguishes two literals in one file: a string quoted
  *  (`'resize-handle'`), and a computed kind as its printed code in parentheses
@@ -145,11 +128,10 @@ describe('interaction-handle providers name their owning element', () => {
       population: files.flatMap(({ rel, literals }) => literals
         .filter((lit) => !isOwned(lit))
         .map((lit) => ({ item: `${rel}::${kindOf(lit)}`, site: `${rel} — kind ${kindOf(lit)}` }))),
-      exempt: EXEMPT,
-      // 1 measured 2026-09-12, which is also the pardon — so wiring it trips this floor rather than
-      // the over-blessed arm. Read it that way. The detector-broke check is the sibling test above,
-      // which floors total literals at 15 and providing files at 9.
-      floor: 1,
+      // With no offenders the floor bounds the SCAN — every handle literal read, the same floor as
+      // the sibling test above — since `found 0` is exactly what the fix is meant to leave.
+      scanned: files.reduce((n, f) => n + f.literals.length, 0),
+      floor: 15,
       fix: 'a provider that omits `owner` gets occlusionChecked:false, so its handles are never '
         + 'hit-tested and a covered handle reports as clickable — which cost a wrong bug report '
         + '(QA-SVIEW-0003). Pass the DOM element the handles live in as `owner`.',

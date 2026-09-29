@@ -25,6 +25,7 @@ vi.mock('child_process', async (orig) => {
 import fs from 'fs';
 import type { ChildProcess } from 'child_process';
 import path from 'path';
+import net from 'net';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import {
   RenderJobRunner, applyProgressLine, applyExit, renderAvailability, defaultSpawnRender, renderJobs, type RenderJobView,
@@ -33,18 +34,18 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 
 const OPTIONS = { fps: 30, scale: 1, format: 'mp4' as const, outDir: null, keepFrames: false };
 
-/** The fake CLI. Its behaviour is chosen by the take's file name; it writes the grandchild's pid
- *  beside the take so the test can check it is gone.
+/** The fake CLI. Its behaviour is chosen by the take's file name. Its grandchild dials the test's
+ *  socket as it starts and exits when the test ends that connection, so the test holds a HANDLE on
+ *  the grandchild, never only its pid (#1743): the socket closes when the process dies, and a closed
+ *  socket cannot name whatever unrelated process inherits the number afterwards.
  *
  *  `ok` outlives its `done` line, as the real CLI does (it flushes, then exits): the job ends on the
  *  LINE, so a test that waited for `done` has not waited for the exit — which is what the teardown
  *  must wait for (#1735). The linger is far longer than any test, so the last `ok` CLI is still
  *  alive at teardown however the file grows, and dropping the wait fails every Windows run. The
- *  grandchild runs outside `dir`: the test holds only its pid, which gives no `exit` event (only a
- *  poll that races PID reuse), and a process holds its cwd on Windows until it has exited. */
+ *  grandchild runs outside `dir`, because a process holds its cwd on Windows until it has exited. */
 const FAKE_CLI = `
 const { spawn } = require('child_process');
-const fs = require('fs');
 const take = process.argv[2];
 const mode = require('path').basename(take).replace('.take.json', '');
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
@@ -59,8 +60,8 @@ if (mode === 'ok') {
   return;
 }
 if (mode === 'crash') { console.error('boom: something broke'); process.exit(3); }
-const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', cwd: require('os').tmpdir() });
-fs.writeFileSync(take + '.pid', String(gc.pid));
+const gc = spawn(process.execPath, ['-e', "const s = require('net').connect(__GC_PORT__, '127.0.0.1'); s.on('end', () => process.exit(0)); s.on('error', () => process.exit(0));"],
+  { detached: true, stdio: 'ignore', cwd: require('os').tmpdir() });
 out({ stage: 'frames', frame: 1, total: 3 });
 if (mode === 'deaf') {
   process.on('SIGTERM', () => {});
@@ -74,17 +75,30 @@ if (mode === 'deaf') {
 let dir: string;
 let script: string;
 const take = (mode: string) => { const p = path.join(dir, `${mode}.take.json`); fs.writeFileSync(p, '{}'); return p; };
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const until = async (cond: () => boolean, ms = 10_000) => {
   const end = Date.now() + ms;
   while (!cond()) { if (Date.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 20)); }
 };
-const leftovers: number[] = [];
 
-beforeAll(() => {
+/** One fake grandchild, as the test sees it: the socket it dialled in on, and whether that closed. */
+type Grandchild = { socket: net.Socket; closed: Promise<void>; isClosed: () => boolean };
+const grandchildren: Grandchild[] = [];
+let handedOut = 0;
+let gcServer: net.Server;
+/** The next grandchild to dial in — the one the CLI a test just started spawned. */
+const nextGrandchild = async () => { await until(() => grandchildren.length > handedOut); return grandchildren[handedOut++]; };
+
+beforeAll(async () => {
   dir = makeScratchDir('modoki-render-job-');
+  gcServer = net.createServer((socket) => {
+    let closed = false;
+    socket.on('error', () => { /* ECONNRESET when the grandchild is killed — the close below still fires */ });
+    const g: Grandchild = { socket, closed: new Promise((r) => socket.once('close', () => { closed = true; r(); })), isClosed: () => closed };
+    grandchildren.push(g);
+  });
+  await new Promise<void>((r) => gcServer.listen(0, '127.0.0.1', r));
   script = path.join(dir, 'fake-cli.cjs');
-  fs.writeFileSync(script, FAKE_CLI);
+  fs.writeFileSync(script, FAKE_CLI.replace('__GC_PORT__', String((gcServer.address() as net.AddressInfo).port)));
 });
 /** Resolves once `p` has exited — the `exit` event, not a kill's return. */
 const exited = (p: ChildProcess) => new Promise<void>((resolve) => {
@@ -92,13 +106,27 @@ const exited = (p: ChildProcess) => new Promise<void>((resolve) => {
   else p.once('exit', () => resolve());
 });
 afterEach(async () => {
-  for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
-  // Every CLI runs in `dir`, and on Windows a process holds its cwd until it has EXITED — after its
-  // closing line (which is all a test waits for) and after a kill returns. So `afterAll`'s rmSync
-  // fails EPERM unless each CLI is waited out here (#1735).
-  await Promise.all(clis.splice(0).map((p) => { const done = exited(p); p.kill('SIGKILL'); return done; }));
+  // A grandchild the CLI never reached (the `deaf` test, on posix) is still connected: ending the
+  // connection is what makes it exit. One that already died closed its socket, so it is skipped —
+  // never a signal to its old pid, which the OS may have handed to an unrelated process (#1743).
+  // The spy holds the teardown to that: it may not signal ANY bare pid.
+  const kill = vi.spyOn(process, 'kill');
+  try {
+    await Promise.all(grandchildren.splice(0).map((g) => { if (!g.isClosed()) g.socket.end(); return g.closed; }));
+    // Every CLI runs in `dir`, and on Windows a process holds its cwd until it has EXITED — after its
+    // closing line (which is all a test waits for) and after a kill returns. So `afterAll`'s rmSync
+    // fails EPERM unless each CLI is waited out here (#1735).
+    await Promise.all(clis.splice(0).map((p) => { const done = exited(p); p.kill('SIGKILL'); return done; }));
+    expect(kill, 'the teardown signalled a bare pid').not.toHaveBeenCalled();
+  } finally {
+    kill.mockRestore();
+    handedOut = 0;
+  }
 });
-afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+afterAll(async () => {
+  await new Promise<void>((r) => gcServer.close(() => r()));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 const start = (runner: RenderJobRunner, mode: string) => runner.start({ repoRoot: dir, scriptPath: script, take: take(mode), options: OPTIONS });
 
@@ -118,7 +146,7 @@ describe('RenderJobRunner', () => {
     const runner = new RenderJobRunner();
     expect(start(runner, 'waits').ok).toBe(true);
     await until(() => runner.current()!.stage === 'frames');
-    leftovers.push(Number(fs.readFileSync(path.join(dir, 'waits.take.json.pid'), 'utf8')));
+    await nextGrandchild();
     expect(start(runner, 'ok')).toEqual({ ok: false, status: 409, error: expect.stringMatching(/already running/) });
     runner.cancel();
     await until(() => runner.current()!.status !== 'running');
@@ -130,20 +158,19 @@ describe('RenderJobRunner', () => {
     const runner = new RenderJobRunner();
     start(runner, 'waits');
     await until(() => runner.current()!.stage === 'frames');
-    const gc = Number(fs.readFileSync(path.join(dir, 'waits.take.json.pid'), 'utf8'));
-    leftovers.push(gc);
-    expect(alive(gc)).toBe(true);
+    const gc = await nextGrandchild();
+    expect(gc.isClosed()).toBe(false);
     expect(runner.cancel()).toMatchObject({ cancelRequested: true, status: 'running' });
     await until(() => runner.current()!.status !== 'running');
     expect(runner.current()).toMatchObject({ status: 'cancelled', stage: 'cancelled' });
-    await until(() => !alive(gc), 3000);
+    await until(gc.isClosed, 3000);
   });
 
   it('kills a CLI that ignores the cancel once the grace runs out, and still ends the job cancelled', async () => {
     const runner = new RenderJobRunner(defaultSpawnRender, Date.now, 300);
     start(runner, 'deaf');
     await until(() => runner.current()!.stage === 'frames');
-    leftovers.push(Number(fs.readFileSync(path.join(dir, 'deaf.take.json.pid'), 'utf8')));
+    await nextGrandchild();
     runner.cancel();
     // The grace, then `killBuildProcess`'s own SIGTERM-to-SIGKILL escalation (5 s) for a CLI that ignores SIGTERM too.
     await until(() => runner.current()!.status !== 'running', 8000);

@@ -53,6 +53,7 @@ const fakeEntity = {
 };
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   findEntity: (id: number) => (id === 2 ? fakeEntity : null),
+  guidOfEntityId: () => undefined,
 }));
 vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => [
@@ -63,6 +64,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 }));
 
 import { UIResizeOverlay } from '../../src/editor/panels/UIResizeOverlay';
+import { collectHandles } from '../../src/runtime/rendering/interactionHandles';
 
 // ── DOM helpers ──────────────────────────────────────────
 function rectStub(left: number, top: number, width: number, height: number): () => DOMRect {
@@ -77,6 +79,7 @@ function rectStub(left: number, top: number, width: number, height: number): () 
 function mountPreviewFrame(frame: { left: number; top: number; width: number; height: number }) {
   const frameEl = document.createElement('div');
   frameEl.setAttribute('data-ui-preview-frame', '');
+  frameEl.style.overflow = 'hidden'; // as SceneView's frame is: it is what clips a handle past the device edge
   frameEl.getBoundingClientRect = rectStub(frame.left, frame.top, frame.width, frame.height);
   const entityEl = document.createElement('div');
   entityEl.setAttribute('data-entity-id', '2');
@@ -134,6 +137,96 @@ describe('UIResizeOverlay — device simulation wiring', () => {
     rerender(<UIResizeOverlay entityId={2} />);
 
     expect(selectionBox().width).toBeCloseTo(375, 0); // ← would stay 834 with the bug
+  });
+
+  // #1726. Each handle's owner is its own grab div, because that is what a press must land on, and
+  // `computeHandles` hit-tests and clips against the owner. The frame would count the overlay's own
+  // move arrows (drawn over small elements' handles) as clean. The entity element would count every
+  // grab div as a cover. The aim is the centre of the div's part inside the frame.
+  /** Render the overlay INSIDE the frame, where SceneView mounts it; the provider looks there. */
+  const renderInFrame = (frameEl: HTMLElement) => render(<UIResizeOverlay entityId={2} />, { container: frameEl.appendChild(document.createElement('div')) });
+  const grabDivs = () => [...document.querySelectorAll<HTMLElement>('[data-ui-resize-handle]')];
+  /** jsdom has no layout: give each grab div an on-screen box of `size` centred on its geometric point. */
+  function stubGrabDivs(el: { left: number; top: number; width: number; height: number }, size: number) {
+    for (const div of grabDivs()) {
+      const h = collectHandles({ editor: 'ui-resize', ids: [`ui:${div.dataset.uiResizeHandle}`] })[0];
+      const cx = el.left + el.width * (h.meta!.fx as number), cy = el.top + el.height * (h.meta!.fy as number);
+      div.getBoundingClientRect = rectStub(cx - size / 2, cy - size / 2, size, size);
+    }
+  }
+
+  it('names each resize handle\'s own GRAB DIV as its owner — not the frame, not the entity element', () => {
+    renderInFrame(mountPreviewFrame({ left: 10, top: 20, width: 417, height: 597 }));
+    const handles = collectHandles({ editor: 'ui-resize' });
+    expect(handles).toHaveLength(8);
+    for (const h of handles) {
+      expect((h.owner as HTMLElement).dataset.uiResizeHandle, h.id).toBe(h.meta!.handle);
+    }
+  });
+
+  it.each([
+    ['at scale 1 (an 8px grab div)', 8],
+    ['at scale 0.5 (a 4px grab div), below where a fixed inset stops fitting', 4],
+    ['at scale 0.25 (a 2px grab div)', 2],
+  ])('aims a handle ON the frame edge at the visible half of its grab div, %s', (_label, size) => {
+    const box = { left: 10, top: 20, width: 417, height: 597 }; // the element fills the frame
+    renderInFrame(mountPreviewFrame(box));
+    stubGrabDivs(box, size);
+    for (const h of collectHandles({ editor: 'ui-resize' })) {
+      const gx = box.left + box.width * (h.meta!.fx as number), gy = box.top + box.height * (h.meta!.fy as number);
+      expect(h.x, h.id).toBeGreaterThan(box.left); expect(h.x, h.id).toBeLessThan(box.left + box.width);
+      expect(h.y, h.id).toBeGreaterThan(box.top); expect(h.y, h.id).toBeLessThan(box.top + box.height);
+      expect(Math.abs(h.x - gx), h.id).toBeLessThan(size / 2); // still on the div
+      expect(Math.abs(h.y - gy), h.id).toBeLessThan(size / 2);
+    }
+  });
+
+  it('leaves a handle whose grab div lies wholly outside the frame at its true point, so it is refused', () => {
+    const frameEl = mountPreviewFrame({ left: 10, top: 20, width: 417, height: 597 });
+    const el = { left: 10, top: 20, width: 834, height: 716 }; // 200% × 120%
+    (frameEl.querySelector('[data-entity-id="2"]') as HTMLElement).getBoundingClientRect = rectStub(el.left, el.top, el.width, el.height);
+    renderInFrame(frameEl);
+    stubGrabDivs(el, 8);
+    const br = collectHandles({ editor: 'ui-resize', ids: ['ui:resize-br'] })[0];
+    expect({ x: br.x, y: br.y }).toEqual({ x: 844, y: 736 });
+  });
+
+  it('aims inside a tighter clip ABOVE the frame too — the zoomed Scene viewport, not only the frame', () => {
+    const box = { left: 10, top: 20, width: 417, height: 597 };
+    const frameEl = mountPreviewFrame(box);
+    const viewport = document.createElement('div');
+    viewport.style.overflow = 'hidden';
+    viewport.getBoundingClientRect = rectStub(10, 20, 415, 597); // cuts the frame 2px short on the right
+    document.body.appendChild(viewport);
+    viewport.appendChild(frameEl);
+    renderInFrame(frameEl);
+    stubGrabDivs(box, 8); // resize-r's div spans x 423..431; the viewport shows 423..425
+    const r = collectHandles({ editor: 'ui-resize', ids: ['ui:resize-r'] })[0];
+    expect(r.x).toBe(424);
+  });
+
+  it('lists no handle whose grab div is not drawn — there is nothing there to press', () => {
+    renderInFrame(mountPreviewFrame({ left: 10, top: 20, width: 417, height: 597 }));
+    expect(collectHandles({ editor: 'ui-resize' })).toHaveLength(8);
+    for (const div of grabDivs()) div.removeAttribute('data-ui-resize-handle'); // React owns the node; untag it
+    expect(collectHandles({ editor: 'ui-resize' })).toEqual([]);
+  });
+
+  it('draws only the handles on an auto-sized axis as disabled, matching meta.disabled', () => {
+    const ui = traitData.UIElement as Record<string, unknown>;
+    const width = ui.width;
+    ui.width = 0; // auto width, fixed height
+    try {
+      renderInFrame(mountPreviewFrame({ left: 10, top: 20, width: 417, height: 597 }));
+      for (const div of grabDivs()) {
+        const h = collectHandles({ editor: 'ui-resize', ids: [`ui:${div.dataset.uiResizeHandle}`] })[0];
+        expect(div.style.border.includes('dashed'), h.id).toBe(h.meta!.disabled);
+      }
+      expect(grabDivs().filter((d) => d.style.border.includes('dashed')).map((d) => d.dataset.uiResizeHandle).sort())
+        .toEqual(['resize-bl', 'resize-br', 'resize-l', 'resize-r', 'resize-tl', 'resize-tr']);
+    } finally {
+      ui.width = width;
+    }
   });
 
   it('renders nothing when the entity has no preview-frame DOM node', () => {

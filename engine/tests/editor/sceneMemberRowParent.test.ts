@@ -44,7 +44,7 @@ const ent = (id: number, name: string, parentId: number | string, guid: string) 
 /** Root with three FLAT children — flat so deleting the FIRST one renumbers the other two without
  *  taking either with it, which is what makes derivation give a different answer. */
 const authored = (): SceneData => ({
-  id: 'member-rows', version: 1, name: 'M', resources: [],
+  id: 'member-rows', version: 8, name: 'M', resources: [],
   entities: [
     ent(1, 'Holder', 0, HOLDER),
     ent(2, 'Root', HOLDER, ROOT),
@@ -103,7 +103,7 @@ async function placedInstance(): Promise<{ template: PrefabFile; scene: { entiti
   await load(authored());
   const template = makeTemplate();
   await load({
-    id: 's', version: 1, name: 'S', resources: [],
+    id: 's', version: 8, name: 'S', resources: [],
     entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
   } as unknown as SceneData);
   const scene = await serializeScene() as unknown as { entities: unknown[] };

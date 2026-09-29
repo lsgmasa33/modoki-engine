@@ -2,7 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld, trait } from 'koota';
-import { SCENE_FORMAT_VERSION } from '../../src/runtime/core/version';
+import { MIN_READABLE_SCENE_FORMAT_VERSION, SCENE_FORMAT_VERSION } from '../../src/runtime/core/version';
 import type { SceneData } from '../../src/runtime/loaders/loadSceneFile';
 
 // We need to mock the world and traitRegistry modules that loadSceneFile imports
@@ -102,90 +102,13 @@ async function getLoader() {
 }
 
 describe('loadSceneFile', () => {
-  describe('v3 → v4 migration (text fields from UIStyle to UIText)', () => {
-    it('migrates fontSize from UIStyle to UIText', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 3,
-        entities: [{
-          id: 1,
-          traits: {
-            UIStyle: { fontSize: 24, backgroundColor: '#fff' },
-            // No UIText — migration should create it
-          },
-        }],
-      };
-
-      // loadSceneFile mutates data.version and entity traits in place
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      // After migration, UIStyle should not have fontSize, UIText should
-      // Note: since these aren't registered traits, they won't spawn entities,
-      // but the migration mutates the data object directly
-      expect(data.version).toBeGreaterThanOrEqual(4);
-    });
-  });
-
-  describe('v4 → v5 migration (merge UI traits into UIElement)', () => {
-    it('bumps version to 5', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 4,
-        entities: [{
-          id: 1,
-          traits: {
-            UIElement: { width: 100 },
-            UIStyle: { backgroundColor: '#ff0000' },
-            UIText: { fontSize: 16 },
-          },
-        }],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      expect(data.version).toBe(SCENE_FORMAT_VERSION);
-      // UIStyle and UIText should be merged into UIElement and removed
-      const entry = data.entities[0];
-      expect(entry.traits.UIStyle).toBeUndefined();
-      expect(entry.traits.UIText).toBeUndefined();
-      expect((entry.traits.UIElement as any).backgroundColor).toBe('#ff0000');
-      expect((entry.traits.UIElement as any).fontSize).toBe(16);
-    });
-
-    it('strips elementType from UIElement', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 4,
-        entities: [{
-          id: 1,
-          traits: {
-            UIElement: { width: 100, elementType: 'button' },
-          },
-        }],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      expect((data.entities[0].traits.UIElement as any).elementType).toBeUndefined();
-    });
-  });
-
   describe('entity spawning', () => {
     it('spawns entities with registered traits', async () => {
       const { loadSceneFile } = await getLoader();
       const onEntitySpawned = vi.fn();
 
       const data = {
-        version: 5,
+        version: 8,
         entities: [{
           id: 100,
           traits: {
@@ -211,7 +134,7 @@ describe('loadSceneFile', () => {
       const onEntitySpawned = vi.fn();
 
       const data = {
-        version: 5,
+        version: 8,
         entities: [
           { id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'A', parentId: 0 } } },
           { id: 2, traits: { Transform: { x: 1 }, EntityAttributes: { name: 'B', parentId: 0 } } },
@@ -235,7 +158,7 @@ describe('loadSceneFile', () => {
       const spawnedEntities: { entity: any; oldId: number }[] = [];
 
       const data = {
-        version: 5,
+        version: 8,
         entities: [
           { id: 10, traits: { Transform: true, EntityAttributes: { name: 'Parent', parentId: 0 } } },
           { id: 20, traits: { Transform: true, EntityAttributes: { name: 'Child', parentId: 10 } } },
@@ -273,7 +196,7 @@ describe('loadSceneFile', () => {
 
       // Current files store parentId as the PARENT'S guid, not a numeric file id.
       const data = {
-        version: 5,
+        version: 8,
         entities: [
           { id: 10, traits: { Transform: true, EntityAttributes: { name: 'Parent', guid: 'guid-parent', parentId: '' } } },
           { id: 20, traits: { Transform: true, EntityAttributes: { name: 'Child', guid: 'guid-child', parentId: 'guid-parent' } } },
@@ -357,7 +280,7 @@ describe('loadSceneFile', () => {
       const onDeletePlaceholder = vi.fn();
 
       const data = {
-        version: 5,
+        version: 8,
         entities: [{
           id: 50,
           traits: {
@@ -389,7 +312,7 @@ describe('loadSceneFile', () => {
 
       const overrides = { 2: { Transform: { x: 99 } } };
       const data = {
-        version: 7,
+        version: 8,
         entities: [{
           id: 50,
           traits: {
@@ -460,7 +383,7 @@ describe('loadSceneFile', () => {
       const onInstantiatePrefab = vi.fn();
 
       const data = {
-        version: 5,
+        version: 8,
         entities: [{
           id: 50,
           traits: {
@@ -888,7 +811,7 @@ describe('loadSceneFile', () => {
       const { loadSceneFile } = await getLoader();
 
       await expect(loadSceneFile(
-        { version: 5, entities: [] },
+        { version: 8, entities: [] },
         { fetchPrefab: async () => null, loadModels: false },
       )).resolves.toBeUndefined();
     });
@@ -948,123 +871,56 @@ describe('loadSceneFile', () => {
       expect(testWorld.entities.length).toBe(1); // baseline only — see the comment above
     });
 
-    it('still migrates a scene with an ABSENT version (deliberate exception — do not gate this)', async () => {
-      // `absent` is § 2a's "legacy or freshly created — readable" verdict. A genuinely
-      // pre-v3 scene has no `version` key at all and MUST still run the whole ladder; this
-      // guards that exception against a later "tidy-up" that folds it into the refusal.
-      const { loadSceneFile } = await getLoader();
+    // #1769: the v3→v8 steps are gone, so an older scene, or one with no version at all (only a
+    // pre-v3 scene lacks one), would load its pre-v8 shapes as defaults and lose them on the next
+    // save. Refused instead, with the same byte-for-byte check as the too-new case above.
+    it('refuses a scene below the minimum readable version, naming both versions, and does not mutate it', async () => {
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
+      const data = {
+        version: MIN_READABLE_SCENE_FORMAT_VERSION - 1,
+        resources: [],
+        entities: [{ traits: { Persistent: { guid: 'pre-v8' }, EntityAttributes: { name: 'Old', parentId: 0 } } }],
+      };
+      const snapshot = JSON.parse(JSON.stringify(data));
+
+      const load = loadSceneFile(data as any, { fetchPrefab: async () => null, loadModels: false });
+      await expect(load).rejects.toThrow(SceneFormatRefusedError);
+      await expect(load).rejects.toMatchObject({ reason: 'too-old' });
+      await expect(load).rejects.toThrow(`format version ${MIN_READABLE_SCENE_FORMAT_VERSION - 1}, and this engine reads scenes from format version ${MIN_READABLE_SCENE_FORMAT_VERSION} up`);
+
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1); // baseline only
+    });
+
+    it('refuses a scene with NO version as too old — only a pre-v3 scene lacks one', async () => {
+      const { loadSceneFile, SceneFormatRefusedError } = await getLoader();
       const data: any = {
         resources: [],
-        entities: [{
-          id: 1,
-          traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Legacy', parentId: 0 } },
-        }],
+        entities: [{ id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Legacy', parentId: 0 } } }],
       };
+      const snapshot = JSON.parse(JSON.stringify(data));
 
-      await expect(loadSceneFile(data, { fetchPrefab: async () => null, loadModels: false }))
-        .resolves.toBeUndefined();
+      const load = loadSceneFile(data, { fetchPrefab: async () => null, loadModels: false });
+      await expect(load).rejects.toThrow(SceneFormatRefusedError);
+      await expect(load).rejects.toThrow('it has no format version');
 
+      expect(data).toEqual(snapshot);
+      expect(testWorld.entities.length).toBe(1);
+    });
+
+    it('loads a scene AT the minimum readable version — the floor is inclusive', async () => {
+      const { loadSceneFile } = await getLoader();
+      const data: any = {
+        version: MIN_READABLE_SCENE_FORMAT_VERSION,
+        resources: [],
+        entities: [{ id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Oldest', parentId: 0 } } }],
+      };
+      await expect(loadSceneFile(data, { fetchPrefab: async () => null, loadModels: false })).resolves.toBeUndefined();
       expect(data.version).toBe(SCENE_FORMAT_VERSION);
-      expect(testWorld.entities.length).toBe(2); // baseline (1) + the one spawned entity
+      expect(testWorld.entities.length).toBe(2);
     });
   });
 });
-
-  describe('v5 → v6 migration (derive resources)', () => {
-    it('synthesizes resources array from entities', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 5,
-        entities: [{
-          id: 1,
-          traits: {
-            Transform: { x: 0 },
-            Renderable3D: { mesh: 'b0000000-0000-4000-8000-000000000001', material: 'b0000000-0000-4000-8000-000000000002' },
-            EntityAttributes: { name: 'Hero', parentId: 0 },
-          },
-        }],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      expect(data.version).toBe(SCENE_FORMAT_VERSION);
-      expect((data as any).resources).toBeDefined();
-      expect((data as any).resources.length).toBeGreaterThan(0);
-    });
-
-    it('preserves existing resources on v6+ scenes', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 6,
-        resources: [{ type: 'mesh', path: '/existing.mesh.json' }],
-        entities: [],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      expect((data as any).resources).toContainEqual({ type: 'mesh', path: '/existing.mesh.json' });
-    });
-  });
-
-  describe('v6 → v7 migration (Renderable2D size → width/height)', () => {
-    it('splits Renderable2D.size into width and height', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 6,
-        resources: [],
-        entities: [{
-          id: 1,
-          traits: {
-            Transform: { x: 0 },
-            Renderable2D: { sprite: 'circle', size: 50, color: 0xff0000 },
-            EntityAttributes: { name: 'Sprite', parentId: 0 },
-          },
-        }],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      expect(data.version).toBe(SCENE_FORMAT_VERSION);
-      const r2d = data.entities[0].traits.Renderable2D as any;
-      expect(r2d.width).toBe(50);
-      expect(r2d.height).toBe(50);
-      expect(r2d.size).toBeUndefined();
-    });
-
-    it('leaves Renderable2D without size unchanged', async () => {
-      const { loadSceneFile } = await getLoader();
-      const data = {
-        version: 6,
-        resources: [],
-        entities: [{
-          id: 1,
-          traits: {
-            Transform: { x: 0 },
-            Renderable2D: { sprite: 'square', width: 40, height: 60 },
-            EntityAttributes: { name: 'Sprite', parentId: 0 },
-          },
-        }],
-      };
-
-      await loadSceneFile(data as any, {
-        fetchPrefab: async () => null,
-        loadModels: false,
-      });
-
-      const r2d = data.entities[0].traits.Renderable2D as any;
-      expect(r2d.width).toBe(40);
-      expect(r2d.height).toBe(60);
-    });
-  });
 
 describe('collectResourceRefsFromEntities', () => {
   // References are GUID-only — fixtures use GUIDs (collector stores refs verbatim).
@@ -1581,53 +1437,9 @@ describe('collectResourceRefsFromEntities', () => {
   });
 });
 
-// ── v7 → v8 migration (Persistent.guid → EntityAttributes.guid) ──────────
+// ── Persistent at v8 (a marker tag; the guid lives on EntityAttributes) ──────────
 
-describe('v7 → v8 migration (consolidate Persistent.guid into EntityAttributes)', () => {
-  it('moves Persistent.guid onto EntityAttributes.guid', async () => {
-    const { loadSceneFile } = await getLoader();
-    const data = {
-      version: 7,
-      resources: [],
-      entities: [{
-        id: 1,
-        traits: {
-          EntityAttributes: { name: 'Player', parentId: 0 },
-          Persistent: { guid: 'guid-player-1' },
-        },
-      }],
-    };
-    await loadSceneFile(data as any, {
-      fetchPrefab: async () => null,
-      loadModels: false,
-    });
-    expect(data.version).toBe(SCENE_FORMAT_VERSION);
-    expect((data.entities[0].traits.EntityAttributes as any).guid).toBe('guid-player-1');
-    // Persistent should be reduced to its marker form
-    expect(data.entities[0].traits.Persistent).toBe(true);
-  });
-
-  it('does not overwrite an existing EntityAttributes.guid', async () => {
-    const { loadSceneFile } = await getLoader();
-    const data = {
-      version: 7,
-      resources: [],
-      entities: [{
-        id: 1,
-        traits: {
-          EntityAttributes: { name: 'Player', parentId: 0, guid: 'already-set' },
-          Persistent: { guid: 'guid-old' },
-        },
-      }],
-    };
-    await loadSceneFile(data as any, {
-      fetchPrefab: async () => null,
-      loadModels: false,
-    });
-    expect((data.entities[0].traits.EntityAttributes as any).guid).toBe('already-set');
-    expect(data.entities[0].traits.Persistent).toBe(true);
-  });
-
+describe('Persistent at v8, the oldest readable format', () => {
   it('preserves v8 Persistent/guid data (version advances to current)', async () => {
     const { loadSceneFile } = await getLoader();
     const data = {
@@ -1649,29 +1461,6 @@ describe('v7 → v8 migration (consolidate Persistent.guid into EntityAttributes
     expect(data.version).toBe(SCENE_FORMAT_VERSION);
     expect(data.entities[0].traits.Persistent).toBe(true);
     expect((data.entities[0].traits.EntityAttributes as any).guid).toBe('g1');
-  });
-
-  it('handles a Persistent trait without a guid (legacy edge case)', async () => {
-    const { loadSceneFile } = await getLoader();
-    const data = {
-      version: 7,
-      resources: [],
-      entities: [{
-        id: 1,
-        traits: {
-          EntityAttributes: { name: 'X', parentId: 0 },
-          Persistent: {},
-        },
-      }],
-    };
-    await loadSceneFile(data as any, {
-      fetchPrefab: async () => null,
-      loadModels: false,
-    });
-    expect(data.version).toBe(SCENE_FORMAT_VERSION);
-    expect(data.entities[0].traits.Persistent).toBe(true);
-    // No guid was available to move
-    expect((data.entities[0].traits.EntityAttributes as any).guid).toBeFalsy();
   });
 });
 
@@ -1731,10 +1520,10 @@ describe('migration terminal version', () => {
   // the constant is the single source of truth. If someone bumps the constant (or
   // adds a migration) without keeping the terminal stamp in lockstep, this fails
   // instead of silently mislabeling freshly-migrated files as under-versioned.
-  it('migrates an old (v3) scene up to exactly SCENE_FORMAT_VERSION', async () => {
+  it('migrates the oldest readable scene up to exactly SCENE_FORMAT_VERSION', async () => {
     const { loadSceneFile } = await getLoader();
     const data = {
-      version: 3,
+      version: MIN_READABLE_SCENE_FORMAT_VERSION,
       entities: [{
         id: 1,
         traits: { EntityAttributes: { name: 'X', parentId: 0 } },
@@ -1772,7 +1561,7 @@ describe('migrateV9toV10 (base-scene plan, Phase 1)', () => {
   it('round-trips an optional baseScene ref through the migration chain', async () => {
     const { loadSceneFile } = await getLoader();
     const data = {
-      version: 3,
+      version: MIN_READABLE_SCENE_FORMAT_VERSION,
       baseScene: 'base-scene-guid-123',
       entities: [{ id: 1, traits: { EntityAttributes: { name: 'X', parentId: 0 } } }],
     };

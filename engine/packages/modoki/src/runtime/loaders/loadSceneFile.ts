@@ -19,7 +19,7 @@ import {
   descendStructureLayers, foldStructureLayers, type StructureLayer,
   type NestedOverridePaths,
 } from './prefabOverrides';
-import { SCENE_FORMAT_VERSION } from '../core/version';
+import { MIN_READABLE_SCENE_FORMAT_VERSION, SCENE_FORMAT_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
 import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
@@ -347,7 +347,7 @@ export interface LoadSceneOptions {
   scenePath?: string;
 }
 
-/** Thrown by `loadSceneFile` when a scene's format version is `too-new` or `unreadable`
+/** Thrown by `loadSceneFile` when a scene's format version is `too-new`, `too-old` or `unreadable`
  *  (docs/format-versioning.md § 2b-bis — Scene is REFUSE). A named class rather than a bare
  *  `Error` so a caller several frames up (the editor's `loadScene` wrapper, item 2/3 of #784
  *  phase C3) can tell "this load was refused because of its format version" apart from every
@@ -357,115 +357,50 @@ export interface LoadSceneOptions {
  *  for "a specific, nameable reason a throw needs to survive to a caller that must react
  *  differently to it than to a generic failure". */
 export class SceneFormatRefusedError extends Error {
-  readonly reason: 'too-new' | 'unreadable';
-  constructor(message: string, reason: 'too-new' | 'unreadable') {
+  readonly reason: 'too-new' | 'too-old' | 'unreadable';
+  constructor(message: string, reason: 'too-new' | 'too-old' | 'unreadable') {
     super(message);
     this.name = 'SceneFormatRefusedError';
     this.reason = reason;
   }
 }
 
-const TEXT_FIELDS = ['fontSize', 'fontWeight', 'textColor', 'textAlign'] as const;
-
-/** Migrate v3→v4: move text fields from UIStyle to UIText, strip Transform from UI entities. */
-function migrateSceneData(data: SceneData): void {
-  if (data.version >= 4) return;
-  for (const entry of data.entities) {
-    // Move text fields from UIStyle → UIText
-    const style = entry.traits.UIStyle;
-    if (style && typeof style !== 'boolean') {
-      const styleObj = style as Record<string, unknown>;
-      const textFields: Record<string, unknown> = {};
-      let hasText = false;
-      for (const f of TEXT_FIELDS) {
-        if (f in styleObj) {
-          textFields[f] = styleObj[f];
-          delete styleObj[f];
-          hasText = true;
-        }
-      }
-      if (hasText && !entry.traits.UIText) {
-        entry.traits.UIText = textFields;
-      }
-    }
-    // Strip Transform from UI entities (not needed for DOM-based UI)
-    if (entry.traits.RenderableUI && entry.traits.Transform) {
-      delete entry.traits.Transform;
-    }
+/** Refuse a scene this build cannot read, whatever the caller. The one gate: both `SceneManager`
+ *  (before it acquires a scene's resources) and `loadSceneFile` (for every other caller) call it,
+ *  so the two cannot disagree on a verdict.
+ *
+ *  `too-old` covers a version below `MIN_READABLE_SCENE_FORMAT_VERSION` AND a scene with no
+ *  `version` at all. Both used to run a v3→v8 ladder; that ladder is gone (#1769), so loading
+ *  either as-is would spawn its pre-v8 shapes as defaults and drop them on the next save. That is
+ *  the silent data loss this refusal exists to prevent. */
+export function assertSceneFormatReadable(data: unknown): void {
+  const verdict = classifyFormatVersion(data, SCENE_FORMAT_VERSION, { minReadable: MIN_READABLE_SCENE_FORMAT_VERSION });
+  if (verdict.kind === 'too-new') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
+      `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
+      'too-new',
+    );
   }
-  data.version = 4;
-}
-
-/** Migrate v4→v5: merge UIStyle, UIText, UIContent into UIElement. Strip elementType. */
-function migrateV4toV5(data: SceneData): void {
-  if (data.version >= 5) return;
-  for (const entry of data.entities) {
-    const uiEl = entry.traits.UIElement;
-    if (!uiEl || typeof uiEl === 'boolean') continue;
-    const el = uiEl as Record<string, unknown>;
-    for (const traitName of ['UIStyle', 'UIText', 'UIContent'] as const) {
-      const src = entry.traits[traitName];
-      if (src && typeof src !== 'boolean') {
-        Object.assign(el, src);
-        delete entry.traits[traitName];
-      }
-    }
-    // elementType removed — rendering is content-driven
-    delete el.elementType;
+  if (verdict.kind === 'too-old' || verdict.kind === 'absent') {
+    const found = verdict.kind === 'too-old' ? `format version ${verdict.version}` : 'no format version';
+    // A versionless file is more likely hand-written than old: every editor since v3 stamps one.
+    const why = verdict.kind === 'too-old'
+      ? 'No released editor wrote an older scene.'
+      : 'Every editor since format v3 writes one, so this file was probably written by hand.';
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: it has ${found}, and this engine reads scenes from format version ` +
+      `${MIN_READABLE_SCENE_FORMAT_VERSION} up. ${why}`,
+      'too-old',
+    );
   }
-  data.version = 5;
-}
-
-/** Migrate v5→v6: derive `resources` array by walking entities. v6 scenes already
- *  have it; for older scenes we synthesize one in memory so SceneManager has a
- *  manifest to acquire from. The editor will write a real `resources` field on
- *  the next save. */
-function migrateV5toV6(data: SceneData): void {
-  if (data.version >= 6) {
-    if (!data.resources) data.resources = [];
-    return;
+  if (verdict.kind === 'unreadable') {
+    throw new SceneFormatRefusedError(
+      `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
+      `The file may be corrupt or hand-edited incorrectly.`,
+      'unreadable',
+    );
   }
-  if (!data.resources) {
-    data.resources = collectResourceRefsFromEntities(data.entities);
-  }
-  data.version = 6;
-}
-
-function migrateV6toV7(data: SceneData): void {
-  if (data.version >= 7) return;
-  for (const entry of data.entities) {
-    const r2d = entry.traits['Renderable2D'];
-    if (r2d && typeof r2d !== 'boolean') {
-      const obj = r2d as Record<string, unknown>;
-      if ('size' in obj) {
-        const size = obj.size as number;
-        obj.width = size;
-        obj.height = size;
-        delete obj.size;
-      }
-    }
-  }
-  data.version = 7;
-}
-
-/** Migrate v7→v8: Persistent.guid → EntityAttributes.guid. Persistent becomes a
- *  marker tag. Identity is consolidated on EntityAttributes for the universal
- *  cross-scene/cross-prefab UUID. */
-function migrateV7toV8(data: SceneData): void {
-  if (data.version >= 8) return;
-  for (const entry of data.entities) {
-    const p = entry.traits['Persistent'];
-    if (p && typeof p === 'object') {
-      const oldGuid = (p as Record<string, unknown>).guid as string | undefined;
-      if (oldGuid) {
-        const ea = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
-        if (ea && !ea.guid) ea.guid = oldGuid;
-      }
-      // Replace with marker tag (true) — Persistent no longer carries fields
-      entry.traits['Persistent'] = true;
-    }
-  }
-  data.version = 8;
 }
 
 /** Version-agnostic cleanup: `CameraFrame.showGizmo` used to be a serialized trait field but is
@@ -2810,46 +2745,22 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // after `parseAssetJson`, before `collectSceneResourceRefs`) — not because it was
   // moved, but because `SceneManager` mutates the same object (assigning
   // `sceneData.resources`) and spawns entities from it before ever calling this
-  // function, so a too-new/unreadable scene must be refused before that happens,
+  // function, so a refused scene must be refused before that happens,
   // not merely before this function's own migration ladder runs — `SceneManager` is
   // the only non-test caller of `loadSceneFile` (#784 phase C adversarial review,
   // finding 1). The guard stays HERE too because `loadSceneFile` is the single
   // entry every OTHER path funnels through — `preloaded` snapshots, direct
-  // test/tool calls — and both sites route through the same `classifyFormatVersion`
-  // and the same `SceneFormatRefusedError`, so they cannot disagree on the verdict.
+  // test/tool calls — and both sites call the same `assertSceneFormatReadable`, so they
+  // cannot disagree on the verdict.
   // (#807 removed a `sceneData.version = Math.max(sceneData.version ?? 6, 6)` tail
   // that used to sit at the end of `collectSceneResourceRefs` and ran before this
   // guard on a `SceneManager`-driven load — it doesn't factor into either site's
   // reasoning any more.)
-  const verdict = classifyFormatVersion(data, SCENE_FORMAT_VERSION);
-  if (verdict.kind === 'too-new') {
-    throw new SceneFormatRefusedError(
-      `Scene not loaded: its format version (${verdict.version}) is newer than this ` +
-      `engine supports (${SCENE_FORMAT_VERSION}). Update the engine to open this scene.`,
-      'too-new',
-    );
-  }
-  if (verdict.kind === 'unreadable') {
-    throw new SceneFormatRefusedError(
-      `Scene not loaded: its format version is unreadable (${verdict.reason}). ` +
-      `The file may be corrupt or hand-edited incorrectly.`,
-      'unreadable',
-    );
-  }
-  // `absent` (no version field at all) is NOT refused — a genuinely pre-v3 scene has
-  // no `version` key and SHOULD run the whole migration ladder below. This looks like
-  // an oversight next to the too-new/unreadable throws above, but it is deliberate:
-  // `absent` is § 2a's "legacy or freshly created — readable" verdict, and refusing it
-  // would break every scene the ladder exists to migrate.
+  assertSceneFormatReadable(data);
   // Opt-out for a chain/carry load, where SceneManager owns the once-per-world clear
   // and a per-call clear would wipe the marks an earlier scene in the chain seeded
   // (A9 defect 1) — see the `clearMarks` docblock on LoadSceneOptions.
   if (options.clearMarks !== false) clearAllOverrideMarks();
-  migrateSceneData(data);
-  migrateV4toV5(data);
-  migrateV5toV6(data);
-  migrateV6toV7(data);
-  migrateV7toV8(data);
   migrateV8toV9(data);
   migrateV9toV10(data);
   migrateV10toV11(data);

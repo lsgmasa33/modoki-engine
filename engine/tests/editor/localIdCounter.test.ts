@@ -138,7 +138,7 @@ const p3Doc = () => ({ id: P, version: 5, name: 'P', rootLocalId: 1, entities: [
   row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-000000177411'), row(2, 'A', 1, 'eeeeeeee-0000-4000-8000-000000177412'),
   row(3, 'B', 1, 'eeeeeeee-0000-4000-8000-000000177413'),
 ] });
-const sceneOfP = (): SceneData => ({ id: 's1774', version: 1, name: 'S', resources: [], entities: [
+const sceneOfP = (): SceneData => ({ id: 's1774', version: 8, name: 'S', resources: [], entities: [
   { id: 1, prefab: P, guid: INST, traits: { EntityAttributes: { name: 'I', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
 ] } as unknown as SceneData);
 const guidOf = (name: string) => getAllEntities().find((e) => e.id === one(name))!.guid!;
