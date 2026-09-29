@@ -2266,9 +2266,10 @@ function registerRead(source: string, prefab: PrefabFile): void {
   if (prefab.id && url) registerAsset(prefab.id, url, 'prefab');
 }
 
-/** Read a prefab file from disk, uncached — `getPrefabSource`'s fetch half, shared with
- *  `refreshPrefabSourceForPath`. It registers nothing: its callers do, for a read they keep (`registerRead`). */
-async function fetchPrefabSource(source: string, init?: RequestInit): Promise<PrefabFile | null> {
+/** Read a prefab file from disk, uncached — the editor's ONE prefab read (#1671 row 6): `getPrefabSource`'s fetch half,
+ *  `refreshPrefabSourceForPath`'s, and the prefab-edit open's. It registers nothing: its callers do, for a read they
+ *  keep (`registerRead`). Null for anything that is not a readable prefab document. */
+export async function fetchPrefabSource(source: string, init: RequestInit = ASSET_FETCH_INIT): Promise<PrefabFile | null> {
   // Normally a GUID (resolve via manifest). A freshly-instantiated instance can
   // still carry a path before its owning scene is saved + normalized; resolveRef
   // rejects internal asset paths loudly, so fetch a path ref directly instead.
@@ -5055,7 +5056,7 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
   return unresolved;
 }
 
-/** Seed (or evict) both prefab caches with a document READ from disk — `openPrefabForEditing`'s raw fetch.
+/** Seed (or evict) both prefab caches with a document READ from disk — `openPrefabForEditing`'s read (`fetchPrefabSource`).
  *  ⚠️ NOT for a write: a prefab write is `commitPrefabWrite` (prefabCommit.ts, #1692), which seats both caches under
  *  every key only once the write has landed, and then rebuilds the live frames. Every writer used to call this after
  *  its own write, and each one that stopped there left other instances expanded from the old document (#1685). */
@@ -7124,46 +7125,6 @@ function localToEcsGuid(guid: string): number {
   if (!guid) return 0;
   const ent = findEntityByGuid(guid);
   return ent ? ent.id() : 0;
-}
-
-/** Build a key set of every live override on the instance, then call
- *  applyToPrefabSelective. Kept for the "apply everything" path used by
- *  programmatic callers (and as the legacy menu's behavior). */
-export async function applyToPrefab(selectedEntityId: number): Promise<void> {
-  const ctx = resolveInstanceContext(selectedEntityId);
-  if (!ctx) {
-    console.warn('[Prefab] Selected entity is not a prefab instance');
-    return;
-  }
-  const { rootInstanceId, source } = ctx;
-  const prefab = await getPrefabSource(source);
-  if (!prefab) {
-    console.warn(`[Prefab] Cannot apply: source prefab not in cache: ${source}`);
-    return;
-  }
-  // `captureInstanceStructure` below reads nested children from the cache SYNCHRONOUSLY
-  // (`captureInstanceOverrides` does not — it only diffs trait bags against the world), and this
-  // path builds the key set that applyToPrefabSelective then acts on. So a cold miss here does
-  // not just hide a row, it silently drops the subtree from an "apply EVERYTHING" action (#1284).
-  await preloadNestedPrefabsForSubtree(rootInstanceId);
-  const all = captureInstanceOverrides(rootInstanceId, prefab);
-  const keys = new Set<string>();
-  for (const [localId, traits] of Object.entries(all)) {
-    for (const [trait, fields] of Object.entries(traits)) {
-      if (getTraitByName(trait)?.category === 'tag') { keys.add(`+trait.${localId}.${trait}`); continue; } // #1491
-      for (const field of Object.keys(fields)) keys.add(`${localId}.${trait}.${field}`);
-    }
-  }
-  // Structural diffs too — added subtrees, removed members, removed components.
-  const structure = captureInstanceStructure(rootInstanceId, prefab);
-  for (const node of structure.added) keys.add(`+added.${node.guid}`);
-  for (const localId of structure.removed) keys.add(`-removed.${localId}`);
-  for (const [localId, names] of Object.entries(structure.removedTraits)) {
-    for (const name of names) keys.add(`-trait.${localId}.${name}`);
-  }
-  for (const localId of Object.keys(structure.moved)) keys.add(`~moved.${localId}`); // #1437
-  for (const m of nestedFrameMoves(rootInstanceId)) keys.add(m.key);
-  await applyToPrefabSelective(rootInstanceId, keys);
 }
 
 /** A live per-copy customization on a NESTED instance, captured before an outer

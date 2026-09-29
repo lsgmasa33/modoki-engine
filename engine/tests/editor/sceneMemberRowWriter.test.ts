@@ -423,7 +423,8 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     await load(scene(O, e1 as never));
     expect(count('C')).toBe(1);
     expect(tf('C')?.x).toBe(3);
-    expect(strip(await entryOf())).toEqual(e1);
+    // Bytes, not toEqual: toEqual cannot see order (#1670). (Key order is pinned by the next case; this one has one row.)
+    expect(JSON.stringify(await entryOf())).toBe(JSON.stringify(e1));
   });
 
   it('two frames down, under a prefab row`s OWN nestedStructure (the loader`s structDirect)', async () => {
@@ -444,7 +445,10 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     await load(scene(O, e1 as never));
     expect(count('A')).toBe(0);
     expect(count('B')).toBe(1);
-    expect(strip(await entryOf())).toEqual(e1);
+    // Bytes, not toEqual: toEqual cannot see order. The rows are written in KEY order whatever order the capture found
+    // them in (`moveChannelsOntoRows`' sort), so the file does not churn between saves (#1670).
+    expect(Object.keys(e1.members!)).toEqual(Object.keys(e1.members!).sort());
+    expect(JSON.stringify(await entryOf())).toBe(JSON.stringify(e1));
   });
 
   it('a node the prefab row ADDED and the scene deleted stays deleted', async () => {

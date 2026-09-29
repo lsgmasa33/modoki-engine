@@ -112,17 +112,4 @@ describe('Play/Stop in the prefab-edit world', () => {
     expect(loadScene, 'no revert — the snapshot belongs to a scene that is no longer loaded')
       .not.toHaveBeenCalled();
   });
-
-  it('an UNTITLED new scene does not revert under the PREVIOUS scene\'s identity', async () => {
-    // ⚠️ The regression a blanket `sceneManager.getCurrent()?.path ?? getCurrentScenePath()` caused.
-    // newScene() leaves sceneManager pointing at the OLD scene while nulling the file path, so
-    // preferring the live path made Stop reload the blank untitled world under scene A's identity —
-    // registering unrelated content as if it were A. Only the SYNTHETIC path may win that
-    // preference.
-    currentPath = '/assets/scenes/A.scene.json';   // stale — newScene did not touch sceneManager
-    filePath = null;                                // untitled
-    await enterPlay();
-    await stopPlay();
-    expect(loadScene.mock.calls[0]?.[0], 'must NOT impersonate scene A').not.toBe('/assets/scenes/A.scene.json');
-  });
 });

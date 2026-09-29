@@ -22,11 +22,12 @@
  *  It moved out so a SECOND caller (the `modoki_prefab {prefabAction:'overrides'}`
  *  agent op, which has no dialog to build a tree in) can enumerate the exact same
  *  keys the dialog checkboxes carry, rather than reimplementing the walk and
- *  drifting from it the next time one of the two changes. One builder, one set of
- *  key shapes, two consumers. */
+ *  drifting from it the next time one of the two changes. One builder
+ *  (`collectInstanceOverrideListing`), one set of key shapes, two consumers. */
 
 import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
-import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { readTraitData, getAllEntities } from '../../runtime/core/ecs/entityUtils';
+import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import {
@@ -195,49 +196,41 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
   return { entities: entries, addedTags };
 }
 
-// ── Flat key enumeration (fields + structural), for a caller that only needs the
-//    key SET — the agent `prefab overrides` op, and `applyToPrefabSelective`'s "act
-//    on everything" default. ──
+// ── The listing: every override on an instance, as display nodes carrying their keys. ONE builder (#1671) — the
+//    dialog renders it, the agent op flattens it to keys (`collectInstanceOverrideKeys`); the dialog used to re-walk the
+//    structure itself and drifted (#1661: it listed and pre-checked fields Apply cannot write). ──
 
-export interface InstanceOverrideKeys {
-  /** `"<member>.traitName.fieldName"` keys (`<member>`: see the module header). */
-  fields: string[];
-  /** `"+added.<guid>"` keys. */
-  added: string[];
-  /** `"-removed.<member>"` keys. */
-  removedEntities: string[];
-  /** `"-trait.<member>.<name>"` keys. */
-  removedTraits: string[];
-  /** `"+trait.<member>.<tag>"` keys — a tag added to a member (#1491). */
-  addedTags: string[];
-  /** `"~moved.<member>"` keys — a member moved to another parent inside the instance (#1437) — and
-   *  `"~moved.<nested row chain>:<member>"` for a NESTED instance's member moved out of it. Revert puts it
-   *  back; Apply writes it into this prefab (a move it cannot express comes back in `ApplyResult.skipped`,
-   *  with the reason). */
-  moved: string[];
-  /** All of the above, concatenated — what `applyToPrefabSelective`/
-   *  `revertOverridesSelective` accept as `selectedKeys`. */
-  all: string[];
+/** `"-removed.<member>"` — a deleted prefab member. */
+export interface RemovedEntityNode { localId: number; name: string; key: string }
+/** `"-trait.<member>.<name>"` — a component removed from a surviving member. */
+export interface RemovedTraitNode { localId: number; entityName: string; trait: string; key: string }
+/** `"~moved.<member>"` (#1437), or a nested instance's member moved out of it (`~moved.<chain>:<member>`). */
+export interface MovedNode { localId: number; name: string; parentName: string; key: string }
+/** `"+added.<guid>"` — an added child subtree. */
+export interface AddedNode { node: AddedEntity; key: string }
+
+export interface InstanceOverrideListing {
+  entities: EntityOverrideNode[];
+  addedTags: AddedTagNode[];
+  added: AddedNode[];
+  removedEntities: RemovedEntityNode[];
+  removedTraits: RemovedTraitNode[];
+  moved: MovedNode[];
   /** U14 (#1693): each NESTED instance's own edits — its fields, added tags and removed components — keyed from this
    *  instance: `<nested row chain>:<the nested instance's key>` (`nestedKeyRef`). Apply writes them into THIS
    *  instance's prefab by default, as overrides on the row it holds for that instance; Revert does not take them (it
-   *  reverts on the nested instance itself), so they are not in `all`. */
+   *  reverts on the nested instance itself). */
   nested: string[];
-  /** The subset of `fields` that REVERT can act on but APPLY cannot, because the field is
-   *  deliberately kept out of a written template (`isTemplateExcludedField` — a runtime
-   *  read-back, or the scene-only `EntityAttributes.editorFolder`).
-   *
-   *  These are real overrides and belong in `all`: reverting one is meaningful (reset this
-   *  instance's folder back to the base). But `applyToPrefabSelective` `continue`s past them
-   *  WITHOUT counting them, so an apply that "succeeds" may quietly not have written one.
-   *  Surfacing the set is what lets the apply path report honestly instead of echoing the
-   *  caller's request back as `appliedKeys`. */
+  /** The field keys REVERT can act on but APPLY cannot, because the field is deliberately kept out of a written
+   *  template (`isTemplateExcludedField` — a runtime read-back, or the scene-only `EntityAttributes.editorFolder`).
+   *  Real overrides: reverting one is meaningful (reset this instance's folder back to the base). But Apply `continue`s
+   *  past them without counting them, so a surface offering Apply must not offer these (`listingFor`, #1661). */
   applyExcluded: string[];
   /** Count of added subtrees that could NOT be given an addressable key because the live
    *  entity has no guid yet (`EntityAttributes.guid` is minted lazily — an entity created in
    *  this session and never saved has `''`).
    *
-   *  They are OMITTED from `added`/`all` rather than keyed as `+added.`, because that string
+   *  They are OMITTED from `added` rather than keyed as `+added.`, because that string
    *  is ambiguous in a way that mis-targets: `applyToPrefabSelective` builds `addedByGuid`
    *  from the same value, so a second unguided addition OVERWRITES the first (only one gets
    *  inserted), and on the revert side `subtractRevertedStructure`'s `has(n.guid)` test
@@ -246,19 +239,13 @@ export interface InstanceOverrideKeys {
   unaddressableAdded: number;
 }
 
-export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideKeys {
-  const tree = collectInstanceOverrideTree(rootInstanceId, prefab);
-  const entities = tree.entities;
-  const addedTags = tree.addedTags.map((t) => t.key);
-  const fields: string[] = [];
+export function collectInstanceOverrideListing(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideListing {
+  const { entities, addedTags } = collectInstanceOverrideTree(rootInstanceId, prefab);
   const applyExcluded: string[] = [];
   for (const e of entities) {
     for (const t of e.traits) {
       const meta = getTraitByName(t.trait);
-      for (const f of t.fields) {
-        fields.push(f.key);
-        if (meta && isTemplateExcludedField(meta, f.field)) applyExcluded.push(f.key);
-      }
+      for (const f of t.fields) if (meta && isTemplateExcludedField(meta, f.field)) applyExcluded.push(f.key);
     }
   }
 
@@ -266,21 +253,27 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   // key for it here is one Apply writes into `prefab` — a row's removed trait stripped from every instance of it.
   const structure = ownInstanceStructure(rootInstanceId, prefab);
   // Drop unguided additions rather than emit an ambiguous `+added.` — see the field's doc above.
-  const addressableAdded = structure.added.filter((node) => !!node.guid);
-  const unaddressableAdded = structure.added.length - addressableAdded.length;
-  const added = addressableAdded.map((node) => addedKey(node.guid));
+  const added = structure.added.filter((node) => !!node.guid).map((node) => ({ node, key: addedKey(node.guid) }));
+  const unaddressableAdded = structure.added.length - added.length;
   const refOf = documentMemberRefs(prefab);
-  const removedEntities = structure.removed.map((localId) => removedEntityKey(refOf(localId)));
-  const removedTraits: string[] = [];
+  const prefabName = (localId: number) => prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
+  const removedEntities = structure.removed.map((localId) => ({ localId, name: prefabName(localId), key: removedEntityKey(refOf(localId)) }));
+  const removedTraits: RemovedTraitNode[] = [];
   for (const [localIdStr, names] of Object.entries(structure.removedTraits)) {
     const localId = Number(localIdStr);
-    for (const trait of names) removedTraits.push(removedTraitKey(refOf(localId), trait));
+    for (const trait of names) removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(refOf(localId), trait) });
   }
+  const live = getAllEntities();
+  const nameOfGuid = new Map(live.filter((e) => e.guid).map((e) => [e.guid!, e.name]));
+  const moved: MovedNode[] = Object.entries(structure.moved).map(([localIdStr, parentGuid]) => {
+    const localId = Number(localIdStr);
+    return { localId, name: prefabName(localId), parentName: nameOfGuid.get(parentGuid) || '(unknown)', key: movedKey(refOf(localId)) };
+  });
   // …and a nested instance's member moved OUT of it, which only this outer instance's prefab can record.
-  const moved = [
-    ...Object.keys(structure.moved).map((localId) => movedKey(refOf(Number(localId)))),
-    ...nestedFrameMoves(rootInstanceId).map((m) => m.ref),
-  ];
+  const nameOfId = new Map(live.map((e) => [e.id, e.name]));
+  for (const m of nestedFrameMoves(rootInstanceId)) {
+    moved.push({ localId: m.lid, name: nameOfId.get(m.memberEcs) || `localId ${m.lid}`, parentName: nameOfGuid.get(m.parentGuid) || '(unknown)', key: m.ref });
+  }
 
   // U14: what each nested instance changed of its own, measured against its own base (the rows enclosing it included).
   const nested: string[] = [];
@@ -304,11 +297,72 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
     for (const k of own) nested.push(nestedKeyRef(prefab, chain, k, getCachedPrefabSync));
   }
 
+  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, unaddressableAdded };
+}
+
+/** What a surface offering `mode` lists: Apply leaves out the fields it cannot write (#1661) — listed, they were
+ *  pre-checked and then skipped with no word — and Revert leaves out the nested instances' own edits, which it reverts
+ *  on the nested instance itself. */
+export function listingFor(listing: InstanceOverrideListing, mode: 'apply' | 'revert'): InstanceOverrideListing {
+  if (mode === 'revert') return { ...listing, nested: [] };
+  const excluded = new Set(listing.applyExcluded);
+  const entities = listing.entities
+    .map((e) => ({ ...e, traits: e.traits.map((t) => ({ ...t, fields: t.fields.filter((f) => !excluded.has(f.key)) })).filter((t) => t.fields.length > 0) }))
+    .filter((e) => e.traits.length > 0);
+  return { ...listing, entities, applyExcluded: [] };
+}
+
+/** Every key a listing carries, nested ones included. */
+export function listingKeys(l: InstanceOverrideListing): string[] {
+  return [
+    ...l.entities.flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => f.key))),
+    ...l.added.map((n) => n.key), ...l.removedEntities.map((n) => n.key), ...l.removedTraits.map((n) => n.key),
+    ...l.addedTags.map((n) => n.key), ...l.moved.map((n) => n.key), ...l.nested,
+  ];
+}
+
+// ── Flat key enumeration, for a caller that only needs the key SET — the agent `prefab overrides` / apply / revert op ──
+
+export interface InstanceOverrideKeys {
+  /** `"<member>.traitName.fieldName"` keys (`<member>`: see the module header). */
+  fields: string[];
+  /** `"+added.<guid>"` keys. */
+  added: string[];
+  /** `"-removed.<member>"` keys. */
+  removedEntities: string[];
+  /** `"-trait.<member>.<name>"` keys. */
+  removedTraits: string[];
+  /** `"+trait.<member>.<tag>"` keys — a tag added to a member (#1491). */
+  addedTags: string[];
+  /** `"~moved.<member>"` keys — a member moved to another parent inside the instance (#1437) — and
+   *  `"~moved.<nested row chain>:<member>"` for a NESTED instance's member moved out of it. Revert puts it
+   *  back; Apply writes it into this prefab (a move it cannot express comes back in `ApplyResult.skipped`,
+   *  with the reason). */
+  moved: string[];
+  /** All of the above, concatenated — what `applyToPrefabSelective`/
+   *  `revertOverridesSelective` accept as `selectedKeys`. */
+  all: string[];
+  /** {@link InstanceOverrideListing.nested} — not in `all`. */
+  nested: string[];
+  /** {@link InstanceOverrideListing.applyExcluded} — a subset of `fields`, and in `all`: surfacing the set is what lets
+   *  the agent's apply report honestly instead of echoing the caller's request back as `appliedKeys`. */
+  applyExcluded: string[];
+  /** {@link InstanceOverrideListing.unaddressableAdded}. */
+  unaddressableAdded: number;
+}
+
+export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideKeys {
+  const l = collectInstanceOverrideListing(rootInstanceId, prefab);
+  const fields = l.entities.flatMap((e) => e.traits.flatMap((t) => t.fields.map((f) => f.key)));
+  const added = l.added.map((n) => n.key);
+  const removedEntities = l.removedEntities.map((n) => n.key);
+  const removedTraits = l.removedTraits.map((n) => n.key);
+  const addedTags = l.addedTags.map((n) => n.key);
+  const moved = l.moved.map((n) => n.key);
   return {
     fields, added, removedEntities, removedTraits, addedTags, moved,
     all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
-    nested,
-    applyExcluded, unaddressableAdded,
+    nested: l.nested, applyExcluded: l.applyExcluded, unaddressableAdded: l.unaddressableAdded,
   };
 }
 

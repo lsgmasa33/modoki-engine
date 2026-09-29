@@ -233,7 +233,7 @@ describe('an outer prefab\'s edit in a nested frame does not pin what the inner 
 });
 
 describe('a scene over a prefab row\'s rows (#1533)', () => {
-  // Mutation: in `resolveEffectivePrefabStructure`, fold no row layer (`foldStructureLayers` → base) — the scene's
+  // Mutation: in `foldPath` (prefabOverrides.ts), fold each deeper row with no layer forwarded from above — the scene's
   // baseline misses OUTER's deletion, and an untouched scene restates it.
   it('an untouched scene instance states nothing of the row\'s rows', async () => {
     install(midDoc());

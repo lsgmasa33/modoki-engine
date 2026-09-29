@@ -32,12 +32,6 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   const real = await importOriginal<Record<string, unknown>>();
   return {
   ...real,
-  // `duringRepair` runs inside the undo's member-path repair — its rebuild's one await before the restore (#1750 T3).
-  requestMemberPathRepair: async (...args: unknown[]) => {
-    const out = await (real.requestMemberPathRepair as (...a: unknown[]) => Promise<unknown>)(...args);
-    const f = sm.duringRepair; sm.duringRepair = null; f?.();
-    return out;
-  },
   // `duringWrite` runs inside the write's await — where an undo's file install waits, and an Exit can land.
   postWriteFile: async () => {
     const f = sm.duringWrite; sm.duringWrite = null; f?.();
@@ -47,7 +41,7 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 });
 
 /** The live world's synthetic path, and the loader the stubbed swap runs. */
-const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void), duringRepair: null as null | (() => void) }));
+const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void) }));
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return {

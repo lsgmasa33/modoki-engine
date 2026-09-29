@@ -149,9 +149,10 @@ beforeEach(() => {
 });
 
 describe('openPrefabForEditing refuses a file that is not a prefab document (#1813 close-out sibling)', () => {
-  // The open reads the file RAW and seeds both caches from it, outside the cache boundary #1813 guards; an entity-less file
-  // threw "prefab.entities is not iterable" out of the open. Mutation: drop the `isPrefabDocument` check in
-  // `openPrefabForEditing` — the open rejects.
+  // The open seeds both caches from its read and builds the edit world from `entities`; an entity-less file threw
+  // "prefab.entities is not iterable" out of the open. It reads through `fetchPrefabSource` (#1671 row 6). Mutation: make
+  // its `isPrefabDocument` check hand the document back instead of null — the open rejects. (Deleting the check alone
+  // stays green: the zIndex migration then throws on the missing `entities`, and the read's catch returns null too.)
   it('logs and opens nothing', async () => {
     served = { id: RAW_PREFAB.id, version: 8, name: 'Badge' } as unknown as PrefabFile;
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -350,5 +351,37 @@ describe('savePrefabEditReport keeps the validation warnings its write reported 
     } finally {
       setRunMode('stopped');
     }
+  });
+});
+
+// `savePrefabEdit` must refuse while scrub/preview/play is live — the prefab twin of `saveScene`'s guard. It serializes
+// the prefab subtree out of the LIVE world, so during a preview envelope a save writes a posed rig, a control-spawned
+// prefab or physics-settled positions into the `.prefab.json`, and every scene instantiating it inherits them; Stop
+// restores the world, not the file. It was guarded in one caller only (the Cmd+S handler), so the agent's `edit-save`
+// never had it, and #259 removed the human's too. These cases lived in `prefabSaveRunModeGuard.test.ts`, which had no
+// prefab-edit world, so NO mode could write and "writes nothing" could not fail (#1670): here the stopped control
+// really writes. Mutation: drop the `whyWorldNotAuthored` refusal in `savePrefabEditReport` — every refusing case writes.
+describe('savePrefabEdit refuses to write authored data out of a previewing world', () => {
+  for (const mode of ['scrub', 'preview', 'playing'] as const) {
+    it(`refuses in run-mode '${mode}', and writes NOTHING`, async () => {
+      await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        setRunMode(mode);
+        await expect(savePrefabEdit()).resolves.toBe(false);
+        // The reason names the mode: a bare false reads like any other failed save, which needs the opposite advice.
+        expect(written).toBeNull();
+        expect(err.mock.calls.flat().join(' ')).toContain(mode);
+      } finally {
+        setRunMode('stopped');
+        err.mockRestore();
+      }
+    });
+  }
+
+  it('saves when stopped — the control that proves the same world CAN write', async () => {
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    await expect(savePrefabEdit()).resolves.toBe(true);
+    expect(written).not.toBeNull();
   });
 });

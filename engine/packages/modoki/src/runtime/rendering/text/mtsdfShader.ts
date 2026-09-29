@@ -169,11 +169,14 @@ export function makeMtsdfMaterial(
 
   // ── SHADOW: the glyph silhouette sampled at an OFFSET UV, behind everything. Crisp
   // via the median when softness 0, soft via the alpha SDF otherwise. Masked on opacity.
+  // The soft ramp's lower threshold is floored like the glow's: once softness > edge it
+  // goes negative and every far texel gets a constant shadow over the whole quad (#1775).
   const shadowMask = step(float(1e-5), u.shadowOpacity);
   const shUv = vUv.sub(u.shadowOffset);
   const shTex = texNode(tex, shUv);
   const shCrisp = clamp(median(shTex).sub(edge).mul(spr).add(0.5), 0.0, 1.0);
-  const shSoft = smoothstep(edge.sub(u.shadowSoftness), edge, hasTrueSdf ? shTex.a : median(shTex));
+  const shSoftLo = max(edge.sub(u.shadowSoftness), float(0.5 - GLOW_MAX_SPREAD));
+  const shSoft = smoothstep(shSoftLo, edge, hasTrueSdf ? shTex.a : median(shTex));
   const shCov = mix(shCrisp, shSoft, step(float(1e-5), u.shadowSoftness));
   const shadowA = u.shadowOpacity.mul(shCov).mul(shadowMask);
 

@@ -114,9 +114,15 @@ describe('applyOverridesByRootInstance', () => {
   });
 
   it('silently skips overrides for unknown localIds', () => {
+    // Skipped means NOWHERE: not.toThrow alone stayed green with localId 99's override written onto the root (#1670).
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
+    const childId = findChildEcsId(rootId);
     expect(() => applyOverridesByRootInstance(rootId, { 99: { Transform: { x: 1 } } }))
       .not.toThrow();
+    const tfMeta = getTraitByName('Transform')!;
+    const xs = new Map<number, number>();
+    getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => { xs.set(entity.id(), (tf as Record<string, number>).x); });
+    expect([xs.get(rootId), xs.get(childId)]).toEqual([0, 5]);
   });
 });

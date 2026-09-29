@@ -256,4 +256,31 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
     expect(keys.fields).toEqual(expect.arrayContaining(['1.EntityAttributes.editorFolder', '2.EngineFlame.idleScale']));
     expect(keys.applyExcluded).toEqual(['1.EntityAttributes.editorFolder']);
   });
+
+  it('the Apply listing leaves out a field Apply cannot write; the Revert listing still shows it (#1661)', async () => {
+    // The dialog lists `listingFor(listing, mode)` and pre-checks every key of it. It used to list and pre-check
+    // editorFolder for Apply, which then skipped it with no word. Revert CAN act on it (reset the folder back to the
+    // base), so dropping it there too would hide a real override from the only surface that can undo it.
+    const { root } = await setup();
+    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
+    const { collectInstanceOverrideListing, listingFor, listingKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
+    const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(root, TRAITS[2], 'editorFolder', 'Enemies'); markOverride(index.get(root), 'EntityAttributes', 'editorFolder');
+    const listing = collectInstanceOverrideListing(root, shipPrefab as any);
+    expect(listingKeys(listingFor(listing, 'apply')).sort()).toEqual(['2.EngineFlame.idleScale']);
+    expect(listingKeys(listingFor(listing, 'revert')).sort()).toEqual(['1.EntityAttributes.editorFolder', '2.EngineFlame.idleScale']);
+  });
+
+  it('Revert leaves out the nested instances\' own edits; Apply keeps them (U14, #1693)', async () => {
+    // Revert acts on a nested instance itself, so an outer Revert listing them would hand `revertOverridesSelective`
+    // keys it does not take. A synthetic listing: this file's fixture has no nested frame.
+    const { listingFor, listingKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
+    const listing = {
+      entities: [], addedTags: [], added: [], removedEntities: [], removedTraits: [], moved: [],
+      nested: ['3:2.Transform.x'], applyExcluded: [], unaddressableAdded: 0,
+    };
+    expect(listingKeys(listingFor(listing, 'apply'))).toEqual(['3:2.Transform.x']);
+    expect(listingKeys(listingFor(listing, 'revert'))).toEqual([]);
+  });
 });

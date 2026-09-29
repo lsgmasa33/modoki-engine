@@ -11,26 +11,24 @@ import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
   preloadNestedPrefabsForSubtree,
-  ownInstanceStructure,
   revertRefusal,
   missingSourceRefusal,
   previewApply,
-  type PrefabFile,
   type ApplyPreview,
 } from '../scene/prefab';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../undo/revertPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { findEntity, getAllEntities } from '../../runtime/core/ecs/entityUtils';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { livePinnedId } from '../../runtime/core/ecs/entityPin';
 import { subjectGoneNotice, runOnPinnedSubject } from './prefabDialogSubject';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
 import {
-  collectInstanceOverrideTree, collectInstanceOverrideKeys, addedKey, removedEntityKey, removedTraitKey, movedKey, applyOutcomeNotice, nestedFrameMoves, documentMemberRefs,
-  type EntityOverrideNode, type AddedTagNode,
+  collectInstanceOverrideListing, listingFor, listingKeys, applyOutcomeNotice,
+  type EntityOverrideNode, type InstanceOverrideListing,
 } from '../scene/prefabOverrideKeys';
 import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
@@ -43,21 +41,10 @@ import {
 // of this file (predating the extraction) doesn't need a wholesale rename.
 type EntityNode = EntityOverrideNode;
 
-/** Structural diff nodes, alongside the per-field EntityNode list. */
-interface RemovedEntityNode { localId: number; name: string; key: string }   // "-removed.<member>" (prefabOverrideKeys.ts)
-interface RemovedTraitNode { localId: number; entityName: string; trait: string; key: string } // "-trait.<member>.<name>"
-interface MovedNode { localId: number; name: string; parentName: string; key: string } // "~moved.<member>" (#1437)
-interface Structural {
-  added: AddedEntity[];                  // each subtree root keyed "+added.<guid>"
-  removedEntities: RemovedEntityNode[];
-  removedTraits: RemovedTraitNode[];
-  moved: MovedNode[];
-}
-
 type LoadState =
   | { kind: 'loading' }
   | { kind: 'error'; message: string }
-  | { kind: 'ready'; entities: EntityNode[]; addedTags: AddedTagNode[]; structural: Structural; nested: string[] };
+  | ({ kind: 'ready' } & InstanceOverrideListing);
 
 function stringifyValue(v: unknown): string {
   if (typeof v === 'number') {
@@ -66,39 +53,6 @@ function stringifyValue(v: unknown): string {
   if (typeof v === 'string') return JSON.stringify(v);
   if (v === undefined) return '∅';
   return JSON.stringify(v);
-}
-
-/** Build the structural diff (added subtrees, removed entities, removed traits)
- *  for the dialog from the live instance + prefab. */
-function buildStructural(rootInstanceId: number, prefab: PrefabFile): Structural {
-  // Only what THIS instance changed (#1506): a structural row the enclosing prefab authors is not its to apply.
-  const s = ownInstanceStructure(rootInstanceId, prefab);
-  const refOf = documentMemberRefs(prefab); // read from the document the capture diffs against (#1468 Phase 4)
-  const prefabName = (localId: number) =>
-    prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
-
-  const removedEntities: RemovedEntityNode[] = s.removed.map((localId) => ({
-    localId, name: prefabName(localId), key: removedEntityKey(refOf(localId)),
-  }));
-
-  const removedTraits: RemovedTraitNode[] = [];
-  for (const [localIdStr, names] of Object.entries(s.removedTraits)) {
-    const localId = Number(localIdStr);
-    for (const trait of names) {
-      removedTraits.push({ localId, entityName: prefabName(localId), trait, key: removedTraitKey(refOf(localId), trait) });
-    }
-  }
-  const nameOfGuid = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.name]));
-  const moved: MovedNode[] = Object.entries(s.moved).map(([localIdStr, parentGuid]) => {
-    const localId = Number(localIdStr);
-    return { localId, name: prefabName(localId), parentName: nameOfGuid.get(parentGuid) || '(unknown)', key: movedKey(refOf(localId)) };
-  });
-  // A nested instance's member moved out of it: recorded by THIS prefab (#1437).
-  const nameOfId = new Map(getAllEntities().map((e) => [e.id, e.name]));
-  for (const m of nestedFrameMoves(rootInstanceId)) {
-    moved.push({ localId: m.lid, name: nameOfId.get(m.memberEcs) || `localId ${m.lid}`, parentName: nameOfGuid.get(m.parentGuid) || '(unknown)', key: m.ref });
-  }
-  return { added: s.added, removedEntities, removedTraits, moved };
 }
 
 /** Count the leaf trait/field names inside an added subtree (for the row label). */
@@ -211,32 +165,24 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         if (!cancelled) setLoadState({ kind: 'error', message: missingSourceRefusal(rootInstanceId, source, mode) });
         return;
       }
-      // `buildStructural` -> `ownInstanceStructure` -> `captureInstanceStructure` -> `captureNestedRef` reads nested
+      // The listing's `ownInstanceStructure` -> `captureInstanceStructure` -> `captureNestedRef` reads nested
       // children from the editor cache SYNCHRONOUSLY. The fetch above warms only the OUTER
       // prefab, so on a cold cache a nested instance the author dragged in by hand is dropped
       // from `added[]` and is simply MISSING from this dialog — unpromotable, with only a
       // console.warn (#1284).
       await preloadNestedPrefabsForSubtree(rootInstanceId);
       if (cancelled) return;
-      const { entities, addedTags } = collectInstanceOverrideTree(rootInstanceId, prefab);
-      const structural = buildStructural(rootInstanceId, prefab);
+      // The ONE listing the agent op reads too (#1671), cut to what this mode can act on: Apply leaves out the fields it
+      // cannot write (#1661) and takes the nested instances' own edits (U14, #1693); Revert the reverse.
+      const listing = listingFor(collectInstanceOverrideListing(rootInstanceId, prefab), mode);
       if (cancelled) return;
-      const allKeys = new Set<string>();
-      for (const e of entities) for (const t of e.traits) for (const f of t.fields) allKeys.add(f.key);
-      for (const t of addedTags) allKeys.add(t.key);
-      for (const node of structural.added) allKeys.add(addedKey(node.guid));
-      for (const r of structural.removedEntities) allKeys.add(r.key);
-      for (const r of structural.removedTraits) allKeys.add(r.key);
-      for (const r of structural.moved) allKeys.add(r.key);
-      // U14 (#1693): the nested instances' own edits, which Apply on this OUTER instance writes into its prefab by default.
-      const nested = mode === 'apply' ? collectInstanceOverrideKeys(rootInstanceId, prefab).nested : [];
-      for (const k of nested) allKeys.add(k);
+      const allKeys = new Set(listingKeys(listing));
       setChecked(allKeys);
       const opts = mode === 'apply' ? applyTargetOptions(rootInstanceId, prefab, [...allKeys]) : new Map<string, KeyTargets>();
       setTargetOpts(opts);
       setChoice(initialTargets(opts));
       setCollapsed(new Set());
-      setLoadState({ kind: 'ready', entities, addedTags, structural, nested });
+      setLoadState({ kind: 'ready', ...listing });
     })();
     return () => { cancelled = true; };
   }, [active, subject]);
@@ -260,17 +206,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
 
   const totals = useMemo(() => {
     if (loadState.kind !== 'ready') return { total: 0, checked: 0 };
-    let total = 0;
-    let checkedCount = 0;
-    const tally = (key: string) => { total++; if (checked.has(key)) checkedCount++; };
-    for (const e of loadState.entities) for (const t of e.traits) for (const f of t.fields) tally(f.key);
-    for (const t of loadState.addedTags) tally(t.key);
-    for (const node of loadState.structural.added) tally(addedKey(node.guid));
-    for (const r of loadState.structural.removedEntities) tally(r.key);
-    for (const r of loadState.structural.removedTraits) tally(r.key);
-    for (const r of loadState.structural.moved) tally(r.key);
-    for (const k of loadState.nested) tally(k);
-    return { total, checked: checkedCount };
+    const keys = listingKeys(loadState);
+    return { total: keys.length, checked: keys.filter((k) => checked.has(k)).length };
   }, [loadState, checked]);
 
   if (!active) return null;
@@ -498,20 +435,18 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           {loadState.kind === 'error' && (
             <div style={{ color: '#e74c3c', fontSize: 12, padding: 8 }}>{loadState.message}</div>
           )}
-          {loadState.kind === 'ready' && loadState.entities.length === 0
-            && loadState.addedTags.length === 0
-            && loadState.structural.added.length === 0
-            && loadState.structural.removedEntities.length === 0
-            && loadState.structural.removedTraits.length === 0
-            && loadState.structural.moved.length === 0
-            && loadState.nested.length === 0 && (
+          {loadState.kind === 'ready' && listingKeys(loadState).length === 0 && loadState.unaddressableAdded === 0 && (
             <div style={{ color: '#888', fontSize: 12, padding: 8 }}>{emptyMsg}</div>
           )}
           {loadState.kind === 'ready'
             && buildOverrideForest(loadState.entities).map((fnode) => renderEntityNode(fnode))}
 
-          {loadState.kind === 'ready' && loadState.structural.added.map((node) => {
-            const key = addedKey(node.guid);
+          {loadState.kind === 'ready' && loadState.unaddressableAdded > 0 && (
+            <div style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px' }}>
+              {loadState.unaddressableAdded} added {loadState.unaddressableAdded === 1 ? 'entity is' : 'entities are'} not listed: {loadState.unaddressableAdded === 1 ? 'it has' : 'they have'} no id until the scene is saved.
+            </div>
+          )}
+          {loadState.kind === 'ready' && loadState.added.map(({ node, key }) => {
             return (
               <div key={key} style={{ marginBottom: 4 }}>
                 <div style={{ ...baseRow, paddingLeft: 4 }}>
@@ -537,7 +472,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             );
           })}
 
-          {loadState.kind === 'ready' && loadState.structural.removedEntities.map((r) => (
+          {loadState.kind === 'ready' && loadState.removedEntities.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
               <span style={{ width: 14 }} />
               <TriCheckbox
@@ -557,9 +492,9 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#ddd', fontWeight: 'bold' }}>{r.name}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}{isRevert ? '' : ' · affects all instances'}</span>
             </div>
-          )).flatMap((row, i) => [row, <div key={`${loadState.structural.removedEntities[i]!.key}:target`}>{targetCell(loadState.structural.removedEntities[i]!.key, 40)}</div>])}
+          )).flatMap((row, i) => [row, <div key={`${loadState.removedEntities[i]!.key}:target`}>{targetCell(loadState.removedEntities[i]!.key, 40)}</div>])}
 
-          {loadState.kind === 'ready' && loadState.structural.removedTraits.map((r) => (
+          {loadState.kind === 'ready' && loadState.removedTraits.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
               <span style={{ width: 14 }} />
               <TriCheckbox
@@ -578,7 +513,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <span style={{ color: '#ddd' }}>{r.entityName}</span>
               <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {r.localId}</span>
             </div>
-          )).flatMap((row, i) => [row, <div key={`${loadState.structural.removedTraits[i]!.key}:target`}>{targetCell(loadState.structural.removedTraits[i]!.key, 40)}</div>])}
+          )).flatMap((row, i) => [row, <div key={`${loadState.removedTraits[i]!.key}:target`}>{targetCell(loadState.removedTraits[i]!.key, 40)}</div>])}
 
           {loadState.kind === 'ready' && loadState.addedTags.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
@@ -601,7 +536,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             </div>
           )).flatMap((row, i) => [row, <div key={`${loadState.addedTags[i]!.key}:target`}>{targetCell(loadState.addedTags[i]!.key, 40)}</div>])}
 
-          {loadState.kind === 'ready' && loadState.structural.moved.map((r) => (
+          {loadState.kind === 'ready' && loadState.moved.map((r) => (
             <div key={r.key} style={{ ...baseRow, paddingLeft: 4, marginBottom: 2 }}>
               <span style={{ width: 14 }} />
               <TriCheckbox

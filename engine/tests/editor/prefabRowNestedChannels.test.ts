@@ -3,7 +3,7 @@
  *
  *  - promotion (Apply to Prefab of a user-added nested instance) copies the reference node's slot;
  *  - both loaders expand a row's `nestedStructure` under the outer layer's (outer wins, whole);
- *  - the scene capture's baseline descends through it (`resolveEffectivePrefabStructure`);
+ *  - the scene capture's baseline descends through it (`chainLayer` → `foldPath`, prefabBase.ts);
  *  - the prefab editor forwards both, and its save CAPTURES both from the live expansion;
  *  - that save (and Create Prefab) skips every owned nested instance, which used to get a second row
  *    at the prefab root (#1382).
@@ -185,8 +185,8 @@ describe('a prefab row\'s own nestedStructure expands in both loaders (#1381)', 
     expect(namePaths()).not.toContain('OuterRoot/Panel/Button/MidRoot/Slot/InnerRoot/Leaf');
   });
 
-  // Mutation: remove the path-keyed descend in `resolveEffectivePrefabStructure` (read the row's own
-  // lists at every step). The scene's un-delete then equals the stale baseline, is not written, and
+  // Mutation: remove the path-keyed descend in `foldPath` (prefabOverrides.ts — each step folds its row with no state
+  // forwarded from the level above, i.e. reads the row's own lists at every step). The scene's un-delete then equals the stale baseline, is not written, and
   // the member is deleted again on reload.
   it('a scene that UN-deletes the row-deleted member keeps it across save + reload', async () => {
     install(outerDoc({ nestedStructure: DELETE_LEAF }));
@@ -297,6 +297,13 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     install({ ...innerDoc, entities: [...innerDoc.entities, row(3, 'DeepRow', 1, { prefab: DEEP })] } as PrefabFile);
     const root = await openInEditor(outerDoc({}) as PrefabFile);
     setPrefabCache(INNER, null);
+    // …and no frame RECORD either: since #1693 the capture reads the record (`levelDoc`), which the cache eviction leaves,
+    // so without this the uncached branch was never reached and the mutation above stayed green (#1670).
+    const piMeta = getTraitByName('PrefabInstance')!;
+    for (const e of getCurrentWorld().query(piMeta.trait)) {
+      const pi = e.get(piMeta.trait) as { source?: string; rootInstanceId?: number };
+      if (pi.source === INNER && pi.rootInstanceId === e.id()) noteFrameRootDoc(getCurrentWorld(), e, { source: 'none', doc: {} });
+    }
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     serializePrefab(root, OUTER);
     expect(warn.mock.calls.filter(([m]) => /added inside it not captured/.test(String(m)))).toEqual([]);

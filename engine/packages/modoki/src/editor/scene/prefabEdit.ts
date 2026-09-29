@@ -14,7 +14,7 @@ import { localIdCounter } from '../../runtime/core/localIdCounter';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
-import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { serializePrefab, warnInertPrefabSizes, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource } from './prefab';
 import { commitPrefabWrite, prefabTextIsDocument } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
@@ -32,9 +32,6 @@ import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
-import { isPrefabDocument } from '../../runtime/loaders/prefabRoot';
-import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
@@ -442,26 +439,14 @@ async function openPrefabForEditingSwitching(
   // The read's token, taken before the fetch (#1752, `prefabRead.ts`): a write landing during it seats the newer document,
   // and seeding this one after it put the older bytes back in both caches — then built the edit world from them.
   const readAt = capturePrefabRead(asset.path);
-  let prefab: PrefabFile;
-  try {
-    const res = await fetch(asset.path);
-    prefab = await parseAssetJson(res, asset.path) as PrefabFile;
-  } catch (e) {
-    console.error('[PrefabEdit] fetch failed:', e);
+  // The editor's one prefab read (#1671 row 6): the shape check every prefab read asks where it enters a cache (#1813 —
+  // this one seeds both caches below and builds the edit world from `entities`) and the zIndex migration, which must
+  // run BEFORE that seed or the un-migrated object poisons every later read of this guid for the session.
+  const prefab = await fetchPrefabSource(asset.path);
+  if (!prefab) {
+    console.error(`[PrefabEdit] ${asset.path} is not a prefab document it could read — not opened`);
     return;
   }
-  // The shape check every other prefab read asks where it enters a cache (#1813, `isPrefabDocument`): this raw read seeds
-  // both caches below and builds the edit world from `entities`, and a file without that shape threw out of the open.
-  if (!isPrefabDocument(prefab)) {
-    console.error(`[PrefabEdit] ${asset.path} is not a prefab document (no entities array of rows) — not opened`);
-    return;
-  }
-  // This is a RAW fetch, not routed through getPrefabSource — that helper already runs this
-  // migration (structured walk, see uiAnchorZIndexMigration.ts) on every load, but this path
-  // bypasses it entirely, so it must run here too BEFORE setPrefabCache below, or the
-  // un-migrated object poisons every later getPrefabSource read of this same guid for the
-  // rest of the session.
-  for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
   const guid = prefab.id ?? getGuidForPath(asset.path) ?? asset.path;
   // Nothing is seeded by a request that no longer owns the switch (#1752): `setPrefabCache` rewrites the runtime cache
   // too, bumping the prefab's revision and re-spawning every pool built from it, for an open that will never happen.

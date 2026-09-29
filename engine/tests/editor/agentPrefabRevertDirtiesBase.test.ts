@@ -59,7 +59,7 @@ function instanceIn(scene: string): string {
 }
 
 describe('agent prefab revert on a base\'s instance (#1431)', () => {
-  // Mutation: delete `affectedScenes,` from the revert `pushAction` in agentEditorOps.ts.
+  // Mutation: delete `affectedScenes,` from the revert `pushAction` in `revertOverridesWithUndo` (revertPrefabUndo.ts).
   it('dirties the base on the revert, its undo and its redo', async () => {
     const guid = instanceIn(BASE);
     const res = await runAgentOp('prefab', { action: 'revert', entityGuid: guid }) as { ok: boolean };

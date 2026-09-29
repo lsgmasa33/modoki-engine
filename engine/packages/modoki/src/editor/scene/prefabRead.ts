@@ -2,7 +2,7 @@
  *  asks before it seeds (#1669, #1752).
  *
  *  A seed that follows a READ (a cold `getPrefabSource`, a drop that fetched the file and then awaited its nested
- *  children, the prefab edit-open's raw fetch) holds bytes from before its await. A write can land inside that await —
+ *  children, the prefab edit-open's read) holds bytes from before its await. A write can land inside that await —
  *  Create Prefab → Replace, an Apply, an agent `create`, a trash — and seat the newer document under every key
  *  (`commitPrefabWrite`). A seed that runs after it puts the older bytes back (I10), and every frame expanded from the
  *  newer document then reads as stale against the cache: the next rebase rebuilds them onto the old one (#1685's shape).

@@ -5,9 +5,8 @@
  *     prefab's reference row (child-localId space),
  *   - editing the INNER prefab refreshes every live inner copy in place, each
  *     keeping its OWN override, with no orphan/duplicate and correct re-parenting,
- *   - editing the OUTER prefab rebuilds the instance correctly but currently RESETS
- *     a live per-copy override on the nested child (the design plan's "risk R3" for
- *     the outer-refresh path — documented here so a future fix flips this assert). */
+ *   - editing the OUTER prefab rebuilds the instance correctly AND keeps a live
+ *     per-copy override on the nested child (the design plan's "risk R3", fixed). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';

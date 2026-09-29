@@ -8,8 +8,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import path from 'node:path';
+import { readScannedSource } from '../helpers/sourceScanner';
 import {
-  maxShadowOffsetEm, clampShadowOffset, OUTLINE_MAX_SPREAD,
+  maxShadowOffsetEm, clampShadowOffset, OUTLINE_MAX_SPREAD, GLOW_MAX_SPREAD,
 } from '../../src/runtime/rendering/text/mtsdfStyle';
 import { mtsdfShaderBitsForTest } from '../../src/runtime/rendering/text/mtsdfPixiShader';
 import { Text2D } from '../../src/runtime/traits/Text2D';
@@ -118,5 +120,39 @@ describe('outline band cannot flood the glyph quad', () => {
       expect(bit.fragment.main, lang).toMatch(/outlineLo\s*=\s*max\(/);
       expect(bit.fragment.main, `${lang} must divide 0.5 by spr`).toMatch(/0\.5\s*\)?\s*\/\s*spr|\/\s*spr/);
     }
+  });
+});
+
+describe('soft shadow ramp cannot flood the glyph quad (#1775)', () => {
+  /** A far-outside texel has field ~ 0, and the soft shadow is `smoothstep(lo, edge, field)` with `edge = 0.5 - weight`.
+   *  Unfloored, `lo = edge - softness` goes negative once softness > edge, and every far texel then carries a constant
+   *  shadow: a flat, stepped box over each glyph's quad (observed in the editor: alpha 0.157 on every far texel at weight
+   *  0.2, softness 0.4). The glow's ramp was floored at the field budget for the same reason; the shadow is now too. */
+  const smoothstep = (e0: number, e1: number, x: number) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+  const loFor = (weight: number, softness: number) => Math.max(0.5 - weight - softness, 0.5 - GLOW_MAX_SPREAD);
+
+  it('unfloored, a softness past the edge covers every far texel', () => {
+    expect(smoothstep(0.5 - 0.2 - 0.4, 0.5 - 0.2, 0)).toBeCloseTo(0.15625, 5); // the alpha the editor measured
+  });
+
+  it('floored, a far texel carries no shadow at any weight/softness the Inspector offers', () => {
+    for (const weight of [0, 0.1, 0.2, 0.25]) for (const softness of [0.01, 0.2, 0.4]) {
+      expect(smoothstep(loFor(weight, softness), 0.5 - weight, 0), `weight ${weight} softness ${softness}`).toBe(0);
+    }
+  });
+
+  it('both generated Pixi programs floor it', () => {
+    const { wgsl, glsl } = mtsdfShaderBitsForTest();
+    for (const [lang, bit] of [['wgsl', wgsl], ['glsl', glsl]] as const) {
+      expect(bit.fragment.main, lang).toMatch(/shSoftLo\s*=\s*max\(/);
+      expect(bit.fragment.main, lang).toMatch(/shSoft\s*=\s*smoothstep\(\s*shSoftLo\s*,/);
+    }
+  });
+
+  /** The 3D text is a separate TSL graph (`mtsdfShader.ts`) no test compiles, so its floor is pinned in the source. */
+  it('the 3D TSL graph floors it too', () => {
+    const src = readScannedSource(path.resolve(__dirname, '../../src/runtime/rendering/text/mtsdfShader.ts')).code;
+    expect(src).toMatch(/const shSoftLo = max\(edge\.sub\(u\.shadowSoftness\), float\(0\.5 - GLOW_MAX_SPREAD\)\);/);
+    expect(src).toMatch(/const shSoft = smoothstep\(shSoftLo, edge,/);
   });
 });

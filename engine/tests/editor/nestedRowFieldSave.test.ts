@@ -300,7 +300,7 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
   });
 
   it('NOT shadowed: the applied y is subtracted (#1469) — not listed, nothing in the file', async () => {
-    // Mutation: make `appliedFieldsToDrop` keep every applied field — y is pinned on the source and listed.
+    // Mutation: drop `refreshInstances`' `subtractFieldOverrides(captured, from.fields)` — y is pinned on the source and listed.
     await applyBoth();
     expect(tfOf(inInstance(ROOT1, 'A')).y).toBe(7);
     expect(keysOf(nestedRoot())).not.toContain(`${gA}.Transform.y`);
@@ -595,8 +595,8 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
     });
 
     it('a row UNDER the node reads the node\'s nested STRUCTURE as its base', async () => {
-      // Close-out review. Mutation: drop the `seed` of `resolveEffectivePrefabStructure` in `enclosingLayer` — the node's
-      // removal is listed as the inner instance's own.
+      // Close-out review. Mutation: drop `frameBase`'s node seed (`nodeForward(node, …)` → undefined, prefabBase.ts) — the
+      // node's removal is listed as the inner instance's own.
       const p = pWithAction();
       const node = (withRefNode().entities[3] as unknown as { added: Array<Record<string, unknown>> }).added[0]!;
       node.nestedStructure = { 3: { removedTraits: { 2: ['UIAction'] } } };
@@ -610,8 +610,8 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
     });
 
     it('a row UNDER the node reads the node\'s nested overrides as its base', async () => {
-      // Mutation: drop the `seed` in `enclosingLayer`'s row branch — the node's A.x = 4 is listed as the inner
-      // instance's own override.
+      // Mutation: drop `frameBase`'s node seed (`nodeForward(node, …)` → undefined, prefabBase.ts) — the node's A.x = 4 is
+      // listed as the inner instance's own override.
       install(pDoc(), p2Doc(), withRefNode());
       await load(scene(O, [ROOT1]));
       // P's A twice: in row N's expansion, and in P2's Inner row (parentLocalId 3) under the node.

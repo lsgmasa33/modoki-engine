@@ -53,7 +53,7 @@ answer the same question for themselves. Each place in that column is a place th
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
 | I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor, comparison side: `frameBase` / `chainLayer` (`editor/scene/prefabBase.ts`, #1693)** — one fold (`foldPath`) with the same folds, in the editor expansion's order: a row's fields under the outer layer's forwarded ones, then every layer's member rows over both. **The step itself is shared since #1707** (`foldRowStep` / `foldPath`, `runtime/loaders/prefabOverrides.ts`): the validator and the UIEntries pool (`effectivePrefab*Traits`) compose each nested row with it too. It climbs by `ownerOf` and through a template reference node (#1506), and reads every level's document from its frame record (I3). | The expansion side is still twinned: `instantiatePrefab`, the editor's copy of the spawner. #1707 re-checked #1683's claim and pinned the two walks against each other (`engine/tests/editor/expansionTwinParity.test.ts`). The editor's nested-row apply, which is where a frame's removals run, was handed neither of the frame's moves. A slot's `moved` was lost outright: a pre-v5 member moved inside a scene-added reference node went back to its row on every rebuild of the instance around it. A member row's `parent` was recovered by `spawnNestedInstance`'s top-level apply, except where the same frame removes the member's old ancestor. That removal cascade stops only at a member it is told has moved, so the moved member was deleted with it. Both are fixed, and the apply now gets the runtime's `moved` and `members`. Making the editor call the runtime walk is #1783, with that harness as its pin and its blind spots listed. `effectivePrefab*Traits` still model neither a structural `removed` of the member nor an `added` node. The pose base of an applied nested move (`docChainLayer`), and `referenceRootPose`, fold one level. |
-| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverrides`), whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `applyToPrefab` builds its keys from `captureInstanceOverrides` against the bare child. `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector pass the save's own mark gate (#1717): `gateOnMarks` (a diff with no mark is not an override; an added trait and a moved member's Transform are kept whatever the marks say) and `foldMarkedEqual` (a marked value equal to its base is one). The fold-in skips a field an enclosing row STATES, per field as the save's subtraction does, because the layer's value arrives marked too and would otherwise be listed as the nested instance's own; so a user's deliberate equal edit of a field the row states is not listed (the depth ≥ 2 case #1722 recorded). The moved-member question behind the Transform exemption is asked only for a Transform diff with no mark (`instanceMovedMembers` is lazy), since the Inspector recomputes on every dirty frame. |
+| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverrides`), whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector pass the save's own mark gate (#1717): `gateOnMarks` (a diff with no mark is not an override; an added trait and a moved member's Transform are kept whatever the marks say) and `foldMarkedEqual` (a marked value equal to its base is one). The fold-in skips a field an enclosing row STATES, per field as the save's subtraction does, because the layer's value arrives marked too and would otherwise be listed as the nested instance's own; so a user's deliberate equal edit of a field the row states is not listed (the depth ≥ 2 case #1722 recorded). The moved-member question behind the Transform exemption is asked only for a Transform diff with no mark (`instanceMovedMembers` is lazy), since the Inspector recomputes on every dirty frame. |
 | I3 | A frame is compared against the document it was EXPANDED from. No capture runs on a frame whose recorded rows differ from the cached ones. | The frame record, read through `levelDoc` (`prefabBase.ts`) by every level of `frameBase` / `chainLayer`, the scene save's top-level capture (`savedFrameDoc`, #1685) and its nested captures, the rebuild's readers (`expandedDocOf`) and the settle's save capture (#1693 retired the scoped `expandedFrom` map and the settle's cache swap onto it). The record also lists the nested rows its expansion could NOT expand and no layer removed (`unexpanded`, #1812): the save's removal pass (`nestedRowPresent`) and Create Prefab's refusal (`unexpandedNestedRows`) ask it whether a row was expanded, never the cache. Runtime only; it answers for a capture document holding the SAME ROWS as the record's (`rowsMeanTheSame`, not object identity: the runtime and editor caches hold separate copies of one file after any editor write), and a record no expansion wrote answers nothing, so they fall back to the cache. `framesBuiltFromOtherRows` refuses a frame whose record holds other rows, and `rebaseStaleInstances` repairs it. `rebuildInstanceFromCapture` puts a capture taken against an older document back onto the current one (Revert's undo, #1665). | The two staleness tests differ: `rowsMeanTheSame` for the refusal, `sameDocument` for the rebase. A frame with no record falls back to the current cache (`setFrameDocFallback`), and the refusal cannot judge it; every expansion path writes one (`instantiatePrefab`, Create Prefab's tag, a reattach, the loader, a carry across a world swap, an undo respawn). |
 
 #### Identity
@@ -1301,6 +1301,17 @@ foldered — that is what the field is for); only templates drop it. It is now e
 BY NAME, where it used to be excluded as accidental collateral of the `meta.fields` gate
 that was also losing `Animator.clips`.
 
+**So Apply does not OFFER them, and Revert does** (#1661). The Apply/Revert listing has ONE builder,
+`collectInstanceOverrideListing` (`prefabOverrideKeys.ts`, #1671): the dialog renders
+`listingFor(listing, mode)`, and the agent op flattens the same listing to keys. Apply's cut leaves
+out `applyExcluded` (the dialog used to list and pre-check `editorFolder`, and Apply then skipped it
+with no word); Revert keeps them, since resetting an instance's folder to the base is meaningful, and
+leaves out the nested instances' own (U14) edits, which it reverts on the nested instance itself. An
+added subtree whose live root has no durable guid is not listed at all, only counted
+(`unaddressableAdded`, a note in the dialog): `+added.` cannot name one of two such subtrees. Every
+editor create/duplicate path mints a durable guid (`ensureGuid`), so this is a code- or
+runtime-spawned child, addressable once the scene is saved.
+
 ## Core operations (`editor/scene/prefab.ts`)
 
 - **`serializePrefab(selectedEntityId, existingId?, opts?)`** — collects the selected
@@ -1339,7 +1350,7 @@ that was also losing `Animator.clips`.
   reached the human as a bare `null` the panels only logged. The cache lets the serialize loop and the
   Inspector read override diffs synchronously. (The runtime resource cache uses
   its own `getCachedPrefab()` in `meshTemplateCache.ts`.)
-- **`applyToPrefab` / `applyToPrefabSelective`** — write live overrides back into
+- **`applyToPrefabSelective`** — write live overrides back into
   the source file and refresh sibling instances.
 
 ### A read-side seed carries its read's token (#1752)
@@ -2361,7 +2372,7 @@ shared template cache as everything else (see
 - Prefabs appear in the Assets panel and can be **dragged into the Hierarchy**
   to instantiate.
 - Override capture works per-localId (including sub-entities), and
-  `applyToPrefab` / `applyToPrefabSelective` push live overrides back to the
+  `applyToPrefabSelective` push live overrides back to the
   source file, refreshing sibling instances.
 - **Structural overrides** — an instance can add child entities, delete prefab
   members, and remove components; these survive save/reload and are pushed back
@@ -2738,10 +2749,11 @@ the file.**
   **deleted** once the cache became populated by construction (see below), because it needed a new
   anchor per reader and that treadmill was its own maintenance defect.
 
-  ⚠️ **`applyToPrefab` is the one worth remembering**, because it shows what the cold read
-  actually costs. It captures the structure and uses the result to BUILD the key set it hands
-  to `applyToPrefabSelective`, so a cold miss did not merely hide a row — it silently dropped
-  a hand-added nested subtree from an action whose entire promise is "apply all of it". It was
+  ⚠️ **The old `applyToPrefab` is the one worth remembering** (deleted as dead code, #1671), because
+  it showed what the cold read actually costs. It captured the structure and used the result to
+  BUILD the key set it handed to `applyToPrefabSelective`, so a cold miss did not merely hide a row —
+  it silently dropped a hand-added nested subtree from an action whose entire promise is "apply all
+  of it". It was
   found by a source census on its first run, having been missed by both a manual sweep and an
   adversarial review — which is the argument for the construction-level fix below rather than for
   keeping the census.

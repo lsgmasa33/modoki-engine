@@ -133,7 +133,9 @@ const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
   // comment below: it has an Inspector caller, but that only serves edits made INSIDE the editor.
   // #842 wired it into ASSET_CACHE_INVALIDATORS (agentBridge.ts) too, so it is no longer allowlisted
   // — it must show as WIRED now, and an entry here for it again would silently un-fix #842.
-  { item: 'invalidatePrefab', reason: 'editor/scene/prefab.ts (prefab apply/instantiate flow)' },
+  // `invalidatePrefab`'s callers are NOT the apply/instantiate flow (instantiate never called it; #1670): the commit's
+  // trash branch and the watcher's own prefab path, which evicts outside ASSET_CACHE_INVALIDATORS.
+  { item: 'invalidatePrefab', reason: 'editor/scene/prefabCommit.ts seatCaches (a committed delete) + agentBridge.ts evictRuntimePrefabs (the watcher\'s prefab-change path)' },
   // `invalidatePixiShaderProgram` is never called directly from ASSET_CACHE_INVALIDATORS — it's
   // called FROM `spriteMaterialCache.ts`'s `invalidateShader`, which IS wired (as `shader:`) below
   // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it unconditionally,

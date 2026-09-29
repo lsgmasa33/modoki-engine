@@ -158,10 +158,14 @@ ${gpu ? `    ${d(v2)}screenTexSize = ${v2}(${F(1)}) / fwidth(vUV);
     ${d(f)}glowA = smoothstep(glowEdgeLo, edge, asd) * ${M}uGlowStrength * glowMask * (${F(1)} - fill);
 
     // ── SHADOW (offset sample; crisp median or soft alpha), masked on opacity.
+    // The soft ramp's lower threshold is floored at the glow's field budget, for the same
+    // reason: once softness > edge the threshold goes negative, and every far texel
+    // (field ~ 0) then gets a constant shadow — a flat box over the whole quad (#1775).
     ${d(f)}shadowMask = step(${F(0.00001)}, ${M}uShadowColor.a);
     ${d(v4)}shTex = ${shSample};
     ${d(f)}shCrisp = clamp(${median('shTex')} * spr - (edge * spr) + ${F(0.5)}, ${F(0)}, ${F(1)});
-    ${d(f)}shSoft = smoothstep(edge - ${M}uShadowSoftness, edge, ${mix}(${median('shTex')}, shTex.a, ${M}uHasTrueSdf));
+    ${d(f)}shSoftLo = max(edge - ${M}uShadowSoftness, ${F(0.5 - GLOW_MAX_SPREAD)});
+    ${d(f)}shSoft = smoothstep(shSoftLo, edge, ${mix}(${median('shTex')}, shTex.a, ${M}uHasTrueSdf));
     ${d(f)}shCov = ${mix}(shCrisp, shSoft, step(${F(0.00001)}, ${M}uShadowSoftness));
     ${d(f)}shadowA = ${M}uShadowColor.a * shCov * shadowMask;
 

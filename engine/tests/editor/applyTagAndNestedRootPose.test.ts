@@ -37,7 +37,7 @@ import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo,
 } from '@modoki/engine/editor';
 import {
-  setPrefabCache, applyToPrefab, applyToPrefabSelective, revertOverridesSelective, type PrefabFile,
+  setPrefabCache, applyToPrefabSelective, revertOverridesSelective, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import {
   collectInstanceOverrideKeys, collectInstanceOverrideTree, applyOutcomeNotice,
@@ -167,15 +167,6 @@ describe('an added TAG is an override with a key (#1491)', () => {
     expect(result.skipped ?? []).toEqual([]);
     expect(written(P)!.entities.find((e) => e.localId === 2)!.traits.Paused).toBe(true);
     expect(hasTag(inInstance(ROOT2, 'A'), 'Paused')).toBe(true);
-  });
-
-  it('the legacy apply-everything lists and writes it too', async () => {
-    // Mutation: drop the tag line in `applyToPrefab`'s key loop.
-    install(pDoc());
-    await load(scene(P));
-    addTag(inInstance(ROOT1, 'A'), 'Paused');
-    await applyToPrefab(rootOf(ROOT1));
-    expect(written(P)?.entities.find((e) => e.localId === 2)!.traits.Paused).toBe(true);
   });
 
   it('Revert takes it off the instance, and leaves the other one alone', async () => {

@@ -203,7 +203,7 @@ multiplies on top via a vertex attribute.
 | `weight` | Faux-bold: shifts the fill threshold outward. **Negative is clamped to 0 by both shaders** — eroding a rasterized glyph nicks sharp corners, so *thinning is an import choice* (a lighter `variationAxes.wght`, or the family's Light weight), not a per-entity one. The Inspector's minimum is 0; a scene/prefab/code can still author a negative, and it does nothing. |
 | `outlineWidth` / `outlineColor` / `outlineOpacity` | 0..1 mapped to a seam-free budget. Uses the **median** field (a sharp outline wants the same clash-free field the fill uses). Shrinks toward nothing at small on-screen sizes rather than flooding the quad. |
 | `glowSize` / `glowColor` / `glowStrength` | Soft band outside the median silhouette. **Both `glowSize` and `glowStrength` must be non-zero** — `glowStrength` defaults to 1 and `glowColor` to white precisely because a 0/black default made the glow doubly inert. |
-| `shadowOpacity` / `shadowColor` / `shadowOffsetX/Y` / `shadowSoftness` | `shadowOpacity: 0` = off. Offset is in em and **clamped** (§2). `shadowSoftness` 0 = crisp (median), > 0 = soft (alpha SDF). |
+| `shadowOpacity` / `shadowColor` / `shadowOffsetX/Y` / `shadowSoftness` | `shadowOpacity: 0` = off. Offset is in em and **clamped** (§2). `shadowSoftness` 0 = crisp (median), > 0 = soft (alpha SDF). The soft ramp is floored at the same field budget as the glow, so softness past `0.45 − weight` stops widening it; unfloored, it painted a flat box over every glyph's quad (#1775). |
 
 **`variationAxes.wght` vs `Text2D.weight` — not the same thing, and this has been conflated
 more than once.** The axis picks which *instance of the typeface* is rasterized: real

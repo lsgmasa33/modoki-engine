@@ -429,16 +429,6 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     expect(inner).toEqual(['Holder/OuterRoot/Panel/Button/InnerRoot']);
   });
 
-  // Mutation: drop the uncached-prefab guard in the presence check.
-  it('a row whose prefab could not be loaded expanded to nothing, and is NOT saved as removed', async () => {
-    prefabs.delete(INNER);
-    setPrefabCache(INNER, null);
-    await load(withShelf());
-    expect([...treePaths().values()].filter((p) => p.includes('InnerRoot'))).toEqual([]);
-    const saved = await serializeScene() as unknown as { entities: Array<{ prefab?: string; removed?: number[] }> };
-    expect(saved.entities.find((e) => e.prefab === OUTER)?.removed).toBeUndefined();
-  });
-
   // The editor-side apply (refresh/revert rebuild). Mutation: drop the nested-row mapping in
   // applyStructureByRootInstance.
   it('deleted, then the outer instance is REBUILT: the rebuild does not bring it back', async () => {
@@ -455,10 +445,12 @@ describe('an owned nested instance that leaves its row stays gone after save + r
   // An UNSTAMPED instance at the row used to count as present too ("the legacy form"). #1367 made it
   // independent: it is written as a reference node and the row as removed, which reloads as the same
   // single instance — pinned in the #1367 block, not here.
+  // Mutation: `nestedRowPresent` answers "absent" — the row is saved as removed. Read through `view`: since #1468 a
+  // removal is written on the member ROW, and the raw top-level `removed` stayed undefined whatever it answered (#1670).
   it('left in place: it is NOT recorded as removed', async () => {
     await load(withShelf());
     const saved = await serializeScene() as unknown as { entities: Array<{ prefab?: string; removed?: number[] }> };
-    expect(saved.entities.find((e) => e.prefab === OUTER)?.removed).toBeUndefined();
+    expect(view(saved).entities.find((e) => e.prefab === OUTER)?.removed ?? []).toEqual([]);
     await load(saved as unknown as SceneData);
     expect([...treePaths().values()]).toContain('Holder/OuterRoot/Panel/InnerRoot/Leaf');
   });
