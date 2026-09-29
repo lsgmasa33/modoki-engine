@@ -1189,6 +1189,10 @@ Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, un
   snapshot must be taken before the edit's FIRST write: `reparentEntity` once took it after its own
   marked `sortOrder` write, and its undo put the new mark back. The gizmos' marks belong to their one undo builder,
   `buildTransformUndoAction`'s `markFields` (`editor/scene/gizmoUndo.ts`).
+  ⚠️ **Not yet the undos that restore LINKS or a whole component.** Detach's undo and Remove Component's undo
+  (#1794, #1800) restore the values but capture no marks, so a rebuild in between (Play→Stop, a prefab-edit visit)
+  loses them, and the next save drops what the screen shows. Study and proposed owner:
+  [plans/override-mark-undo.md](./plans/override-mark-undo.md).
 
 ⚠️ **By value cannot keep a reorder local when the template's siblings TIE.** 651 of the 843
 sibling groups across the repo's 325 templates carry equal `sortOrder`s, mostly all 0
