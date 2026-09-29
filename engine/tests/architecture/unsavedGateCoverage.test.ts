@@ -473,6 +473,9 @@ describe('the sidecar park gate covers every Node route that could clobber a par
         + 'newer one. It never writes, so it cannot clobber a parked edit; the route it guards '
         + '(/api/write-file) is byte-opaque and deliberately ungated, which is why the refusal lives here '
         + 'rather than in that route body' },
+      { item: 'engine/plugins/editorWriteGuard.ts', reason: '#1744: READS ONLY — `fingerprintFile` hashes the file a '
+        + 'watcher event names, to tell the editor`s own write from an outside one. It never writes, so it cannot '
+        + 'clobber a parked edit; the watchers call it, and the routes only hash bytes they already hold' },
       { item: 'engine/plugins/rigged-model-optimize.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/texture-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/vendorPlugins.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },

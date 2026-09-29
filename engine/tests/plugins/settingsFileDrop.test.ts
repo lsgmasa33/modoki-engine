@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
+import { fingerprintBytes } from '../../plugins/editorWriteGuard';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { readScannedSource } from '@modoki/engine/testing';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -116,7 +116,7 @@ describe('/api/adopt-file — a file dropped on a Project Settings path field', 
     expect(fs.readFileSync(path.join(projectRoot, 'art', 'downloaded-icon.png')).equals(PNG)).toBe(true);
     expect(markEditorWrite).toHaveBeenCalledWith(
       path.join(projectRoot, 'art', 'downloaded-icon.png'),
-      crypto.createHash('sha1').update(PNG).digest('hex'),
+      fingerprintBytes(PNG),
     );
     expect(fs.existsSync(path.join(projectRoot, 'art', 'downloaded-icon.png.tmp'))).toBe(false);
   });

@@ -17,7 +17,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { createHash } from 'crypto';
 
 const trash = vi.hoisted(() => ({ refuse: new Set<string>() }));
 vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
@@ -33,7 +32,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
-import { createEditorWriteGuard } from '../../plugins/editorWriteGuard';
+import { createEditorWriteGuard, fingerprintFile } from '../../plugins/editorWriteGuard';
 import { createAssetTreeIndex, type TreeEventKind } from '../../plugins/assetTreeIndex';
 import { nodeTreeFs } from '../../plugins/assetTreeWatcher';
 import { classifySceneChange, pathToClassifyForChange } from '../../plugins/vite-asset-scanner';
@@ -71,9 +70,7 @@ const post = (urlPath: string, body: unknown) =>
 const put = (rel: string, bytes: string) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), bytes); };
 const abs = (rel: string) => path.join(dir, rel);
 /** What the watcher asks on an event for `rel`: the guard, handed a lazy re-hash of the file (null once it is gone). */
-const watcherSkips = (rel: string) => guard.isWrite(abs(rel), () => {
-  try { return createHash('sha1').update(fs.readFileSync(abs(rel))).digest('hex'); } catch { return null; }
-});
+const watcherSkips = (rel: string) => guard.isWrite(abs(rel), () => fingerprintFile(abs(rel)));
 const PREFAB = JSON.stringify({ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee1702', version: 2, name: 'Probe', rootLocalId: 1, entities: [] });
 
 describe('#1702: a delete is the editor`s own change', () => {
@@ -142,6 +139,48 @@ describe('#1702 siblings: the other routes that create a watched file', () => {
   });
 });
 
+/** #1744 — inside the TTL, only the editor's OWN bytes are its echo. The TTL used to answer before the content did, so
+ *  for 1.5 s after a save every change to that path was swallowed: a `git checkout` right after `save_all` never
+ *  hot-reloaded (the stale undo stack then duplicated a guid), and an outside edit of a parked prefab 816 ms after an
+ *  Apply never reached the park (the next Save overwrote it with no dialog). Both observed live; both driven here
+ *  through the real `/api/write-file` save, with the outside write made by `fs` the way git or `gsed` makes it.
+ *
+ *  Mutations: restore the TTL fast path (`if (e.exp > now()) return true` first) → the three outside cases red, the echo
+ *  case green; compare the hash only past the TTL but answer false inside it → the echo case red. */
+describe('#1744: an outside write inside the TTL is reported; the save`s own echo is not', () => {
+  const SCENE = JSON.stringify({ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee1744', version: 13, entities: [{ guid: 'probe' }] }, null, 2);
+  const save = (rel: string, content: string) => post('/api/write-file', { path: `/${rel}`, content });
+
+  it('the save`s own burst, inside the TTL, is still the editor`s echo', async () => {
+    const r = await save('scenes/main.scene.json', SCENE);
+    expect(r.body.ok, JSON.stringify(r.body)).toBe(true);
+    now = 100;
+    for (let i = 0; i < 3; i++) expect(watcherSkips('scenes/main.scene.json'), `event ${i} of the burst`).toBe(true);
+  });
+
+  it('(1) a checkout of the scene right after the save is an outside change, inside the TTL', async () => {
+    await save('scenes/main.scene.json', SCENE);
+    now = 200;
+    put('scenes/main.scene.json', SCENE.replace('"probe"', '"committed"')); // `git checkout -- main.scene.json`
+    expect(watcherSkips('scenes/main.scene.json')).toBe(false);
+  });
+
+  it('(2) an outside edit of a prefab 816 ms after its Apply wrote it is an outside change', async () => {
+    await save('prefabs/crate.prefab.json', PREFAB);
+    now = 816;
+    put('prefabs/crate.prefab.json', PREFAB.replace('"Probe"', '"Edited"')); // `gsed -i` on the parked prefab
+    expect(watcherSkips('prefabs/crate.prefab.json')).toBe(false);
+  });
+
+  it('(3) on macOS/Linux, a checkout that DELETES the just-saved scene is an outside change (close-out review)', async () => {
+    guard = createEditorWriteGuard(1500, () => now, 'linux'); // Windows keeps an unreadable read inconclusive
+    await save('scenes/main.scene.json', SCENE);
+    now = 300;
+    fs.rmSync(abs('scenes/main.scene.json')); // `git checkout` of a branch without the scene
+    expect(watcherSkips('scenes/main.scene.json')).toBe(false);
+  });
+});
+
 /** #1708 — on Windows the watcher is ONE recursive `fs.watch` per root, which reports a recycled folder as a single
  *  event. `assetTreeIndex` expands it into the per-file unlinks the marks were written against, and a rescan after an
  *  overflow emits its own. Those SYNTHETIC events must still be recognised as the editor's own, or the delete of a
@@ -157,9 +196,7 @@ describe('#1708: the Windows watcher`s synthetic events still meet the marks', (
     index.seed();
     return { index, events };
   }
-  const isOwn = (absPath: string) => guard.isWrite(absPath, () => {
-    try { return createHash('sha1').update(fs.readFileSync(absPath)).digest('hex'); } catch { return null; }
-  });
+  const isOwn = (absPath: string) => guard.isWrite(absPath, () => fingerprintFile(absPath));
   const nested = ['kit/a.prefab.json', 'kit/sub é/b.prefab.json', 'kit/sub é/deeper/c.mat.json'];
 
   it('the folder expansion of a delete with nested subfolders (one non-ASCII): every unlink is the editor`s own', async () => {

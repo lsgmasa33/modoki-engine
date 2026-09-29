@@ -23,7 +23,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { relay } from './backendRelay';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
+import { fingerprintBytes } from '../../plugins/editorWriteGuard';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   calleeName, declarationOf, findNodes, flatText, lineOf, parseSource, statementOf, ts, unwrapValue,
@@ -120,7 +120,7 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
     expect(onDisk[onDisk.length - 1], 'the flushed asset lost its trailing newline').toBe(0x0a);
     expect(hash, 'the self-write fingerprint does not match the file — the guard fails OPEN and a '
       + 'parked edit made just after this write would be silently discarded')
-      .toBe(crypto.createHash('sha1').update(onDisk).digest('hex'));
+      .toBe(fingerprintBytes(onDisk));
   });
 
   /** ⚠️ **A SCENE now gets the SAME bytes as every other document — the two writers converged

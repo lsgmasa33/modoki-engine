@@ -983,14 +983,16 @@ Two host-specific concerns stay out of the shared router:
   server rather than duplicating the pipeline; the renderer's `EventSource` still targets
   one base. With no `viteOrigin` they return 503.
 - **Asset bytes + the watcher** — `engine/electron/assetBackend.ts` is a standalone
-  chokidar asset backend giving the router the same asset-root resolution + manifest
-  cache + file watcher the Vite plugin owns, so it runs in main **with no Vite server**.
-  It reuses the scanner's pure machinery (`findAssetRoots` / `scanAllAssets` /
-  `buildManifest` / `resolveAssetPath` / `detectType`) and re-implements only the
-  editor-own-write suppression (a 1.5 s TTL + content-hash guard so an editor Cmd+S
-  doesn't bounce the live scene) and the debounced scene/prefab classification inline —
-  identical logic to the Vite plugin, kept separate to avoid importing a Vite-plugin
-  module into the Electron main process.
+  asset backend giving the router the same asset-root resolution + manifest cache + file
+  watcher the Vite plugin owns, so it runs in main **with no Vite server**. Its watcher is
+  `createAssetTreeWatcher` (chokidar on macOS/Linux, one recursive `fs.watch` per root on
+  Windows, #1708). It reuses the scanner's pure machinery (`findAssetRoots` /
+  `scanAllAssets` / `buildManifest` / `resolveAssetPath` / `detectType`) and its change
+  classification (`pathToClassifyForChange` / `classifySceneChange` /
+  `isSiblingRaisedChange`), and shares the editor-own-write suppression with the Vite
+  plugin (`editorWriteGuard.ts`, a content-hash guard, so an editor Cmd+S doesn't bounce
+  the live scene — [editor-hmr.md](./editor-hmr.md)). Only the debounce-and-dispatch
+  loop is its own.
 
 The MCP tools that drive this backend (`modoki_*`) are documented in
 [Debug Tools (MCP)](./debug-tools-mcp.md).

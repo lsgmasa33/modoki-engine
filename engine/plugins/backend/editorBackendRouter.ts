@@ -52,7 +52,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
-import { EDITOR_DELETE_FINGERPRINT } from '../editorWriteGuard';
+import { EDITOR_DELETE_FINGERPRINT, fingerprintBytes, fingerprintFile } from '../editorWriteGuard';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
@@ -1057,8 +1057,7 @@ function importIdentity(ctx: BackendContext, destUrl: string, bytes: Buffer, cla
  *  after a SYNCHRONOUS write, with no await between: the watcher runs on this same event loop, so its event for the
  *  write cannot be handled before the mark. */
 function markWrittenFile(ctx: BackendContext, abs: string): void {
-  let hash: string | null = null;
-  try { hash = crypto.createHash('sha1').update(fs.readFileSync(abs)).digest('hex'); } catch { /* TTL-only */ }
+  const hash = fingerprintFile(abs); // null → TTL-only
   ctx.markEditorWrite(abs, hash);
 }
 
@@ -1074,7 +1073,7 @@ function plannedMoveLandings(absFrom: string, absTo: string, isDir: boolean): Ar
   if (!isDir) {
     try {
       const bytes = fs.readFileSync(absFrom);
-      return [[absTo, crypto.createHash('sha1').update(bytes).digest('hex')]];
+      return [[absTo, fingerprintBytes(bytes)]];
     } catch {
       // Unreadable for some other reason — still mark the destination, TTL-only.
       return [[absTo, null]];
@@ -4054,7 +4053,7 @@ async function describeUnresolvedAgainstLiveWorld(
           return json({ error: 'destination escapes the project' }, 403);
         }
         fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-        ctx.markEditorWrite(destAbs, crypto.createHash('sha1').update(bytes).digest('hex'));
+        ctx.markEditorWrite(destAbs, fingerprintBytes(bytes));
         const tmpPath = `${destAbs}.tmp`;
         try {
           fs.writeFileSync(tmpPath, bytes);
@@ -4693,7 +4692,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // (`selfWrite` is read once, above the gate — see its comment there.)
       if (selfWrite) {
         const bytes = assetJsonBytes(out);
-        ctx.markEditorWrite(abs, crypto.createHash('sha1').update(bytes).digest('hex'));
+        ctx.markEditorWrite(abs, fingerprintBytes(bytes));
       }
       const outBytes = assetJsonBytes(out);
       writeJsonAtomic(abs, outBytes);
@@ -4783,7 +4782,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // and silently restores the bug.
       // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
       // so there is no stale cached def the invalidation needs to clear.
-      ctx.markEditorWrite(abs, crypto.createHash('sha1').update(assetJsonBytes(data)).digest('hex'));
+      ctx.markEditorWrite(abs, fingerprintBytes(assetJsonBytes(data)));
       writeJsonAtomic(abs, assetJsonBytes(data));
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
@@ -4862,7 +4861,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const bytes = encoding === 'base64'
         ? Buffer.from(content as string, 'base64')
         : Buffer.from(typeof content === 'string' ? content : JSON.stringify(content, null, 2));
-      ctx.markEditorWrite(absPath, crypto.createHash('sha1').update(bytes).digest('hex'));
+      ctx.markEditorWrite(absPath, fingerprintBytes(bytes));
       const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       // Atomic write (tmp + rename), not a direct writeFileSync: this endpoint is
@@ -4936,7 +4935,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const guid = crypto.randomUUID();
       const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
       const bytes = assetJsonBytes(copy);
-      ctx.markEditorWrite(absPath, crypto.createHash('sha1').update(bytes).digest('hex'));
+      ctx.markEditorWrite(absPath, fingerprintBytes(bytes));
       const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       writeJsonAtomic(absPath, bytes);

@@ -9,15 +9,13 @@
  */
 
 import path from 'path';
-import fs from 'fs';
-import crypto from 'crypto';
 import {
   findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
   isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
-import { createEditorWriteGuard } from '../plugins/editorWriteGuard';
+import { createEditorWriteGuard, fingerprintFile } from '../plugins/editorWriteGuard';
 import { createAssetTreeWatcher, type AssetTreeWatcher } from '../plugins/assetTreeWatcher';
 import { computeKeptAssets, enumerateRefEdges, type TreeShakeResult, type RefEdgeEnumeration } from '../plugins/asset-tree-shaker';
 
@@ -61,10 +59,6 @@ export function createAssetBackend(opts: {
   // This used to be an inline copy, "the logic is identical", kept apart to keep a Vite-plugin module out of the main
   // process — which already imported the scanner for everything else, and #1702 then had to change both copies.
   const { mark: markEditorWrite, isWrite: isEditorWrite } = createEditorWriteGuard();
-  const hashFileSync = (file: string): string | null => {
-    try { return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex'); }
-    catch { return null; }
-  };
 
   const rebuildManifest = (): ElectronAssetManifest => {
     assetRoots = findAssetRoots(projectRoot);
@@ -125,7 +119,7 @@ export function createAssetBackend(opts: {
     const target = pathToClassifyForChange(file);
     // isEditorWrite is checked against `file` (the BODY actually written), never `target` (the
     // remapped descriptor) — it's a content-hash guard, and hashing the wrong file would defeat it.
-    if (target && !isEditorWrite(file, () => hashFileSync(file))) {
+    if (target && !isEditorWrite(file, () => fingerprintFile(file))) {
       const rel = target.split(path.sep).join('/');
       const kind = classifySceneChange(rel);
       if (kind) {

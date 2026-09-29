@@ -75,6 +75,23 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
      the TTL is 1500ms, and a Finder trash over AppleScript can take longer.
    - **A delete's fingerprint is "gone"** (`EDITOR_DELETE_FINGERPRINT`). An `unlink` past the TTL
      is still recognized, and the file coming back evicts the mark.
+   - **The bytes answer, inside the TTL as well as past it (#1744).** A fingerprinted mark
+     recognizes only the editor's own bytes (or "gone" for a delete). Any other content is an
+     outside change even 0 ms after the save, and it evicts the mark. The TTL used to win outright,
+     so for 1.5 s after a save EVERY change was read as the echo. Observed twice live: a
+     `git checkout` right after `save_all` never hot-reloaded (the kept undo stack then duplicated
+     a guid), and an outside edit of a parked prefab 816 ms after an Apply never reached the park,
+     so the next Save would have overwritten it without the Overwrite/Cancel dialog. The TTL alone
+     answers only for a mark with no fingerprint (a move's source, a folder move's children, a
+     failed read-back). **One rule computes both sides**: every route marks with
+     `fingerprintBytes` and both watchers re-hash with `fingerprintFile` (`editorWriteGuard.ts`).
+     Each site used to spell the sha1 out itself, and a mark and a watcher that disagree on it
+     now bounce every save, not only a late rename. An unreadable file under a WRITE mark inside
+     the TTL is an outside delete on macOS/Linux (every route writes synchronously and the
+     watcher reads afterwards). On **Windows only** it counts as the echo, because a file another
+     process holds open (an antivirus scan of the fresh write) can fail to read. That premise is
+     INFERRED, not observed. The residual it leaves on Windows: an outside DELETE within 1.5 s of
+     a save is still swallowed.
    - **One key function, `normalizeWriteGuardKey`, spells both sides.** It folds separators and the
      drive letter, applies Unicode NFC, strips a trailing separator, and folds letter case on
      macOS/Windows (not on Linux). ⚠️ It over-folds on a case-SENSITIVE volume on those platforms.

@@ -21,7 +21,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
+import { fingerprintBytes } from '../../plugins/editorWriteGuard';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -70,7 +70,7 @@ describe('/api/create-asset — the self-write guard', () => {
 
     const [abs, hash] = markEditorWrite.mock.calls[0] as [string, string];
     const onDisk = fs.readFileSync(abs);
-    expect(hash).toBe(crypto.createHash('sha1').update(onDisk).digest('hex'));
+    expect(hash).toBe(fingerprintBytes(onDisk));
   });
 
   it('does not mark anything when the write is refused', async () => {

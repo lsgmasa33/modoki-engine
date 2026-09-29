@@ -7,8 +7,8 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
-import crypto, { randomUUID } from 'crypto';
-import { createEditorWriteGuard } from './editorWriteGuard';
+import { randomUUID } from 'crypto';
+import { createEditorWriteGuard, fingerprintFile } from './editorWriteGuard';
 import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatcher';
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
@@ -1784,20 +1784,14 @@ export function assetScannerPlugin(): Plugin {
   // watcher skips the hot-reload broadcast for these so an editor Cmd+S doesn't
   // bounce the live scene — external edits (an agent's file write, /api/scene-
   // mutate) still reload.
-  // The 1500ms TTL covers chokidar's add+change burst (the common case); the F9
-  // late-rename gap is closed by a content fingerprint — markEditorWrite records a
-  // hash of the bytes it wrote, and the watcher (below) hands isEditorWrite a lazy
-  // re-hash of the on-disk file, so a rename event that lands past the TTL is still
-  // recognized as a self-write as long as the bytes are unchanged. The TTL behavior,
+  // markEditorWrite records a hash of the bytes it wrote, and the watcher (below)
+  // hands isEditorWrite a lazy re-hash of the on-disk file: an event is the editor's
+  // own while the bytes are unchanged, whether it lands inside the 1500ms TTL or past
+  // it (the F9 late rename), and an outside change is reported even inside it (#1744).
+  // Only a mark with no hash falls back to the TTL alone. The TTL behavior,
   // fingerprint fallback, and self-cleaning timer all live in createEditorWriteGuard
   // (above), factored out so they're unit-testable with an injectable clock.
   const { mark: markEditorWrite, isWrite: isEditorWrite } = createEditorWriteGuard();
-  /** sha1 of a file's bytes, or null if it can't be read (e.g. an unlink event).
-   *  Cheap on the small JSON scenes/prefabs this guards; only called on a TTL miss. */
-  const hashFileSync = (file: string): string | null => {
-    try { return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex'); }
-    catch { return null; }
-  };
 
   /** Relay an op to the browser over the HMR socket and await its reply. Rejects
    *  on timeout (no app open / no agent bridge connected). */
@@ -2057,7 +2051,7 @@ export function assetScannerPlugin(): Plugin {
         // isEditorWrite is checked against `file` (the BODY actually written), never
         // `target` (the remapped descriptor) — it's a content-hash guard, and hashing the
         // wrong file would defeat it.
-        if (target && !isEditorWrite(file, () => hashFileSync(file))) {
+        if (target && !isEditorWrite(file, () => fingerprintFile(file))) {
           const rel = target.split(path.sep).join('/');
           // classifySceneChange just forwards detectType's verdict for 'scene' now that
           // the catch-all is gone (#54) — every 'scene' is positively identified (suffix

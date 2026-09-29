@@ -520,13 +520,52 @@ describe('createEditorWriteGuard (self-write TTL)', () => {
     expect(isWrite('/p/scene.json', () => 'hashA')).toBe(false);
   });
 
-  it('within the TTL the fast path wins without reading content (no hash needed)', () => {
-    const t = 0;
+  // #1744 reversed what this block used to pin ("within the TTL the fast path wins without reading content"): that
+  // fast path swallowed EVERY change for 1.5 s after a save, so a `git checkout` right after `save_all`, or an outside
+  // edit of a parked prefab 816 ms after an Apply, never reached the editor. A fingerprinted mark now answers by the
+  // bytes inside the TTL too. The end-to-end repros, through the real save route: editorOwnFileChangesMarked.test.ts.
+  it('#1744: within the TTL, different bytes are an outside change — and the entry is evicted', () => {
+    let t = 0;
     const { mark, isWrite } = createEditorWriteGuard(1500, () => t);
     mark('/p/a.json', 'hashA');
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(true);  // the save's own event
+    t = 200;
+    expect(isWrite('/p/a.json', () => 'hashB')).toBe(false); // an outside write inside the window
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(false); // evicted: a later event is not re-guarded
+  });
+  it('#1744: within the TTL on Windows, an unreadable file under a WRITE mark is inconclusive (a held file), not foreign', () => {
+    let t = 0;
+    const { mark, isWrite } = createEditorWriteGuard(1500, () => t, 'win32');
+    mark('C:/p/a.json', 'hashA');
+    expect(isWrite('C:/p/a.json', () => null)).toBe(true);
+    expect(isWrite('C:/p/a.json', () => 'hashA')).toBe(true); // not evicted by the inconclusive read
+    t = 3000;
+    expect(isWrite('C:/p/a.json', () => null)).toBe(false);   // past the TTL, gone is foreign again
+  });
+  it('#1744: within the TTL on macOS and Linux, an unreadable file under a WRITE mark is gone — an outside delete', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      const { mark, isWrite } = createEditorWriteGuard(1500, () => 0, platform);
+      mark('/p/a.json', 'hashA');
+      expect(isWrite('/p/a.json', () => null), platform).toBe(false);
+      expect(isWrite('/p/a.json', () => 'hashA'), `${platform}: evicted`).toBe(false);
+    }
+  });
+  it('#1744: a mark with no fingerprint is answered by the TTL alone — there is nothing to compare', () => {
+    let t = 0;
+    const { mark, isWrite } = createEditorWriteGuard(1500, () => t);
+    mark('/p/moved-from.json', null);
     let hashed = false;
-    expect(isWrite('/p/a.json', () => { hashed = true; return 'whatever'; })).toBe(true);
-    expect(hashed).toBe(false); // TTL fast path short-circuits before hashing
+    expect(isWrite('/p/moved-from.json', () => { hashed = true; return 'anything'; })).toBe(true);
+    expect(hashed).toBe(false);
+    t = 1600;
+    expect(isWrite('/p/moved-from.json', () => 'anything')).toBe(false);
+  });
+  it('#1744: a delete mark within the TTL — gone is ours, the file back is an outside change', () => {
+    const t = 0;
+    const { mark, isWrite } = createEditorWriteGuard(1500, () => t);
+    mark('/p/trashed.json', EDITOR_DELETE_FINGERPRINT);
+    expect(isWrite('/p/trashed.json', () => null)).toBe(true);
+    expect(isWrite('/p/trashed.json', () => 'restored')).toBe(false);
   });
 
   // Windows Ctrl+S full-reload regression: the editor's save resolved an OPENED

@@ -8,6 +8,22 @@
  *  comes back as an EXTERNAL one — and an external prefab change reloads the open scene from disk, discarding its
  *  unsaved edits and undo stack (#1702: every Move to Trash of a prefab did exactly that). */
 
+import crypto from 'crypto';
+import fs from 'fs';
+
+/** The ONE fingerprint rule: every route that marks a write hashes its bytes with this, and both watchers re-hash the
+ *  file on disk with {@link fingerprintFile}. Since #1744 the guard compares them on every event of every save, inside
+ *  the TTL too, so a mark and a watcher that disagreed on the rule would report the editor's own save as an outside
+ *  change and reload the open scene (the #1702 class). It used to be spelled out at every site. */
+export function fingerprintBytes(bytes: Buffer | string): string {
+  return crypto.createHash('sha1').update(bytes).digest('hex');
+}
+
+/** {@link fingerprintBytes} of the file now on disk, or null if it cannot be read (gone, or a failed read). */
+export function fingerprintFile(absPath: string): string | null {
+  try { return fingerprintBytes(fs.readFileSync(absPath)); } catch { return null; }
+}
+
 /** The `hash` a route marks a path it DELETES with: "the editor removed this file". `isWrite` then recognises the path
  *  while it stays absent, past the TTL too. Not a sha1, so it can never equal a real file's fingerprint. */
 export const EDITOR_DELETE_FINGERPRINT = 'deleted-by-editor';
@@ -86,25 +102,25 @@ export function normalizeWriteGuardKey(absPath: string, platform: NodeJS.Platfor
 /** The self-write guard: scene/prefab files the editor just saved itself (via
  *  /api/write-file) are recorded here so the watcher skips the hot-reload broadcast
  *  for them — an editor Cmd+S must not bounce the live scene, while external edits
- *  (an agent's write, /api/scene-mutate) still reload. Gated by expiry only — NEVER
- *  delete on read, because chokidar emits several events per save (add+change,
- *  write+rename) and deleting on the first would let later events of the same save
- *  bounce the scene; the TTL covers the burst, and a second `mark` for the same
- *  file extends it. A self-cleaning timer drops entries that never re-fire a watcher
+ *  (an agent's write, /api/scene-mutate) still reload. NEVER delete on a match,
+ *  because chokidar emits several events per save (add+change, write+rename) and
+ *  deleting on the first would let later events of the same save bounce the scene;
+ *  a second `mark` for the same file replaces the entry and extends its TTL. A
+ *  self-cleaning timer drops entries that never re-fire a watcher
  *  event so the map can't leak. Factored out (+ injectable clock) for unit testing
  *  the TTL behavior (editor-core F9). */
 export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.now, platform: NodeJS.Platform = process.platform) {
   // A delete's fingerprint is "the file is gone" ({@link EDITOR_DELETE_FINGERPRINT}): the timing-independent check
   // for an `unlink` that lands past the TTL — a Finder trash over AppleScript can take seconds. The file coming back
   // (its `add`) no longer matches, which evicts the entry, so a later external change still reloads.
-  // Per path: the TTL expiry (fast path for chokidar's add+change burst) PLUS an
-  // optional content fingerprint of the exact bytes the editor wrote. The hash is
-  // the timing-independent fallback the fixed TTL couldn't give: if a rename event
-  // lands AFTER the TTL (heavy disk latency, the F9 failure) but the file's current
-  // bytes still equal what we wrote, it's unmistakably our own save — skip the
-  // bounce. The instant the bytes diverge (a genuine external edit / agent write),
-  // the fingerprint stops matching and the reload proceeds, so this can't mask a
-  // real change. (editor-core F9)
+  // Per path: a TTL expiry PLUS an optional content fingerprint of the exact bytes
+  // the editor wrote. The fingerprint is the answer whenever there is one: if a
+  // rename event lands AFTER the TTL (heavy disk latency, the F9 failure) but the
+  // file's current bytes still equal what we wrote, it's unmistakably our own save,
+  // so the bounce is skipped. The instant the bytes diverge (a genuine external edit
+  // or agent write), the fingerprint stops matching and the reload proceeds, inside
+  // the TTL too (#1744), so this can't mask a real change. The TTL alone answers only
+  // for a mark with no fingerprint. (editor-core F9)
   const recent = new Map<string, { exp: number; hash: string | null }>();
   const mark = (absPathRaw: string, hash: string | null = null) => {
     const absPath = normalizeWriteGuardKey(absPathRaw, platform);
@@ -119,16 +135,28 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
       if (e && e.exp <= now() && e.hash == null) recent.delete(absPath);
     }, ttlMs + 100);
   };
+  // (#1744) A fingerprinted mark answers by the BYTES, inside the TTL as well as past it. The TTL used to win outright,
+  // so for 1.5 s after a save ANY change to that path read as the editor's echo: a `git checkout` right after
+  // `save_all` was swallowed (no hot reload, the stale undo stack kept → two entities with one guid), and an outside
+  // edit of a parked prefab 816 ms after an Apply never reached the park, so the next Save overwrote it with no
+  // dialog. Every route marks the exact bytes it writes, synchronously and with no await before the watcher can run
+  // (`markWrittenFile`'s comment), so the editor's own burst still matches. Only a mark with nothing to compare
+  // (a move's source, a folder move's children, a failed read-back) is left to the TTL alone.
   const isWrite = (absPathRaw: string, currentHash?: () => string | null) => {
     const absPath = normalizeWriteGuardKey(absPathRaw, platform);
     const e = recent.get(absPath);
     if (!e) return false;
-    if (e.exp > now()) return true; // fast path: still inside the burst window
-    if (e.hash != null && currentHash) {
-      const cur = currentHash();
-      if (e.hash === EDITOR_DELETE_FINGERPRINT ? cur == null : (cur != null && cur === e.hash)) return true; // still ours
-      recent.delete(absPath); // diverged → a genuine external edit; stop guarding it
-    }
+    const inBurst = e.exp > now();
+    if (e.hash == null || !currentHash) return inBurst;
+    const cur = currentHash();
+    if (e.hash === EDITOR_DELETE_FINGERPRINT ? cur == null : (cur != null && cur === e.hash)) return true; // still ours
+    // Windows only: an unreadable file under a WRITE mark, inside the burst, is inconclusive rather than foreign. A
+    // read there can fail on a file another process holds open (an antivirus scan of the fresh write), and bouncing
+    // the editor's own save is the bug #1702 fixed. INFERRED, not observed. Every route writes synchronously and the
+    // watcher reads afterwards, so on POSIX a null read is the file really gone, an outside delete, and is reported.
+    // The residual on Windows: an outside DELETE within the TTL of a save is still swallowed.
+    if (platform === 'win32' && inBurst && cur == null && e.hash !== EDITOR_DELETE_FINGERPRINT) return true;
+    recent.delete(absPath); // diverged → a genuine external edit; stop guarding it
     return false;
   };
   return { mark, isWrite };
