@@ -298,22 +298,18 @@ describe('moveEntityToScene — undo/redo', () => {
   });
 
   it('preserves world pose across the parent change (decision: preserve, not jump)', async () => {
-    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
-    const wt = mod.worldTransforms as Map<number, any>;
-    wt.clear();
+    // The poses are LIVE: the move reads the chains on demand, never the per-frame cache (#1848), so no pass has run.
     const { moveEntityToScene } = await getModule();
     const baseRow = spawn('BaseRow', { sourceScene: BASE });
+    baseRow.set(Transform, { x: 5 });
     const parent = spawn('Parent');
     const e = testWorld.spawn(Transform({ x: 10 }), EntityAttributes({ name: 'E', parentId: parent.id() }));
     entityIndex.set(e.id(), e);
-    wt.set(baseRow.id(), { x: 5, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    wt.set(e.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 
     moveEntityToScene(e.id(), BASE, { newParentId: baseRow.id() });
     let x = NaN;
     testWorld.query(Transform).updateEach(([tf]: any[], ent: any) => { if (ent.id() === e.id()) x = tf.x; });
     expect(x).toBeCloseTo(5, 5); // world x=10 under a parent whose world x=5 → local x=5
-    wt.clear();
   });
 });
 

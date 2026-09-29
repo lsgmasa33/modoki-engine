@@ -9,7 +9,6 @@ import { readTraitData, getAllEntities, buildEntityTree } from '@modoki/engine/r
 import { reparentEntity, setActionCallback } from '@modoki/engine/editor';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { pushAction, clearHistory, undo, redo, canUndo } from '@modoki/engine/editor';
-import { worldTransforms } from '@modoki/engine/runtime';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -41,11 +40,6 @@ describe('reparentEntity', () => {
       EntityAttributes({ name: 'Sibling', sortOrder: 1 }),
     );
     siblingId = sibling.id();
-
-    // Populate worldTransforms for the test entities
-    worldTransforms.set(parentId, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    worldTransforms.set(childId, { x: 15, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    worldTransforms.set(siblingId, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
   });
 
   it('rejects reparenting to self', () => {
@@ -95,11 +89,10 @@ describe('reparentEntity', () => {
   });
 
   it('reorders within same parent (sort only, no transform change)', () => {
-    const child2 = spawnEntity(getCurrentWorld(), 
+    spawnEntity(getCurrentWorld(), 
       Transform({ x: 1, y: 0, z: 0 }),
       EntityAttributes({ name: 'Child2', sortOrder: 5, parentId: parentId }),
     );
-    worldTransforms.set(child2.id(), { x: 11, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 
     // Reorder child under same parent with different sortOrder
     const result = reparentEntity(childId, parentId, 10);

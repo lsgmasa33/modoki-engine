@@ -1,7 +1,6 @@
 /** Editor-only entity actions with undo support.
  *  Wraps runtime entityUtils with undo/redo tracking. */
 
-import * as THREE from 'three';
 import { emptyDocMap, hasDocKey } from '../../runtime/core/docKeys';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
@@ -24,8 +23,7 @@ import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../run
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
 import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
-import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
-import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
+import { reparentSuffixes, reparentWrite, mergeTrs, IDENTITY_TRS, type PoseHierarchy } from '../../runtime/scene/transformSpace';
 import { pushAction, type EditDetail } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
@@ -1088,19 +1086,41 @@ export function deleteEntityWithUndo(entityId: number): void {
 
 // ── Reparent with undo ──
 
-function matrixFromTransform(tf: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }): THREE.Matrix4 {
-  const pos = new THREE.Vector3(tf.x, tf.y, tf.z);
-  const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(tf.rx, tf.ry, tf.rz));
-  const scale = new THREE.Vector3(tf.sx, tf.sy, tf.sz);
-  return new THREE.Matrix4().compose(pos, quat, scale);
+/** The live hierarchy a reparent walks, read ON DEMAND, node by node — only the two chains the move asks about. Never the
+ *  per-frame `worldTransforms` cache (#1848): it is only as fresh as the last propagation pass, so a parent created, or a
+ *  mover edited, since then was read at its stale pose — the mover jumped by the new parent's offset, or the reparent
+ *  undid the edit. An entity with no Transform places nothing (`PoseHierarchy.places`), as in `transformPropagationSystem`. */
+function liveHierarchy(transformMeta: TraitMeta, attrMeta: TraitMeta): PoseHierarchy<number> {
+  return {
+    parentOf: (id) => Number(readTraitData(id, attrMeta)?.parentId) || null,
+    places: (id) => !!readTraitData(id, transformMeta),
+    trsOf: (id) => mergeTrs(IDENTITY_TRS, readTraitData(id, transformMeta) ?? {}),
+  };
 }
 
-function decomposeMatrix(mat: THREE.Matrix4): { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number } {
-  const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const scale = new THREE.Vector3();
-  decomposeTrs(mat, pos, quat, scale); // singular-safe — see #258
-  const euler = new THREE.Euler().setFromQuaternion(quat);
-  return { x: pos.x, y: pos.y, z: pos.z, rx: euler.x, ry: euler.y, rz: euler.z, sx: scale.x, sy: scale.y, sz: scale.z };
+/** The minimal Transform write that keeps `entityId`'s world pose under `newParentId` (0 = the root), from its LIVE local
+ *  pose and the live chains — `reparentWrite`, the owner the file route shares. */
+function liveReparentWrite(entityId: number, newParentId: number, local: Record<string, unknown>, transformMeta: TraitMeta, attrMeta: TraitMeta):
+  ReturnType<typeof reparentWrite> {
+  const { from, to } = reparentSuffixes(liveHierarchy(transformMeta, attrMeta), entityId, newParentId || null);
+  return reparentWrite(mergeTrs(IDENTITY_TRS, local), from, to);
 }
+
+/** Whether moving `entityId` under `newParentId` must be refused because the new chain has ZERO scale (#1848,
+ *  docs/scene-loading.md § "A reparent keeps the world pose"): no local transform keeps the world pose there. `planReparent` asks it, so every entry point refuses before it
+ *  writes anything; `reparentEntity` and `moveEntityToScene` keep it as the backstop for a direct caller. */
+function collapsesUnder(entityId: number, newParentId: number): boolean {
+  const transformMeta = getTraitByName('Transform');
+  const attrMeta = getTraitByName('EntityAttributes');
+  const local = transformMeta && attrMeta && newParentId ? readTraitData(entityId, transformMeta) : null;
+  return !!local && 'collapsed' in liveReparentWrite(entityId, newParentId, local, transformMeta!, attrMeta!);
+}
+
+/** A move under a zero-scale parent (`collapsesUnder`). */
+export type CollapsedParentRefusal = 'collapsed-parent';
+
+/** The editor's words for a move refused under a zero-scale parent, used by every entry point. */
+export const COLLAPSED_PARENT_REFUSAL_TEXT = "The new parent's chain has ZERO scale, which collapses every child onto its origin, so no local transform keeps the moved object's world pose. Give that ancestor a non-zero scale first.";
 
 /** The root of the OUTERMOST prefab instance `nodeId` sits in: the instance root of its topmost ancestor
  *  (itself included) that carries `PrefabInstance`, or 0 when none does. A member moved anywhere under the
@@ -1331,26 +1351,17 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // tag — folded into this action's undo/redo so Cmd+Z restores the tag too.
   const clearFolder = parentChanged && newParentId !== 0 && oldFolder !== '';
 
-  // Compensate local transform to preserve world position (only if entity has Transform)
-  const fields = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
+  // Keep the world pose (only if the entity has a Transform), writing only what the move changes (#1848).
   let oldLocal: Record<string, any> | null = null;
   let newLocal: Record<string, number> | null = null;
 
   if (parentChanged && transformMeta) {
     oldLocal = readTraitData(entityId, transformMeta);
     if (oldLocal) {
-      const entityWorld = worldTransforms.get(entityId);
-      const entityWorldMatrix = entityWorld
-        ? matrixFromTransform(entityWorld)
-        : matrixFromTransform(oldLocal as any);
-      let newParentWorldMatrix = new THREE.Matrix4();
-      if (newParentId !== 0) {
-        const parentWorld = worldTransforms.get(newParentId);
-        if (parentWorld) newParentWorldMatrix = matrixFromTransform(parentWorld);
-      }
-      const invParent = newParentWorldMatrix.clone().invert();
-      newLocal = decomposeMatrix(new THREE.Matrix4().multiplyMatrices(invParent, entityWorldMatrix));
-      for (const f of fields) writeTraitField(entityId, transformMeta, f, newLocal[f]);
+      const kept = liveReparentWrite(entityId, newParentId, oldLocal, transformMeta, attrMeta);
+      if ('collapsed' in kept) { reportWriteRefusal(`"${entityNameOf(entityId)}" was not moved: ${COLLAPSED_PARENT_REFUSAL_TEXT}`); return false; }
+      newLocal = kept.write as Record<string, number> | null;
+      if (newLocal) for (const [f, v] of Object.entries(newLocal)) writeTraitField(entityId, transformMeta, f, v);
     }
   }
 
@@ -1473,7 +1484,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       writeTraitField(id, attrMeta!, 'parentId', parent);
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
-      if (savedOldLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
+      // Only the keys the move wrote: an edit since to any other field is not the move's to undo.
+      if (savedOldLocal && savedNewLocal && transformMeta) { for (const f of Object.keys(savedNewLocal)) writeTraitField(id, transformMeta, f, savedOldLocal[f]); }
       restoreMarks(id, oldMarks);
       markStructureDirty();
     },
@@ -1484,7 +1496,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       // would re-reconcile a mark the move never touched and drop a stored override equal to the base.
       if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
-      if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
+      if (savedNewLocal && transformMeta) { for (const [f, v] of Object.entries(savedNewLocal)) writeTraitField(id, transformMeta, f, v); }
       if (detaching) applyDetach(); // re-strip after the move
       if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
@@ -1577,7 +1589,7 @@ function rewriteEntityRefsForGuid(oldGuid: string, newGuid: string): RefRewrite[
 
 export interface SceneMoveResult {
   ok: boolean;
-  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | SceneMoveRefusal | RestructureRefusal;
+  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | 'collapsed-parent' | SceneMoveRefusal | RestructureRefusal;
   /** Live ids of every entity re-stamped (the subtree, root first). */
   movedIds: number[];
   /** True when the root's parentId was cleared (landed at the target scene's
@@ -1662,24 +1674,19 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   // means something there).
   const clearFolder = parentChanged && newParentId !== 0 && oldFolder !== '';
 
-  // Preserve world pose across the parent change (owner decision) — identical
-  // math to reparentEntity's (module-private matrixFromTransform/decomposeMatrix
-  // defined above in this file).
-  const fields = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
+  // Preserve world pose across the parent change (owner decision), writing only what the move changes — the owner
+  // reparentEntity computes with (#1848).
   let oldLocal: Record<string, number> | null = null;
   let newLocal: Record<string, number> | null = null;
   if (parentChanged && transformMeta) {
     oldLocal = readTraitData(entityId, transformMeta) as Record<string, number> | null;
     if (oldLocal) {
-      const entityWorld = worldTransforms.get(entityId);
-      const entityWorldMatrix = entityWorld ? matrixFromTransform(entityWorld) : matrixFromTransform(oldLocal as any);
-      let newParentWorldMatrix = new THREE.Matrix4();
-      if (newParentId !== 0) {
-        const parentWorld = worldTransforms.get(newParentId);
-        if (parentWorld) newParentWorldMatrix = matrixFromTransform(parentWorld);
+      const kept = liveReparentWrite(entityId, newParentId, oldLocal, transformMeta, attrMeta);
+      if ('collapsed' in kept) {
+        reportWriteRefusal(`"${rootInfo.name}" was not moved: ${COLLAPSED_PARENT_REFUSAL_TEXT}`);
+        return { ...NULL_MOVE_RESULT, reason: 'collapsed-parent' };
       }
-      const invParent = newParentWorldMatrix.clone().invert();
-      newLocal = decomposeMatrix(new THREE.Matrix4().multiplyMatrices(invParent, entityWorldMatrix));
+      newLocal = kept.write as Record<string, number> | null;
     }
   }
 
@@ -1720,7 +1727,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', parent);
     writeTraitFieldMarked(rid, attrMeta, 'sortOrder', newSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', '');
-    if (newLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, newLocal[f]);
+    if (newLocal && transformMeta) for (const [f, v] of Object.entries(newLocal)) writeTraitField(rid, transformMeta, f, v);
     if (oldLocal && newLocal) markCompensatedTransform(rid, oldLocal, newLocal);
   };
   const undoStamps = ({ ids, parent }: { ids: number[]; parent: number }) => {
@@ -1729,7 +1736,8 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     if (parentChanged) writeTraitField(rid, attrMeta, 'parentId', parent);
     writeTraitField(rid, attrMeta, 'sortOrder', oldSortOrder);
     if (clearFolder) writeTraitField(rid, attrMeta, 'editorFolder', oldFolder);
-    if (oldLocal && transformMeta) for (const f of fields) writeTraitField(rid, transformMeta, f, oldLocal[f]);
+    // Only the keys the move wrote: an edit since to any other field is not the move's to undo.
+    if (oldLocal && newLocal && transformMeta) for (const f of Object.keys(newLocal)) writeTraitField(rid, transformMeta, f, oldLocal[f]);
     restoreMarks(rid, rootMarks);
   };
   const rootMarks = captureMarks(entityId);
@@ -1835,7 +1843,7 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason | RestructureRefusal }
+  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason | RestructureRefusal | CollapsedParentRefusal }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
@@ -1854,6 +1862,9 @@ export function planReparent(entityId: number, newParentId: number, newSortOrder
   const oldSort = ea ? Number((readTraitData(entityId, ea) as { sortOrder?: number } | null)?.sortOrder ?? 0) : 0;
   const reorder = newSortOrder !== undefined && newSortOrder !== oldSort;
   if (restructureRefusal({ id: entityId, parentId: newParentId, reorder })) return { kind: 'refused', reason: 'restructure' };
+  // No local transform keeps the world pose under a zero-scale parent (#1848). Asked here, in the plan, so a multi-target
+  // field write refuses before its first target moves, and the op names the reason instead of reading a no-op.
+  if (collapsesUnder(entityId, newParentId)) return { kind: 'refused', reason: 'collapsed-parent' };
   // Un-parenting keeps the entity's own scene: a root belongs to whichever file stamps it.
   if (newParentId === 0) return { kind: 'same-scene' };
   const from = rawSourceScene(entityId);

@@ -55,7 +55,7 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
-  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, partOfInstanceRefusal,
+  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, partOfInstanceRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
@@ -697,6 +697,7 @@ function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>[
   if (reason in PREFAB_EDIT_REFUSAL_TEXT) return `${op}: refused to move ${id} under ${parentId} — ${PREFAB_EDIT_REFUSAL_TEXT[reason as keyof typeof PREFAB_EDIT_REFUSAL_TEXT]}`;
   switch (reason) {
     case 'restructure': return `${op}: refused to move or reorder ${id} — ${RESTRUCTURE_REFUSAL_TEXT} ${id} is part of a prefab instance: the prefab supplies it (a member, a nested prefab, or a node the prefab added), and only objects the scene added move inside an instance. Nothing was applied.`;
+    case 'collapsed-parent': return `${op}: refused to move ${id} under ${parentId} — ${COLLAPSED_PARENT_REFUSAL_TEXT} Nothing was applied.`;
     case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
     default: return `${op}: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;

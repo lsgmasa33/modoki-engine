@@ -96,10 +96,6 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   transformName: (n: string) => n,
 }));
 
-// Mock worldTransforms (used by reparentEntity)
-vi.mock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
-  worldTransforms: new Map(),
-}));
 
 // Capture pushed actions
 let pushedActions: { label: string; undo: () => void | Promise<void>; redo: () => void | Promise<void> }[] = [];
@@ -830,30 +826,19 @@ describe('reparentEntity core rules (panels #1)', () => {
   });
 
   it('compensates the local transform on parent change to preserve world position', async () => {
-    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
-    const wt = mod.worldTransforms as Map<number, any>;
-    wt.clear();
     const { reparentEntity } = await getModule();
     const p = spawnEntity('P', { x: 10 });
     const c = spawnEntity('C', { x: 10 }); // world (10,0,0) at root
-    wt.set(p.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    wt.set(c.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 
     expect(reparentEntity(c.id(), p.id())).toBe(true);
-    // local = inv(parentWorld) * childWorld → x: 10 - 10 = 0 (stays at world x=10 under P)
+    // local = inv(parent) · child, over the LIVE chains (#1848) → x: 10 - 10 = 0 (stays at world x=10 under P)
     expect(tfOf(c.id()).x).toBeCloseTo(0, 5);
-    wt.clear();
   });
 
   it('undo restores parent + sortOrder + local transform; redo re-applies', async () => {
-    const mod = await import('../../src/runtime/core/ecs/transformPropagationSystem');
-    const wt = mod.worldTransforms as Map<number, any>;
-    wt.clear();
     const { reparentEntity } = await getModule();
     const p = spawnEntity('P', { x: 10 });
     const c = spawnEntity('C', { x: 10 });
-    wt.set(p.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    wt.set(c.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 
     reparentEntity(c.id(), p.id(), 7);
     expect(attrOf(c.id())).toEqual({ parentId: p.id(), sortOrder: 7 });
@@ -867,7 +852,6 @@ describe('reparentEntity core rules (panels #1)', () => {
     action.redo();
     expect(attrOf(c.id())).toEqual({ parentId: p.id(), sortOrder: 7 });
     expect(tfOf(c.id()).x).toBeCloseTo(0, 5);
-    wt.clear();
   });
 });
 

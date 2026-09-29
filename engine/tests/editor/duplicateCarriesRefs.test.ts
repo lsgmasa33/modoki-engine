@@ -21,7 +21,7 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode,
-  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, worldTransforms, getOverrideMarkSet, registerTrait, type SceneData,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, getOverrideMarkSet, registerTrait, type SceneData,
 } from '@modoki/engine/runtime';
 import {
   duplicateEntity, writeTraitFieldWithUndo, setActionCallback, pushAction, clearHistory, serializeScene,
@@ -384,16 +384,15 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     const panel = idAt('Holder/OuterRoot/Panel');
     const entityOf = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
     const before = [...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort();
-    worldTransforms.set(panel, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    worldTransforms.set(solo, { x: 0, y: 4, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    try {
-      reparentEntity(solo, panel);
-      expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
-      await undo();
-      expect([...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort()).toEqual(before);
-      await redo();
-      expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
-    } finally { worldTransforms.delete(panel); worldTransforms.delete(solo); }
+    // Panel "moved" to x=10 in the LIVE world: the reparent reads the chains on demand, never the per-frame cache (#1848).
+    const tfTrait = getTraitByName('Transform')!.trait;
+    entityOf(panel).set(tfTrait, { ...(entityOf(panel).get(tfTrait) as object), x: 10 });
+    reparentEntity(solo, panel);
+    expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
+    await undo();
+    expect([...(getOverrideMarkSet(entityOf(solo)) ?? [])].sort()).toEqual(before);
+    await redo();
+    expect(getOverrideMarkSet(entityOf(solo))?.has('Transform.x')).toBe(true);
     await load(await serializeScene() as unknown as SceneData);
     const tf = entityOf(idAt('Holder/OuterRoot/Panel/Solo')).get(getTraitByName('Transform')!.trait) as { x: number; y: number };
     expect(linked(idAt('Holder/OuterRoot/Panel/Solo'))).toBe(true);

@@ -13,7 +13,7 @@
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
 import { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentLinkRefusal, type ParentGraph } from '../core/ecs/parentLink';
-import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, reparentSuffixes, isTemplatePlaced, sameTrsMatrix, sameRotationScale, rotationKeepingScale, IDENTITY_TRS, type TRS } from './transformSpace';
+import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, fileHierarchy, reparentSuffixes, reparentWrite, isTemplatePlaced, sameTrsMatrix, sameRotationScale, IDENTITY_TRS, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */
@@ -593,7 +593,8 @@ function judgeFileParent(scene: MutableScene, entity: MutableEntity, raw: unknow
  *
  *  Only what the move depends on is read: the two parent chains below their shared prefix (`reparentSuffixes`), since
  *  the shared part cancels. When those compose to the same pose the entity keeps its local transform exactly — whatever
- *  its own local is, even one this file cannot read. Otherwise it is recomputed, and only what CHANGES is written: the
+ *  its own local is, even one this file cannot read. Otherwise it is recomputed by `reparentWrite` (the owner the live
+ *  reparent shares, #1848), and only what CHANGES is written: the
  *  position group when it moves, and the rotation and scale groups only when their LINEAR part changes
  *  (`sameRotationScale`). A decomposition picks its own Euler angles and mirror axis, so comparing numbers rewrote an
  *  untouched `{sy:-1}` as `{sx:-1, rz:π}` and a backwards yaw as `{rx:-π, ry:…, rz:-π}` on every move — not equivalent
@@ -605,7 +606,7 @@ function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: Mu
   { write: Record<string, number> | null; warning?: string } | { error: string } {
   const stored = storedTransformOf(entity);
   if (!stored && !entity.prefab) return { write: null };
-  const { from, to, unknown } = reparentSuffixes(scene.entities, entity, newParent);
+  const { from, to, unknown } = reparentSuffixes(fileHierarchy(scene.entities), entity, newParent);
   // A suffix entry this file cannot read makes that suffix's pose a guess, so "same pose" cannot be judged either. The
   // entity's OWN local, by contrast, cancels when the suffixes match — so it is asked only after.
   const same = !unknown && sameTrsMatrix(from, to);
@@ -621,29 +622,16 @@ function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: Mu
   if (who) {
     return { write: null, warning: `${who} takes part of its placement from its prefab, which this route does not read, so the world pose cannot be kept: the entity kept its LOCAL transform and its world position follows the new parent. modoki_reparent_entity with the scene open keeps it` };
   }
-  const collapsed = collapsedParentAxes(to);
-  if (collapsed) {
-    return { error: `the new parent's chain has ZERO scale on ${collapsed.join('/')}, which collapses every child onto its origin, so no local transform keeps this entity's world pose. Give that ancestor a non-zero scale first` };
+  // The write itself is the one owner every reparent route shares (#1848). A template-placed root is compensated on its
+  // POSITION only: its rotation and scale are partly in the template, and a rotation written into the partial override
+  // would replace the template's (fifth review: a 5e-5 rad suffix turn that the suffix check's tolerance let through
+  // wrote `rx`, dropping a template `rx:0.4`).
+  const kept = reparentWrite(mergeTrs(IDENTITY_TRS, stored ?? {}), from, to, { positionOnly: isTemplatePlaced(entity) });
+  if ('collapsed' in kept) {
+    return { error: `the new parent's chain has ZERO scale on ${kept.collapsed.join('/')}, which collapses every child onto its origin, so no local transform keeps this entity's world pose. Give that ancestor a non-zero scale first` };
   }
-  const local = mergeTrs(IDENTITY_LOCAL, stored ?? {});
-  const next = worldToLocalTrs(localToWorldTrs(local, from), to);
-  const write: Record<string, number> = {};
-  if ((['x', 'y', 'z'] as const).some((k) => Math.abs(next[k] - local[k]) > 1e-9)) for (const k of ['x', 'y', 'z'] as const) write[k] = next[k];
-  // A template-placed root is compensated on its POSITION only: its rotation and scale are partly in the template, and a
-  // rotation written into the partial override would replace the template's (fifth review: a 5e-5 rad suffix turn that
-  // the suffix check's tolerance let through wrote `rx`, dropping a template `rx:0.4`).
-  if (isTemplatePlaced(entity)) return { write: Object.keys(write).length ? write : null };
-  if (!sameRotationScale(next, local)) {
-    // A pure turn keeps the authored scale — mirror sign included — and writes only the rotation; the scale group is
-    // written only when the linear part changed scale or shear too (then the decomposition's spelling is all there is).
-    const turned = rotationKeepingScale(next, local);
-    if (turned) Object.assign(write, turned);
-    else for (const k of ['rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const) write[k] = next[k];
-  }
-  return { write: Object.keys(write).length ? write : null };
+  return { write: kept.write as Record<string, number> | null };
 }
-
-const IDENTITY_LOCAL: TRS = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
 
 /** Collect an entity id plus all descendants (by EntityAttributes.parentId).
  *  Works whether parentId is a GUID (current) or a numeric file id (legacy), and

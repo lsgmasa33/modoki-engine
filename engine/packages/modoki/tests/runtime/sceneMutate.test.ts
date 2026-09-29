@@ -719,6 +719,20 @@ describe("setTrait {space:'world'} — authoring in world coordinates (file path
     expect(tf(scene, 1)).toEqual({ x: 42, y: 6 }); // untouched keys stay byte-identical
   });
 
+  // An entry with no Transform places nothing: propagation puts its children at the root, so the chain ends there and
+  // G's offset is not part of C's world pose (#1848 close-out; the live conversion breaks there too). Every fixture above
+  // has a Transform-less ROOT ancestor, where stopping and composing identity agree. Mutation: compose every ancestor in
+  // `ancestors` (places: () => true) — C gets x:-5.
+  it('stops the parent chain at an entry with no Transform', () => {
+    const scene: MutableScene = { entities: [
+      { id: 1, traits: { EntityAttributes: { name: 'G', guid: 'g-g', parentId: 0 }, Transform: { x: 10 } } },
+      { id: 2, traits: { EntityAttributes: { name: 'HUD', guid: 'g-hud', parentId: 'g-g' } } },
+      { id: 3, traits: { EntityAttributes: { name: 'C', guid: 'g-c', parentId: 'g-hud' }, Transform: { x: 1 } } },
+    ] };
+    expect(applyOps(scene, [{ op: 'setTrait', entity: { id: 3 }, trait: 'Transform', space: 'world', fields: { x: 5 } }]).errors).toEqual([]);
+    expect(tf(scene, 3).x).toBe(5);
+  });
+
   it("REFUSES `space` on a non-Transform trait rather than ignoring it", () => {
     // Never silently accept a parameter that does nothing — it implies a conversion that
     // never happened.
@@ -920,6 +934,24 @@ describe('applyOps — setTrait parentId keeps the world pose (#1847)', () => {
     // …and to the root: the world pose becomes the local one.
     applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-c' }, trait: 'EntityAttributes', fields: { parentId: 0 } }], mint);
     close(byName(s, 'C').traits.Transform as never, before as never);
+  });
+
+  // An entry with no Transform loads with none, so propagation puts its children at the root (#1848 close-out re-review):
+  // a move under it keeps the world pose as the local one, and a move out of it starts from the local pose as the world
+  // one. The live reparent answers the same (reparentWorldPose.test.ts). Mutation: drop `places` in chainOf, or in
+  // reparentSuffixes' new chain — M lands at x:-10 (into HUD) or x:11 (out of it).
+  it('a parent with no Transform holds its children at the root, both ways', () => {
+    const s = scene();
+    s.entities.push(
+      { id: 20, name: 'G', traits: { EntityAttributes: { name: 'G', guid: 'g-g10', parentId: 0 }, Transform: { x: 10 } } },
+      { id: 21, name: 'HUD', traits: { EntityAttributes: { name: 'HUD', guid: 'g-hud', parentId: 'g-g10' } } },
+      { id: 22, name: 'M', traits: { EntityAttributes: { name: 'M', guid: 'g-m', parentId: 0 }, Transform: { x: 0, y: 3 } } },
+      { id: 23, name: 'N', traits: { EntityAttributes: { name: 'N', guid: 'g-n', parentId: 'g-hud' }, Transform: { x: 1 } } },
+    );
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-m' }, trait: 'EntityAttributes', fields: { parentId: 'g-hud' } }], mint).errors).toEqual([]);
+    expect(byName(s, 'M').traits.Transform).toEqual({ x: 0, y: 3 });
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-n' }, trait: 'EntityAttributes', fields: { parentId: 0 } }], mint).errors).toEqual([]);
+    expect(byName(s, 'N').traits.Transform).toEqual({ x: 1 });
   });
 
   // Only the persisted groups that change are written: a position-only move adds no rotation or scale keys, and an entity

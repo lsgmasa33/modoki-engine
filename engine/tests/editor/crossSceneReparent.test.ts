@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld, worldTransforms,
+  createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, getCurrentWorld,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, serializeScene, undo, redo, planReparent } from '@modoki/engine/editor';
 import { getOverrideMarkSet } from '@modoki/engine/runtime';
@@ -49,6 +49,7 @@ const spawn = (name: string, extra: Record<string, unknown> = {}) =>
 /** Link a live entity into a prefab instance the way an instantiate does. */
 const link = (e: Ent, localId: number, rootInstanceId: number, parentLocalId = 0) =>
   (getCurrentWorld().entities.find((x) => x.id() === e.id()) as any).add(PrefabInstance({ source: 'x', localId, rootInstanceId, parentLocalId }));
+const liveOf = (id: number) => getCurrentWorld().entities.find((x) => x.id() === id)!;
 const namesIn = async (scene?: typeof BASE_FILE) =>
   JSON.stringify((await serializeScene(scene ? { scene } : undefined)).entities);
 
@@ -273,14 +274,49 @@ describe('apply-scene-ops: a same-scene parentId write is a real reparent (#1434
   it('keeps the world position, clears the folder tag, and writes the other fields in the op', async () => {
     const shelf = spawn('Shelf');
     const kid = spawn('Kid', { editorFolder: 'Props' });
-    worldTransforms.set(shelf.id(), { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    worldTransforms.set(kid.id(), { x: 3, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-    try {
-      expect((await setParent(kid, shelf.id(), { name: 'Renamed' })).errors).toEqual([]);
-      expect(attrs(kid.id())).toMatchObject({ parentId: shelf.id(), name: 'Renamed' });
-      expect((getCurrentWorld().entities.find((e) => e.id() === kid.id())!.get(EntityAttributes) as { editorFolder: string }).editorFolder).toBe('');
-      expect(tf(kid.id()).x).toBeCloseTo(-7);
-    } finally { worldTransforms.delete(shelf.id()); worldTransforms.delete(kid.id()); }
+    // The poses are LIVE: the reparent reads the chains on demand, never the per-frame cache (#1848).
+    liveOf(shelf.id()).set(Transform, { x: 10 });
+    liveOf(kid.id()).set(Transform, { x: 3 });
+    expect((await setParent(kid, shelf.id(), { name: 'Renamed' })).errors).toEqual([]);
+    expect(attrs(kid.id())).toMatchObject({ parentId: shelf.id(), name: 'Renamed' });
+    expect((getCurrentWorld().entities.find((e) => e.id() === kid.id())!.get(EntityAttributes) as { editorFolder: string }).editorFolder).toBe('');
+    expect(tf(kid.id()).x).toBeCloseTo(-7);
+  });
+
+  // #1848 close-out review: a zero-scale parent is refused in the PLAN, so every agent entry point names it and nothing
+  // lands. It used to be refused only inside reparentEntity: apply-scene-ops answered ok with no error, reparent-entity
+  // said "nothing changed — already under", and a two-target set-traits moved one target and refused the other.
+  // Mutation (all three): drop the `collapsesUnder` refusal in planReparent.
+  describe('a zero-scale new parent is refused by every agent entry point, before anything is applied', () => {
+    it('apply-scene-ops setTrait parentId', async () => {
+      const flat = spawn('Flat');
+      liveOf(flat.id()).set(Transform, { sz: 0 });
+      const kid = spawn('Kid');
+      expect((await setParent(kid, flat.id(), { name: 'Renamed' })).errors.join('\n')).toMatch(/ZERO scale/);
+      expect(attrs(kid.id())).toMatchObject({ parentId: 0, name: 'Kid' });
+    });
+
+    it('reparent-entity names the reason, not a no-op', async () => {
+      const flat = spawn('Flat');
+      liveOf(flat.id()).set(Transform, { sy: 0 });
+      const kid = spawn('Kid');
+      await expect(runAgentOp('reparent-entity', { guid: guidOf(kid), parentGuid: guidOf(flat) })).rejects.toThrow(/ZERO scale/);
+      expect(attrs(kid.id()).parentId).toBe(0);
+    });
+
+    it('a two-target set-traits refuses the whole call: the target that could move does not', async () => {
+      // A's move from G to P cancels G (the shared prefix) and would be legal alone; B's, from the root, is not.
+      const g = spawn('G');
+      liveOf(g.id()).set(Transform, { sx: 0 });
+      const p = spawn('P', { parentId: g.id() });
+      const a = spawn('MoverA', { parentId: g.id() });
+      const b = spawn('MoverB');
+      expect(planReparent(a.id(), p.id()).kind).toBe('same-scene'); // …and A alone is allowed: the whole-call refusal is B's
+      const r = await runAgentOp('set-traits', { where: 'EntityAttributes.name~Mover', set: { 'EntityAttributes.parentId': p.id() } }).catch((e: unknown) => ({ thrown: String(e) }));
+      expect(JSON.stringify(r)).toMatch(/ZERO scale/);
+      expect(attrs(a.id()).parentId).toBe(g.id());
+      expect(attrs(b.id()).parentId).toBe(0);
+    });
   });
 });
 
@@ -323,8 +359,7 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       // Slot sits at x=10 and the coin at the origin, so the move writes local x=-10: an override the base
       // must save, or the coin reloads at Slot's origin. Mutation: drop the markCompensatedTransform call
       // in moveEntityToScene's applyStamps.
-      worldTransforms.set(slot, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
-      worldTransforms.set(coin, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+      liveOf(slot).set(Transform, { x: 10 });
       await runAgentOp('reparent-entity', { guid: attrs(coin).guid, parentGuid: attrs(slot).guid, moveToScene: true });
       const live = getCurrentWorld().entities.find((e) => e.id() === coin)!;
       expect(attrs(coin)).toMatchObject({ parentId: slot, sourceScene: BASE });
@@ -340,7 +375,7 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       expect(marks()).toContain('Transform.x');
       await undo();
       expect(marks()).not.toContain('Transform.x');
-    } finally { setPrefabCache(COIN, null); worldTransforms.clear(); }
+    } finally { setPrefabCache(COIN, null); }
   });
 
   // #1709: an instance root saves its sortOrder only when it is override-marked, and every sortOrder rewrite used to

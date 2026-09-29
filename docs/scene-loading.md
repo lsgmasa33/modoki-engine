@@ -1311,7 +1311,7 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434); a member's parent write is refused since #1869, below. A string parent is a guid; one matching no live entity is refused |
   | agent `set-traits` `parentId` in the EDITOR (eval `modoki.setTraits`) | the same answer as `apply-scene-ops`, in the same words: both write through `writeTraitAsEditor` (`agentEditorOps.ts`, #1816), whose parent change is `fieldParentWriteRefusal` then `applyReparent`. EVERY target is planned before ANY write, so one refused target refuses the call and nothing lands; a posed world refuses. The editor REPLACES the device's op, and the whole call is one composite undo entry with the parent written first, so a parent and a Transform in one call undo and redo together. Until #1787 the device's raw op ran here and its write reached the field past `planReparent`; until #1816 every other field was still raw. The device keeps the raw write behind its self/cycle/resource guard |
   | a parent written on an entity that LACKS `EntityAttributes` (apply-scene-ops `setTrait`, `set-traits`) | the trait is seeded WITHOUT the parent, then the parent goes through the reparent above (#1825); it used to be seeded raw, past every check |
-  | file-direct `scene-mutate` `setTrait parentId` (`modoki_mutate_scene` with no editor holding the scene) | judged by `parentLinkRefusal` (`runtime/core/ecs/parentLink.ts`), the rule `reparentRefusal` asks of the live world, over the FILE's entries: self, cycle and (with the schema's resource traits) resource are refused, and a parent naming no entry of the file is refused, never stored — a prefab member is not an entry, so a member parent needs the live editor. On an instance ROOT the parent goes to the entry's own `traits.EntityAttributes`, where the loader reads it, not into its overrides, so Apply has nothing to carry (Unity: an instance root's parent is scene-side). It keeps the WORLD pose, as every live reparent does (#1847): the local Transform is recomputed under the new parent (`keepWorldPose`, over `transformSpace.ts`), writing only the groups that change, into the overrides for an instance root. Only the two parent chains BELOW their shared prefix matter (`reparentSuffixes` — the shared part cancels); when those compose to the same pose nothing is written, and otherwise position is written when it moves and rotation/scale only when their LINEAR part changes (`sameRotationScale`) — a decomposition picks its own Euler angles and mirror axis, and comparing numbers rewrote an untouched `{sy:-1}` as `{sx:-1, rz:π}`. A pure turn writes the rotation alone and keeps the authored scale, mirror sign included (`rotationKeepingScale`); the scale group is written only when the linear part changed scale or shear. A zero-scale new suffix is refused (no local keeps the pose). When the recompute needs a pose only partly in this file — an entry on either suffix, or the entity itself, is an instance root whose override does not store all nine Transform fields (`isTemplatePlaced`) — it keeps its LOCAL transform and warns, rather than computing against a guessed identity — except an instance root whose override stores x, y, z moved where the suffixes differ by translation only: its position depends on its translation alone, so that is compensated — its POSITION only: nothing ever writes rotation or scale into a partial override, where it would replace the template's. Exact for suffixes without shear (each is decomposed to one TRS). The LIVE reparent still writes all nine decomposed fields (#1848) |
+  | file-direct `scene-mutate` `setTrait parentId` (`modoki_mutate_scene` with no editor holding the scene) | judged by `parentLinkRefusal` (`runtime/core/ecs/parentLink.ts`), the rule `reparentRefusal` asks of the live world, over the FILE's entries: self, cycle and (with the schema's resource traits) resource are refused, and a parent naming no entry of the file is refused, never stored — a prefab member is not an entry, so a member parent needs the live editor. On an instance ROOT the parent goes to the entry's own `traits.EntityAttributes`, where the loader reads it, not into its overrides, so Apply has nothing to carry (Unity: an instance root's parent is scene-side). It keeps the WORLD pose, as every live reparent does (#1847): see [§ A reparent keeps the world pose](#a-reparent-keeps-the-world-pose-writing-only-what-the-move-changes-1848), into the overrides for an instance root. What is file-only: when the recompute needs a pose only partly in this file — an entry on either suffix, or the entity itself, is an instance root whose override does not store all nine Transform fields (`isTemplatePlaced`) — it keeps its LOCAL transform and warns, rather than computing against a guessed identity — except an instance root whose override stores x, y, z moved where the suffixes differ by translation only, which is compensated on its POSITION only (`positionOnly`): nothing ever writes rotation or scale into a partial override, where it would replace the template's |
   | file-direct `scene-mutate` `addEntity` (`op.parentId` or an authored `EntityAttributes.parentId`) | a parent naming no entry of the file, or a resource, re-roots the new entity with a warning, as the live create does; it used to store the orphan |
   | a generic write of `EntityAttributes.sourceScene`: `apply-scene-ops` / `modoki_mutate_scene` `setTrait`, `set-traits` (eval `modoki.setTraits`), file-direct `scene-mutate` (setTrait and addEntity) | **refused**, naming the scene move (`fieldWriteRefusal`, `traitEditPolicy.ts`). A field write stamped one entity and not its subtree, and could name a scene that is not loaded (#1757). Writing back the value the entity already has passes |
 
@@ -1356,6 +1356,57 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   spawned, warning loudly. Chain order means the **first scene to spawn a guid keeps
   it**. This is a transitional safety net for bases extracted by copy-and-thin (sling's
   two levels shared all 38 guids), not a statement about precedence.
+
+### A reparent keeps the world pose, writing only what the move changes (#1848)
+
+Every reparent route keeps the entity's WORLD pose by recomputing its local Transform, as Unity's `SetParent`,
+`transform.parent =` and `Undo.SetTransformParent` do: the Hierarchy drop, `reparent-entity`, apply-scene-ops /
+set-traits `parentId` (all `reparentEntity`), the scene move (`moveEntityToScene`), and the file route
+(`keepWorldPose`, table above). They compute it with ONE owner, `reparentWrite` in `runtime/scene/transformSpace.ts`,
+and each route supplies only the hierarchy it walks (`PoseHierarchy`): the scene file's entries (`fileHierarchy`) or the
+live world read node by node (`liveHierarchy` in `entityActions.ts`).
+
+- **Only the two parent chains BELOW their shared prefix matter** (`reparentSuffixes`): new local =
+  inv(to) · from · local, because the shared part cancels. When the suffixes compose to the same matrix, nothing is
+  written. **An entity with no Transform places nothing** (`PoseHierarchy.places`): `transformPropagationSystem` puts
+  its children at the root, so a chain ends there, and such a NEW parent is the root. Composing past it shifted the
+  mover by that entry's ancestors' offset (a HUD under G at x=10: -10 into it, 11 out of it). The file's
+  `space:'world'` conversion walks the same chain. In the file, a plain entry places exactly when it stores
+  `traits.Transform` (the loader adds none, and the serializer writes even an all-default one, as `Transform: {}`). An
+  instance entry is read as placing, but live it places only when its TEMPLATE root has a Transform, which the file
+  route cannot see: 19 of the repo's 125 prefabs, all UI, have a root without one. A reparent through such an instance
+  root keeps its local transform and warns (it is template-placed), while a `space:'world'` write under one is still
+  computed as if it placed (known gap, not fixed here).
+- **Only what changes is written.** The position group when it moves. The rotation and scale groups only when the
+  LINEAR part (rotation × scale, as one matrix: `sameRotationScale`) changes, so a translation-only parent change
+  never writes rotation or scale. A decomposition picks its own Euler angles and mirror axis. Writing all nine fields
+  re-spelled an untouched `{sy:-1}` as `{sx:-1, rz:-π}` and a backwards yaw `{ry:2.5}` as `{rx:-π, ry:0.64, rz:-π}`,
+  on every drag. A pure turn keeps the authored scale, mirror sign included (`rotationKeepingScale`), with a fresh XYZ
+  spelling of the new rotation. Unity's runtime value is a quaternion, and only its editor-only Euler hint keeps a
+  spelling, so no "closest to the old Euler" search is made. The scale group is written only when the linear part
+  changed scale or shear, and then the decomposition's spelling is the only one there is. Unity keeps `localRotation`
+  and `localScale` when the linear part is unchanged (INFERRED: its world-to-local conversion multiplies by the
+  parent's inverse rotation, and the native code is unpublished).
+- **The live routes read the hierarchy ON DEMAND, never the per-frame `worldTransforms` cache.** That cache is only as
+  fresh as the last `transformPropagationSystem` pass. Reading it, a parent created since the pass had no entry and read
+  as identity, so the mover jumped by the parent's offset (F2). A mover edited since the pass was compensated from its
+  old world pose, so the reparent silently undid the edit (F3). Both are agent paths: apply-scene-ops `addEntity` and
+  then `setTrait parentId` in one op list, or an eval.
+- **A zero-scale new chain is refused** on every route: no local transform keeps the pose. Live, the refusal is in
+  `planReparent` (`'collapsed-parent'`), the one decision every entry point asks before it writes, so the Hierarchy
+  toasts it, `reparent-entity` names it, and a multi-target `set-traits` refuses the whole call. Asked only inside
+  `reparentEntity`, it reached agents as a success, a "nothing changed", or a half-applied call. The file route returns
+  its own error. Unity calls zero scale "undefined results", so this is consistency, not
+  parity.
+- **Marks, undo and redo follow the write.** `markCompensatedTransform` marks, on a stored instance root, each WRITTEN
+  key whose number changed, as Unity records an override only for a value that differs. A translation-only move of a
+  mirrored root marks `x`/`y`; it used to pin the re-spelled `rz`/`sx`/`sy` as overrides, so later template rotation
+  changes stopped reaching that instance. Undo restores only the written keys, so an edit made since to any other
+  field survives it.
+- Known gap, shared with Unity: a non-uniformly scaled, rotated ancestor shears its children, and a TRS cannot hold
+  shear. Cancelling the shared prefix makes a move between siblings under such an ancestor exact.
+
+Tests: `engine/tests/editor/reparentWorldPose.test.ts` (live routes) and `sceneMutate.test.ts` (file route).
 
 ### Guid uniqueness is a PER-FILE rule, not a repo-wide one
 
@@ -1691,8 +1742,8 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   paths; the tests now assert the link itself.
   A reparent keeps the world pose by rewriting the local Transform, and on an entity still linked to
   an instance those values are OVERRIDES — which the save keeps only when marked. So
-  `reparentEntity` and `moveEntityToScene` mark the fields the compensation changed
-  (`markCompensatedTransform`), and undo puts the prior marks back. Unmarked, a linked root dropped
+  `reparentEntity` and `moveEntityToScene` mark the fields the compensation wrote and changed
+  (`markCompensatedTransform`, [§ A reparent keeps the world pose](#a-reparent-keeps-the-world-pose-writing-only-what-the-move-changes-1848)), and undo puts the prior marks back. Unmarked, a linked root dropped
   under a moved parent reloaded at the prefab's value, offset by the parent (#1436 review).
   `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
   refresh left the root unstamped, which the save reads as a user-added instance.

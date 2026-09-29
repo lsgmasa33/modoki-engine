@@ -145,22 +145,7 @@ function decompose(m: THREE.Matrix4): TRS {
  *  `parentId` is treated as root rather than throwing — `mutate_scene` already warns about
  *  those separately, and a conversion is not the place to fail the whole op). */
 function ancestors(entities: MutableEntity[], entity: MutableEntity): MutableEntity[] {
-  // Index by EVERY addressable key (numeric id AND guid), because a parent ref is a GUID in
-  // current files and a number in legacy ones — a map keyed on `e.id` alone could never match the
-  // common case, which is exactly how this returned "no parent" for every real entity.
-  const byKey = new Map<string | number, MutableEntity>();
-  for (const e of entities) for (const k of keysOf(e)) if (!byKey.has(k)) byKey.set(k, e);
-  const chain: MutableEntity[] = [];
-  const seen = new Set<MutableEntity>([entity]);
-  let ref = parentRefOf(entity);
-  for (let depth = 0; ref && depth < MAX_DEPTH; depth++) {
-    const p = byKey.get(ref);
-    if (!p || seen.has(p)) break; // missing parent, or a cycle
-    seen.add(p);
-    chain.unshift(p);
-    ref = parentRefOf(p);
-  }
-  return chain;
+  return chainOf(fileHierarchy(entities), entity);
 }
 
 /** `entity`'s PARENT's world transform, or null when it is at the root (world == local).
@@ -195,24 +180,101 @@ export function isTemplatePlaced(e: MutableEntity): boolean {
   return !t || !TRS_KEYS.every((k) => typeof t[k] === 'number');
 }
 
+/** A parent hierarchy a reparent walks: the scene FILE's entries ({@link fileHierarchy}), or the LIVE world read on demand
+ *  (`liveHierarchy` in `editor/undo/entityActions.ts`). `places` says whether a node holds its children in its frame —
+ *  one with no Transform does not, and `transformPropagationSystem` puts its children at the root (world = local), so a
+ *  chain ends there and such a new parent is the root (#1848 close-out: composing past it moved the mover by its
+ *  ancestors' offset). `unreadable` names a node whose local pose the source cannot read in full — only the file has one
+ *  (an instance root placed partly by its template). */
+export interface PoseHierarchy<N> {
+  parentOf(node: N): N | null;
+  places(node: N): boolean;
+  trsOf(node: N): TRS;
+  unreadable?(node: N): boolean;
+}
+
+/** The scene file's entries as a {@link PoseHierarchy}: parent refs of either form, an instance root's pose from its
+ *  overrides, and `isTemplatePlaced` as the unreadable test. A plain entry with no `traits.Transform` loads with none, so it
+ *  places nothing. An instance entry is read as placing: live it places only when its template root has a Transform,
+ *  which this file cannot see (docs/scene-loading.md § "A reparent keeps the world pose"). */
+export function fileHierarchy(entities: MutableEntity[]): PoseHierarchy<MutableEntity> {
+  // Index by EVERY addressable key (numeric id AND guid), because a parent ref is a GUID in current files and a number in
+  // legacy ones — a map keyed on `e.id` alone could never match the common case, which is exactly how this returned "no
+  // parent" for every real entity. A missing parent reads as the root: a dangling `parentId` is not treated as an error
+  // (`mutate_scene` already warns about those separately, and a conversion is not the place to fail the whole op).
+  const byKey = new Map<string | number, MutableEntity>();
+  for (const e of entities) for (const k of keysOf(e)) if (!byKey.has(k)) byKey.set(k, e);
+  return {
+    parentOf: (e) => { const ref = parentRefOf(e); return (ref && byKey.get(ref)) || null; },
+    places: (e) => !!e.prefab || !!e.traits?.Transform,
+    trsOf,
+    unreadable: isTemplatePlaced,
+  };
+}
+
+/** `node`'s ancestors that place it, root-first. Stops at a missing parent, one that places nothing (`places`), a cycle,
+ *  or the depth cap. */
+function chainOf<N>(h: PoseHierarchy<N>, node: N): N[] {
+  const chain: N[] = [];
+  const seen = new Set<N>([node]);
+  for (let p = h.parentOf(node), depth = 0; p != null && h.places(p) && !seen.has(p) && depth < MAX_DEPTH; p = h.parentOf(p), depth++) {
+    seen.add(p);
+    chain.unshift(p);
+  }
+  return chain;
+}
+
 /** What a reparent of `entity` under `newParent` (null = the root) actually depends on (#1847): the two parent chains
  *  BELOW their shared prefix. new local = inv(to) · from · local, because the shared part cancels (exactly for suffixes
- *  without shear: each suffix is decomposed to one TRS, as `parentWorldTrs` decomposes a whole chain) — so an entry on it
- *  whose pose this file cannot read (`isTemplatePlaced`) does not matter, and one on either suffix does (`unknown`). */
-export function reparentSuffixes(entities: MutableEntity[], entity: MutableEntity, newParent: MutableEntity | null):
-  { from: TRS | null; to: TRS | null; unknown?: MutableEntity } {
-  const oldChain = ancestors(entities, entity);                                   // root-first, ends at the old parent
-  const newChain = newParent ? [...ancestors(entities, newParent), newParent] : [];
+ *  without shear: each suffix is decomposed to one TRS, as `parentWorldTrs` decomposes a whole chain) — so a node on it
+ *  whose pose the source cannot read (`unreadable`) does not matter, and one on either suffix does (`unknown`). */
+export function reparentSuffixes<N>(h: PoseHierarchy<N>, entity: N, newParent: N | null):
+  { from: TRS | null; to: TRS | null; unknown?: N } {
+  const oldChain = chainOf(h, entity);                                          // root-first, ends at the old parent
+  const newChain = newParent != null && h.places(newParent) ? [...chainOf(h, newParent), newParent] : [];
   let k = 0;
   while (k < oldChain.length && k < newChain.length && oldChain[k] === newChain[k]) k++;
-  const compose = (chain: MutableEntity[]): TRS | null => {
+  const compose = (chain: N[]): TRS | null => {
     if (!chain.length) return null;
     _acc.identity();
-    for (const a of chain) _acc.multiply(matrixOf(trsOf(a), _m));
+    for (const a of chain) _acc.multiply(matrixOf(h.trsOf(a), _m));
     return decompose(_acc);
   };
-  const unknown = [...oldChain.slice(k), ...newChain.slice(k)].find(isTemplatePlaced);
-  return { from: compose(oldChain.slice(k)), to: compose(newChain.slice(k)), ...(unknown ? { unknown } : {}) };
+  const unknown = h.unreadable ? [...oldChain.slice(k), ...newChain.slice(k)].find((n) => h.unreadable!(n)) : undefined;
+  return { from: compose(oldChain.slice(k)), to: compose(newChain.slice(k)), ...(unknown !== undefined ? { unknown } : {}) };
+}
+
+/** The MINIMAL local write that keeps a reparented entity's world pose — the one owner every reparent route computes with
+ *  (#1848): the live reparent, the live scene move, and the file route. `from`/`to` are the old and new parent chains
+ *  below their shared prefix ({@link reparentSuffixes}); `local` is the entity's own LOCAL transform — never a cached world
+ *  pose, which misses a parent created, or a mover edited, since the last propagation pass.
+ *
+ *  Only what the move changes is written, as Unity keeps `localRotation` and `localScale` when the linear part is unchanged
+ *  (docs/scene-loading.md § "A reparent keeps the world pose"). The position group when it moves. The rotation and scale groups only when the
+ *  LINEAR part changes (`sameRotationScale`) — a decomposition picks its own Euler angles and mirror axis, so writing all
+ *  nine re-spelled an untouched `{sy:-1}` as `{sx:-1, rz:-π}` and a backwards yaw as `{rx:-π, ry:…, rz:-π}` on every move.
+ *  A pure turn keeps the authored scale, mirror sign included (`rotationKeepingScale`), with a fresh XYZ spelling of the
+ *  new rotation (the hub's D1: Unity's runtime value is a quaternion). `positionOnly` compensates the position alone, for
+ *  a pose whose rotation and scale the caller cannot write (a template-placed instance root in the file).
+ *
+ *  `null` write: nothing moves (the suffixes compose to the same matrix). `collapsed`: the new suffix has ZERO scale on
+ *  those axes, so no local transform keeps the pose, and the caller refuses the move. */
+export function reparentWrite(local: TRS, from: TRS | null, to: TRS | null, opts?: { positionOnly?: boolean }):
+  { write: Partial<TRS> | null } | { collapsed: ('x' | 'y' | 'z')[] } {
+  if (sameTrsMatrix(from, to)) return { write: null };
+  const collapsed = collapsedParentAxes(to);
+  if (collapsed) return { collapsed };
+  const next = worldToLocalTrs(localToWorldTrs(local, from), to);
+  const write: Partial<TRS> = {};
+  if (TRS_GROUPS[0]!.some((k) => Math.abs(next[k] - local[k]) > 1e-9)) for (const k of TRS_GROUPS[0]!) write[k] = next[k];
+  if (!opts?.positionOnly && !sameRotationScale(next, local)) {
+    // A pure turn writes only the rotation; the scale group is written only when the linear part changed scale or shear
+    // too (then the decomposition's spelling is all there is).
+    const turned = rotationKeepingScale(next, local);
+    if (turned) Object.assign(write, turned);
+    else for (const k of [...TRS_GROUPS[1]!, ...TRS_GROUPS[2]!]) write[k] = next[k];
+  }
+  return { write: Object.keys(write).length ? write : null };
 }
 
 /** Do two poses compose to the same matrix (null = identity)? Unlike comparing fields, this sees `{sy:-1}` and
