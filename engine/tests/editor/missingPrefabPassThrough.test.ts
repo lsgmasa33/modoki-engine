@@ -38,12 +38,13 @@ import {
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, undo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { setPrefabCache, getCachedPrefabSync, applyToPrefabSelective, revertOverridesSelective, instantiatePrefab, rebuildInstance, rebaseStaleInstances, withKeptStateBake, bakingKeptStateForTest, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { serializePrefab, setPrefabCache, getCachedPrefabSync, applyToPrefabSelective, revertOverridesSelective, instantiatePrefab, rebuildInstance, rebaseStaleInstances, withKeptStateBake, bakingKeptStateForTest, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { expandsToRoot } from '../../packages/modoki/src/runtime/loaders/prefabRoot';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
+import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
 import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefab';
@@ -1573,5 +1574,147 @@ describe('Create Prefab\'s undo untags by the prefab document\'s guid, not throu
     expect(leftTagged).toBe(false);
     expect(piOf('Plain')).toBeNull();
     expect(piOf('Leaf')).toBeNull();
+  });
+});
+
+describe('Create Prefab refuses a tree holding a frame built from other rows than the cache holds (#1815, I3)', () => {
+  // The capture measures a frame through `captureDoc`, which reads the CACHE first. INST was expanded from a PQ with row 3
+  // (Qrow → Q); the cache then holds a newer PQ without it. Nothing refused, and the new template wrote the live Qrow
+  // expansion as a template-ADDED reference node — a row only the OLD document had, brought back.
+  // Mutation for every case here: drop `staleFramesInTreeRefusal` from both callers (or make it return null).
+  const HOLDER = 'dddddddd-0000-4000-8000-000000001600';
+  /** PQ as a later write left it: row 3 gone. */
+  const pqWithoutQ = () => ({ ...pqDoc(), entities: pqDoc().entities.slice(0, 2) });
+  const refusalOf = (r: unknown) => (r && typeof r === 'object' && 'refused' in r ? (r as { refused: string }).refused : '');
+  /** INST expanded from PQ with row 3; the editor cache then holds PQ without it (the frame is not rebased). */
+  const loadStale = async () => {
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    expect(getAllEntities().some((e) => e.name === 'QR')).toBe(true); // precondition: row 3 expanded
+    setPrefabCache(PQ, pqWithoutQ() as never);
+    writes.length = 0;
+  };
+
+  it('the human path refuses over the holder and over the instance root, and writes nothing', async () => {
+    for (const guid of [HOLDER, INST]) {
+      await loadStale();
+      const refused = refusalOf(await createPrefabFromEntity(rootOf(guid), 'prefabs/Stale.prefab.json', 'Stale', async () => true));
+      expect(refused).toMatch(/built from a different version of .* than the editor now holds/);
+      expect(refused).toMatch(/Reload the scene/);
+      expect(writes.length).toBe(0);
+    }
+  });
+
+  it('the agent prefab create op refuses the same tree, with the same words', async () => {
+    await loadStale();
+    await expect(runAgentOp('prefab', { action: 'create', entityGuid: HOLDER, path: 'prefabs/Stale.prefab.json' }))
+      .rejects.toThrow(/built from a different version of .* than the editor now holds/);
+    expect(writes.length).toBe(0);
+  });
+
+  it('the control: a frame built from the document the cache holds is not refused, whatever its values', async () => {
+    // A VALUE change is not a row change (`rowsMeanTheSame`): refusing it would block over any byte difference.
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    setPrefabCache(PQ, { ...pqDoc(), entities: pqDoc().entities.map((e) => e.localId === 2 ? row(2, 'A', 1, gA, 5) : e) } as never);
+    const created = await createPrefabFromEntity(rootOf(HOLDER), 'prefabs/Fresh.prefab.json', 'Fresh', async () => true);
+    expect(refusalOf(created)).toBe('');
+  });
+});
+
+describe('Create Prefab from an instance ROOT drops the old prefab\'s kept rows on it — an unpack (#1814, hub ruling)', () => {
+  // INST, an instance of P, keeps an orphan member row `/DEAD` (a member P dropped). Create Prefab over INST makes an
+  // ORIGINAL and relinks INST to it; the row stayed on INST, keyed in P's identity, and every save wrote it again. Unity
+  // drops an unpacked instance's unused overrides. Mutation for the drop cases: make `dropUnpackedRootKeptState` return
+  // before clearing — the scene save still writes `/DEAD` on INST.
+  const DEAD = 'eeeeeeee-0000-4000-8000-00000000d814';
+  const BEEF = 'eeeeeeee-0000-4000-8000-00000000b814';
+  const orphan = { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } };
+  const loadWithOrphan = async () => {
+    install(pDoc());
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${DEAD}`]: orphan };
+    await load(sc);
+  };
+  const membersOf = (s: SceneData) => (entryOf(s, INST)!.members ?? {}) as Record<string, unknown>;
+  const create = () => createPrefabFromEntity(rootOf(INST), 'prefabs/Unpacked.prefab.json', 'Unpacked', async () => true);
+  const lastWritten = () => JSON.parse(writes.filter((w) => w.path.endsWith('Unpacked.prefab.json')).pop()!.content) as PrefabFile;
+
+  it('neither the scene nor the new template keeps the row, and a reload keeps it gone', async () => {
+    await loadWithOrphan();
+    expect(membersOf(await save())[`/${DEAD}`]).toEqual(orphan); // precondition: the row is kept before the create
+    const created = await create();
+    expect(created && typeof created === 'object' && 'refused' in created).toBe(false);
+    const doc = lastWritten();
+    expect(JSON.stringify(doc)).not.toContain(DEAD);
+    const saved = await save();
+    expect(entryOf(saved, INST)!.prefab).toBe(doc.id); // precondition: INST is an instance of the new original
+    expect(JSON.stringify(entryOf(saved, INST))).not.toContain(DEAD);
+    install(doc);
+    await load(saved);
+    expect(JSON.stringify(entryOf(await save(), INST))).not.toContain(DEAD);
+  });
+
+  it('undo puts the row back on the instance, and redo drops it again', async () => {
+    // Mutation: drop `undoUnpack()` from `tagCreatedPrefab`'s undo — after the undo INST saves as an instance of P with the
+    // orphan row gone, for good.
+    await loadWithOrphan();
+    const before = entryOf(await save(), INST);
+    clearHistory();
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/api/delete-asset')) return { ok: true, status: 200, json: async () => ({ ok: true, trashed: 1, missing: [], failed: [] }) };
+      const last = writes.filter((w) => String(url).includes('Unpacked.prefab.json') && w.path.endsWith('Unpacked.prefab.json')).pop();
+      return last ? new Response(last.content, { status: 200 }) : { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+    });
+    const created = await create();
+    pushAction((created as { action: Parameters<typeof pushAction>[0] }).action);
+    await undo();
+    expect(entryOf(await save(), INST)).toEqual(before);
+    await redo();
+    expect(JSON.stringify(entryOf(await save(), INST))).not.toContain(DEAD);
+  });
+
+  it('KEPT: a Replace of the root\'s OWN prefab is no unpack — the instance stays connected, with its unused override', async () => {
+    // Mutation: drop the `instanceSourceRef(before) === written` clause — the Replace strips the row.
+    await loadWithOrphan();
+    const replaced = { ...serializePrefab(rootOf(INST), P, { replacing: pDoc() })!, id: P };
+    tagCreatedPrefab(rootOf(INST), 'prefabs/P.prefab.json', replaced);
+    expect(entryOf(await save(), INST)!.prefab).toBe(P); // precondition: still an instance of P
+    expect(membersOf(await save())[`/${DEAD}`]).toEqual(orphan);
+  });
+
+  it('KEPT: a tag that refused leaves the root linked to its old prefab, with its row', async () => {
+    // Mutation: drop the `instanceSourceRef(now) !== written` clause — a refused tag strips the row of an unchanged instance.
+    await loadWithOrphan();
+    const mismatched = { id: 'cccccccc-0000-4000-8000-00000000f814', version: 8, name: 'X', rootLocalId: 1, entities: [] } as unknown as PrefabFile;
+    tagCreatedPrefab(rootOf(INST), 'prefabs/X.prefab.json', mismatched);
+    expect(entryOf(await save(), INST)!.prefab).toBe(P); // precondition: the tag refused
+    expect(membersOf(await save())[`/${DEAD}`]).toEqual(orphan);
+  });
+});
+
+describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the explicit choice)', () => {
+  // The delete now evicts the editor cache (`applyAssetPathMoves`' delete branch). The live instance is left EXPANDED —
+  // #1738's evicted state — and every writer captures it from its frame record, so the save writes what it wrote before
+  // the delete and what the reload's Missing Prefab placeholder reads back. Mutation: drop `evictDeletedEditorPrefabs` from
+  // the delete branch — the editor cache still answers for the deleted prefab.
+  const P_PATH = '/assets/p1805.prefab.json';
+  it('the editor cache forgets it, the live instance stays, and the save writes the entry byte for byte', async () => {
+    registerAsset(P, P_PATH, 'prefab');
+    install(pDoc());
+    await load(scene(P));
+    writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'x', 6);
+    const before = entryOf(await save(), INST);
+    prefabs.delete(P); // gone from disk
+    applyAssetPathMoves([{ from: P_PATH, to: null }]);
+    expect(getCachedPrefabSync(P)).toBeNull();
+    expect(x(inside(INST, 'A'))).toBe(6); // still expanded
+    const saved = await save();
+    expectSameBytes(entryOf(saved, INST), before);
+    await load(saved);
+    expect(getAllEntities().some((e) => e.name === 'A')).toBe(false); // the reload: a placeholder, nothing expanded
+    install(pDoc());
+    await load(saved);
+    expect(x(inside(INST, 'A'))).toBe(6); // and the edit comes back with the prefab
   });
 });

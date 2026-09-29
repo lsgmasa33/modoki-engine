@@ -37,7 +37,7 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
 const setPrefabCacheSpy = vi.fn((..._args: unknown[]) => undefined);
 const serializePrefabSpy = vi.fn((..._args: unknown[]) => ({ id: 'g-new', root: {} }));
 vi.mock('../../src/editor/scene/prefab', () => ({
-  serializePrefab: (...args: unknown[]) => serializePrefabSpy(...args),
+  serializeRebuildOver: (...args: unknown[]) => serializePrefabSpy(...args),
   setPrefabCache: (...args: unknown[]) => setPrefabCacheSpy(...args),
   // #1468: the existing-id lookup moved off `getGuidForPath` (manifest only, so it minted a fresh
   // guid over a prefab the scanner had not indexed yet) onto the shared classifier. Mirrored here
@@ -269,8 +269,8 @@ describe('makeRigPrefabAsset undo/redo — success paths', () => {
     expect(result).toEqual({ path: '/rigs/existing.prefab.json', updated: true });
     // The mock returns `id: 'g-existing'` whatever it is given, so the id assertions below cannot
     // tell an update that KEPT the prefab's GUID from one that minted a new one. Pin the argument
-    // the update actually passes (#1670).
-    expect(serializePrefabSpy).toHaveBeenCalledWith(expect.anything(), 'g-existing', { priorCounter: expect.any(Number) });
+    // the update actually passes (#1670): the kept id, and the bytes it rebuilds over (#1782 — a bone keeps its row by path).
+    expect(serializePrefabSpy).toHaveBeenCalledWith(expect.anything(), 'g-existing', '{"id":"g-existing","old":true}');
     const action = pushActionSpy.mock.calls[0][0];
 
     writeAssetFileSpy.mockClear();

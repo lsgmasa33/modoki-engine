@@ -148,6 +148,20 @@ beforeEach(() => {
   }));
 });
 
+describe('openPrefabForEditing refuses a file that is not a prefab document (#1813 close-out sibling)', () => {
+  // The open reads the file RAW and seeds both caches from it, outside the cache boundary #1813 guards; an entity-less file
+  // threw "prefab.entities is not iterable" out of the open. Mutation: drop the `isPrefabDocument` check in
+  // `openPrefabForEditing` — the open rejects.
+  it('logs and opens nothing', async () => {
+    served = { id: RAW_PREFAB.id, version: 8, name: 'Badge' } as unknown as PrefabFile;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' })).resolves.toBeUndefined();
+      expect(error.mock.calls.some((c) => /is not a prefab document/.test(String(c[0])))).toBe(true);
+    } finally { error.mockRestore(); }
+  });
+});
+
 describe('openPrefabForEditing → savePrefabEdit round trip (#762 follow-up close-out)', () => {
   it('migrates UIAnchor.zIndex onto UIElement.zIndex BEFORE seeding the prefab cache', async () => {
     await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });

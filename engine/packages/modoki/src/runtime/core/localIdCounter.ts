@@ -48,9 +48,3 @@ export function advanceLocalIdCounter(doc: { nextLocalId?: number } & CountedDoc
   return next;
 }
 
-/** {@link localIdCounter} of a document read as bytes (a writer's `readPriorDocument`), or 0 for none, or for bytes that
- *  do not parse — a positional rebuild then states only its own mark. */
-export function priorLocalIdCounter(text: string | null | undefined): number {
-  if (!text) return 0;
-  try { return localIdCounter(JSON.parse(text.replace(/^\uFEFF/, '')) as CountedDoc); } catch { return 0; }
-}

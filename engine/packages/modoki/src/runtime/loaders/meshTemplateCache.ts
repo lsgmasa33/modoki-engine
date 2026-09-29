@@ -42,6 +42,7 @@ import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 import { disposeAllFontFaces } from './fontLoader';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
+import { isPrefabDocument } from './prefabRoot';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -2474,7 +2475,7 @@ function prefabCacheKey(prefabRef: string): string | undefined {
  *  in-flight fetch carrying the pre-write bytes is refused rather than landing on top. */
 export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
   const prefabPath = prefabCacheKey(prefabRef);
-  if (!prefabPath || !prefabOwners.get(prefabPath)?.size || !data || typeof data !== 'object') {
+  if (!prefabPath || !prefabOwners.get(prefabPath)?.size || !isPrefabDocument(data)) {
     invalidatePrefab(prefabRef);
     return;
   }
@@ -2554,7 +2555,11 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(prefabPath)));
       // parseAssetJson types a non-ok status and the SPA fallback (a missing asset arriving as
       // 200 OK index.html), so the failure memo can tell absent from unreachable (#1397).
-      const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };
+      const parsed = await parseAssetJson(res, prefabPath);
+      // Not a prefab document (#1813): refused like a file that does not parse — a plain Error, so a corrupt file is never
+      // read as an absent one — and nothing is cached. Every reader downstream assumes the shape.
+      if (!isPrefabDocument(parsed)) throw new Error(`${prefabPath} is not a prefab document (no entities array of rows)`);
+      const data = parsed as { id?: string; entities: { traits?: Record<string, unknown> }[] };
       // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
       // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
       // migration unconditionally here (cheap, idempotent) is the smallest thing that closes
@@ -2563,7 +2568,7 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       // added[] subtrees and nestedOverrides paths (including a prefab FILE's own nested rows,
       // since this runs unconditionally on every row, not just non-nested ones), not just
       // entry.traits.
-      for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+      for (const entry of data.entities) migrateUIAnchorZIndexStructured(entry);
       if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
       prefabFailures.forget(prefabPath);

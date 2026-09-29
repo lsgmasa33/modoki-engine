@@ -86,6 +86,11 @@ const detachMarks = (f: StepFailure, ops: readonly Op[]): boolean => f.check ===
 
 /** #1819: an edit whose undo cannot reach its target, because a world swap folded it into a placeholder's kept record —
  *  the record still holds the edit after the undo walk. */
+/** The suffix a round-trip difference carries when it was measured with the run's deleted prefabs RESTORED (#1805,
+ *  `checkRoundTrip`): the same difference, seen through the stricter comparison — optional, so a route with no deletion
+ *  keeps matching. */
+const RESTORED = String.raw`( \(with the deleted prefab restored\))?`;
+
 const PLACEHOLDER_KEPT_EDIT = /^\/entities\/[^/]+\/(added\/\d+\/)*members\/\/[^:]+\/(traits|added|a\+k-[^/:]+): undefined vs [[{]/;
 const placeholderEditUndo = (f: StepFailure, ops: readonly Op[]): boolean => UNDO_IDENTITY.test(f.check) && f.op === 'undo/redo to the ends'
   && PLACEHOLDER_KEPT_EDIT.test(f.detail) && !ops.some((o) => o.kind === 'detach') && (() => {
@@ -358,41 +363,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       && (() => { const r = ops.findIndex((o) => o.kind === 'removeComponent'); return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'undo'); })(),
   },
   {
-    issue: 1805,
-    what: 'an Assets delete leaves the prefab in the editor cache while a world swap drops it from the loader, so the save writes rows naming it as removed',
-    repro: [
-      { kind: 'trashPrefab', u: [0.5253717228770256, 0.3637211681343615, 0.16043360973708332, 0.6716910290997475, 0.20890621887519956, 0.42551467870362103, 0.42723338585346937, 0.0039873996283859015] },
-      { kind: 'prefabEdit', u: [0.2850157537031919, 0.2534669756423682, 0.6076711313799024, 0.6218444388359785, 0.11600693548098207, 0.14820343581959605, 0.1644768884871155, 0.3037136106286198], inner: [] },
-      { kind: 'instantiate', u: [0.5536115297582, 0.7428521458059549, 0.17168851662427187, 0.6443779191467911, 0.9432437820360065, 0.49406764027662575, 0.3743322738446295, 0.2861176738515496] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity',
-    // A trashed prefab before the failure, then a world swap (prefab edit, a reload, a watcher reload) or a prefab created
-    // this session before the trash (the loader never held it; the final save→reload is the swap) — two routes. Keyed on
-    // what the reload lost: an entity of a deleted prefab's instance, or an instance that came back a placeholder
-    // (checkRoundTrip names both) — never any lost entity (review).
-    stops: (f, ops) => f.check === 'save→reload is not the identity'
-      && /\((an entity of a deleted prefab was lost|it came back a Missing Prefab placeholder of a deleted prefab)\)$/.test(f.detail) && (() => {
-        const t = ops.findIndex((o) => o.kind === 'trashPrefab');
-        return t >= 0 && (ops.slice(t + 1).some((o) => o.kind === 'prefabEdit' || o.kind === 'saveReload' || o.kind === 'outsideEdit')
-          || ops.slice(0, t).some((o) => o.kind === 'createPrefab'));
-      })(),
-  },
-  {
-    issue: 1805,
-    what: "the same route 2, where the first difference is the instance member's marks (it came back a placeholder)",
-    repro: [
-      { kind: 'instantiate', u: [0.5075831420253962, 0.8186536263674498, 0.4673538957722485, 0.9546289832796901, 0.39170667389407754, 0.5493532461114228, 0.4505586097948253, 0.8853592379018664] },
-      { kind: 'duplicate', u: [0.39032594044692814, 0.04696453106589615, 0.3570088869892061, 0.40155923343263566, 0.5113228356931359, 0.29383464995771646, 0.025902038207277656, 0.7472156076692045] },
-      { kind: 'createPrefab', u: [0.5959376466926187, 0.9407973305787891, 0.6634466790128499, 0.633407388580963, 0.013036289950832725, 0.15678744250908494, 0.8456963025964797, 0.3821238283999264] },
-      { kind: 'trashPrefab', u: [0.3976654135622084, 0.9079436135943979, 0.3005773222539574, 0.4423462732229382, 0.34140314417891204, 0.17301023192703724, 0.8832939309068024, 0.3436738490127027] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(it came back a Missing Prefab placeholder of a deleted prefab\)$/.test(f.detail),
-    // Keyed on what the reload did to the instance, not on the mark that happened to sort first (a mark alone is #1777's
-    // shape, which the reject test holds unclaimed).
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /\(it came back a Missing Prefab placeholder of a deleted prefab\)$/.test(f.detail)
-      && (() => { const t = ops.findIndex((o) => o.kind === 'trashPrefab'); return t >= 0 && ops.slice(0, t).some((o) => o.kind === 'createPrefab'); })(),
-  },
-  {
     issue: 1808,
     what: "a template-added node dragged into another instance of its template keeps its stale TemplateAddedKey",
     repro: [
@@ -459,10 +429,10 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'prefabEdit', u: [0.954, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
       { kind: 'addComponent', u: [0, 0, 0, 0, 0, 0, 0, 0] },
     ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined$/.test(f.detail),
+    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined${RESTORED}$`).test(f.detail),
     // A trashed prefab, a world swap that makes the placeholder, then a component added. Keyed on a whole component the
     // reload lost, never an entity.
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /^\/[^/]+\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined$/.test(f.detail)
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`^\/[^/]+\/traits\/(Rotate3D|Renderable3DPrimitive): .* vs undefined${RESTORED}$`).test(f.detail)
       && (() => {
         const t = ops.findIndex((o) => o.kind === 'trashPrefab'); const w = ops.findIndex((o, i) => i > t && o.kind === 'prefabEdit');
         return t >= 0 && w >= 0 && ops.slice(w + 1).some((o) => o.kind === 'addComponent');
@@ -476,8 +446,8 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'prefabEdit', u: [0.1, 0.9, 0, 0, 0, 0, 0, 0], inner: [] },
       { kind: 'duplicate', u: [0.15, 0, 0, 0, 0, 0, 0, 0] },
     ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+$/.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /^\/[^/]+\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+$/.test(f.detail) && (() => {
+    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+${RESTORED}$`).test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`^\/[^/]+\/traits\/EntityAttributes\/sortOrder: \d+ vs \d+${RESTORED}$`).test(f.detail) && (() => {
       const t = ops.findIndex((o) => o.kind === 'trashPrefab');
       const w = ops.findIndex((o, i) => i > t && ['prefabEdit', 'saveReload', 'outsideEdit'].includes(o.kind));
       return t >= 0 && w >= 0 && ops.slice(w + 1).some((o) => ['duplicate', 'paste', 'reparent'].includes(o.kind));
@@ -569,7 +539,7 @@ export const KNOWN_OPEN: KnownOpen[] = [
     // A copy, then a template change (Apply, Create Prefab Replace, a prefab-edit save, an outside edit), then a paste.
     // Keyed on a member lost or a transform value the reload changed.
     stops: (f, ops) => f.check === 'save→reload is not the identity'
-      && (/\(an entity was lost\)$/.test(f.detail) || /^\/[^/]+\/traits\/Transform\/(x|y|z|rx|ry|rz|sx|sy|sz): /.test(f.detail)) && (() => {
+      && (new RegExp(String.raw`\(an entity was lost\)${RESTORED}$`).test(f.detail) || /^\/[^/]+\/traits\/Transform\/(x|y|z|rx|ry|rz|sx|sy|sz): /.test(f.detail)) && (() => {
         const c = ops.findIndex((o) => o.kind === 'copy');
         const ch = ops.findIndex((o, i) => i > c && ['apply', 'createPrefab', 'prefabEdit', 'outsideEdit'].includes(o.kind));
         return c >= 0 && ch >= 0 && ops.slice(ch + 1).some((o) => o.kind === 'paste') && lastOp(ops) === 'paste' && touchedBy(f, 'paste', subjectGuid(f));
@@ -584,7 +554,7 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'prefabEdit', u: [0.4197337697260082, 0.45629017311148345, 0.9499380351044238, 0.30179717764258385, 0.4023724365979433, 0.017604060005396605, 0.281649986281991, 0.47618820145726204], inner: [{ kind: 'instantiate', u: [0.7530755579937249, 0.7304247959982604, 0.6359159634448588, 0.5732636176981032, 0.24562921142205596, 0.715872710570693, 0.18062788620591164, 0.5258615149650723] }] },
       { kind: 'undo', u: [0.9111525018233806, 0.4756720804143697, 0.2995174073148519, 0.8736095151398331, 0.7850008409004658, 0.6371805649250746, 0.5273122461512685, 0.5875295428559184] },
     ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(an entity was gained\)$/.test(f.detail),
+    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\(an entity was gained\)${RESTORED}$`).test(f.detail),
     // No stop: nothing in the failure says the gained entity came from the stale re-link (a review found this key
     // claimed any gained entity after a Create Prefab, a change and an undo). Its self-test keeps the route honest;
     // a hunt reports it by its signature.

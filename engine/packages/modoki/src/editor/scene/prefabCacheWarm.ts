@@ -33,7 +33,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { isGuid } from '../../runtime/loaders/assetManifest';
-import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, type PrefabFile } from './prefab';
+import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, editorPrefabDeleted, type PrefabFile } from './prefab';
 
 /** Every distinct `PrefabInstance.source` in `world`. Read off the STAGING world the hook is
  *  handed — `getAllEntities()` would read the world being replaced. */
@@ -56,7 +56,9 @@ export async function warmEditorPrefabCacheFor(world: World): Promise<void> {
     // the case the fetch below exists for, so asking anyway would print an integrity error on
     // the one input this branch is designed to handle. `fetchPrefabSource` dodges the same
     // edge deliberately (it uses `assetUrl` for a non-guid); this matches it.
-    if (isGuid(source)) {
+    // …except a prefab an asset delete evicted (#1805): the loader keeps its entry until its scene lets go (#1834), so it
+    // would hand the deleted document straight back. Read from disk instead (`editorPrefabDeleted` names the outcomes).
+    if (isGuid(source) && !editorPrefabDeleted(source)) {
       // The loader already fetched, parsed and migrated this — take it rather than re-reading.
       const shared = getCachedPrefab(source) as PrefabFile | undefined;
       if (shared) { primeEditorPrefabCache(source, shared); continue; }

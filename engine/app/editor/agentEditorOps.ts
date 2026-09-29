@@ -50,7 +50,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, tagCreatedPrefab, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
@@ -3086,13 +3086,6 @@ export function registerEditorAgentOps(): void {
       // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
-      // A nested frame that could not be expanded (#1790, owner ruling D; the human path's refusal) — after the warm, so a
-      // merely cold key is not a missing prefab.
-      const unexpanded = unexpandedNestedRefusal(entityId);
-      if (unexpanded) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${unexpanded}.`,
-          { options: ['restore the missing nested prefab (a scene reload re-expands it), then retry', 'create the prefab from a subtree that does not hold that instance'] });
-      }
       // What is at `path` now, read ONCE (#1692): the bytes the write below is conditional on (I10), and — over an existing
       // prefab, a Replace — the rows it overwrites, which a node with no live identity is matched against by name, the
       // same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`). One read, so the rows matched are the rows the
@@ -3111,6 +3104,21 @@ export function registerEditorAgentOps(): void {
       if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — ${notAuthoredExit(late) ?? 'stop Play first, or the played pose is written into the prefab'}.`);
       if (!adopted() || !sameRoot()) {
         throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${adopted() ? 'the entity was rebuilt in place (a prefab instance refreshed)' : 'the scene was reloaded'} while the prefab was being prepared, so entity ${entityId} may name another entity now. Nothing was written. Address it again (by guid) and retry.`);
+      }
+      // A nested frame that could not be expanded (#1790, owner ruling D; the human path's refusal) — after the warm, so a
+      // merely cold key is not a missing prefab, and after the LAST await (the prior read) and the world re-checks, as the human path asks them: a watcher
+      // refresh landing in that read changes the cache the answers are about, and a reload makes `entityId` another entity,
+      // whose refusal would name the wrong cause (#1815 close-out reviews).
+      const unexpanded = unexpandedNestedRefusal(entityId);
+      if (unexpanded) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${unexpanded}.`,
+          { options: ['restore the missing nested prefab (a scene reload re-expands it), then retry', 'create the prefab from a subtree that does not hold that instance'] });
+      }
+      // A frame built from other rows than the cache holds (#1815, I3; the human path's refusal).
+      const stale = staleFramesInTreeRefusal(entityId);
+      if (stale) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${stale}.`,
+          { options: ['reload the scene (it re-expands the instance from the current prefab), then retry', 'create the prefab from a subtree that does not hold that instance'] });
       }
       let runtimeExcluded = 0;
       const prefab = serializePrefab(entityId, keptId, { bakeKeptState: true, replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });

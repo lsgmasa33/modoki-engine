@@ -120,7 +120,8 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   const trace: string[] = [];
   consoleErrors.length = 0;
   const f = await startRun(be, setupNest, JSON.stringify(ops));
-  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() } };
+  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, prefabBytes: new Map() };
+  for (const [p, t] of be.snapshot()) if (p.endsWith('.prefab.json')) st.prefabBytes!.set(p, t);
   const history: LocalIdHistory = new Map();
   /** Every file content the run has had, at any path: a write of one of these is a verbatim carry (an undo's restore, a
    *  move), which I15 exempts. */
@@ -162,6 +163,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (errors.length) return fail(i, label, { check: 'console.error', detail: errors[0].slice(0, 300) });
 
     const after = be.snapshot();
+    for (const [p, t] of after) if (p.endsWith('.prefab.json')) st.prefabBytes!.set(p, t);
     for (const [p, t] of after) {
       if (before.get(p) === t) continue;
       // A write the editor made of content no file in the run has had before.

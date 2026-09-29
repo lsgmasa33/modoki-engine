@@ -30,9 +30,11 @@ const CALL_SITES: Record<string, string> = {
   'engine/packages/modoki/src/editor/scene/prefabEdit.ts':
     'the open edit session\'s own guid (`editingPrefab.guid`), plus preserveLocalIds/preserveNodeGuids from the baseline document',
   'engine/packages/modoki/src/editor/scene/skinPrefab.ts':
-    'classifyExistingPrefabId(savePath) — manifest, then the on-disk id; refuses an unreadable file',
+    'classifyExistingPrefabId(savePath) — manifest, then the on-disk id; refuses an unreadable file. A REBUILD '
+    + '(serializeRebuildOver, #1782): each bone keeps its row by its path',
   'engine/packages/modoki/src/editor/panels/Assets.tsx':
-    'classifyExistingPrefabId(prefabPath) — the model-import path; refuses an unreadable file',
+    'classifyExistingPrefabId(prefabPath) — the model-import path; refuses an unreadable file. A REBUILD '
+    + '(serializeRebuildOver, #1782): each node keeps its row by its path',
   'engine/packages/modoki/src/editor/panels/assetViews/ModelAssetView.tsx':
     'classifyExistingPrefabId(prefabPath) — the rigged re-import path; the merge then carries node identity',
   'engine/packages/modoki/src/editor/panels/assetOps.ts':
@@ -53,11 +55,15 @@ function productionSources(): { rel: string; abs: string }[] {
     .filter(({ rel }: { rel: string }) => !rel.endsWith('editor/index.ts'));
 }
 
-/** Files whose CODE calls `serializePrefab(` — comments stripped, so a docblock naming it is not a
+/** The entry points a prefab write serializes through: `serializePrefab`, and `serializeRebuildOver` — the same writer for
+ *  a rebuild over an existing file (#1782), which is where the file guid is handed in all the same. */
+const ENTRY_POINTS = ['serializePrefab(', 'serializeRebuildOver('];
+
+/** Files whose CODE calls an entry point — comments stripped, so a docblock naming it is not a
  *  call site (`commentStripperIsShared.test.ts` owns that entry point). */
 function callers(): string[] {
   return productionSources()
-    .filter(({ abs }) => readScannedSource(abs).code.includes('serializePrefab('))
+    .filter(({ abs }) => { const { code } = readScannedSource(abs); return ENTRY_POINTS.some((e) => code.includes(e)); })
     .map(({ rel }: { rel: string }) => rel)
     .sort();
 }
@@ -79,6 +85,21 @@ describe('every serializePrefab caller says where its file guid comes from (#146
     // A guard that matches nothing passes forever, and a comment-stripping scan is exactly the kind
     // that can silently start matching nothing (a rename, a re-export, a helper indirection).
     expect(callers().length).toBeGreaterThanOrEqual(5);
+  });
+
+  // #1782: a writer that REBUILDS an existing prefab from a fresh tree must keep its rows' identity — a node matched by its
+  // path keeps its localId and nodeGuid. Through `serializePrefab` with no `replacing` it numbered rows by position, and a
+  // scene's ref to an old member retargeted onto whatever node took its number. The behaviour is tested
+  // (`prefabRebuildOver.test.ts`); these two writers are a React callback and an async rig builder, so which entry point
+  // they call is pinned here. Mutation: call `serializePrefab(` again in either — this goes red.
+  it('the two rebuild writers serialize through serializeRebuildOver, not serializePrefab (#1782)', () => {
+    for (const rel of ['engine/packages/modoki/src/editor/scene/skinPrefab.ts', 'engine/packages/modoki/src/editor/panels/Assets.tsx']) {
+      const src = productionSources().find((f: { rel: string }) => f.rel === rel);
+      expect(src, rel).toBeDefined();
+      const { code } = readScannedSource(src!.abs);
+      expect(code.includes('serializeRebuildOver('), rel).toBe(true);
+      expect(code.includes('serializePrefab('), rel).toBe(false);
+    }
   });
 
   it('every row names a real source of the guid, not an empty string', () => {

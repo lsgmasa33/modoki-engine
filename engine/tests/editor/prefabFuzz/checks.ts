@@ -283,18 +283,31 @@ export function canonScene(scene: unknown, placeholders: ReadonlySet<string>, no
   return walk(scene);
 }
 
-/** Save → reload is the identity, and save → reload → save writes the same bytes. */
+/** Save → reload is the identity, and save → reload → save writes the same bytes.
+ *
+ *  When the run deleted a prefab (`restored` is set, #1805), the identity is measured against the save reloaded WITH the
+ *  deleted prefabs put back: the live instance of a deleted prefab stays expanded while a plain reload gives its Missing
+ *  Prefab placeholder (Unity does the same), so the two cannot be equal, and what must hold is that the save lost nothing
+ *  the live world holds. The byte check still runs on the plain reload's save, so the placeholder must write its record
+ *  back byte for byte. */
 export function checkRoundTrip(
-  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string }, tolerate: Tolerate = {},
+  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown }, tolerate: Tolerate = {},
   prefabGone: (source: string) => boolean = () => false,
 ): Failure[] {
   const out: Failure[] = [];
-  const d = firstDiff(rt.before, rt.after);
+  // Either comparison may hold, and the run fails only when NEITHER does. The plain one holds when the live world already
+  // shows the deleted prefab's instances as the reload does (a world swap after the delete made them placeholders, or they
+  // never expanded); the restored one holds when the live instance is still expanded and the save carried all of it. The
+  // restored one alone would fail a correct run whose live world holds a frame the delete left unexpanded: restored, it
+  // expands. Reported through the restored comparison, the stricter one for the case it exists for.
+  const restoring = rt.restored !== undefined && firstDiff(rt.before, rt.after) !== null;
+  const reloaded = restoring ? rt.restored : rt.after;
+  const d = firstDiff(rt.before, reloaded);
   if (d) {
     // Whether a whole entity went missing, and if so whether one with its name took a NEW guid on the other side (a guid
     // that changed across the reload) or nothing did (lost, or gained): the KNOWN_OPEN predicates key on it.
     const before = rt.before as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
-    const after = rt.after as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
+    const after = reloaded as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
     const nameOf = (e: { traits?: { EntityAttributes?: { name?: string } } } | undefined) => e?.traits?.EntityAttributes?.name;
     const onlyIn = (a: typeof before, b: typeof before) => Object.keys(a).filter((k) => !(k in b));
     const lost = onlyIn(before, after); const gained = onlyIn(after, before);
@@ -318,7 +331,7 @@ export function checkRoundTrip(
     const lostKind = lost.some(ofGonePrefab) ? ' (an entity of a deleted prefab was lost)' : ' (an entity was lost)';
     const kind = lost.length || gained.length ? (renamed ? ' (an entity changed guid)' : lost.length ? lostKind : ' (an entity was gained)')
       : becamePlaceholder ? (prefabGone(placeholderSource!) ? ' (it came back a Missing Prefab placeholder of a deleted prefab)' : ' (it came back a Missing Prefab placeholder)') : '';
-    out.push({ check: 'save→reload is not the identity', detail: `${d}${kind}` });
+    out.push({ check: 'save→reload is not the identity', detail: `${d}${kind}${restoring ? ' (with the deleted prefab restored)' : ''}` });
   }
   if (rt.firstBytes !== rt.secondBytes) {
     const a = JSON.parse(rt.firstBytes); const b = JSON.parse(rt.secondBytes);

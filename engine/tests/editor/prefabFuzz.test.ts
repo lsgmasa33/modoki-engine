@@ -42,6 +42,13 @@
  *
  *  - A tainted segment's walk (after an outside edit, a prefab-edit save or a watcher reload) forgives every refusal, so
  *    a write whose #1774 mark-conflict recovery fails there is not caught; only a clean segment holds it.
+ *  - The renderer's manifest is pushed only by the simulated watcher, never by a route: the backend's `rebuildManifest`
+ *    returns the manifest without pushing it (#1835), while the host's pushes it before the route's renderer repair. So
+ *    right after a route move, a path looked up through the manifest reads stale here and fresh in the editor (#1807's
+ *    and #1828's routes need that lag; in the editor they need a failed inline rebuild).
+ *  - A deleted prefab's round trip is judged with it RESTORED as well as plainly (#1805, `saveReload`): a run fails only
+ *    when neither holds. A loss the live world itself cannot show — a row a swap left unexpanded — needs a regression
+ *    repro (#1812's), not the identity.
  *  - A run's paths and guids come from a 32-bit hash of its op list (plus its occurrence count): two lists can collide in
  *    one process (~N²/2³³ for N lists, including a shrink's replays), sharing a run folder while the caches are not reset.
  *
@@ -286,11 +293,56 @@ describe('#1789 prefab fuzz', () => {
     expect(checkRoundTrip(rt(scene('ab', 'xy', 1.0000001)), { nodeOrder: true })).toHaveLength(1);
   });
 
+  // #1805: a live instance of a DELETED prefab stays expanded while a reload gives its Missing Prefab placeholder (Unity does
+  // the same), so a round trip is judged against the save reloaded with the deleted prefab put back (`saveReload`), and a
+  // run fails only when neither comparison holds (`checkRoundTrip`). Loss stays visible: with #1812's record read taken
+  // out, the #1812 regressions go red through the restored comparison.
+  it('harness: the round trip of a deleted prefab — plain or restored identity passes, neither fails (#1805)', () => {
+    const live = { a: { traits: { X: 1 } }, m: { traits: { Y: 2 } } };
+    const placeholder = { a: { traits: { X: 1 } }, unresolvedEntry: { unresolved: 'p' } };
+    const same = { firstBytes: '{}', secondBytes: '{}' };
+    expect(checkRoundTrip({ before: live, after: placeholder, restored: live, ...same })).toEqual([]); // restored holds
+    expect(checkRoundTrip({ before: placeholder, after: placeholder, restored: live, ...same })).toEqual([]); // plain holds
+    const lost = checkRoundTrip({ before: live, after: placeholder, restored: { a: live.a }, ...same });
+    expect(lost.map((f) => f.check)).toEqual(['save→reload is not the identity']);
+    expect(lost[0]!.detail).toMatch(/\(with the deleted prefab restored\)$/);
+    // No deletion: the plain comparison, as before.
+    expect(checkRoundTrip({ before: live, after: placeholder, ...same }).map((f) => f.check)).toEqual(['save→reload is not the identity']);
+  });
+
+  it('harness: a prefab created and then deleted in one run passes the final round trip (#1805 route 2, allowed)', async () => {
+    // Mutation: in `saveReload`, skip the restore (no `restored`) — the plain comparison fails: the live instance is
+    // expanded, the reload gives its placeholder.
+    const ops: Op[] = [
+      { kind: 'instantiate', u: [0.5075831420253962, 0.8186536263674498, 0.4673538957722485, 0.9546289832796901, 0.39170667389407754, 0.5493532461114228, 0.4505586097948253, 0.8853592379018664] },
+      { kind: 'duplicate', u: [0.39032594044692814, 0.04696453106589615, 0.3570088869892061, 0.40155923343263566, 0.5113228356931359, 0.29383464995771646, 0.025902038207277656, 0.7472156076692045] },
+      { kind: 'createPrefab', u: [0.5959376466926187, 0.9407973305787891, 0.6634466790128499, 0.633407388580963, 0.013036289950832725, 0.15678744250908494, 0.8456963025964797, 0.3821238283999264] },
+      { kind: 'trashPrefab', u: [0.3976654135622084, 0.9079436135943979, 0.3005773222539574, 0.4423462732229382, 0.34140314417891204, 0.17301023192703724, 0.8832939309068024, 0.3436738490127027] },
+    ];
+    const r = await runOps(be, ops, OPTS);
+    expect(r.trace.slice(0, 4).every((l) => l.includes('→ done')), r.trace.join('\n')).toBe(true); // precondition: all ran
+    // …with the created prefab's instance a placeholder on the plain reload, as production's reload gives: the loader never
+    // held it. Mutation: drop the dance's loader restore (`invalidatePrefab` of an entry it seeded) — 0 placeholders.
+    expect(r.trace[4], r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toMatch(/^4: final save→reload → done \(1 deleted prefab\(s\) restored for the comparison; [1-9]\d* placeholder\(s\) on the plain reload\)$/);
+    // The round trip passed. The walk after it runs undo against the placeholder the reload made — #1819's class (group 1
+    // of #1789: the owner ruled such an undo refuses and drops its step; not built yet), which this test does not judge.
+    expect(r.failure === undefined || r.failure.op === 'undo/redo to the ends', r.failure ? `${r.failure.op} — ${r.failure.check}: ${r.failure.detail}` : '').toBe(true);
+  }, 120_000);
+
   it('harness: a run is reproducible — the same list twice gives the same trace and the same outcome', async () => {
     const ops = generate(VERIFY_SEEDS[0], VERIFY_LEN);
     const [a, b] = [await runOps(be, ops, OPTS), await runOps(be, ops, OPTS)];
-    // Only the run's folder differs (a second run of one list takes the next occurrence tag, so its guids are its own).
-    const masked = (t: string[]) => t.map((line) => line.replace(/\/fuzz\/r[0-9a-f]{12}\//g, '/fuzz/rTAG/'));
+    // Only the run's TAG differs: a second run of one list takes the next occurrence (the tag's low 16 bits), and the tag is
+    // both the run's folder and every run guid's last group (`harness.ts` `tagFor`). Masked in both places — a guid only by
+    // its occurrence digits, so the list hash before them must still match. The folder alone was masked until a trace line
+    // named a guid: an Apply that is a noop because its prefab was deleted says which (#1805's eviction made it one).
+    const masked = (t: string[]) => t.map((line) => line
+      .replace(/\/fuzz\/r[0-9a-f]{12}\//g, '/fuzz/rTAG/')
+      .replace(/(-[0-9a-f]{4}-[0-9a-f]{8})[0-9a-f]{4}\b/g, '$1OCCR'));
+    // The mask forgives the occurrence and nothing else: a different list hash, or a different guid counter, still differs.
+    expect(masked(['x cccccccc-0000-4000-8001-31f1810d0000'])).toEqual(masked(['x cccccccc-0000-4000-8001-31f1810d0001']));
+    expect(masked(['x cccccccc-0000-4000-8001-31f1810d0000'])).not.toEqual(masked(['x cccccccc-0000-4000-8001-41f1810d0000']));
+    expect(masked(['x 10000001-0000-4000-8000-31f1810d0000'])).not.toEqual(masked(['x 10000002-0000-4000-8000-31f1810d0000']));
     expect(masked(b.trace)).toEqual(masked(a.trace));
     expect(b.failure && signature(b.failure)).toBe(a.failure && signature(a.failure));
     // Every minted guid is the run's seeded sequence (a counter, then the run's tag), not entropy: a guid tie-break then

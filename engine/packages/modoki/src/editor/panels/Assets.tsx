@@ -6,7 +6,7 @@ import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
-  serializePrefab, classifyExistingPrefabId,
+  serializeRebuildOver, classifyExistingPrefabId,
 } from '../scene/prefab';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
@@ -16,7 +16,6 @@ import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { placePrefabFromPath } from '../scene/prefabPlace';
 import { commitPrefabWrite } from '../scene/prefabCommit';
-import { priorLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // Backend-IO wrappers + create-prefab flow shared with the Hierarchy panel
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
@@ -244,11 +243,11 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // `ModelAssetView`'s re-import has resolved the id all along. Same operation, two code paths, one
     // of them asking. The classify itself is hoisted above the import — see the note up there.
     //
-    // Node identity is a separate question and mints here either way: a freshly imported GLB tree has
-    // no correspondence to the old document's rows, so there is nothing to carry. What the file guid
-    // buys is that the instances still point AT this prefab, rather than at nothing.
-    // Positional over the old file (#1782), but its high-water mark never goes down (#1774).
-    const prefab = serializePrefab(rootId, existing.kind === 'known' ? existing.id : undefined, { priorCounter: priorLocalIdCounter(previousContent) });
+    // Node identity is the other half (#1782): a freshly imported GLB tree carries no link to the old
+    // document's rows, so the rebuild matches each node to a row by its hierarchy PATH, as Unity's model
+    // importer does — a matched node keeps its localId and nodeGuid, so a scene's edit of it and a ref to it
+    // survive the reimport; a new node goes above the old mark (#1774). It used to renumber by position.
+    const prefab = serializeRebuildOver(rootId, existing.kind === 'known' ? existing.id : undefined, previousContent);
 
     // Remove temporary entities from scene
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');

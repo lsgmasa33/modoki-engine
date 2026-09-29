@@ -14,7 +14,7 @@
 
 import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, tagCreatedPrefab, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, type PrefabFile } from '../scene/prefab';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef } from '../undo/entityRef';
@@ -658,6 +658,9 @@ export async function createPrefabFromEntity(
   // is not a missing prefab.
   const unexpanded = unexpandedNestedRefusal(entityId);
   if (unexpanded) return { refused: `Create Prefab refused — ${unexpanded}. Restore it, or leave the instance out of the selection.` };
+  // A frame built from other rows than the cache holds (#1815, I3) — after the warm too: a cold key cannot be judged.
+  const stale = staleFramesInTreeRefusal(entityId);
+  if (stale) return { refused: `Create Prefab refused — ${stale}. Reload the scene and try again.` };
   let runtimeExcluded = 0;
   // ⚠️ A Replace that keeps the replaced prefab's id serializes AGAINST the document it replaces (#1686): with no id, every
   // row's `nodeGuid` was minted fresh, and every other instance's edits and pinned member guids are keyed by the old ones.

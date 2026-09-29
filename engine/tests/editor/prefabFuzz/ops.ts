@@ -34,7 +34,9 @@ import { saveScene, loadSceneReporting } from '../../../packages/modoki/src/edit
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { parseAssetJson, isMissingAsset } from '../../../packages/modoki/src/runtime/loaders/assetFetch';
 import { deleteEntity } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
-import { authored, piOf, isInstanceRoot, editing, worldTree, settle, type Fixture } from './harness';
+import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
+import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
+import { authored, piOf, isInstanceRoot, editing, worldTree, settle, placeholderGuids, type Fixture } from './harness';
 import type { FuzzBackend } from './backend';
 
 export type OpKind =
@@ -100,8 +102,12 @@ export interface RunState {
   be: FuzzBackend;
   f: Fixture;
   clip: EntityClipboard | null;
-  /** What the round trip inside a save→reload op measured; the checks read it. */
-  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string };
+  /** What the round trip inside a save→reload op measured; the checks read it. `restored`: the same saved file reloaded
+   *  with every deleted prefab put back, when the run deleted one (#1805). */
+  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown };
+  /** The last bytes the run saw at every prefab path (the runner records them after each step): what a deleted prefab's
+   *  restore puts back. */
+  prefabBytes?: Map<string, string>;
   /** Set by an executor when an op could not run (nothing to choose, or the editor refused as the UI would show). */
   note?: string;
   /** Set by a prefab edit: whether it wrote the prefab (a discard changes no file the scene's undo cannot see). */
@@ -124,6 +130,21 @@ export type Outcome = 'done' | 'noop' | 'refused';
 const pick = <T,>(u: number, arr: readonly T[]): T | undefined => (arr.length ? arr[Math.min(arr.length - 1, Math.floor(u * arr.length))] : undefined);
 const meta = (name: string) => getTraitByName(name)!;
 const noSelect = () => {};
+
+/** Every prefab DOCUMENT the run has seen that is in no file now (by id), with the last path and bytes it had. */
+function deletedPrefabs(st: RunState): Array<[string, string]> {
+  const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
+  const present = new Set([...st.be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')).map(([, t]) => idOf(t)));
+  const out = new Map<string, [string, string]>();
+  for (const [p, t] of st.prefabBytes ?? []) {
+    const id = idOf(t);
+    if (!id || present.has(id) || st.be.read(p) !== undefined) continue;
+    // The path the manifest names for it wins over whichever path the map happened to list last (a rename and its undo
+    // leave both): restored elsewhere, the reload looks for it at the manifest's path and misses (close-out re-review).
+    if (!out.has(id) || resolveGuidToPath(id) === p) out.set(id, [p, t]);
+  }
+  return [...out.values()];
+}
 
 /** Prefab files on disk, sorted. */
 function prefabFiles(st: RunState): string[] {
@@ -383,12 +404,37 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const s1 = await saveScene({ allowDialog: false });
       if (!s1.saved) { st.note = `save: ${s1.reason}`; return 'refused'; }
       const firstBytes = st.be.read(st.f.scenePath) ?? '';
+      // A prefab the run DELETED (#1805): its live instances stay expanded — Unity keeps an instance's objects when its
+      // asset is deleted — while a reload gives the Missing Prefab placeholder, so the live world cannot equal the reload.
+      // What must hold instead is that the save LOST nothing: the same file, reloaded with the deleted prefabs put back,
+      // is the live world. So: put them back, reload, measure, take them away again through the real delete repair, and
+      // then do the ordinary reload. A deleted prefab is one whose DOCUMENT is in no file now (by id: a rename is not a
+      // delete), put back at the last path it had.
+      const gone = deletedPrefabs(st);
+      let restored: unknown;
+      if (gone.length) {
+        // The loader's entry for each, as the dance found it: the restored reload fetches and OWNS it, and a production
+        // reload never would for one the loader did not hold (a prefab created and deleted in the session), so the entry
+        // the dance seeded goes again — or the ordinary reload below expands the deleted prefab from it (close-out review).
+        const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
+        const heldBefore = new Set(gone.filter(([, t]) => { const id = idOf(t); return !!id && getCachedPrefab(id) !== undefined; }).map(([p]) => p));
+        for (const [p, t] of gone) st.be.write(p, t);
+        const back = await loadSceneReporting(st.f.scenePath);
+        if (back.outcome !== 'loaded') throw new Error(`reload with the deleted prefabs restored: ${back.outcome}`);
+        restored = worldTree();
+        for (const [p] of gone) st.be.remove(p);
+        applyAssetPathMoves(gone.map(([from]) => ({ from, to: null })));
+        for (const [p] of gone) if (!heldBefore.has(p)) invalidatePrefab(p);
+      }
       const loaded = await loadSceneReporting(st.f.scenePath);
       if (loaded.outcome !== 'loaded') throw new Error(`reload: ${loaded.outcome}`);
       const after = worldTree();
+      // Said in the trace, so a test can see the plain reload really gave placeholders (production's shape), not an
+      // expansion from an entry the dance left behind.
+      if (gone.length) st.note = `${gone.length} deleted prefab(s) restored for the comparison; ${placeholderGuids().size} placeholder(s) on the plain reload`;
       const s2 = await saveScene({ allowDialog: false });
       if (!s2.saved) throw new Error(`second save: ${s2.reason}`);
-      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '' };
+      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '', ...(gone.length ? { restored } : {}) };
       return 'done';
     }
     case 'trashPrefab': {

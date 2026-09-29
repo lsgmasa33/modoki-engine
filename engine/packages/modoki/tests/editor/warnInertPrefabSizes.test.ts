@@ -395,6 +395,7 @@ const GENERATED_PREFAB_WRITERS = [
 /** Functions that serialize a prefab for a CALLER and write nothing themselves: whether it is written, and so warned,
  *  is the caller's, which the write census above holds to it. */
 const SERIALIZE_FOR_A_CALLER = [
+  { item: 'packages/modoki/src/editor/scene/prefab.ts::serializeRebuildOver', reason: 'the rebuild entry point (#1782): it serializes for its two callers, Import Model and the skin-rig update, which are GENERATED_PREFAB_WRITERS rows' },
   { item: 'packages/modoki/src/editor/scene/prefabEdit.ts::serializePrefabEditWorld', reason: 'the prefab-edit world as a document: savePrefabEditReport warns what it writes (the write census row for it), and the tests read it as what a Save would write' },
 ];
 
@@ -472,8 +473,10 @@ function serializeCensus(): Array<{ file: string; in: string | undefined; warns:
     .filter((f) => /\.tsx?$/.test(f)).map((f) => path.join(root, f)));
   return files.sort().flatMap((abs) => {
     const code = readScannedSource(abs).code;
-    if (!code.includes('serializePrefab(')) return [];
-    return callsTo(parseSource(code, path.basename(abs)), 'serializePrefab').map((call) => {
+    // Both entry points: a rebuild over an existing file serializes through `serializeRebuildOver` (#1782).
+    if (!code.includes('serializePrefab(') && !code.includes('serializeRebuildOver(')) return [];
+    const sf = parseSource(code, path.basename(abs));
+    return [...callsTo(sf, 'serializePrefab'), ...callsTo(sf, 'serializeRebuildOver')].map((call) => {
       const fn = enclosingNamedFunction(call);
       return {
         file: path.relative(ENGINE, abs).split(path.sep).join('/'),

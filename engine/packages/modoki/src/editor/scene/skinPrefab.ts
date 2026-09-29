@@ -12,8 +12,7 @@ import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
-import { serializePrefab, classifyExistingPrefabId, type PrefabFile } from './prefab';
-import { priorLocalIdCounter } from '../../runtime/core/localIdCounter';
+import { serializeRebuildOver, classifyExistingPrefabId, type PrefabFile } from './prefab';
 import { commitPrefabWrite, parsePrefabBytes } from './prefabCommit';
 import { readPriorDocument } from '../panels/assetOps';
 import { jsonFileBody } from '../backend/editorBackend';
@@ -90,8 +89,8 @@ export async function makeRigPrefabAsset(
   // a scene instance. All synchronous, so the temp entities never render.
   const rootId = spawnEntitySubtree(0, buildRigSubtree(rigGuid, rigDef.bones, rootName));
   if (rootId == null) return null;
-  // Positional over the old file (#1782), but its high-water mark never goes down (#1774).
-  const prefab = serializePrefab(rootId, existingId, { priorCounter: priorLocalIdCounter(prevContent) });
+  // A rebuild over the old file (#1782): a bone keeps its row by its path in the rig, a new one goes above the mark (#1774).
+  const prefab = serializeRebuildOver(rootId, existingId, prevContent);
   deleteEntity(rootId);
   if (!prefab) return null;
 

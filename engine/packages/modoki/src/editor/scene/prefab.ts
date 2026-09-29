@@ -1,6 +1,6 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
-import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
+import { expandsToRoot, isPrefabDocument } from '../../runtime/loaders/prefabRoot';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
@@ -23,7 +23,7 @@ import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMess
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
-import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
+import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef, resolveGuidToPath, getAllAssets } from '../../runtime/loaders/assetManifest';
 import { durableGuid, memberStepId, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isDerivedMember, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
@@ -1055,16 +1055,37 @@ function nodeGuidsFor(
   // name makes it "unpredictable"; here a duplicate name — on either side — matches nothing and mints, because a guess
   // hands one node's stored edits to another. A nested row matches only a nested row of the same child prefab, and a
   // plain node only a plain row. The live `nodeGuid` above wins wherever it exists: it is the exact correspondence.
+  // A REBUILD (`serializeRebuildOver`, #1782) matches by hierarchy PATH instead — the names from the root down — as
+  // Unity's model importer keeps a node's identity across a reimport by its path: two same-named nodes under different
+  // parents both keep theirs. The same rule on either side: a path that is not unique matches nothing and mints.
   if (replacing?.entities?.length) {
     const kindOf = (e: EntityInfo): string => (nestedRowIds.has(e.id)
       ? `ref:${(piMeta ? (readTraitData(e.id, piMeta) as { source?: string } | null)?.source : '') ?? ''}` : 'plain');
+    const byPath = replacing.match === 'path';
+    const liveById = new Map(flatTree.map((e) => [e.id, e] as const));
+    const livePath = (e: EntityInfo): string => {
+      const names: string[] = [];
+      for (let at: EntityInfo | undefined = e; at && at.id !== selectedEntityId; at = liveById.get(at.parentId)) names.unshift(at.name ?? '');
+      return names.join('\0');
+    };
+    const rowByLocal = new Map(replacing.entities.map((r) => [r.localId, r] as const));
+    const rootLid = replacing.rootLocalId ?? 1;
+    const rowPath = (r: ReplacedRow): string => {
+      const names: string[] = [];
+      const seen = new Set<number>();
+      for (let at: ReplacedRow | undefined = r; at && at.localId !== rootLid && !seen.has(at.localId ?? 0); at = rowByLocal.get(at.traits?.EntityAttributes?.parentId)) {
+        seen.add(at.localId ?? 0);
+        names.unshift(at.name ?? '');
+      }
+      return names.join('\0');
+    };
     const count = <T,>(xs: Iterable<T>, key: (x: T) => string) => {
       const n = new Map<string, number>();
       for (const x of xs) n.set(key(x), (n.get(key(x)) ?? 0) + 1);
       return n;
     };
-    const liveKey = (e: EntityInfo) => `${kindOf(e)}\0${e.name ?? ''}`;
-    const rowKey = (r: { name?: string; prefab?: string }) => `${r.prefab ? `ref:${r.prefab}` : 'plain'}\0${r.name ?? ''}`;
+    const liveKey = (e: EntityInfo) => `${kindOf(e)}\0${byPath ? livePath(e) : e.name ?? ''}`;
+    const rowKey = (r: ReplacedRow) => `${r.prefab ? `ref:${r.prefab}` : 'plain'}\0${byPath ? rowPath(r) : r.name ?? ''}`;
     const liveNames = count(flatTree, liveKey);
     const rowNames = count(replacing.entities, rowKey);
     const rowByKey = new Map(replacing.entities.map((r) => [rowKey(r), r]));
@@ -1193,10 +1214,6 @@ function serializePrefabBody(
      *  highest localId the session has opened or written, so a number freed by a delete is never handed to a new member
      *  while the deleted one can still come back by undo (#1662; Unity never reuses a fileID either). */
     localIdFloor?: number;
-    /** The high-water mark of the document this write lands over, for a writer that passes neither `replacing` nor a
-     *  preserve map — a rebuild over an existing file (Import Model, the skin-rig update). It numbers nothing; it keeps
-     *  the written mark from going down (#1774). */
-    priorCounter?: number;
     /** ecsId → the reference row a placeholder stands for, whose prefab the load could not expand (#1699, prefab-edit
      *  only). The row is written as given (its prefab, edits and traits), numbered, identified, named and parented like
      *  any other: the edit world holds nothing of that frame for a capture to find. */
@@ -1412,7 +1429,7 @@ function serializePrefabBody(
   // The high-water mark (#1774): above every row written, and never below the document this write replaces or lands
   // over — prefab-edit's session floor, a Replace's document, a rebuild's prior file. `commitPrefabWrites` holds the same
   // line against the file on disk; stating it here keeps the bytes a caller records before the commit the bytes written.
-  advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0, opts?.priorCounter);
+  advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0);
   assertNoRuntimeGuids(file, 'a serialized prefab');
   opts?.onRows?.(ecsToLocal);
   writtenRows.set(file.entities, new Map(flatTree.filter((e) => e.guid).map((e) => [e.guid!, ecsToLocal.get(e.id)!])));
@@ -1749,11 +1766,15 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
 
 /** The rows a Replace matches identity against (#1686): each row's name, `nodeGuid` and nested `prefab`, and the
  *  numbering a matched row keeps (#1759: its `localId`, and the document's `rootLocalId`). */
+type ReplacedRow = { name?: string; nodeGuid?: string; prefab?: string; localId?: number; traits?: { EntityAttributes?: { parentId?: number } } };
 export type ReplacedRows = {
-  entities?: ReadonlyArray<{ name?: string; nodeGuid?: string; prefab?: string; localId?: number }>;
+  entities?: ReadonlyArray<ReplacedRow>;
   rootLocalId?: number;
   /** The replaced document's high-water mark (#1774): a new row is numbered above it. */
   nextLocalId?: number;
+  /** How a node with no live identity is matched to a row: by its NAME (a Replace, Unity's U22) or by its hierarchy PATH
+   *  (a rebuild of a fresh tree — Import Model, the skin-rig update — as Unity's model importer does, #1782). */
+  match?: 'name' | 'path';
 };
 
 /** {@link ReplacedRows} from a replaced prefab's raw bytes — undefined for bytes that are not a prefab document. Read
@@ -1769,6 +1790,18 @@ export function parsedPrefabRows(text: string | null): ReplacedRows | undefined 
       ...(typeof doc.nextLocalId === 'number' ? { nextLocalId: doc.nextLocalId } : {}),
     };
   } catch { return undefined; }
+}
+
+/** A REBUILD of an existing prefab from a freshly spawned tree — Import Model over an existing prefab, the 2D skin-rig update
+ *  in place (#1782) — serialized as a Replace of the bytes the writer read (`previousContent`): a node whose hierarchy
+ *  PATH matches one row keeps that row's `localId` and `nodeGuid` (#1759 option 1: Unity's model importer keeps identity
+ *  across a reimport by path), and a new node is numbered above the old document's high-water mark (#1774). Both used to
+ *  number rows 1..n with fresh nodeGuids, so each new row derived the member guid the old row at its POSITION had, and a
+ *  scene's ref to an old member retargeted onto whatever node now sat at that number. A pre-v5 document (no nodeGuids)
+ *  keeps the positional plan (`replaceNumbering`); no document at all (a first import) is an ordinary create. */
+export function serializeRebuildOver(rootId: number, existingId: string | undefined, previousContent: string | null | undefined): PrefabFile | null {
+  const rows = parsedPrefabRows(previousContent ? previousContent.replace(/^\uFEFF/, '') : null);
+  return serializePrefab(rootId, existingId, rows ? { replacing: { ...rows, match: 'path' } } : {});
 }
 
 /** Resolve the stable id a (re)written prefab at `prefabPath` must keep, so a
@@ -2155,7 +2188,7 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
     prefab = await fetchPrefabSource(source);
     if (prefabCache.has(source)) return prefabCache.get(source)!;
     if (!unchanged()) continue;
-    if (prefab) { prefabCache.set(source, prefab); registerRead(source, prefab); }
+    if (prefab) { seatEditorEntry(source, prefab); registerRead(source, prefab); }
     return prefab;
   }
   return prefab;
@@ -2180,7 +2213,9 @@ async function fetchPrefabSource(source: string, init?: RequestInit): Promise<Pr
   try {
     const res = await fetch(url, init);
     if (!res.ok) return null;
-    const prefab: PrefabFile = await res.json();
+    const prefab: unknown = await res.json();
+    // Not a prefab document (#1813) is a prefab that did not load — the loader's rule (`isPrefabDocument`).
+    if (!isPrefabDocument(prefab)) return null;
     // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
     // nothing on the loading path inspects (#365/#379). Applying the zIndex migration
     // unconditionally here (cheap, idempotent) is the smallest thing that closes the same
@@ -2189,7 +2224,7 @@ async function fetchPrefabSource(source: string, init?: RequestInit): Promise<Pr
     // nestedOverrides paths too (including this prefab FILE's own nested rows), not just
     // entry.traits.
     for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
-    return prefab;
+    return prefab as PrefabFile;
   } catch { return null; }
 }
 
@@ -2227,7 +2262,7 @@ export async function refreshPrefabSourceForPath(path: string): Promise<void> {
     const before = prefabCache.get(key);
     if (before === undefined || key === editing) continue;
     const fresh = await fetchPrefabSource(key, { cache: 'no-store' });
-    if (fresh && prefabCache.get(key) === before) { prefabCache.set(key, fresh); registerRead(key, fresh); }
+    if (fresh && prefabCache.get(key) === before) { seatEditorEntry(key, fresh); registerRead(key, fresh); }
   }
 }
 
@@ -2385,14 +2420,34 @@ export async function instantiatePrefabInstance(
  *  re-spawn every pooled row built from it (#1308) — on every drag-drop, and once per prefab on
  *  every scene swap. */
 export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void {
-  prefabCache.set(source, prefab);
+  seatEditorEntry(source, prefab);
+}
+
+/** The ONE place the editor cache takes an entry (#1813): only a prefab DOCUMENT (`isPrefabDocument`), and anything else
+ *  leaves the key absent — a prefab that did not load, which I18 handles — rather than a shape every sync reader of this
+ *  cache assumes and throws on. Every writer below goes through it, and a new one must too. */
+function seatEditorEntry(source: string, prefab: PrefabFile | null): void {
+  if (prefab && isPrefabDocument(prefab)) { prefabCache.set(source, prefab); deletedEditorKeys.delete(source); }
+  else prefabCache.delete(source);
+}
+
+/** The GUIDS of what an asset delete evicted or deleted (#1805 close-out review): a scene swap's warm
+ *  (`warmEditorPrefabCacheFor`, which seeds only guid sources from the loader) seeds a cold key from the LOADER's entry,
+ *  which a delete leaves in place (#1834), so a reload put the deleted prefab straight back and the eviction lasted one
+ *  swap. Such a guid is read from disk instead, through the manifest: a 404 for a file still gone, the document for one an
+ *  undo restored — or, where the manifest still maps the guid to that path and a new file took it, that file's document,
+ *  which the warm got through the loader before this too. Cleared by any document seated under the guid. */
+const deletedEditorKeys = new Set<string>();
+
+/** Did an asset delete evict `source` from the editor cache, with nothing seated under it since? */
+export function editorPrefabDeleted(source: string): boolean {
+  return deletedEditorKeys.has(source);
 }
 
 /** The editor cache's half of a prefab write, for `commitPrefabWrite` (prefabCommit.ts) alone: set `source` to the
  *  document just written, or evict it after a trash. The runtime cache is the commit's to update. */
 export function seatEditorPrefabCache(source: string, prefab: PrefabFile | null): void {
-  if (prefab) prefabCache.set(source, prefab);
-  else prefabCache.delete(source);
+  seatEditorEntry(source, prefab);
 }
 
 /** A prefab file moved from `from` to `to` (every file under it when `prefix`): its PATH key follows it (#1751 F6), so a
@@ -2409,6 +2464,46 @@ export function rekeyEditorPrefabCache(from: string, to: string, prefix = false)
     prefabCache.delete(key);
     prefabCache.set(next, doc);
   }
+}
+
+/** A prefab file was DELETED (#1805, I9) — every file under `from` when `prefix`: every entry of the EDITOR cache that
+ *  answers for it goes. Without it the editor cache kept answering after the trash while a world swap's re-fetch 404'd in
+ *  the loader's, and a sync reader expanded a prefab that no longer exists (an instantiate from the stale entry, which the
+ *  reload then showed empty).
+ *
+ *  ⚠️ The LOADER's entry is left until the scene that owns it lets go, deliberately (#1834): evicted here, any reload after
+ *  the delete turned the live instances into Missing Prefab placeholders, and an undo run against a placeholder is #1819's
+ *  open class (group 1 of #1789) — trash, reload, Cmd+Z reached it. A reload of the same scene keeps that entry, so what
+ *  this evicts is TOMBSTONED (`editorPrefabDeleted`) and a swap's warm reads it from disk rather than seeding it back from
+ *  the loader. Every save captures the live instance from its frame record (I18).
+ *
+ *  An entry answers for the deleted file when its key is the path, when its key is a guid the manifest still maps into the
+ *  deleted range, or when it is the id of a DOCUMENT held under one of those — which finds the guid key after a pruning
+ *  manifest update (the dev server's full rescan, `createEditor.tsx`) has already forgotten the guid. ⚠️ One window
+ *  stays: that rescan landing BEFORE this repair, with the prefab held under its guid ALONE, leaves nothing to trace the
+ *  guid to the path, and the entry is not found. The Electron IPC update is additive and never prunes, so there the guid
+ *  still maps when the route's repair runs.
+ *  Live instances of it stay expanded: that is #1738's evicted state, and every writer captures them from their frame
+ *  records (I18), so a save writes what the reload's Missing Prefab placeholder reads back. Returns how many it evicted. */
+export function evictDeletedEditorPrefabs(from: string, prefix = false): number {
+  if (!from) return 0;
+  const dir = from.endsWith('/') ? from : `${from}/`;
+  const inRange = (p: string | undefined) => !!p && (p === from || (prefix && p.startsWith(dir)));
+  const pathOf = (key: string) => (isGuid(key) ? resolveGuidToPath(key) : key);
+  const ids = new Set<string>();
+  for (const [key, doc] of prefabCache) if (inRange(pathOf(key)) && doc.id) ids.add(doc.id);
+  // Tombstoned too: every guid the manifest still maps into the range, whether or not the editor held it — the next swap's
+  // warm would otherwise seed it from the loader's stale entry (`editorPrefabDeleted`).
+  for (const a of getAllAssets()) if (a.type === 'prefab' && inRange(a.path)) ids.add(a.guid);
+  let n = 0;
+  for (const key of [...prefabCache.keys()]) {
+    if (!inRange(pathOf(key)) && !ids.has(key)) continue;
+    prefabCache.delete(key);
+    if (isGuid(key)) deletedEditorKeys.add(key);
+    n++;
+  }
+  for (const id of ids) deletedEditorKeys.add(id);
+  return n;
 }
 
 /** Is this source already in the editor cache? (`getCachedPrefabSync` answers the same
@@ -4822,8 +4917,7 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
  *  every key only once the write has landed, and then rebuilds the live frames. Every writer used to call this after
  *  its own write, and each one that stopped there left other instances expanded from the old document (#1685). */
 export function setPrefabCache(source: string, prefab: PrefabFile | null): void {
-  if (prefab) prefabCache.set(source, prefab);
-  else prefabCache.delete(source);
+  seatEditorEntry(source, prefab);
   // Keep the runtime refcounted prefab cache in sync. REPLACE rather than evict: an eviction strands every synchronous
   // runtime reader until the next scene load (#1308). A delete still evicts.
   if (prefab) replaceCachedPrefab(source, prefab);
@@ -9071,11 +9165,60 @@ export function unexpandedNestedRefusal(rootId: number): string | null {
   return `"${hit.row}" in "${hit.instance}" is a nested prefab that could not be loaded (${hit.prefab}), so the instance cannot be written into a template until it resolves`;
 }
 
+/** The refusal Create Prefab gives a tree holding an instance frame built from other rows than the editor's cached copy of
+ *  its prefab (#1815, I3), or null — ONE wording for the human path and the agent op. The capture reads the cache first
+ *  (`captureDoc`), so such a frame's members would be matched with the wrong rows, and a row only the OLD document had
+ *  came back as a template-added node. Apply and Revert ask the same predicate of their instance
+ *  ({@link framesBuiltFromOtherRows}); this asks it of every instance root in the subtree of `rootId`, the root included.
+ *  Refused rather than rebased, as they do: a rebase would rebuild the tree the human selected under them.
+ *  ⚠️ Asked AFTER the caller's nested warm, like {@link unexpandedNestedRefusal}: a frame with no cached copy cannot be
+ *  judged, and is not reported. */
+export function staleFramesInTreeRefusal(rootId: number): string | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return null;
+  const stale: string[] = [];
+  for (const id of subtreeIds(getAllEntities(), rootId)) {
+    const pi = readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null;
+    if (!pi?.source || pi.rootInstanceId !== id) continue;
+    for (const s of framesBuiltFromOtherRows(id)) if (!stale.includes(s)) stale.push(s);
+  }
+  if (!stale.length) return null;
+  return `a prefab instance in the selection was built from a different version of ${stale.map((s) => `"${(isGuid(s) ? resolveRef(s) : undefined) ?? s}"`).join(', ')} ` +
+    'than the editor now holds, so its members would be matched with the wrong rows of that prefab';
+}
+
 /** Create Prefab's tag (#1790, owner ruling D), for both callers: `tagEntityTreeAsInstance`, then the scene half of the
  *  bake. Returns the tag's rename and the undo of the settle, which runs BEFORE the rename is reversed. */
 export function tagCreatedPrefab(rootEcsId: number, source: string, writtenPrefab: PrefabFile): { guidRemap: Map<string, string>; undoKept: () => void } {
+  const piMeta = getTraitByName('PrefabInstance');
+  const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
   const guidRemap = tagEntityTreeAsInstance(rootEcsId, source, writtenPrefab);
-  return { guidRemap, undoKept: settleSwallowedKeptState(rootEcsId) };
+  const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
+  const undoSettle = settleSwallowedKeptState(rootEcsId);
+  return { guidRemap, undoKept: () => { undoSettle(); undoUnpack(); } };
+}
+
+/** Create Prefab from an instance ROOT unpacks it (#1814, hub ruling under "prefab behaviour copies Unity"): the root was an
+ *  instance of another prefab and is now the root of an original, so what R2 kept for its OWN old frame — orphan member
+ *  rows, legacy channels, all in the old prefab's identity space — names nothing the new prefab has, and never can. Unity
+ *  drops an unpacked instance's unused overrides; so does this. Not owner ruling D (#1790), which bakes the unused overrides
+ *  of the roots the new instance SWALLOWS: those stay nested. Run after the tag and before the settle, which then moves the
+ *  swallowed roots' identity rows onto a clean root. Left alone: a root that was no instance (`before` empty), a Replace of
+ *  the root's OWN prefab (still an instance of the same document — nothing was unpacked, and Unity keeps a connected
+ *  instance's unused overrides), and a tag that refused (the root is still linked to the old prefab). By document id
+ *  (`instanceSourceRef`, #1807), not a path through the manifest. Returns the undo. */
+function dropUnpackedRootKeptState(rootId: number, before: string | undefined, writtenPrefab: PrefabFile): () => void {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!before || !piMeta || !eaMeta) return () => {};
+  const now = (readTraitData(rootId, piMeta) as { source?: string } | null)?.source;
+  const written = instanceSourceRef('', writtenPrefab);
+  if (!now || instanceSourceRef(now) !== written || instanceSourceRef(before) === written) return () => {};
+  const rootGuid = durableGuid((readTraitData(rootId, eaMeta) as { guid?: string } | null)?.guid);
+  const kept = rootGuid ? keptStateOf(rootGuid) : undefined;
+  if (!kept) return () => {};
+  restoreKeptState(rootGuid, {});
+  return () => restoreKeptState(rootGuid, kept);
 }
 
 /** After the tag: what R2 kept for every root the new instance swallowed, left as the SCENE half of the bake. Its edits

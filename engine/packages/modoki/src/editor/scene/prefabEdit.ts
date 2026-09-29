@@ -33,6 +33,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
+import { isPrefabDocument } from '../../runtime/loaders/prefabRoot';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
@@ -449,6 +450,12 @@ async function openPrefabForEditingSwitching(
     console.error('[PrefabEdit] fetch failed:', e);
     return;
   }
+  // The shape check every other prefab read asks where it enters a cache (#1813, `isPrefabDocument`): this raw read seeds
+  // both caches below and builds the edit world from `entities`, and a file without that shape threw out of the open.
+  if (!isPrefabDocument(prefab)) {
+    console.error(`[PrefabEdit] ${asset.path} is not a prefab document (no entities array of rows) — not opened`);
+    return;
+  }
   // This is a RAW fetch, not routed through getPrefabSource — that helper already runs this
   // migration (structured walk, see uiAnchorZIndexMigration.ts) on every load, but this path
   // bypasses it entirely, so it must run here too BEFORE setPrefabCache below, or the
@@ -677,7 +684,7 @@ export function collectPreservedLocalIds(
  *  every number and identity (close-out review 2). It lives as long as the editor process. Leaving prefab edit drops the
  *  prefab's undo history (U27 in `docs/prefabs.md`, #1704), so what it keeps across visits costs only gaps in the
  *  numbering.
- *  ⚠️ A write made OUTSIDE prefab edit between two visits (a positional rebuild, #1782; a pre-v5 Replace; a checkout)
+ *  ⚠️ A write made OUTSIDE prefab edit between two visits (a rebuild over the file, #1782; a pre-v5 Replace; a checkout)
  *  can give a number this record remembers to another row. A remembered ADDED member then yields to the document
  *  (`collectPreservedLocalIds`' `current`). A SENTINEL cannot: `__prefab_edit_local__<n>` names row n of whichever
  *  document the entity came from. Only an undo from an earlier visit could bring such a row back, and that history is

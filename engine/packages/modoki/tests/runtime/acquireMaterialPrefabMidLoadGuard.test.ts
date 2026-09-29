@@ -58,7 +58,8 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     await gateFor(url).promise;
     const id = url === MAT_PATH ? MAT_GUID : PREFAB_GUID;
-    const body = url === MAT_PATH ? { version: 1, id, type: 'pbr' } : { version: 1, id };
+    // A prefab is a DOCUMENT, or the loader refuses it (#1813).
+    const body = url === MAT_PATH ? { version: 1, id, type: 'pbr' } : { version: 1, id, entities: [] };
     return {
       ok: true, status: 200, statusText: 'OK',
       text: async () => JSON.stringify(body),

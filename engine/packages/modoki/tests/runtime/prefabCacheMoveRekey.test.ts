@@ -17,7 +17,7 @@ import {
   rekeyCachedPrefab, disposeAllCachedResources, invalidatePrefab,
 } from '../../src/runtime/loaders/meshTemplateCache';
 import { applyAssetPathMoves } from '../../src/editor/panels/assetEditorBindings';
-import { setPrefabCache, getCachedPrefabSync } from '../../src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, primeEditorPrefabCache } from '../../src/editor/scene/prefab';
 
 const GUID = '55555555-2222-4333-8444-000000001751';
 const OLD = '/games/g/assets/ui/Row.prefab.json';
@@ -198,5 +198,52 @@ describe('a moved prefab keeps its runtime cache entry (#1751 F6)', () => {
     await settle();
     expect((getCachedPrefab(GUID) as { name: string } | undefined)?.name).toBe('Row');
     expect(getResourceStats().prefabs).toEqual({ [NEW]: 2 });
+  });
+});
+
+describe('a deleted prefab leaves the editor cache (#1805, I9)', () => {
+  // An Assets delete is marked as the editor's own, so no watcher evicted: the editor's sync cache kept answering after the
+  // trash while a world swap's re-fetch 404'd in the loader's, and an instantiate expanded a prefab that no longer exists
+  // (the #1789 fuzzer's seed 199). The delete repair — `applyAssetPathMoves` with `to: null`, which the route's renderer
+  // repair, the panel and every undo trash run — now evicts the EDITOR cache. The loader's entry is left to the next world
+  // swap: evicted, a reload after the delete gave placeholders, and an undo against one is #1819's open class.
+  afterEach(() => { for (const k of [GUID, OLD, NEW]) setPrefabCache(k, null as never); });
+
+  // Mutation: drop the eviction from the delete branch of `applyAssetPathMoves` — both editor keys still answer.
+  it('evicts every editor key — the path, and the guid — and leaves the loader\'s entry to the next swap', async () => {
+    await acquirePrefab(1, GUID);
+    primeEditorPrefabCache(GUID, doc as never);
+    primeEditorPrefabCache(OLD, doc as never);
+    applyAssetPathMoves([{ from: OLD, to: null }]);
+    expect(getCachedPrefabSync(GUID)).toBeNull();
+    expect(getCachedPrefabSync(OLD)).toBeNull();
+    expect(getCachedPrefab(GUID)).toEqual(doc); // the loader's: dropped when its scene lets go, not here
+  });
+
+  // Mutation: drop the document-id match in `evictDeletedEditorPrefabs` — the guid key survives a pruned manifest.
+  it('a guid the manifest already forgot is found by the document the path key holds', () => {
+    primeEditorPrefabCache(GUID, doc as never);
+    primeEditorPrefabCache(OLD, doc as never);
+    clearManifest(); // the dev server's pruning rescan landed before the repair
+    applyAssetPathMoves([{ from: OLD, to: null }]);
+    expect(getCachedPrefabSync(GUID)).toBeNull();
+  });
+
+  // Mutation: drop the `prefix` branch of the eviction — the folder delete leaves the editor's entry.
+  it('a folder delete evicts every prefab under it, and nothing that merely shares the prefix', async () => {
+    const SIBLING = '55555555-2222-4333-8444-000000001805';
+    const SIB_PATH = '/games/g/assets/ui2/Other.prefab.json';
+    const sibling = { ...doc, id: SIBLING, name: 'Other' };
+    registerAsset(SIBLING, SIB_PATH, 'prefab');
+    // Each path serves its OWN document: the shared stub serves Row everywhere, and its fetch would register GUID at SIB_PATH.
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({ ok: true, status: 200, statusText: 'OK', text: async () => JSON.stringify(url === SIB_PATH ? sibling : doc) }) as unknown as Response));
+    await acquirePrefab(1, GUID);
+    await acquirePrefab(1, SIBLING);
+    primeEditorPrefabCache(GUID, doc as never);
+    primeEditorPrefabCache(SIBLING, sibling as never);
+    applyAssetPathMoves([{ from: '/games/g/assets/ui', to: null, prefix: true }]);
+    expect(getCachedPrefabSync(GUID)).toBeNull();
+    expect(getCachedPrefabSync(SIBLING)).not.toBeNull();
+    setPrefabCache(SIBLING, null as never);
   });
 });
