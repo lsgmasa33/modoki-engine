@@ -780,7 +780,11 @@ export async function createPrefabFromEntity(
         rebuild: () => {
           unstamp();
           // By the document's own guid (#1807): the manifest can still map it to a renamed path an undo just moved back.
-          const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath, prefab);
+          const id = ref.resolve();
+          // A miss here comes AFTER the file was trashed, so it is a shortfall of a step that applied in part (#1823).
+          // `require` (docs/prefabs.md I19, #1795's second route) moves this check before the trash, making it a refusal.
+          if (id != null) untagEntityTreeAsInstance(id, savePath, prefab);
+          else reportUndoFailure({ direction: 'Undo', label, detail: `the entity linked to ${savePath} no longer exists, so nothing was unlinked` });
           if (priorLinks) reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
           tagged = false;
         },
@@ -790,8 +794,8 @@ export async function createPrefabFromEntity(
         reportUndoFailure({
           direction: 'Undo', label,
           detail: replaced
-            ? `the replaced prefab was not restored: ${savePath}. The entities were left linked to it rather than half-undone.`
-            : `the prefab file was not trashed and is still on disk: ${savePath}. The entities were left linked to it rather than half-undone.`,
+            ? `the replaced prefab was not restored: ${savePath} (${committed.error ?? 'the write failed'}). The entities were left linked to it rather than half-undone.`
+            : `the prefab file was not trashed and is still on disk: ${savePath} (${committed.error ?? 'the write failed'}). The entities were left linked to it rather than half-undone.`,
         });
         return;
       }
@@ -812,7 +816,8 @@ export async function createPrefabFromEntity(
         bytes: content,
         rebuild: async () => {
           const id = ref.resolve();
-          if (id == null) return;
+          // The file landed; the entity it links is gone, so nothing was linked — said into the step (#1823).
+          if (id == null) return reportUndoFailure({ direction: 'Redo', label, detail: `${savePath} was written, but the entity it links no longer exists, so nothing was linked` });
           if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
           // tagEntityTreeAsInstance re-runs planPrefabRows, whose nested-instance lookup is the
           // same sync cache read as the original create (#1284). Cold, the plan drops the nested
@@ -822,7 +827,8 @@ export async function createPrefabFromEntity(
           // Re-resolve: a cold source makes that warm do real I/O, and entityRef exists in this
           // file precisely because a raw id goes stale across a world rebuild (Play->Stop, a
           // watcher reload). Tagging the pre-await id could hit a different entity, or none.
-          const tagId = ref.resolve(); if (tagId == null) return;
+          const tagId = ref.resolve();
+          if (tagId == null) return reportUndoFailure({ direction: 'Redo', label, detail: `${savePath} was written, but the entity it links no longer exists, so nothing was linked` });
           ({ guidRemap, undoKept } = tagCreatedPrefab(tagId, savePath, prefab)); // re-stamped, so undo reverses THIS run's rename
           tagged = true;
         },
@@ -831,7 +837,7 @@ export async function createPrefabFromEntity(
       if (!committed.ok) {
         reportUndoFailure({
           direction: 'Redo', label,
-          detail: `the prefab file was not written: ${savePath}. The entities were left un-linked rather than pointed at a file that is not there.`,
+          detail: `the prefab file was not written: ${savePath} (${committed.error ?? 'the write failed'}). The entities were left un-linked rather than pointed at a file that is not there.`,
         });
         return;
       }

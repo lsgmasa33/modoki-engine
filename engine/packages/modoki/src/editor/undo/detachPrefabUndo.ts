@@ -7,6 +7,7 @@
  *  beside the row it recorded as REMOVED (#1665 close-out review). */
 
 import { pushAction } from './undoManager';
+import { reportUndoFailure } from './undoFailure';
 import { entityRef } from './entityRef';
 import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefab';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -62,8 +63,9 @@ export function detachPrefabInstanceWithUndo(rootId: number, label: string, logT
     label,
     undo: async () => {
       const unresolved = await reattachDetachedInstance(snapshot);
-      // Reported, never discarded — that silence is what hid #1272 for as long as it did.
-      if (unresolved > 0) console.warn(`${logTag} Detach undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
+      // Reported, never discarded — that silence is what hid #1272 for as long as it did. Into the step (#1823), so
+      // the undo answers PARTIAL rather than `did:true`.
+      if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${logTag} ${unresolved} prefab link(s) could not be put back — no longer addressable` });
     },
     redo: () => {
       const id = ref.resolve(); if (id == null) return;

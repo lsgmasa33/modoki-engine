@@ -192,12 +192,15 @@ export function makeDeleteUndo(
       // deletionPathsFor deliberately lists maybe-absent sidecars (`.meta.local.json` is
       // gitignored and usually not on disk), so a deletePaths-based diff would name files
       // that never existed and send the user hunting in the trash for them.
+      // Through `reportUndoFailure` (#1823), so the step's result carries it: it was a bare console line, and the agent's
+      // undo answered `did:true` over files still in the trash.
       const lost = Array.from(inTrash);
       if (lost.length > 0) {
-        console.error(
-          `[Assets] Undo of "${label}" restored ${restoredPaths.length} of ${restoredPaths.length + lost.length} file(s). ` +
-          `Still in the trash, recover by hand: ${lost.join(', ')}` + (refusals.length ? `. Refused: ${refusals.join('; ')}` : ''),
-        );
+        reportUndoFailure({
+          direction: 'Undo', label,
+          detail: `restored ${restoredPaths.length} of ${restoredPaths.length + lost.length} file(s). ` +
+            `Still in the trash, recover by hand: ${lost.join(', ')}` + (refusals.length ? `. Refused: ${refusals.join('; ')}` : ''),
+        });
       }
       if (unrolled.length > 0 && occupied.length === 0) {
         // A write failed part-way and the put-back failed too: half an asset is on disk. Say which files, because the
@@ -209,7 +212,8 @@ export function makeDeleteUndo(
         reportUndoFailure({
           direction: 'Undo', label, userFixable: true,
           detail: `not restored, because another file is now at ${occupied.join(', ')} — that asset is still in the trash, and the file at its path was left as it is` +
-            (unrolled.length ? `. These were restored and could not be taken back: ${unrolled.join(', ')}` : ''),
+            // The partial branch above is skipped when something collided, so the write failure's reason is said here.
+            (unrolled.length ? `. These were restored (a write failed${refusals.length ? `: ${refusals.join('; ')}` : ''}) and could not be taken back: ${unrolled.join(', ')}` : ''),
         });
       }
       // Refresh even on a partial restore — the files that DID come back must appear.
@@ -240,13 +244,14 @@ export function makeDeleteUndo(
       if (res.conflicts?.length) throw fileChangedRefusal(res.conflicts);
       // Same false-success shape on the other half: a failed re-delete left the files on
       // disk, refresh() re-listed them, and redo read as a no-op (#291).
+      // Reported into the step (#1823), not only to the console.
       if (!res.ok) {
-        console.error(`[Assets] Redo of "${label}" failed — the files are still on disk: ${allPaths.join(', ')}`);
+        reportUndoFailure({ direction: 'Redo', label, detail: `nothing was trashed — the files are still on disk: ${allPaths.join(', ')}` });
       } else if (res.failed.length > 0) {
         // ⚠️ A PARTIAL refusal is `ok:true`, so the check above cannot see it — the very defect
         // #884 fixed in `executeDeletion`, left standing on this half until the close-out review
         // found it. Silent here means the redo re-lists the refused file and reads as a no-op.
-        console.error(`[Assets] Redo of "${label}" did not fully apply — the OS refused: ${res.failed.join(', ')}`);
+        reportUndoFailure({ direction: 'Redo', label, detail: `the OS refused to trash: ${res.failed.join(', ')}` });
       }
       // ⚠️ Only on a SUCCESSFUL redo, and only the `failed` half. On `!res.ok` the redo deleted
       // nothing — `deleteAssetFiles` answers `{ok:false, missing:[], failed:[]}` for a non-2xx and
@@ -750,7 +755,7 @@ export function makeModelImportUndo(params: {
       });
       if (w.conflict) throw fileChangedRefusal([prefabPath]);
       if (w.ok) onDisk = false;
-      else reportUndoFailure({ direction: 'Undo', label, detail: `prefab "${prefabPath}" was not ${replaced ? 'restored' : 'trashed'}` });
+      else reportUndoFailure({ direction: 'Undo', label, detail: `prefab "${prefabPath}" was not ${replaced ? 'restored' : 'trashed'}: ${w.error ?? 'the write failed'}` });
       onDone?.();
     },
     redo: async () => {
@@ -759,7 +764,7 @@ export function makeModelImportUndo(params: {
       });
       if (w.conflict) throw fileChangedRefusal([prefabPath]);
       if (w.ok) onDisk = true;
-      else reportUndoFailure({ direction: 'Redo', label, detail: `prefab "${prefabPath}" was not recreated` });
+      else reportUndoFailure({ direction: 'Redo', label, detail: `prefab "${prefabPath}" was not recreated: ${w.error ?? 'the write failed'}` });
       onDone?.();
     },
   };

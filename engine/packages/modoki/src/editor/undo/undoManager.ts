@@ -2,7 +2,8 @@
 
 import { editorEmit, type EditorJournalType } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
-import { reportUndoThrew, UndoRefusedError } from './undoFailure';
+import { reportStepShortfall, reportUndoThrew, UndoRefusedError } from './undoFailure';
+import { _resetStepWindow, closeStepWindow, currentStepWindow, openStepWindow } from './stepWindow';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
@@ -253,6 +254,52 @@ export function beginWorldBoundOperation(): () => void {
     notifyIdleIfSo();
   };
 }
+/** An undo/redo step (or a rollback on the step chain) is queued or running NOW — the synchronous question, for a
+ *  forward edit that must REFUSE rather than wait (#1832; docs/scene-loading.md § "Readers of the world"). Its entry
+ *  would be pushed inside the step's window and dropped (`pushAction`), or the step would open during its await. */
+export function isUndoStepInFlight(): boolean {
+  return _stepsPending > 0;
+}
+
+/** Forward edits in flight that must record their undo entry whole (#1832): an agent op that pushes one. While any
+ *  is, every undo/redo step is REFUSED (`undoRefusedReason`), for the mirror of the reason the op refuses during a
+ *  step: a step that opened during the op's await would take the op's push into its window, where it is dropped. A
+ *  COUNT, since ops can overlap. The HUMAN's forward edits hold nothing (#1833). */
+let _forwardEdits = 0;
+/** Invalidated by the test reset, so a hold taken before it cannot drive the count below zero when released after. */
+const _forwardEditLiveness = createTeardownToken();
+/** The longest a forward edit holds undo off. An agent op can outlive its caller — an eval's timeout abandons its
+ *  body without cancelling it, and a backend write that never answers never settles — and an unbounded hold then
+ *  refused every human undo until a reload (close-out review). Past this the hold lets go, with a warning: undo works
+ *  again, at the cost of the protection for an op this slow. */
+export const FORWARD_EDIT_MAX_HOLD_MS = 30_000;
+export function beginForwardEdit(): () => void {
+  _forwardEdits += 1;
+  const alive = _forwardEditLiveness.capture();
+  notifyUndoChanged(); // the Edit menu's enabled state reads the refusal
+  // Warn at the stall mark, as `beginWorldSwitch` does for a stalled step; let go at the bound.
+  const stall = setTimeout(() => {
+    console.warn(`[undo] an agent edit has held undo/redo for ${WORLD_SWITCH_STALL_WARN_MS / 1000}s — until it settles `
+      + `(or ${FORWARD_EDIT_MAX_HOLD_MS / 1000}s pass), every undo and redo is refused; a backend write it awaits may never have answered`);
+  }, WORLD_SWITCH_STALL_WARN_MS);
+  const bound = setTimeout(() => {
+    console.warn(`[undo] released an agent edit's hold on undo/redo after ${FORWARD_EDIT_MAX_HOLD_MS / 1000}s — it has not settled; `
+      + 'an undo now can drop that edit\'s undo entry if it lands later');
+    release();
+  }, FORWARD_EDIT_MAX_HOLD_MS);
+  let released = false;
+  const release = () => {
+    clearTimeout(stall);
+    clearTimeout(bound);
+    if (released) return;
+    released = true;
+    if (!alive()) return;
+    _forwardEdits -= 1;
+    notifyUndoChanged();
+  };
+  return release;
+}
+
 /** A world switch is in progress (#1579) — a forward operation that must land in one world refuses to start then. */
 export function isWorldSwitchInProgress(): boolean {
   return _worldSwitches > 0;
@@ -388,9 +435,9 @@ export function _setUndoClock(fn: () => number) { _clock = fn; }
  *  distinct edit sessions on their own. */
 export function breakUndoCoalescing() { _coalesce = null; }
 
-/** Guard: true while executing undo/redo to prevent re-entrant pushes */
-let _executing = false;
-export function isExecutingUndoRedo(): boolean { return _executing; }
+/** True while an undo/redo step's window is open (`stepWindow.ts`, the one definition). ⚠️ A TIME window: it reads true
+ *  for forward work that runs during a step's awaits too — see that module's note. */
+export function isExecutingUndoRedo(): boolean { return currentStepWindow() !== null; }
 
 // ── In-flight serialization (undo/redo mutex) ─────────────
 // `undo`/`redo` are async (an action's undo/redo may `await`, e.g. prefab
@@ -398,7 +445,7 @@ export function isExecutingUndoRedo(): boolean { return _executing; }
 // Cmd+Z, Cmd+Z (or Cmd+Z then Cmd+Shift+Z) could otherwise start a second
 // undo/redo while the first is mid-`await`: the second `pop()` runs before the
 // first's `await action.undo()` resolves and before its `redoStack.push`,
-// corrupting stack order. `_executing` only blocks PUSHES, not re-entrant
+// corrupting stack order. The step window only blocks PUSHES, not re-entrant
 // undo/redo. We chain every undo/redo onto a single tail promise so they run
 // strictly one-at-a-time, in call order, and each pops the stack only when it is
 // actually its turn (editor-prefab-system.md F6).
@@ -415,6 +462,19 @@ function serialize<T>(op: () => Promise<T>): Promise<T> {
   run.then(settled, settled);
   _inFlight = run.catch(() => {});
   return run;
+}
+
+/** Run `op` on the step chain WITHOUT opening a step window — forward work that must not overlap a step (#1823).
+ *
+ *  The step window is time, not ownership (`stepWindow.ts`), so forward work that reports or pushes during a step's
+ *  awaits is read as the step's. Where that work is ours to schedule, this keeps it out: `op` starts only once every
+ *  queued step has finished, and no step starts until it has. `compositeAction`'s rollback runs here, so the undo
+ *  closures it replays report with no step open (console-only) and can never land in a step's result. A world switch
+ *  waits for it as for a step (`undoStepPending`).
+ *
+ *  ⚠️ Never call this from inside an undo/redo closure: it would wait for the chain it is part of, forever. */
+export function runOnStepChain<T>(op: () => Promise<T>): Promise<T> {
+  return serialize(op);
 }
 
 // ── Action capture (the composite/transaction primitive's collection half) ────
@@ -479,7 +539,10 @@ export function endActionCapture(frame: UndoAction[]): UndoAction[] {
 
 /** Push a new action. Clears redo stack. */
 export function pushAction(action: UndoAction) {
-  if (_executing) return; // don't push during undo/redo execution
+  // Dropped inside a step's window (a closure's own push must not clear the redo stack it is about to land on). ⚠️ The
+  // window is time, so a HUMAN forward edit made while a step awaits is dropped too (#1833); an AGENT one is refused
+  // before it applies (#1832, `agentStepGate` in agentEditorOps.ts).
+  if (currentStepWindow()) return;
   // Divert into the innermost open capture frame (see the block comment above).
   // BEFORE notifyEdited/coalesce/emit: a captured sub-action is not yet a committed
   // edit — the composite that wraps it does all three exactly once, for the batch.
@@ -545,7 +608,7 @@ export function pushSelectionChange(
   undoFn: () => void,
   redoFn: () => void,
 ) {
-  if (_executing) return;
+  if (currentStepWindow()) return;
   pushAction({ label, undo: undoFn, redo: redoFn, _isSelection: true });
 }
 
@@ -575,21 +638,28 @@ export function pushSelectionChange(
  *  Returns whether the step actually applied and, when it threw, what — as `failed` (#1681). Both reach the MCP
  *  `undo`/`redo` op (agentEditorOps.ts): `did` used to report success for a step that threw, and then, once it did
  *  not, a bare `did:false` that read as "the stack was empty" — the console line and the toast above are the human's,
- *  and an agent reads neither. */
+ *  and an agent reads neither.
+ *
+ *  Also what the step REPORTED without throwing (#1823): every `reportUndoFailure` made while its window was open, as
+ *  `shortfall` — the entry moved across the stacks as usual, but part of the step did not apply — and whether the
+ *  entry was `dropped` because the world swapped under it. Each used to answer `did:true`. */
 async function runStep(
   direction: 'Undo' | 'Redo',
   action: UndoAction,
   run: () => void | Promise<void>,
   pushTo: UndoAction[],
   event: '!undo' | '!redo',
-): Promise<{ ok: boolean; failed: UndoStepFailure | null }> {
-  _executing = true;
+): Promise<{ ok: boolean; failed: UndoStepFailure | null; shortfall: UndoShortfall | null; dropped: boolean }> {
+  const window = openStepWindow(direction, action.label);
   let ok = false;
   let error: unknown;
   const sameHistory = _historyLiveness.capture();
   // Not `catch { }` + a sentinel: a closure may legitimately throw `undefined`, and testing the
   // caught value for one would read that as success.
-  try { await run(); ok = true; } catch (e) { error = e; } finally { _executing = false; }
+  try { await run(); ok = true; } catch (e) { error = e; } finally { closeStepWindow(window); }
+  const shortfall = window.shortfalls.length > 0
+    ? { label: action.label, details: window.shortfalls.map((s) => s.detail) }
+    : null;
 
   // A history swap during the await (a scene load, an Exit from prefab edit, a Create Scene) refilled `pushTo` IN
   // PLACE with the incoming world's stack. Pushed there, the entry would be undone or redone later against a world it
@@ -615,6 +685,7 @@ async function runStep(
   const payload = buildEditorPayload(action);
   if (!ok) payload.failed = true;
   if (worldGone) payload.dropped = true; // it ran, and it is on neither stack
+  if (shortfall) payload.shortfall = [...shortfall.details];
   editorEmit(event, payload);
 
   // Reported LAST, and guarded. `reportUndoThrew` reaches into the editor store to toast, and
@@ -627,8 +698,15 @@ async function runStep(
     } catch (e) {
       console.error('[undo] failed to report a throwing undo/redo closure', e);
     }
+  } else if (shortfall) {
+    // A throw's toast already says the step failed, so a shortfall it also reported adds nothing on screen.
+    try {
+      reportStepShortfall({ direction, label: action.label, userFixable: window.shortfalls.some((s) => s.userFixable) });
+    } catch (e) {
+      console.error('[undo] failed to report a step that did not fully apply', e);
+    }
   }
-  return { ok, failed: ok ? null : describeStepFailure(action.label, error) };
+  return { ok, failed: ok ? null : describeStepFailure(action.label, error), shortfall, dropped: worldGone };
 }
 
 /** What a throwing step's caller is told (#1681). A REFUSAL (`UndoRefusedError`) says why in its `toast` — the user's
@@ -679,6 +757,7 @@ export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string |
   const top = direction === 'undo' ? undoStack[undoStack.length - 1] : redoStack[redoStack.length - 1];
   if (!top) return null; // nothing to undo is never a refusal, whatever the mode
   if (_worldSwitches > 0) return `A scene switch is in progress — ${direction} again once it has landed.`;
+  if (_forwardEdits > 0) return `An agent edit is still landing — ${direction} again once it has.`;
   if (_restoringSessions.size > 0) return `The preview is closing — ${direction} again once the scene has been restored.`;
   if (_restoreBarriers.some((isRestoring) => isRestoring())) return `The scene is being restored after Stop — ${direction} again once it has landed.`;
   if (canEdit()) return null;
@@ -716,8 +795,24 @@ export function dropPreviewSceneEdits(session: number): number {
 /** What one undo/redo step did: `did` — an entry was popped and its closure ran; `refused` — the
  *  gate's reason when it refused (`did` is then false and neither stack moved); `failed` — the entry was popped and its
  *  closure THREW (#310), so it was DROPPED from both stacks. `did:false` with both null is an empty stack, and only
- *  that (#1681: a throwing step used to answer the same bare `did:false`). */
-export interface UndoStepResult { did: boolean; refused: string | null; failed: UndoStepFailure | null }
+ *  that (#1681: a throwing step used to answer the same bare `did:false`).
+ *
+ *  Two ways a step that did not throw still fell short (#1823), both of which used to be a bare `did:true`:
+ *  `shortfall` — the closure REPORTED part of itself as not applied (`reportUndoFailure`); its entry moved to the other
+ *  stack as usual. `dropped` — the world swapped under the step, so its entry is on NEITHER stack (`runStep`). A
+ *  throwing step's entry is on neither stack too; `dropped` says it only for the step that did not throw. */
+export interface UndoStepResult {
+  did: boolean;
+  /** The popped entry's label, or null when nothing was popped (a refusal, an empty stack). */
+  label: string | null;
+  refused: string | null;
+  failed: UndoStepFailure | null;
+  shortfall: UndoShortfall | null;
+  dropped: boolean;
+}
+
+/** What a step reported as not applied (#1823): one `detail` per `reportUndoFailure` made inside its window. */
+export interface UndoShortfall { label: string; details: string[] }
 
 /** A step whose closure threw (#1681). `refused`: an `UndoRefusedError` — nothing was applied, and `error` is its
  *  user-facing reason; otherwise the step may have applied partway, and `error` is the thrown message. Either way the
@@ -738,14 +833,14 @@ export interface UndoStepFailure { label: string; refused: boolean; error: strin
 export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
   return serialize(async () => {
     const refused = undoRefusedReason(direction);
-    if (refused !== null) return { did: false, refused, failed: null };
+    if (refused !== null) return { did: false, label: null, refused, failed: null, shortfall: null, dropped: false };
     _coalesce = null; // any explicit undo/redo ends the current edit chain
     const action = (direction === 'undo' ? undoStack : redoStack).pop();
-    if (!action) return { did: false, refused: null, failed: null };
-    const { ok, failed } = direction === 'undo'
+    if (!action) return { did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false };
+    const { ok, failed, shortfall, dropped } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
-    return { did: ok, refused: null, failed };
+    return { did: ok, label: action.label, refused: null, failed, shortfall, dropped };
   });
 }
 
@@ -909,6 +1004,9 @@ export function _resetHistoryContexts() {
   _histories.clear();
   _activeKey = '';
   _captureStack.length = 0; // a test that threw mid-batch must not leak a capture frame
+  _resetStepWindow(); // …nor a step window
+  _forwardEdits = 0;
+  _forwardEditLiveness.invalidateAll();
   undoStack.length = 0;
   redoStack.length = 0;
   _coalesce = null;

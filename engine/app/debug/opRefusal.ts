@@ -30,13 +30,18 @@ export class OpRefusal extends Error {
   readonly options?: string[];
   /** Why a runtime guid missed (#1223 D4) — `classifyRuntimeGuidMiss`'s answer, on a NOT_FOUND only. */
   readonly stale?: string;
+  /** Where an undo/redo step's entry ended up, on a failed step (#1823): `moved` — to the other stack as usual, so the
+   *  next opposite call re-applies it; `dropped` — on neither stack, so the next call reaches the entry below it. The
+   *  two leave the history in opposite states, so it is a field, not only prose. */
+  readonly entry?: 'moved' | 'dropped';
 
-  constructor(code: ErrorCode, message: string, opts: { options?: string[]; stale?: string } = {}) {
+  constructor(code: ErrorCode, message: string, opts: { options?: string[]; stale?: string; entry?: 'moved' | 'dropped' } = {}) {
     super(message);
     this.name = 'OpRefusal';
     this.code = code;
     if (opts.options) this.options = opts.options;
     if (opts.stale) this.stale = opts.stale;
+    if (opts.entry) this.entry = opts.entry;
   }
 }
 
@@ -57,7 +62,7 @@ export async function opReplyFor(run: () => unknown): Promise<{ result: unknown 
     return { result: toJsonSafe(await run(), 'result') };
   } catch (e) {
     if (e instanceof OpRefusal) {
-      return { result: { ok: false, code: e.code, error: e.message, ...(e.options ? { options: e.options } : {}), ...(e.stale ? { stale: e.stale } : {}) } };
+      return { result: { ok: false, code: e.code, error: e.message, ...(e.options ? { options: e.options } : {}), ...(e.stale ? { stale: e.stale } : {}), ...(e.entry ? { entry: e.entry } : {}) } };
     }
     return { error: String(e instanceof Error ? e.message : e) };
   }

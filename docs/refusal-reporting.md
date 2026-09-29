@@ -59,9 +59,9 @@ because it goes stale.
 | R3 | A refusal's reason is read one way: the body's `error`, else `reason`, else its `errors`, else `HTTP <status>`. It is never empty. `code`, `options` and a precondition `conflict` travel with it. | `readWriteRefusal` (`editor/backend/editorBackend.ts`), for `/api/write-file` only. | Every other wrapper: `deleteAssetFile`, `deleteAssetFiles`, `duplicateAssetFileReport`, `createFolderApi`, `moveFileToStatus`/`moveFileTo`, `firstWritableAssetRoot` (`panels/assetOps.ts`); `writeMetaConditional` (`panels/assetViews/widgets.tsx`), which answers `HTTP <n>` and calls every 409 "changed on disk"; `writeSceneCopy`, `importedFileContent`, `repairPrefabMemberPaths` (`editorBackend.ts`); `writeLayoutJson` (`utils/layoutStore.ts`); `makeTexture2D`; `writeCollisionMeshAssets`; the re-import in the Texture, Font, Audio, Video, Atlas, Model and Environment asset views; and `modelImport.ts`'s three `/api/write-meta` posts. |
 | R4 | A wrapper hands the reason to its caller as data. It does not log it and then return a bare boolean, `null` or `{ok:false}`. | The `/api/write-file` wrappers since #1811: `writeAssetFile` answers `{ok:false, error, options?}`, and `writeAssetFileGuarded` answers `'conflict'` or `'failed'` with the error. | The same list as R3. The "console, then `null`" shape (`importedFileContent`, `repairPrefabMemberPaths`, `duplicateAssetFileReport`) hides the most, because the log looks like handling. |
 | R5 | The caller states the reason to whoever asked. **An agent** gets the route's `code`, relayed and never invented (`codeFromBody`'s rule), plus its `error`. **A human gesture** puts the reason on screen, not only in the console (#901, #1577). Which widget says it is the caller's choice: the channel is local, as it is in format-versioning.md. | Each caller. | Results thrown away: the post-import convert in `Assets.tsx` (`.catch(() => {})`), paste's cut and copy skips, `TextureBatchView`/`ModelBatchView`, all nine callers of `flushPendingMetaFor`, `BuildSupportDialog`'s toolchain settings, the layout autosave, and `writeCollisionMeshAssets`' meta write. For an agent, Apply to Prefab's result simply lacks `fileRepair` when `repairPrefabMemberPaths` failed. Human refusals that reach only the console: Duplicate or Paste of an asset with unsaved edits (`/api/duplicate-asset`'s unsaved gate refuses the human path by design), folder create/rename/delete, and a layout save. |
-| U1 | An undo or redo step's outcome reaches `UndoStepResult`, the one result every trigger reads. The outcome is one of: applied; **applied in part**; refused, with nothing applied; threw; **dropped**. | `runStep` / `undoStep` (`undo/undoManager.ts`), for a step that **throws** (#1681). | **No owner for "applied in part".** 33 `reportUndoFailure` calls (`undo/undoFailure.ts`) report and return. 28 are in `assetUndo.ts` (21), `assetOps.ts` (2), `baseSceneUndo.ts` (2), `skinPrefab.ts` (2) and `prefabInstantiateUndo.ts` (1). Five report and deliberately carry on: `applyPrefabUndo.ts` (4, Apply's scene save and base-instance rebuild) and `reportUnrestoredLinks` (1). Console-only shortfalls: `makeDeleteUndo`'s "restored N of M" line and its redo's two lines, `detachPrefabInstanceWithUndo`, and the agent's link-only Create Prefab undo. **"Dropped"** has no owner either: when `runStep` drops a step because the world swapped under it, the step still answers `did:true`. **Target lookups that give up silently:** `writeTraitFieldWithUndo`'s undo and redo, and about six more `ref.resolve()` early returns in `entityActions.ts`, return when the entity no longer resolves, so an undo that did nothing answers `did:true`. `undoOrRefuse`'s own comment concedes it ("verify with get_scene_state, not `did`"). |
-| U2 | The agent's undo/redo reply says what the human is told. | `undoOrRefuse`, mapping `UndoStepResult` to `REFUSED_BY_OP` / `PARTIAL` (#1681). | Everything U1 misses. Also `runSequential` (`undo/compositeAction.ts`), which throws one `AggregateError` for a batch's failed subs. A sub's `UndoRefusedError` becomes `PARTIAL` (an `AggregateError` is not an `UndoRefusedError`), and the subs' own messages are not in the reply. |
-| U3 | A shortfall report names the reason the step's helper had. | `reportUndoFailure`'s `detail`. | Sites that had the reason and left it out: `makeModelImportUndo` (undo and redo), `createPrefabFromEntity`'s undo and redo (`committed.error`), `makeRigPrefabAsset` (`wrote.error`), and the collision lines in `makeDeleteUndo` and `makeFileImportUndo`. Every site whose helper had already dropped the reason (R4) cannot name it. |
+| U1 | An undo or redo step's outcome reaches `UndoStepResult`, the one result every trigger reads. The outcome is one of: applied; **applied in part** (`shortfall`); refused, with nothing applied; threw; **dropped** (`dropped`). | `runStep` / `undoStep` (`undo/undoManager.ts`): a throw since #1681; since #1823 (Owner B), every `reportUndoFailure` made inside the step's window (`undo/stepWindow.ts`) as `shortfall`, and a world swap under the step as `dropped`. | **Target misses found before anything is written** are not shortfalls: they are refusals, owned by `require` ([prefabs.md](./prefabs.md) I19, work-ai3). Until it lands, `writeTraitFieldWithUndo` and the rest of the I19 "silent no-op" list still answer `did:true`. A miss found AFTER a write is a shortfall and reports today (Create Prefab's redo rebuild and undo untag). `baseSceneUndo.ts`'s two reports are probably unreachable (SceneAssetView's `write` returns true since #831). |
+| U2 | The agent's undo/redo reply says what the human is told. | `undoOrRefuse` (`app/editor/agentEditorOps.ts`): `PARTIAL` + `entry:'moved'` for a shortfall, `PARTIAL` + `entry:'dropped'` for a drop or a throw, `REFUSED_BY_OP` + `entry:'dropped'` for a refusal. The human gets one toast per step that fell short (`reportStepShortfall`, owner ruling F1 2026-09-29). `runSequential` (`undo/compositeAction.ts`) keeps each sub's class: all refused is a refusal, anything else a `CompositeStepError` naming each sub. | A dropped step's human side is still only a `console.warn`: a world switch waits for steps (`beginWorldSwitch`), so the drop is a backstop. |
+| U3 | A shortfall report names the reason the step's helper had. | `reportUndoFailure`'s `detail`. Since #1823, `makeModelImportUndo`, `createPrefabFromEntity` and `makeRigPrefabAsset` name the write's `error`, and `makeDeleteUndo`'s collision line names the write failure its partial branch no longer reaches. | Every site whose helper had already dropped the reason (R4) cannot name it: `deleteAssetFiles`, `moveFileToStatus`, `createFolderApi`, `duplicateAssetFileReport`, `importedFileContent`. Owner A fixes those. |
 
 ### Steps are serialized against each other, not against the rest of the editor
 
@@ -72,22 +72,36 @@ tell the step's own calls from those. The comment above `_captureStack` says so 
 `beginWorldSwitch`'s docblock says `isExecutingUndoRedo()` "reads true for a concurrent user gesture
 too".
 
-So "the step that is running" is a **time window**, not ownership. Anything keyed on it attributes by
-time:
-- **Today, `pushAction`'s `if (_executing) return`** silently drops the undo entry of a forward edit
-  made while a step is awaiting. Found by this study's review, read and not driven, not filed. It is
-  outside this family: its mechanism is history ownership, not reporting. Named here for the hub to
-  route.
-- **A per-step report collector (Owner B) would too.** Any `reportUndoFailure` fired by forward work
-  inside a step's window lands in that step. Today the only forward caller is `compositeAction`'s
-  `rollback`, which undoes the subs of a forward batch that failed. It is reachable during a step only
-  through an agent's `evalApi` composite that wraps an asset or prefab helper, so the misattribution is
-  latent. Every other `reportUndoFailure` call runs inside an undo/redo closure, and the review checked
-  each one (`rederiveBaseInstances` is reached only from Apply's undo and redo).
+So "the step that is running" is a **time window**, not ownership. **`undo/stepWindow.ts` is its one
+definition** (#1823, #1832): `runStep` opens and closes it, and `isExecutingUndoRedo()`, `pushAction`'s
+and `pushSelectionChange`'s guards, and `reportUndoFailure`'s collector all read it. Anything keyed on it
+attributes by time, so the rule is: **where the forward work is ours to schedule, keep it OUT of the
+window, by refusing it rather than waiting for it.**
+- **Reports.** A `reportUndoFailure` fired by forward work inside a step's window would land in that
+  step. The only forward caller is `compositeAction`'s `rollback`, which undoes the subs of a forward
+  batch that failed. It runs **on the step chain** (`runOnStepChain`): no window is open while it
+  reports and none opens under it, so its reports stay console-only. Every other `reportUndoFailure`
+  call runs inside an undo/redo closure (the study's review checked each; `rederiveBaseInstances` is
+  reached only from Apply's undo and redo). Suspending collection during rollback was rejected: that is
+  a time window too, and would swallow the real step's reports made during rollback's awaits.
+- **Pushes (#1832, observed headlessly).** `pushAction` drops a push made inside the window, so a
+  forward edit made while a step awaits applied with no undo entry. Even a kept push would clear the
+  redo stack before the step pushed its entry there. **The agent half is closed by exclusion:** the
+  editor's op gate (`agentStepGate`, asked by `runAgentOp`) refuses an op that records an undo entry
+  (`app/editor/agentOpUndoClass.ts`, every op classified; `prefab` by action, so `edit-exit` still waits
+  for the step as #1579 designed) while a step is queued or running, and while
+  such an op runs it holds new steps off (`beginForwardEdit` → `undoRefusedReason`), because a step
+  opening during the op's await drops its push the same way. `eval` is never gated, because it is how an
+  agent looks at an editor whose step has stalled; its `modoki.composite` is gated and held like an op.
+  A hold that never settles warns after 10s, as a stalled world switch does, and lets go after 30s
+  (`FORWARD_EDIT_MAX_HOLD_MS`): an eval's timeout abandons its body without cancelling it, and an unbounded
+  hold then refused every human undo until a reload. A dry-run Apply records nothing and is not gated. **The human half is open (#1833):** nothing can tell a closure's own echo push
+  from a human forward edit, so every push in the window is still dropped until the echo pushes are
+  measured live.
 
-A report fired with **no** step open keeps today's console-only behaviour. That covers a rollback while
-no step runs, a forward path that runs a closure directly (`Hierarchy` applies a sibling renumber by
-calling its `redo()`), and work a closure starts and does not await.
+A report fired with **no** step open keeps its old console-only behaviour. That covers a rollback, a
+forward path that runs a closure directly (`Hierarchy` applies a sibling renumber by calling its
+`redo()`), and work a closure starts and does not await.
 
 ## Classification of the history
 
@@ -109,7 +123,7 @@ Every member fits a rule above, and none needs a new rule.
 - **Adjacent, owned elsewhere: only the raw-id fallback.** #1827 (work-ai3's study) owns the five creation-type undos that fall back to a raw ECS id and delete the wrong entity. That is an identity bug, not a reporting one. **The silent `ref.resolve()` early returns are NOT in #1827** (`writeTraitFieldWithUndo` and about six more in `entityActions.ts`). They are U1 bypasses, "did nothing, answered `did:true`", so they join #1823: each needs one line that reports, and Owner B carries the rest.
 - **Ejected:** #1661. Apply skips an `applyExcluded` key without a `skipped` entry. That is an in-process skip list, with no transport and no step.
 
-## Verdict: missing owners
+## Verdict: missing owners (Owner B built 2026-09-29, #1823; Owner A next, #1824)
 
 **The model is right.** Where an owner exists, the rule holds: `/api/write-file` since #1811, and a
 throwing step since #1681. Every open member is a site that answers the owner's question for itself.
@@ -142,7 +156,10 @@ On the route side:
 
 **Absorbs:** #1824 and the unfiled sites above. **Size: L**, most of it in the per-caller R5 choices.
 
-**Owner B: the step report.** `reportUndoFailure` records its detail into the running step, through a
+**Owner B: the step report. BUILT (#1823, work-qa, 2026-09-29)** as below, with the step window in
+`undo/stepWindow.ts` and the rollback on the step chain. The silent target lookups went to `require`
+instead (a pre-write miss is a refusal, [prefabs.md](./prefabs.md) I19); only post-write misses report
+here. The design as proposed: `reportUndoFailure` records its detail into the running step, through a
 collector `runStep` opens and closes. `UndoStepResult` gains the shortfall and `dropped`.
 `runSequential` keeps each sub's classification and message. **The collector's window is a time window**
 (above), so B must also close the one forward path that can report inside it. Its failures are
@@ -203,5 +220,10 @@ The agent's reply (above) is decided by § 5 either way.
   makes it a reading.
 - **A report fired with no step open stays console-only.** Don't make the collector throw on an
   unopened report: rollback is exactly where the stack must not be disturbed further.
+- **A new agent op must be classified** in `app/editor/agentOpUndoClass.ts` (`agentOpStepGate.test.ts`
+  fails otherwise). One that reaches `pushAction` goes in `UNDO_RECORDING_OPS`, or its entry is dropped
+  whenever a human undo is awaiting.
+- **Never run forward work on the step chain from inside a closure** (`runOnStepChain`): it waits for the
+  chain it is part of.
 - **"No step open" is not "not this step's".** Read § "Steps are serialized against each other, not
   against the rest of the editor" before keying anything on `_executing` or `isExecutingUndoRedo()`.

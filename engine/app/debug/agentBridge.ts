@@ -2976,7 +2976,23 @@ registerAgentOp('set-traits', (params) =>
 export async function runAgentOp(op: string, params: unknown = {}): Promise<unknown> {
   const handler = agentOps.get(op);
   if (!handler) throw new Error(`unknown agent op '${op}'`);
-  return handler(params);
+  // Asked here, the one entry point both editor transports and an eval's `modoki.call` share, so no path skips it.
+  const gate = _opGate?.(op, params) ?? null;
+  if (gate instanceof OpRefusal) throw gate;
+  try {
+    return await handler(params);
+  } finally {
+    gate?.();
+  }
+}
+
+/** Asked before every op runs (#1832): an `OpRefusal` refuses it, a function is a hold released when the op settles,
+ *  null lets it run. Installed by the editor (`agentStepGate` in agentEditorOps.ts), which owns the undo stack this
+ *  guards; this module ships to devices and imports no editor code, so it holds only the slot. */
+export type AgentOpGate = (op: string, params: unknown) => OpRefusal | (() => void) | null;
+let _opGate: AgentOpGate | null = null;
+export function setAgentOpGate(gate: AgentOpGate | null): void {
+  _opGate = gate;
 }
 const handleOp = runAgentOp;
 

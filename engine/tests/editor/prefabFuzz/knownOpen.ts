@@ -239,12 +239,12 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'createPrefab', u: [0.8449, 0.6267, 0.0149, 0.1407, 0.4933, 0.2333, 0.3549, 0.3216] },
       { kind: 'prefabEdit', u: [0.3871, 0.5004, 0.0544, 0.7359, 0.5348, 0.7957, 0.3886, 0.1663], inner: [] },
     ],
-    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — \d+ prefab links? the tree had before could not be put back/.test(f.detail),
+    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail),
     // The second route (comment on #1795): a trashed prefab, then a world swap (prefab edit), then a Create Prefab whose
     // undo or redo runs against the placeholder. Keyed on the two lines that say so; the "rows now vs written" wording
     // keeps it off #1796's positional re-tag, which says "was written at localId" or "changed between".
     stops: (f, ops) => f.check === 'console.error' && (f.op === 'undo/redo to the ends' || /^(undo|redo)\(/.test(f.op))
-      && (/^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — \d+ prefab links? the tree had before could not be put back/.test(f.detail)
+      && (/^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail)
         || /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \(\d+ rows now vs \d+ written\)/.test(f.detail))
       && ops.some((o) => o.kind === 'createPrefab') && (() => {
         const t = ops.findIndex((o) => o.kind === 'trashPrefab'); return t >= 0 && ops.slice(t + 1).some((o) => o.kind === 'prefabEdit');
@@ -671,10 +671,10 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'instantiate', u: [0.7, 0.5, 0.7666666666666667, 0, 0, 0, 0, 0] },
       { kind: 'prefabEdit', u: [0.7, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.3, 0, 0, 0, 0, 0, 0, 0] }] },
     ],
-    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — \d+ prefab links? the tree had before could not be put back/.test(f.detail),
+    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail),
     // The only symptom a tainted segment shows: the NEXT undo's line. Disjoint from #1795 (a trash) by its op shape.
     stops: (f, ops) => f.check === 'console.error' && f.op === 'undo/redo to the ends'
-      && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — \d+ prefab links? the tree had before could not be put back — that entity is no longer addressable/.test(f.detail)
+      && /^\[undo\] Undo of "Save prefab "[^"]*"" did not fully apply — (\d+ prefab links? the tree had before could not be put back — that entity is no longer addressable|the entity linked to \S+ no longer exists, so nothing was unlinked)/.test(f.detail)
       && !ops.some((o) => o.kind === 'trashPrefab') && ops.some((o) => o.kind === 'createPrefab') && (() => {
         const n = ops.findIndex((o) => o.kind === 'instantiate' && o.u[1] >= 0.4);
         return n >= 0 && ops.slice(n + 1).some((o) => o.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((x) => x.kind === 'delete'));

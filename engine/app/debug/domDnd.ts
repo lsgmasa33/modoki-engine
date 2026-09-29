@@ -197,7 +197,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // (scene edits and `_isFileDirect` asset edits alike); the registry catches a park that
     // pushed nothing.
     committed = after.stack !== before.stack || after.assets !== before.assets;
-    // ⚠️ FOUR known imprecisions, stated rather than left to be rediscovered. All are "something
+    // ⚠️ FIVE known imprecisions, stated rather than left to be rediscovered. All are "something
     // moved that was not this drop", and all need an event inside the 400 ms window:
     //  1. `getDirtyAssetsVersion` bumps on park AND on flush/discard — a racing `save_all` reads
     //     as a commit.
@@ -209,6 +209,8 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     //  4. …and from `undo()`/`redo()` themselves, which call `notifyUndoChanged()`
     //     unconditionally — so a HUMAN pressing Cmd+Z mid-window reads as a commit. Likelier in
     //     practice than (3); the list said "three" and stopped, which invited trusting the set.
+    //  5. …and from `beginForwardEdit` taking and releasing its hold (#1832), so ANOTHER undo-recording agent op
+    //     starting or ending mid-window reads as a commit. (This op's own hold brackets the whole call, so it does not.)
     // The alternative — diffing the stack's top entry and the registry's contents — buys a
     // stronger signal than "did this drop do anything" needs.
     if (committed) committedTo = after.world !== before.world ? 'scene' : 'asset-document';

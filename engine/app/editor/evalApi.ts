@@ -13,7 +13,8 @@
  *  non-mutating list that could itself drift. */
 
 import { listAgentOps, runAgentOp } from '../debug/agentBridge';
-import { backendFetch, withEditorActor, runAsCompositeAction } from '@modoki/engine/editor';
+import { backendFetch, withEditorActor, runAsCompositeAction, isUndoStepInFlight, beginForwardEdit } from '@modoki/engine/editor';
+import { stepRunningRefusal } from './agentOpUndoClass';
 import { kebabToCamel } from '../debug/bridgeHelpers';
 
 /** Re-exported for anything still importing it from here (moved to bridgeHelpers.ts in #83 so
@@ -75,7 +76,12 @@ export function makeEvalApi(): EvalApi {
     import: (path: string) => importAsApp(path),
     ops: () => opNames.map((op) => ({ op, method: `modoki.${kebabToCamel(op)}(params)` })),
     api: (path: string, init?: RequestInit) => backendFetch(path, init),
-    composite: <T,>(label: string, fn: () => T | Promise<T>) => runAsCompositeAction({ label }, fn),
+    // Gated like an undo-recording op (#1832): `eval` itself is not, so an agent can still look at a stalled step.
+    composite: async <T,>(label: string, fn: () => T | Promise<T>): Promise<T> => {
+      if (isUndoStepInFlight()) throw stepRunningRefusal('modoki.composite');
+      const release = beginForwardEdit();
+      try { return await runAsCompositeAction({ label }, fn); } finally { release(); }
+    },
   };
   for (const op of opNames) {
     const method = kebabToCamel(op);

@@ -223,7 +223,9 @@ describe('agent prefab create — undo restores the links the tree already had (
    *  announced "2 prefab links could not be put back" over a completely correct undo, which is
    *  worse than the silence it replaced: it sends the next reader hunting a phantom. */
   it('says nothing when the undo actually restored everything, across a reload', async () => {
+    // `console.error` too: the report goes through `reportUndoFailure` since #1823, which logs an error.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-quiet-r' }));
       const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-quiet-hull' }));
@@ -238,9 +240,9 @@ describe('agent prefab create — undo restores the links the tree already had (
 
       // Precondition: the undo really did restore them — otherwise silence proves nothing.
       expect((hull.get(PrefabInstance) as { source: string }).source).toBe(CHILD_GUID);
-      const unresolved = warn.mock.calls.map(String).filter((m) => m.includes('could not be put back'));
+      const unresolved = [...warn.mock.calls, ...error.mock.calls].map(String).filter((m) => m.includes('could not be put back'));
       expect(unresolved, `a correct undo must not report a failure: ${unresolved.join(' | ')}`).toEqual([]);
-    } finally { warn.mockRestore(); }
+    } finally { warn.mockRestore(); error.mockRestore(); }
   });
 });
 

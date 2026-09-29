@@ -3739,8 +3739,17 @@ export async function redo(): Promise<boolean> { … }
 
 An `UndoAction`'s `undo`/`redo` may return `void | Promise<void>` — some actions are
 async (e.g. prefab instantiation that loads a `*.prefab.json`). **Callers and tests must
-`await`** `undo()` / `redo()`; the manager sets an `_executing` guard while running an
-action so re-entrant pushes are dropped.
+`await`** `undo()` / `redo()`; the manager opens a **step window** (`undo/stepWindow.ts`) while
+running an action, so re-entrant pushes are dropped. ⚠️ The window is TIME, not ownership: a push
+from a human forward edit made while an async step awaits is dropped too (#1833), and an agent op
+that records an undo entry is refused during a step instead (#1832).
+
+**What a step reports** (`undoStep`'s `UndoStepResult`, #1681 and #1823): `failed` for a closure that
+threw (the entry is dropped), `shortfall` for one that REPORTED part of itself as not applied with
+`reportUndoFailure` (the entry moves as usual; the human gets one toast, "did not fully apply — see the
+console"), and `dropped` for a step the world swapped under. The agent's `undo`/`redo` op answers each as
+a coded failure with `entry: 'moved' | 'dropped'`. Model, invariants and owners:
+[refusal-reporting.md](./refusal-reporting.md) § U1–U3.
 
 **Selection changes push individual undo entries** — intentionally. `editorStore`'s
 `selectEntity` / `selectAsset` call `pushSelectionChange()` so each selection step is

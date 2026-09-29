@@ -331,7 +331,7 @@ describe('timeline preview session controller', () => {
       beginPreviewRestore(9002);
       try {
         expect(undoRefusedReason('undo')).toBeNull();
-        expect(await undoStep('undo')).toEqual({ did: false, refused: null, failed: null });
+        expect(await undoStep('undo')).toEqual({ did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false });
         pushAction(scene('something'));
         expect(undoRefusedReason('undo')).toContain('closing');
       } finally { finishPreviewRestore(9002, { drop: false }); }

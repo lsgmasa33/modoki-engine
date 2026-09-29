@@ -214,8 +214,9 @@ const insideScanDirs = (rel: string): boolean =>
  *    `await`ed one at a time against the STAGING world before the atomic swap. Each is already
  *    isolated with its own `try` + `console.warn`; what the helper cannot do is wait for it.
  *  - `editor/undo/compositeAction.ts` `runSequential` — a batch's undo/redo sub-steps, `await`ed
- *    strictly in order. Failures are COLLECTED and rethrown as one `AggregateError`, so `undo()`
- *    still rejects visibly; a helper that reports and swallows would make a failed undo look done.
+ *    strictly in order. Failures are COLLECTED and rethrown as one error that keeps each sub's class
+ *    (#1823: `UndoRefusedError` when every sub refused, else `CompositeStepError`), so `undo()` still
+ *    rejects visibly; a helper that reports and swallows would make a failed undo look done.
  *
  *  ── registration ──
  *  - `engine/tools/modoki-mcp/src/registerAll.ts` `registerAllTools` — the fixed list of tool

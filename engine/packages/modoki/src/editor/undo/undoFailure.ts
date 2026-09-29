@@ -25,10 +25,16 @@
  *  a place anyone is looking. A backend failure (a full disk, a restarting server) is
  *  not actionable, so it stays a console error, matching #291 exactly. Pass
  *  `userFixable` only where a 409-shaped collision is what actually happened —
- *  `moveFileToStatus` reports the status precisely so this need not be guessed. */
+ *  `moveFileToStatus` reports the status precisely so this need not be guessed.
+ *
+ *  **Inside a step, the report belongs to the step (#1823).** It is recorded into the open step window
+ *  (`stepWindow.ts`), and the step's result says it did not fully apply: the agent's undo op answers PARTIAL, and the
+ *  human gets ONE toast for the step (`reportStepShortfall`, owner ruling F1 2026-09-29, which overrides the two levels
+ *  above for undo). The two levels still decide a report made with no step open. */
 
 import { useEditorStore } from '../store/editorStore';
 import { sha256OfWritten } from '../utils/contentHash';
+import { currentStepWindow } from './stepWindow';
 
 export type UndoDirection = 'Undo' | 'Redo';
 
@@ -50,12 +56,31 @@ export function reportUndoFailure(opts: {
 }): void {
   const { direction, label, detail, userFixable } = opts;
   console.error(`[undo] ${direction} of "${label}" did not fully apply — ${detail}`);
-  if (userFixable) {
-    useEditorStore.getState().showToast(
-      `${direction} of "${label}" failed — something already exists at the original path (see console)`,
-      'warn',
-    );
+  // Inside a step, the step's result carries it (#1823): the agent's undo op answers PARTIAL, and `runStep` toasts
+  // ONCE for the step (`reportStepShortfall`) however many reports it made. A report with no step open — a forward
+  // path that ran a closure directly — keeps the two-level rule below.
+  const step = currentStepWindow();
+  if (step) {
+    step.shortfalls.push({ detail, userFixable: !!userFixable });
+    return;
   }
+  if (userFixable) useEditorStore.getState().showToast(collisionToast(direction, label), 'warn');
+}
+
+function collisionToast(direction: UndoDirection, label: string): string {
+  return `${direction} of "${label}" failed — something already exists at the original path (see console)`;
+}
+
+/** Tell the human that a step did not fully apply (#1823, owner ruling F1 2026-09-29): one toast per step, whatever
+ *  caused the shortfall. This reverses the two-level rule above FOR A STEP only — a partial undo leaves the disk short
+ *  of what the history now claims, the same kind of loss `reportUndoThrew` already toasts for. A collision keeps its
+ *  own, more useful wording. Other backend failures outside undo keep #291/#308's console-only ruling. */
+export function reportStepShortfall(opts: { direction: UndoDirection; label: string; userFixable: boolean }): void {
+  const { direction, label, userFixable } = opts;
+  useEditorStore.getState().showToast(
+    userFixable ? collisionToast(direction, label) : `${direction} of "${label}" did not fully apply — see the console`,
+    'warn',
+  );
 }
 
 /** A step that REFUSED before it changed anything (#1664) — thrown, so `runStep` drops the entry (#310), but reported

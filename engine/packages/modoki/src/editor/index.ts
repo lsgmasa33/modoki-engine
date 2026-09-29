@@ -10,10 +10,10 @@
 // reason: a game panel's undo that rewrites its own file must state what it expects there, and without the seam in
 // the barrel each game would grow its own guard shape (#1697, sling's Level/Wave editors).
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile, writeAssetFileGuarded } from './backend/editorBackend';
-export { expectedHash, fileChangedRefusal, UndoRefusedError } from './undo/undoFailure';
+export { expectedHash, fileChangedRefusal, UndoRefusedError, reportUndoFailure } from './undo/undoFailure';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
-  pushAction, undo, redo, undoStep, undoStepPending, isExecutingUndoRedo, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
+  pushAction, undo, redo, undoStep, undoStepPending, isExecutingUndoRedo, isUndoStepInFlight, beginForwardEdit, type UndoStepResult, type UndoShortfall, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
 export { assetDocAction, runAssetDocStep, captureAssetDocBaseline, type AssetDocBaseline, type AssetDocSide } from './undo/assetDocUndo';

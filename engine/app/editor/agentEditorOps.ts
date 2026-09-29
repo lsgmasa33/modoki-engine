@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -75,7 +75,9 @@ import {
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
+  reportUndoFailure, isUndoStepInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
+import { recordsUndo, stepRunningRefusal } from './agentOpUndoClass';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
   getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, captureEntityIdentity, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
@@ -1221,6 +1223,19 @@ function refusePrefsWriteInSession(): void {
     { options });
 }
 
+/** The gate `runAgentOp` asks before an op runs (#1832). An op that records an undo entry (`agentOpUndoClass.ts`) is
+ *  REFUSED while an undo/redo step is queued or running: its push would land in the step's window and be dropped, so
+ *  the edit would apply with no way back. Once it runs, it holds every new step off until it settles
+ *  (`beginForwardEdit`), because a step opening during the op's await drops the push the same way. Refuse, never wait
+ *  (docs/scene-loading.md § "Readers of the world").
+ *
+ *  `eval` is not gated (see `NON_RECORDING_OPS`): it is how an agent looks at an editor whose step has stalled. */
+export function agentStepGate(op: string, params?: unknown): OpRefusal | (() => void) | null {
+  if (!recordsUndo(op, params)) return null;
+  if (isUndoStepInFlight()) return stepRunningRefusal(op);
+  return beginForwardEdit();
+}
+
 export function registerEditorAgentOps(): void {
   // Every op registered here is the AGENT acting (human actions come through the UI,
   // not these ops). Shadow registerAgentOp so any editor-activity events an op emits
@@ -1229,6 +1244,7 @@ export function registerEditorAgentOps(): void {
   const registerAgentOp = (name: string, handler: AgentOpHandler): void =>
     _registerAgentOp(name, (params) => withEditorActor('agent', () => handler(params)));
   if (registered) return;
+  setAgentOpGate(agentStepGate);
   registered = true;
 
   // Suppress scene hot-reload whenever the live world is not the authored one: Play/Pause (Stop
@@ -2287,13 +2303,29 @@ export function registerEditorAgentOps(): void {
   // prefab and undid (#1664's refusal) concluded the history was empty. `ok:true, did:false` now means EMPTY and only
   // that. A refusal (`UndoRefusedError`: nothing applied) is REFUSED_BY_OP; any other throw is PARTIAL, because the
   // closure may have applied part of itself before it threw.
+  //
+  // ⚠️ And a step that did NOT throw can still fall short (#1823), which used to answer `did:true`. It is PARTIAL, as
+  // §5 decides for a result where part of the work did not land, and `entry` says where the entry went, because the
+  // two cases leave the history in opposite states: a SHORTFALL (the closure reported part of itself as not applied,
+  // e.g. an asset still in the trash) moved the entry to the other stack as usual — `entry:'moved'`; a step DROPPED
+  // because the world swapped under it is on neither stack — `entry:'dropped'`, as every failed step above is too.
   const undoOrRefuse = async (op: 'undo' | 'redo') => {
-    const { did, refused, failed } = await undoStep(op);
+    const { did, label, refused, failed, shortfall, dropped } = await undoStep(op);
     if (refused !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${refused} Nothing was undone or redone, and the stack is untouched.`);
+    // What the step REPORTED rides on every failure below, a throw's included: it is the only hand-recovery path (a file
+    // still in the trash), and a batch sub that reported before another threw would otherwise lose it (close-out review).
+    const notApplied = shortfall ? ` What did not apply: ${shortfall.details.join(' | ')}` : '';
     if (failed !== null) {
       throw failed.refused
-        ? new OpRefusal('REFUSED_BY_OP', `${op} of "${failed.label}" was refused: ${failed.error}. Nothing was applied, and the entry was DROPPED from the history — it is on neither stack, so the next ${op} reaches the entry below it.`)
-        : new OpRefusal('PARTIAL', `${op} of "${failed.label}" threw: ${failed.error}. The entry was DROPPED from the history (it is on neither stack), and part of it may have applied — read the state (modoki_get_scene_state) before continuing.`);
+        ? new OpRefusal('REFUSED_BY_OP', `${op} of "${failed.label}" was refused: ${failed.error}. Nothing was applied, and the entry was DROPPED from the history — it is on neither stack, so the next ${op} reaches the entry below it.${notApplied}`, { entry: 'dropped' })
+        : new OpRefusal('PARTIAL', `${op} of "${failed.label}" threw: ${failed.error}. The entry was DROPPED from the history (it is on neither stack), and part of it may have applied — read the state (modoki_get_scene_state) before continuing.${notApplied}`, { entry: 'dropped' });
+    }
+    if (dropped) {
+      throw new OpRefusal('PARTIAL', `${op} of "${label}" ran while the scene switched under it, so it applied to the world that left and was DROPPED from the history — it is on neither stack, so the next ${op} reaches the entry below it. Read the state (modoki_get_scene_state) before continuing.${notApplied}`, { entry: 'dropped' });
+    }
+    if (shortfall) {
+      const next = op === 'undo' ? 'the redo stack as usual, so the next redo re-applies the edit' : 'the undo stack as usual, so the next undo reverts it';
+      throw new OpRefusal('PARTIAL', `${op} of "${shortfall.label}" did not fully apply.${notApplied}. The entry MOVED to ${next}; what did not apply is left as it is (the details say where).`, { entry: 'moved' });
     }
     return { did, ...editorStateFields('undo', 'unsavedChanges') };
   };
@@ -3186,8 +3218,9 @@ export function registerEditorAgentOps(): void {
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
         // undoing an overwrite by deleting the file would destroy an asset the agent never
         // created. File-direct writes are not undoable anywhere else in the MCP surface either.
+        const label = `Create prefab "${prefab.name ?? path}" (link only)`;
         pushAction({
-          label: `Create prefab "${prefab.name ?? path}" (link only)`,
+          label,
           undo: () => {
             const id = ref.resolve(); if (id == null) return;
             // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
@@ -3200,7 +3233,7 @@ export function registerEditorAgentOps(): void {
             // than being stripped and restored from a guid that a Play→Stop may have re-minted.
             untagEntityTreeAsInstance(id, landedPath, prefab); // by the document's guid, not the manifest (#1807)
             const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
-            if (unresolved > 0) console.warn(`[prefab create] undo: ${unresolved} prior prefab link(s) could not be put back — no longer addressable.`);
+            if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${unresolved} prior prefab link(s) could not be put back — no longer addressable` });
           },
           redo: async () => {
             const id = ref.resolve(); if (id == null) return;

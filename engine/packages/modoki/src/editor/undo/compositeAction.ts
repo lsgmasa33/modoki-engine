@@ -27,15 +27,17 @@
  *  RE-ENTRANCY. A composite's own `undo`/`redo` run INSIDE an already-serialized
  *  `undoManager.undo()`/`redo()` call — `_executing` is true and the `_inFlight` tail is
  *  held. So this file must never call the exported `undo()`/`redo()` and never tries to
- *  re-acquire that lock; it is just a well-behaved single `UndoAction`. (`_executing`
- *  being true also means a sub-action that itself calls `pushAction` during undo/redo is
- *  refused by the manager, as for any other action.)
+ *  re-acquire that lock; it is just a well-behaved single `UndoAction`. (The step window
+ *  being open also means a sub-action that itself calls `pushAction` during undo/redo is
+ *  refused by the manager, as for any other action.) A sub that REPORTS a shortfall
+ *  (`reportUndoFailure`) lands in the same step's window, so the batch's result carries it.
  */
 
 import {
-  pushAction, beginActionCapture, endActionCapture,
+  pushAction, beginActionCapture, endActionCapture, runOnStepChain,
   type UndoAction,
 } from './undoManager';
+import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 
 export interface CompositeActionOptions {
@@ -86,20 +88,52 @@ function summarizeSubActions(subs: UndoAction[]): Record<string, unknown> {
   return payload;
 }
 
+/** A batch whose sub-actions failed, and not all by refusing (#1823): at least one threw, or some refused while
+ *  others applied. Its message names each failed sub, its class and its own message — an `AggregateError`'s default
+ *  message named only the count, so the agent's reply lost every sub's reason. */
+export class CompositeStepError extends AggregateError {
+  constructor(errors: unknown[], message: string) {
+    super(errors, message);
+    this.name = 'CompositeStepError';
+  }
+}
+
 /** Run each sub-action's `undo`/`redo` strictly one at a time, in the given order.
  *  A failing sub does NOT abort the rest: a half-reverted batch is worse than a fully
  *  attempted one, and the entry has already left its stack by the time this runs.
- *  Failures are collected and rethrown as an AggregateError so `undo()`'s promise still
- *  rejects visibly (matching a single action's behaviour: a throwing undo propagates and
- *  the entry is dropped rather than silently pretending to have worked). */
-async function runSequential(steps: (() => void | Promise<void>)[], what: string): Promise<void> {
-  const errors: unknown[] = [];
+ *  Failures are collected and rethrown so `undo()`'s promise still rejects visibly (matching a
+ *  single action's behaviour: a throwing undo propagates and the entry is dropped rather than
+ *  silently pretending to have worked).
+ *
+ *  What is rethrown keeps each sub's classification (#1823): when EVERY sub refused
+ *  (`UndoRefusedError`), nothing in the batch applied, so the batch is refused too — one
+ *  `UndoRefusedError` carrying every sub's reason — and the agent reads REFUSED_BY_OP, not PARTIAL.
+ *  Anything else (a throw, or refusals beside subs that applied) may have applied partway: a
+ *  `CompositeStepError` naming each failed sub. */
+async function runSequential(subs: UndoAction[], run: (a: UndoAction) => void | Promise<void>, what: string): Promise<void> {
+  const failures: { label: string; error: unknown }[] = [];
+  // Each step CALLED as the loop element, so `notifyIsShared`'s fan-out detector sees this loop and its EXEMPT row
+  // (async-sequential) stays earned; a `run(sub)` call hides the same fan-out from it.
+  const steps = subs.map((sub) => () => run(sub));
+  let i = 0;
   for (const step of steps) {
-    try { await step(); } catch (err) { errors.push(err); }
+    const label = subs[i++].label;
+    try { await step(); } catch (error) { failures.push({ label, error }); }
   }
-  if (errors.length) {
-    throw new AggregateError(errors, `[compositeAction] ${errors.length} sub-action(s) failed during ${what}`);
+  if (failures.length === 0) return;
+  const errors = failures.map((f) => f.error);
+  if (failures.length === subs.length && errors.every((e) => e instanceof UndoRefusedError)) {
+    const refusals = errors as UndoRefusedError[];
+    throw new UndoRefusedError(
+      `every sub-action refused during ${what}: ${failures.map((f, i) => `"${f.label}": ${refusals[i].message}`).join(' | ')}`,
+      refusals.map((e) => e.toast).join('; '),
+    );
   }
+  const describe = (e: unknown) => e instanceof UndoRefusedError ? `refused (${e.toast})` : `threw (${e instanceof Error ? e.message : String(e)})`;
+  throw new CompositeStepError(
+    errors,
+    `${failures.length} of ${subs.length} sub-action(s) failed during ${what}: ${failures.map((f) => `"${f.label}" ${describe(f.error)}`).join('; ')}`,
+  );
 }
 
 /** Wrap `subActions` into ONE `UndoAction`. Returns null for an empty batch — nothing
@@ -144,8 +178,8 @@ export function composeUndoActions(
     kind: opts.kind ?? '!batch',
     // Reverse order: later ops undo first (an op that depends on an earlier op's
     // result must be reverted before that result is taken away).
-    undo: () => runSequential(subs.slice().reverse().map((a) => () => a.undo()), 'undo'),
-    redo: () => runSequential(subs.map((a) => () => a.redo()), 'redo'),
+    undo: () => runSequential(subs.slice().reverse(), (a) => a.undo(), 'undo'),
+    redo: () => runSequential(subs, (a) => a.redo(), 'redo'),
     journalPayload: { ...summarizeSubActions(subs), ...(opts.journalPayload ?? {}) },
   };
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;
@@ -162,13 +196,22 @@ export function composeUndoActions(
 
 /** Roll a partially-applied batch back: undo the captured sub-actions in reverse,
  *  sequentially, isolating failures (this is already the error path — a second throw
- *  must not mask the first). */
+ *  must not mask the first).
+ *
+ *  ⚠️ **On the step chain, not beside it** (#1823, `runOnStepChain`). These are undo closures, and
+ *  some report a shortfall through `reportUndoFailure`, which records into whichever step's window
+ *  is open — a TIME window (`stepWindow.ts`). Run beside a step that is awaiting, the rollback's
+ *  reports would land in THAT step's result and a human's unrelated Cmd+Z would read as partial.
+ *  On the chain, no step is open while it runs and none starts under it, so its reports stay
+ *  console-only, as a forward path's always were. */
 async function rollback(subs: UndoAction[]): Promise<void> {
-  for (let i = subs.length - 1; i >= 0; i--) {
-    try { await subs[i].undo(); } catch (err) {
-      console.error('[compositeAction] rollback of a sub-action failed; the world may be partially mutated', err);
+  await runOnStepChain(async () => {
+    for (let i = subs.length - 1; i >= 0; i--) {
+      try { await subs[i].undo(); } catch (err) {
+        console.error('[compositeAction] rollback of a sub-action failed; the world may be partially mutated', err);
+      }
     }
-  }
+  });
 }
 
 /**

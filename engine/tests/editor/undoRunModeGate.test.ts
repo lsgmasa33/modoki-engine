@@ -135,9 +135,9 @@ describe('inside an envelope the gate reads the ENTRY on top', () => {
       pushClipEdit('clip key');    // an asset-document edit on top of it
       setRunMode(mode);
       expect(undoRefusedReason('undo')).toBeNull();
-      expect(await undoStep('undo')).toEqual({ did: true, refused: null, failed: null });
-      expect(await undoStep('redo')).toEqual({ did: true, refused: null, failed: null });
-      expect(await undoStep('undo')).toEqual({ did: true, refused: null, failed: null });
+      expect(await undoStep('undo')).toEqual({ did: true, label: 'clip key', refused: null, failed: null, shortfall: null, dropped: false });
+      expect(await undoStep('redo')).toEqual({ did: true, label: 'clip key', refused: null, failed: null, shortfall: null, dropped: false });
+      expect(await undoStep('undo')).toEqual({ did: true, label: 'clip key', refused: null, failed: null, shortfall: null, dropped: false });
       // Now the scene edit is on top.
       const r = await undoStep('undo');
       expect(r.did).toBe(false);
@@ -159,7 +159,7 @@ describe('inside an envelope the gate reads the ENTRY on top', () => {
     pushClipEdit('clip key');
     setRunMode('playing');
     const r = await undoStep('undo');
-    expect(r).toEqual({ did: false, refused: expect.stringContaining('Play'), failed: null });
+    expect(r).toEqual({ did: false, label: null, refused: expect.stringContaining('Play'), failed: null, shortfall: null, dropped: false });
     expect(calls).toEqual([]);
   });
 
@@ -176,7 +176,7 @@ describe('inside an envelope the gate reads the ENTRY on top', () => {
   it('an empty stack is not a refusal', async () => {
     setRunMode('scrub');
     expect(undoRefusedReason('undo')).toBeNull();
-    expect(await undoStep('undo')).toEqual({ did: false, refused: null, failed: null });
+    expect(await undoStep('undo')).toEqual({ did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false });
   });
 
   it('the re-pose sequence: three clip undos in a row, though the first one opens the envelope', async () => {
@@ -259,7 +259,7 @@ describe('a refusal decided when the step RUNS is still reported, not read as an
   it('undoStep reports it', async () => {
     queueSceneEditBehindClipUndo();
     const [first, second] = await Promise.all([undoStep('undo'), undoStep('undo')]);
-    expect(first).toEqual({ did: true, refused: null, failed: null });
+    expect(first).toEqual({ did: true, label: 'clip key', refused: null, failed: null, shortfall: null, dropped: false });
     expect(second.did).toBe(false);
     expect(second.refused).toContain('"Move"');
   });

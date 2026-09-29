@@ -30,10 +30,10 @@ const throwing = (label: string) => ({ label, undo: async () => { throw new Erro
 describe('undoStep reports a throwing step as `failed`', () => {
   it('a refusal carries its user-facing reason; a throw its message; an empty stack neither', async () => {
     pushAction(refusing('Make prefab'));
-    expect(await undoStep('undo')).toEqual({ did: false, refused: null, failed: { label: 'Make prefab', refused: true, error: 'x.prefab.json changed on disk since, and was left as it is' } });
+    expect(await undoStep('undo')).toEqual({ did: false, label: 'Make prefab', refused: null, failed: { label: 'Make prefab', refused: true, error: 'x.prefab.json changed on disk since, and was left as it is' }, shortfall: null, dropped: false });
     pushAction(throwing('Delete x.png'));
-    expect(await undoStep('undo')).toEqual({ did: false, refused: null, failed: { label: 'Delete x.png', refused: false, error: 'disk exploded' } });
-    expect(await undoStep('undo')).toEqual({ did: false, refused: null, failed: null });
+    expect(await undoStep('undo')).toEqual({ did: false, label: 'Delete x.png', refused: null, failed: { label: 'Delete x.png', refused: false, error: 'disk exploded' }, shortfall: null, dropped: false });
+    expect(await undoStep('undo')).toEqual({ did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false });
   });
 });
 

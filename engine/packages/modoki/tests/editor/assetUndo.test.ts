@@ -16,6 +16,8 @@ import {
   type DeleteResult, type DupResult,
 } from '../../src/editor/panels/assetUndo';
 import { COLLISION_STATUS } from '../../src/editor/undo/undoFailure';
+import { pushAction, undoStep, _resetHistoryContexts } from '../../src/editor/undo/undoManager';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { deleteAssetFile, deleteAssetFiles } from '../../src/editor/panels/assetOps';
 import { useEditorStore } from '../../src/editor/store/editorStore';
 import type { AssetEntry } from '../../src/editor/utils/assetPaths';
@@ -1173,5 +1175,49 @@ describe('makeDeleteUndo — a refused file is not the undo\'s to restore (#884)
     expect(err.mock.calls[0][0]).toContain('restored 1 of 2');
     expect(err.mock.calls[0][0]).toContain('/assets/a.png');
     err.mockRestore();
+  });
+});
+
+/** #1823: the shortfall these builders report reaches the STEP's result, not only the console. Before, the agent's
+ *  undo answered `did:true` over files still in the trash, and the human saw no toast for a backend shortfall. */
+describe('the step report (#1823)', () => {
+  beforeEach(() => { setRunMode('stopped'); _resetHistoryContexts(); });
+
+  it('a delete undo that restored only part of the asset set carries its shortfall, and toasts once', async () => {
+    spyConsole('error');
+    const good: DeleteResult = { asset: A('/assets/good.glb'), snapshots: [{ path: '/assets/good.glb', content: 'QQ==', encoding: 'base64' }], deletePaths: ['/assets/good.glb'] };
+    const bad: DeleteResult = { asset: A('/assets/bad.glb'), snapshots: [], deletePaths: ['/assets/bad.glb'] };
+    pushAction(makeDeleteUndo([good, bad], vi.fn()));
+    const r = await undoStep('undo');
+    expect(r.did).toBe(true);
+    expect(r.shortfall?.details).toEqual([expect.stringContaining('restored 1 of 2')]);
+    expect(r.shortfall?.details[0]).toContain('/assets/bad.glb');
+    expect(useEditorStore.getState().toast?.message).toContain('did not fully apply');
+  });
+
+  it('a delete redo whose re-delete failed carries its shortfall', async () => {
+    spyConsole('error');
+    pushAction(makeDeleteUndo([{ asset: A('/assets/x.glb'), snapshots: [{ path: '/assets/x.glb', content: 'QQ==', encoding: 'base64' }], deletePaths: ['/assets/x.glb'] }], vi.fn()));
+    await undoStep('undo');
+    failNext('/api/delete-asset', 500);
+    const r = await undoStep('redo');
+    expect(r.shortfall?.details).toEqual([expect.stringContaining('the files are still on disk: /assets/x.glb')]);
+  });
+
+  it('a delete redo the OS refused in PART (ok:true, failed) carries its shortfall', async () => {
+    spyConsole('error');
+    pushAction(makeDeleteUndo([{ asset: A('/assets/x.glb'), snapshots: [{ path: '/assets/x.glb', content: 'QQ==', encoding: 'base64' }], deletePaths: ['/assets/x.glb'] }], vi.fn()));
+    await undoStep('undo');
+    respondNext('/api/delete-asset', { ok: true, missing: [], failed: ['/assets/x.glb'] });
+    const r = await undoStep('redo');
+    expect(r.shortfall?.details).toEqual([expect.stringContaining('the OS refused to trash: /assets/x.glb')]);
+  });
+
+  it('a model-import undo whose trash failed names the reason the write gave (U3)', async () => {
+    spyConsole('error');
+    pushAction(makeModelImportUndo({ assetName: 'Rig', prefabPath: '/assets/models/rig.prefab.json', content: '{"id":"p1","entities":[]}' }));
+    failNext('/api/delete-asset', 500);
+    const r = await undoStep('undo');
+    expect(r.shortfall?.details).toEqual(['prefab "/assets/models/rig.prefab.json" was not trashed: /assets/models/rig.prefab.json could not be trashed']);
   });
 });

@@ -292,10 +292,17 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'PREVIOUS world (anything from before a scene hot-reload, which any file write triggers) ' +
       'undoes against entities that no longer exist. So verify with modoki_get_scene_state rather ' +
       'than trusting `did` — the same rule as every other mutation on this surface. ' +
-      'A step whose entry was popped but FAILED is an error, never did=false: REFUSED_BY_OP naming the entry when it ' +
-      'refused before changing anything (e.g. the file it would rewrite changed on disk since), PARTIAL when it threw ' +
-      'and may have applied partway. Either way that entry was DROPPED — it is on neither stack, so the next call ' +
+      'A step whose entry was popped but did not fully apply is an error, never did=true, and `got.entry` says where ' +
+      'the entry went: PARTIAL with entry:"moved" when the step REPORTED part of itself as not applied (e.g. an asset ' +
+      'still in the trash — the message lists what) — the entry moved to the other stack as usual, so the opposite call ' +
+      'reverses this step; PARTIAL with entry:"dropped" when it threw and may have applied partway, or ran while the scene ' +
+      'switched under it; REFUSED_BY_OP with entry:"dropped" naming the entry when it refused before changing anything ' +
+      '(e.g. the file it would rewrite changed on disk since). A dropped entry is on neither stack, so the next call ' +
       'reaches the entry below it. ' +
+      'While an undo/redo step is running (the human pressed Cmd+Z on an asset or prefab edit), every tool that ' +
+      'records an undo entry (create/duplicate/delete/reparent entity, mutate_scene, prefab, the asset-document ' +
+      'editors, modoki.composite inside an eval) REFUSES with REFUSED_BY_OP rather than lose its entry — retry once it has finished; and while ' +
+      'one of those tools is running, this one refuses the same way. ' +
       'REFUSES (REFUSED_BY_OP, stack untouched) during Play/Pause, and inside a scrub/preview envelope ' +
       '(runMode scrub|preview) when the entry is a SCENE edit made BEFORE that preview — that world reverts on ' +
       'Exit. Inside the envelope an asset-document edit (clip, timeline, rig, material), a selection step, and a ' +

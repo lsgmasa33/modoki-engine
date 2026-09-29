@@ -124,7 +124,7 @@ export async function makeRigPrefabAsset(
       });
       if (wrote.conflict) throw fileChangedRefusal([savePath]);
       if (!wrote.ok) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not ${prevContent != null ? 'restored' : 'deleted'}` });
+        reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not ${prevContent != null ? 'restored' : 'deleted'}: ${wrote.error ?? 'the write failed'}` });
         return;
       }
       applied = false;
@@ -133,7 +133,7 @@ export async function makeRigPrefabAsset(
       const wrote = await commitPrefabWrite(savePath, prefab, { expected: applied ? content : prevContent, bytes: content });
       if (wrote.conflict) throw fileChangedRefusal([savePath]);
       if (!wrote.ok) {
-        reportUndoFailure({ direction: 'Redo', label, detail: `"${savePath}" was not written` });
+        reportUndoFailure({ direction: 'Redo', label, detail: `"${savePath}" was not written: ${wrote.error ?? 'the write failed'}` });
         return;
       }
       applied = true;
