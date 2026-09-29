@@ -955,7 +955,7 @@ describe('applyOps — setTrait parentId keeps the world pose (#1847)', () => {
 
   // A PARTIAL override (only the marked fields are written — the normal shape) or none takes the rest from the
   // template, which this route cannot read: guessing identity moved the entity (review: a template y=3 landed at 0).
-  // So it keeps its local transform and says so. Mutation: make templatePlacedEntry return undefined — the partial
+  // So it keeps its local transform and says so. Mutation: make isTemplatePlaced return false — the partial
   // override is rewritten with identity-filled values.
   it('an instance root placed partly by its template keeps its local transform, with a warning', () => {
     for (const over of [{ x: 2 }, undefined]) {
@@ -977,6 +977,146 @@ describe('applyOps — setTrait parentId keeps the world pose (#1847)', () => {
     expect(res.errors).toEqual([]);
     expect(res.warnings.join('\n')).toMatch(/'PadInst' \(a prefab instance root on the parent chain\) takes part of its placement/);
     expect(s.entities[2].traits.Transform).toEqual({ x: 1 });
+  });
+
+  // A decomposition picks its own Euler angles and mirror axis, so rotation and scale are written only when their LINEAR
+  // part changes. A translation-only move used to rewrite `{sy:-1}` as `{sx:-1, rz:π}` and a backwards yaw as
+  // `{rx:-π, ry:0.64, rz:-π}`. Mutation: drop the `sameRotationScale` check — both come back rewritten.
+  it('a move that changes only position leaves the authored rotation and scale numbers alone', () => {
+    const s = scene();
+    s.entities.push(
+      { id: 6, name: 'G', traits: { EntityAttributes: { name: 'G', guid: 'g-g', parentId: 0 }, Transform: { x: 5, y: 2 } } },
+      { id: 7, name: 'M', traits: { EntityAttributes: { name: 'M', guid: 'g-m', parentId: 0 }, Transform: { x: 1, sy: -1 } } },
+      { id: 8, name: 'Y', traits: { EntityAttributes: { name: 'Y', guid: 'g-y', parentId: 0 }, Transform: { x: 1, ry: 2.5 } } },
+    );
+    for (const g of ['g-m', 'g-y']) expect(applyOps(s, [{ op: 'setTrait', entity: { guid: g }, trait: 'EntityAttributes', fields: { parentId: 'g-g' } }], mint).errors).toEqual([]);
+    expect(byName(s, 'M').traits.Transform).toEqual({ x: -4, y: -2, z: 0, sy: -1 });
+    expect(byName(s, 'Y').traits.Transform).toEqual({ x: -4, y: -2, z: 0, ry: 2.5 });
+  });
+
+  /** R is an instance root placed partly by its template (override x only), with plain C under it and E under C. */
+  const deepScene = (): MutableScene => {
+    const s = prefabInstanceScene();
+    s.entities[1].overrides![1].Transform = { x: 4 };
+    s.entities.push(
+      { id: 3, name: 'C', traits: { EntityAttributes: { name: 'C', guid: 'g-c2', parentId: 'g-inst' }, Transform: { x: 1 } } },
+      { id: 4, name: 'E', traits: { EntityAttributes: { name: 'E', guid: 'g-e', parentId: 'g-c2' }, Transform: { x: 2 } } },
+      { id: 5, name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a2', parentId: 'g-inst' }, Transform: { x: 3 } } },
+      { id: 6, name: 'Root2', traits: { EntityAttributes: { name: 'Root2', guid: 'g-r2', parentId: 0 }, Transform: { x: 5 } } },
+    );
+    return s;
+  };
+
+  // The template-placed entry need not be the parent itself: any entry on either chain's suffix makes that pose a guess.
+  // Mutation: in reparentSuffixes, ask isTemplatePlaced of each chain's LAST entry only — both moves compute against an
+  // identity-filled R and rewrite E.
+  it('an instance root placed by its template DEEPER on either chain: kept local, warned, naming it', () => {
+    const out = deepScene();                                   // old chain R > C, new chain the plain Root2
+    const r1 = applyOps(out, [{ op: 'setTrait', entity: { guid: 'g-e' }, trait: 'EntityAttributes', fields: { parentId: 'g-r2' } }], mint);
+    expect(r1.warnings.join('\n')).toMatch(/'PadInst' \(a prefab instance root on the parent chain\)/);
+    expect(out.entities.find((e) => e.name === 'E')!.traits.Transform).toEqual({ x: 2 });
+    const into = deepScene();                                  // E at the root, moved under C (new chain R > C)
+    (into.entities.find((e) => e.name === 'E')!.traits.EntityAttributes as { parentId: unknown }).parentId = 0;
+    const r2 = applyOps(into, [{ op: 'setTrait', entity: { guid: 'g-e' }, trait: 'EntityAttributes', fields: { parentId: 'g-c2' } }], mint);
+    expect(r2.warnings.join('\n')).toMatch(/'PadInst' \(a prefab instance root on the parent chain\)/);
+    expect(into.entities.find((e) => e.name === 'E')!.traits.Transform).toEqual({ x: 2 });
+  });
+
+  // …but on the SHARED prefix it cancels: E moved from C to its sibling A, both under R, is new = inv(A)·C·E whatever R
+  // is. Mutation: compare the whole chains (no shared prefix) in reparentSuffixes — this warns and keeps x 2.
+  it('an instance root shared by both chains cancels: a sibling move is compensated with no warning', () => {
+    const s = deepScene();
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-e' }, trait: 'EntityAttributes', fields: { parentId: 'g-a2' } }], mint);
+    expect(res.warnings).toEqual([]);
+    expect((s.entities.find((e) => e.name === 'E')!.traits.Transform as { x: number }).x).toBeCloseTo(0, 9);  // 1 + 2 - 3
+  });
+
+  // The everyday case (26 of 29 instance roots in the repo's scenes store a partial override or none): an instance
+  // root moved into an identity group keeps its pose by keeping its local, so nothing is said. Mutation: ask
+  // isTemplatePlaced(entity) BEFORE the same-pose check — it warns falsely.
+  it('an instance root placed by its template, moved into an identity group: no warning, nothing rewritten', () => {
+    const s = prefabInstanceScene();
+    s.entities[1].overrides![1].Transform = { x: 2 };
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint);
+    expect(res.warnings).toEqual([]);
+    expect(s.entities[1].overrides![1].Transform).toEqual({ x: 2 });
+    expect((s.entities[1].traits.EntityAttributes as { parentId: unknown }).parentId).toBe('g-group');
+  });
+
+  // An instance root placed partly by its template is still compensated when its override stores x,y,z and the move
+  // keeps the linear part: its position depends on its translation alone (12 of 29 instance roots in the repo's scenes
+  // store that shape). Mutation: drop `!positionOnly` from the warning — it warns and x stays 3 (world jumps to 13).
+  it('an instance root with x,y,z in its override, moved under a translated group: position compensated, nothing else', () => {
+    const s = prefabInstanceScene();
+    (s.entities[0].traits as Record<string, unknown>).Transform = tf(10);
+    s.entities[1].overrides![1].Transform = { x: 3, y: 0, z: 1, ry: 0.5 };
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint);
+    expect(res.warnings).toEqual([]);
+    expect(s.entities[1].overrides![1].Transform).toEqual({ x: -7, y: 0, z: 1, ry: 0.5 });
+  });
+
+  // The instance-root exemption holds only while the move keeps the linear part: under a ROTATED group an {x,y,z}
+  // override cannot be compensated without the template's rotation. Mutation: drop the
+  // `sameRotationScale(from, to)` clause of positionOnly — the override gains identity-derived rotation.
+  it('an instance root with x,y,z in its override, moved under a ROTATED group: warned, override untouched', () => {
+    const s = prefabInstanceScene();
+    (s.entities[0].traits as Record<string, unknown>).Transform = tf(10, { rz: 0.7 });
+    s.entities[1].overrides![1].Transform = { x: 3, y: 0, z: 1, ry: 0.5 };
+    const res = applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint);
+    expect(res.warnings.join('\n')).toMatch(/this instance root takes part of its placement/);
+    expect(s.entities[1].overrides![1].Transform).toEqual({ x: 3, y: 0, z: 1, ry: 0.5 });
+  });
+
+  // …and even when the suffix check's tolerance lets a tiny turn through, only POSITION is written into the partial
+  // override. Mutation: drop the `isTemplatePlaced(entity)` early return in keepWorldPose — rx/rz appear in it.
+  it('a template-placed root is never given rotation or scale by a compensation', () => {
+    const s = prefabInstanceScene();
+    (s.entities[0].traits as Record<string, unknown>).Transform = { x: -3, rz: 5e-5, sx: 0.01, sy: 0.01, sz: 0.01 };
+    s.entities.push({ id: 3, name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a3', parentId: 0 }, Transform: { x: 5, sx: 0.01, sy: 0.01, sz: 0.01 } } });
+    (s.entities[1].traits as Record<string, unknown>).EntityAttributes = { parentId: 'g-a3' };
+    s.entities[1].overrides![1].Transform = { x: 3, y: 1, z: 2, ry: 0.5 };
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { parentId: 'g-group' } }], mint).errors).toEqual([]);
+    expect(Object.keys(s.entities[1].overrides![1].Transform as object).sort()).toEqual(['ry', 'x', 'y', 'z']);
+    expect((s.entities[1].overrides![1].Transform as { ry: number }).ry).toBe(0.5);
+  });
+
+  // A move under a MIRRORED parent flips handedness: no rotation of the authored scale composes it, so the full
+  // decomposition is written and the world pose kept. Mutation: drop the `determinant() <= 0` check in
+  // rotationKeepingScale — an improper matrix is read as Euler angles and the pose is lost.
+  it('a move under a mirrored parent keeps the world pose', () => {
+    const s = scene();
+    s.entities.push(
+      { id: 6, name: 'Mir', traits: { EntityAttributes: { name: 'Mir', guid: 'g-mir', parentId: 0 }, Transform: { x: 2, sx: -1 } } },
+      { id: 7, name: 'W', traits: { EntityAttributes: { name: 'W', guid: 'g-w', parentId: 0 }, Transform: { x: 1, rz: 0.4, sy: 2 } } },
+    );
+    const m = (t: Record<string, number>) => new THREE.Matrix4().compose(new THREE.Vector3(t.x, t.y, t.z), new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz)), new THREE.Vector3(t.sx, t.sy, t.sz));
+    const before = m(worldTrsOf(s.entities, byName(s, 'W')) as never);
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-w' }, trait: 'EntityAttributes', fields: { parentId: 'g-mir' } }], mint).errors).toEqual([]);
+    const after = m(worldTrsOf(s.entities, byName(s, 'W')) as never);
+    after.elements.forEach((v, i) => expect(v, `element ${i}`).toBeCloseTo(before.elements[i]!, 9));
+  });
+
+  // A pure turn writes the rotation only and keeps the authored scale, mirror sign included; the decomposition moved a
+  // mirror to `sx` and wrote float noise into the scale group. Mutation: drop the rotationKeepingScale branch — K gains
+  // sx/sy noise and loses sy:-1, T gains rx..sz.
+  it('a move that turns the entity writes rotation only, keeping the authored scale and its mirror', () => {
+    const s = scene();
+    s.entities.push(
+      { id: 6, name: 'R90', traits: { EntityAttributes: { name: 'R90', guid: 'g-r90', parentId: 0 }, Transform: { rz: Math.PI / 2 } } },
+      { id: 7, name: 'M', traits: { EntityAttributes: { name: 'M', guid: 'g-m', parentId: 0 }, Transform: { sy: -1 } } },
+      { id: 8, name: 'T', traits: { EntityAttributes: { name: 'T', guid: 'g-t', parentId: 0 }, Transform: { rz: 0.5 } } },
+      { id: 9, name: 'R3', traits: { EntityAttributes: { name: 'R3', guid: 'g-r3', parentId: 0 }, Transform: { rz: 0.3 } } },
+    );
+    for (const [g, p] of [['g-m', 'g-r90'], ['g-t', 'g-r3']]) {
+      expect(applyOps(s, [{ op: 'setTrait', entity: { guid: g }, trait: 'EntityAttributes', fields: { parentId: p } }], mint).errors).toEqual([]);
+    }
+    const m = byName(s, 'M').traits.Transform as Record<string, number>;
+    expect(m.sy).toBe(-1);
+    expect(m.sx).toBeUndefined();
+    expect(m.rz).toBeCloseTo(-Math.PI / 2, 9);
+    const t = byName(s, 'T').traits.Transform as Record<string, number>;
+    expect(Object.keys(t).sort()).toEqual(['rx', 'ry', 'rz']);
+    expect(t.rz).toBeCloseTo(0.2, 9);
   });
 
   // Between two parents with the same world pose nothing is rewritten: the round trip turned `{sy:-1}` into the

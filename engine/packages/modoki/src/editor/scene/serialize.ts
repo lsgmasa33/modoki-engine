@@ -841,11 +841,19 @@ export function markSceneSaved(atEditVersion?: number): void {
 }
 
 /** The WORLD-shaped dirty state (the two world causes of `worldHasUnsavedEdits`) as a baseline a revert can put back. */
-export interface WorldDirtyBaseline { readonly primaryClean: boolean; readonly scenes: ReadonlySet<string>; readonly savedAt: number }
+export interface WorldDirtyBaseline { readonly primaryClean: boolean; readonly scenes: ReadonlySet<string>; readonly savedAt: number; readonly editVersion: number }
 
 /** Taken at the Play press, with Play's undo barrier (`playMode.ts`). */
-export function captureWorldDirtyBaseline(): WorldDirtyBaseline {
-  return { primaryClean: getEditVersion() === _savedAtEditVersion, scenes: dirtySceneGuidsSnapshot(), savedAt: _savedAtEditVersion };
+/** `snapshotVersion`: the edit version when the snapshot this baseline goes with STARTED. An edit landing during the
+ *  snapshot's awaits may be missing from it, so a save of the capture's version would no longer hold the snapshot — the
+ *  baseline then records no version a save can match (#1816 close-out, fourth review). */
+export function captureWorldDirtyBaseline(snapshotVersion?: number): WorldDirtyBaseline {
+  const v = getEditVersion();
+  // Both answers are about what the SNAPSHOT holds: an edit during its awaits may be missing from it, so neither "clean at
+  // the press" nor "a save of this version holds it" can be claimed then (fifth review: a save of that edit landing
+  // before the capture read `primaryClean`, and Stop marked a world without the edit clean against a disk with it).
+  const snapshotComplete = snapshotVersion === undefined || snapshotVersion === v;
+  return { primaryClean: snapshotComplete && v === _savedAtEditVersion, scenes: dirtySceneGuidsSnapshot(), savedAt: _savedAtEditVersion, editVersion: snapshotComplete ? v : -1 };
 }
 
 /** Put the world's dirty state back to `baseline`, once Stop has reverted the world and cut the undo stack to Play's
@@ -859,8 +867,11 @@ export function restoreWorldDirtyBaseline(baseline: WorldDirtyBaseline): void {
   // A save since the capture (one landing during Play's startup awaits, before `'playing'` refuses saves) wrote a
   // world the snapshot does not hold: disk and the restored world differ, so nothing is cleared — dirty is the safe
   // answer (#1816 close-out re-review).
-  if (_savedAtEditVersion !== baseline.savedAt) return;
-  if (baseline.primaryClean) markSceneSaved();
+  // …unless that save wrote exactly the capture's version: a save serialized before the press whose disk write landed
+  // after it holds the snapshot itself (#1816 close-out, third review).
+  const diskHoldsSnapshot = _savedAtEditVersion === baseline.editVersion;
+  if (_savedAtEditVersion !== baseline.savedAt && !diskHoldsSnapshot) return;
+  if (baseline.primaryClean || diskHoldsSnapshot) markSceneSaved();
   clearSceneDirtyExcept(baseline.scenes);
 }
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently

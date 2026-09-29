@@ -13,7 +13,7 @@
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
 import { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentLinkRefusal, type ParentGraph } from '../core/ecs/parentLink';
-import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, worldTrsOf, storedTransformOf, templatePlacedEntry, sameTrsMatrix, type TRS } from './transformSpace';
+import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, reparentSuffixes, isTemplatePlaced, sameTrsMatrix, sameRotationScale, rotationKeepingScale, IDENTITY_TRS, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */
@@ -589,37 +589,58 @@ function judgeFileParent(scene: MutableScene, entity: MutableEntity, raw: unknow
 }
 
 /** The local Transform that keeps `entity`'s WORLD pose once `newParent` (null = the root) holds it — the file twin of
- *  the live reparent's compensation (#1847; Unity's editor reparent keeps the world pose too). Only the persisted groups
- *  that actually change are returned, and a move between two parents with the SAME world pose writes nothing — a
- *  compose/decompose round trip would otherwise rewrite authored numbers into an equivalent pose (`{sy:-1}` becomes
- *  `{sx:-1, rz:π}`), which is not equivalent to a game reading the sign of `sy`. An entry that stores no Transform has
- *  no pose to keep. When a pose on EITHER side is not fully readable here — the entity, or any entry up either parent
- *  chain, is an instance root whose placement is partly in its template (`templatePlacedEntry`) — the entity keeps its
- *  local transform and the reply says so, rather than computing against an identity it guessed. A ZERO-scale new
- *  ancestor cannot hold any pose, so the move is refused, as `space:'world'` refuses it. */
+ *  the live reparent's compensation (#1847; Unity's editor reparent keeps the world pose too).
+ *
+ *  Only what the move depends on is read: the two parent chains below their shared prefix (`reparentSuffixes`), since
+ *  the shared part cancels. When those compose to the same pose the entity keeps its local transform exactly — whatever
+ *  its own local is, even one this file cannot read. Otherwise it is recomputed, and only what CHANGES is written: the
+ *  position group when it moves, and the rotation and scale groups only when their LINEAR part changes
+ *  (`sameRotationScale`). A decomposition picks its own Euler angles and mirror axis, so comparing numbers rewrote an
+ *  untouched `{sy:-1}` as `{sx:-1, rz:π}` and a backwards yaw as `{rx:-π, ry:…, rz:-π}` on every move — not equivalent
+ *  to a game reading the sign of `sy` (#1847 close-out re-review). When the recompute needs a pose this file cannot
+ *  read — the entity's own, or an entry on either suffix, being an instance root placed partly by its template — the
+ *  entity keeps its local transform and the reply says so, rather than computing against a guessed identity. A
+ *  ZERO-scale new suffix cannot hold any pose, so the move is refused, as `space:'world'` refuses it. */
 function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: MutableEntity | null):
   { write: Record<string, number> | null; warning?: string } | { error: string } {
   const stored = storedTransformOf(entity);
   if (!stored && !entity.prefab) return { write: null };
-  const unknown = templatePlacedEntry(scene.entities, entity) ?? templatePlacedEntry(scene.entities, newParent);
-  if (unknown) {
-    const who = unknown === entity ? 'this instance root' : `'${unknown.name ?? entityGuid(unknown) ?? unknown.id}' (a prefab instance root on the parent chain)`;
+  const { from, to, unknown } = reparentSuffixes(scene.entities, entity, newParent);
+  // A suffix entry this file cannot read makes that suffix's pose a guess, so "same pose" cannot be judged either. The
+  // entity's OWN local, by contrast, cancels when the suffixes match — so it is asked only after.
+  const same = !unknown && sameTrsMatrix(from, to);
+  if (same) return { write: null };
+  // An instance root whose rotation/scale is partly in its template is still computable when the move keeps the linear
+  // part (the suffixes differ by translation only) and its override stores x, y, z: its new position depends on its own
+  // translation alone, and its rotation and scale do not change (#1847, fourth review — 12 of 29 instance roots in the
+  // repo's scenes store exactly that shape).
+  const positionOnly = !!stored && (['x', 'y', 'z'] as const).every((k) => typeof stored[k] === 'number')
+    && sameRotationScale(from ?? IDENTITY_TRS, to ?? IDENTITY_TRS);
+  const who = unknown ? `'${unknown.name ?? entityGuid(unknown) ?? unknown.id}' (a prefab instance root on the parent chain)`
+    : isTemplatePlaced(entity) && !positionOnly ? 'this instance root' : null;
+  if (who) {
     return { write: null, warning: `${who} takes part of its placement from its prefab, which this route does not read, so the world pose cannot be kept: the entity kept its LOCAL transform and its world position follows the new parent. modoki_reparent_entity with the scene open keeps it` };
   }
-  const oldParentWorld = parentWorldTrs(scene.entities, entity);
-  const newParentWorld = newParent ? worldTrsOf(scene.entities, newParent) : null;
-  if (sameTrsMatrix(oldParentWorld, newParentWorld)) return { write: null };
-  const collapsed = collapsedParentAxes(newParentWorld);
+  const collapsed = collapsedParentAxes(to);
   if (collapsed) {
     return { error: `the new parent's chain has ZERO scale on ${collapsed.join('/')}, which collapses every child onto its origin, so no local transform keeps this entity's world pose. Give that ancestor a non-zero scale first` };
   }
   const local = mergeTrs(IDENTITY_LOCAL, stored ?? {});
-  const next = worldToLocalTrs(localToWorldTrs(local, oldParentWorld), newParentWorld);
-  const changed = (Object.keys(local) as (keyof TRS)[]).filter((k) => Math.abs(next[k] - local[k]) > 1e-9);
-  if (!changed.length) return { write: null };
+  const next = worldToLocalTrs(localToWorldTrs(local, from), to);
   const write: Record<string, number> = {};
-  for (const k of persistedTrsKeys(Object.fromEntries(changed.map((k) => [k, next[k]])))) write[k] = next[k];
-  return { write };
+  if ((['x', 'y', 'z'] as const).some((k) => Math.abs(next[k] - local[k]) > 1e-9)) for (const k of ['x', 'y', 'z'] as const) write[k] = next[k];
+  // A template-placed root is compensated on its POSITION only: its rotation and scale are partly in the template, and a
+  // rotation written into the partial override would replace the template's (fifth review: a 5e-5 rad suffix turn that
+  // the suffix check's tolerance let through wrote `rx`, dropping a template `rx:0.4`).
+  if (isTemplatePlaced(entity)) return { write: Object.keys(write).length ? write : null };
+  if (!sameRotationScale(next, local)) {
+    // A pure turn keeps the authored scale — mirror sign included — and writes only the rotation; the scale group is
+    // written only when the linear part changed scale or shear too (then the decomposition's spelling is all there is).
+    const turned = rotationKeepingScale(next, local);
+    if (turned) Object.assign(write, turned);
+    else for (const k of ['rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const) write[k] = next[k];
+  }
+  return { write: Object.keys(write).length ? write : null };
 }
 
 const IDENTITY_LOCAL: TRS = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };

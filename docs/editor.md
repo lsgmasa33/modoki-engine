@@ -1791,7 +1791,10 @@ enter-play / revert-on-stop:
   editor read "unsaved" with nothing to undo or save (#1816 close-out review; Unity does not dirty a scene for Play
   changes). It only clears — work unsaved at the press stays unsaved — and asset-shaped causes are untouched. A save
   made after the press (Play's startup awaits allow one) wrote a world the snapshot does not hold, so then it clears
-  nothing: the restored world differs from disk, and dirty is the safe answer. The reload
+  nothing: the restored world differs from disk, and dirty is the safe answer — unless that save wrote exactly the
+  capture's edit version (serialized before the press, landed after it), which holds the snapshot itself — and only
+  when no edit landed during the snapshot's own awaits, which the snapshot may lack. Such an edit voids "clean at
+  the press" too (`captureWorldDirtyBaseline` is handed the version read before the snapshot). The reload
   **carries** kept bases and the primary's `Persistent` roots instead of rebuilding them, so
   `restoreAuthoredSnapshot` replays their authored fields afterwards (#1547). ⚠️ A snapshot is
   SPARSE — the serializer omits every field at its trait default — so the replay fills schema

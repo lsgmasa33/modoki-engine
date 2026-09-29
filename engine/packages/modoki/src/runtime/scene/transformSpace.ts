@@ -186,18 +186,33 @@ export function storedTransformOf(entity: MutableEntity): Record<string, unknown
   return t && typeof t === 'object' ? (t as Record<string, unknown>) : undefined;
 }
 
-/** The first entry — `entity` itself, then its ancestors nearest-first — whose LOCAL pose this file cannot fully read: a
- *  prefab instance root whose override Transform does not store all nine fields, so the rest come from a template the
- *  file does not hold. `trsOf` reads identity there, which is right only by luck. Undefined when the chain is fully
- *  known (a plain entry's omitted field IS its default: the serializer omits exactly those). */
-export function templatePlacedEntry(entities: MutableEntity[], entity: MutableEntity | null): MutableEntity | undefined {
-  if (!entity) return undefined;
-  for (const e of [entity, ...ancestors(entities, entity).reverse()]) {
-    if (!e.prefab) continue;
-    const t = instanceOverrideTraits(e)?.Transform as Record<string, unknown> | undefined;
-    if (!t || !TRS_KEYS.every((k) => typeof t[k] === 'number')) return e;
-  }
-  return undefined;
+/** Is this entry's LOCAL pose only partly in this file? A prefab instance root whose override Transform does not store
+ *  all nine fields takes the rest from a template the file does not hold; `trsOf` reads identity there, which is right
+ *  only by luck. A plain entry's omitted field IS its default (the serializer omits exactly those). */
+export function isTemplatePlaced(e: MutableEntity): boolean {
+  if (!e.prefab) return false;
+  const t = instanceOverrideTraits(e)?.Transform as Record<string, unknown> | undefined;
+  return !t || !TRS_KEYS.every((k) => typeof t[k] === 'number');
+}
+
+/** What a reparent of `entity` under `newParent` (null = the root) actually depends on (#1847): the two parent chains
+ *  BELOW their shared prefix. new local = inv(to) · from · local, because the shared part cancels (exactly for suffixes
+ *  without shear: each suffix is decomposed to one TRS, as `parentWorldTrs` decomposes a whole chain) — so an entry on it
+ *  whose pose this file cannot read (`isTemplatePlaced`) does not matter, and one on either suffix does (`unknown`). */
+export function reparentSuffixes(entities: MutableEntity[], entity: MutableEntity, newParent: MutableEntity | null):
+  { from: TRS | null; to: TRS | null; unknown?: MutableEntity } {
+  const oldChain = ancestors(entities, entity);                                   // root-first, ends at the old parent
+  const newChain = newParent ? [...ancestors(entities, newParent), newParent] : [];
+  let k = 0;
+  while (k < oldChain.length && k < newChain.length && oldChain[k] === newChain[k]) k++;
+  const compose = (chain: MutableEntity[]): TRS | null => {
+    if (!chain.length) return null;
+    _acc.identity();
+    for (const a of chain) _acc.multiply(matrixOf(trsOf(a), _m));
+    return decompose(_acc);
+  };
+  const unknown = [...oldChain.slice(k), ...newChain.slice(k)].find(isTemplatePlaced);
+  return { from: compose(oldChain.slice(k)), to: compose(newChain.slice(k)), ...(unknown ? { unknown } : {}) };
 }
 
 /** Do two poses compose to the same matrix (null = identity)? Unlike comparing fields, this sees `{sy:-1}` and
@@ -298,6 +313,24 @@ const _mb = new THREE.Matrix4();
 const _sa = new THREE.Vector3();
 const _sb = new THREE.Vector3();
 const _zero = new THREE.Vector3();
+/** The rotation that, with `scale`'s own (authored) scale, composes `pose`'s linear part — or null when no proper
+ *  rotation does (the linear part really changed scale or shear). A reparent that turns a mirrored entity keeps its
+ *  authored mirror this way: `{sy:-1}` stays `sy:-1` with a new rotation, where a decomposition would move the mirror
+ *  to `sx` and add π (#1847 close-out, fourth review). */
+export function rotationKeepingScale(pose: TRS, scale: Pick<TRS, 'sx' | 'sy' | 'sz'>): Pick<TRS, 'rx' | 'ry' | 'rz'> | null {
+  if (!scale.sx || !scale.sy || !scale.sz) return null;
+  _ma.compose(_zero, _qa.setFromEuler(_euler.set(pose.rx, pose.ry, pose.rz)), _sa.set(pose.sx, pose.sy, pose.sz));
+  _ma.multiply(_mb.makeScale(1 / scale.sx, 1 / scale.sy, 1 / scale.sz));
+  // `pose` is a TRS, so its linear part is R·D and R·D·diag(1/s) = R·diag(D/s): the columns are orthogonal by
+  // construction, and only their LENGTHS (a scale change) and the SIGN (a mirror moved between axes) can disqualify it.
+  const e = _ma.elements;
+  const unit = (i: number) => Math.abs(e[i * 4]! ** 2 + e[i * 4 + 1]! ** 2 + e[i * 4 + 2]! ** 2 - 1) <= 1e-6;
+  if (![0, 1, 2].every(unit)) return null;
+  if (_ma.determinant() <= 0) return null;
+  _euler.setFromRotationMatrix(_ma, 'XYZ');
+  return { rx: _euler.x, ry: _euler.y, rz: _euler.z };
+}
+
 /** Whether two poses have the SAME rotation-and-scale — the linear part of the transform, compared as one matrix.
  *  Rotation and a NEGATIVE scale are coupled as well: a decomposition puts a mirror's sign on whichever axis it
  *  likes, so `sz: -1` comes back as `sx: -1` turned π about y. Per field, or rotation apart from scale, those read

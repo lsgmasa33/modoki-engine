@@ -58,7 +58,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   // A load already in flight when Play is pressed is the other half of the guard (#573).
   isSceneLoadInFlight: () => loadInFlight,
   bootSceneWalkPending: () => null,
-  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0 }),
+  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0, editVersion: 0 }),
   restoreWorldDirtyBaseline: () => {},
 }));
 
@@ -75,7 +75,7 @@ vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),
   getCachedAiSettings: () => ({}),
 }));
-vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {}, beginWorldSwitch: () => ({ idle: null, release: () => {} }), worldSwitchesSettled: () => null }));
+vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, getEditVersion: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {}, beginWorldSwitch: () => ({ idle: null, release: () => {} }), worldSwitchesSettled: () => null }));
 vi.mock('../../src/editor/editorJournal', () => ({ editorEmit: vi.fn() }));
 
 const { enterPlay, stopPlay, pausePlay } = await import('../../src/editor/scene/playMode');

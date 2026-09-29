@@ -20,7 +20,7 @@ import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, boot
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
 import { beginWorldReplacement } from './authoringSettle';
 import { adoptionsSettled, captureAdoption } from './sceneAdoption';
-import { undoDepth, truncateUndoTo, beginWorldSwitch } from '../undo/undoManager';
+import { undoDepth, truncateUndoTo, beginWorldSwitch, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import {
@@ -201,12 +201,13 @@ export async function enterPlay(): Promise<PlayOutcome> {
     const adopted = captureAdoption();
     if (!adopted) return refusePlay('scene-swap', 'Play refused — a scene is still loading. Try again once it is open.');
     // Snapshot only — NO `assignGuids` (see captureAuthoredSnapshot). Bases included (A5).
+    const versionAtSnapshot = getEditVersion();
     _snapshot = await captureAuthoredSnapshot();
     // The undo barrier belongs to the SNAPSHOT, not to the moment Play flips: an edit made during the
     // awaits below is not in the snapshot, so Stop's revert discards it in the world and its undo entry
     // must go with it (#1574 close-out re-review — the settings fetch moved ahead of the re-check).
     const barrier = undoDepth();
-    const dirtyAtBarrier = captureWorldDirtyBaseline();
+    const dirtyAtBarrier = captureWorldDirtyBaseline(versionAtSnapshot);
     // A body added since the scene loaded (the load itself already awaited Rapier) would otherwise
     // run Play's first frames with no physics (#1175). Awaited BEFORE the generation re-check below,
     // so a scene load landing during the WASM fetch is refused exactly like one landing mid-snapshot.

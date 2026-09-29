@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   openGate: null as (() => void) | null,
   aiCached: true,                                  // false = a cold first Play: enterPlay FETCHES the settings
   aiFetchGate: null as Promise<void> | null,
+  baselineArg: undefined as number | undefined,
 }));
 
 vi.mock('../../src/editor/scene/serialize', () => ({
@@ -32,7 +33,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   sceneLoadGeneration: () => h.generation,
   isSceneLoadInFlight: () => h.loadInFlight,
   bootSceneWalkPending: () => null,
-  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0 }),
+  captureWorldDirtyBaseline: (v?: number) => { h.baselineArg = v; return { primaryClean: false, scenes: new Set(), savedAt: 0, editVersion: 0 }; },
   restoreWorldDirtyBaseline: () => {},
 }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
@@ -55,7 +56,7 @@ import { enterPlay, stopPlay } from '../../src/editor/scene/playMode';
 import { beginTimelinePreviewSession, hasTimelinePreviewSession, endTimelinePreviewSession } from '../../src/editor/scene/timelinePreview';
 import { lastRestoreFailed } from '../../src/editor/scene/authoredSnapshot';
 import { getPlayState, setPlayState, setRunMode } from '../../src/runtime/core/playState';
-import { pushAction, undoDepth, clearHistory } from '../../src/editor/undo/undoManager';
+import { pushAction, undoDepth, clearHistory, getEditVersion } from '../../src/editor/undo/undoManager';
 
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
@@ -183,6 +184,25 @@ describe('enterPlay — each refusal is named, not only warned', () => {
     expect(await p).toEqual({ kind: 'started' });
     await stopPlay();
     expect(undoDepth(), 'only the pre-Play entry survives Stop').toBe(1);
+    clearHistory();
+  });
+
+  // The dirty baseline is told the version the SNAPSHOT started at, read before its awaits: an edit during them may be
+  // missing from the snapshot (#1816 close-out). Mutation: read getEditVersion() after `await captureAuthoredSnapshot()`
+  // in enterPlay — the baseline is handed the post-edit version.
+  it('the dirty baseline gets the version from BEFORE the snapshot, not after an edit made during it', async () => {
+    const before = getEditVersion();
+    let open!: () => void;
+    h.serializeGate = new Promise<void>((r) => { open = r; });
+    h.openGate = open;
+    const p = enterPlay();
+    await settle();
+    pushAction({ label: 'edit during the snapshot', undo: () => {}, redo: () => {} });
+    expect(getEditVersion()).toBe(before + 1);
+    open();
+    expect(await p).toEqual({ kind: 'started' });
+    expect(h.baselineArg).toBe(before);
+    await stopPlay();
     clearHistory();
   });
 

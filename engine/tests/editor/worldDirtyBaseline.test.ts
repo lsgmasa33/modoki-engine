@@ -55,4 +55,41 @@ describe('restoreWorldDirtyBaseline', () => {
     expect(hasUnsavedChanges()).toBe(true);
     expect(isSceneDirty(DURING)).toBe(true);
   });
+
+  // …but a save that serialized at the capture's own version and landed after it wrote the snapshot itself: disk equals
+  // what Stop restores, so it is clean. Mutation: drop `diskHoldsSnapshot` — a false "unsaved" after Stop.
+  it('a save of exactly the capture\'s version, landing after the press, still clears', () => {
+    edit();                                            // unsaved at the press
+    const baseline = captureWorldDirtyBaseline();
+    markSceneSaved(baseline.editVersion);              // its write lands now, stamped with the version it serialized
+    edit();                                            // a Play-time edit
+    restoreWorldDirtyBaseline(baseline);
+    expect(hasUnsavedChanges()).toBe(false);
+  });
+
+  // …and only when the snapshot saw every edit up to that version: one landing during the snapshot's own awaits may be
+  // missing from it, so a save of the capture's version no longer matches what Stop restores. Mutation: record
+  // `editVersion: v` whatever `snapshotVersion` says — the restore reads clean over a world the save outran.
+  it('an edit during the snapshot\'s awaits: a save of the capture\'s version clears nothing', () => {
+    const atSnapshotStart = (captureWorldDirtyBaseline()).editVersion;
+    edit();                                            // lands while the snapshot is being taken
+    const baseline = captureWorldDirtyBaseline(atSnapshotStart);
+    markSceneSaved(atSnapshotStart + 1);              // a save of the capture's version (the one after the edit)
+    edit();
+    restoreWorldDirtyBaseline(baseline);
+    expect(hasUnsavedChanges()).toBe(true);
+  });
+
+  // The same holds for "clean at the press": an edit during the snapshot's awaits, saved before the capture, makes the
+  // primary read clean at capture — but the snapshot may lack the edit disk holds. Mutation: compute primaryClean
+  // without `snapshotComplete` — Stop marks the reverted world clean.
+  it('an edit and its save during the snapshot\'s awaits: the restore leaves the scene unsaved', () => {
+    const atSnapshotStart = captureWorldDirtyBaseline().editVersion;
+    edit();                                            // lands during the snapshot's awaits
+    markSceneSaved();                                  // and a save of it completes before the capture
+    const baseline = captureWorldDirtyBaseline(atSnapshotStart);
+    edit();                                            // a Play-time edit
+    restoreWorldDirtyBaseline(baseline);
+    expect(hasUnsavedChanges()).toBe(true);
+  });
 });
