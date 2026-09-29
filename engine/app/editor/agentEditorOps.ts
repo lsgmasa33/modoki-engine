@@ -55,6 +55,7 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
+  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, partOfInstanceRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
@@ -695,6 +696,7 @@ function reparentRefusalText(reason: Extract<ReparentPlan, { kind: 'refused' }>[
   // one was added (`scaffold` fell to the default and told the agent the target was a descendant, close-out review).
   if (reason in PREFAB_EDIT_REFUSAL_TEXT) return `${op}: refused to move ${id} under ${parentId} — ${PREFAB_EDIT_REFUSAL_TEXT[reason as keyof typeof PREFAB_EDIT_REFUSAL_TEXT]}`;
   switch (reason) {
+    case 'restructure': return `${op}: refused to move or reorder ${id} — ${RESTRUCTURE_REFUSAL_TEXT} ${id} is part of a prefab instance: the prefab supplies it (a member, a nested prefab, or a node the prefab added), and only objects the scene added move inside an instance. Nothing was applied.`;
     case 'resource': return `${op}: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`;
     case 'instance-member': return `${op}: refused to move ${id} under ${parentId} — ${parentId} belongs to another scene, and a prefab instance would be split across two scene files: something in ${id}'s subtree (${id} itself, or an entity under it) belongs to an instance that would stay behind, or a member of an instance in it lives outside the subtree. Move that instance's root instead, or unpack that instance first.`;
     default: return `${op}: refused to move ${id} under ${parentId} — the move is illegal (${reason === 'self-parent' ? 'an entity cannot be its own parent' : `${parentId} is a descendant of ${id}`}).`;
@@ -780,6 +782,12 @@ function writeTraitAsEditor(op: string, id: number, meta: LiveTraitMeta, fields:
   const parentMove = typeof newParent === 'number';
   const refusedParent = parentMove ? fieldParentWriteRefusal(op, id, newParent as number, shown) : null;
   if (refusedParent) return { ok: false, error: `${refusedParent} Nothing was applied to entity ${id}` };
+  // A new sortOrder is a reorder: an object a prefab supplies keeps the prefab's place (#1869), under the parent it has or
+  // the one written beside it.
+  if (meta.name === 'EntityAttributes' && 'sortOrder' in fields && fields.sortOrder !== current?.sortOrder) {
+    const reordered = restructureRefusal({ id, parentId: parentMove ? newParent as number : Number(current?.parentId ?? 0), reorder: true });
+    if (reordered) return { ok: false, error: `${op}: refused to reorder ${id} — ${reordered} Nothing was applied to entity ${id}` };
+  }
 
   const rest = Object.entries(fields).filter(([field]) => !(parentMove && field === 'parentId'));
   if (!had) {
@@ -822,11 +830,20 @@ const editorTraitWriter: LiveTraitWriter = {
       }
     }
     const parent = writes.find(isParentWrite);
-    if (!parent) return null;
-    const newParent = Number(parent.value);   // guardParentWrite already refused a non-number and a dead id
+    const newParent = parent ? Number(parent.value) : undefined;   // guardParentWrite already refused a non-number and a dead id
+    const none = `Nothing was applied to any of the ${ids.length} target${ids.length === 1 ? '' : 's'}.`;
     for (const id of ids) {
-      const refused = fieldParentWriteRefusal('set-traits', id, newParent);
-      if (refused) return `${refused} Nothing was applied to any of the ${ids.length} target${ids.length === 1 ? '' : 's'}.`;
+      const refused = newParent !== undefined ? fieldParentWriteRefusal('set-traits', id, newParent) : null;
+      if (refused) return `${refused} ${none}`;
+    }
+    // A new sortOrder is a reorder, refused on an object a prefab supplies (#1869) — asked here with the others, so a dry
+    // run answers what the call would, and the call never reaches `writeTraitAsEditor`'s own check mid-way.
+    const order = writes.find((w) => w.trait === 'EntityAttributes' && w.field === 'sortOrder');
+    if (order) {
+      for (const id of ids) {
+        const reordered = reorderWriteRefusal([id], 'EntityAttributes', 'sortOrder', order.value);
+        if (reordered) return `set-traits: refused to reorder ${id} — ${reordered} ${none}`;
+      }
     }
     return null;
   },
@@ -844,7 +861,7 @@ const editorTraitWriter: LiveTraitWriter = {
     }
     for (const { meta, fields } of byTrait.values()) {
       const wrote = writeTraitAsEditor('set-traits', id, meta, fields);
-      if (!wrote.ok) throw new TraitWriteRefused(`set-traits: ${wrote.error} (the whole call was rolled back).`);
+      if (!wrote.ok) throw new TraitWriteRefused(`${wrote.error.startsWith('set-traits:') ? '' : 'set-traits: '}${wrote.error} (the whole call was rolled back).`);
     }
   },
   // In Play the write lands in the Play world, which Stop reverts along with its undo entry and its dirty mark
@@ -3089,7 +3106,7 @@ export function registerEditorAgentOps(): void {
     const id = requireLiveId(p, 'reparent-entity');
     const parentId = resolveParentId(p, 'reparent-entity parent', { move: true });
     // The one decision every reparent entry point asks (#1429), so the refusal can name its rule.
-    const plan = planReparent(id, parentId);
+    const plan = planReparent(id, parentId, p.sortOrder);
     if (plan.kind === 'refused') throw new OpRefusal('REFUSED_BY_OP', reparentRefusalText(plan.reason, id, parentId));
     // A parent from another scene makes this a SCENE MOVE. A human answers the Hierarchy's prompt; the
     // agent answers it with `moveToScene: true`, after reading the same text the human reads. Refusing
@@ -3214,6 +3231,12 @@ export function registerEditorAgentOps(): void {
       if (getRunMode() === 'playing') {
         throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${whyWorldNotAuthored()} — stop Play first, or the played pose is written into the prefab.`,
           { options: ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] });
+      }
+      // Part of a prefab instance is not saved as a prefab of its own (#1869, Unity's rule) — the human path's refusal.
+      const part = partOfInstanceRefusal(entityId);
+      if (part) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${part}`,
+          { options: ['create the prefab from the instance root', "prefab {action:'detach'} on the outermost instance root first, then retry"] });
       }
       // A reference to a missing prefab holds its edits as a scene record, which a template cannot take (#1699, I8) — the
       // human path refuses the same tree (`createPrefabFromEntity`).

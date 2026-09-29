@@ -77,7 +77,7 @@ import { loadPrefabEditWorld, serializePrefabEditWorld, PREFAB_EDIT_LOCAL_GUID_P
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
-import { writeTraitFieldWithUndo, reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -143,7 +143,6 @@ sm.load = (data) => load(data as SceneData);
 
 const all = () => getAllEntities();
 const parentOf = (id: number) => all().find((e) => e.id === id)?.parentId ?? 0;
-const nameOf = (id: number) => all().find((e) => e.id === id)?.name;
 /** The instance root of row A or B — named MID's root, found by the sentinel guid the edit world stamps on a row. */
 const rootOf = (rowName: 'A' | 'B') => all().find((e) => e.guid === `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${rowName === 'A' ? 2 : 3}`)!.id;
 /** The entity called `name` inside instance `rowName`. */
@@ -248,33 +247,6 @@ describe('undoing an Apply made in the prefab editor rebuilds that world (#1573)
     await quietly(() => undo());
     expect(keyOf()).toBe(KA);
     expect(saved()).toEqual(before);
-  });
-
-  it('a member move goes back to being the instance\'s own move, and leaves the other instance', async () => {
-    reparentEntity(inRow('A', 'Box'), inRow('A', 'Slot'));
-    const before = saved();
-    await applyFromA((k) => k.moved);
-    expect(nameOf(parentOf(inRow('B', 'Box')))).toBe('Slot'); // precondition: B inherits the applied move
-
-    await quietly(() => undo());
-    expect(parentOf(inRow('B', 'Box'))).toBe(rootOf('B'));
-    expect(nameOf(parentOf(inRow('A', 'Box')))).toBe('Slot');
-    expect(saved()).toEqual(before);
-  });
-});
-
-describe('the restore`s own world check (#1750 T3: the stub swaps a world of its own)', () => {
-  // The commit skips its rebuild for any swap during the WRITE, so the restore's `getCurrentWorld() !== world` is reached
-  // only by one landing inside the rebuild's member-path repair, under the SAME key — a switch through `SceneManager`
-  // that is not an editor route (the key check cannot see it). Mutation: drop that clause → this goes red.
-  it('a world swapped in under the same key during the member-path repair is not overwritten by the snapshot', async () => {
-    reparentEntity(inRow('A', 'Box'), inRow('A', 'Slot'));
-    await applyFromA((k) => k.moved);
-    let swapped: ReturnType<typeof createWorld> | null = null;
-    sm.duringRepair = () => { swapped = createWorld(); setCurrentWorld(swapped); };
-    await quietly(() => undo());
-    expect(swapped, 'premise: the repair ran inside the undo').not.toBeNull();
-    expect(getCurrentWorld() === swapped, 'the snapshot was loaded over the world that replaced it').toBe(true);
   });
 });
 

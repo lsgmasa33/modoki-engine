@@ -34,9 +34,8 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setActionCallback, pushAction, clearHistory, createEntityWithUndo, reparentEntity } from '@modoki/engine/editor';
-import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { setPrefabCache, serializePrefab, detachPrefabInstance, instantiatePrefab, setPrefabSource, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } from '@modoki/engine/editor';
+import { setPrefabCache, serializePrefab, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { buildPrefabEditScene, savePrefabEditReport, PREFAB_EDIT_ROOT_GUID, _resetPrefabEditSessionRows } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
@@ -50,7 +49,6 @@ setActionCallback(pushAction);
 
 const O = 'cccccccc-0000-4000-8000-000000169101';
 const P = 'cccccccc-0000-4000-8000-000000169102';
-const INST = 'dddddddd-0000-4000-8000-000000169101';
 
 const row = (localId: number, name: string, parentId: number, nodeGuid: string, prefab?: string) => ({
   localId, name, nodeGuid, ...(prefab ? { prefab } : {}),
@@ -59,11 +57,6 @@ const row = (localId: number, name: string, parentId: number, nodeGuid: string, 
 /** P: R → A. */
 const pDoc = () => ({ id: P, version: 5, name: 'P', rootLocalId: 1, entities: [
   row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-000000169111'), row(2, 'A', 1, 'eeeeeeee-0000-4000-8000-000000169112'),
-] });
-/** O: OR → Slot → N (a nested row of P), and OR → Slot2. */
-const oDoc = () => ({ id: O, version: 5, name: 'O', rootLocalId: 1, entities: [
-  row(1, 'OR', 0, 'eeeeeeee-0000-4000-8000-000000169121'), row(2, 'Slot', 1, 'eeeeeeee-0000-4000-8000-000000169122'),
-  row(3, 'N', 2, 'eeeeeeee-0000-4000-8000-000000169123', P), row(4, 'Slot2', 1, 'eeeeeeee-0000-4000-8000-000000169124'),
 ] });
 const install = (...docs: Array<{ id?: string }>) => { for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); } };
 
@@ -99,14 +92,8 @@ const one = (name: string) => {
   if (hits.length !== 1) throw new Error(`fixture: ${hits.length} entities named ${name}`);
   return hits[0]!.id;
 };
-const duplicateGuids = () => {
-  const seen = new Map<string, number>();
-  for (const e of getAllEntities()) if (e.guid && !isRuntimeGuid(e.guid)) seen.set(e.guid, (seen.get(e.guid) ?? 0) + 1);
-  return [...seen].filter(([, n]) => n > 1).map(([g]) => g);
-};
 const add = (label: string, parent: number, name: string) =>
   createEntityWithUndo(label, parent, [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name, parentId: parent } }], () => {})!;
-const parentName = (id: number) => getAllEntities().find((e) => e.id === getAllEntities().find((x) => x.id === id)?.parentId)?.name;
 
 beforeEach(() => {
   setRunMode('stopped');
@@ -128,44 +115,6 @@ beforeEach(() => {
   });
 });
 afterAll(() => { for (const id of [O, P]) setPrefabCache(id, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
-
-describe('#1687: the save partitions instance roots by identity, not by live parent', () => {
-  const scene = (): SceneData => ({
-    id: 'identity-owner', version: 16, name: 'S', resources: [],
-    entities: [{ id: 1, prefab: O, guid: INST, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } } }],
-  } as unknown as SceneData);
-
-  for (const under of ['Slot2', 'OR'] as const) {
-    it(`an owned nested root moved under a plain node added under ${under} is saved once, and stays once over two rounds`, async () => {
-      // Mutation: partition by the LIVE parent again (`parentInfo?.traits.includes('PrefabInstance') && parentLocalId`)
-      // — the root is written as its own top-level scene entry as well, and every round adds a copy: R 1 → 2 → 3.
-      install(oDoc(), pDoc());
-      await load(scene());
-      const plain = add('Add Plain', one(under), 'Plain');
-      expect(reparentEntity(one('R'), plain)).toBe(true);
-      for (let round = 1; round <= 2; round++) {
-        const saved = await serializeScene() as unknown as SceneData;
-        expect(saved.entities.filter((e) => (e as { prefab?: string }).prefab === P)).toEqual([]);
-        await load(saved);
-        expect(byName('R')).toHaveLength(1);
-        expect(byName('A')).toHaveLength(1);
-        expect(parentName(one('R'))).toBe('Plain');
-        expect(duplicateGuids()).toEqual([]);
-      }
-    });
-  }
-
-  it('control: the same root moved under Slot2 itself was already saved once', async () => {
-    install(oDoc(), pDoc());
-    await load(scene());
-    expect(reparentEntity(one('R'), one('Slot2'))).toBe(true);
-    const saved = await serializeScene() as unknown as SceneData;
-    expect(saved.entities.filter((e) => (e as { prefab?: string }).prefab === P)).toEqual([]);
-    await load(saved);
-    expect(byName('R')).toHaveLength(1);
-    expect(parentName(one('R'))).toBe('Slot2');
-  });
-});
 
 describe('#1686: Create Prefab → Replace carries each row\'s nodeGuid — by live identity, then by a unique name (Unity U22)', () => {
   const X = 'cccccccc-0000-4000-8000-000000169131';
@@ -811,42 +760,5 @@ describe('#1662: a prefab-edit save keeps the row and the nodeGuid of a member A
     expect((await savePrefabEditReport()).saved).toBe(true);
     expect(uniqueIds()).toBe(true);
     expect(rowsOf().F!.split(':')[0]).toBe('3');
-  });
-});
-
-describe('Detach strips the instance\'s IDENTITY subtree: a member of another frame dragged under it stays linked (#1691, I6)', () => {
-  const Q = 'cccccccc-0000-4000-8000-000000169141';
-  const O2 = 'cccccccc-0000-4000-8000-000000169142';
-  /** Q: QR → QA. O2: OR → Slot, Keep. */
-  const qDoc = () => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
-    row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000169141'), row(2, 'QA', 1, 'eeeeeeee-0000-4000-8000-000000169142'),
-  ] });
-  const o2Doc = () => ({ id: O2, version: 5, name: 'O2', rootLocalId: 1, entities: [
-    row(1, 'OR', 0, 'eeeeeeee-0000-4000-8000-000000169143'), row(2, 'Slot', 1, 'eeeeeeee-0000-4000-8000-000000169144'),
-    row(3, 'Keep', 1, 'eeeeeeee-0000-4000-8000-000000169145'),
-  ] });
-  const piOf = (id: number) => readTraitData(id, getTraitByName('PrefabInstance')!) as { rootInstanceId?: number } | null;
-
-  it('detaching a user-added instance leaves the outer instance\'s member that was dragged under it linked, and it survives the reload', async () => {
-    // Mutation: strip the LIVE tree again (`collectTree` without the identity filter) — Keep loses its link to O2, and
-    // the save records O2's row as removed and Keep as a plain node.
-    install(o2Doc(), qDoc());
-    await load({ id: 'detach', version: 16, name: 'S', resources: [],
-      entities: [{ id: 1, prefab: O2, guid: INST, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } } }] } as unknown as SceneData);
-    const qRoot = instantiatePrefab(getCachedPrefabSync(Q) as PrefabFile, one('Slot'));
-    setPrefabSource(qRoot, { id: Q });
-    await load(await serializeScene() as unknown as SceneData);
-    expect(reparentEntity(one('Keep'), one('QA'))).toBe(true);
-    const or = idOfGuid(INST);
-    expect(piOf(one('Keep'))?.rootInstanceId).toBe(or); // precondition: still O2's member
-    detachPrefabInstance(one('QR'));
-    expect(piOf(one('QR'))).toBeNull();
-    expect(piOf(one('QA'))).toBeNull();
-    expect(piOf(one('Keep'))?.rootInstanceId).toBe(or);
-    await load(await serializeScene() as unknown as SceneData);
-    expect(byName('Keep')).toHaveLength(1);
-    expect(piOf(one('Keep'))?.rootInstanceId).toBe(idOfGuid(INST));
-    expect(parentName(one('Keep'))).toBe('QA');
-    expect(duplicateGuids()).toEqual([]);
   });
 });

@@ -23,7 +23,7 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData, type SceneEntityEntry,
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { setActionCallback, pushAction, reparentEntity } from '@modoki/engine/editor';
+import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import {
   setPrefabCache, serializePrefab, tagEntityTreeAsInstance, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
@@ -113,12 +113,6 @@ async function placedInstance(): Promise<{ template: PrefabFile; scene: { entiti
 beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
-
-/** Move `name` under `to` the way the editor does, inside the instance. */
-function move(name: string, to: string): void {
-  reparentEntity(idOf(name), idOf(to));
-}
-
 const rowNamed = (entry: SceneEntityEntry, name: string) =>
   Object.entries(entry.members ?? {}).find(([, r]) => r.name === name)?.[1];
 
@@ -128,41 +122,6 @@ const parentNameOf = (name: string): string => {
 };
 
 describe('SceneMemberRow.parent — a member moved inside its instance (#1468 Phase 3)', () => {
-  it('stores the new parent on the moved member`s row, and nothing on its siblings`', async () => {
-    await placedInstance();
-    const before = guidOf('Badge');
-    move('Badge', 'Panel');
-    const scene = await serializeScene() as unknown as { entities: unknown[] };
-    const entry = instanceEntry(scene);
-
-    // The moved member names where it now sits — by GUID, the only kind of entity reference this
-    // format has (docs/prefab-structural-overrides.md § A move is stored on the member's row).
-    expect(rowNamed(entry, 'Badge')).toEqual({ guid: before, name: 'Badge', parent: guidOf('Panel') });
-    // …and the members that did NOT move say nothing, which is what makes `parent` an override.
-    expect(rowNamed(entry, 'Panel')).toEqual({ guid: guidOf('Panel'), name: 'Panel' });
-    expect(rowNamed(entry, 'Label')).toEqual({ guid: guidOf('Label'), name: 'Label' });
-  });
-
-  it('puts the member back under that parent on reload, with the guid it had', async () => {
-    await placedInstance();
-    const before = guidOf('Badge');
-    move('Badge', 'Panel');
-    const saved = await serializeScene() as unknown as SceneData;
-
-    // ⚠️ The row is now the ONLY thing that can put Badge back: `moved` was deleted from the format
-    // in the same phase, so nothing else in this document says where Badge sits. This assertion is
-    // what keeps that true — the day a second channel reappears, the round trip below would be
-    // green whether or not `row.parent` is read at all.
-    const entry = instanceEntry(saved as unknown as { entities: unknown[] });
-    expect((entry as { moved?: unknown }).moved).toBeUndefined();
-
-    await load(saved);
-    // ⚠️ Names the WRONG ANSWER, not merely "it is somewhere": a reload that ignored `parent` puts
-    // Badge back under Root, where its template row hangs, and the move is silently undone.
-    expect(parentNameOf('Badge')).toBe('Panel');
-    expect(parentNameOf('Badge')).not.toBe('Root');
-    expect(guidOf('Badge')).toBe(before);
-  });
 
   it('lets a TEMPLATE re-parent move an un-moved member — R4, the case always-writing would break', async () => {
     await placedInstance();
@@ -183,18 +142,6 @@ describe('SceneMemberRow.parent — a member moved inside its instance (#1468 Ph
     // under Root for ever and this would read 'Root' — the silent defeat R4 exists to prevent.
     expect(parentNameOf('Badge')).toBe('Panel');
     expect(guidOf('Badge')).toBe(before);
-  });
-
-  it('re-keys nothing when the member moves — the flat key is what survives it (D1(a))', async () => {
-    await placedInstance();
-    const keyBefore = Object.entries(instanceEntry(await serializeScene() as unknown as { entities: unknown[] }).members ?? {})
-      .find(([, r]) => r.name === 'Badge')![0];
-    move('Badge', 'Panel');
-    const keyAfter = Object.entries(instanceEntry(await serializeScene() as unknown as { entities: unknown[] }).members ?? {})
-      .find(([, r]) => r.name === 'Badge')![0];
-    // Under an ancestor-chain key this would change and the stored row would orphan on the next
-    // load. The whole point of D1(a) is that a move touches `parent` and nothing else.
-    expect(keyAfter).toBe(keyBefore);
   });
 });
 
@@ -234,32 +181,5 @@ describe('a pre-Phase-3 `moved` map still applies, and migrates onto the row on 
     badge.parent = guidOf('Label');
     await load(legacy);
     expect(parentNameOf('Badge')).toBe('Label');
-  });
-});
-
-// Close-out review finding 1: a member of a PRE-v5 template has no row — no `nodeGuid`, no key — so the
-// row cannot carry its move, and Phase 3 first wrote it nowhere: moved, saved, reloaded at its template
-// row. Every prefab the released editor wrote is pre-v5, so that was every project outside this repo.
-// The capture now splits its moves: a row states a keyed member's, and the legacy map carries the rest.
-describe('a move inside an instance of a PRE-v5 template survives save + reload (#1468)', () => {
-  // Mutation: have noteMove put every move into `rowed` (never into `unrowed`).
-  it('is written to the legacy `moved` map, and reloads where it was put', async () => {
-    const { template } = await placedInstance();
-    const v4 = JSON.parse(JSON.stringify(template)) as PrefabFile & { entities: Array<{ nodeGuid?: string }> };
-    v4.version = 4;
-    for (const r of v4.entities) delete r.nodeGuid;
-    prefabs.set(PREFAB, v4);
-    setPrefabCache(PREFAB, v4 as never);
-    await load({
-      id: 's', version: 1, name: 'S', resources: [],
-      entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }],
-    } as unknown as SceneData);
-    move('Badge', 'Panel');
-    const saved = await serializeScene() as unknown as SceneData;
-    const entry = instanceEntry(saved as unknown as { entities: unknown[] }) as SceneEntityEntry & { moved?: Record<number, string> };
-    expect(entry.members).toBeUndefined(); // the premise: no row exists to carry it
-    expect(entry.moved).toEqual({ [rowOf(v4, 'Badge').localId]: guidOf('Panel') });
-    await load(saved);
-    expect(parentNameOf('Badge')).toBe('Panel');
   });
 });

@@ -1308,12 +1308,19 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   | Hierarchy row drop, cut → paste | the editor's own modal (`confirmInEditor`), text from `formatSceneMoveConfirm` |
   | Hierarchy drop on a scene GROUP row, on a scene's FOLDER row, or on the empty area (demote) | the same modal (`handleMoveToScene`). These land at the target scene's root, so they ask `planSceneDrop` rather than `planReparent`: a drop on the entity's OWN scene is a no-op, not a refusal. After the modal, `sceneDropTarget` refuses if the world was replaced while it was open (the guid may name another file's entity there), then `moveEntityToScene` |
   | agent `reparent-entity` / `modoki_reparent_entity` | refused with that same text until re-sent with `moveToScene: true` |
-  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (unpack on move, world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434). A string parent is a guid; one matching no live entity is refused |
+  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434); a member's parent write is refused since #1869, below. A string parent is a guid; one matching no live entity is refused |
   | agent `set-traits` `parentId` in the EDITOR (eval `modoki.setTraits`) | the same answer as `apply-scene-ops`, in the same words: both write through `writeTraitAsEditor` (`agentEditorOps.ts`, #1816), whose parent change is `fieldParentWriteRefusal` then `applyReparent`. EVERY target is planned before ANY write, so one refused target refuses the call and nothing lands; a posed world refuses. The editor REPLACES the device's op, and the whole call is one composite undo entry with the parent written first, so a parent and a Transform in one call undo and redo together. Until #1787 the device's raw op ran here and its write reached the field past `planReparent`; until #1816 every other field was still raw. The device keeps the raw write behind its self/cycle/resource guard |
   | a parent written on an entity that LACKS `EntityAttributes` (apply-scene-ops `setTrait`, `set-traits`) | the trait is seeded WITHOUT the parent, then the parent goes through the reparent above (#1825); it used to be seeded raw, past every check |
   | file-direct `scene-mutate` `setTrait parentId` (`modoki_mutate_scene` with no editor holding the scene) | judged by `parentLinkRefusal` (`runtime/core/ecs/parentLink.ts`), the rule `reparentRefusal` asks of the live world, over the FILE's entries: self, cycle and (with the schema's resource traits) resource are refused, and a parent naming no entry of the file is refused, never stored — a prefab member is not an entry, so a member parent needs the live editor. On an instance ROOT the parent goes to the entry's own `traits.EntityAttributes`, where the loader reads it, not into its overrides, so Apply has nothing to carry (Unity: an instance root's parent is scene-side). It keeps the WORLD pose, as every live reparent does (#1847): the local Transform is recomputed under the new parent (`keepWorldPose`, over `transformSpace.ts`), writing only the groups that change, into the overrides for an instance root. Only the two parent chains BELOW their shared prefix matter (`reparentSuffixes` — the shared part cancels); when those compose to the same pose nothing is written, and otherwise position is written when it moves and rotation/scale only when their LINEAR part changes (`sameRotationScale`) — a decomposition picks its own Euler angles and mirror axis, and comparing numbers rewrote an untouched `{sy:-1}` as `{sx:-1, rz:π}`. A pure turn writes the rotation alone and keeps the authored scale, mirror sign included (`rotationKeepingScale`); the scale group is written only when the linear part changed scale or shear. A zero-scale new suffix is refused (no local keeps the pose). When the recompute needs a pose only partly in this file — an entry on either suffix, or the entity itself, is an instance root whose override does not store all nine Transform fields (`isTemplatePlaced`) — it keeps its LOCAL transform and warns, rather than computing against a guessed identity — except an instance root whose override stores x, y, z moved where the suffixes differ by translation only: its position depends on its translation alone, so that is compensated — its POSITION only: nothing ever writes rotation or scale into a partial override, where it would replace the template's. Exact for suffixes without shear (each is decomposed to one TRS). The LIVE reparent still writes all nine decomposed fields (#1848) |
   | file-direct `scene-mutate` `addEntity` (`op.parentId` or an authored `EntityAttributes.parentId`) | a parent naming no entry of the file, or a resource, re-roots the new entity with a warning, as the live create does; it used to store the orphan |
   | a generic write of `EntityAttributes.sourceScene`: `apply-scene-ops` / `modoki_mutate_scene` `setTrait`, `set-traits` (eval `modoki.setTraits`), file-direct `scene-mutate` (setTrait and addEntity) | **refused**, naming the scene move (`fieldWriteRefusal`, `traitEditPolicy.ts`). A field write stamped one entity and not its subtree, and could name a scene that is not loaded (#1757). Writing back the value the entity already has passes |
+
+  **Before any of these, an object a prefab supplies does not move at all** (#1869, docs/prefabs.md U7):
+  `restructureRefusal` refuses a member, an owned nested root or a node the prefab added, in the same scene or
+  into another, and a free mover whose subtree would carry one away from its instance. `planReparent` asks it
+  (with the `sortOrder` the caller gives, a reorder), and so do `planSceneDrop` and `moveEntityToScene`, which a
+  keyed node reached past `sceneMoveRefusal` (that one reads `PrefabInstance` links only). The Hierarchy toasts it
+  (`SCENE_MOVE_REFUSAL_TEXT.restructure`), the agent ops refuse with it, and nothing is written.
 
   One prefab case is **refused**, by `sceneMoveRefusal`, **which `moveEntityToScene` asks itself before it writes
   anything** — so no entry point can reach a move without it. `planReparent` and the Hierarchy's group/folder/
@@ -1324,7 +1331,9 @@ Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
   "unpack on move": `instance-member`, where something in the moved subtree is linked to an
   instance that stays behind. That covers a member, an owned nested root whose outer instance is
   not moving, and a member held under a plain added child. Moving it would split the instance
-  across two files. Move the whole instance, or unpack it first. A whole stored instance dropped
+  across two files. Move the whole instance, or unpack it first. (Since #1869 the restructure rule
+  above answers first for all three, which only a pre-#1869 file can still hang under an added child;
+  this one stays inside `moveEntityToScene`, asked before it.) A whole stored instance dropped
   under a base instance's member is NOT refused: it moves and becomes that instance's user-added
   nested instance, exactly as in a same-scene drop (#1436, below).
 
@@ -1514,22 +1523,12 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     5000 entities × 20 keys. A world that expands no keyed prefab pays nothing. The prefab-edit world
     never notes the EDITED prefab's own keys — its rows are flattened, not expanded — so those nodes
     are not healed there; the editor's template write recovers them instead.
-  - **A move keeps the key exactly while the frame that DECLARES it still holds the node (#1808, #1852).** One owner,
-    `moveKeys` in `editor/undo/entityActions.ts`, shared by `reparentEntity` and `moveEntityToScene`:
-    - **The declaring frame** is the nearest instance-root ancestor whose OWN prefab document names the key
-      (`templateKeysOf`), read from the document the WORLD recorded that frame as expanded from (`frameDocReader`),
-      so a trashed and evicted prefab still answers. It is not the root the node's guid derives from: a nested
-      template node's guid derives from the OUTERMOST root, so that rule stripped a key a deeper template declares.
-    - **The move strips** the key from a node it takes out of that frame, right after the parent write and BEFORE the
-      detach. A stale key answered to that key in any other frame of the same template, so the save let the moved node
-      claim that frame's own node: it dropped the moved node and restated the real one as `own`, an I7 duplicate
-      (#1808). Before the detach, because a promotion re-derives a keyed node's guid through its key onto the new root,
-      and this load heal then re-keyed it at the next reload.
-    - **The undo re-seats every key the move saw.** It does not trust the world to still hold them: a save→reload
-      after the move drops the marker from a node the save states plainly, and without the re-seat the redo's promotion
-      re-derived nothing, so the next step named a guid nobody held (#1852). The redo strips the same nodes again.
-    - A move inside the declaring frame keeps the key. Whether the save then unlinks the node is decided by where it
-      sits (#1516), not by the marker.
+  - **A keyed node does not move (#1869)** — a plain added node or a template reference node's root. A node its prefab added is part of that prefab, so the reparent that could
+    take it out of the frame whose document declares its key is refused (`restructureRefusal`, docs/prefabs.md U7),
+    and its key needs no handling across a move. That path was #1808 (a stale key let the moved node claim another
+    frame's own node, an I7 duplicate) and #1852 (the undo lost the key); the `moveKeys` machinery that managed the key
+    across a move was reverted with the refusal. The same declaring-document walk (`frameDocReader` + `templateKeysOf`)
+    now decides whether a keyed node is the prefab's at all: the edited prefab's OWN added node in prefab edit is not.
   - **Write.** Every prefab-file writer captures in TEMPLATE form:
     - `planPrefabRows` passes `{ template: true }` to `captureInstanceReference` and
       `captureNestedChannels`;

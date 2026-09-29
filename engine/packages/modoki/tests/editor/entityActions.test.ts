@@ -724,26 +724,20 @@ describe('reparentEntity prefab boundaries (panels F2)', () => {
   };
   const has = (id: number) => entityIndex.get(id)?.has(PrefabInstance) ?? false;
 
-  it('auto-detaches a member dragged OUT of its instance (and undo re-tags it)', async () => {
-    const { reparentEntity } = await getModule();
-    const { a, b } = buildInstance();
-    expect(reparentEntity(b.id(), 0)).toBe(true); // move B to scene root
-    expect(has(b.id())).toBe(false);              // B unpacked → plain entity
-    expect(has(a.id())).toBe(true);               // source root untouched
-
-    pushedActions[pushedActions.length - 1].undo();
-    expect(has(b.id())).toBe(true);               // re-tagged on undo
-    expect(entityIndex.get(b.id())!.get(PrefabInstance)!.rootInstanceId).toBe(a.id());
-  });
-
-  it('keeps PrefabInstance when a member moves WITHIN the same instance', async () => {
+  // A member does not leave its instance, nor move within it (#1869, Unity's "Cannot restructure Prefab instance"): the
+  // move is refused before anything is written, and pushes no entry. (It used to unpack the member on the way out.)
+  // Mutation: drop the `restructureRefusal` backstop in reparentEntity — both moves land.
+  it('refuses a member dragged out of its instance or within it, with nothing written', async () => {
     const { reparentEntity } = await getModule();
     const { a, b } = buildInstance();
     const d = testWorld.spawn(Transform({}), EntityAttributes({ name: 'D', parentId: a.id(), guid: 'D' }),
       PrefabInstance({ source: 'p.json', localId: 3, rootInstanceId: a.id() }));
     entityIndex.set(d.id(), d);
-    expect(reparentEntity(b.id(), d.id())).toBe(true); // B under D — both in instance A
-    expect(has(b.id())).toBe(true);                    // stays a member
+    const before = pushedActions.length;
+    expect(reparentEntity(b.id(), 0)).toBe(false);
+    expect(reparentEntity(b.id(), d.id())).toBe(false);
+    expect(pushedActions.length).toBe(before);
+    expect(entityIndex.get(b.id())!.get(EntityAttributes)!.parentId).toBe(a.id());
     expect(entityIndex.get(b.id())!.get(PrefabInstance)!.rootInstanceId).toBe(a.id());
   });
 

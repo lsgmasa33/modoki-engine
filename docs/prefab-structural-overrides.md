@@ -752,6 +752,12 @@ root's derived guid is itself computed from this stamp (`memberStepId`).
 
 ## Moved members (#1437)
 
+**Since #1869 no gesture creates a move.** Unity refuses to restructure a prefab instance, and so does the editor
+(`restructureRefusal`, docs/prefabs.md U7). A file written before holds its moves, and they keep LOADING and SAVING as
+described below, with no migration and no rewrite; the Apply/Revert dialog still lists one (`~moved.<member>`), so it
+can be applied to the prefab or reverted. The rulings below say how such a file came to be. Pinned by
+`engine/tests/editor/legacyMovedEntries.test.ts`.
+
 A prefab member moved to another parent **inside its outermost instance** stays linked, and the move
 is saved (owner rulings, #1437: (a) same frame, (b) across frames — under a scene-added node, into a
 nested instance's member, out of a nested instance into its outer one). Moved OUT of the outermost
@@ -1106,7 +1112,8 @@ such a member sits at its row there. A prefab move whose member no longer exists
 dropped that row — is skipped silently on load; the entry is cleaned up the next time the prefab that
 holds it is applied. A row lifted past removed rows without a `Transform` of its own gets no carried pose,
 and a carried pose under a non-uniformly scaled, rotated removed row is the nearest TRS, not exact. A ref into a node promoted by Apply still stays a guid, as
-before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
+before. Tests: `engine/tests/editor/legacyMovedEntries.test.ts` (a file holding a move; the authoring tests went
+with the gesture in #1869),
 `engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
 planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
 
@@ -1588,8 +1595,8 @@ when the equality did not hold. The payoff that justified a format bump was unif
 only preserving identity. No open issue beyond #1468 needed it; it was preventive.
 
 **Rejected, with reasons, so they are not re-proposed:**
-- **Warn, don't fix.** Dragging a member out of an instance already unpacks it (a plain entity keeps
-  its guid), so the only everyday way to lose identity was Create Prefab, and a warning naming the files
+- **Warn, don't fix.** Dragging a member out of an instance unpacked it then (a plain entity keeps
+  its guid; since #1869 the drag is refused), so the only everyday way to lose identity was Create Prefab, and a warning naming the files
   that would dangle was a real option. Rejected by the owner's bar.
 - **Store the guid in the existing `overrides` channel** (no format bump). It inherits the dead end's
   first fault exactly: `remintSceneEntityGuids` is a KNOWN-FIELD walk and does not read guids there. Its
@@ -1782,27 +1789,32 @@ Measured headlessly with the real editor functions (`reparentEntity`, `deleteEnt
 and `Inner` (`InnerRoot → {Leaf, Leaf2}`), with a second `Outer` instance to confirm Apply reaches it. Every
 row round-trips through save + reload.
 
+**Since #1869 every drag of an object the prefab supplies is REFUSED** (`restructureRefusal`, docs/prefabs.md U7 — Unity's
+rule). The rows below that drag a member or a nested instance say "refused"; their old outcome survives only as what a
+pre-#1869 file holds, which loads, saves, applies and reverts as described (§ Moved members).
+
 | Action | The dragged thing afterwards | Apply on the outer instance | Apply on the nested instance |
 |---|---|---|---|
 | Create / drag a plain entity under an outer member | plain, an `added` node | becomes an Outer member | — |
 | Create / drag a plain entity under a nested member | plain, in `nestedStructure` | nothing to apply | becomes an **Inner** member (every Inner) |
-| Drag an outer member out of the instance | unpacked; the instance records it `removed` | removed from Outer | — |
-| Drag a member to another parent inside the instance | stays linked, its row records `parent` | re-parents the row | — |
-| Drop a user-added instance's root under its own member | that member is unpacked (#1450); the instance stays linked under it | — | — |
-| Drag a nested member into the outer instance | stays linked | Outer records the move (`moved` map) | refused, pointing outward |
-| Drag an outer member into the nested instance | stays linked | Outer records the move | — |
-| Drag a nested member out of everything | unpacked | nothing to apply | removed from Inner |
-| **Drag a nested instance out of everything** | **stays an Inner instance** (#1447); Outer records the row `removed` | removes the row | — |
-| Drag a nested instance to another outer member | stays linked | re-parents the row | — |
+| Drag an outer member out of the instance | **refused** (#1869); it was unpacked, the instance recording it `removed` | — | — |
+| Drag a member to another parent inside the instance | **refused** (#1869); a pre-#1869 file's move keeps its row's `parent` | re-parents the row (a file's move) | — |
+| Drop a user-added instance's root under its own member | refused: a cycle, since no member leaves its instance (#1869); it once unpacked that member (#1450) | — | — |
+| Drag a nested member into the outer instance | **refused** (#1869) | Outer records a file's move (`moved` map) | refused, pointing outward |
+| Drag an outer member into the nested instance | **refused** (#1869) | Outer records a file's move | — |
+| Drag a nested member out of everything | **refused** (#1869) | — | — |
+| Drag a nested instance out of everything | **refused** (#1869); it stayed an Inner instance (#1447) | — | — |
+| Drag a nested instance to another outer member | **refused** (#1869) | re-parents the row (a file's move) | — |
 | Delete an outer member / the nested instance / a nested member | — | removes it from Outer / removes the row / nothing | — / — / removes it from Inner |
 | Drag a prefab instance into the outer instance | stays linked, a reference node | becomes a nested row | — |
 | Drag a prefab instance under a nested member | stays linked | nothing to apply | becomes a nested row of Inner |
-| Drag a member into ANOTHER instance | unpacked (#1445): the old instance records it `removed`, the new one saves it as `added` | — | — |
+| Drag a member into ANOTHER instance | **refused** (#1869); it was unpacked (#1445) | — | — |
 | Drag an instance into an instance of the SAME prefab | allowed, a reference node (#1436) | **refused**, with a reason: a prefab cannot contain itself (#1446) | — |
 
 A linked member is written by its **frame**'s save: the first promoted root on its ownership chain, or else
 the stored root (top-level or user-added) that chain reaches. A frame is saved from its root down. So after
-EVERY reparent (`planMoveUnlinks`), a linked member is unpacked in exactly the two shapes the save cannot
+EVERY reparent (`planMoveUnlinks`, which since #1869 moves only stored roots and scene-added nodes, and so reaches these
+shapes only through a pre-#1869 file), a linked member is unpacked in exactly the two shapes the save cannot
 write: it sits ABOVE its frame, or the outermost instance it sits inside differs from its frame's. Written
 nowhere, both it and the instance vanished on reload. A member merely BESIDE its frame inside the same
 outermost instance is an ordinary #1437 move and stays linked.
@@ -1889,7 +1901,7 @@ names Detach Prefab in the refusal. It also holds the core traits that can never
 EntityAttributes). The paths are: the Inspector remove button, the Add Component picker,
 `add`/`removeTraitFromEntitiesWithUndo` (the seam every editor caller goes through), the agent live
 `apply-scene-ops`, the file-direct `sceneMutate`, and the device `set-traits`. A per-member "unlink" command was
-considered and declined; dragging a member out of its instance already unpacks it (#1447). Not covered:
+considered and declined; dragging a member out of its instance unpacked it then (#1447; refused since #1869). Not covered:
 `applyStructureCore`'s `removedTraits` at load, which the capture side never writes for `PrefabInstance`.
 Before the fix, the walk stepped through an OWNED root. A nested root moved beside its owner (Mid's `InnerRoot`
 under Panel), with the owner then deleted, was re-pointed into the grandparent frame. That frame records no move

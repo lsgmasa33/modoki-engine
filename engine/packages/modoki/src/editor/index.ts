@@ -116,6 +116,7 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 // carried a copy of its closures).
 export { revertOverridesWithUndo } from './undo/revertPrefabUndo';
 export { detachPrefabInstanceWithUndo, detachRefusal, detachPrefabMenuItem } from './undo/detachPrefabUndo';
+export { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, partOfInstanceRefusal, RESTRUCTURE_REFUSAL_TEXT, PART_OF_INSTANCE_TEXT, type RestructureGesture } from './scene/restructureRefusal';
 export {
   saveScene, saveAll, serializeScene, loadScene, loadSceneReporting, type SceneLoadReport, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,

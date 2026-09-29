@@ -29,8 +29,15 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, spawnEntity, Transform, EntityAttributes,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, Transient as TransientTrait, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, redo, duplicateEntity, reparentEntity } from '@modoki/engine/editor';
-import { snapshotEntity, respawnFromSnapshot, copySnapshot, moveEntityToScene } from '../../packages/modoki/src/editor/undo/entityActions';
+import { clearHistory, setActionCallback, pushAction, serializeScene, deleteEntitiesWithUndo, undo, duplicateEntity } from '@modoki/engine/editor';
+import {
+  snapshotEntity, respawnFromSnapshot, copySnapshot, planReparent, applyReparent, reparentEntity, moveEntityToScene, planSceneDrop, siblingDropRefusal,
+  siblingKeepsItsPlace, siblingsKeepingTheirPlace, stuckDropText, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo,
+} from '../../packages/modoki/src/editor/undo/entityActions';
+import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { restructureRefusal, RESTRUCTURE_REFUSAL_TEXT, partOfInstanceRefusal, PART_OF_INSTANCE_TEXT } from '../../packages/modoki/src/editor/scene/restructureRefusal';
+import { detachRefusal, detachPrefabMenuItem, detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
+import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import {
   setPrefabCache, serializePrefab, applyToPrefabSelective, instantiatePrefabAsync, getOverrideValues, collectComparableTraits,
   baseTokenResolver, type PrefabFile,
@@ -840,19 +847,15 @@ describe('a duplicated or pasted instance keeps its template-added nodes keyed a
     };
     return getAllEntities().filter((e) => under(e.id)).map((e) => `${e.name}:${e.guid}`).sort();
   };
-  it.each([
-    ['promoted, when the root is moved out of its instance', true],
-    ['copied as an independent instance', false],
-  ])('a keyed reference node under an owned root that is %s keeps every guid through save + reload', async (_label, promote) => {
+  it('a keyed reference node under an owned root that is copied as an independent instance keeps every guid through save + reload', async () => {
     install(droppedDoc());
     await load({ ...twoInstances(OUTER, 'OuterRoot'), entities: [twoInstances(OUTER, 'OuterRoot').entities[0]] } as unknown as SceneData);
     const mid = getAllEntities().find((e) => e.name === 'MidRoot')!.id;
     const dropped = getAllEntities().find((e) => e.name === 'InnerRoot' && keyOn(e.id) === REF_KEY)!.id;
     const droppedBefore = guidsUnder(dropped);
-    const root = promote ? (expect(reparentEntity(mid, 0)).toBe(true), mid) : duplicateEntity(mid, () => {})!;
-    // A promotion moves no identity it has no reason to: the save states this subtree's guids, so a ref to one of them
-    // from another file must keep resolving.
-    if (promote) expect(guidsUnder(dropped)).toEqual(droppedBefore);
+    const root = duplicateEntity(mid, () => {})!;
+    // The copy moves no identity of the source's: a ref to one of them from another file must keep resolving.
+    expect(guidsUnder(dropped)).toEqual(droppedBefore);
     const rootGuid = getAllEntities().find((e) => e.id === root)!.guid;
     const before = guidsUnder(root);
     expect(before.filter((g) => g.startsWith('InnerRoot:'))).toHaveLength(2); // the row's expansion and the dropped node
@@ -964,65 +967,226 @@ describe('the heal caches its misses (#1426 close-out)', () => {
   });
 });
 
-// ── #1808 / #1852: a keyed node's template key across a move ─────────────────────────────────────────
-describe("a reparent keeps a keyed node's template key exactly while the node stays in the frame that keys it (#1808, #1852)", () => {
+// ── #1869: an object a prefab supplies is not restructured (Unity: "Cannot restructure Prefab instance") ─────────────
+/** OUTER's MID row adds `Extra` under MID's Slot, so each OUTER instance holds: OuterRoot (stored) → Panel (member) →
+ *  MidRoot (owned nested root) → Slot (MID's member) → Extra (keyed: OUTER's document declares its key) and MidNested's
+ *  InnerRoot (owned) → Leaf. Every one of those but the stored root is the prefab's; a node the SCENE adds is not.
+ *  Each refusal must leave NO trace: the saved bytes, the undo history and the live link as they were. */
+describe('#1869: restructuring a prefab instance is refused, with no side effect', () => {
   const live = (id: number) => [...getCurrentWorld().entities].find((x) => x.id() === id)!;
-  const extra = () => getAllEntities().find((e) => e.name === 'Extra')!;
-  const keyOfExtra = () => templateKeyOf(live(extra().id));
-  const oneOuter = (): SceneData => ({ ...twoInstances(OUTER, 'OuterRoot'), entities: [twoInstances(OUTER, 'OuterRoot').entities[0]] } as unknown as SceneData);
-  const midRoot = () => getAllEntities().find((e) => e.name === 'MidRoot')!.id;
+  const inst = (guid: string) => getAllEntities().find((e) => e.guid === guid)!.id;
+  const under = (root: number, name: string) => {
+    const inside = (id: number): boolean => { for (let c = getAllEntities().find((e) => e.id === id); c; c = getAllEntities().find((e) => e.id === c!.parentId)) if (c.id === root) return true; return false; };
+    return getAllEntities().find((e) => e.name === name && inside(e.id))!.id;
+  };
+  const parentOf = (id: number) => getAllEntities().find((e) => e.id === id)!.parentId;
+  const sortOf = (id: number) => getAllEntities().find((e) => e.id === id)!.sortOrder;
+  const withExtra = async () => { install(outerDoc({ added: [keyed('Extra', 2)] })); await load(twoInstances(OUTER, 'OuterRoot')); clearHistory(); };
+  /** Run `gesture`, and require that it changed nothing a save, the undo history or the mover's link would show. */
+  const noTrace = async (mover: number, gesture: () => unknown) => {
+    const bytes = JSON.stringify((await serializeScene()).entities);
+    const version = getEditVersion();
+    const before = { parent: parentOf(mover), sort: sortOf(mover), key: templateKeyOf(live(mover)), pi: JSON.stringify(live(mover).get(getTraitByName('PrefabInstance')!.trait as never) ?? null) };
+    await gesture();
+    expect(getEditVersion(), 'no undo entry').toBe(version);
+    expect({ parent: parentOf(mover), sort: sortOf(mover), key: templateKeyOf(live(mover)), pi: JSON.stringify(live(mover).get(getTraitByName('PrefabInstance')!.trait as never) ?? null) }).toEqual(before);
+    expect(JSON.stringify((await serializeScene()).entities), 'the saved entities').toBe(bytes);
+  };
+  const refusedEverywhere = (mover: number, parent: number) => {
+    expect(planReparent(mover, parent)).toEqual({ kind: 'refused', reason: 'restructure' });
+    expect(applyReparent(mover, parent).ok).toBe(false);
+    expect(reparentEntity(mover, parent)).toBe(false);
+  };
 
-  it("a key OUTER's row declares is dropped when MID's root leaves OUTER; the undo re-seats it after a save→reload, the redo drops it again", async () => {
-    // Mutations: drop the strip (`leftFrame`) — the key survives the move (#1808); drop the undo's re-seat — the key is gone
-    // after the reload's undo, so a redo's promotion would re-derive nothing (#1852).
-    install(outerDoc({ added: [keyed('Extra', 2)] }));
-    await load(oneOuter());
-    const keyedGuid = extra().guid;
-    expect(keyOfExtra()).toBe(KEY);
-    expect(reparentEntity(midRoot(), 0)).toBe(true);
-    expect(keyOfExtra(), 'left the frame that keys it').toBe('');
-    await load(await serializeScene() as unknown as SceneData); // a rebuild: the save states the node, unkeyed
-    expect(keyOfExtra()).toBe('');
-    expect(await undo()).toBe(true);
-    expect(keyOfExtra(), 'back in OUTER\'s frame').toBe(KEY);
-    expect(extra().guid).toBe(keyedGuid);
-    expect(await redo()).toBe(true);
-    expect(keyOfExtra()).toBe('');
+  // #1808, route 1 (its hub repro): OUTER's keyed node dragged into the OTHER instance of OUTER. It kept its stale key
+  // there, claimed that frame's own node, and the save lost it. Mutation: drop the keyed-node branch of
+  // `suppliedByPrefab` — the drag goes through.
+  it('#1808: a keyed node dragged into another instance of its template is refused', async () => {
+    await withExtra();
+    const extra = under(inst(G1), 'Extra');
+    expect(templateKeyOf(live(extra))).toBe(KEY); // precondition: the node IS keyed
+    const target = under(inst(G2), 'Panel');
+    await noTrace(extra, () => refusedEverywhere(extra, target));
   });
 
-  it("a key MID's own template declares STAYS when MID's root leaves OUTER: its anchor moves with it", async () => {
-    // Mutation: strip every anchored key on a move that crosses an instance (the "outermost instance changed" rule, which
-    // #1808's design rejects) — this goes red, and the reload below restates the node beside the chain's own (I7).
-    install(midDoc({ added: [keyed('Extra', 1)] }));
-    await load(oneOuter());
-    expect(keyOfExtra()).toBe(KEY);
-    expect(reparentEntity(midRoot(), 0)).toBe(true);
-    expect(keyOfExtra()).toBe(KEY);
-    await load(await serializeScene() as unknown as SceneData);
-    expect(getAllEntities().filter((e) => e.name === 'Extra')).toHaveLength(1);
-    expect(keyOfExtra()).toBe(KEY);
+  // #1808, route 2 (win's hunt seed 4906): the same, into a Duplicate of its own instance. Same mutation.
+  it('#1808: a keyed node dragged into a Duplicate of its instance is refused', async () => {
+    await withExtra();
+    const copy = duplicateEntity(inst(G1), () => {})!;
+    const extra = under(inst(G1), 'Extra');
+    await noTrace(extra, () => refusedEverywhere(extra, under(copy, 'Slot')));
   });
 
-  it("the declaring document is the one the frame was EXPANDED from: a prefab evicted from both caches still strips (#1834)", async () => {
-    // Mutation: read the declarer's document from the editor cache (`getCachedPrefabSync`) — evicted, the key survives.
-    install(outerDoc({ added: [keyed('Extra', 2)] }));
-    await load(oneOuter());
-    prefabs.delete(OUTER);
-    setPrefabCache(OUTER, null as never);
-    expect(reparentEntity(midRoot(), 0)).toBe(true);
-    expect(keyOfExtra()).toBe('');
+  // #1852 (hunt seed 6079): a reparent into a nested member's own list — within the node's OWN instance, onto INNER's Leaf.
+  // Its undo once refused "Extra is no longer in the scene". Same mutation.
+  it('#1852: a keyed node dragged onto a nested member of its own instance is refused', async () => {
+    await withExtra();
+    const extra = under(inst(G1), 'Extra');
+    await noTrace(extra, () => refusedEverywhere(extra, under(inst(G1), 'Leaf')));
   });
 
-  it('a SCENE move takes the same rule: a keyed node moved into another scene loses its key, its undo re-seats it', async () => {
-    // `moveEntityToScene` re-parents without `reparentEntity`. Mutation: drop its `keys.strip()` — Extra keeps OUTER's key
-    // in the other scene; drop its `keys.reseat()` — the undo brings it back unkeyed.
-    install(outerDoc({ added: [keyed('Extra', 2)] }));
-    await load(oneOuter());
-    expect(moveEntityToScene(extra().id, 'b1808000-0000-4000-8000-000000000001')).toMatchObject({ ok: true });
-    expect(keyOfExtra()).toBe('');
-    expect(await undo()).toBe(true);
-    expect(keyOfExtra()).toBe(KEY);
-    expect(await redo()).toBe(true);
-    expect(keyOfExtra()).toBe('');
+  // #1792: a member dragged OUT of its instance (then a Revert respawned it on the guid it held). The drag is refused, so
+  // the Revert has nothing to collide with. Mutation: drop the member branch of `suppliedByPrefab` — Leaf moves (Panel
+  // is still refused then, by its subtree: it carries MidRoot, whose instance would stay behind).
+  it('#1792: a member dragged out of its instance is refused; so is an owned nested root, anywhere', async () => {
+    await withExtra();
+    const leaf = under(inst(G1), 'Leaf');
+    await noTrace(leaf, () => refusedEverywhere(leaf, 0));
+    const panel = under(inst(G1), 'Panel');
+    await noTrace(panel, () => refusedEverywhere(panel, 0));
+    // An owned nested root, within its own instance (Mutation: drop the owned-root branch — MidRoot moves).
+    const mid = under(inst(G1), 'MidRoot');
+    await noTrace(mid, () => refusedEverywhere(mid, inst(G1)));
+  });
+
+  // #1792's second route: Create Prefab on a member made it the root of a new prefab in place, and a Revert of the row it
+  // left respawned the row beside it on one guid. Unity refuses it: "Can't save part of a Prefab instance as a Prefab".
+  // Mutation: drop the `partOfInstanceRefusal` call in `createPrefabFromEntity` — the create proceeds (and, with no
+  // backend here, fails some other way, not with this refusal).
+  it('#1792 route 2: Create Prefab on part of an instance is refused, with no trace', async () => {
+    await withExtra();
+    for (const name of ['Panel', 'MidRoot', 'Extra']) {
+      const id = under(inst(G1), name);
+      expect(partOfInstanceRefusal(id), name).toBe(PART_OF_INSTANCE_TEXT);
+      await noTrace(id, async () => {
+        expect(await createPrefabFromEntity(id, '/p1869.prefab.json', 'Save prefab', async () => true)).toEqual({ refused: `Create Prefab refused — ${PART_OF_INSTANCE_TEXT}` });
+      });
+    }
+    // Accept: the outermost root, and a node the scene added (Mutation: make `partOfInstanceRefusal` refuse any entity).
+    expect(partOfInstanceRefusal(inst(G1))).toBeNull();
+    expect(partOfInstanceRefusal(spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Added', parentId: inst(G1), guid: DURABLE })).id())).toBeNull();
+  });
+
+  // #1792's third route: Detach of a NESTED frame unpacked it inside its outer instance, and a Revert of the outer one
+  // respawned the nested row beside the unpacked copy. Unity's Unpack takes only an outermost instance root. Mutation:
+  // drop the owned-root half of `detachRefusal` (`rootId === id && !isOwnedRoot` → `rootId === id`) — MidRoot detaches.
+  it('#1792 route 3: Detach of a nested prefab is refused, naming the outermost root, with no trace', async () => {
+    await withExtra();
+    const mid = under(inst(G1), 'MidRoot');
+    expect(detachRefusal(mid)).toEqual({ rootId: inst(G1), reason: expect.stringMatching(/^Detach the instance root "OuterRoot" instead: "MidRoot" is a prefab nested inside it/) });
+    // A member of the nested frame names the OUTERMOST root too, not the nested one it belongs to.
+    expect(detachRefusal(under(inst(G1), 'Slot'))?.rootId).toBe(inst(G1));
+    expect(detachPrefabMenuItem(mid, false, () => {})).toMatchObject({ disabled: true, title: detachRefusal(mid)!.reason });
+    await noTrace(mid, () => expect(() => detachPrefabInstanceWithUndo(mid, 'Detach', '[t]')).toThrow(/is a prefab nested inside it/));
+  });
+
+  // A member linked to a live entity that is no instance root (a hand-edited file, an agent write to `rootInstanceId`):
+  // no outermost root can be named, so nothing is offered to detach instead — it detaches itself, or its link could be cut
+  // on neither surface (#1764's rule; close-out re-review 2). Mutation: name the member's own root when the chain ends
+  // nowhere (`outermostPrefabRoot(id) || pi.rootInstanceId`) — the refusal points at a row with no Detach.
+  it('a member whose root is no instance is refused nothing: Detach is not pointed at a row it cannot act on', async () => {
+    await withExtra();
+    const plain = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Plain', parentId: 0, guid: DURABLE })).id();
+    const m = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'M', parentId: plain, guid: 'eeeeeeee-0000-4000-8000-0000000018b2' })).id();
+    live(m).add((getTraitByName('PrefabInstance')!.trait as unknown as (v: object) => never)({ source: OUTER, localId: 2, rootInstanceId: plain }));
+    expect(detachRefusal(m)).toBeUndefined();
+  });
+
+  // Accept: an outermost root detaches, and so does a stored root the scene added inside another instance (it is its own
+  // outermost root). Mutation: make `detachRefusal` refuse every root — both go red.
+  it('an outermost instance root detaches, including one the scene added inside another instance', async () => {
+    await withExtra();
+    const panel = under(inst(G1), 'Panel');
+    expect(reparentEntity(inst(G2), panel)).toBe(true);
+    expect(detachRefusal(inst(G2))).toBeUndefined();
+    expect(detachPrefabInstanceWithUndo(inst(G2), 'Detach', '[t]').links.length).toBeGreaterThan(0);
+    expect(detachRefusal(inst(G1))).toBeUndefined();
+    expect(detachPrefabInstanceWithUndo(inst(G1), 'Detach', '[t]').links.length).toBeGreaterThan(0);
+  });
+
+  // Close-out review, finding 1: a template REFERENCE node — a nested prefab the outer prefab added — loads as a STORED
+  // root that carries a key, so a check that stopped at "a root that is not owned" let it move (keeping a stale key in
+  // the other instance, and the save then dropped the row it left, with nothing listed to revert), detach and become a
+  // prefab. It is the outer prefab's, like any node it added. Mutation: in `supplierOf`, answer a stored root before the
+  // key check (`if (root === id) return isOwnedRoot(…) ? … : 0`) — every line goes red.
+  it('a template reference node is refused like any node the prefab added: move, Detach, Create Prefab', async () => {
+    install(outerDoc({ added: [{ parentLocalId: 2, guid: '', key: REF_KEY, name: 'Dropped', prefab: INNER, traits: {}, children: [] }] }));
+    await load(twoInstances(OUTER, 'OuterRoot'));
+    clearHistory();
+    const inside = (root: number) => getAllEntities().filter((e) => e.name === 'InnerRoot' && templateKeyOf(live(e.id)) === REF_KEY).map((e) => e.id)
+      .find((id) => outermostOf(id) === root)!;
+    const outermostOf = (id: number) => { let top = id; for (let c = getAllEntities().find((e) => e.id === id); c; c = getAllEntities().find((e) => e.id === c!.parentId)) top = c.id; return top; };
+    const ref = inside(inst(G1));
+    expect(ref).toBeDefined(); // precondition: G1 holds the keyed reference root
+    await noTrace(ref, () => refusedEverywhere(ref, under(inst(G2), 'Panel')));
+    expect(partOfInstanceRefusal(ref)).toBe(PART_OF_INSTANCE_TEXT);
+    expect(detachRefusal(ref)?.rootId).toBe(inst(G1));
+  });
+
+  // A REORDER of a supplied object is refused on every route that gives it a place: the Hierarchy's sibling drop, a
+  // reparent that names a sortOrder, and a sortOrder field write (the Inspector's input, one entity or a selection).
+  // Mutations: drop the `reorder` half of `restructureRefusal` — every line goes red; drop `reorderWriteRefusal` in the
+  // field-write family — the two field writes land.
+  it('a supplied object is not reordered, by any route', async () => {
+    await withExtra();
+    const root = inst(G1);
+    const panel = under(root, 'Panel');
+    const added = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Added', parentId: root, guid: DURABLE })).id();
+    expect(siblingDropRefusal(panel, root)).toEqual({ kind: 'restructure', reason: RESTRUCTURE_REFUSAL_TEXT });
+    expect(planReparent(panel, root, sortOf(panel) + 5)).toEqual({ kind: 'refused', reason: 'restructure' });
+    await noTrace(panel, () => {
+      expect(reparentEntity(panel, root, sortOf(panel) + 5)).toBe(false);
+      expect(writeTraitFieldWithUndo(panel, getTraitByName('EntityAttributes')!, 'sortOrder', 99)).toBe(RESTRUCTURE_REFUSAL_TEXT);
+      // A selection holding one refuses as a whole: the scene-added node beside it is not written either.
+      expect(writeTraitFieldMultiWithUndo([added, panel], getTraitByName('EntityAttributes')!, 'sortOrder', 99)).toBe(RESTRUCTURE_REFUSAL_TEXT);
+    });
+    expect(sortOf(added)).not.toBe(99);
+    // The same value is no reorder: a no-op write is not refused.
+    expect(restructureRefusal({ id: panel, parentId: root, reorder: false })).toBeNull();
+  });
+
+  // A scene move re-parents too. `sceneMoveRefusal` never saw a keyed node (it reads `PrefabInstance` links), so a keyed
+  // node could be moved into another scene file. Mutation: drop the restructure check in `moveEntityToScene` — ok:true;
+  // in `planSceneDrop` — a move plan.
+  it('a keyed node is not moved into another scene file', async () => {
+    await withExtra();
+    const extra = under(inst(G1), 'Extra');
+    const base = 'b1869000-0000-4000-8000-000000000001';
+    expect(planSceneDrop(extra, base)).toEqual({ kind: 'refused', reason: 'restructure' });
+    await noTrace(extra, () => expect(moveEntityToScene(extra, base)).toMatchObject({ ok: false, reason: 'restructure' }));
+  });
+
+  // The ACCEPT side. A node the scene added moves and reorders anywhere, including between the prefab's own children,
+  // and a stored instance root goes anywhere, into another instance too. Mutation: make `suppliedByPrefab` answer true
+  // for anything under an instance — every line goes red.
+  it('a scene-added node and a stored root move and reorder freely', async () => {
+    await withExtra();
+    const root = inst(G1);
+    const added = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Added', parentId: root, guid: DURABLE })).id();
+    expect(siblingDropRefusal(added, root)).toBeNull();
+    expect(reparentEntity(added, root, 7)).toBe(true);
+    expect(sortOf(added)).toBe(7);
+    expect(reparentEntity(added, under(root, 'Slot'))).toBe(true);
+    expect(reparentEntity(inst(G2), under(root, 'Panel'))).toBe(true);
+    expect(parentOf(inst(G2))).toBe(under(root, 'Panel'));
+  });
+
+  // The Hierarchy's renumber after a tie numbers only what may take a new place: the prefab's own children keep theirs,
+  // and a tie between two of them leaves no room, said in its own words. Mutation: drop `isSuppliedByPrefab` from
+  // `siblingKeepsItsPlace` — Panel is renumbered.
+  it('a renumber leaves the prefab\'s own children where they are', async () => {
+    await withExtra();
+    const root = inst(G1);
+    const added = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Added', parentId: root, guid: DURABLE })).id();
+    expect(siblingKeepsItsPlace(under(root, 'Panel'))).toBe(true);
+    expect(siblingKeepsItsPlace(added)).toBe(false);
+    // The batch form the Hierarchy renumber uses (one world walk for all the siblings). Mutation: have
+    // `siblingsKeepingTheirPlace` pass a checker that answers false — Panel is renumbered.
+    const keeps = siblingsKeepingTheirPlace();
+    expect([keeps(under(root, 'Panel')), keeps(under(root, 'MidRoot')), keeps(added)]).toEqual([true, true, false]);
+    expect(stuckDropText(under(root, 'Panel'))).toMatch(/"Panel" and its neighbour share one place in the prefab's order/);
+  });
+
+  // In prefab edit, the edited prefab's OWN added node under a nested instance is its own work, as Unity's Prefab Mode
+  // has it: it moves. The nested prefab's objects do not. Mutation: treat every keyed node as supplied (drop the
+  // declaring-document walk in `keyDeclared`) — Extra is refused.
+  it('in prefab edit, the edited prefab\'s own added node moves; the nested prefab\'s member does not', async () => {
+    const editRoot = await openInEditor(outerDoc({ added: [keyed('Extra', 2)] }) as unknown as PrefabFile);
+    const extra = getAllEntities().find((e) => e.name === 'Extra')!.id;
+    expect(templateKeyOf(live(extra))).toBe(KEY); // precondition: keyed here too
+    expect(planReparent(extra, editRoot)).toEqual({ kind: 'same-scene' });
+    expect(reparentEntity(extra, editRoot)).toBe(true);
+    const slot = getAllEntities().find((e) => e.name === 'Slot')!.id;
+    expect(planReparent(slot, editRoot)).toEqual({ kind: 'refused', reason: 'restructure' });
   });
 });

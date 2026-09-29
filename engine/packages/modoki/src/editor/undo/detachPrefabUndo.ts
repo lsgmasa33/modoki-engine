@@ -12,31 +12,37 @@ import { entityRef, buildGuidIndex, requireWith, renamesOf, requireDetachedMembe
 import { detachPrefabInstance, reattachDetachedInstance, type DetachSnapshot } from '../scene/prefab';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { isSuppliedByPrefab, outermostPrefabRoot } from '../scene/restructureRefusal';
 import type { ContextMenuItem } from '../components/ContextMenu';
 
-/** Why entity `id` cannot be detached, or undefined when it can. A MEMBER of an instance is refused, naming its root
- *  (#1764): Detach unpacks a whole instance from its root, as Unity's Unpack does (U17 — Unity's
- *  `PrefabUtility.UnpackPrefabInstance` throws on a non-root, and its Hierarchy greys Unpack on one). The Hierarchy's
- *  greyed item shows this text and the agent op refuses with it, so the two say the same thing; before, the Hierarchy
- *  quietly detached the root and the agent unpacked only the member. A nested instance's own root is not a member
- *  here: detaching it stays allowed, as U17 records. `rootId` is the root to name in an alternative. */
+/** Why entity `id` cannot be detached, or undefined when it can. Detach unpacks an instance from its OUTERMOST root, as
+ *  Unity's Unpack does (U17): `PrefabUtility.UnpackPrefabInstance` throws unless `IsOutermostPrefabInstanceRoot`
+ *  (UnityCsReference `PrefabUtility.cs`), and its Hierarchy greys Unpack elsewhere. So anything the prefab supplies is
+ *  refused: a MEMBER (#1764), and since #1792/#1869 a nested root too — an owned one, or a template reference node the
+ *  outer prefab added. Unpacking a prefab nested in an instance restructures that instance, and its Revert then respawned
+ *  the row beside the unpacked copy on one guid. A stored root the scene put there is its own outermost root and
+ *  detaches. The refusal names the outermost root (`rootId`) to act on instead, and the Hierarchy's greyed item shows it
+ *  as hover text while the agent op refuses with it, so the two say the same thing. */
 export function detachRefusal(id: number): { reason: string; rootId: number } | undefined {
   const meta = getTraitByName('PrefabInstance');
-  const pi = meta ? readTraitData(id, meta) : null;
-  const rootId = pi?.rootInstanceId as number | undefined;
-  // 0 is "unset", as everywhere a root is read (a legacy entry loads that way), and a root that is not live cannot be
-  // the thing to detach instead: either way nothing names a whole instance to act on, so this one detaches (close-out
-  // review — refused, a link neither surface could cut).
-  // Live by `findEntity`, not by `getAllEntities`, which drops a parked pooled row (`UIEntry.live:false`) with its subtree:
-  // a member of one read as rootless, so its greyed row came back enabled for a Detach that strips nothing (close-out
-  // re-review). The list only supplies the names.
-  if (!rootId || rootId === id || !findEntity(rootId)) return undefined;
+  const pi = meta ? readTraitData(id, meta) as { rootInstanceId?: number } | null : null;
+  // Only an instance entity is detached at all; one the prefab does not supply (a stored root; a member whose root is not
+  // live, or an owned root nothing owns that hangs under no instance root — each links to nothing a save could write it into) detaches itself.
+  // Live by `findEntity` (inside the predicate), not by `getAllEntities`, which drops a parked pooled row
+  // (`UIEntry.live:false`) with its subtree: a member of one read as rootless, so its greyed row came back enabled for a
+  // Detach that strips nothing (close-out re-review). The list only supplies the names.
+  if (!pi?.rootInstanceId || !isSuppliedByPrefab(id)) return undefined;
+  // No outermost root to name (a member whose root carries no `PrefabInstance`, a supplier chain that loops): nothing is
+  // offered to detach instead, so this one detaches — refused, its link could be cut on neither surface (#1764's rule).
+  const outer = outermostPrefabRoot(id);
+  if (!outer || outer === id) return undefined;
   const names = new Map(getAllEntities().map((e) => [e.id, e.name]));
-  const root = names.get(rootId) ?? String(rootId);
-  const member = names.get(id) ?? String(id);
+  const root = names.get(outer) ?? String(outer);
+  const self = names.get(id) ?? String(id);
+  const what = pi.rootInstanceId === id ? 'a prefab nested inside it' : 'a member of it';
   return {
-    rootId,
-    reason: `Detach the instance root "${root}" instead: "${member}" is a member of it, and Detach unpacks a whole instance from its root, as Unity's Unpack does.`,
+    rootId: outer,
+    reason: `Detach the instance root "${root}" instead: "${self}" is ${what}, and Detach unpacks a whole instance from its outermost root, as Unity's Unpack does.`,
   };
 }
 

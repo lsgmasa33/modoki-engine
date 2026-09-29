@@ -11,7 +11,7 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, type EntityClipboard } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, siblingsKeepingTheirPlace, stuckDropText, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { placePrefabFromPath } from '../scene/prefabPlace';
@@ -24,11 +24,11 @@ import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { withPrefabEditRefusalToast, toastIfPrefabEditReason } from './prefabEditRefusalToast';
 import { prefabEditRefusal } from '../scene/prefabEditRefusal';
+import { restructureRefusal, partOfInstanceRefusal } from '../scene/restructureRefusal';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
 import { planCollidingDrop } from '../undo/reorderSiblingsUndo';
-import { placeholderWriteRefusal, entityNameOf } from '../undo/placeholderGate';
 import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
@@ -373,7 +373,7 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             // goes on to `requestReparent`, which reports it as it always has; a placeholder's reorder is said here.
             const dropRefused = siblingDropRefusal(id, targetParent);
             if (dropRefused?.kind === 'reparent') { onReparent(id, targetParent); return; }
-            if (dropRefused?.kind === 'placeholder') { reportWriteRefusal(dropRefused.reason); return; }
+            if (dropRefused?.kind === 'placeholder' || dropRefused?.kind === 'restructure') { reportWriteRefusal(dropRefused.reason); return; }
             const loSort = zone === 'before' ? prevSiblingSort : entity.sortOrder;
             const hiSort = zone === 'before' ? entity.sortOrder : nextSiblingSort;
             const collides = loSort !== null && hiSort !== null && loSort === hiSort;
@@ -393,16 +393,15 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
                 // undo). Previously a raw writeTraitField loop bypassed undo, so
                 // Cmd+Z left every sibling rewritten (Hierarchy F1). Pushed before
                 // the reparent so undo peels reparent → renumber in order.
-                // A sibling whose save cannot keep a sortOrder (a Missing Prefab placeholder inside an instance, #1818)
-                // keeps its value, and the rest are numbered around it. The whole placement is decided before anything is
-                // written (`planCollidingDrop`), so a drop it refuses leaves no renumber entry behind.
+                // A sibling that keeps its place (`siblingKeepsItsPlace`: a Missing Prefab placeholder inside an instance,
+                // #1818, or an object the prefab supplies, #1869) keeps its value, and the rest are numbered around it. The
+                // whole placement is decided before anything is written (`planCollidingDrop`), so a drop it refuses leaves
+                // no renumber entry behind.
+                const keeps = siblingsKeepingTheirPlace();
                 const plan = planCollidingDrop(siblings.map((s) => ({
-                  id: s.id, sortOrder: s.sortOrder, fixed: !!placeholderWriteRefusal(s.id, 'EntityAttributes', 'sortOrder'),
+                  id: s.id, sortOrder: s.sortOrder, fixed: keeps(s.id),
                 })), entity.id, zone === 'before' ? 'before' : 'after');
-                if ('stuck' in plan) {
-                  reportWriteRefusal(`Can't place it here: "${entityNameOf(plan.stuck) || 'Missing Prefab'}" is a Missing Prefab inside this instance, and its place in the order can't be saved, so there is no room to place anything beside it. Restore the prefab and reload the scene to reorder them.`);
-                  return;
-                }
+                if ('stuck' in plan) { reportWriteRefusal(stuckDropText(plan.stuck)); return; }
                 // The override marks it writes and puts back are `makeSortOrderRenumberAction`'s (#1709).
                 const action = plan.changes.length ? makeSortOrderRenumberAction(plan.changes) : null;
                 if (action) {
@@ -1040,11 +1039,11 @@ export default function Hierarchy() {
    *  another scene makes it a SCENE MOVE into that scene, so it asks first, in the editor's own modal.
    *  A same-scene reparent applies at once, as before. */
   const requestReparent = useCallback(async (entityId: number, newParentId: number, sortOrder?: number): Promise<boolean> => {
-    const plan = planReparent(entityId, newParentId);
+    const plan = planReparent(entityId, newParentId, sortOrder);
     if (plan.kind === 'refused') {
       // Only the scene-move refusals toast. Self, cycle and resource refusals are refused silently,
       // as a same-scene drop always was.
-      if (plan.reason === 'instance-member') useEditorStore.getState().showToast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn');
+      if (plan.reason === 'instance-member' || plan.reason === 'restructure') useEditorStore.getState().showToast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn');
       // A prefab-edit refusal says why too (#1836): moving the root, or an entity out of it, is not a silent no-op.
       else toastIfPrefabEditReason(plan.reason);
       return false;
@@ -1411,6 +1410,9 @@ export default function Hierarchy() {
       // Out to the top level: in prefab edit the root stays put and nothing leaves it (#1836) — say so, not a no-op.
       const editRefusal = prefabEditRefusal({ kind: 'reparent', id: entityId, parentId: 0 });
       if (editRefusal) { useEditorStore.getState().showToast(editRefusal.text, 'warn'); return; }
+      // …and an object a prefab supplies does not leave its instance (#1869).
+      const restructure = restructureRefusal({ id: entityId, parentId: 0 });
+      if (restructure) { useEditorStore.getState().showToast(restructure, 'warn'); return; }
       if (!reparentEntity(entityId, 0)) return; // reparent(→root) never clears the tag
       if (target) writeTraitFieldWithUndo(entityId, eaMeta, 'editorFolder', target);
       return;
@@ -1544,7 +1546,8 @@ export default function Hierarchy() {
       { label: '', separator: true },
       { label: 'Focus', shortcut: 'F', onClick: () => handleFocus(entity) },
       { label: isActive ? 'Deactivate' : 'Activate', onClick: () => handleToggleActive(entity), disabled: dis },
-      { label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: dis },
+      // Greyed on part of a prefab instance, with the refusal as its hover text, as Detach is (#1869, Unity's rule).
+      ...(() => { const part = partOfInstanceRefusal(entity.id); return [{ label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: !!dis || !!part, ...(part ? { title: part } : {}) }]; })(),
       ...(isPrefabInstance ? [detachPrefabMenuItem(entity.id, !!dis, () => handleDetachPrefab(entity))] : []),
       { label: '', separator: true },
       { label: 'Find References', onClick: () => openFindReferences(guid, entity.name), disabled: !guid },
@@ -1588,7 +1591,7 @@ export default function Hierarchy() {
     if (entityId == null) { toast('Not moved: the scene changed while the prompt was open. Drag it again.', 'warn'); return; }
     const res = moveEntityToScene(entityId, targetScene);
     if (!res.ok) {
-      if (res.reason === 'instance-member') toast(SCENE_MOVE_REFUSAL_TEXT[res.reason], 'warn');
+      if (res.reason === 'instance-member' || res.reason === 'restructure') toast(SCENE_MOVE_REFUSAL_TEXT[res.reason], 'warn');
       return;
     }
     if (folderPath !== undefined) {

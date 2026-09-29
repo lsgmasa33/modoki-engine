@@ -7,7 +7,6 @@
  *
  *  Driven through the real loader, capture, save and rebuild. Each case names the mutation that turns it red. */
 
-
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -35,7 +34,6 @@ import {
   setActionCallback, pushAction, clearHistory, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo,
   addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo, duplicateEntity,
 } from '@modoki/engine/editor';
-import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
   setPrefabCache, rebaseStaleInstances, serializePrefab, applyToPrefabSelective, revertOverridesSelective, getCachedPrefabSync, instantiatePrefab, setPrefabSource,
   previewApply, type PrefabFile,
@@ -817,79 +815,6 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     expect(state()).toEqual({ bx: 4, bRotate: false, extra: [9], d: 0 });
   });
 
-  it('a subtree member still LIVE (moved out before the delete) is not seeded again: the layer\'s node under it stays single', async () => {
-    // Close-out review: the seed covered the whole template subtree, and a live member's capture already carries the
-    // layer. Mutation: drop the `live` exclusion in `layerForRestoredMembers` — Extra comes back twice, and the save
-    // writes the copy as the scene's own added node.
-    const d = pDoc();
-    const pD = { ...d, entities: [...d.entities, row(3, 'D', 2, gB)] };
-    install(pD, (() => {
-      const o = oWith({ 3: { Transform: { x: 7 } } });
-      Object.assign(o.entities[3] as Record<string, unknown>, {
-        added: [{ parentLocalId: 3, guid: '', key: 'k1730b', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
-      });
-      return o;
-    })());
-    await load(scene(O, [ROOT1]));
-    const extras = () => getAllEntities().filter((e) => e.name === 'Extra').length;
-    expect(extras()).toBe(1);
-    reparentEntity(inInstance(ROOT1, 'D'), nestedRoot());
-    await revertRemovedA();
-    expect(extras()).toBe(1);
-    expect(x(inInstance(ROOT1, 'D'))).toBe(7);
-    const { scene: s } = await saved();
-    await load(s);
-    expect(extras()).toBe(1);
-  });
-
-  it('a moved-out REFERENCE row (an owned nested root) under the restored member is live too: the layer\'s node under it stays single', async () => {
-    // Second close-out review: an owned nested root is its own `rootInstanceId`, so the live set missed it. Mutation:
-    // drop the owned-root branch of the `live` set in `layerForRestoredMembers` — Extra comes back twice and is saved so.
-    const Q = 'cccccccc-0000-4000-8000-000000001797';
-    const qDoc = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001797')] };
-    const d = pDoc();
-    const pWithNQ = { ...d, entities: [...d.entities, { localId: 3, name: 'NQ', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001798', prefab: Q, traits: { EntityAttributes: { name: 'NQ', parentId: 2, guid: '' } } }] };
-    const o = oWith({});
-    Object.assign(o.entities[3] as Record<string, unknown>, {
-      added: [{ parentLocalId: 3, guid: '', key: 'k1797', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
-    });
-    install(qDoc, pWithNQ, o);
-    await load(scene(O, [ROOT1]));
-    const extras = () => getAllEntities().filter((e) => e.name === 'Extra').length;
-    expect(extras()).toBe(1); // precondition
-    reparentEntity(inInstance(ROOT1, 'QR'), nestedRoot());
-    await revertRemovedA();
-    expect(extras()).toBe(1);
-    const { scene: s } = await saved();
-    await load(s);
-    expect(extras()).toBe(1);
-  });
-
-  it('a descendant removed on its OWN key (moved out, then deleted) stays removed, and so does the layer\'s node under it', async () => {
-    // The seed does reach it (it is in the reverted member's template subtree and not live), and that is harmless only
-    // because the structure pass skips an addition anchored on a member it removes. Mutation: drop that skip in
-    // `applyStructureCore` (`loadSceneFile.ts`, `removedLocals`) — Extra comes back hanging off nothing.
-    const d = pDoc();
-    const pDE = { ...d, entities: [...d.entities, row(3, 'D', 2, gB), row(4, 'E', 3, 'eeeeeeee-0000-4000-8000-000000001799')] };
-    const o = oWith({ 4: { Transform: { x: 4 } } });
-    Object.assign(o.entities[3] as Record<string, unknown>, {
-      added: [{ parentLocalId: 4, guid: '', key: 'k1799', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } }, children: [] }],
-    });
-    install(pDE, o);
-    await load(scene(O, [ROOT1]));
-    const count = (name: string) => getAllEntities().filter((e) => e.name === name).length;
-    expect(count('Extra')).toBe(1); // precondition
-    reparentEntity(inInstance(ROOT1, 'D'), nestedRoot());
-    deleteEntitiesWithUndo([inInstance(ROOT1, 'E')]);
-    deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
-    expect(listed().filter((k) => k.startsWith('-removed.'))).toHaveLength(2); // precondition: E is its own key
-    await revertOverridesSelective(nestedRoot(), new Set([`-removed.${gA}`]));
-    expect([count('A'), count('D'), count('E'), count('Extra')]).toEqual([1, 1, 0, 0]);
-    const { scene: s } = await saved();
-    await load(s);
-    expect([count('A'), count('D'), count('E'), count('Extra')]).toEqual([1, 1, 0, 0]);
-  });
-
   /** #1737: a frame the rebuild spawns with nothing live to capture gets its WHOLE enclosing layer, as a load builds it.
    *  The rebuild expands its root under the state the layers enclosing it FORWARD (`frameForward`), and the nested
    *  capture subtracts that same state, so every frame the expansion brings in gets the layer whether a capture reaches
@@ -1283,17 +1208,6 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
         install(pBX(true));
         await rebaseStaleInstances();
         expect(named('QR')).toHaveLength(1); // the Refresh did bring C in
-        expect(parentName('X')).toBe('B');
-      });
-
-      it('the scene\'s OWN move still beats the enclosing prefab\'s move across a Revert', async () => {
-        const o = oWith({}) as Record<string, unknown>;
-        o.moved = { '2.4.5': '@member:3' }; // O moves N's X under Slot2
-        install(qDoc(), pBX(true), o);
-        await load(scene(O, [ROOT1]));
-        expect(parentName('X')).toBe('Slot2'); // precondition: O's move holds
-        reparentEntity(inInstance(ROOT1, 'X'), inInstance(ROOT1, 'B'));
-        await revertRemovedA();
         expect(parentName('X')).toBe('B');
       });
 

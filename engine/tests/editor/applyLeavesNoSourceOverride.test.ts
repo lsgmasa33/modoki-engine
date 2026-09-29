@@ -26,7 +26,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
-import { setActionCallback, pushAction, writeTraitFieldWithUndo, reparentEntity } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache, applyToPrefabSelective, getCachedPrefabSync, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -165,22 +165,5 @@ describe('Apply leaves no override behind on the instance it applied from (#1469
 
     await saveRetuneReload(retuned(retuned(getCachedPrefabSync(P)!, 'A', 'x', 9), 'A', 'y', 8));
     expect(tf('Root1', 'A')).toMatchObject({ x: 9, y: 3 });
-  });
-
-  it('an applied MOVE does not pin the moved member`s Transform', async () => {
-    install(template());
-    await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
-    reparentEntity(member('Root1', 'B').id, member('Root1', 'A').id);
-    // A pose that differs from B's base, so a pinned Transform would show. (Left at x=0 it equals the base,
-    // and this case stayed green with the fix deleted.)
-    writeTraitFieldWithUndo(member('Root1', 'B').id, getTraitByName('Transform')!, 'x', 4);
-    const result = await applyToPrefabSelective(rootId('Root1'), new Set([`~moved.${gB}`]));
-    expect(result.applied).toBe(true);
-    expect(result.skipped).toBeUndefined();
-
-    expect(tf('Root2', 'B').x).toBe(4);  // the template carries the move's pose now
-    await saveRetuneReload(retuned(getCachedPrefabSync(P)!, 'B', 'x', 9));
-    expect(tf('Root2', 'B').x).toBe(9);  // control
-    expect(tf('Root1', 'B').x).toBe(9);
   });
 });

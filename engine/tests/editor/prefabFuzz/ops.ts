@@ -16,7 +16,8 @@ import {
   type PrefabFile,
 } from '../../../packages/modoki/src/editor/scene/prefab';
 import { placePrefabFromPath } from '../../../packages/modoki/src/editor/scene/prefabPlace';
-import { detachPrefabInstanceWithUndo } from '../../../packages/modoki/src/editor/undo/detachPrefabUndo';
+import { suppliedByPrefabChecker } from '../../../packages/modoki/src/editor/scene/restructureRefusal';
+import { detachPrefabInstanceWithUndo, detachRefusal } from '../../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import {
   duplicateEntity, clipEntity, cutSourceId, pasteEntityCopy, deleteEntitiesWithUndo, writeTraitFieldWithUndo,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, createEntityWithUndo, planReparent, applyReparent,
@@ -35,7 +36,7 @@ import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scen
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
-import { authored, piOf, isInstanceRoot, editing, worldTree, settle, placeholderGuids, unexpandedRows, type Fixture } from './harness';
+import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, type Fixture } from './harness';
 import type { FuzzBackend } from './backend';
 
 export type OpKind =
@@ -182,6 +183,15 @@ async function dropPrefab(path: string, parentId: number): Promise<Outcome> {
   return id ? 'done' : 'refused';
 }
 
+/** The entity draw `u` makes among `all`; when it lands on one `allowed` refuses (a gesture #1869 refuses: moving, cutting
+ *  or saving as a prefab an object a prefab supplies), the draw `u` makes among the allowed ones instead. So a seed whose
+ *  draw was already legal replays exactly as it did before #1869, and only a draw that reached a refused gesture moves. */
+function legalPick<T extends { id: number }>(u: number, all: T[], allowed: (x: T) => boolean): T | undefined {
+  const first = pick(u, all);
+  if (!first || allowed(first)) return first;
+  return pick(u, all.filter(allowed));
+}
+
 /** `Hierarchy.tsx`'s `requestReparent`, with the scene-move modal answered "Move". */
 function requestReparent(entityId: number, newParentId: number): Outcome {
   const plan = planReparent(entityId, newParentId);
@@ -217,7 +227,9 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
   switch (op.kind) {
     case 'createPrefab': {
       if (editing()) return 'noop';
-      const e = pick(u[0], ents);
+      // Part of a prefab instance is not saved as a prefab (#1869, Unity's rule), so the op draws from what may be.
+      const supplied = suppliedByPrefabChecker(); // `partOfInstanceRefusal`'s predicate, built once for the draw
+      const e = legalPick(u[0], ents, (x) => !supplied(x.id));
       if (!e) return 'noop';
       const safe = (e.name || 'Entity').replace(/[^a-zA-Z0-9_-]/g, '_');
       const coveredBefore = subtreeGuids(e.id);
@@ -253,7 +265,11 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     case 'detach': {
       const e = pick(u[0], ents.filter((x) => piOf(x.id)));
       if (!e) return 'noop';
-      const root = piOf(e.id)!.rootInstanceId || e.id;
+      // The Hierarchy greys Detach on anything but an outermost instance root and names that root (`detachRefusal`,
+      // #1764, #1869 — Unity's Unpack): the person detaches the root it names.
+      const refused = detachRefusal(e.id);
+      const root = refused ? refused.rootId : e.id;
+      if (!root) return 'refused';
       for (const g of subtreeGuids(root)) st.touched.detach.add(g);
       detachPrefabInstanceWithUndo(root, 'Detach prefab', '[fuzz]');
       return 'done';
@@ -265,7 +281,9 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     }
     case 'copy':
     case 'cut': {
-      const e = pick(u[0], ents);
+      // A cut is spent by a move, so it draws from what may move, as `reparent` does (#1869); a copy takes anything.
+      const supplied = suppliedByPrefabChecker();
+      const e = op.kind === 'cut' ? legalPick(u[0], ents, (x) => !supplied(x.id)) : pick(u[0], ents);
       if (!e) return 'noop';
       st.clip = clipEntity(e.id, op.kind);
       return st.clip ? 'done' : 'refused';
@@ -324,15 +342,13 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       return editRefusable(() => (createEntityWithUndo(`Create ${name}`, parent, named, noSelect) == null ? 'refused' : 'done'), st);
     }
     case 'reparent': {
-      const e = pick(u[0], ents);
+      // The Hierarchy drag of what may move: a scene-added node, a stored instance root, a plain entity. An object a
+      // prefab supplies is refused by `restructureRefusal` (#1869, Unity's "Cannot restructure Prefab instance"), so the
+      // op does not spend its draw on it (`legalPick`): to the root, or anywhere.
+      const supplied = suppliedByPrefabChecker();
+      const e = legalPick(u[0], ents, (x) => !supplied(x.id));
       if (!e) return 'noop';
-      // Three shapes of the Hierarchy drag: to the root, anywhere, or inside the entity's own instance (a member moved
-      // under another member of its frame — the move Apply writes into the template, #1437). Drawn uniformly, the last
-      // almost never happened (the first 100-seed hunt called /api/prefab-member-paths zero times).
-      const pi = piOf(e.id);
-      const frame = pi && pi.rootInstanceId !== e.id ? pi.rootInstanceId : undefined;
-      const sameFrame = frame ? ents.filter((x) => x.id !== e.id && (x.id === frame || piOf(x.id)?.rootInstanceId === frame)) : [];
-      const parent = u[1] < 0.2 ? 0 : u[1] < 0.55 && sameFrame.length ? pick(u[2], sameFrame)!.id : (pick(u[2], ents)?.id ?? 0);
+      const parent = u[1] < 0.2 ? 0 : (pick(u[2], ents)?.id ?? 0);
       return requestReparent(e.id, parent);
     }
     case 'apply':
@@ -343,18 +359,9 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       await preloadNestedPrefabsForSubtree(root);
       const prefab = getCachedPrefabSync(source);
       if (!prefab) { st.note = `no cached prefab for ${source}`; return 'noop'; }
-      // Directed, on a fifth of the Applies: first move one of the frame's own members under another member of the SAME
-      // frame, then Apply all — the one gesture pair that writes a row move and so runs /api/prefab-member-paths (#1751).
-      // Undirected, 400 hunt seeds never composed it (the route was called zero times). Reported as a generator change.
-      let directed = false;
-      if (op.kind === 'apply' && u[5] < 0.2) {
-        const members = ents.filter((x) => x.id !== root && piOf(x.id)?.rootInstanceId === root);
-        const mover = pick(u[6], members);
-        const parents = mover ? [root, ...members.map((x) => x.id)].filter((id) => id !== mover.id && id !== mover.parentId) : [];
-        const to = pick(u[7], parents);
-        if (mover && to !== undefined && requestReparent(mover.id, to) === 'done') { directed = true; await settle(); }
-      }
-      const sel = selectKeys(root, prefab, op.kind, directed ? 0 : u[1], u[2]);
+      // (Until #1869 a fifth of the Applies first moved a member within its frame, to write a row move. A member no
+      // longer moves, so no gesture authors one.)
+      const sel = selectKeys(root, prefab, op.kind, u[1], u[2]);
       if (sel.size === 0) return 'noop';
       if (op.kind === 'revert') {
         const refusal = await revertRefusal(root);

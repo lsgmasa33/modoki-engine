@@ -30,7 +30,7 @@ import { applyTargetOptions } from '../../packages/modoki/src/editor/scene/prefa
 import { initialTargets, toApplyTargets } from '../../packages/modoki/src/editor/panels/applyDialogModel';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
-import { writeTraitFieldWithUndo, applyReparent, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
@@ -254,29 +254,6 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(qFrameGuids(f).length).toBe(4); // the two P frames' Q rows, untouched
   });
 
-  for (const [what, back] of [['moved under a member and left there', false], ['moved away and back to its template spot', true]] as const) {
-    it(`a kept frame that was ${what} survives the rebuild (its owner link does not get it promoted)`, async () => {
-      // Mutation: drop `relinkDetachedMembers` after the teardown's delete — the moved frame's `ownerGuid` names the root
-      // torn down, `promoteOwnedRoots` promotes it, and `seatKeptFrames` finds no owner and drops it (close-out review, S3/S4).
-      const f = await startRun(be, noNest, `keep-moved-${back}`);
-      const root = p1(f);
-      const { qr } = nestedQ(f, root);
-      const before = qFrameGuids(f);
-      expect(applyReparent(qr, member(root, 'B')).ok).toBe(true);
-      if (back) expect(applyReparent(qr, root).ok).toBe(true);
-      await settle();
-      expect(writeTraitFieldWithUndo(member(root, 'A'), getTraitByName('Transform')!, 'y', 9)).toBeFalsy();
-      await settle();
-      await trashQ(f);
-      const sel = new Set([...collectInstanceOverrideKeys(p1(f), getCachedPrefabSync(f.prefabs.P.guid)!).all].filter((k) => /\.Transform\.y$/.test(k)));
-      expect(await revertOverridesWithUndo(p1(f), sel)).not.toBeNull();
-      await settle();
-      expect(qFrameGuids(f)).toEqual(before);
-      expect([...unexpandedRows()]).toEqual([]);
-      const now = nestedQ(f, p1(f));
-      expect(getAllEntities().find((e) => e.id === now.qr)!.parentId).toBe(back ? p1(f) : member(p1(f), 'B'));
-    });
-  }
 
   it('a kept frame goes when the rebuilt row now names ANOTHER missing prefab, even with both guids pruned', async () => {
     // Mutation: compare `resolveRef` of the two refs unguarded in `seatKeptFrames` — both pruned, `undefined === undefined`

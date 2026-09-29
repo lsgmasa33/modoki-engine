@@ -12,7 +12,6 @@
  *  and asserts the second save writes the control's record. Then the prefab comes back and the reload shows the edits.
  *  Driven through the real loader and the real `serializeScene`. Each case names the mutation that turns it red. */
 
-
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -692,31 +691,6 @@ describe('the template writers refuse a missing reference wherever it sits (#169
 });
 
 describe('the template refusals ask what is promoted or written, not the live tree (#1699 narrow review)', () => {
-  const N = 'dddddddd-0000-4000-8000-000000001604';
-
-  it('Apply promotes an added node while a placeholder under a member moved into it stays behind', async () => {
-    // Mutation: walk the node's LIVE subtree in `planApply` — QINST hangs under A, which was moved into N, so the Apply
-    // of N and the move is refused although promoting N leaves QINST with A.
-    install(pDoc(), qDoc());
-    await load(scene(P, [
-      { id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } },
-      { id: 4, traits: { EntityAttributes: { name: 'N', parentId: 'dddddddd-0000-4000-8000-000000001600', guid: N } } },
-    ]));
-    reparentEntity(rootOf(N), rootOf(INST));
-    reparentEntity(inside(INST, 'A'), rootOf(N));
-    reparentEntity(rootOf(QINST), inside(INST, 'A'));
-    writeTraitFieldWithUndo(inside(QINST, 'QX'), meta('Transform'), 'x', 7);
-    const control = await save();
-    uninstall(Q);
-    await load(control);
-    const keys = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile);
-    const picked = keys.all.filter((k) => k === `+added.${N}` || k.startsWith('~moved.'));
-    expect(picked.length).toBe(2); // precondition: N's key and A's move
-    const res = await applyToPrefabSelective(rootOf(INST), new Set(picked));
-    expect(res.refused).toBeUndefined();
-    expect(res.applied).toBe(true);
-    expect(getAllEntities().find((e) => e.guid === QINST)?.missingPrefab).toBe(true);
-  });
 
   it('the prefab-edit save refuses an added reference node whose prefab is missing', async () => {
     // Mutation: skip node-kind placeholders in `serializePrefabEditWorld` again — the save succeeds and writes QR as a

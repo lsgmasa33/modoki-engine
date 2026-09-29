@@ -17,6 +17,8 @@ import {
 import { clearHistory, markSceneSaved, serializeScene, undo, redo, planReparent } from '@modoki/engine/editor';
 import { getOverrideMarkSet } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { sceneMoveRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
+import { detachRefusal } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { PrefabInstance } from '../../packages/modoki/src/runtime/traits/PrefabInstance';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -61,14 +63,16 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     expect(planReparent(baseParent.id(), 0)).toEqual({ kind: 'same-scene' });
   });
 
-  // Mutation: drop the `instance-member` refusal in planReparent.
+  // A member is refused by the restructure rule first (#1869); the scene-move refusal behind it still answers for a direct
+  // `moveEntityToScene` caller. Mutation: drop either refusal — its line goes red.
   it('a non-root prefab member is refused rather than split across two scene files', () => {
     const root = spawn('InstRoot');
     const member = spawn('Member', { parentId: root.id() });
     (getCurrentWorld().entities.find((e) => e.id() === root.id()) as any).add(PrefabInstance({ source: 'x', localId: 1, rootInstanceId: root.id() }));
     (getCurrentWorld().entities.find((e) => e.id() === member.id()) as any).add(PrefabInstance({ source: 'x', localId: 2, rootInstanceId: root.id() }));
     const baseParent = spawn('BaseParent', { sourceScene: BASE });
-    expect(planReparent(member.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(member.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'restructure' });
+    expect(sceneMoveRefusal(member.id())).toBe('instance-member');
     // The instance ROOT may move: it carries its whole instance with it.
     expect(planReparent(root.id(), baseParent.id())).toMatchObject({ kind: 'scene-move', to: BASE });
   });
@@ -83,11 +87,15 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     link(engine, 1, engine.id(), 1); // expanded from the outer prefab's row: parentLocalId > 0
     link(part, 2, engine.id());
     const baseParent = spawn('BaseParent', { sourceScene: BASE });
-    expect(planReparent(engine.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(engine.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'restructure' });
+    expect(sceneMoveRefusal(engine.id())).toBe('instance-member');
     expect(planReparent(outer.id(), baseParent.id())).toMatchObject({ kind: 'scene-move' });
   });
 
-  // Mutation: check only the moved entity's own link (not its subtree's) in sceneMovePrefabRefusal.
+  // A member under a scene-added node is a `moved` entry only a pre-#1869 file holds; moving the node would carry it away
+  // from its instance, so the restructure rule refuses the node too (#1869's subtree half). Mutation: drop the subtree
+  // loop in restructureRefusal — the reason falls to `instance-member`; drop the subtree check in sceneMovePrefabRefusal —
+  // its line goes red.
   it('a plain entity holding a member of an instance that stays behind is refused', () => {
     const root = spawn('InstRoot');
     const added = spawn('AddedChild', { parentId: root.id() });
@@ -95,7 +103,8 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     link(root, 1, root.id());
     link(member, 2, root.id());
     const baseParent = spawn('BaseParent', { sourceScene: BASE });
-    expect(planReparent(added.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(added.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'restructure' });
+    expect(sceneMoveRefusal(added.id())).toBe('instance-member');
   });
 
   // #1691 (I6): the check runs both ways. A member dragged OUT of the subtree (#1437) is still a row of the instance
@@ -122,7 +131,12 @@ describe('planReparent — the one decision every reparent entry point asks (#14
     const nested = spawn('Nested', { parentId: holder.id() });
     link(nested, 1, nested.id(), 2); // expanded from row 2 of some outer prefab, but nothing here says which frame
     const baseParent = spawn('BaseParent', { sourceScene: BASE });
+    // Nothing owns it, so it links to nothing a save could write it into and the restructure rule refuses it nothing
+    // (#1869 close-out review, finding 3: it used to be frozen, and Detach named an instance that does not exist); the
+    // scene-move fallback still keeps it with its parent. Mutation: make `supplierOf` answer an owned root with no owner
+    // as supplied — the first line answers `restructure`, and Detach is refused.
     expect(planReparent(nested.id(), baseParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(detachRefusal(nested.id())).toBeUndefined();
     expect(planReparent(holder.id(), baseParent.id())).toMatchObject({ kind: 'scene-move' });
   });
 
@@ -203,33 +217,29 @@ describe('apply-scene-ops: a same-scene parentId write is a real reparent (#1434
   }) as Promise<{ errors: string[] }>;
   const tf = (id: number) => getCurrentWorld().entities.find((e) => e.id() === id)!.get(Transform) as { x: number };
 
-  // Mutation: in apply-scene-ops' setTrait branch, write parentId as a plain field again (drop applyReparent).
-  it('a prefab member moved out of its instance is unpacked, and the save keeps it', async () => {
+  // #1869: a member does not leave its instance — the field write is refused like reparent-entity, before anything is
+  // applied (it used to unpack the member). Mutation: drop restructureRefusal in planReparent — the member moves.
+  it('a prefab member moved out of its instance is refused, and stays linked where it was', async () => {
     const root = spawn('InstRoot');
     const member = spawn('Member', { parentId: root.id() });
     link(root, 1, root.id());
     link(member, 2, root.id());
     const shelf = spawn('Shelf');
-    expect((await setParent(member, shelf.id())).errors).toEqual([]);
-    expect(attrs(member.id()).parentId).toBe(shelf.id());
-    expect(getCurrentWorld().entities.find((e) => e.id() === member.id())!.has(PrefabInstance)).toBe(false);
-    expect(await namesIn()).toMatch(/"Member"/);
+    expect((await setParent(member, shelf.id(), { name: 'Renamed' })).errors.join('\n')).toMatch(/Can't restructure a prefab instance/);
+    expect(attrs(member.id())).toMatchObject({ parentId: root.id(), name: 'Member' });
+    expect(getCurrentWorld().entities.find((e) => e.id() === member.id())!.has(PrefabInstance)).toBe(true);
   });
 
   // #1434 review. Mutation: drop the string-guid resolution in apply-scene-ops' setTrait branch (the guid is
   // then written raw into the numeric field, past every check).
   it('a guid-string parentId resolves to its entity and reparents like a numeric one', async () => {
-    const root = spawn('InstRoot');
-    const member = spawn('Member', { parentId: root.id() });
-    link(root, 1, root.id());
-    link(member, 2, root.id());
+    const kid = spawn('Kid');
     const shelf = spawn('Shelf');
     const r = await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'setTrait', entity: { guid: guidOf(member) }, trait: 'EntityAttributes', fields: { parentId: guidOf(shelf) } }],
+      ops: [{ op: 'setTrait', entity: { guid: guidOf(kid) }, trait: 'EntityAttributes', fields: { parentId: guidOf(shelf) } }],
     }) as { errors: string[] };
     expect(r.errors).toEqual([]);
-    expect(attrs(member.id()).parentId).toBe(shelf.id());
-    expect(getCurrentWorld().entities.find((e) => e.id() === member.id())!.has(PrefabInstance)).toBe(false);
+    expect(attrs(kid.id()).parentId).toBe(shelf.id());
   });
 
   // Mutation: drop the no-live-entity refusal for a numeric parentId.
@@ -259,7 +269,7 @@ describe('apply-scene-ops: a same-scene parentId write is a real reparent (#1434
     expect(r.changed).toBe(0);
   });
 
-  // Same mutation.
+  // Mutation: in apply-scene-ops' setTrait branch, write parentId as a plain field again (drop applyReparent).
   it('keeps the world position, clears the folder tag, and writes the other fields in the op', async () => {
     const shelf = spawn('Shelf');
     const kid = spawn('Kid', { editorFolder: 'Props' });

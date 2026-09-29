@@ -6,8 +6,7 @@
  *  OUTER2 holds an INNER row whose `added` has a reference node → MID; MID's own row 3 expands INNER. Driven through
  *  the real prefab-edit scene builder, the real saves and both loaders. Each case names the mutation that turns it red. */
 
-import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
-import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
 
@@ -38,14 +37,11 @@ import {
   rebaseStaleInstances, revertOverridesSelective, rebuildInstance, type PrefabFile,
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { collectInstanceOverrideFields, collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
+import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { rewritePrefabMemberTokens } from '../../packages/modoki/src/runtime/loaders/memberPaths';
-import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { clearKeptMemberOrphans, deriveInstanceMemberGuids, keptMemberOrphans, setKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
-import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -330,19 +326,6 @@ describe('#1538 close-out review', () => {
   /** `doc` as a pre-v5 file: no row carries a `nodeGuid`, so no member row can key its members. */
   const preV5 = (doc: { entities: Array<Record<string, unknown>> }) => ({ ...doc, version: 4, entities: doc.entities.map(({ nodeGuid: _n, ...e }) => e) });
 
-  // A move no member row can carry (a pre-v5 member) rides the scene-form slot's `moved`, which the template form has
-  // no place for. Mutation: in `sameAddedNode`, drop the nested-slot `moved` check from `holdsInstanceIdentity`.
-  it('a scene move inside a pre-v5 frame of the node survives a save', async () => {
-    install(preV5(innerDoc));
-    install(midDoc());
-    install(outer2());
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const scene = await serializeScene();
-    await load(scene as unknown as SceneData);
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-  });
-
   // A legacy key-less node in a whole pre-v5 slot is minted a key by the capture; the slot is then dropped as unchanged,
   // so no file declares that key. Mutation: build `declared` in `finishTemplateReferenceNode` from `rc.*` (the capture).
   it('a ref to a legacy node in a dropped slot is kept as its guid, and resolves', async () => {
@@ -401,21 +384,6 @@ describe('#1538 close-out re-review', () => {
     const saved = serializePrefab(root, OUTER2)!;
     expect(refNodeOf(saved).nestedStructure).toBeUndefined();
     expect(JSON.stringify(refNodeOf(saved).nestedOverrides)).not.toContain(KN);
-  });
-
-  // A move no row can carry, inside a reference node MID authors in a whole pre-v5 slot of the node. Mutation: in
-  // `holdsInstanceIdentity`, drop the recursion into a slot's `added`.
-  it('a scene move inside a reference node in a pre-v5 slot of the node survives a save', async () => {
-    const X = 'aaaaaaaa-0000-4000-8000-000000041538';
-    install(preV5(innerDoc));
-    install({ id: X, version: 4, name: 'X', rootLocalId: 1, entities: [row(1, '', 'XRoot', 0), row(2, '', 'XKid', 1)].map(({ nodeGuid: _n, ...e }) => e) });
-    install(midDoc({ added: [{ parentLocalId: 2, guid: '', key: K1, name: 'XRoot', prefab: X, traits: {}, children: [] }] }));
-    install(outer2());
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    reparentEntity(inMid('XKid')[0]!.id, inMid('Leaf')[0]!.id);
-    const scene = await serializeScene();
-    await load(scene as unknown as SceneData);
-    expect(nameOf(parentOf(inMid('XKid')[0]!.id))).toBe('Leaf');
   });
 });
 
@@ -916,152 +884,7 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
   });
 });
 
-describe('#1543: a move inside a template reference node is saved', () => {
-  /** MID with a second member of its own, so a move of one of the node's DIRECT members has somewhere to go. */
-  const midOther = () => ({ ...midDoc(), entities: [...midDoc().entities, row(4, G(14), 'Other', 1)] });
-  const reopen = async (saved: PrefabFile) => { install(saved); await openInEditor(saved); };
-
-  // The case #1543 was observed with: Leaf, in MID's own INNER row, moved under MID's Slot.
-  // Mutation: in `finishTemplateReferenceNode`, write no `templateMoved`.
-  it('a member of a nested frame moved in the prefab editor reloads where it was moved', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    expect(refNodeOf(saved).templateMoved).toBeTruthy();
-    await reopen(saved);
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-  });
-
-  // A move of one of the node's own members, in MID's frame. Mutation: in `finishTemplateReferenceNode`, write no
-  // `templateMoved`.
-  it('a direct member of the node moved in the prefab editor reloads where it was moved', async () => {
-    install(midOther());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Slot')[0]!.id, inMid('Other')[0]!.id);
-    await reopen(serializePrefab(root, OUTER2)!);
-    expect(nameOf(parentOf(inMid('Slot')[0]!.id))).toBe('Other');
-  });
-
-  // Every expansion of OUTER2 applies the node's move. Mutation: drop the `templateMoved` queue in the runtime
-  // spawner (the scene case goes red), or in the editor's (the editor-instantiate case).
-  it('each spawner applies the node\'s move', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    await eachExpansion(saved, (where) => expect(nameOf(parentOf(inMid('Leaf')[0]!.id)), where).toBe('Slot'));
-  });
-
-  // A scene instance of OUTER2 whose node moves Leaf is where the template puts it: its save states no move.
-  // Mutation: leave the node's moves out of `prefabMoveTargets`' frames.
-  it('an untouched scene instance of OUTER2 states nothing about the node\'s move', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    install(saved);
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot'); // precondition
-    const scene = await serializeScene();
-    const entry = (scene.entities as unknown as Array<Record<string, unknown>>).find((e) => e.prefab === OUTER2)!;
-    expect(JSON.stringify(entry)).not.toContain('"parent"');
-    expect(entry.nestedStructure).toBeUndefined();
-  });
-
-  // A Refresh in the prefab editor respawns the node from the INNER row instance's scene-form capture, whose own moves
-  // are measured against the node's: they ride it, or Leaf went back to InnerRoot and the next save dropped the move.
-  // Mutation: in `captureNestedRef`, leave `templateMoved` out of the scene-form node.
-  it('a Refresh in the prefab editor keeps the node\'s move', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    install(saved);
-    const again = await openInEditor(saved);
-    install({ ...innerDoc, entities: [...innerDoc.entities, row(4, G(98), 'Extra4', 1)] });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try { await rebaseStaleInstances(); } finally { warn.mockRestore(); }
-    expect(inMid('Extra4')).toHaveLength(1); // precondition: the node was rebuilt
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    expect(refNodeOf(serializePrefab(again, OUTER2)!).templateMoved).toEqual(refNodeOf(saved).templateMoved);
-  });
-
-  // A Refresh of a scene instance re-expands the node through the EDITOR's spawner, which records its moves too, so the
-  // next scene save still states nothing about them. Mutation: in the editor's `spawnNestedInstance`, skip
-  // `noteNodeMoves`.
-  it('a scene instance refreshed in the editor states nothing about the node\'s move', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    install(saved);
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    install({ ...saved, entities: [...saved.entities, row(9, G(29), 'Extra', 1)] });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try { await rebaseStaleInstances(); } finally { warn.mockRestore(); }
-    expect(all().filter((e) => e.name === 'Extra')).toHaveLength(1); // precondition: the instance was rebuilt
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    const scene = await serializeScene();
-    const entry = (scene.entities as unknown as Array<Record<string, unknown>>).find((e) => e.prefab === OUTER2)!;
-    expect(JSON.stringify(entry)).not.toContain('"parent"');
-    expect(entry.nestedStructure).toBeUndefined();
-  });
-
-  // An untouched save of a file that moves Leaf writes the same move again, not a second one and not none.
-  // Mutation: base the node's own moves on its record (`templateMoved`) too — nothing reads as moved, and it is dropped.
-  it('an untouched re-save keeps the node\'s move', async () => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    install(saved);
-    const again = await openInEditor(saved);
-    expect(refNodeOf(serializePrefab(again, OUTER2)!).templateMoved).toEqual(refNodeOf(saved).templateMoved);
-  });
-});
-
 describe('#1543/#1567 close-out review', () => {
-  const midOther = () => ({ ...midDoc(), entities: [...midDoc().entities, row(4, G(14), 'Other', 1)] });
-  const quietly = async <T,>(f: () => Promise<T>): Promise<T> => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try { return await f(); } finally { warn.mockRestore(); }
-  };
-  const movedOuter2 = async (): Promise<PrefabFile> => {
-    install(midDoc());
-    const root = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(root, OUTER2)!;
-    install(saved);
-    return saved;
-  };
-
-  // The node's OWN frame rebuilt (its prefab MID changed): `instantiatePrefab` records a fresh frame with no node
-  // moves, and no spawner runs for the root. Mutation: in `rebuildInstance`, skip carrying the root's `nodeMoved`.
-  it('a Refresh of the node\'s own prefab keeps the node\'s move, in the prefab editor', async () => {
-    const saved = await movedOuter2();
-    const again = await openInEditor(saved);
-    install(midOther());
-    await quietly(() => rebaseStaleInstances());
-    expect(inMid('Other')).toHaveLength(1); // precondition: the node was rebuilt
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    expect(refNodeOf(serializePrefab(again, OUTER2)!).templateMoved).toEqual(refNodeOf(saved).templateMoved);
-  });
-
-  // …and in a scene, where losing the record made the next save restate the whole node without the move.
-  // Mutation: in `rebuildInstance`, skip carrying the root's `nodeMoved`.
-  it('a Refresh of the node\'s own prefab keeps the node\'s move, in a scene', async () => {
-    await movedOuter2();
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    install(midOther());
-    await quietly(() => rebaseStaleInstances());
-    expect(inMid('Other')).toHaveLength(1); // precondition
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    const scene = await serializeScene();
-    const entry = (scene.entities as unknown as Array<Record<string, unknown>>).find((e) => e.prefab === OUTER2)!;
-    expect(JSON.stringify(entry)).not.toContain('"parent"');
-    expect(entry.nestedStructure).toBeUndefined();
-  });
 
   // The undo of a Revert rebuilds from the capture taken before it, and the node it brings back was not in that
   // teardown: its key has to travel with the capture. Mutation: in `rebuildInstance`, skip `structure.templateKeys`.
@@ -1185,58 +1008,6 @@ describe('#1568: prefab-edit Refresh R2 gaps', () => {
 });
 
 describe('#1564: an Apply that renumbers member paths re-points every carrier', () => {
-  const quietly = async <T,>(f: () => Promise<T>): Promise<T> => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try { return await f(); } finally { warn.mockRestore(); error.mockRestore(); }
-  };
-  /** OUTER2 with a second row, Other, that Panel can be moved under: Panel's path goes 2 → 3.2. */
-  const withOther = () => ({ ...outer2(), entities: [...outer2().entities, row(3, G(23), 'Other', 1)] }) as unknown as PrefabFile;
-  const byName = (name: string) => all().find((e) => e.name === name)!;
-  /** Save `edit`'s result, load it in a scene, move Panel under Other and apply that move: the OUTER2 it writes. */
-  const applyPanelMove = async (edit: () => void): Promise<PrefabFile> => {
-    install(midDoc());
-    const root = await openInEditor(withOther());
-    edit();
-    install(serializePrefab(root, OUTER2)!);
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    reparentEntity(byName('Panel').id, byName('Other').id);
-    const { moved } = collectInstanceOverrideKeys(byName('OuterRoot').id, prefabs.get(OUTER2) as PrefabFile);
-    expect(moved).toHaveLength(1); // precondition: the one move, Panel's
-    const res = await quietly(() => applyToPrefabSelective(byName('OuterRoot').id, new Set(moved)));
-    expect(res.memberPathsChanged).toBe(true);
-    return JSON.parse(writes.filter((w) => w.content.includes(OUTER2)).pop()!.content) as PrefabFile;
-  };
-
-  // A token inside a template reference node that climbs out of it to the prefab around it. Mutation: in
-  // `rewritePrefabMemberTokens`' `addedIn`, return a reference node as it is.
-  it('a reference node\'s climbing token follows the member it names', async () => {
-    const written = await applyPanelMove(() => writeTraitFieldWithUndo(inMid('Leaf')[0]!.id, getTraitByName('UIFocusable')!, 'navUp', byName('Panel').guid!));
-    expect(refNodeOf(written).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { navUp: '@member:^.^.^.3.2' } } } });
-  });
-
-  // A nested row's member row (prefab v6, #1533) holds tokens like any payload: a node the MID row adds under Leaf in
-  // MID's own INNER frame, keyed `/<MidNested>/<Leaf>` and read in that frame. Mutation: in `framePayload`, skip
-  // `members`.
-  it('a member row\'s token follows the member it names', async () => {
-    const midRow = () => row(6, G(26), 'MidRow', 1, { prefab: MID });
-    const withMidRow = () => ({ ...withOther(), entities: [...withOther().entities, midRow()] }) as unknown as PrefabFile;
-    /** The Leaf in the MID row: not under Panel, which holds the INNER row and its node. */
-    const midRowLeaf = () => all().find((e) => e.name === 'Leaf' && !under(e.id, 'Panel'))!;
-    install(midDoc());
-    const root = await openInEditor(withMidRow());
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Tag', parentId: midRowLeaf().id }), getTraitByName('UIFocusable')!.trait({ navUp: byName('Panel').guid! } as never));
-    const saved = serializePrefab(root, OUTER2)!;
-    const rowOf = (p: PrefabFile) => p.entities.find((e) => e.prefab === MID)!;
-    expect(JSON.stringify(rowOf(saved).members ?? {})).toContain('"navUp":"@member:^.^.2"'); // precondition
-    install(saved);
-    await load(sceneWith(OUTER2, 'OuterRoot'));
-    reparentEntity(byName('Panel').id, byName('Other').id);
-    const { moved } = collectInstanceOverrideKeys(byName('OuterRoot').id, prefabs.get(OUTER2) as PrefabFile);
-    await quietly(() => applyToPrefabSelective(byName('OuterRoot').id, new Set(moved)));
-    const written = JSON.parse(writes.filter((w) => w.content.includes(OUTER2)).pop()!.content) as PrefabFile;
-    expect(JSON.stringify(rowOf(written).members ?? {})).toContain('"navUp":"@member:^.^.3.2"');
-  });
 
   // The repair of the OTHER files: MID renumbers MidNested (2.3 → 3), and OUTER2's node states a move by path in MID's
   // frame. Mutation: in `framePayload`, skip `templateMoved`.
@@ -1262,48 +1033,5 @@ describe('#1564: an Apply that renumbers member paths re-points every carrier', 
     const out = rewritePrefabMemberTokens(outer, OUTER2, read(midDoc()), read(midNew)) as unknown as PrefabFile;
     const rows = out.entities.find((e) => e.prefab === INNER)!.members as Record<string, { own: Array<{ templateMoved: unknown }> }>;
     expect(rows[`/${G(1)}`]!.own[0]!.templateMoved).toEqual({ '3.2': '@member:2' });
-  });
-
-  // The live record of the node's moves: an Apply to MID rebuilds the node's root, whose carry re-queued the stale path.
-  // Mutation: in `applyToPrefabSelective`, skip `rewriteNodeMoves`.
-  it('a reference node\'s move survives an Apply that renumbers its prefab, live and on save', async () => {
-    install(midDoc());
-    const first = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(first, OUTER2)!;
-    expect(refNodeOf(saved).templateMoved).toEqual({ '2.3.2': '@member:2' }); // precondition
-    const root = await openInEditor(saved);
-    reparentEntity(all().find((e) => e.name === 'InnerRoot' && under(e.id, 'MidRoot'))!.id, byName('MidRoot').id);
-    const { moved } = collectInstanceOverrideKeys(byName('MidRoot').id, prefabs.get(MID) as PrefabFile);
-    const res = await quietly(() => applyToPrefabSelective(byName('MidRoot').id, new Set(moved)));
-    expect(res.memberPathsChanged).toBe(true); // precondition: MidNested moved from 2.3 to 3
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    expect(refNodeOf(serializePrefab(root, OUTER2)!).templateMoved).toEqual({ '3.2': '@member:2' });
-  });
-
-  // …and its undo puts the record back: a Persistent or base root is CARRIED across the undo's world swap with its
-  // record whole, then rebased onto the restored MID. Modelled without the swap — the carry copies the record verbatim
-  // (`SceneManager`'s `carriedFrameDocs`) — and with the rebase the swap is followed by. The swap is stubbed out
-  // explicitly: this world has no scene loaded, which the undo now reloads under '' like any untitled one (#1575).
-  // Mutation: in `restoreSnapshot`, skip `rewriteNodeMoves`.
-  it('its undo puts the live move record back on the restored paths', async () => {
-    const swap = vi.spyOn(sceneManager, 'loadScene').mockImplementation(async () => ({ world: (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() }) as never);
-    onTestFinished(() => swap.mockRestore());
-    install(midDoc());
-    const first = await openInEditor(outer2());
-    reparentEntity(inMid('Leaf')[0]!.id, inMid('Slot')[0]!.id);
-    const saved = serializePrefab(first, OUTER2)!;
-    const root = await openInEditor(saved);
-    reparentEntity(all().find((e) => e.name === 'InnerRoot' && under(e.id, 'MidRoot'))!.id, byName('MidRoot').id);
-    const { moved } = collectInstanceOverrideKeys(byName('MidRoot').id, prefabs.get(MID) as PrefabFile);
-    const res = await quietly(() => applyToPrefabWithUndo(byName('MidRoot').id, new Set(moved)));
-    expect(res.memberPathsChanged).toBe(true); // precondition
-    await quietly(() => undo());
-    expect(swap).toHaveBeenCalledOnce(); // precondition: the undo reached the swap this case models away
-    expect(prefabs.get(MID) ?? null).not.toBeNull();
-    await quietly(() => rebaseStaleInstances());
-    expect(nameOf(parentOf(all().find((e) => e.name === 'InnerRoot' && under(e.id, 'MidRoot'))!.id))).toBe('Slot'); // precondition: MID restored
-    expect(nameOf(parentOf(inMid('Leaf')[0]!.id))).toBe('Slot');
-    expect(refNodeOf(serializePrefab(root, OUTER2)!).templateMoved).toEqual({ '2.3.2': '@member:2' });
   });
 });

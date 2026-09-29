@@ -301,19 +301,6 @@ describe('a REBUILD across two versions of the template translates what it carri
     expect(parentName('Extra')).toBe('A');
   });
 
-  it('a MOVE is carried by identity too — the moved member stays where it was put', async () => {
-    install(template());
-    await load(scene(P));
-    reparentEntity(one('A').id, one('B').id);
-    const old = prefabs.get(P) as PrefabFile;
-    const root = one('R').id;
-    const next = renumbered() as unknown as PrefabFile;
-    install(next as never);
-    rebuildInstance(root, P, next, captureInstanceOverrides(root, old), captureInstanceStructure(root, old), old);
-    expect(parentName('A')).toBe('B');
-    expect(parentName('C')).toBe('R');
-  });
-
   it('a member the new template DROPPED takes its edit with it, instead of handing it on', async () => {
     install(template());
     await load(scene(P));
@@ -351,12 +338,11 @@ describe('Apply/Revert keys name a member by identity (#1468 Phase 4)', () => {
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
     removeTraitFromEntitiesWithUndo([one('B').id], meta('Renderable3DPrimitive'));
     deleteEntitiesWithUndo([one('C').id]);
-    reparentEntity(one('B').id, one('A').id);
+    // (A `~moved` key comes only from a file written before #1869; `legacyMovedEntries.test.ts` lists one.)
     const keys = collectInstanceOverrideKeys(one('R').id, prefabs.get(P) as PrefabFile);
     expect(keys.fields).toContain(`${gA}.Transform.x`);
     expect(keys.removedTraits).toEqual([`-trait.${gB}.Renderable3DPrimitive`]);
     expect(keys.removedEntities).toEqual([`-removed.${gC}`]);
-    expect(keys.moved).toEqual([`~moved.${gB}`]);
   });
 
   it('a key listed BEFORE the template renumbered still reverts the member it named', async () => {
@@ -398,26 +384,6 @@ describe('Apply/Revert keys name a member by identity (#1468 Phase 4)', () => {
     expect(canonicalOverrideKey('3.Transform.x', doc)).not.toBe(canonicalOverrideKey(`${gA}.Transform.x`, doc));
     await revertOverridesSelective(one('R').id, new Set(['2.Transform.x']));
     expect(tf('A')?.x).toBe(0);
-  });
-
-  it('a NESTED instance`s member moved out of it is keyed by identity at every depth, and reverts by that key', async () => {
-    install(template(), outer());
-    await load(scene(O));
-    reparentEntity(one('A').id, one('Slot').id);
-    const keys = collectInstanceOverrideKeys(one('OR').id, prefabs.get(O) as PrefabFile);
-    expect(keys.moved).toEqual([`~moved.${gN}:${gA}`]);
-    await revertOverridesSelective(one('OR').id, new Set(keys.moved));
-    expect(parentName('A')).toBe('R');
-  });
-
-  it('Apply reports a key it skips in the CALLER`s spelling, not the internal one it turned it into', async () => {
-    install(template());
-    await load(scene(P));
-    addChild('R', 'Extra');
-    reparentEntity(one('A').id, one('Extra').id);
-    const key = `~moved.${gA}`;
-    const result = await applyToPrefabSelective(one('R').id, new Set([key]));
-    expect(result.skipped?.map((x) => x.key)).toEqual([key]);
   });
 
   it('a key naming a member the template no longer has is REPORTED by Apply, never handed to another', async () => {
@@ -799,7 +765,6 @@ describe('a P instance dropped inside another P instance, through an Apply fan-o
   }
 });
 
-
 describe('a carried instance whose NESTED frame was built from another version of its template (#1493)', () => {
   // The nested capture (a save's `captureNestedChannels`, a rebuild's nested re-apply) reads the CACHED child
   // document, so a nested frame built from other rows must be current before anything captures it. The hot
@@ -881,164 +846,5 @@ describe('a carried instance whose NESTED frame was built from another version o
     expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);
     expect([count('A'), count('B'), count('C')]).toEqual([1, 1, 0]);
     expect([tf('A')?.x, tf('B')?.x]).toEqual([5, 2]);
-  });
-
-  it('a Q frame moved to the scene ROOT (unlinked: a stored root now) and the nested P frame it left are both rebuilt', async () => {
-    // P nests Q; both renumber. Reparenting QR out of the O instance to the Holder unlinks it (it becomes its own
-    // stored root, and the save writes its row as removed), so the P frame no longer owns it: two independent
-    // stale frames, each rebuilt from its own record.
-    const Q = 'cccccccc-0000-4000-8000-000000000b03';
-    const q = (ids: [number, number]) => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
-      row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000000b21'),
-      row(ids[0], 'QX', 1, 'eeeeeeee-0000-4000-8000-000000000b22'), row(ids[1], 'QY', 1, 'eeeeeeee-0000-4000-8000-000000000b23'),
-    ] });
-    const withQ = (ids: [number, number, number]) => {
-      const t = valued(ids);
-      t.entities.push(row(5, 'Qrow', 1, 'eeeeeeee-0000-4000-8000-000000000b24', { prefab: Q }));
-      return t;
-    };
-    install(q([2, 3]), withQ([2, 3, 4]), outer());
-    await load(scene(O));
-    writeTraitFieldWithUndo(one('QX').id, meta('Transform'), 'x', 8);
-    reparentEntity(one('QR').id, one('Holder').id);
-    install(q([3, 2]), withQ([4, 2, 3]));
-    expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([P]);
-    expect(framesBuiltFromOtherRows(one('QR').id)).toEqual([Q]);   // the premise: the moved-out frame is stale too
-    await rebaseStaleInstances();
-    expect([count('QR'), count('QX'), count('QY'), count('A')]).toEqual([1, 1, 1, 1]);
-    expect(parentName('QR')).toBe('Holder');
-    expect([tf('QX')?.x, tf('QY')?.x]).toEqual([8, 0]);
-    expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);
-    expect(framesBuiltFromOtherRows(one('QR').id)).toEqual([]);
-  });
-
-  describe('a frame MOVED within its instance is rebuilt with what it carries (#1499 — #1493 left it stale)', () => {
-    // O = OR → Slot → N(P); P nests Q at row 5. QR is moved under OR and stays OWNED by the P frame (its row
-    // writes `parent: OR`). Rebuilding the P frame alone destroyed the moved Q frame and its edit; rebuilding
-    // QR alone unlinked it from its row (review of d8de97f8f), so #1493 skipped both. #1499 fixed the rebuild
-    // (capture from the teardown's set; carry `ownerGuid`), and the rebase rebuilds them.
-    const Q = 'cccccccc-0000-4000-8000-000000000b03';
-    const q = (ids: [number, number]) => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
-      row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000000b21'),
-      row(ids[0], 'QX', 1, 'eeeeeeee-0000-4000-8000-000000000b22'), row(ids[1], 'QY', 1, 'eeeeeeee-0000-4000-8000-000000000b23'),
-    ] });
-    const withQ = (bumpRoot = false) => {
-      const t = template();
-      t.entities.push(row(5, 'Qrow', 1, 'eeeeeeee-0000-4000-8000-000000000b24', { prefab: Q }));
-      if (bumpRoot) (t.entities[0]!.traits.Transform as { y: number }).y = 1;   // a values-only change
-      return t;
-    };
-    const setUp = async () => {
-      install(q([2, 3]), withQ(), outer());
-      await load(scene(O));
-      writeTraitFieldWithUndo(one('QX').id, meta('Transform'), 'x', 8);
-      reparentEntity(one('QR').id, one('OR').id);
-    };
-    const qLinked = (entry: SceneEntityEntry) => !JSON.stringify(entry).includes('"removed":true');
-
-    it('the P frame that OWNS the moved Q frame: rebuilt, and the Q edit survives it, a save and a reload', async () => {
-      await setUp();
-      install(withQ(true));
-      expect(await rebaseStaleInstances()).toBe(1);
-      expect((tf('R') as { y?: number } | undefined)?.y).toBe(1); // the P frame really was rebuilt
-      expect([tf('QX')?.x, parentName('QR')]).toEqual([8, 'OR']);
-      const entry = await entryOf();
-      await load(scene(O, entry as never));
-      expect([count('QX'), tf('QX')?.x, parentName('QR')]).toEqual([1, 8, 'OR']);
-    });
-
-    it('the moved Q frame itself: rebuilt alone, and the save keeps it linked to its row', async () => {
-      await setUp();
-      install(q([3, 2]));
-      expect(await rebaseStaleInstances()).toBe(1);
-      expect(framesBuiltFromOtherRows(one('OR').id)).toEqual([]);   // current: Apply/Revert no longer refused
-      expect([tf('QX')?.x, parentName('QR')]).toEqual([8, 'OR']);
-      const entry = await entryOf();
-      expect(qLinked(entry)).toBe(true);
-      await load(scene(O, entry as never));
-      expect([count('QX'), tf('QX')?.x, parentName('QR')]).toEqual([1, 8, 'OR']);
-    });
-
-    it('a member moved WITHIN the stale frame`s own subtree does not stop the rebuild — the save stays right', async () => {
-      // Review 2 of this close-out: a guard that skipped ANY moved member left this frame stale, and the save
-      // then wrote C's deletion onto A's row (reload: A gone, C back).
-      install(valued([2, 3, 4]), outer());
-      await load(scene(O));
-      deleteEntitiesWithUndo([one('C').id]);
-      writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
-      reparentEntity(one('B').id, one('A').id);
-      install(valued([4, 2, 3]));
-      expect(await rebaseStaleInstances()).toBe(1);
-      const entry = await entryOf();
-      await load(scene(O, entry as never));
-      expect([count('A'), count('C'), tf('A')?.x, parentName('B')]).toEqual([1, 0, 5, 'A']);
-    });
-
-    for (const [qrTo, qxTo] of [['B', 'A'], ['A', 'A'], ['A', 'B']] as const) {
-      it(`a nested root AND its member both moved within the frame (QR→${qrTo}, QX→${qxTo}): rebuilt once, no stray copy`, async () => {
-        // Review 3 of this close-out: the teardown unparked in ONE pass, before its fixpoint, so a member parked
-        // under another of our members whose frame joined the teardown later survived beside its respawned self —
-        // its link stripped, and the save kept it as a plain node.
-        await setUp();
-        reparentEntity(one('QR').id, one(qrTo).id);
-        reparentEntity(one('QX').id, one(qxTo).id);
-        install(withQ(true));
-        expect(await rebaseStaleInstances()).toBe(1);
-        const state = () => [count('QR'), count('QX'), parentName('QR'), parentName('QX'), tf('QX')?.x, !!readTraitData(one('QX').id, meta('PrefabInstance'))];
-        expect(state()).toEqual([1, 1, qrTo, qxTo, 8, true]);
-        const entry = await entryOf();
-        await load(scene(O, entry as never));
-        expect(state()).toEqual([1, 1, qrTo, qxTo, 8, true]);
-      });
-    }
-
-    // A USER-ADDED Q instance dropped inside O (a stored root) whose member QX is moved out of it, still inside O:
-    // the rebuild of whatever owns QX reaches outside its own subtree. Review 2 of this close-out drove both.
-    const W = 'cccccccc-0000-4000-8000-000000000b04';
-    const ROOTQ = 'dddddddd-0000-4000-8000-000000000b03';
-    const withQ2 = (): SceneData => ({ ...scene(O), entities: [...scene(O).entities,
-      { id: 3, prefab: Q, guid: ROOTQ, traits: { EntityAttributes: { name: 'Root2', parentId: HOLDER } } }] } as unknown as SceneData);
-
-    it('a STORED frame whose member was moved out is not rebuilt — its teardown would recycle a later entry`s id', async () => {
-      // O = OR → Slot → Deep; Q = QR → QX → Prow(P). QR is dropped under Deep, QX moved to OR: QR sorts first,
-      // and its rebuild destroyed QX and the P frame under it. The P entry then rebuilt that id, recycled onto
-      // the new W root, as a P instance — a second A, and W gone.
-      const deepO = { id: O, version: 5, name: 'O', rootLocalId: 1, entities: [row(1, 'OR', 0, gOR), row(2, 'Slot', 1, gSlot), row(3, 'Deep', 2, 'eeeeeeee-0000-4000-8000-000000000b08')] };
-      const qDoc = (ids: [number, number, number], withW = false) => {
-        const rows = [row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000000b21'), row(ids[0], 'QX', 1, 'eeeeeeee-0000-4000-8000-000000000b22'),
-          row(ids[1], 'QY', 1, 'eeeeeeee-0000-4000-8000-000000000b23'), row(ids[2], 'Prow', ids[0], 'eeeeeeee-0000-4000-8000-000000000b24', { prefab: P })];
-        if (withW) rows.splice(3, 0, row(9, 'Wrow', 1, 'eeeeeeee-0000-4000-8000-000000000b26', { prefab: W }));
-        return { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: rows };
-      };
-      const w = { id: W, version: 5, name: 'W', rootLocalId: 1, entities: [row(1, 'WR', 0, 'eeeeeeee-0000-4000-8000-000000000b31'), row(2, 'WX', 1, 'eeeeeeee-0000-4000-8000-000000000b32')] };
-      install(valued([2, 3, 4]), qDoc([2, 3, 4]), deepO, w);
-      await load(withQ2());
-      reparentEntity(one('QR').id, one('Deep').id);
-      writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
-      reparentEntity(one('QX').id, one('OR').id);
-      install(qDoc([3, 2, 4], true), valued([4, 2, 3]));
-      await rebaseStaleInstances();
-      expect([count('QR'), count('QX'), count('R'), count('A'), parentName('QX'), tf('A')?.x]).toEqual([1, 1, 1, 1, 'OR', 5]);
-    });
-
-    it('an OWNED frame holding that node is not rebuilt — its teardown would reach a stale frame under the moved member', async () => {
-      // O = OR → Slot → Deep → N(P); Q = QR → QX → Wrow(W). QR dropped under A (inside the nested P frame), QX
-      // moved to OR. N's rebuild tore down QX with the W frame under it and re-expanded W against the cached,
-      // renumbered rows: WX's edit landed on WY, and the frame then read as current.
-      const deepO = { id: O, version: 5, name: 'O', rootLocalId: 1, entities: [row(1, 'OR', 0, gOR), row(2, 'Slot', 1, gSlot), row(3, 'Deep', 2, 'eeeeeeee-0000-4000-8000-000000000b08'), row(4, 'N', 3, gN, { prefab: P })] };
-      const w = (ids: [number, number]) => ({ id: W, version: 5, name: 'W', rootLocalId: 1, entities: [row(1, 'WR', 0, 'eeeeeeee-0000-4000-8000-000000000b31'), row(ids[0], 'WX', 1, 'eeeeeeee-0000-4000-8000-000000000b32'), row(ids[1], 'WY', 1, 'eeeeeeee-0000-4000-8000-000000000b33')] });
-      const qDoc = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
-        row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000000b21'), row(2, 'QX', 1, 'eeeeeeee-0000-4000-8000-000000000b22'),
-        row(3, 'QY', 1, 'eeeeeeee-0000-4000-8000-000000000b23'), row(4, 'Wrow', 2, 'eeeeeeee-0000-4000-8000-000000000b26', { prefab: W }),
-      ] };
-      install(valued([2, 3, 4]), qDoc, w([2, 3]), deepO);
-      await load(withQ2());
-      reparentEntity(one('QR').id, one('A').id);
-      writeTraitFieldWithUndo(one('WX').id, meta('Transform'), 'x', 8);
-      reparentEntity(one('QX').id, one('OR').id);
-      install(valued([4, 2, 3]), w([3, 2]));
-      await rebaseStaleInstances();
-      expect([count('WX'), count('WY'), tf('WX')?.x, tf('WY')?.x, parentName('QX')]).toEqual([1, 1, 8, 0, 'OR']);
-    });
   });
 });

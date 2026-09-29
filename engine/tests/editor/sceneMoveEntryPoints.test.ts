@@ -101,13 +101,15 @@ describe('moveEntityToScene asks the scene-move refusal itself (#1757)', () => {
     expect([attrs(root).sourceScene, attrs(slot).sourceScene]).toEqual([BASE, BASE]);
   });
 
-  // The Hierarchy's drops ask sceneMoveRefusal before their prompt, and planReparent asks it for a row drop: one
-  // answer for the same subtree. Mutation: make planReparent stop asking sceneMoveRefusal.
+  // The Hierarchy's drops and a row drop give one answer for the same subtree: a member is refused by the restructure
+  // rule on both, before the scene question (#1869). Mutation: drop the restructure check in planSceneDrop — it answers
+  // `instance-member`; drop it in planReparent — the same.
   it('planReparent and the drops agree on the refusal', async () => {
     const { slot } = await instance(true);
     const primaryParent = spawn('Shelf');
     expect(sceneMoveRefusal(slot)).toBe('instance-member');
-    expect(planReparent(slot, primaryParent.id())).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planReparent(slot, primaryParent.id())).toEqual({ kind: 'refused', reason: 'restructure' });
+    expect(planSceneDrop(slot, '')).toEqual({ kind: 'refused', reason: 'restructure' });
   });
 });
 
@@ -117,7 +119,7 @@ describe('a Hierarchy drop that lands at a scene root: planSceneDrop / sceneDrop
   it('a drop on the entity\'s own scene is a no-op, and on another scene the refusal', async () => {
     const { slot } = await instance(true);
     expect(planSceneDrop(slot, BASE)).toEqual({ kind: 'same-scene' });
-    expect(planSceneDrop(slot, '')).toEqual({ kind: 'refused', reason: 'instance-member' });
+    expect(planSceneDrop(slot, '')).toEqual({ kind: 'refused', reason: 'restructure' });
   });
 
   // The world was replaced while the prompt was open: the guid may name another file's entity there. Mutation: drop

@@ -67,22 +67,12 @@ const NODE_LIST_DIFF = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(pa
  *  keeps matching. */
 const RESTORED = String.raw`( \(with the deleted prefab restored\))?`;
 
+// Retired by #1869, whose refusals (a supplied object is not moved, reordered, detached out of its instance or saved as
+// a prefab of its own — Unity's rule) left their only route unreachable, and which a 300-seed hunt with the re-aimed ops
+// and a sweep of legal variants did not re-find: #1792 (every route refused; closed), #1808, #1826, #1829, #1851, and one
+// route each of #1796 (two: Create Prefab on a member), #1809 (Create Prefab on a member, then the directed Apply) and
+// #1820 (Create Prefab's undo, on a member).
 export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 1792,
-    what: 'Revert of a -removed row whose member was dragged out respawns it on the guid the moved entity holds',
-    repro: [
-      { kind: 'reparent', u: [0.794, 0.1, 0.5, 0, 0, 0, 0, 0] },
-      { kind: 'revert', u: [0.214, 0.1, 0.5, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'I7 duplicate guid' && /not rows of one frame/.test(f.detail),
-    // An entity leaves its row but keeps the row's derived guid, and a Revert respawns the row beside it. Three routes, all
-    // OBSERVED (comments on #1792): a drag OUT, a Detach of a nested frame, a Create Prefab on a member. Keyed on the
-    // CONTENT — the two holders are not rows of one frame — so #1777's shape (a pin and a derivation inside one frame),
-    // which a predicate keyed on the op list alone swallowed, is not claimed.
-    stops: (f, ops) => f.check === 'I7 duplicate guid' && /not rows of one frame/.test(f.detail) && f.op.startsWith('revert')
-      && ops.some((o) => o.kind === 'reparent' || o.kind === 'detach' || o.kind === 'createPrefab'),
-  },
   {
     issue: 1796,
     what: 'nested node lists are saved in ECS query order, so a save after a reload reorders them',
@@ -91,22 +81,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     ],
     reproduces: (f) => f.check === 'save→reload→save is not byte-identical',
     tolerate: 'nodeOrder',
-  },
-  {
-    issue: 1796,
-    what: "the same query order reaches Create Prefab's redo, which re-tags by position and is refused after a reload",
-    repro: [
-      { kind: 'duplicate', u: [0.0005, 0.7639, 0.1438, 0.6678, 0.7747, 0.344, 0.5285, 0.0697] },
-      { kind: 'saveReload', u: [0.9055, 0.5241, 0.2558, 0.4764, 0.7382, 0.6179, 0.362, 0.2463] },
-      { kind: 'createPrefab', u: [0.2822, 0.0907, 0.9868, 0.1901, 0.0497, 0.3445, 0.7354, 0.5284] },
-      { kind: 'prefabEdit', u: [0.7606, 0.2686, 0.3478, 0.6593, 0.9336, 0.4852, 0.8874, 0.3418], inner: [] },
-    ],
-    reproduces: (f) => f.check === 'console.error' && /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \(".*" was written at localId \d+, but sits where row \d+ was written\)/.test(f.detail),
-    // The same query order reaches Create Prefab's redo (comment on #1796): it re-tags by position through collectTree,
-    // and after a reload reorders siblings planMatchesFile refuses. Keyed on those two refusal wordings.
-    stops: (f, ops) => f.check === 'console.error' && (f.op === 'undo/redo to the ends' || /^redo\(/.test(f.op))
-      && /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \((".*" was written at localId \d+, but sits where row \d+ was written|row \d+ changed between a nested reference and a plain member)\)/.test(f.detail)
-      && ops.some((o) => o.kind === 'createPrefab'),
   },
   {
     issue: 1796,
@@ -120,31 +94,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => f.check === 'redo to the end does not restore the scene' && /\/added: undefined vs \[/.test(f.detail),
     // Keyed on the refusal the walk logged (the runner hands the walk's console lines to the predicate).
     stops: positionalRetagRedo,
-  },
-  {
-    issue: 1796,
-    what: "the same redo, the other direction of the scene diff (the tree's added node missing)",
-    repro: [
-      { kind: 'duplicate', u: [0.033303552540019155, 0.6072016530670226, 0.17860231618396938, 0.36060059955343604, 0.24519648379646242, 0.01585288904607296, 0.7660753296222538, 0.0734335642773658] },
-      { kind: 'createPrefab', u: [0.20849957410246134, 0.6444018911570311, 0.005679936148226261, 0.3887866751756519, 0.5991325152572244, 0.022242528619244695, 0.49629448540508747, 0.33016981394030154] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && !!f.console?.some((l) => POSITIONAL_RETAG.test(l)),
-    stops: positionalRetagRedo,
-  },
-  {
-    issue: 1809,
-    what: "an Apply that drops a layer-added node's anchor row keeps its old derived guid live; the reload re-derives it",
-    repro: [
-      { kind: 'createPrefab', u: [0.676, 0.9, 0, 0, 0, 0, 0, 0] },
-      { kind: 'apply', u: [0.1875, 0.1, 0, 0.9, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(an entity changed guid\)$/.test(f.detail),
-    // An Apply before the failure, after something that changes the anchor row's path (a Create Prefab Replace, or a
-    // move: two routes). Keyed on the content: an entity whose guid CHANGED across the reload, not one that was lost.
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /\(an entity changed guid\)$/.test(f.detail) && (() => {
-      const c = ops.findIndex((o) => o.kind === 'createPrefab' || o.kind === 'reparent');
-      return c >= 0 && ops.slice(c + 1).some((o) => o.kind === 'apply');
-    })(),
   },
   {
     issue: 1809,
@@ -179,20 +128,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
         const ch = ops.findIndex((o, i) => i > c && ['apply', 'createPrefab', 'prefabEdit', 'outsideEdit'].includes(o.kind));
         return c >= 0 && ch >= 0 && ops.slice(ch + 1).some((o) => o.kind === 'paste') && lastOp(ops) === 'paste' && touchedBy(f, 'paste', subjectGuid(f));
       })(),
-  },
-  {
-    issue: 1820,
-    what: "the same missing rebase, through Create Prefab's undo: it re-links the tree to its old template's stale expansion",
-    repro: [
-      { kind: 'createPrefab', u: [0.9428159724920988, 0.9500395997893065, 0.8217625359538943, 0.2986950015183538, 0.315559288719669, 0.43765105050988495, 0.01984696416184306, 0.9973117003683001] },
-      { kind: 'createPrefab', u: [0.0017358909826725721, 0.3970535541884601, 0.538624168606475, 0.21942522306926548, 0.32584577915258706, 0.5943802592810243, 0.018516797805204988, 0.8010917166247964] },
-      { kind: 'prefabEdit', u: [0.4197337697260082, 0.45629017311148345, 0.9499380351044238, 0.30179717764258385, 0.4023724365979433, 0.017604060005396605, 0.281649986281991, 0.47618820145726204], inner: [{ kind: 'instantiate', u: [0.7530755579937249, 0.7304247959982604, 0.6359159634448588, 0.5732636176981032, 0.24562921142205596, 0.715872710570693, 0.18062788620591164, 0.5258615149650723] }] },
-      { kind: 'undo', u: [0.9111525018233806, 0.4756720804143697, 0.2995174073148519, 0.8736095151398331, 0.7850008409004658, 0.6371805649250746, 0.5273122461512685, 0.5875295428559184] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && new RegExp(String.raw`\(an entity was gained\)${RESTORED}$`).test(f.detail),
-    // No stop: nothing in the failure says the gained entity came from the stale re-link (a review found this key
-    // claimed any gained entity after a Create Prefab, a change and an undo). Its self-test keeps the route honest;
-    // a hunt reports it by its signature.
   },
   {
     issue: 1820,
@@ -231,38 +166,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       })(),
   },
   {
-    issue: 1826,
-    what: "rebuilding a nested frame drops the deep template-row statements of an instance dropped under one of its members",
-    repro: [
-      { kind: 'duplicate', u: [0.764801949961111, 0.5406083094421774, 0.6430164149496704, 0.3840809662360698, 0.6933569198008627, 0.5875219090376049, 0.9633324407041073, 0.22859293804503977] },
-      { kind: 'instantiate', u: [0.38572820043191314, 0.794073564466089, 0.39131955173797905, 0.8752983931917697, 0.47591003542765975, 0.10997878038324416, 0.06098071322776377, 0.4177168821915984] },
-      { kind: 'saveReload', u: [0.4362363861873746, 0.3671279076952487, 0.7622446878813207, 0.11943517229519784, 0.8320129390340298, 0.6271690565627068, 0.5742204568814486, 0.4504863144829869] },
-      { kind: 'instantiate', u: [0.6227461930830032, 0.9314032015390694, 0.6335036314558238, 0.34088405361399055, 0.5395517745055258, 0.16060505318455398, 0.2577482636552304, 0.36398861138150096] },
-      { kind: 'apply', u: [0.47614545724354684, 0.6902347311843187, 0.2799380994401872, 0.6043396857567132, 0.6697595652658492, 0.15446191583760083, 0.8628419709857553, 0.020307525526732206] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/marks\/\d+: "Transform\.z" vs "Transform\.y"$/.test(f.detail),
-    // A drop under a parent, then an Apply (which rebuilds the frames), no Detach (#1794's shape, fixed). A Transform mark only: a
-    // component's is #1800's or #1822's.
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /\/marks\/\d+: ("Transform\.[a-z]+"|undefined) vs "Transform\.[a-z]+"$/.test(f.detail)
-      && !ops.some((o) => o.kind === 'detach')
-      && lastOp(ops) === 'apply' && touchedBy(f, 'drop', subjectGuid(f))
-      && (() => { const n = ops.findIndex((o) => o.kind === 'instantiate' && o.u[1] >= 0.4); return n >= 0 && ops.slice(n + 1).some((o) => o.kind === 'apply'); })(),
-  },
-  {
-    issue: 1829,
-    what: "an Apply that removes a component from a template row leaves a partial override of it marked on the overridden fields only",
-    repro: [
-      { kind: 'editField', u: [0.72, 0, 0.5, 0, 0, 0, 0, 0] },
-      { kind: 'reparent', u: [0.32, 0.1, 0, 0, 0, 0, 0, 0] },
-      { kind: 'apply', u: [0.55, 0.1, 0, 0.9, 0, 0.9, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/marks\/0: "Transform\.[xyz]" vs "Transform\.rx"$/.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /^\/[^/]+\/marks\/0: "Transform\.[xyz]" vs "Transform\.rx"$/.test(f.detail)
-      && lastOp(ops) === 'apply' && !ops.some((o) => o.kind === 'detach') && !ops.some((o) => o.kind === 'instantiate' && o.u[1] >= 0.4)
-      && ops.some((o) => o.kind === 'editField')
-      && (() => { const r = ops.findIndex((o) => o.kind === 'reparent'); return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'apply'); })(),
-  },
-  {
     issue: 1830,
     what: "Create Prefab's redo mints a fresh TemplateAddedKey for a marker-less added node instead of the file's key",
     repro: [
@@ -277,24 +180,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       && (touchedBy(f, 'create', diffSubject(f)) || memberKeys(f).some((k) => touchedBy(f, 'create', k)))
       && !(['drop', 'paste', 'detach'] as const).some((k) => touchedBy(f, k, diffSubject(f)))
       && ops.some((o) => o.kind === 'createPrefab'),
-  },
-  {
-    issue: 1851,
-    what: 'prune on: a {removed:true} statement in an own list under a placeholder frame (after a trash) is lost on save→reload→save',
-    repro: [
-      { kind: 'instantiate', u: [0.890076193260029, 0.07602464105002582, 0.8748778670560569, 0.8994004868436605, 0.27102022571489215, 0.9918312109075487, 0.09686897811479867, 0.650577523978427] },
-      { kind: 'createPrefab', u: [0.10641237534582615, 0.4541084480006248, 0.33052576892077923, 0.07681006751954556, 0.5245194090530276, 0.10923540079966187, 0.011485954280942678, 0.8934976372402161] },
-      { kind: 'delete', u: [0.7875144437421113, 0.012621408328413963, 0.2831360867712647, 0.5367887993343174, 0.2565011365804821, 0.1866220193915069, 0.8291857801377773, 0.1646028971299529] },
-      { kind: 'duplicate', u: [0.25096105434931815, 0.41517852898687124, 0.599444696912542, 0.9083774276077747, 0.7222796024288982, 0.14209487126208842, 0.08802204579114914, 0.17651533195748925] },
-      { kind: 'prefabEdit', u: [0.5254611463751644, 0.2734725868795067, 0.8239260467234999, 0.4681115027051419, 0.08659698511473835, 0.21779864304699004, 0.798325058305636, 0.005162230459973216], inner: [{ kind: 'addChild', u: [0.5445627241861075, 0.6406494460534304, 0.24393830355256796, 0.5524948914535344, 0.21830334048718214, 0.9373807050287724, 0.7852899883873761, 0.02144386968575418] }] },
-      { kind: 'instantiate', u: [0.7125174487009645, 0.5778118125163019, 0.8138011395931244, 0.39210460148751736, 0.4582940158434212, 0.7859341835137457, 0.07254934683442116, 0.7631003758870065] },
-      { kind: 'trashPrefab', u: [0.2291001125704497, 0.06505722552537918, 0.3196396178100258, 0.5072860661894083, 0.9762245726305991, 0.09268465684726834, 0.5966271760407835, 0.6079313140362501] },
-      { kind: 'saveReload', u: [0.6465196667704731, 0.05350407934747636, 0.16035932721570134, 0.13257079641334713, 0.9233581093139946, 0.29431016836315393, 0.9723562414292246, 0.9721436109393835] },
-      { kind: 'reparent', u: [0.12739807600155473, 0.7872736032586545, 0.6443532698322088, 0.5128415427170694, 0.5043930902611464, 0.47902564983814955, 0.5393894750159234, 0.4522446892224252] },
-      { kind: 'createPrefab', u: [0.4085471951402724, 0.8239434850402176, 0.6017588612157851, 0.32962158299051225, 0.3047786010429263, 0.07762112468481064, 0.871194537030533, 0.01045084954239428] },
-    ],
-    reproduces: (f) => f.check === 'save→reload→save is not byte-identical' && /\/own\/.*: undefined vs \{"removed":true\}$/.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload→save is not byte-identical' && /\/own\/.*: undefined vs \{"removed":true\}$/.test(f.detail) && ops.some((o) => o.kind === 'trashPrefab'),
   },
 ];
 
@@ -449,31 +334,6 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
     repro: [
       { kind: 'createPrefab', u: [0.24430793477222323, 0.5578774318564683, 0.44810137269087136, 0.10805997927673161, 0.10153932473622262, 0.8677448665257543, 0.9063538603950292, 0.1537257907912135] },
       { kind: 'prefabEdit', u: [0.21278736181557178, 0.1596795073710382, 0.2053778253030032, 0.339336343575269, 0.7885611937381327, 0.17296946281567216, 0.45481607667170465, 0.247781571932137], inner: [{ kind: 'addComponent', u: [0.2794236254412681, 0.437290902948007, 0.19698106171563268, 0.22118132980540395, 0.048200189135968685, 0.9753480581566691, 0.8320993515662849, 0.2162562918383628] }] },
-    ],
-  },
-  {
-    issue: 1808,
-    what: "a template-added node dragged into another instance of its template drops its key, so the save neither lets it claim that frame's own node nor restates the real one (I7)",
-    repro: [
-      { kind: 'instantiate', u: [0.375, 0.1, 0, 0, 0, 0, 0, 0] },
-      { kind: 'reparent', u: [0.4375, 0.99, 0.8125, 0, 0, 0, 0, 0] },
-    ],
-  },
-  {
-    issue: 1808,
-    what: "the same, into a Duplicate of its instance (win's hunt seed 4906)",
-    repro: [
-      { kind: 'instantiate', u: [0.33546734880656004, 0.3447843382600695, 0.30051140766590834, 0.12782464898191392, 0.9830972701311111, 0.190639344509691, 0.4433795770164579, 0.5476007000543177] },
-      { kind: 'duplicate', u: [0.7372088129632175, 0.14683093107305467, 0.9046876113861799, 0.8760492680594325, 0.4298952512908727, 0.5522012941073626, 0.9785065127070993, 0.5436816818546504] },
-      { kind: 'reparent', u: [0.3311857592780143, 0.27454603649675846, 0.8415862247347832, 0.9143918077461421, 0.8354436776135117, 0.8086224568542093, 0.46160089829936624, 0.7940282034687698] },
-    ],
-  },
-  {
-    issue: 1852,
-    what: "a reparent's undo after a rebuild re-seats the template key the rebuild dropped, so its redo's promotion re-derives the guid the next step names (hunt seed 6079)",
-    repro: [
-      { kind: 'reparent', u: [0.3138674683868885, 0.10535246133804321, 0.6912389222998172, 0.5796298943459988, 0.24617210449650884, 0.7101706576067954, 0.21633561491034925, 0.08806159486994147] },
-      { kind: 'reparent', u: [0.591921912971884, 0.7589867576025426, 0.5511010221671313, 0.7398249786347151, 0.5937459345441312, 0.859238832257688, 0.8048971630632877, 0.5140114538371563] },
     ],
   },
   {
@@ -638,6 +498,8 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
     issue: 1812,
     what: 'the same, where the world swap is the final save→reload (baseline seed 246)',
+    // #1869: this Apply first moved a member within its frame (the fuzzer's retired directed branch), then applied every
+    // key. A member no longer moves, so the repro applies every key (`u[1] = 0`) without the move.
     repro: [
       { kind: 'renamePrefab', u: [0.29216481326147914, 0.1476494751404971, 0.18551874696277082, 0.07410656800493598, 0.41970898350700736, 0.4152033708523959, 0.13034801022149622, 0.09932499984279275] },
       { kind: 'createPrefab', u: [0.5039114304818213, 0.255739972461015, 0.09370358125306666, 0.7442081868648529, 0.380464835325256, 0.46510340296663344, 0.25256184837780893, 0.05835147784091532] },
@@ -650,7 +512,7 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'instantiate', u: [0.29211976029910147, 0.15278238710016012, 0.25975321140140295, 0.7465326695237309, 0.994651313405484, 0.5035853921435773, 0.6328171074856073, 0.6932727838866413] },
       { kind: 'prefabEdit', u: [0.3292363465297967, 0.798240183852613, 0.011706580873578787, 0.7644205500837415, 0.3508245141711086, 0.12864016951061785, 0.8345876485109329, 0.7216439375188202], inner: [] },
       { kind: 'trashPrefab', u: [0.4036154255736619, 0.43466546991840005, 0.38601681031286716, 0.2412711256183684, 0.09834549622610211, 0.639129497576505, 0.9453888835851103, 0.30100506939925253] },
-      { kind: 'apply', u: [0.7839175323024392, 0.7955678380094469, 0.42464192933402956, 0.6151037919335067, 0.8330991917755455, 0.19254334270954132, 0.9538525966927409, 0.8849528867285699] },
+      { kind: 'apply', u: [0.7839175323024392,  0,  0.42464192933402956,  0.6151037919335067,  0.8330991917755455,  0.19254334270954132,  0.9538525966927409,  0.8849528867285699] },
     ],
   },
   {

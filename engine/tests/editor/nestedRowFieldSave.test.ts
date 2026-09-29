@@ -19,7 +19,6 @@
  *  Driven through the real loader, the real capture and the real Apply. Each case names the mutation that turns
  *  it red. */
 
-
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -222,21 +221,6 @@ describe('a scene edit to a field the row also sets is saved (#1498)', () => {
     expect([t.rx, t.ry, t.rz].map((v) => +v.toFixed(6))).toEqual([-Math.PI, 0, -Math.PI + 0.25].map((v) => +v.toFixed(6)));
   });
 
-  it('a MIRRORED member moved out and back keeps its mirror: rotation and scale are one value (close-out review)', async () => {
-    // The move's compensation re-spells `sz: -1` as `sx: -1` turned π about y; the capture keeps only the MARKED
-    // component (`sz: 1`). Mutation: compare rotation and scale per field in `subtractChainOverrides` (make
-    // `chainPoses` false) — the save pins `sz: 1`, and the reload loses the mirror.
-    install(pDoc(), oWith({ 2: { Transform: { sz: -1 } } }));
-    await load(scene(O, [ROOT1]));
-    const a = inInstance(ROOT1, 'A');
-    reparentEntity(a, inInstance(ROOT1, 'Slot2'));
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'R'));
-    const { entry, scene: s } = await saved();
-    expect(rowOf(entry, gA)?.traits).toBeUndefined(); // the same pose as the row's: nothing pinned
-    await load(s);
-    expect(tfOf(inInstance(ROOT1, 'A'))).toMatchObject({ sx: 1, sy: 1, sz: -1 });
-  });
-
   it('a row\'s member TOKEN is compared as the guid it names: an unchanged ref is not restated, a changed one is kept', async () => {
     // Mutation: drop the `baseTokenResolver` step in `captureNestedSceneDelta` — the unchanged ref never equals the
     // token and is pinned as a guid.
@@ -344,24 +328,6 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
     expect(x(inInstance(ROOT1, 'A'))).toBe(3);
     expect(keysOf(nestedRoot())).toEqual([]);
   });
-
-  it('#1490\'s second half: after Apply of a MOVED nested root, the source saves no pose of its own, so a later row edit moves it', async () => {
-    // Apply writes the pose into row N's overrides, so the save's by-VALUE subtraction (#1498) takes it off the
-    // source. Mutation: never subtract an equal value in `subtractChainOverrides` — the pose is pinned in the scene
-    // and the row edit does not move it.
-    install(pDoc(), oDoc());
-    await load(scene(O, [ROOT1]));
-    reparentEntity(nestedRoot(), inInstance(ROOT1, 'Slot2'));
-    setTf(nestedRoot(), 'x', 4);
-    expect((await applyToPrefabSelective(rootOf(ROOT1), new Set([`~moved.${gN}`]))).applied).toBe(true);
-    const { scene: s } = await saved();
-    expect(rowOf(s.entities.find((e) => (e as { prefab?: string }).prefab === O) as never, gR)?.traits).toBeUndefined();
-    const edited = JSON.parse(JSON.stringify(getCachedPrefabSync(O))) as { entities: Array<{ localId: number; overrides?: Record<number, { Transform?: Record<string, number> }> }> };
-    edited.entities.find((e) => e.localId === 4)!.overrides![1]!.Transform!.x = 9;
-    install(edited as never);
-    await load(s);
-    expect(x(nestedRoot())).toBe(9);
-  });
 });
 
 describe('rotation and scale widen to ONE value only for a re-spelled pose (#1498 close-out, second review)', () => {
@@ -415,39 +381,6 @@ describe('rotation and scale widen to ONE value only for a re-spelled pose (#149
     install(oWith({ 2: { Transform: { sx: 1, sy: 1, sz: 1 } } }));
     await load(s);
     expect([+aTf().rz.toFixed(6), aTf().sx]).toEqual([1, 1]);
-  });
-
-
-  it('I: a mirrored member moved out and back AND turned reloads as the pose shown', async () => {
-    // Mutation: never widen (make the re-spelled test `if (false)`) — the marked components over the row reload as
-    // another pose.
-    await loadWith({ sz: -1 });
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'Slot2'));
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'R'));
-    setTf(inInstance(ROOT1, 'A'), 'rz', (aTf().rz ?? 0) + 0.25);
-    const before = aTf();
-    await load((await saved()).scene);
-    expect(sameRotationScale(before as never, aTf() as never)).toBe(true);
-  });
-
-  it('J: a TEMPLATE mirror under a row turn, moved out and back, reloads as shown and still takes a later row turn', async () => {
-    // The live read re-spells the unmarked axes (`rz: -π`, the sign moved to `sx`) while the marked `ry` over the chain
-    // still rebuilds the same matrix. Mutation: decide and write rotation from `livePose` in the per-component branch
-    // (the pre-review-3 code) — the save writes `rz: -π` over the template's `sy: -1`, and it reloads turned 180°.
-    install(pWithA({ sy: -1 }), oWith({ 2: { Transform: { ry: 0.5 } } }));
-    await load(scene(O, [ROOT1]));
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'Slot2'));
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'R'));
-    const before = aTf();
-    const { scene: s } = await saved();
-    await load(s);
-    expect(sameRotationScale(before as never, aTf() as never)).toBe(true);
-    // …and the rebuild: the row turns further on disk, and the rebase brings the turn in with the mirror intact.
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'Slot2'));
-    reparentEntity(inInstance(ROOT1, 'A'), inInstance(ROOT1, 'R'));
-    install(oWith({ 2: { Transform: { ry: 0.8 } } }));
-    expect(await rebaseStaleInstances()).toBe(1);
-    expect(sameRotationScale(aTf() as never, { rx: 0, ry: 0.8, rz: 0, sx: 1, sy: -1, sz: 1 })).toBe(true);
   });
 
   it('sameRotationScale: a re-spelled mirror is equal; a change under a large scale on ANOTHER axis is not', () => {
@@ -868,17 +801,6 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(inner).toBeTruthy(); // precondition: the node's slot removes the inner A's UIAction
       expect(rows((await saved()).entry)[`/${gN}`]?.added).toBeUndefined();
     });
-
-    it('a member the scene MOVED inside the node is kept through a save', async () => {
-      // Mutation: strip `parent` from member rows too in `withoutLiveIdentity` — the move reads as identity, the node
-      // compares equal, and XB reloads under R4.
-      install(pDoc(), p4(), withNode4());
-      await load(scene(O, [ROOT1]));
-      reparentEntity(inInstance(ROOT1, 'XB'), inInstance(ROOT1, 'XA'));
-      await reloadUnder(p4());
-      const byId = new Map(getAllEntities().map((e) => [e.id, e]));
-      expect(byId.get(byId.get(inInstance(ROOT1, 'XB'))!.parentId)!.name).toBe('XA');
-    });
   });
 
   it('the row\'s node keeps its guid through a save and a reload it is no longer restated in', async () => {
@@ -938,34 +860,6 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     const entry = await reloadUnder(twoRow(1, 1));
     expect(rows(entry)[`/${gN}/a+k-extra`]).toEqual({ traits: { Transform: { x: 0 } } });
     expect(x(inInstance(ROOT1, 'Extra'))).toBe(0);
-  });
-
-  it('#1516: re-parenting a template node under a prefab MEMBER unlinks that node only (owner, 2026-09-24)', async () => {
-    // Mutation: match live nodes by key anywhere in the frame (`matchList`: drop `chainKeys.has(k)`) — Extra is lost.
-    install(pDoc(), twoRow(1, 1));
-    await load(scene(O, [ROOT1]));
-    reparentEntity(inInstance(ROOT1, 'Extra'), inInstance(ROOT1, 'A'));
-    const entry = await reloadUnder(twoRow(8, 8));
-    expect(rows(entry)[`/${gN}/a+k-extra`]).toEqual({ removed: true });
-    const byId = new Map(getAllEntities().map((e) => [e.id, e]));
-    const ex = inInstance(ROOT1, 'Extra');
-    expect(byId.get(byId.get(ex)!.parentId)!.name).toBe('A'); // where the scene put it
-    expect(x(ex)).toBe(1); // unlinked: the template's 8 does not reach it
-    expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8); // its sibling still follows the row
-  });
-
-  it('#1516: re-parenting a template node under a SIBLING template node unlinks it the same way', async () => {
-    install(pDoc(), twoRow(1, 1));
-    await load(scene(O, [ROOT1]));
-    reparentEntity(inInstance(ROOT1, 'Extra'), inInstance(ROOT1, 'Extra2'));
-    const entry = await reloadUnder(twoRow(8, 8));
-    expect(rows(entry)[`/${gN}/a+k-extra`]).toEqual({ removed: true });
-    expect((rows(entry)[`/${gN}/a+k-extra2`]?.own as unknown[] | undefined)?.length).toBe(1);
-    const byId = new Map(getAllEntities().map((e) => [e.id, e]));
-    const ex = inInstance(ROOT1, 'Extra');
-    expect(byId.get(byId.get(ex)!.parentId)!.name).toBe('Extra2');
-    expect(x(ex)).toBe(1);
-    expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8);
   });
 
   it('#1516: a node the scene adds LIVE beside the row\'s rides `own`, and the row\'s nodes still follow the template', async () => {

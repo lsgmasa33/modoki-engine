@@ -15,6 +15,7 @@
 import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, callBackend, postBackend, type BackendAnswer } from '../backend/editorBackend';
 import { serializePrefab, preloadNestedPrefabsForSubtree, getCachedPrefabSync, primeEditorPrefabCache, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, type PrefabFile } from '../scene/prefab';
+import { partOfInstanceRefusal } from '../scene/restructureRefusal';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef, isInstanceRootCheck } from '../undo/entityRef';
@@ -613,6 +614,9 @@ export async function createPrefabFromEntity(
   // entity saved as a prefab carries the pose into every future instance.
   const notAuthored = whyWorldNotAuthored();
   if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. ${sentence(notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first')}.` };
+  // Part of a prefab instance is not saved as a prefab of its own (#1869, Unity's rule): asked before anything awaits.
+  const part = partOfInstanceRefusal(entityId);
+  if (part) return { refused: `Create Prefab refused — ${part}` };
   // A reference to a missing prefab holds its edits as a scene record, which a template cannot take (#1699, I8).
   const missing = missingPrefabPlaceholders(entityId)[0];
   if (missing) return { refused: `Create Prefab refused — "${missing.name}" is a reference to a missing prefab, so its edits cannot be written into a template until that prefab resolves. Restore it first, or leave it out of the selection.` };

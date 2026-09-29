@@ -22,7 +22,6 @@ import { endFrames, captureRootLinks, restoreRootLinks, promoteOwnedRoots, apply
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
 import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
-import { templateKeyOf, setTemplateKey, clearTemplateKey } from '../../runtime/core/templateIdentity';
 import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
@@ -37,8 +36,8 @@ import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
+import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
 import { prefabNestingReader } from '../scene/prefab';
-import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -68,12 +67,36 @@ export function assignFreshSortOrder(newId: number, parentId: number): void {
  *  own refusal (self-parent, cycle, prefab edit: `planReparent`), which the caller leaves to `requestReparent` to report
  *  as it always has. `placeholder`: a Missing Prefab placeholder reordered inside its own instance, whose save cannot
  *  keep the order (`reparentEntity` refuses it too). */
-export function siblingDropRefusal(moverId: number, targetParent: number): { kind: 'reparent' } | { kind: 'placeholder'; reason: string } | null {
+export function siblingDropRefusal(moverId: number, targetParent: number): { kind: 'reparent' } | { kind: 'placeholder' | 'restructure'; reason: string } | null {
   if (planReparent(moverId, targetParent).kind === 'refused') return { kind: 'reparent' };
+  // A sibling drop gives the mover a new place, so a prefab-supplied mover is refused even under its own parent (#1869).
+  const restructure = restructureRefusal({ id: moverId, parentId: targetParent, reorder: true });
+  if (restructure) return { kind: 'restructure', reason: restructure };
   const ea = getTraitByName('EntityAttributes');
   const parent = ea ? Number((readTraitData(moverId, ea) as { parentId?: number } | null)?.parentId ?? 0) : 0;
   const reason = parent === targetParent ? placeholderWriteRefusal(moverId, 'EntityAttributes', 'sortOrder') : null;
   return reason ? { kind: 'placeholder', reason } : null;
+}
+
+/** Whether the Hierarchy's renumber after a tie leaves sibling `id`'s `sortOrder` where it is, numbering the rest around
+ *  it (`planCollidingDrop`'s `fixed`): a Missing Prefab placeholder inside an instance, whose save cannot keep one (#1818),
+ *  and an object a prefab supplies, whose place is the prefab's — a renumber would reorder the instance (#1869). */
+export function siblingKeepsItsPlace(id: number, supplied: (id: number) => boolean = isSuppliedByPrefab): boolean {
+  return !!placeholderWriteRefusal(id, 'EntityAttributes', 'sortOrder') || supplied(id);
+}
+
+/** {@link siblingKeepsItsPlace} for one renumber's siblings, asked against one world (`suppliedByPrefabChecker`). */
+export function siblingsKeepingTheirPlace(): (id: number) => boolean {
+  const supplied = suppliedByPrefabChecker();
+  return (id) => siblingKeepsItsPlace(id, supplied);
+}
+
+/** The words for a colliding drop `planCollidingDrop` found no room for, naming the sibling that keeps its place. */
+export function stuckDropText(stuck: number): string {
+  const name = entityNameOf(stuck);
+  return isSuppliedByPrefab(stuck)
+    ? `Can't place it here: "${name}" and its neighbour share one place in the prefab's order, so there is no room between them, and the prefab's own objects are not renumbered. Place it before or after both.`
+    : `Can't place it here: "${name || 'Missing Prefab'}" is a Missing Prefab inside this instance, and its place in the order can't be saved, so there is no room to place anything beside it. Restore the prefab and reload the scene to reorder them.`;
 }
 
 /** Say a write was refused before it changed anything (#1818): the console for the record, and a toast, since the
@@ -97,7 +120,7 @@ export function placeholderGestureRefusal(ids: readonly number[], trait: string)
 /** Write a field with undo tracking. Returns the refusal's words when the placeholder gate refuses it (#1818), else
  *  null. */
 export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field: string, value: unknown): string | null {
-  const refused = placeholderWriteRefusal(entityId, meta.name, field);
+  const refused = placeholderWriteRefusal(entityId, meta.name, field) ?? reorderWriteRefusal([entityId], meta.name, field, value);
   if (refused) return reportWriteRefusal(refused);
   let oldValue: unknown;
   if (meta.category === 'tag') {
@@ -143,7 +166,8 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
   if (entityIds.length === 0) return null;
   // One refusal for the whole selection (#1818): skipping the placeholder would write the rest as one entry the user
   // did not ask for.
-  const refused = placeholderWriteRefusalAny(entityIds, meta.name, field);
+  // …and one for a reorder of an object a prefab supplies (#1869).
+  const refused = placeholderWriteRefusalAny(entityIds, meta.name, field) ?? reorderWriteRefusal(entityIds, meta.name, field, value);
   if (refused) return reportWriteRefusal(refused);
   const oldValues = entityIds.map((id) => {
     if (meta.category === 'tag') {
@@ -197,6 +221,8 @@ export function writeTraitFieldPerEntityWithUndo(
     return { id, ref: entityRef(id), oldValue, newValue: compute(oldValue, id), oldMarks: markStateOf(id, meta.name, [field]) };
   }).filter((e) => !Object.is(e.oldValue, e.newValue));
   if (entries.length === 0) return null;
+  const reordered = entries.map((e) => reorderWriteRefusal([e.id], meta.name, field, e.newValue)).find((r) => r); // #1869
+  if (reordered) return reportWriteRefusal(reordered);
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
   // Resolve by guid each invocation (incl. the immediate apply) so redo survives a rebuild.
   const applyAll = () => {
@@ -1276,6 +1302,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   }
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
   if (!parentChanged && !orderChanged) return false;
+  // A prefab-supplied object neither moves nor takes a new place (#1869). The backstop for a direct caller, as the checks
+  // above are: every entry point asks `planReparent`, which says it.
+  if (restructureRefusal({ id: entityId, parentId: newParentId, reorder: orderChanged })) return false;
 
   // Base-scene persistence guard (Phase 6): refuse a reparent that would put an
   // entity under a parent from a DIFFERENT source scene. The entry points reach a
@@ -1334,13 +1363,11 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // agree. (A plain member records nothing: its template parent is read from the document.)
   // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
   // snapshot after it made the undo restore that mark, pinning the old order as an override.
-  const keys = moveKeys(entityId, attrMeta); // before the parent write: read under the pre-move ancestry
   const oldMarks = captureMarks(entityId);
   if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
   if (clearFolder) writeTraitField(entityId, attrMeta, 'editorFolder', '');
-  keys.strip(); // BEFORE the detach — see `moveKeys`
 
   // Leaving the OUTERMOST instance cuts exactly the links the move splits (#1447): a member carried away from its
   // instance root, or left behind by it, is unpacked into a plain entity that keeps its guid; an OWNED nested
@@ -1443,7 +1470,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       const id = requireWith(ref, idx, undefined, renames);
       const parent = oldParentRef ? requireWith(oldParentRef, idx, undefined, renames) : 0;
       if (detaching) undoDetach(); // re-tag the detached members first, and take back a promotion's rename
-      keys.reseat();
       writeTraitField(id, attrMeta!, 'parentId', parent);
       writeTraitField(id, attrMeta!, 'sortOrder', oldSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', oldFolder);
@@ -1459,7 +1485,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const f of fields) writeTraitField(id, transformMeta, f, savedNewLocal[f]); }
-      keys.restrip(); // before the detach, as the move did
       if (detaching) applyDetach(); // re-strip after the move
       if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
@@ -1472,68 +1497,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   });
 
   return true;
-}
-
-/** A move's template keys (#1808, #1852): every keyed node the moved subtree carries, with its key and the frame that
- *  DECLARES it, read BEFORE the move under its pre-move ancestry. The one owner for a keyed node's marker across a move,
- *  shared by `reparentEntity` and `moveEntityToScene`.
- *  - `strip()`, the move's, right after its parent write and BEFORE a detach: a node the move took out of the frame that
- *    declares its key keeps no key. A stale one answered to that key in any other frame of the same template, so the save
- *    let it claim that frame's own node, dropped the moved node and restated the real one as own (#1808, I6/I7). Before
- *    the detach, because a promotion re-derives a keyed node's guid through its key onto the new root, and the loader's
- *    heal then re-keyed it at the next reload.
- *  - `restrip()`, the redo's: the same nodes, by ref (a rebuild reassigns ids), before its detach as well.
- *  - `reseat()`, the undo's: every key the move saw, back, once the undo has reversed any rename. It restates them rather
- *    than trusting the world to still hold them: a rebuild after the move (a save→reload) drops the marker from a node the
- *    save states plainly, and the undo brings the node back into the frame that keys it (#1852). */
-function moveKeys(entityId: number, attrMeta: TraitMeta) {
-  const piMeta = getTraitByName('PrefabInstance');
-  const keyed = subtreeIds(getAllEntities(), entityId)
-    .map((id) => ({ id, key: templateKeyOf(findEntity(id)) }))
-    .filter((k) => k.key)
-    .map((k) => ({ ...k, ref: entityRef(k.id), declarer: keyDeclarer(k.id, k.key, attrMeta, piMeta) }));
-  let left: typeof keyed = [];
-  const resolved = (list: typeof keyed) => { const at = buildGuidIndex(); return list.map((k) => ({ k, id: resolveWith(k.ref, at) })); };
-  return {
-    strip() {
-      left = keyed.filter((k) => k.declarer !== 0 && !isLiveAncestor(k.declarer, k.id, attrMeta));
-      for (const k of left) clearTemplateKey(findEntity(k.id));
-    },
-    restrip() { if (left.length) for (const { id } of resolved(left)) if (id != null) clearTemplateKey(findEntity(id)); },
-    reseat() { if (keyed.length) for (const { k, id } of resolved(keyed)) if (id != null) setTemplateKey(findEntity(id), k.key); },
-  };
-}
-
-/** The instance root whose OWN template declares `key` for the node `id` (#1808): the nearest live ancestor that is an
- *  instance root (a scene instance or an owned nested one) and whose prefab document names the key — the same key set
- *  the loader's heal recovers from (`templateKeysOf`).
- *  The document is the one the WORLD recorded that frame as expanded from (`frameDocReader`), not the editor cache: a
- *  live keyed node came from a live frame, so its document is known even once the prefab was trashed and evicted from
- *  the caches (#1834); a root with no record of its own (a respawn) falls back to the source's last expansion in this
- *  world, then the caches. 0 when no ancestor's document names the key: nothing is known, so nothing is stripped. */
-function keyDeclarer(id: number, key: string, attrMeta: TraitMeta, piMeta: TraitMeta | undefined): number {
-  if (!piMeta) return 0;
-  const readDoc = frameDocReader(getCurrentWorld());
-  const parentOf = (e: number) => (readTraitData(e, attrMeta)?.parentId as number) || 0;
-  const seen = new Set<number>([id]);
-  for (let cur = parentOf(id); cur && !seen.has(cur); cur = parentOf(cur)) {
-    seen.add(cur);
-    const pi = readTraitData(cur, piMeta) as { source?: string; rootInstanceId?: number } | null;
-    if (!pi?.source || pi.rootInstanceId !== cur) continue;
-    const doc = readDoc(pi.source, cur);
-    if (doc && templateKeysOf(doc as Parameters<typeof templateKeysOf>[0]).includes(key)) return cur;
-  }
-  return 0;
-}
-
-/** Whether `ancestor` is on `id`'s LIVE parent chain (#1808): the frame that declares a keyed node's key still holds it. */
-function isLiveAncestor(ancestor: number, id: number, attrMeta: TraitMeta): boolean {
-  const seen = new Set<number>();
-  for (let cur = id; cur && !seen.has(cur); cur = (readTraitData(cur, attrMeta)?.parentId as number) || 0) {
-    if (cur === ancestor) return true;
-    seen.add(cur);
-  }
-  return false;
 }
 
 // ── Move between scenes (scene-loading.md Phase 14) ──
@@ -1614,7 +1577,7 @@ function rewriteEntityRefsForGuid(oldGuid: string, newGuid: string): RefRewrite[
 
 export interface SceneMoveResult {
   ok: boolean;
-  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | SceneMoveRefusal;
+  reason?: 'no-entity' | 'no-attrs' | 'same-scene' | 'trait-missing' | SceneMoveRefusal | RestructureRefusal;
   /** Live ids of every entity re-stamped (the subtree, root first). */
   movedIds: number[];
   /** True when the root's parentId was cleared (landed at the target scene's
@@ -1666,6 +1629,8 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   // scene-group, scene-folder and empty-area drops called this directly and skipped `planReparent`'s check.
   const refusal = sceneMoveRefusal(entityId);
   if (refusal) return { ...NULL_MOVE_RESULT, reason: refusal };
+  // A scene move re-parents too (a re-root, or under `newParentId`): a prefab-supplied object does not move (#1869).
+  if (restructureRefusal({ id: entityId, parentId: opts?.newParentId ?? 0, move: true })) return { ...NULL_MOVE_RESULT, reason: 'restructure' };
 
   const flat = getAllEntities();
   const byId = new Map(flat.map((e) => [e.id, e]));
@@ -1768,9 +1733,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     restoreMarks(rid, rootMarks);
   };
   const rootMarks = captureMarks(entityId);
-  const keys = moveKeys(entityId, attrMeta); // #1808/#1852, as `reparentEntity`: a scene move re-parents too
   applyStamps();
-  keys.strip(); // after the parent write, before the rekey renames anything
 
   // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
   // dialog yet). `rewriteEntityRefsForGuid` is symmetric under argument order, so
@@ -1817,14 +1780,12 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
       const target = requireMove(oldParentRef, new Map(rekeyPairs.map((p) => [p.oldGuid, p.newGuid])));
       undoRekeys();
       undoStamps(target);
-      keys.reseat();
       markStructureDirty(); markUIDirty();
       if (fromScene) markSceneDirty(fromScene);
       if (targetScene) markSceneDirty(targetScene);
     },
     redo: () => {
       applyStamps();
-      keys.restrip(); // by the refs the move took, before the rekey renames them
       applyRekeys();
       markStructureDirty(); markUIDirty();
       if (fromScene) markSceneDirty(fromScene);
@@ -1874,17 +1835,25 @@ export function demoteEntityToScene(entityId: number, opts?: Omit<SceneMoveOptio
  *  A stored instance root dropped inside a base's instance is NOT refused: it becomes that instance's
  *  user-added nested instance, as it does in a same-scene reparent (#1436). */
 export type ReparentPlan =
-  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason }
+  | { kind: 'refused'; reason: ReparentRefusal | SceneMoveRefusal | PrefabEditRefusalReason | RestructureRefusal }
   | { kind: 'same-scene' }
   | { kind: 'scene-move'; from: string; to: string };
 
-export function planReparent(entityId: number, newParentId: number): ReparentPlan {
+export function planReparent(entityId: number, newParentId: number, newSortOrder?: number): ReparentPlan {
   const refusal = reparentRefusal(entityId, newParentId);
   if (refusal) return { kind: 'refused', reason: refusal };
   // In prefab edit, the root does not move and nothing leaves it (#1836) — before the scene questions: that world is
   // one synthetic scene.
   const editRefusal = prefabEditRefusal({ kind: 'reparent', id: entityId, parentId: newParentId });
   if (editRefusal) return { kind: 'refused', reason: editRefusal.reason };
+  // A prefab-supplied object does not move, within its instance or out of it (#1869) — before the scene questions, so a
+  // member dropped on another scene's row is told the rule, not offered a move the scene-move refusal then turns down.
+  // `newSortOrder`, when the caller gives the mover a place: a new one is a reorder, refused the same way under its own
+  // parent.
+  const ea = getTraitByName('EntityAttributes');
+  const oldSort = ea ? Number((readTraitData(entityId, ea) as { sortOrder?: number } | null)?.sortOrder ?? 0) : 0;
+  const reorder = newSortOrder !== undefined && newSortOrder !== oldSort;
+  if (restructureRefusal({ id: entityId, parentId: newParentId, reorder })) return { kind: 'refused', reason: 'restructure' };
   // Un-parenting keeps the entity's own scene: a root belongs to whichever file stamps it.
   if (newParentId === 0) return { kind: 'same-scene' };
   const from = rawSourceScene(entityId);
@@ -1899,9 +1868,14 @@ export function planReparent(entityId: number, newParentId: number): ReparentPla
 /** Why a scene move refuses. */
 export type SceneMoveRefusal = 'instance-member';
 
+/** A move or reorder of an object a prefab supplies (#1869, `restructureRefusal`). */
+export type RestructureRefusal = 'restructure';
+export { RESTRUCTURE_REFUSAL_TEXT };
+
 /** The editor's words for a refused scene move: the Hierarchy toasts this for every drop that asks. */
-export const SCENE_MOVE_REFUSAL_TEXT: Record<SceneMoveRefusal, string> = {
+export const SCENE_MOVE_REFUSAL_TEXT: Record<SceneMoveRefusal | RestructureRefusal, string> = {
   'instance-member': 'This would split a prefab instance across two scene files: part of it belongs to an instance that stays behind. Move the whole instance, or unpack it first.',
+  restructure: RESTRUCTURE_REFUSAL_TEXT,
 };
 
 /** Why moving `entityId`'s subtree into another scene file is refused, or null when it may move (#1757). The ONE
@@ -1914,13 +1888,14 @@ export const SCENE_MOVE_REFUSAL_TEXT: Record<SceneMoveRefusal, string> = {
  *  AND the world the person dropped it in, for `sceneDropTarget` after the prompt. */
 export type SceneDropPlan =
   | { kind: 'same-scene' }
-  | { kind: 'refused'; reason: SceneMoveRefusal }
+  | { kind: 'refused'; reason: SceneMoveRefusal | RestructureRefusal }
   | { kind: 'move'; entity: EntityRef; world: ReturnType<typeof getCurrentWorld> };
 
 export function planSceneDrop(entityId: number, targetScene: string): SceneDropPlan {
   // Before the refusal: it ignores the target, so a member dropped on its OWN scene's group would be told it splits
   // an instance, for a drop that crosses no file.
   if (rawSourceScene(entityId) === targetScene) return { kind: 'same-scene' };
+  if (restructureRefusal({ id: entityId, parentId: 0, move: true })) return { kind: 'refused', reason: 'restructure' };
   const reason = sceneMoveRefusal(entityId);
   if (reason) return { kind: 'refused', reason };
   return { kind: 'move', entity: entityRef(entityId), world: getCurrentWorld() };
@@ -1975,7 +1950,7 @@ export interface ReparentResult {
  *  prompt belongs to the caller (the Hierarchy's modal, the agent op's `moveToScene` flag), because only
  *  the caller knows how to ask. */
 export function applyReparent(entityId: number, newParentId: number, newSortOrder?: number): ReparentResult {
-  const plan = planReparent(entityId, newParentId);
+  const plan = planReparent(entityId, newParentId, newSortOrder);
   if (plan.kind === 'refused') return { ok: false, plan };
   if (plan.kind === 'same-scene') return { ok: reparentEntity(entityId, newParentId, newSortOrder), plan };
   const name = getAllEntities().find((e) => e.id === entityId)?.name || `Entity ${entityId}`;

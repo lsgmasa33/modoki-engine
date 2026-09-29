@@ -35,8 +35,7 @@ import {
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { writeUIHandleValues, commitUIHandleDrag } from '../../packages/modoki/src/editor/scene/uiHandleCommit';
-import { makeReorderSiblingsAction } from '../../packages/modoki/src/editor/undo/reorderSiblingsUndo';
-import { writeTraitFieldMarked, makeSortOrderRenumberAction } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
+import { makeSortOrderRenumberAction } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { buildTransformUndoAction } from '../../packages/modoki/src/editor/scene/gizmoUndo';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { entityRef } from '../../packages/modoki/src/editor/undo/entityRef';
@@ -175,50 +174,43 @@ describe('the UI resize/move handles on an instance member (#1709)', () => {
 });
 
 describe('sortOrder rewrites on an instance (#1709)', () => {
-  // The hub's case: reorder ONE child, save, then the template reorders an untouched pair — after a reload the pair
-  // follows the template and the moved child keeps its place. The renumber is driven over every sibling, as a
-  // renumber after a tie does, so an untouched sibling is written with the value it already had.
-  // Mutation A: make `writeTraitFieldMarked` a raw write (drop its reconcile) — D reloads at 30.
-  // Mutation B: make `reconcileOverrideMarks` mark unconditionally — B and C are pinned at 10/20 and ignore the swap.
-  it('a reorder keeps the moved child, and an untouched pair still follows a template reorder', async () => {
-    const siblings = ['A', 'B', 'C'].map((n, i) => ({ id: member(n), oldSort: sortOf(n) as number, newSort: i * 10 }));
-    const renumber = makeReorderSiblingsAction(siblings, (id, sort) => writeTraitFieldMarked(id, meta('EntityAttributes'), 'sortOrder', sort));
-    renumber.redo(); pushAction(renumber);
-    reparentEntity(member('D'), rootId(), 5); // between A and B
+  // A member is not reordered any more (#1869: the prefab supplies its place), so the reorder these pin is the instance
+  // ROOT's, among the scene's own entities: its sortOrder is an override on the root row (I21), and the template's root
+  // row is its base. `rootSort` reads it; `rootRow` patches the template's.
+  const rootSort = () => field(rootId(), 'EntityAttributes', 'sortOrder');
+  const rootRow = (sortOrder: number) => (d: ReturnType<typeof baseDoc>) => { (d.entities[0]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = sortOrder; };
+
+  // Mutation A: make `writeTraitFieldMarked` a raw write (drop its reconcile) — the root reloads at the template's 20.
+  it('a reordered instance root keeps its place over a later template change', async () => {
+    reparentEntity(rootId(), 0, 5);
     const s = await saved();
-    install(pDoc((d) => {
-      (d.entities[2]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 20;
-      (d.entities[3]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 10;
-    }));
+    install(pDoc(rootRow(20)));
     await load(s);
-    expect(['A', 'B', 'C', 'D'].map(sortOf)).toEqual([0, 20, 10, 5]);
+    expect(rootSort()).toBe(5);
   });
 
-  // Mutation: drop the `unmarkOverride` branch of reconcileOverrideMarks — D, renumbered back onto its base 30, stays
-  // marked and ignores the template's later 40.
-  it('a renumber that puts a child back on its base unmarks it', async () => {
-    reparentEntity(member('D'), rootId(), 35);
-    const siblings = ['A', 'B', 'C', 'D'].map((n, i) => ({ id: member(n), oldSort: sortOf(n) as number, newSort: i * 10 }));
-    const renumber = makeReorderSiblingsAction(siblings.filter((c) => c.oldSort !== c.newSort), (id, sort) => writeTraitFieldMarked(id, meta('EntityAttributes'), 'sortOrder', sort));
-    renumber.redo(); pushAction(renumber);
-    expect(sortOf('D')).toBe(30);
+  // Mutation: drop the `unmarkOverride` branch of reconcileOverrideMarks — the root, reordered back onto its base 0,
+  // stays marked and ignores the template's later 40.
+  it('a reorder that puts the root back on its base unmarks it', async () => {
+    reparentEntity(rootId(), 0, 7);
+    reparentEntity(rootId(), 0, 0);
     const s = await saved();
-    install(pDoc((d) => { (d.entities[4]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 40; }));
+    install(pDoc(rootRow(40)));
     await load(s);
-    expect(sortOf('D')).toBe(40);
+    expect(rootSort()).toBe(40);
   });
 
   // #1709 close-out review: reparentEntity took its undo's mark snapshot AFTER its own marked sortOrder write, so the
   // undo put the new mark back and the old order was saved pinned. Mutation: move `const oldMarks = captureMarks(entityId)`
-  // in reparentEntity back below the writes — D stays marked at 30 and ignores the template's 40.
+  // in reparentEntity back below the writes — the root stays marked at 0 and ignores the template's 40.
   it('an undone reorder is not saved as an override', async () => {
-    reparentEntity(member('D'), rootId(), 5);
+    reparentEntity(rootId(), 0, 5);
     await undo();
-    expect(sortOf('D')).toBe(30);
+    expect(rootSort()).toBe(0);
     const s = await saved();
-    install(pDoc((d) => { (d.entities[4]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 40; }));
+    install(pDoc(rootRow(40)));
     await load(s);
-    expect(sortOf('D')).toBe(40);
+    expect(rootSort()).toBe(40);
   });
 
   // The renumber's undo puts back the marks it found, snapshotted before it ran (`makeSortOrderRenumberAction`, the
@@ -247,20 +239,20 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
   });
 
   // A reparent that sets no sortOrder must not touch the mark on redo either (close-out re-review: the redo wrote the
-  // unchanged value through the marking writer, re-reconciling B's stored override away).
+  // unchanged value through the marking writer, re-reconciling a stored override away). The root, moved under Other.
   // Mutation: make the redo call `writeTraitFieldMarked(..., 'sortOrder', ...)` unconditionally with the old value.
   it('an undone + redone reparent with no sortOrder keeps a stored override', async () => {
-    writeTraitFieldWithUndo(member('B'), meta('EntityAttributes'), 'sortOrder', 10);
+    writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 0); // marked, equal to the base
     await load(await saved());
     clearHistory();
-    reparentEntity(member('B'), member('C'));
+    const other = getAllEntities().find((e) => e.guid === OTHER)!.id;
+    expect(reparentEntity(rootId(), other)).toBe(true);
     await undo();
     await redo();
     const s = await saved();
-    install(pDoc((d) => { (d.entities[2]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 15; }));
+    install(pDoc(rootRow(15)));
     await load(s);
-    const b = getAllEntities().find((e) => e.name === 'B')!;
-    expect(b.sortOrder).toBe(10);
+    expect(rootSort()).toBe(0);
   });
 
   // Mutation: make `assignFreshSortOrder` write raw (`writeTraitField`) — the copy's root reloads at the template's 0.

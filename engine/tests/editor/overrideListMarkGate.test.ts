@@ -12,7 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import { getCurrentWorld, markOverride, findEntityById, getTraitByName } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { instantiatePrefab, captureInstanceOverrides, reparentEntity, type PrefabFile } from '@modoki/engine/editor';
+import { instantiatePrefab, captureInstanceOverrides, type PrefabFile } from '@modoki/engine/editor';
 import { collectInstanceOverrideTree } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { memberOverrideKeys, collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefab';
 
@@ -105,19 +105,5 @@ describe('the override list and the Inspector highlight show exactly what the sa
     const s = surfaces(root, prefab, 2);
     expect([...s.saved].some((k) => k.startsWith('Rotate3D.'))).toBe(true);
     expect([...s.listed].some((k) => k.startsWith('Rotate3D.'))).toBe(true);
-  });
-
-  // The save's second exemption (#1437). Mutation: drop the `moved` Transform exemption from `gateOnMarks` — the moved
-  // member's compensated pose, which carries no mark, is dropped from the list and from the save alike.
-  it("a member moved inside its instance lists its Transform with no mark: the pose is part of the move", () => {
-    const prefab = makePrefab();
-    const root = instantiatePrefab(prefab);
-    expect(reparentEntity(memberOf(root, 2), memberOf(root, 3))).toBe(true);
-    // The pose relative to its new parent, unmarked, as the move's compensation leaves it (`markCompensatedTransform`).
-    // A hand-built world has no world transforms to compensate against, so it is written here.
-    setField(memberOf(root, 2), 'Transform', 'y', -2);
-    const s = surfaces(root, prefab, 2);
-    expect([...s.saved].some((k) => k.startsWith('Transform.'))).toBe(true);
-    expect([...s.listed].filter((k) => k.startsWith('Transform.')).sort()).toEqual([...s.saved].filter((k) => k.startsWith('Transform.')).sort());
   });
 });

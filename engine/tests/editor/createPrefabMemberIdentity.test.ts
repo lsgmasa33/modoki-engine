@@ -29,7 +29,7 @@ import {
 import { setActionCallback, pushAction, clearHistory, serializeScene, reparentEntity, createEntityWithUndo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache, serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { memberPathIndex, keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -149,7 +149,6 @@ function createPrefabFrom(rootPath: string, target: string = PREFAB): PrefabFile
 
 type Entry = { prefab?: string; guid?: string; members?: Record<string, { name?: string; parent?: string }> };
 const saved = async () => await serializeScene() as unknown as { entities: Entry[] };
-const instanceEntry = (doc: { entities: Entry[] }) => doc.entities.find((e) => e.prefab === PREFAB)!;
 
 beforeEach(() => {
   setRunMode('stopped');
@@ -161,61 +160,6 @@ beforeEach(() => {
 afterAll(() => { setPrefabCache(INNER, null); setPrefabCache(LEAFP, null); setPrefabCache(PREFAB, null); setPrefabCache(PREFAB2, null); getCurrentWorld()?.destroy(); });
 
 describe('a member moved inside an instance made by Create Prefab in the same session (#1461)', () => {
-  /** The issue body's repro, step for step. Mutation: drop the stamp from tagEntityTreeAsInstance. */
-  it('the move survives the reload', async () => {
-    await load(baseScene());
-    const file = createPrefabFrom('Holder/Root');
-    reparentEntity(idAt('Holder/Root/Panel/Button'), idAt('Holder/Root/Label'));
-
-    const doc = await saved();
-    await load(doc as unknown as SceneData);
-
-    expect([...treePaths().values()]).toContain('Holder/Root/Label/Button');
-    // …and the value that was written names the parent the reload actually has. Stored on Button's
-    // own member ROW since #1468 Phase 3, keyed by the template row's minted identity — the
-    // localId-keyed `moved` map this used to read is gone from the format.
-    const key = `/${file.entities.find((e) => e.name === 'Button')!.nodeGuid}`;
-    expect(instanceEntry(doc).members?.[key]?.parent).toBe(guidAt('Holder/Root/Label'));
-  });
-
-  /** Close-out review F1. Re-tagging a member that had been MOVED under the PREVIOUS prefab must derive it
-   *  from its row in the NEW one. It was a stale `homeParent` then (koota's setter is a partial merge, and
-   *  `applyTag` did not name the field); since #1468 Phase 6 the row is read from the document, so what can
-   *  go stale is WHICH document — the frame root's record still names the previous prefab's. A stale answer
-   *  derives the member from a path the reload does not walk, and the stamp repoints refs to the wrong value.
-   *  Mutations: drop the tag's `noteFrameDoc`; drop the source check on a root's own record (`frameDocReader`). */
-  it('a member that was MOVED is re-stamped from its row, not from a stale home', async () => {
-    await load(baseScene());
-    createPrefabFrom('Holder/Root');
-    reparentEntity(idAt('Holder/Root/Panel/Button'), idAt('Holder/Root/Label'));
-    await load(await saved() as unknown as SceneData);
-    expect([...treePaths().values()]).toContain('Holder/Root/Label/Button'); // #1461 proper, still good
-
-    // Create Prefab AGAIN over the same tree: every member is retagged, the moved one included.
-    createPrefabFrom('Holder/Root', PREFAB2);
-    const button = guidAt('Holder/Root/Label/Button');
-
-    await load(await saved() as unknown as SceneData);
-
-    expect(pathOf(button)).toBe('Holder/Root/Label/Button');
-  });
-
-  /** #1468 Phase 6: a member's row parent is READ from the document its frame was expanded from, and a tagged
-   *  tree was expanded from nothing — so the tag records the document it just wrote at the root, and the editor's
-   *  prefab cache stands behind it. A member moved before any reload must still be named by its ROW path, which
-   *  is where every template token and the reload's derive reach it. Right after the tag nothing has moved, so
-   *  a walk with no document at all agrees — which is why only a move in that window can tell.
-   *  Mutation: drop BOTH the tag's `noteFrameDoc` and `setFrameDocFallback` (either alone is covered by the other). */
-  it('a member moved right after Create Prefab is still named by its row path', async () => {
-    await load(baseScene());
-    const file = createPrefabFrom('Holder/Root');
-    const lid = (name: string) => file.entities.find((e) => e.name === name)!.localId;
-    const button = idAt('Holder/Root/Panel/Button');
-    reparentEntity(button, idAt('Holder/Root/Label'));
-    const index = memberPathIndex(getCurrentWorld(), idAt('Holder/Root'));
-    expect(index.get(`${lid('Panel')}.${lid('Button')}`)?.id()).toBe(button);
-    expect(index.has(`${lid('Label')}.${lid('Button')}`)).toBe(false);
-  });
 
   /** The invariant behind every symptom: after Create Prefab the live members already hold the identity
    *  the reload will give them. Asserted as "the round trip does not move them", so it covers consumers

@@ -75,38 +75,59 @@ describe('set-traits parentId in the editor goes through planReparent (#1787)', 
     expect(canUndo()).toBe(false);
   });
 
-  // A base instance's member under a primary parent would split the instance across two files. Same mutation.
-  it('a member moved into another scene is refused as instance-member, still linked where it was', async () => {
+  // A base instance's member under a primary parent: a prefab-supplied object does not move (#1869). Same mutation.
+  it('a member moved into another scene is refused, still linked where it was', async () => {
     const { root, slot } = await instance(true);
     const shelf = spawn('Shelf');
     const r = await setParent(attrs(slot).guid, shelf);
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/^set-traits: refused to move \d+ under \d+ — .*split across two scene files/);
+    expect(r.error).toMatch(/^set-traits: refused to move or reorder \d+ — Can't restructure a prefab instance/);
     expect(attrs(slot).parentId).toBe(root);
     expect(link(slot)).toBe(root);
   });
 
-  // The #1434 half: a same-scene move out of the instance unpacks, as reparent-entity's does, and is one undo entry.
-  // Mutation: send the editor's set-traits through applySetTraits(params) with no writer — still linked, no undo.
-  it('a same-scene member move unpacks it like reparent-entity, and undoes', async () => {
-    const viaOp = await instance();
-    const shelfA = spawn('ShelfA');
-    await runAgentOp('reparent-entity', { guid: attrs(viaOp.slot).guid, parentGuid: attrs(shelfA).guid });
-    const expected = link(viaOp.slot);
-    game!.dispose(); game = createTestWorld({}); setPlayState('stopped');
-
+  // #1869: a same-scene member move is refused like reparent-entity's, before anything is written — no entry, still
+  // linked. So is a new sortOrder (a reorder), on its own or beside the parent. A node the SCENE added under the instance
+  // takes both. Mutation: drop restructureRefusal in planReparent — the parent write lands; drop the sortOrder pre-check
+  // in writeTraitAsEditor — the reorder lands (the field write's own gate refuses mid-call, after the check passed).
+  it('a same-scene member move or reorder is refused with nothing applied; a scene-added node moves and reorders', async () => {
     const { root, slot } = await instance();
     const shelf = spawn('Shelf');
-    const r = await setParent(attrs(slot).guid, shelf);
-    expect(r.ok).toBe(true);
-    expect(attrs(slot).parentId).toBe(shelf);
-    expect(link(slot)).toBe(expected);
-    expect(link(slot)).not.toBe(root);
-    expect(r.savedNote).toMatch(/one undo entry/);
-    expect(canUndo()).toBe(true);
-    await undo();
-    expect(attrs(slot).parentId).toBe(root);
-    expect(link(slot)).toBe(root);
+    const sortOf = (id: number) => (live(id).get(EntityAttributes) as { sortOrder: number }).sortOrder;
+    const slotSort = sortOf(slot);
+    for (const set of [{ 'EntityAttributes.parentId': shelf }, { 'EntityAttributes.sortOrder': 7 }, { 'EntityAttributes.sortOrder': 7, 'Transform.x': 3 }]) {
+      const r = await runAgentOp('set-traits', { guid: attrs(slot).guid, set }) as Reply;
+      expect(r.ok, JSON.stringify(set)).toBe(false);
+      expect(r.error, JSON.stringify(set)).toMatch(/Can't restructure a prefab instance/);
+      expect([attrs(slot).parentId, sortOf(slot)]).toEqual([root, slotSort]);
+      expect(link(slot)).toBe(root);
+      expect(canUndo(), JSON.stringify(set)).toBe(false);
+    }
+    // The other two agent routes: reparent-entity with a sortOrder alone (a reorder under the same parent), and
+    // apply-scene-ops' setTrait. Mutation: stop passing the sortOrder to planReparent in reparent-entity — it answers
+    // "nothing changed" instead of the rule.
+    await expect(runAgentOp('reparent-entity', { guid: attrs(slot).guid, parentGuid: attrs(root).guid, sortOrder: 7 })).rejects.toThrow(/refused to move or reorder \d+ — Can't restructure a prefab instance/);
+    const ops = await runAgentOp('apply-scene-ops', { ops: [{ op: 'setTrait', entity: { guid: attrs(slot).guid }, trait: 'EntityAttributes', fields: { sortOrder: 7 } }] }) as { errors: string[] };
+    expect(ops.errors.join('\n')).toMatch(/refused to reorder \d+ — Can't restructure a prefab instance/);
+    expect([sortOf(slot), canUndo()]).toEqual([slotSort, false]);
+    // …and the agent's Create Prefab on a member (#1792's second route; Unity: "Can't save part of a Prefab instance as a
+    // Prefab"). Mutation: drop the `partOfInstanceRefusal` call in the agent op — it goes on to write a file.
+    await expect(runAgentOp('prefab', { action: 'create', entityGuid: attrs(slot).guid, path: '/p1869.prefab.json' })).rejects.toThrow(/prefab create refused: Can't save part of a prefab instance as a prefab/);
+    expect([link(slot), canUndo()]).toEqual([root, false]);
+    const added = spawn('Added', { parentId: root });
+    // A dry run answers what the call would, for a mixed selection too (#1869 close-out review, finding 2: the pre-check
+    // asked only the placeholder and parent rules, so a dry run said ok:true for a reorder the real call refused, and the
+    // real call reached the mid-write backstop). Mutation: drop the sortOrder check in `editorTraitWriter.refusal`.
+    const addedSort = sortOf(added);
+    for (const dryRun of [true, false]) {
+      const r = await runAgentOp('set-traits', { guid: [attrs(added).guid, attrs(slot).guid], set: { 'EntityAttributes.sortOrder': 7 }, dryRun }) as Reply;
+      expect(r.ok, `dryRun ${dryRun}`).toBe(false);
+      expect(r.error).toMatch(/^set-traits: refused to reorder \d+ — Can't restructure a prefab instance.*Nothing was applied to any of the 2 targets\./);
+    }
+    expect([sortOf(added), sortOf(slot), canUndo()]).toEqual([addedSort, slotSort, false]);
+    expect((await runAgentOp('set-traits', { guid: attrs(added).guid, set: { 'EntityAttributes.sortOrder': 7 } }) as Reply).ok).toBe(true);
+    expect((await setParent(attrs(added).guid, shelf)).ok).toBe(true);
+    expect([attrs(added).parentId, sortOf(added)]).toEqual([shelf, 7]);
   });
 
   // #1787 refused parentId beside another field, because the reparent was an undo entry and every other write was raw
