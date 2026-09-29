@@ -291,3 +291,303 @@ const movedScene = (parent: string | undefined = '60fab4f8-4635-5a21-fb1a-bf7670
     { name: 'Holder', traits: { Transform: {}, EntityAttributes: { name: 'Holder', parentId: '', guid: HOLDER } } },
   ],
 } as unknown as SceneData);
+
+/** A SAVED prefab edit between a step and its undo: the template changes on disk and in the cache, and the scene is
+ *  reopened from its save, as leaving prefab edit reopens it (`exitPrefabEditing`'s loadScene). The history stays. */
+async function savedPrefabEdit(edit: (doc: ReturnType<typeof pDoc>) => void): Promise<void> {
+  const data = await save();
+  const doc = JSON.parse(JSON.stringify(prefabs.get(P))) as ReturnType<typeof pDoc>;
+  edit(doc);
+  prefabs.set(P, doc);
+  setPrefabCache(P, doc as never);
+  await load(data);
+}
+const tplA = (doc: ReturnType<typeof pDoc>) => doc.entities.find((e) => e.name === 'A')!.traits as Record<string, Record<string, unknown>>;
+
+/** Each field's live value, then the same field after a save→reload: an undo must leave the world the reload gives. */
+async function liveThenReloaded(fields: [trait: string, field: string][]): Promise<{ live: unknown[]; reloaded: unknown[] }> {
+  const live = fields.map(([t, f]) => field(idOf('A'), t, f));
+  await rebuild();
+  return { live, reloaded: fields.map(([t, f]) => field(idOf('A'), t, f)) };
+}
+
+describe("an undo after a SAVED prefab edit takes UNMARKED fields from the CURRENT template (#1800 owner ruling)", () => {
+  // y = 9 (the instance's own edit), then a saved prefab edit sets the template's A.y = 4, then undo: the instance no
+  // longer overrides y, so it shows the template's 4, as the reload does, not the 0 the old template had.
+  // Mutation: drop the base resync from `putMarkState` — the undo shows y 0, the reload 4.
+  it('field write: undo shows the current template value, as the reload does', async () => {
+    writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'y', 9);
+    await savedPrefabEdit((d) => { tplA(d).Transform.y = 4; });
+    expect(field(idOf('A'), 'Transform', 'y')).toBe(9); // still the instance's own override
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(marksOf(idOf('A'))).not.toContain('Transform.y');
+    const { live, reloaded } = await liveThenReloaded([['Transform', 'y']]);
+    expect(reloaded).toEqual([4]);
+    expect(live).toEqual(reloaded);
+  });
+
+  // (accept) a MARKED override survives: x = 7 is the instance's own (from the file), edited to 9, the template's x moves
+  // to 3, the undo gives back the instance's 7, not the template's 3. Mutation: resync MARKED fields too — the undo shows 3.
+  it('(accept) field write: a marked override comes back as the instance had it', async () => {
+    await withOverrides();
+    writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'x', 9);
+    await savedPrefabEdit((d) => { tplA(d).Transform.x = 3; });
+    expect((await undoStep('undo')).did).toBe(true);
+    const { live, reloaded } = await liveThenReloaded([['Transform', 'x']]);
+    expect(reloaded).toEqual([7]);
+    expect(live).toEqual(reloaded);
+  });
+
+  // Remove Rotate3D (speed 5 marked, axis the template's), a saved prefab edit moves the template's axis to 'x', undo:
+  // axis follows the template, speed stays the instance's 5. Mutation: drop the base resync from `restoreMarks` — the
+  // undo shows axis 'y', the reload 'x'.
+  it('Remove Component: undo re-adds with the current template for unmarked fields, the marked override kept', async () => {
+    await withOverrides();
+    expect(removeTraitFromEntitiesWithUndo([idOf('A')], meta('Rotate3D'))).toBeNull();
+    await savedPrefabEdit((d) => { tplA(d).Rotate3D.axis = 'x'; });
+    expect((await undoStep('undo')).did).toBe(true);
+    const { live, reloaded } = await liveThenReloaded([['Rotate3D', 'axis'], ['Rotate3D', 'speed']]);
+    expect(reloaded).toEqual(['x', 5]);
+    expect(live).toEqual(reloaded);
+  });
+
+  // Delete A (a member, its frame survives), a saved prefab edit sets the template's A.y = 4, undo: A comes back with
+  // y 4 and its own x 7 / speed 5. Held by `survivingFrameRows` + `rebaseRespawned` (#1820): the frame is re-recorded as
+  // the old document and rebuilt onto the current one through the mark gate.
+  it('delete a member: undo respawns it with the current template for unmarked fields, the marked overrides kept', async () => {
+    await withOverrides();
+    deleteEntitiesWithUndo([idOf('A')]);
+    await savedPrefabEdit((d) => { tplA(d).Transform.y = 4; });
+    expect((await undoStep('undo')).did).toBe(true);
+    const { live, reloaded } = await liveThenReloaded([['Transform', 'y'], ['Transform', 'x'], ['Rotate3D', 'speed']]);
+    expect(reloaded).toEqual([4, 7, 5]);
+    expect(live).toEqual(reloaded);
+  });
+
+  // Detach, a saved prefab edit (the plain tree reloads with the values it had), undo: re-attached, A takes the
+  // template's new y and keeps its own x 7 / speed 5. Held by `reattachDetachedInstance`, which brings the re-attached
+  // instance onto the current template (#1665's sibling), not by `restoreMarks`' resync (dropping it leaves this green).
+  it('Detach: undo re-attaches with the current template for unmarked fields, the marked overrides kept', async () => {
+    await withOverrides();
+    detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]');
+    await savedPrefabEdit((d) => { tplA(d).Transform.y = 4; });
+    expect((await undoStep('undo')).did).toBe(true);
+    const { live, reloaded } = await liveThenReloaded([['Transform', 'y'], ['Transform', 'x'], ['Rotate3D', 'speed']]);
+    expect(reloaded).toEqual([4, 7, 5]);
+    expect(live).toEqual(reloaded);
+  });
+
+  // The whole instance deleted: its frame goes with it, so the respawn comes back from the OLD document. Held by
+  // `rebaseRespawned` (#1820), which rebuilds the respawned frame onto the current document through the mark gate.
+  it('delete the instance: undo respawns it with the current template for unmarked fields, the marked overrides kept', async () => {
+    await withOverrides();
+    deleteEntitiesWithUndo([guidIdOf(INST)]);
+    await savedPrefabEdit((d) => { tplA(d).Transform.y = 4; });
+    expect((await undoStep('undo')).did).toBe(true);
+    const { live, reloaded } = await liveThenReloaded([['Transform', 'y'], ['Transform', 'x'], ['Rotate3D', 'speed']]);
+    expect(reloaded).toEqual([4, 7, 5]);
+    expect(live).toEqual(reloaded);
+  });
+});
+
+describe("a relink after a SAVED prefab edit takes UNMARKED fields from the CURRENT template (#1800 owner ruling)", () => {
+  // A here is a legacy member moved OUTSIDE its instance, so its whole Transform is part of the move (the save's gate
+  // exempts it, `gateOnMarks`) and a template Transform change does not reach it. `Rotate3D.axis` is an unmarked field
+  // the template does reach, so it is the one each case moves.
+  const edit = (d: ReturnType<typeof pDoc>) => { tplA(d).Rotate3D.axis = 'x'; tplA(d).Transform.y = 4; };
+  const fields: [string, string][] = [['Rotate3D', 'axis'], ['Transform', 'y'], ['Transform', 'x'], ['Rotate3D', 'speed']];
+
+  // R's delete unlinks A where it stands; the saved prefab edit reloads it as a plain entity with the values it had;
+  // the undo relinks it. Held by #1820's frame rebase, which rebuilds R's respawned frame after the relink.
+  it('delete the nested root, a saved prefab edit, the undo: the relinked member shows the current template', async () => {
+    await load(movedScene());
+    clearHistory();
+    deleteEntitiesWithUndo([idOf('R')]);
+    await savedPrefabEdit(edit);
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
+    const { live, reloaded } = await liveThenReloaded(fields);
+    expect(reloaded[0]).toBe('x');
+    expect(live).toEqual(reloaded);
+  });
+
+  // #1450's route: OR dropped under its own moved member A unpacks A; the saved prefab edit reloads A plain; the undo
+  // re-links it (reparent's `undoDetach`, through `restoreMarks`), and no rebase follows. Mutation: drop the base resync
+  // from `restoreMarks` — the undo shows axis 'y', the reload 'x'.
+  it('OR dropped under its own moved member A, a saved prefab edit, the undo: A shows the current template', async () => {
+    await load(movedScene(HOLDER));
+    clearHistory();
+    expect(reparentEntity(guidIdOf(INST), idOf('A'))).toBe(true);
+    await savedPrefabEdit(edit);
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).not.toBeNull();
+    const { live, reloaded } = await liveThenReloaded(fields);
+    expect(reloaded).toEqual(['x', 0, 7, 5]); // y stays the move's 0
+    expect(live).toEqual(reloaded);
+  });
+});
+
+describe("an undo after a SAVED edit of an ENCLOSING row leaves the nested instance as a load does (#1800 owner ruling)", () => {
+  const OI = 'dddddddd-0000-4000-8000-000000001799';
+  /** An instance of O (OR → B, OR → nested P's R → A) at the scene root. */
+  const oScene = (): SceneData => ({
+    id: 's1800o', version: 16, name: 'S', resources: [],
+    entities: [{ id: 1, prefab: O, guid: OI, traits: { EntityAttributes: { name: 'OI', parentId: 0 } } }],
+  } as unknown as SceneData);
+  /** A saved edit of O: its row 3 (the nested P) states `overrides` on P's rows, as an Apply into O or a prefab-edit save
+   *  of O writes them. */
+  async function savedRowEdit(overrides: Record<number, Record<string, Record<string, unknown>>>): Promise<void> {
+    const data = await save();
+    const doc = JSON.parse(JSON.stringify(prefabs.get(O))) as { entities: { localId: number; overrides?: unknown }[] };
+    doc.entities.find((e) => e.localId === 3)!.overrides = overrides;
+    prefabs.set(O, doc);
+    setPrefabCache(O, doc as never);
+    await load(data);
+  }
+  const state = (name: string, t: string, f: string) => ({ value: field(idOf(name), t, f), marked: marksOf(idOf(name)).includes(`${t}.${f}`) });
+  async function liveEqualsReload(name: string, t: string, f: string, reloaded: { value: unknown; marked: boolean }) {
+    const live = state(name, t, f);
+    await rebuild();
+    expect(state(name, t, f)).toEqual(reloaded);
+    expect(live).toEqual(reloaded);
+  }
+
+  // The nested A's y = 9 (its own), then O's row states A.y = 4, then undo: A shows the row's 4, MARKED, as a load marks a
+  // layer's value (docs/prefabs.md I2). Mutation: drop the layer-mark loop from `takeUnmarkedFromBase` — y 4 unmarked.
+  it("field write: the undo takes the enclosing row's value, marked", async () => {
+    await load(oScene());
+    clearHistory();
+    writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'y', 9);
+    await savedRowEdit({ 2: { Transform: { y: 4 } } });
+    expect(field(idOf('A'), 'Transform', 'y')).toBe(9);
+    expect((await undoStep('undo')).did).toBe(true);
+    await liveEqualsReload('A', 'Transform', 'y', { value: 4, marked: true });
+  });
+
+  // Delete the nested root R (its frame, O's instance, survives), then O's row states R.y = 4, then undo: R comes back
+  // with the row's 4, marked. Held by #1820's rebase: R's own frame (O) is the one whose document changed.
+  it("delete the nested root: the undo's respawn takes the enclosing row's value, marked", async () => {
+    await load(oScene());
+    clearHistory();
+    deleteEntitiesWithUndo([idOf('R')]);
+    await savedRowEdit({ 1: { Transform: { y: 4 } } });
+    expect((await undoStep('undo')).did).toBe(true);
+    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: true });
+  });
+
+  // One level deeper (#1831 seed 6246's shape): X = XR → a nested O, whose row 3 is the nested P's root R. Delete R (its
+  // frame, the nested O, survives), then X's row states R.y = 4 through O's row 3 (`nestedOverrides`), then undo. The document that changed
+  // is X's, not that of R's frame, so #1820's rebase never sees a stale frame. Mutation: drop the resync loop from the
+  // delete's undo (`deleteEntitiesWithUndo`) — y 0 unmarked.
+  it("delete a root two levels down: the undo's respawn takes the grand-outer row's value, marked", async () => {
+    const X = 'cccccccc-0000-4000-8000-000000001800';
+    const xDoc = {
+      id: X, version: 5, name: 'X', rootLocalId: 1, entities: [
+        { localId: 1, name: 'XR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001800', traits: { EntityAttributes: { name: 'XR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+        { localId: 2, name: 'OR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001801', prefab: O, traits: { EntityAttributes: { name: 'OR', parentId: 1, guid: '' } } },
+      ],
+    };
+    prefabs.set(X, xDoc);
+    setPrefabCache(X, xDoc as never);
+    await load({ id: 's1800x', version: 16, name: 'S', resources: [], entities: [{ id: 1, prefab: X, guid: OI, traits: { EntityAttributes: { name: 'XI', parentId: 0 } } }] } as unknown as SceneData);
+    clearHistory();
+    deleteEntitiesWithUndo([idOf('R')]);
+    const data = await save();
+    const doc = JSON.parse(JSON.stringify(xDoc)) as typeof xDoc & { entities: { nestedOverrides?: unknown }[] };
+    doc.entities[1].nestedOverrides = { 3: { 1: { Transform: { y: 4 } } } }; // O's row 3 (the nested P), P's row 1 (R)
+    prefabs.set(X, doc);
+    setPrefabCache(X, doc as never);
+    await load(data);
+    expect((await undoStep('undo')).did).toBe(true);
+    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: true });
+  });
+});
+
+describe('a member-token field survives the restore (#1800 close-out review)', () => {
+  // Q = QR → QA, QR's UIAction bound to its own member QA by the template token `@member:2` (#1352). Detach's undo
+  // re-links the tree one entry at a time, root first, and restores each entry's marks as it goes: when the root's pass
+  // ran, no member was linked yet, the token resolved to nothing, and the "differs, unmarked" branch wrote the RAW token
+  // into the live binding. Mutation: drop the `hasMemberToken` skip from `takeUnmarkedFromBase` — both cases read
+  // '@member:2'.
+  const Q = 'cccccccc-0000-4000-8000-00000000aa01';
+  const QI = 'dddddddd-0000-4000-8000-00000000aa01';
+  const bind = (target: string) => ({ UIAction: { bindings: [{ event: 'click', kind: 'call', action: 'noop', target }] } });
+  const qDoc = () => ({
+    id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+      { localId: 1, name: 'QR', nodeGuid: 'eeeeeeee-0000-4000-8000-00000000aa01', traits: { EntityAttributes: { name: 'QR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 }, ...bind('@member:2') } },
+      { localId: 2, name: 'QA', nodeGuid: 'eeeeeeee-0000-4000-8000-00000000aa02', traits: { EntityAttributes: { name: 'QA', parentId: 1, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+    ],
+  });
+  const targetOf = (id: number) => (field(id, 'UIAction', 'bindings') as { target: string }[] | undefined)?.[0]?.target;
+  const qaGuid = () => getAllEntities().find((e) => e.name === 'QA')!.guid;
+  beforeEach(async () => {
+    const d = qDoc(); prefabs.set(Q, d); setPrefabCache(Q, d as never);
+    await load({ id: 'sq', version: 16, name: 'S', resources: [], entities: [{ id: 1, prefab: Q, guid: QI, traits: { EntityAttributes: { name: 'QI', parentId: 0 } } }] } as unknown as SceneData);
+    clearHistory();
+    expect(targetOf(guidIdOf(QI))).toBe(qaGuid()); // precondition: the load resolved the token
+  });
+
+  it('Detach, then undo: the root binding still names QA', async () => {
+    const g = qaGuid();
+    detachPrefabInstanceWithUndo(guidIdOf(QI), 'Detach prefab', '[test]');
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(targetOf(guidIdOf(QI))).toBe(g);
+  });
+
+  it('Detach, a save and reopen, undo: the binding names QA, as the reload does', async () => {
+    detachPrefabInstanceWithUndo(guidIdOf(QI), 'Detach prefab', '[test]');
+    await rebuild();
+    const g = qaGuid();
+    expect((await undoStep('undo')).did).toBe(true);
+    const live = targetOf(guidIdOf(QI));
+    expect(live).toBe(g);
+    await rebuild();
+    expect(targetOf(guidIdOf(QI))).toBe(live);
+  });
+});
+
+describe('a legacy member moved out of its frame, relinked two levels down (#1800 close-out review)', () => {
+  // X = XR → OR (O), O = OR → B, R (nested P), P = R → A, with A a legacy member moved under B. Delete R: A is unlinked
+  // where it stands. A saved edit of X states A's axis through O's row 3 (`nestedOverrides`); the undo relinks A. The
+  // document that changed is X's, the one above A's frame, so no frame reads as stale and #1820's rebase never reaches A;
+  // it is not respawned either. Mutation: drop the detached members from the delete undo's pass — axis 'y' unmarked,
+  // the reload 'x' marked.
+  it('delete R, a saved edit of X, undo: the relinked A matches the reload', async () => {
+    const X = 'cccccccc-0000-4000-8000-000000001800';
+    const gXO = 'eeeeeeee-0000-4000-8000-000000001801';
+    const xDoc = () => ({ id: X, version: 5, name: 'X', rootLocalId: 1, entities: [
+      { localId: 1, name: 'XR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001800', traits: { EntityAttributes: { name: 'XR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+      { localId: 2, name: 'OR', nodeGuid: gXO, prefab: O, traits: { EntityAttributes: { name: 'OR', parentId: 1, guid: '' } } } as Record<string, unknown>,
+    ] });
+    const BG = '60fab4f8-4635-5a21-fb1a-bf76708690d7';
+    const XI = 'dddddddd-0000-4000-8000-00000000cc01';
+    const x0 = xDoc(); prefabs.set(X, x0); setPrefabCache(X, x0 as never);
+    await load({
+      id: 'sx', version: 17, name: 'S', resources: [],
+      entities: [{
+        name: 'XR', prefab: X, guid: XI,
+        traits: { PrefabInstance: { source: X, localId: 1, rootInstanceId: XI } },
+        members: {
+          [`/${gXO}`]: { guid: '60fab4f8-4635-5a21-fb1a-bf76708690d1', name: 'OR' },
+          [`/${gXO}/${gB}`]: { guid: BG, name: 'B' },
+          [`/${gXO}/${gPN}`]: { guid: '61fab68b-4535-588e-fc1a-c1096f868f44', name: 'R' },
+          [`/${gXO}/${gPN}/${gA}`]: { guid: '64293cf7-325d-8396-6553-b8f5c75d6c84', name: 'A', parent: BG },
+        },
+      }],
+    } as unknown as SceneData);
+    clearHistory();
+    expect(getAllEntities().find((e) => e.name === 'A')!.parentId).toBe(idOf('B')); // precondition: A lives under B
+    deleteEntitiesWithUndo([idOf('R')]);
+    const data = await save();
+    const doc = xDoc() as { entities: Record<string, unknown>[] };
+    doc.entities[1]!.nestedOverrides = { 3: { 2: { Rotate3D: { axis: 'x' } } } };
+    prefabs.set(X, doc); setPrefabCache(X, doc as never);
+    await load(data);
+    expect((await undoStep('undo')).did).toBe(true);
+    const state = () => ({ axis: field(idOf('A'), 'Rotate3D', 'axis'), marked: marksOf(idOf('A')).includes('Rotate3D.axis') });
+    const live = state();
+    await rebuild();
+    expect(state()).toEqual({ axis: 'x', marked: true });
+    expect(live).toEqual(state());
+  });
+});

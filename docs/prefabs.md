@@ -1227,6 +1227,23 @@ Every editor mark write now goes through `editor/undo/overrideMarkWrites.ts`, un
   that no longer resolves when it is recorded gets NO record rather than an empty one (a multi-select delete can
   destroy a member an earlier target detached; its own snapshot restores its marks, and an empty record wiped them);
   `relinkPutsMarksBack.test.ts` keeps editor code off the bare relink.
+- **What an undo leaves UNMARKED comes from the CURRENT template** (owner ruling on #1800, 2026-09-30; Unity always
+  shows the current asset's value). A snapshot holds the values of the world it was taken in, so after a SAVED
+  template change in between (leaving prefab edit, an outside edit, an Apply from another instance) restoring them
+  verbatim showed the OLD template's values in the editor and in Play until a reload, while the save, which keeps only
+  marked fields, wrote nothing and the reload showed the new ones. `putMarkState` and `restoreMarks` end with
+  `takeUnmarkedFromBase`: the fields the save would DROP (the value diff against `instanceBase`, then `gateOnMarks`)
+  take the base's value, so an added trait, a moved member's Transform and a marked field stay as restored; and a
+  field an enclosing row states is left marked, as a load leaves it (I2). The delete's undo runs it over every
+  respawned and relinked node after its rebase. A base value that still holds a member token after resolving is left
+  as restored: Detach's and Create Prefab's undo re-link the tree root first, so when the root's pass runs no member is
+  linked yet and its `@member:` refs cannot resolve (the close-out review caught the raw token written into a live
+  `UIAction` target). Which route holds what (`overrideMarkUndo.test.ts`, each mutation-checked): a field write and
+  Remove Component, the owner; a delete whose own frame's document changed, and Detach's undo, #1820's rebase and
+  `reattachDetachedInstance`; a delete two levels down, where the document that changed is the one ABOVE the deleted
+  node's frame so no frame reads as stale, the owner's pass in the delete's undo, over the respawned root and over a
+  legacy member the delete unlinked where it stood. `relinkDetachedMembersMarked` itself runs no pass, since it runs
+  before its caller's relinks and rebase settle the frame.
 
 #### Why an undo cannot trust the side store (#1794, #1800, #1853)
 

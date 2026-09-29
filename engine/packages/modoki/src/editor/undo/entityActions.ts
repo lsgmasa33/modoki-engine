@@ -14,7 +14,7 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
 import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState, captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from './overrideMarkWrites';
+import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState, captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, takeUnmarkedFromBase, type MarkCapture } from './overrideMarkWrites';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 import { endFrames, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
@@ -339,7 +339,8 @@ export function addTraitToEntitiesWithUndo(
   const affectedScenes = resolveAffectedScenes(targets);
   const initial = values ? filterToTraitSchema(meta, values) : undefined;
   const refs = targets.map((id) => entityRef(id));
-  const oldMarks = targets.map((id) => captureMarks(id));
+  // Only this trait's: the add changes no other mark, and its undo's restore must not touch another trait's fields.
+  const oldMarks = targets.map((id) => captureMarks(id, meta.name));
   const apply = () => {
     requireAll(refs).forEach((id) => { // I19: every target, before the first add
       // Clone per entity AND per apply: without it, redo would re-seat the same
@@ -1189,6 +1190,11 @@ export function deleteEntitiesWithUndo(
       // After the links are back: a prefab-edit save or an outside edit since the delete changed a template (#1820).
       // and the rows of a frame that survived the delete, whose own record that edit already moved on (`survivingFrameRows`).
       rebaseRespawned(snaps.map((x) => x.snapshot), rebaseRows());
+      // What the rebase leaves: a node whose frame is current still holds the snapshot's values — a nested root deleted as
+      // its own target, or a legacy member the delete unlinked where it stood, whose base changed through a row an
+      // enclosing frame states (#1800 close-out review). Their unmarked fields take the CURRENT template's (#1800 owner
+      // ruling). By guid: a rebuilt frame respawns at new ids, and a relinked member has its pre-delete guid back.
+      for (const g of [...respawnedGuids, ...detached.map((d) => d.guid)]) { const e = findEntityByGuid(g); if (e) takeUnmarkedFromBase(e.id()); }
       setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
     },
     redo: () => {

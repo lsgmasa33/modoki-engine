@@ -28,15 +28,17 @@
  *  component, and the next save dropped the values the screen still showed. Unity keeps its overrides as data on the
  *  instance (`m_Modifications`), which its undo snapshots like any other; this is that rule for Modoki's side store. */
 
-import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { findEntity, writeTraitField } from '../../runtime/core/ecs/entityUtils';
+import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
+import { findEntity, writeTraitField, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
 import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
 import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { baseTokenResolver } from '../scene/prefabTokens';
-import { collectComparableTraits, getOverrideValues } from '../scene/prefabInstanceOverrides';
-import { instanceBase } from '../scene/prefabChain';
+import { hasMemberToken } from '../../runtime/core/templateRefs';
+import { collectComparableTraits, getOverrideValues, gateOnMarks } from '../scene/prefabInstanceOverrides';
+import { instanceMovedMembers } from '../scene/prefabMembers';
+import { instanceBase, enclosingRowOverrides } from '../scene/prefabChain';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
 import { entityRef, buildGuidIndex, requireWith } from './entityRef';
@@ -159,6 +161,8 @@ export function putMarkState(entityId: number, traitName: string, state: MarkSta
     if (marked) markOverride(e, traitName, f);
     else unmarkOverride(e, traitName, f);
   }
+  const meta = getTraitByName(traitName);
+  if (meta) takeUnmarkedFromBase(entityId, [meta], Object.keys(state));
 }
 
 /** An entity's override marks as plain data, taken WITH an undo snapshot: its whole set, or only `trait`'s keys when
@@ -169,13 +173,72 @@ export function captureMarks(entityId: number, trait?: string): MarkCapture {
   const all = e ? [...(getOverrideMarkSet(e) ?? [])] : [];
   return trait ? { trait, keys: all.filter((k) => k.startsWith(`${trait}.`)) } : { keys: all };
 }
-/** Put a {@link captureMarks} back: the marks in its scope become exactly the captured ones. */
+/** Put a {@link captureMarks} back: the marks in its scope become exactly the captured ones, and the fields they leave
+ *  unmarked take the CURRENT template's values ({@link takeUnmarkedFromBase}). */
 export function restoreMarks(entityId: number, capture: MarkCapture): void {
   const e = findEntity(entityId);
   if (!e) return;
   if (!capture.trait) clearOverrideMarks(e);
   else for (const k of [...(getOverrideMarkSet(e) ?? [])]) if (k.startsWith(`${capture.trait}.`)) unmarkOverride(e, capture.trait, k.slice(capture.trait.length + 1));
   restoreOverrideMarks(e, capture.keys);
+  const meta = capture.trait ? getTraitByName(capture.trait) : undefined;
+  if (!capture.trait || meta) takeUnmarkedFromBase(entityId, meta ? [meta] : undefined);
+}
+
+/** After an undo puts a member's marks back, bring every UNMARKED field in scope (`traits`, every trait the entity has
+ *  when omitted; only `fields` when given) to the value its instance resolves it to NOW: the CURRENT template, through
+ *  the layers enclosing the instance ({@link instanceBase}, token refs resolved as the save compares them). Owner
+ *  ruling on #1800 (2026-09-30): Unity always shows the current asset's value for a field the instance does not
+ *  override.
+ *
+ *  Why an undo needs it: its snapshot holds the values of the world it was taken in. After a SAVED prefab edit in
+ *  between (leaving prefab edit, an outside edit, an Apply from another instance), those are the OLD template's values
+ *  wherever the instance never overrode a field, and restoring them verbatim showed them in the editor and in Play until
+ *  a reload, while the save, which keeps only marked fields, wrote nothing and the reload showed the new ones.
+ *
+ *  Which fields: exactly the ones the SAVE would drop, so the live world is what a save→reload gives. The value diff
+ *  (`getOverrideValues`), then the save's own mark gate (`gateOnMarks`): an added trait, a moved member's Transform and a
+ *  marked field all stay as restored. A field an enclosing layer states is left marked, as a load leaves it (I2). `EntityAttributes.editorFolder` stays too: the save writes a root's folder outside
+ *  the overrides. No-op off an instance, and when the template is not cached (what the screen shows is kept). */
+export function takeUnmarkedFromBase(entityId: number, traits?: readonly TraitMeta[], fields?: readonly string[]): void {
+  const m = memberEntity(entityId);
+  const { source, localId, rootInstanceId: root } = m?.pi ?? {};
+  if (!m || !source || !localId || !root) return;
+  const prefab = getCachedPrefabSync(source);
+  if (!prefab) return;
+  const base = instanceBase(root, prefab);
+  const baseEntity = base.entities.find((x) => x.localId === localId);
+  if (!baseEntity) return;
+  const resolve = baseTokenResolver(root);
+  const metas = (traits ?? getAllTraits()).filter((t) => t.category !== 'tag' && m.entity.has(t.trait));
+  const diffs = getOverrideValues(localId, collectComparableTraits(entityId, metas), base, resolve);
+  const kept: typeof diffs = {};
+  for (const [t, fs] of Object.entries(diffs)) kept[t] = { ...fs };
+  gateOnMarks(kept, getOverrideMarkSet(m.entity), baseEntity, () => instanceMovedMembers(root, prefab)(entityId, !!diffs['Transform']));
+  for (const [traitName, fs] of Object.entries(diffs)) {
+    const meta = getTraitByName(traitName);
+    const baseData = baseEntity.traits[traitName] as Record<string, unknown>;
+    const schema = (meta?.trait as { schema?: Record<string, unknown> } | undefined)?.schema;
+    for (const f of Object.keys(fs)) {
+      if (!meta || (kept[traitName] && f in kept[traitName]) || (fields && !fields.includes(f))) continue;
+      if (traitName === 'EntityAttributes' && f === 'editorFolder') continue;
+      // The value `getOverrideValues` compared against: a field absent from the base is the trait's schema default.
+      const value = resolve(f in baseData ? baseData[f] : schema?.[f]);
+      // A member token that still names nothing is unreadable here, not a value: an undo that re-links a tree one entry
+      // at a time (Detach's, Create Prefab's) restores the root before any member is linked, so its tokens cannot resolve
+      // yet, and writing one put the raw `@member:` string into a live ref (#1800 close-out review). What is restored stays.
+      if (hasMemberToken(value)) continue;
+      writeTraitField(entityId, meta, f, cloneTraitValues({ v: value }).v);
+    }
+  }
+  // A field the layers enclosing the instance STATE arrives override-marked on a load (docs/prefabs.md I2), so the
+  // reload marks it: a restore that left it unmarked differed from the reload by that mark alone.
+  const stated = enclosingRowOverrides(root)?.[localId];
+  for (const meta of metas) {
+    const fs = stated?.[meta.name];
+    if (!fs || typeof fs !== 'object') continue;
+    for (const f of Object.keys(fs)) if (!fields || fields.includes(f)) markOverride(m.entity, meta.name, f);
+  }
 }
 
 /** Record each detached member's marks on it, right after the frame-ending that detached it (`endFrames`, or a
@@ -197,7 +260,9 @@ export function recordDetachedMarks(detached: DetachedMember[]): DetachedMember[
 }
 
 /** THE relink of detached members for an editor undo: {@link relinkDetachedMembers}, then each member's recorded
- *  marks back ({@link recordDetachedMarks}); a member with no record keeps the marks it has. */
+ *  marks back ({@link recordDetachedMarks}); a member with no record keeps the marks it has.
+ *  No {@link takeUnmarkedFromBase} here: it runs before the undo's own relinks and rebase have settled the frame, so the
+ *  caller runs it after them (the delete's undo does, over its respawned and relinked nodes). */
 export function relinkDetachedMembersMarked(detached: readonly DetachedMember[]): void {
   relinkDetachedMembers(detached);
   for (const d of detached) {
