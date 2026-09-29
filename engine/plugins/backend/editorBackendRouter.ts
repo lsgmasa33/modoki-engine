@@ -304,7 +304,24 @@ import {
   ASSET_SCHEMA_TYPES, ASSET_FORMAT_VERSION, type AssetSchemaType,
 } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { classifyJsonFormatVersion } from '../../packages/modoki/src/runtime/core/formatVersion';
-import { SceneFormatRefusedError, assertSceneFormatReadable } from '../../packages/modoki/src/runtime/loaders/sceneFormatGate';
+import { SceneFormatRefusedError, assertSceneFormatReadable, unparsableSceneError } from '../../packages/modoki/src/runtime/loaders/sceneFormatGate';
+
+/** The 409 a copy route answers when the scene it would re-mint is one this build cannot read (`remintSceneEntityGuids`
+ *  and `withFreshJsonIdentity` throw `SceneFormatRefusedError` before anything is written). The same code and `reason`
+ *  token `/api/scene-mutate` answers, so a caller branches on one shape. */
+function sceneCopyRefusal(verb: string, subject: string, e: SceneFormatRefusedError): { status: number; body: Record<string, unknown> } {
+  return {
+    status: 409,
+    body: {
+      ok: false,
+      code: 'REFUSED_BY_OP' satisfies ErrorCode,
+      reason: `scene-format-${e.reason}`,
+      // The gate's message opens "Scene not loaded:" — no load happened here, so that clause goes.
+      error: `${verb} refused ${subject}: ${e.message.replace(/^Scene not loaded: /, '')} A copy needs every entity guid re-minted, which means reading `
+        + 'the scene; nothing was written.',
+    },
+  };
+}
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
 // Type-only, and deliberately from the DOM-free `frameLoopStatus` LEAF, not `frameDriver.ts`
 // itself: this router is reachable from `engine/electron/backendServer.ts`, compiled under
@@ -3284,7 +3301,7 @@ async function describeUnresolvedAgainstLiveWorld(
         scene = readJsonFile(absPath) as MutableScene;
       } catch (e) {
         if (!(e instanceof SyntaxError)) throw e;
-        return refuseFormat('unreadable', `Scene not loaded: it is not valid JSON (${e.message}). The file may be corrupt or hand-edited incorrectly (e.g. unresolved merge markers).`);
+        return refuseFormat('unreadable', unparsableSceneError(e.message).message);
       }
       try {
         assertSceneFormatReadable(scene);
@@ -4914,6 +4931,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // not list the file at all, which the manifest-only check this replaced let through (#1472).
       const kindRefusal = wrongKindRefusal(ctx, absPath, 'scene');
       if (kindRefusal) return kindRefusal;
+      // A non-object is refused `unreadable` before the spread below makes it an object with no version (`too-old`).
+      if (!scene || typeof scene !== 'object' || Array.isArray(scene)) assertSceneFormatReadable(scene);
       const guid = crypto.randomUUID();
       const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
       const bytes = assetJsonBytes(copy);
@@ -4925,6 +4944,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({ ok: true, guid, path: ctx.absToAssetUrl(absPath, { onDisk: true }) ?? filePath, manifestRebuilt });
     } catch (e) {
+      if (e instanceof SceneFormatRefusedError) { const r = sceneCopyRefusal('scene-save-as', String((body as { path?: unknown } | undefined)?.path), e); return json(r.body, r.status); }
       return json({ error: String(e) }, 500);
     }
   }
@@ -4994,6 +5014,7 @@ async function describeUnresolvedAgainstLiveWorld(
           : {}),
       });
     } catch (e) {
+      if (e instanceof SceneFormatRefusedError) { const r = sceneCopyRefusal('duplicate-asset', String((body as { from?: unknown } | undefined)?.from), e); return json(r.body, r.status); }
       return json({ error: String(e) }, 500);
     }
   }
@@ -6120,6 +6141,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const out = importIdentity(ctx, scannerUrlOf(ctx, abs) ?? destUrl, Buffer.from(content, 'base64'), claimedIds);
       return json({ ok: true, content: out.bytes.toString('base64'), ...(out.guid ? { guid: out.guid } : {}), ...(out.id ? { id: out.id } : {}) });
     } catch (e) {
+      if (e instanceof SceneFormatRefusedError) { const r = sceneCopyRefusal('import-identity', String((body as { path?: unknown } | undefined)?.path), e); return json(r.body, r.status); }
       return json({ error: String(e) }, 500);
     }
   }
@@ -6138,7 +6160,6 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!fs.existsSync(srcPath) || !fs.statSync(srcPath).isFile()) return json({ error: `source not found or not a file: ${srcPath}` }, 404);
       const destDirAbs = ctx.resolveAssetPath(destFolder);
       if (!destDirAbs) return outsideAssetRoots('destFolder outside allowed directories');
-      if (!fs.existsSync(destDirAbs)) fs.mkdirSync(destDirAbs, { recursive: true });
       const base = path.basename(srcPath);
       const destAbs = path.join(destDirAbs, base);
       if (fs.existsSync(destAbs)) return json({ error: `destination exists: ${base}` }, 409);
@@ -6151,7 +6172,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // multi-GB video still imports (`readFileSync` refuses past 2 GiB) and stays an APFS clone (close-out review).
       const scanUrl = scannerUrlOf(ctx, destAbs);
       if (!scanUrl) return outsideAssetRoots('destFolder outside allowed directories');
-      if (importDecidesIdentity(scanUrl)) fs.writeFileSync(destAbs, importIdentity(ctx, scanUrl, fs.readFileSync(srcPath)).bytes, { flag: 'wx' });
+      // Decided before the folder is made: a scene this build cannot read throws here, and a refusal leaves nothing behind.
+      const decided = importDecidesIdentity(scanUrl) ? importIdentity(ctx, scanUrl, fs.readFileSync(srcPath)).bytes : null;
+      if (!fs.existsSync(destDirAbs)) fs.mkdirSync(destDirAbs, { recursive: true });
+      if (decided) fs.writeFileSync(destAbs, decided, { flag: 'wx' });
       else fs.copyFileSync(srcPath, destAbs);
       ctx.rebuildManifest();
       // The editor's own write (#1702), after the rebuild: its GUID heal may rewrite the copy, and the mark must
@@ -6208,6 +6232,7 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       return json({ ok: true, saved: true, path: destUrl, guid: (entry as { guid?: string } | undefined)?.guid, type: entry?.type, imported });
     } catch (e) {
+      if (e instanceof SceneFormatRefusedError) { const r = sceneCopyRefusal('import-file', String((body as { srcPath?: unknown } | undefined)?.srcPath), e); return json(r.body, r.status); }
       return json({ error: String(e) }, 500);
     }
   }

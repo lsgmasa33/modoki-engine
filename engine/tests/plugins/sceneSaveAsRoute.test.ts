@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { resolveAssetPath } from '../../plugins/vite-asset-scanner';
 
 let projectRoot = '';
@@ -43,8 +44,9 @@ const PARENT = '22222222-2222-4222-8222-222222222222';
 const CHILD = '33333333-3333-4333-8333-333333333333';
 
 /** The open scene as the editor serializes it: its own id, a parent and a child that refers to it. */
+// Stamped as the client's serializer stamps it — the reminter refuses a scene it cannot read.
 const openScene = () => ({
-  id: SOURCE_ID,
+  id: SOURCE_ID, version: SCENE_FORMAT_VERSION,
   entities: [
     { name: 'Parent', traits: { EntityAttributes: { guid: PARENT } } },
     { name: 'Child', parentId: PARENT, traits: { EntityAttributes: { guid: CHILD } } },

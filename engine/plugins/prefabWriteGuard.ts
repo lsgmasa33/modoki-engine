@@ -63,7 +63,10 @@
  *  precautionary rather than dressed up as closing a demonstrated loss.
  *
  *  **`duplicateAssetFile` is deliberately NOT gated.** It is lossless, and refusing it would break
- *  work that is legitimate on a too-new document: you could not duplicate the file. (The member-path
+ *  work that is legitimate on a too-new document: you could not duplicate the file. (A SCENE is the
+ *  exception, and not through this guard: its duplicate re-mints every entity guid by walking the
+ *  format's shapes, which is not lossless on a version it does not know — `remintSceneEntityGuids`
+ *  refuses one through the scene gate.) (The member-path
  *  repair, `planMemberPathRepair`, was ungated for the same reason; it went in #1868.)
  *
  *  ## What it refuses, and what it deliberately does NOT

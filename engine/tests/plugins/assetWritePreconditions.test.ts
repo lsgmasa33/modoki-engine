@@ -33,6 +33,7 @@ import { handleBackendRequest, type BackendContext, type Manifest } from '../../
 import { readMetaSidecar } from '../../plugins/meta-sidecar';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 let projectRoot = '';
 /** Renderer calls, `[op, params]`. */
@@ -398,7 +399,7 @@ describe('/api/duplicate-asset hands the remint a prefab reader (#1324)', () => 
       { localId: 2, traits: { EntityAttributes: { name: 'Button', parentId: 1, guid: '' } } },
     ] }));
     const oldRef = deriveGuid(`${ROOT}|2`);
-    write('/s/a.scene.json', JSON.stringify({ id: GUID_A, entities: [
+    write('/s/a.scene.json', JSON.stringify({ id: GUID_A, version: SCENE_FORMAT_VERSION, entities: [
       { id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
       { id: 2, traits: { EntityAttributes: { name: 'Ui', parentId: 0, guid: GUID_B }, UIAction: { bindings: [{ target: oldRef }] } } },
     ] }));

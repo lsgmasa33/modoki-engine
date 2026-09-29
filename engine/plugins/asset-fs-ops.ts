@@ -24,6 +24,7 @@ export { derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, type
 import { findDeleteBoundaries } from '../scripts/deleteBoundary.mjs';
 import { classifyJsonAssetPath, ID_BEARING_TYPES } from './assetTypes';
 import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
+import { assertSceneFormatReadable, unparsableSceneError } from '../packages/modoki/src/runtime/loaders/sceneFormatGate';
 
 /** The sidecars an asset carries, as SUFFIXES. Spelled once: `moveAssetFile` renames them and
  *  `moveToTrash`'s refusal predicate must hold them back, and a second hand-kept copy of the list
@@ -395,12 +396,20 @@ export function moveToTrash(
  *
  *  ⚠️ **Accepted cost (owner ruling, #1293):** a `Persistent` entity in the copy no longer matches
  *  its original by guid. (Nothing deduplicates a carried Persistent root against a file since #1863, so
- *  the guid no longer decides anything there.) */
+ *  the guid no longer decides anything there.)
+ *
+ *  ⚠️ **Refuses a scene this build cannot read** (`assertSceneFormatReadable` throws
+ *  `SceneFormatRefusedError`, before anything is minted). The walk below knows where THIS build's
+ *  format defines a guid, and nowhere else: on a too-new file it re-minted the places it knew and
+ *  left the rest, so the copy was half-rewritten and still shared those entities with its original;
+ *  on a too-old or versionless one it rewrote shapes the loader will refuse anyway. Unity's line —
+ *  never re-mint what you cannot read. */
 export function remintSceneEntityGuids(
   scene: Record<string, unknown>,
   genGuid: () => string = randomUUID,
   readPrefab?: PrefabReader,
 ): Record<string, unknown> {
+  assertSceneFormatReadable(scene);
   const remap = new Map<string, string>();
   const define = (g: unknown): void => {
     // durableGuid: a stale RUNTIME guid (#1210) is no identity — the loader derives a distinct one
@@ -493,7 +502,12 @@ export function remintSceneEntityGuids(
  *  another. (`/api/scene-save-as` stamps the same identity on a serialized scene that never was a file.)
  *
  *  A UTF-8 BOM makes JSON.parse throw, and the verbatim fallback then leaves the copy with the ORIGINAL's asset id —
- *  two assets claiming one guid (#1293 review). Parsed past it. */
+ *  two assets claiming one guid (#1293 review). Parsed past it.
+ *
+ *  ⚠️ **A scene gets no verbatim fallback: one this build cannot read THROWS `SceneFormatRefusedError`** — unparsable
+ *  here, too new / too old / versionless / a non-object in `remintSceneEntityGuids`. Copied verbatim, a merge-conflicted
+ *  scene kept its original's asset id and every entity guid; there is no identity of its own to give a file nobody can
+ *  parse, so the copy is refused instead. (A non-scene JSON asset keeps the fallback.) */
 export function withFreshJsonIdentity(
   text: string,
   guid: string,
@@ -502,8 +516,16 @@ export function withFreshJsonIdentity(
   readPrefab?: PrefabReader,
 ): Record<string, unknown> | null {
   let json: unknown;
-  try { json = parseJsonText(text); } catch { return null; }
-  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  try { json = parseJsonText(text); } catch (e) {
+    if (isScene) throw unparsableSceneError(e instanceof Error ? e.message : String(e));
+    return null;
+  }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    // A non-object scene is refused `unreadable` (not-an-object) HERE: the reminter never sees it, and the verbatim
+    // fallback is the shared-identity copy this refusal exists to prevent. Every version verdict is the reminter's.
+    if (isScene) assertSceneFormatReadable(json);
+    return null;
+  }
   const doc = { ...(json as Record<string, unknown>), id: guid };
   return isScene ? remintSceneEntityGuids(doc, genGuid, readPrefab) : doc;
 }
@@ -528,7 +550,9 @@ export function importDecidesIdentity(destUrl: string): boolean {
  *  sorts first, and re-pointing every ref to it at the import.
  *
  *  Anything else — a binary (the scan mints its sidecar), a JSON file the scanner types as no asset or as a kind whose
- *  guid is not in the file, JSON that does not parse — is written exactly as it came. Returns the guid it stamped,
+ *  guid is not in the file, JSON that does not parse — is written exactly as it came. Except a SCENE this build cannot
+ *  read, whenever the import would re-mint it or cannot tell whether it must (unparsable): that throws
+ *  `SceneFormatRefusedError`. A readable-id scene that collides with nothing is kept as it came, whatever its version. Returns the guid it stamped,
  *  when it stamped one, and `id`: the id the written file carries, kept or stamped (absent when it decided nothing). */
 export function importedAssetBytes(
   bytes: Buffer,
@@ -540,7 +564,13 @@ export function importedAssetBytes(
   const { guidTaken, genGuid = randomUUID, readPrefab } = opts;
   const text = bytes.toString('utf-8');
   let own: unknown;
-  try { own = (parseJsonText(text) as { id?: unknown } | null)?.id; } catch { return { bytes }; }
+  try { own = (parseJsonText(text) as { id?: unknown } | null)?.id; } catch (e) {
+    // An unparsable SCENE is refused, not written as it came: whether it collides cannot be decided, and a
+    // merge-conflicted copy of a project scene lands under the original's asset id and entity guids — the copy
+    // `withFreshJsonIdentity` refuses for Duplicate. Any other kind keeps the as-it-came write.
+    if (type === 'scene') throw unparsableSceneError(e instanceof Error ? e.message : String(e));
+    return { bytes };
+  }
   if (typeof own === 'string' && own && !guidTaken(own)) return { bytes, id: own };
   const guid = genGuid();
   const json = withFreshJsonIdentity(text, guid, type === 'scene', genGuid, readPrefab);
@@ -554,21 +584,24 @@ export function importedAssetBytes(
  *  injectable so tests can assert deterministically.
  *
  *  Returns the new GUID, or `null` when the source is JSON that failed to parse
- *  (copied verbatim — the original endpoint's fallback). */
+ *  (copied verbatim — the original endpoint's fallback). Throws `SceneFormatRefusedError`, writing
+ *  nothing, for a scene this build cannot read (`withFreshJsonIdentity`). */
 export function duplicateAssetFile(
   absFrom: string,
   absTo: string,
   genGuid: () => string = randomUUID,
   readPrefab?: PrefabReader,
 ): string | null {
-  const destDir = path.dirname(absTo);
-  if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-
   const newGuid = genGuid();
   const ext = path.extname(absFrom).toLowerCase();
+  // JSON asset: copy + rewrite top-level id (`withFreshJsonIdentity`, shared with import — #1713). Decided BEFORE the
+  // destination folder is made: a scene this build cannot read throws here, and a refused copy leaves nothing behind.
+  const json = ext === '.json'
+    ? withFreshJsonIdentity(fs.readFileSync(absFrom, 'utf-8'), newGuid, absFrom.toLowerCase().endsWith('.scene.json'), genGuid, readPrefab)
+    : undefined;
+  const destDir = path.dirname(absTo);
+  if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
   if (ext === '.json') {
-    // JSON asset: copy + rewrite top-level id (`withFreshJsonIdentity`, shared with import — #1713).
-    const json = withFreshJsonIdentity(fs.readFileSync(absFrom, 'utf-8'), newGuid, absFrom.toLowerCase().endsWith('.scene.json'), genGuid, readPrefab);
     if (!json) { fs.copyFileSync(absFrom, absTo); return null; }
     // Bytes from the one definition (#831) — a copied asset must not be born without the trailing
     // newline every committed asset doc has, or its first edit shows a spurious

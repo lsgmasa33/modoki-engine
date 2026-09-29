@@ -26,6 +26,17 @@ export class SceneFormatRefusedError extends Error {
   }
 }
 
+/** The refusal for a scene file that is not JSON at all (a merge-conflicted file is the commonest).
+ *  The loader's parse fails before this gate can run, so the Node callers that parse the bytes
+ *  themselves (`/api/scene-mutate`, `withFreshJsonIdentity`) state it through here, in one wording. */
+export function unparsableSceneError(detail: string): SceneFormatRefusedError {
+  return new SceneFormatRefusedError(
+    `Scene not loaded: it is not valid JSON (${detail}). The file may be corrupt or hand-edited ` +
+    `incorrectly (e.g. unresolved merge markers).`,
+    'unreadable',
+  );
+}
+
 /** Refuse a scene this build cannot read, whatever the caller. The one gate: both `SceneManager`
  *  (before it acquires a scene's resources) and `loadSceneFile` (for every other caller) call it,
  *  so the two cannot disagree on a verdict.

@@ -222,7 +222,7 @@ describe('duplicateAssetFile', () => {
       // The loader reads a runtime guid as "no guid" and derives a distinct one per row; minting ONE
       // durable guid for the shared value would make both rows answer to it — a same-file collision.
       const RT = '00000000-0000-0001-0000-000000000007';
-      write('rt.scene.json', JSON.stringify({ id: 'o', entities: [
+      write('rt.scene.json', JSON.stringify({ id: 'o', version: 11, entities: [
         { id: 1, traits: { EntityAttributes: { name: 'A', guid: RT } } },
         { id: 2, traits: { EntityAttributes: { name: 'B', guid: RT } } },
       ] }));
@@ -241,7 +241,7 @@ describe('duplicateAssetFile', () => {
     });
 
     it('an own __proto__ key in the document is copied as a field, not applied as a prototype', () => {
-      write('p.scene.json', `{"id":"o","entities":[{"id":1,"traits":{"EntityAttributes":{"guid":"${P}"}}}],"__proto__":{"polluted":true}}`);
+      write('p.scene.json', `{"id":"o","version":11,"entities":[{"id":1,"traits":{"EntityAttributes":{"guid":"${P}"}}}],"__proto__":{"polluted":true}}`);
       duplicateAssetFile(abs('p.scene.json'), abs('p copy.scene.json'), gen);
       const text = read('p copy.scene.json');
       expect(text).toContain('"__proto__"');

@@ -22,6 +22,7 @@ import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { resolveAssetPath, absToAssetUrl, scanAllAssets, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 const ORIGINAL_ID = '11111111-1111-4111-8111-111111111111';
 const UNUSED_ID = '22222222-2222-4222-8222-222222222222';
@@ -103,7 +104,7 @@ describe('/api/import-file: a JSON asset keeps its id unless the project holds i
     expect(readJson('imp/Bare.prefab.json').id).toBe(r.body.guid);
   });
 
-  const scene = (id: string) => ({ id, entities: [
+  const scene = (id: string) => ({ id, version: SCENE_FORMAT_VERSION, entities: [
     { name: 'Parent', traits: { EntityAttributes: { guid: PARENT } } },
     { name: 'Child', parentId: PARENT, traits: { EntityAttributes: { guid: CHILD } } },
   ] });

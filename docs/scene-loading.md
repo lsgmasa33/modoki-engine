@@ -1430,6 +1430,12 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   swapping between the two files spawns it twice. Existing files were deliberately left as they are
   — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
   looks entities up by literal guid, so a DUPLICATE of one of its scenes loses those lookups).
+  **A scene this build cannot read is REFUSED, not reminted** — too new, too old, versionless, or
+  unparsable (`assertSceneFormatReadable` at the top of `remintSceneEntityGuids`; 409
+  `REFUSED_BY_OP`, `scene-format-<kind>`, nothing written). The walk knows where THIS format
+  defines a guid and nowhere else: a v99 copy was observed half-rewritten, still sharing the entity
+  it could not see, and a merge-conflicted one was copied verbatim under every original id. Unity's
+  line — never re-mint what you cannot read. Detail: docs/format-versioning.md § 2b-bis's Scene row.
   **A stored ref to a prefab MEMBER follows too (#1324).** Members are not stored; they derive
   `deriveMemberGuid(anchor, path)` (`core/assetRefRules.ts`, the one spelling of the rule) from the
   now-reminted anchor on load. A ref holding a member's derived guid would otherwise keep the OLD
