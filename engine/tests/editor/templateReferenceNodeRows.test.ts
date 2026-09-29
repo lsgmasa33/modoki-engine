@@ -236,8 +236,8 @@ describe('a template reference node does not pin what its inner prefab put there
 describe('every reader takes a template reference node\'s rows (#1538)', () => {
   const deletesLeaf = () => outer2({ members: { [`/${G_MID_NESTED}/${G_LEAF}`]: { removed: true } } });
 
-  // The runtime loader already folded a node's rows; the editor's own spawn passed them as re-parent statements only.
-  // Mutation: in `editorStructureOps().spawnNestedInstance`, build the layer without `rows: node.members`.
+  // The runtime loader already folded a node's rows; the editor's own spawn passed them as re-parent statements only
+  // (one spawner since #1783). Mutation: in `spawnReferenceNode`, stop handing `members: node.members` to the node's call.
   it('each spawner folds the node\'s rows', async () => {
     install(midDoc());
     await eachExpansion(deletesLeaf(), (where) => expect(inMid('Leaf'), where).toHaveLength(0));

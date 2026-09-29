@@ -477,8 +477,9 @@ export interface ForwardState<D, R> {
  *  `forward` is what the child frame hands ITS nested rows; null without a child document.
  *
  *  The one statement of that step the pure readers share: the editor's effective base (`prefabBase.ts` `foldPath`), the
- *  validator and the UIEntries pool (`effectivePrefabMemberTraits`). The two spawners still state it themselves
- *  (`instantiatePrefabIntoWorld`, the editor's `instantiatePrefab`); a test pins the three against each other. */
+ *  validator and the UIEntries pool (`effectivePrefabMemberTraits`). The spawner still states it itself
+ *  (`instantiatePrefabIntoWorld`, which the editor's `instantiatePrefab` calls since #1783); a test pins the two against
+ *  each other. */
 export function foldRowStep<A extends { parentLocalId: number }, D extends SlotLists<A>, R extends MemberRowChannels<A>>(
   row: FoldRow<A, D, R>,
   state: ForwardState<D, R>,

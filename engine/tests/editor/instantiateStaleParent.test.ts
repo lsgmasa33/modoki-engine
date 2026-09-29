@@ -2,7 +2,7 @@
  *
  *  - `instantiatePrefab` handed a raw parent id no live entity holds REFUSES before it spawns anything. #1793's thrown
  *    redo was exactly that id, recycled by koota during the call's own first pass, so the root was parented under its
- *    own member. And a parent that stops being the same entity during the spawn refuses at the second pass, with what the
+ *    own member. And a parent that stops being the same entity during the spawn refuses once the walk has run, with what the
  *    call spawned taken back out.
  *  - `subtreePaths` (the instantiate undo's guid capture) REFUSES on a parent cycle, naming the entity, where it recursed
  *    until `Maximum call stack size exceeded`. */
@@ -10,16 +10,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 
-/** Runs once, inside `instantiatePrefab`'s first pass (the migration every row goes through): where a spawn could
+/** Runs once, inside the expansion's first pass (the mark reset every spawned row goes through): where a spawn could
  *  change the world under the call. */
 const hook = vi.hoisted(() => ({ during: null as null | (() => void) }));
-vi.mock('../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/runtime/loaders/uiAnchorZIndexMigration')>();
+vi.mock('../../packages/modoki/src/runtime/loaders/overrideMarks', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/runtime/loaders/overrideMarks')>();
   return {
     ...real,
-    migrateUIAnchorZIndexStructured: (...a: Parameters<typeof real.migrateUIAnchorZIndexStructured>) => {
+    clearOverrideMarks: (...a: Parameters<typeof real.clearOverrideMarks>) => {
       const f = hook.during; hook.during = null; f?.();
-      return real.migrateUIAnchorZIndexStructured(...a);
+      return real.clearOverrideMarks(...a);
     },
   };
 });
@@ -79,9 +79,9 @@ describe('instantiatePrefab refuses a raw parent id that is not the live entity 
     expect(names()).toEqual(['A', 'B', 'R', 'X']);
   });
 
-  // Mutation: remove the second-pass check (`sameParent && !sameParent()`) — R is parented under Y, the entity that
-  // took X's recycled id mid-spawn.
-  it('a parent destroyed and its id recycled during the spawn refuses at the second pass, taking the spawned rows back out', () => {
+  // Mutation: remove the after-the-walk check (`findEntity(parentId) !== parentHandle`) — R is parented under Y, the
+  // entity that took X's recycled id mid-spawn.
+  it('a parent destroyed and its id recycled during the spawn refuses once the walk has run, taking the spawned rows back out', () => {
     const x = spawnNamed('X');
     let y = 0;
     hook.during = () => {

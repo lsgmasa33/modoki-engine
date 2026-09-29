@@ -544,10 +544,9 @@ describe('close-out review findings (#1352)', () => {
     expect(performance.now() - t0).toBeLessThan(3000);
   });
 
-  // A token that only a reference node's OWN payload carries (its child prefab holds none). The loader
-  // hands that payload into the node's top call, which notes it; the editor applies it after its top
-  // call closed, so it opens a scope around the whole node. Mutations: no-op the `values` half of
-  // `noteTokens` (the loader stops resolving it); drop the editor's scope in `spawnNestedInstance`.
+  // A token that only a reference node's OWN payload carries (its child prefab holds none). The one spawner
+  // (`spawnReferenceNode`, both sides since #1783) hands that payload into the node's top call, which notes it.
+  // Mutation: no-op the `values` half of `noteTokens` — neither side resolves it.
   it.each([
     ['the scene loader', async () => { await load(twoInstances(MID, 'MidRoot')); }],
     ['the editor instantiate', async () => {

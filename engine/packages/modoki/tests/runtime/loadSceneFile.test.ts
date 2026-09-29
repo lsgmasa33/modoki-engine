@@ -42,7 +42,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => {
     spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
     setStructureCallback: vi.fn(),
     indexEntityGuid: () => {},
-    findEntityById: (_id: number) => undefined,
+    // Finds the entity in the world it is handed: the expansion reaches its rows through this since #1783, and a stub
+    // answering undefined left every walk here with no parent remap and no rootInstanceId, unnoticed.
+    findEntityById: (id: number, world: any = testWorld) => [...world.entities].find((e: any) => e.id() === id),
     findEntityByGuid: (guid: string, world: any = testWorld) => {
       let found: any;
       world.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (!found && ea.guid === guid) found = e; });

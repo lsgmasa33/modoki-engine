@@ -896,9 +896,9 @@ describe('edits inside a USER-ADDED nested instance\'s own nested rows round-tri
   });
 
   // The editor half. `rebuildInstance` (Apply, Revert, a prefab file changing) re-spawns the added
-  // MID from the captured reference node through the editor's own spawn, which must carry the node's
-  // nested channels exactly as the loader does. Mutation: in the editor `spawnNestedInstance`, call
-  // `instantiatePrefab(child, parentEcsId)` without the two channels.
+  // MID from the captured reference node through `spawnReferenceNode` (the loader's own spawner since #1783), which must
+  // carry the node's nested channels. Mutation: in `spawnReferenceNode`, call `instantiatePrefabIntoWorld` without the
+  // two channels.
   it('a rebuild of the outer instance keeps the deletion inside the added instance', async () => {
     await load(withAddedMid());
     deleteEntitiesWithUndo([idAt(LEAF)]);
@@ -1666,7 +1666,7 @@ describe('a pre-Phase-3 nested `moved` map still applies (#1468)', () => {
     return sc as unknown as SceneData;
   };
 
-  // Mutation: stop passing `node.moved` in spawnNestedInstance.
+  // Mutation: stop passing `node.moved` in spawnReferenceNode.
   it('a reference node`s `moved`: its member lands under the named parent', async () => {
     await load(scene([]));
     const panel = guidAt('Holder/OuterRoot/Panel');

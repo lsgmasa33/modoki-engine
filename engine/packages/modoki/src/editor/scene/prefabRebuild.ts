@@ -763,7 +763,7 @@ export function rebuildInstance(
   // The kept structure slots are the OUTERMOST structural layer (layers run innermost first), as a load makes the entry's.
   const forwardedLayers = legacy?.nestedStructure ? [...(forward?.layers ?? []), { slots: legacy.nestedStructure }] : forward?.layers;
   const newRootId = forward || legacy
-    ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), forwardedOverrides, undefined, undefined, forwardedLayers, forward?.forwardRoots ?? [])
+    ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), forwardedOverrides, forwardedLayers)
     : instantiatePrefab(prefab, parentId);
   // Preserve the instance root's stable guid across the teardown+respawn so refs
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the

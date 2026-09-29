@@ -32,7 +32,7 @@ import { markUnresolved } from '../core/unresolvedPrefabRef';
 /** The edit channels a scene entry and an added reference node both carry: the record's substance. */
 const CHANNELS = ['overrides', 'added', 'removed', 'removedTraits', 'moved', 'nestedOverrides', 'nestedStructure', 'members'] as const;
 
-/** A reference node the load could not expand, in the shape both expansion twins share (`AddedEntity`'s subset). */
+/** A reference node the load could not expand, in the shape both structure applies hand it (`AddedEntity`'s subset). */
 export interface UnresolvedNode {
   prefab?: string;
   guid?: string;

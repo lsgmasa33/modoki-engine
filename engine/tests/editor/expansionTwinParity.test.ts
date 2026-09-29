@@ -1,23 +1,26 @@
-/** #1707 — the two EXPANSIONS of a prefab document agree: the runtime's `instantiatePrefabIntoWorld` and the editor's
- *  `instantiatePrefab` (I1's expansion side, docs/prefabs.md § "Model and invariants").
+/** #1707, #1783 — the editor's expansions of a prefab document build what the load builds (I1's expansion side,
+ *  docs/prefabs.md § "Model and invariants").
  *
- *  The editor walk is a twin of the runtime one, and #1683 found it dropping what the runtime hands a nested row. This
- *  pins the two against each other in their real callers' shapes, over one matrix of channels:
- *    - TOP: a prefab dropped into the scene (the editor's plain top call) against the runtime's top call;
- *    - NODE: a scene-form reference node re-expanded by the editor (`spawnNestedInstance`, which every rebuild, Apply
- *      and Revert of the instance around it runs) against the runtime's expansion of the same node;
+ *  Until #1783 the editor carried its own copy of the runtime's walk (`instantiatePrefabIntoWorld`), and #1683 found it
+ *  dropping what the runtime hands a nested row. This pinned the two against each other through the unification; since
+ *  it, `instantiatePrefab` CALLS the runtime walk, so what this compares is each editor caller of it against the load, in
+ *  the real callers' shapes, over one matrix of channels:
+ *    - TOP: a prefab dropped into the scene against the runtime's top call — the editor's wrapper (its cache, #1793's
+ *      guards, the dirty marks) and nothing else;
+ *    - NODE: a scene-form reference node re-expanded by the editor's structure apply (`applyStructureByRootInstance`,
+ *      which every rebuild, Apply and Revert of the instance around it runs: its own row domain and ops, the shared
+ *      `spawnReferenceNode`) against the runtime's expansion of the same node;
  *    - REFRESH: a nested frame rebuilt under what its enclosing layers forward (`frameForward`, #1737) against the load
  *      that built it.
- *  Each is compared as a TREE after the derive: every entity by guid, its parent's guid, and every trait's data. What
- *  that cannot see (trait spawn order, dirty marks, how `noteFrameDoc` is keyed, the move queue's order) is listed as
- *  harness-blind in the unification's issue. This is the before/after pin for that unification.
+ *  Each is compared as a TREE after the derive: every entity by guid, its parent's guid, and every trait's data. The
+ *  "#1783" describe gives each difference the unification's issue listed as blind a case of its own (row numbers are
+ *  that table's).
  *
- *  Found red by it, both at the editor's nested-row apply, which is where the frame's removals run: a slot's `moved` (a
- *  pre-v5 member's move, `InstanceStructure.unrowed`) was dropped, so the member went back to its row on every rebuild of
- *  the instance around the node; and the outermost layer's member rows were not handed down, so a member moved OUT from
- *  under a member the frame removes was deleted with it (close-out review 2 — the first version of this matrix had no
- *  such case and "measured" passing the rows as changing nothing). The last describe drives both through the real
- *  path: a scene load, then a Refresh of the host that rebuilds the node. */
+ *  Found red by it (#1707), both at the editor's own nested-row apply, which is where the frame's removals ran: a slot's
+ *  `moved` (a pre-v5 member's move, `InstanceStructure.unrowed`) was dropped, so the member went back to its row on
+ *  every rebuild of the instance around the node; and the outermost layer's member rows were not handed down, so a
+ *  member moved OUT from under a member the frame removes was deleted with it. The last describe drives both through the
+ *  real path: a scene load, then a Refresh of the host that rebuilds the node. */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
@@ -220,11 +223,89 @@ describe('#1707: the editor and runtime expansions build the same tree', () => {
   }
 
   it('NODE, pre-v5 slot move: the moved member sits where the runtime puts it (the case #1707 found red)', () => {
-    // Mutation: drop `moved: structDirect?.moved` from the editor's nested-row apply (`instantiatePrefab`) — A goes
-    // back under R in the editor tree only.
+    // Since #1783 the nested-row apply is the runtime's: drop `moved: structDirect.moved` from its child call and both
+    // trees lose it, so the runtime assertion below goes red with the editor one.
     const { runtime, editor } = both(NODE_CASES['a nestedStructure slot moving a nested member (pre-v5 carrier)']!);
     expect(parentName(runtime, 'A')).toBe('OR');
     expect(parentName(editor, 'A')).toBe('OR');
+  });
+});
+
+// ── #1783: the differences the unification's issue listed as harness-blind, each given a case ─────────────────────
+describe('#1783: the listed blind differences, pinned', () => {
+  /** TOP on both sides over the documents `docs` installs, with each side's tree. */
+  const top = (...docs: Array<{ id: string }>) => {
+    install(...docs);
+    const runtime = runtimeTop();
+    fresh();
+    return { runtime, editor: editorTop() };
+  };
+  const named = (t: ReturnType<typeof tree>, n: string) => Object.values(t).find((x) => (x.EntityAttributes as { name?: string }).name === n)!;
+
+  it('row 7: a member token on a nested row\'s override and on a template row\'s own member resolve alike', () => {
+    const p = pDoc();
+    (p.entities[3] as { overrides: Record<number, object> }).overrides = { 2: { Transform: { x: 4 }, UIFocusable: { navDown: '@member:2' } } };
+    (p.entities[1]!.traits as Record<string, object>).UIFocusable = { navDown: '@member:2.3' };
+    const { runtime, editor } = top(p);
+    expect(editor).toEqual(runtime);
+    // Not inert: both tokens resolved, to the guids of the members they name.
+    expect((named(runtime, 'M').UIFocusable as { navDown: string }).navDown).toBe(Object.keys(runtime).find((k) => named(runtime, 'M') === runtime[k]));
+    expect((named(runtime, 'A').UIFocusable as { navDown: string }).navDown).toBe(Object.keys(runtime).find((k) => named(runtime, 'B') === runtime[k]));
+  });
+
+  it('row 8: prefab moves of one member at two levels — the outermost wins on both sides', () => {
+    const p = { ...pDoc(), moved: { '2.3': '@member:4' } }; // P: B under C
+    const o = { ...oDoc(), moved: { '2.2.3': '@member:2.4.2' } }; // O: B under M, through N and C
+    const { runtime, editor } = top(p, o);
+    expect(editor).toEqual(runtime);
+    expect(parentName(runtime, 'B')).toBe('M');
+  });
+
+  it('row 10: a row carrying no trait the registry knows spawns alike', () => {
+    const p = pDoc();
+    p.entities.push({ localId: 5, name: 'Bare', nodeGuid: g(11), traits: { NoSuchTrait: { a: 1 } } } as never);
+    const { runtime, editor } = top(p);
+    // The row spawns as a PrefabInstance-only member with no EntityAttributes of its own, so its guid is a RUNTIME one
+    // (#1210), made from its ECS id, which two fresh worlds number differently: compared by its row instead.
+    const bare = (t: ReturnType<typeof tree>) => {
+      const keys = Object.keys(t).filter((k) => (t[k]!.PrefabInstance as { localId?: number } | undefined)?.localId === 5
+        && (t[k]!.PrefabInstance as { source?: string }).source === P);
+      expect(keys).toHaveLength(1);
+      const { [keys[0]!]: row, ...rest } = t;
+      return { row: { ...row, EntityAttributes: { ...(row!.EntityAttributes as object), guid: '<runtime>' } }, rest };
+    };
+    expect(bare(editor)).toEqual(bare(runtime));
+  });
+
+  it('row 11: a document with no rootLocalId expands from row 1 on both sides', () => {
+    // Red before #1783: the editor read `prefab.rootLocalId` bare, returned 0 after spawning every row, and left them in
+    // the scene under no instance. `expandsToRoot` and the runtime read it as 1.
+    const o = oDoc();
+    delete (o as { rootLocalId?: number }).rootLocalId;
+    const { runtime, editor } = top(o);
+    expect(Object.keys(runtime)).toHaveLength(7);
+    expect(editor).toEqual(runtime);
+  });
+
+  it('row 12: a nested row whose document is not cached leaves the same tree', () => {
+    prefabs.delete(Q); setPrefabCache(Q, null);
+    const runtime = runtimeTop();
+    fresh();
+    const editor = editorTop();
+    expect(Object.values(runtime).some((t) => (t.EntityAttributes as { name?: string }).name === 'M')).toBe(false);
+    expect(editor).toEqual(runtime);
+  });
+
+  it('row 1: the editor expands a nested row from the EDITOR cache when the two caches disagree', () => {
+    // The editor's cache is the one it means: it parks a dirty document until Save (#1868), which the runtime cache never
+    // sees. Mutation: read nested rows from the runtime cache in the editor walk — M comes back without Rotate3D.
+    const edited = qDoc();
+    (edited.entities[1]!.traits as Record<string, object>).Rotate3D = { axis: 'x', speed: 3 };
+    setPrefabCache(Q, edited as never);
+    prefabs.set(Q, qDoc()); // `setPrefabCache` seats the runtime side too; put the runtime's older copy back
+    const id = instantiatePrefab(prefabs.get(O) as never);
+    setPrefabSource(id, { id: O });
+    expect(named(tree(), 'M').Rotate3D).toMatchObject({ axis: 'x', speed: 3 });
   });
 });
 
@@ -270,6 +351,22 @@ describe('#1707: a Refresh of a nested frame rebuilds it as the load built it (f
       expect(refreshed).toEqual(tree());
     });
   }
+
+  it('row 7 (#1783): a member token in a FORWARDED layer resolves in the rebuilt frame as the load resolves it', async () => {
+    // O's row N states a token on M through a member row, which only the forward state hands the rebuilt P frame. The
+    // rebuild's top call has to note it, or the frame is never queued for resolution and the token stays raw.
+    const o = oDoc();
+    (o.entities[1] as { members: Record<string, { traits: object }> }).members[`/${gC}/${gM}`] = { traits: { Transform: { y: 8 }, UIFocusable: { navDown: '@member:2' } } };
+    install(o);
+    await load(sceneOf());
+    const navDown = () => (Object.values(tree()).find((t) => (t.EntityAttributes as { name?: string }).name === 'M')!.UIFocusable as { navDown: string }).navDown;
+    expect(navDown()).not.toMatch(/^@member:/); // not inert: the load resolved it
+    install(rootX(pDoc()));
+    expect(await rebaseStaleInstances()).toBeGreaterThan(0);
+    const refreshed = tree();
+    await load(sceneOf());
+    expect(refreshed).toEqual(tree());
+  });
 
   it('a row the template GAINS: the new frame gets what O\'s row states in it, as a load of the new P gives it', async () => {
     // A frame the Refresh GAINS has no live capture at all, and gets O's statements in it (N's `nestedOverrides` and member
@@ -317,8 +414,8 @@ describe('#1707: a host Refresh keeps what the scene stated inside the reference
   for (const [name, { channels, docs, check }] of Object.entries(cases)) {
     it(name, async () => {
       if (docs) install(...docs());
-      // Mutations: drop `moved: structDirect?.moved` (the first goes red) or `members` (the second) from the editor's
-      // nested-row apply in `instantiatePrefab`.
+      // Mutations: drop `moved: structDirect.moved` (the first goes red) or `members: childMembers` (the second) from the
+      // expansion's nested-row call in `instantiatePrefabIntoWorld`.
       await load(hostScene(channels));
       check(tree());
       install(hGained());
@@ -333,8 +430,9 @@ describe('#1707: a host Refresh keeps what the scene stated inside the reference
 
 // ── #1812: the frame RECORD, which the tree comparison above cannot see ──────────────────────────
 describe('#1812: both expansions record the same rows they could not expand, on the same frames', () => {
-  // The save reads `FrameRootRecord.unexpanded` to tell a row the frame never had from one the user removed, so the two
-  // expansions must write it alike. Mutation: record `[]` in either twin's `noteFrameDoc` — the missing-Q cases differ.
+  // The save reads `FrameRootRecord.unexpanded` to tell a row the frame never had from one the user removed, so the
+  // editor's expansions must write it as the load does. Mutation: record `[]` in the expansion's `noteFrameDoc` — the
+  // missing-Q cases lose C from both sides, and the "not inert" assertion goes red.
   /** Every frame root's record, by the root's guid: what it says it could not expand. */
   const records = (): Record<string, readonly number[] | undefined> => {
     const world = getCurrentWorld();

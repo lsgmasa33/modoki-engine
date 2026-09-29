@@ -60,6 +60,8 @@ let testWorld: ReturnType<typeof createWorld>;
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: vi.fn(),
+  // No index here: the lookup the expansion makes since #1783 finds the entity in the world it is handed.
+  findEntityById: (id: number, world: any) => [...world.entities].find((e: any) => e.id() === id),
   spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
   setStructureCallback: vi.fn(),
 }));

@@ -373,17 +373,17 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   `added`, anchored at the member's localId (not as a standalone scene entry).
 - **Expand on load.** `applyStructureByRootInstance` (editor) /
   `applyStructureByLocalToEcs` (runtime) detect `node.prefab` and **expand the child
-  prefab** as a nested instance under the anchor — `instantiatePrefab(child, anchor)`
-  / `instantiatePrefabIntoWorld(world, child, anchor, …)` — replaying its
-  overrides/structure. The spawned root keeps `parentLocalId 0`, so the next capture
+  prefab** as a nested instance under the anchor — both through `spawnReferenceNode`, which calls
+  `instantiatePrefabIntoWorld(world, child, anchor, …)` with the node's channels (#1783), each side reading its own
+  prefab cache. The spawned root keeps `parentLocalId 0`, so the next capture
   re-detects it as user-added — idempotent, because an unstamped instance is never
   taken for a row (#1367; see [the partition](#which-instance-is-a-rows-own-expansion)).
 - **Its own nested rows.** The node is the outermost layer for everything under it, so it
   carries that interior's scene edits itself: `nestedOverrides` and `nestedStructure`,
   path-keyed from the node's own prefab, written by the same `captureNestedChannels` walk a
   top-level entry uses (#1369). Before that, an edit inside the row expansion of a dragged-in
-  prefab was captured by nothing and came back on reload. Both expansion paths forward both
-  channels (`spawnNestedInstance` in the loader and in the editor).
+  prefab was captured by nothing and came back on reload. The one reference-node spawner
+  (`spawnReferenceNode`, which both structure applies run) forwards both channels.
 - **Rebuilds.** `rebuildInstance` re-spawns the node whole from the captured structure, so its
   live re-apply (`captureNestedInstanceOverrides`) skips every instance whose chain passes
   through a user-added root. It used to visit them too and apply their structure a second
@@ -1499,9 +1499,9 @@ frame: the shape of the document-level `moved`, for the node.
   disagree. The base is the node's prefab's own `moved` plus its nested frames' moves. The node's own
   statement is left out of the base (`nodeFrame`), just as `serializePrefab` leaves out the written
   root's own.
-- **Read.** Both spawners (the runtime `spawnNestedInstance` and the editor twin) queue it with
-  `queuePrefabMoves` after the node's prefab has queued its own `moved`, so the node's moves win. They
-  also record it on the root's frame record (`noteNodeMoves` → `FrameRootRecord.nodeMoved`). The record
+- **Read.** The one reference-node spawner (`spawnReferenceNode`, the loader's and the editor's) queues it with
+  `queuePrefabMoves` after the node's prefab has queued its own `moved`, so the node's moves win. It
+  also records it on the root's frame record (`noteNodeMoves` → `FrameRootRecord.nodeMoved`). The record
   sits beside the document, not merged into it, so the stale-frame compare (#1483) still sees the
   document alone. The #1483 carry copies the record whole.
 - **One answer to "which moves are the template's here".** `frameMovesOf(root, doc)` is the document's

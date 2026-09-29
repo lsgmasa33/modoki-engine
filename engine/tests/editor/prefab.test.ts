@@ -18,6 +18,7 @@ import {
   collectPreservedLocalIds,
   resolveReturnScene,
 } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 
 registerAllTraits();
 
@@ -186,38 +187,32 @@ describe('instantiatePrefab', () => {
     expect(childEa!['parentId']).toBe(rootId);
   });
 
-  // Close-out (2026-09-05, #762 follow-up fallout): every RAW-fetched instantiate path
-  // (Assets.tsx/Hierarchy.tsx/Inspector.tsx) hands its prefab straight to instantiatePrefabAsync
-  // → instantiatePrefab WITHOUT going through getPrefabSource, which is where the migration used
-  // to live exclusively — so a raw-fetched prefab authoring UIAnchor.zIndex spawned with the key
-  // silently dropped (koota's generated setter ignores an unknown field) instead of landing on
-  // UIElement.zIndex. instantiatePrefab's spawn loop now runs the migration itself.
-  it('migrates UIAnchor.zIndex onto UIElement.zIndex at spawn time', () => {
-    const prefab: PrefabFile = {
-      version: 1,
-      name: 'ZIndexTest',
-      rootLocalId: 1,
-      entities: [
-        {
-          localId: 1, name: 'Root',
-          traits: {
-            UIAnchor: { zIndex: 20 } as unknown as Record<string, unknown>,
-            UIElement: { zIndex: 0 } as unknown as Record<string, unknown>,
-            EntityAttributes: { name: 'Root', parentId: 0, layer: 'ui' },
-          },
-        },
-      ],
+  // Close-out (2026-09-05, #762 follow-up fallout): a RAW-fetched instantiate path handed its prefab straight to the
+  // spawn WITHOUT going through getPrefabSource, where the migration used to live exclusively, so a prefab authoring
+  // UIAnchor.zIndex spawned with the key silently dropped (koota's generated setter ignores an unknown field). The spawn
+  // migrated rows itself until #1783 made the expansion the runtime's; the one raw read left, the placement's
+  // (`placePrefabFromPath`: the Hierarchy drop, the Assets and Inspector buttons), migrates now, as every read does.
+  it('migrates UIAnchor.zIndex onto UIElement.zIndex when a placement reads the file', async () => {
+    const PATH = '/zindex-test.prefab.json';
+    const prefab = {
+      id: 'cccccccc-0000-4000-8000-000000017830', version: 1, name: 'ZIndexTest', rootLocalId: 1,
+      entities: [{
+        localId: 1, name: 'Root',
+        traits: { UIAnchor: { zIndex: 20 }, UIElement: { zIndex: 0 }, EntityAttributes: { name: 'Root', parentId: 0, layer: 'ui' } },
+      }],
     };
-
-    const rootId = instantiatePrefab(prefab);
-    expect(rootId).toBeGreaterThan(0);
-
-    const uiElementMeta = getTraitByName('UIElement')!;
-    const uiAnchorMeta = getTraitByName('UIAnchor')!;
-    expect(readTraitData(rootId, uiElementMeta)!['zIndex']).toBe(20);
-    // UIAnchor.zIndex no longer exists on the trait at all — the koota schema has no such field —
-    // so there is nothing to assert it was "cleared" beyond the element having picked it up.
-    expect(uiAnchorMeta.fields['zIndex']).toBeUndefined();
+    registerAsset(prefab.id, PATH, 'prefab');
+    vi.stubGlobal('fetch', async (p: string) => (p === PATH
+      ? { ok: true, status: 200, json: async () => structuredClone(prefab), text: async () => JSON.stringify(prefab) }
+      : { ok: false, status: 404, json: async () => ({}), text: async () => '' }));
+    try {
+      // Mutation: drop the migration from `readPrefabFile` — zIndex reads 0.
+      const rootId = await placePrefabFromPath(PATH, { tag: 'test' });
+      expect(rootId).toBeGreaterThan(0);
+      expect(readTraitData(rootId!, getTraitByName('UIElement')!)!['zIndex']).toBe(20);
+      // UIAnchor.zIndex no longer exists on the trait at all — the koota schema has no such field.
+      expect(getTraitByName('UIAnchor')!.fields['zIndex']).toBeUndefined();
+    } finally { vi.unstubAllGlobals(); }
   });
 });
 

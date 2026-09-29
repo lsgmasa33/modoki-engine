@@ -810,7 +810,7 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     // v3 arrived in #762/#762-follow-up (UIAnchor.zIndex removed, folded into UIElement.zIndex)
     // and it is safe to preserve-the-higher-number here: v3 only DROPS a trait field, it does
     // not change the entity shape (see the v1/v2/v3 note on PREFAB_FORMAT_VERSION above), and
-    // every load path (getPrefabSource/fetchPrefab/instantiatePrefab) runs
+    // every load path (getPrefabSource/fetchPrefab, the placement's readPrefabFile) runs
     // migrateUIAnchorZIndexStructured unconditionally on every entity regardless of the stamped
     // version. So a v2-labelled-as-v3 merge here is never actually read as v2 semantics — the
     // migration re-applies (idempotently) the next time anything loads it. A hypothetical v4

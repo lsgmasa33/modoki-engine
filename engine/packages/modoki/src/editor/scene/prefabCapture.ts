@@ -1526,7 +1526,7 @@ export function subtractChainOverrides(
  *  - a member row's `name` (a row holding nothing else goes; a `parent`, a move, stays);
  *  - its own `name`, which no spawn applies (the root is named by the child prefab), so that goes from both sides;
  *  - its own `traits` and `children`, which no spawn reads either (`applyStructureCore` hands a reference node to
- *    `spawnNestedInstance` before its trait loop, and neither twin walks its children; the root's pose rides in
+ *    `spawnNestedInstance` before its trait loop, and the one spawner, `spawnReferenceNode`, never walks its children; the root's pose rides in
  *    `overrides`). The live capture always writes them empty, so a template node that carried either (hand- or
  *    agent-written) never equalled it and was restated on every save, whole list and siblings with it (#1536).
  *  A `nestedStructure` slot's absent list is written as empty, which is how the loader reads it (`structDirect`).

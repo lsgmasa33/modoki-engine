@@ -560,10 +560,10 @@ export function applyOverridesByLocalToEcs(
   overrides: Record<number, Record<string, Record<string, unknown>>>,
 ): void {
   if (!overrides || Object.keys(overrides).length === 0) return;
-  // Map ecsId → entity handle so we can add traits the instance gained beyond the
-  // prefab (added-trait overrides), not just set fields on traits it already has.
-  const ecsToEntity = new Map<number, { id(): number; has(t: unknown): boolean; get(t: unknown): unknown; set(t: unknown, d: unknown): void; add(i: unknown): void }>();
-  for (const e of world.entities) ecsToEntity.set((e as { id(): number }).id(), e as never);
+  // The entity handle, so we can add traits the instance gained beyond the prefab (added-trait overrides), not just set
+  // fields on traits it already has. Through the entity index every spawn populates: a map built by scanning the world
+  // made each override-carrying frame cost the whole world (#1783, measured with the editor on this walk).
+  const ecsToEntity = { get: (id: number) => findEntityById(id, world) as EntityHandle | undefined };
 
   for (const [localIdStr, traitMap] of Object.entries(overrides)) {
     const localId = Number(localIdStr);
@@ -693,10 +693,10 @@ export function prefabSubtreeLocalIds(prefab: PrefabLike, rootLocalId: number): 
  *  add order) is shared in `applyStructureCore` so the two paths can never drift.
  *  F7 from PREFAB_REVIEW: this is the "WorldOps shim" the prior review punted on.
  *
- *  The editor passes `getCurrentWorld()`-backed ops (deleteEntities, findEntity,
- *  registerEntity, its 4-call nested-instance expansion, markStructureDirty/UI);
- *  the runtime passes koota-`world`-direct ops (destroyEntity over the ECS-parent subtree of the mapped ids, byId map, the single
- *  instantiatePrefabIntoWorld call). `log` keeps each side's existing warn prefix. */
+ *  The editor passes `getCurrentWorld()`-backed ops (its `deleteEntities`, which ends frames, and markStructureDirty/UI);
+ *  the runtime passes koota-`world`-direct ops (destroyEntity over the ECS-parent subtree of the mapped ids). Both expand a
+ *  reference node through the one `spawnReferenceNode` (#1783), each reading its own cache. `log` keeps each side's warn
+ *  prefix. */
 export interface StructureApplyOps {
   /** Delete these ECS ids and their ECS-parent subtrees. The ids already include the prefab subtree's mapped
    *  members; the cascade adds what the map cannot reach — a nested instance's own members (#1247). Both
@@ -1048,16 +1048,9 @@ export function applyStructureByLocalToEcs(
   structure: InstanceStructureData,
   /** `instantiatePrefabIntoWorld`'s cycle stack, holding `prefab` (I16, #1817). */
   stack?: ReadonlySet<string>,
+  /** The cache a reference node's document is read from — the runtime's, or the editor's for its expansion (#1783). */
+  read: ExpansionReader = readRuntimeTemplateDoc,
 ): void {
-  // Lazily build an id → handle map only when a removal/component pass needs it.
-  let byId: Map<number, EntityHandle> | null = null;
-  const handleById = (): Map<number, EntityHandle> => {
-    if (!byId) {
-      byId = new Map<number, EntityHandle>();
-      for (const e of world.entities) byId.set((e as EntityHandle).id(), e as EntityHandle);
-    }
-    return byId;
-  };
 
   applyStructureCore(
     {
@@ -1080,57 +1073,64 @@ export function applyStructureByLocalToEcs(
         const doomed = [...world.entities].filter((e) => toDelete.has((e as EntityHandle).id()));
         for (const e of doomed) destroyEntity(e, world);
       },
-      findEntity: (ecsId) => handleById().get(ecsId),
+      findEntity: (ecsId) => findEntityById(ecsId, world) as EntityHandle | undefined,
       spawnAdded: (traitArgs) => {
         const entity = spawnEntity(world, ...(traitArgs as Parameters<typeof world.spawn>));
         return entity.id();
       },
-      spawnNestedInstance: (node, parentEcsId, ancestors) => {
-        // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
-        if (refuseCyclicReferenceNode(ancestors, node, readRuntimeTemplateDoc, '[loadSceneFile]')) return;
-        const child = getCachedPrefab(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
-        // One that loads but expands to no root is kept the same way (#1768).
-        if (!child || !expandsToRoot(child, readRuntimeTemplateDoc)) {
-          console.warn(`[loadSceneFile] added nested instance not cached, or expands to no root: ${node.prefab}`);
-          // A placeholder carrying the node, so the next save writes it back verbatim (#1699).
-          spawnUnresolvedReference(world, node, parentEcsId);
-          return;
-        }
-        const rootEcsId = instantiatePrefabIntoWorld(
-          world, child, parentEcsId, undefined, node.prefab, node.overrides,
-          // The self-containing ancestors carried on, so a loop through two or more documents still meets its own start
-          // and is refused above, instead of recursing until the stack overflows.
-          { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, stackForReferenceNode(ancestors, readRuntimeTemplateDoc), node.nestedOverrides,
-          node.nestedStructure,
-        );
-        // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
-        // serialized with its guid right here in the `added[]` entry — the same way a
-        // TOP-LEVEL instance root carries `SceneEntityEntry.guid`, which the loader hands
-        // to `onInstantiatePrefab` as `rootGuid`. This path had no equivalent, so the
-        // expanded root came out guid-less and `deriveInstanceMemberGuids` minted a fresh
-        // derived one: the entity survived the reload with the right parent, traits and
-        // overrides, under a DIFFERENT guid. Every external reference to it (an agent's
-        // captured address, a cross-entity ref) went stale on the next load with no error,
-        // against the engine's own "guid is the stable anchor" contract. Stamped before
-        // `deriveInstanceMemberGuids` runs, so this instance's MEMBERS also derive off the
-        // stable root guid instead of off a fresh one.
-        if (rootEcsId && node.guid) applyRootGuid(world, rootEcsId, node.guid);
-        // A reference node written into a TEMPLATE has no guid to restore — its root derives one per
-        // instance from the key, like a keyed plain node (#1387). A node carrying both keeps both (#1567).
-        if (rootEcsId && node.key) setTemplateKey(findEntityById(rootEcsId, world) as EntityHandle | undefined, node.key);
-        // The node's own moves, queued after its prefab's (which `instantiatePrefabIntoWorld` just queued), so they win (#1543).
-        if (rootEcsId && node.templateMoved) {
-          queuePrefabMoves(world, rootEcsId, node.templateMoved, '[loadSceneFile]');
-          const root = findEntityById(rootEcsId, world);
-          if (root) noteNodeMoves(world, root as Entity, node.prefab!, child as TemplateDoc, node.templateMoved);
-        }
-      },
+      spawnNestedInstance: (node, parentEcsId, ancestors) => spawnReferenceNode(world, node, parentEcsId, ancestors, read),
     },
     localToEcs,
     prefab,
     structure,
     stack,
   );
+}
+
+/** Expand a structure's REFERENCE node (`node.prefab`) under `parentEcsId`: a user-added nested instance, with its own
+ *  channels handed into its top call. The ONE spawner of a reference node — the loader's structure apply and the
+ *  editor's (`applyStructureByRootInstance`) both run it (#1783), each with the cache it reads documents from. */
+export function spawnReferenceNode(
+  world: World, node: AddedEntity, parentEcsId: number, ancestors: ReadonlySet<string>, read: ExpansionReader = readRuntimeTemplateDoc,
+): void {
+  // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
+  if (refuseCyclicReferenceNode(ancestors, node, read, '[loadSceneFile]')) return;
+  const child = read(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
+  // One that loads but expands to no root is kept the same way (#1768).
+  if (!child || !expandsToRoot(child, read)) {
+    console.warn(`[loadSceneFile] added nested instance not cached, or expands to no root: ${node.prefab}`);
+    // A placeholder carrying the node, so the next save writes it back verbatim (#1699).
+    spawnUnresolvedReference(world, node, parentEcsId);
+    return;
+  }
+  const rootEcsId = instantiatePrefabIntoWorld(
+    world, child, parentEcsId, undefined, node.prefab, node.overrides,
+    // The self-containing ancestors carried on, so a loop through two or more documents still meets its own start
+    // and is refused above, instead of recursing until the stack overflows.
+    { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, stackForReferenceNode(ancestors, read), node.nestedOverrides,
+    node.nestedStructure, { read },
+  );
+  // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
+  // serialized with its guid right here in the `added[]` entry — the same way a
+  // TOP-LEVEL instance root carries `SceneEntityEntry.guid`, which the loader hands
+  // to `onInstantiatePrefab` as `rootGuid`. This path had no equivalent, so the
+  // expanded root came out guid-less and `deriveInstanceMemberGuids` minted a fresh
+  // derived one: the entity survived the reload with the right parent, traits and
+  // overrides, under a DIFFERENT guid. Every external reference to it (an agent's
+  // captured address, a cross-entity ref) went stale on the next load with no error,
+  // against the engine's own "guid is the stable anchor" contract. Stamped before
+  // `deriveInstanceMemberGuids` runs, so this instance's MEMBERS also derive off the
+  // stable root guid instead of off a fresh one.
+  if (rootEcsId && node.guid) applyRootGuid(world, rootEcsId, node.guid);
+  // A reference node written into a TEMPLATE has no guid to restore — its root derives one per
+  // instance from the key, like a keyed plain node (#1387). A node carrying both keeps both (#1567).
+  if (rootEcsId && node.key) setTemplateKey(findEntityById(rootEcsId, world) as EntityHandle | undefined, node.key);
+  // The node's own moves, queued after its prefab's (which `instantiatePrefabIntoWorld` just queued), so they win (#1543).
+  if (rootEcsId && node.templateMoved) {
+    queuePrefabMoves(world, rootEcsId, node.templateMoved, '[loadSceneFile]');
+    const root = findEntityById(rootEcsId, world);
+    if (root) noteNodeMoves(world, root as Entity, node.prefab!, child as TemplateDoc, node.templateMoved);
+  }
 }
 
 type PrefabFileEntry = {
@@ -1791,13 +1791,13 @@ function rebaseStructureTokens(structure: InstanceStructureData, segments: reado
  *  reference node's expansion is a top call of its own inside another. */
 let tokenScope: { seen: boolean } | null = null;
 /** Open a top call's scope; returns the enclosing one, for `closeTokenScope` to restore. */
-export function openTokenScope(): { prev: { seen: boolean } | null } {
+function openTokenScope(): { prev: { seen: boolean } | null } {
   const prev = tokenScope;
   tokenScope = { seen: false };
   return { prev };
 }
 /** Close it, restoring the enclosing scope; true when a token was seen. */
-export function closeTokenScope(scope: { prev: { seen: boolean } | null }): boolean {
+function closeTokenScope(scope: { prev: { seen: boolean } | null }): boolean {
   const seen = !!tokenScope?.seen;
   tokenScope = scope.prev;
   return seen;
@@ -1815,8 +1815,7 @@ export function noteTokens(entities: object | undefined, ...values: unknown[]): 
 }
 
 const pendingFrames = new WeakMap<World, number[]>();
-/** Queue a top instantiate call's root for member-token resolution. The next derive pass resolves it.
- *  Exported for the editor's `instantiatePrefab`, the other expansion of the same files. */
+/** Queue a top instantiate call's root for member-token resolution. The next derive pass resolves it. */
 export function registerTemplateFrame(world: World, rootEcsId: number): void {
   const list = pendingFrames.get(world);
   if (list) list.push(rootEcsId);
@@ -1882,6 +1881,26 @@ function resolveTemplateFrames(world: World): void {
 
 const readRuntimeTemplateDoc = (source: string) => getCachedPrefab(source) as TemplateDoc | undefined;
 
+/** What `instantiatePrefabIntoWorld` expands with, beyond the channels it applies. The ONE expansion of a prefab
+ *  document: the editor's `instantiatePrefab` is a caller of it, not a twin (#1783). */
+export interface PrefabExpansion {
+  /** The cache a nested row's or reference node's document is read from. The runtime's by default; the editor passes its
+   *  own, which holds a document edited and not yet saved (#1868). */
+  read?: ExpansionReader;
+  /** The structural LAYERS reaching this frame, innermost first (#1533). A top call builds one from `structure.members`
+   *  and `nestedStructure`; each nested row adds its own (`descendStructureLayers`). Passed from outside, by a rebuild,
+   *  they are what the frames ENCLOSING the instance forward into it (#1737). */
+  layers?: StructureLayer<NestedStructureDelta, SceneMemberRow>[];
+  /** The first of `layers` whose direct rows fold at this frame; the ones before it only forward (the recursion's, from
+   *  `descendStructureLayers`). A fold at a top call lands only in the `structure` it was handed. */
+  foldFrom?: number;
+  /** This instance's path from the TOP call's root, one segment per nesting level (#1352) — the recursion's. Absent on a
+   *  top call, which registers its root for member-token resolution. Every value applied is rebased onto it. */
+  segments?: MemberStep[][];
+}
+/** A document reader for the expansion: a prefab ref to its document, or nothing when it is not cached. */
+export type ExpansionReader = (ref: string) => TemplateDoc | null | undefined;
+
 export function instantiatePrefabIntoWorld(
   world: World,
   prefab: { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string; moved?: Record<string, string> },
@@ -1899,20 +1918,13 @@ export function instantiatePrefabIntoWorld(
    *  and forwarded exactly like `nestedOverrides` (#1358). Merged UNDER the row's own
    *  `added`/`removed`/`removedTraits` as the row expands — see the merge at the recursion. */
   nestedStructure?: NestedStructurePaths,
-  /** This instance's path from the TOP instantiate call's root, one segment per nesting level (#1352).
-   *  Absent on a top call, which registers its root for member-token resolution. Every value this call
-   *  applies is rebased onto it (`rebaseMemberTokens`). */
-  _segments?: MemberStep[][],
-  /** The structural LAYERS reaching this frame, innermost first (#1533) — set by the recursion only. A
-   *  top call has one, built from `structure.members` and `nestedStructure`; each nested row it expands
-   *  adds its own (`descendStructureLayers`). */
-  _layers?: StructureLayer<NestedStructureDelta, SceneMemberRow>[],
-  /** The first of `_layers` whose direct rows fold at this frame (`descendStructureLayers`). */
-  _foldFrom = 0,
+  /** How to expand — see {@link PrefabExpansion}. A load, a pool and a timeline clip pass nothing. */
+  expand: PrefabExpansion = {},
 ): number {
+  const { read = readRuntimeTemplateDoc, segments: _segments, layers: _layers, foldFrom: _foldFrom = 0 } = expand;
   // A document with no root to expand spawns NOTHING (#1768): its rows used to spawn parentless, under no instance,
   // and the next save wrote them as unrelated entities. Every caller already reads 0 as "nothing spawned".
-  if (!expandsToRoot(prefab, readRuntimeTemplateDoc, _stack)) {
+  if (!expandsToRoot(prefab, read, _stack)) {
     console.warn(`[loadSceneFile] prefab ${prefab.id ?? source ?? '(unnamed)'} expands to no root; nothing spawned`);
     return 0;
   }
@@ -1937,7 +1949,8 @@ export function instantiatePrefabIntoWorld(
   // A TOP call opens a token scope; nested calls report into it (#1352 review: resolution scans the
   // world, so a tree holding no token must not pay for it on every runtime spawn).
   const outerScope = _segments ? null : openTokenScope();
-  noteTokens(prefab.entities, overrides, structure, nestedOverrides, nestedStructure);
+  // …and a top call handed its layers from outside notes them too: a rebuild's forward state reaches its nested rows only.
+  noteTokens(prefab.entities, overrides, structure, nestedOverrides, nestedStructure, _segments ? undefined : _layers);
   const stack = _stack ?? new Set<string>();
   if (prefab.id) {
     if (stack.has(prefab.id)) {
@@ -1959,7 +1972,7 @@ export function instantiatePrefabIntoWorld(
   // First pass: spawn each row (nested rows recurse into the child prefab).
   for (const entry of prefab.entities) {
     if (entry.prefab) {
-      const child = getCachedPrefab(entry.prefab) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null;
+      const child = read(entry.prefab) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
       const rowLocalId = entry.localId ?? 0;
       if (!child) { console.warn(`[loadSceneFile] nested prefab not cached: ${entry.prefab}`); if (rowLocalId) unexpanded.push(rowLocalId); continue; }
       // Overrides an OUTER layer addressed at this nested row: `direct` hits this
@@ -1999,16 +2012,12 @@ export function instantiatePrefabIntoWorld(
           : { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, members: childMembers },
         stack, childNested,
         structForward,
-        [...segments, rowPathInPrefab(prefab, rowLocalId)],
-        childLayers, foldFrom,
+        { read, segments: [...segments, rowPathInPrefab(prefab, rowLocalId)], layers: childLayers, foldFrom },
       );
       // Stamp parentLocalId so a later serialize knows which row produced this
       // instance (and can store/restore its scene-level overrides).
       if (childRoot && rowLocalId && piMeta) {
-        let childEntity: { has(t: unknown): boolean; get(t: unknown): unknown; set(t: unknown, d: unknown): void } | undefined;
-        for (const e of world.entities) {
-          if ((e as { id(): number }).id() === childRoot) { childEntity = e as never; break; }
-        }
+        const childEntity = findEntityById(childRoot, world) as EntityHandle | undefined;
         if (childEntity?.has(piMeta.trait)) {
           // `parentNodeGuid` beside `parentLocalId` (#1468): this nested root's own `nodeGuid` is its
           // identity in the CHILD document, so the OUTER row's identity has nowhere else to live.
@@ -2061,10 +2070,10 @@ export function instantiatePrefabIntoWorld(
   const rootLocalId = prefab.rootLocalId ?? 1;
   const rootEcsId = localToEcs.get(rootLocalId) ?? 0;
 
-  // Build an id → handle map ONCE for the post-spawn passes below. Without it each
-  // pass scanned the whole world per row (O(n²) over a large prefab/scene).
-  const handleById = new Map<number, EntityHandle>();
-  for (const e of world.entities) handleById.set((e as EntityHandle).id(), e as EntityHandle);
+  // The post-spawn passes below reach each row through the entity index every spawn populates. A scan per row was O(n²)
+  // over a large prefab or scene, and the map that replaced it still cost the whole world once per FRAME, nested frames
+  // included, so an instantiate grew with the scene it went into (#1783: 0.45 ms empty, 7.6 ms at 20k entities).
+  const handleById = { get: (id: number) => findEntityById(id, world) as EntityHandle | undefined };
 
   // Second pass: remap parentIds in EntityAttributes. Every row — a nested-instance
   // root included — reads its parent from the FILE entry: the first pass spawned
@@ -2127,7 +2136,7 @@ export function instantiatePrefabIntoWorld(
   // additions can resolve their anchor localId against the fully-built map and a
   // removal can't strand an override that ran before it.
   if (structure && (structure.added?.length || structure.removed?.length || structure.removedTraits || structure.moved || structure.members)) {
-    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments), stack);
+    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments), stack, read);
   }
 
   // Pop this prefab off the cycle stack — the guard tracks ANCESTORS in the

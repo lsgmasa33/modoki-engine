@@ -85,7 +85,7 @@ export interface IdentityParents {
  *  member. Kept on the root's record, not the doc, so a stale-frame compare (#1483) still sees the document alone. */
 /** `unexpanded`: the nested rows of `doc` this expansion could NOT expand (the child prefab was not cached, or expanded to no
  *  root) and that no layer removed (#1812) — a row the frame never had, which is not a removal whatever the cache holds
- *  later. Written only by the two expansions; a record without it (a carry, a tag) answers nothing about expansion.
+ *  later. Written only by the expansion (`instantiatePrefabIntoWorld`, which the editor's `instantiatePrefab` calls); a record without it (a carry, a tag) answers nothing about expansion.
  *  Runtime only: never serialized. */
 type FrameRootRecord = { source: string; doc: TemplateDoc; nodeMoved?: Record<string, string>; unexpanded?: readonly number[] };
 const rootDocsByWorld = new WeakMap<World, Map<PackedEntity, FrameRootRecord>>();
@@ -129,7 +129,7 @@ export function noteFrameRootDoc(world: World, root: Entity, rec: FrameRootRecor
   roots.set(packedOf(root), rec);
 }
 /** The layer applied to `root`'s frame REMOVED `rows` (#1812): a removed row is the frame's removal whether or not it could be
- *  expanded, so it leaves the record's `unexpanded` list. Called by `applyStructureCore`, which both expansions run the
+ *  expanded, so it leaves the record's `unexpanded` list. Called by `applyStructureCore`, which the expansion runs the
  *  frame's structure through AFTER the spawn records the frame. */
 export function noteRowsRemoved(world: World, root: Entity, rows: Iterable<number>): void {
   const rec = frameRootDoc(world, root);

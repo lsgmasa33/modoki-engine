@@ -24,6 +24,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
   getCurrentWorld: () => createWorld(),
   registerEntity: vi.fn(),
+  // No index here: the lookup the expansion makes since #1783 finds the entity in the world it is handed.
+  findEntityById: (id: number, world: any) => [...world.entities].find((e: any) => e.id() === id),
   spawnEntity: (world: any, ...traits: any[]) => world.spawn(...traits),
   unregisterEntity: vi.fn(),
   destroyEntity: (e: any) => { e.destroy(); },

@@ -470,10 +470,10 @@ describe('a placeholder takes the sibling position its entry states as a ROOT ov
   });
 });
 
-describe('a rebuild respawns a missing added node\'s placeholder (#1699, the editor twin)', () => {
+describe('a rebuild respawns a missing added node\'s placeholder (#1699, the editor\'s rebuild)', () => {
   it('an Apply that rebuilds the instance keeps the node', async () => {
-    // Mutation: drop `spawnUnresolvedReference` from the EDITOR's `spawnNestedInstance` — the rebuild spawns nothing
-    // for the node, and the save loses it.
+    // Mutation: drop `spawnUnresolvedReference` from `spawnReferenceNode` (the one spawner since #1783) — the rebuild spawns
+    // nothing for the node, and the save loses it.
     install(pDoc(), qDoc());
     await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
     reparentEntity(rootOf(QINST), inside(INST, 'A'));
@@ -764,9 +764,9 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
     expectSameBytes(entryOf(await save(), INST), entryOf(s1, INST));
   });
 
-  it('an added reference node to it keeps its node through a load and through a rebuild (both spawnNestedInstance twins)', async () => {
-    // Mutations: drop `expandsToRoot` from the LOADER's `spawnNestedInstance` — the node is dropped at load; from the
-    // EDITOR's — the Apply's rebuild drops it. (Each alone: the other twin still spawns the placeholder.)
+  it('an added reference node to it keeps its node through a load and through a rebuild (the one spawner, from both callers)', async () => {
+    // Mutation: drop `expandsToRoot` from `spawnReferenceNode` — the node is dropped at the load and at the Apply's
+    // rebuild, one spawner serving both since #1783.
     install(pDoc(), qDoc());
     await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
     reparentEntity(rootOf(QINST), inside(INST, 'A'));

@@ -8,6 +8,7 @@
  *  `getPrefabSource` and answers in its reply rather than a toast, so it stays in `agentEditorOps.ts`. */
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
@@ -45,7 +46,11 @@ async function readPrefabFile(path: string): Promise<PrefabFile | null> {
   const parked = parkedPrefabRead(path);
   if (parked) return parked;
   try {
-    return await parseAssetJson(await fetch(path), path) as PrefabFile;
+    const prefab = await parseAssetJson(await fetch(path), path) as PrefabFile;
+    // The zIndex migration every editor read runs (`fetchPrefabSource`), at this read too: the expansion no longer
+    // migrates rows itself (#1783), so a placement that skipped it would drop a legacy `UIAnchor.zIndex`.
+    for (const entry of prefab?.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+    return prefab;
   } catch (e) {
     if (isMissingAsset(e)) return null;
     throw e;

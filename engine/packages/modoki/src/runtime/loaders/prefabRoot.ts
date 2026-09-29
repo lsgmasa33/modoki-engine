@@ -6,8 +6,8 @@ import { prefabContainsItself, type NestingReader } from './prefabNesting';
  *  (`keepUnresolvedEntry` / `spawnUnresolvedReference`), and the walk spawns nothing rather than a root-less scatter of
  *  rows that the next save writes as unrelated entities.
  *
- *  This is a second spelling of the rule the expansion applies (`instantiatePrefabIntoWorld` and the editor's
- *  `instantiatePrefab` return 0 when `rootLocalId` maps to nothing), pinned against both by
+ *  This is a second spelling of the rule the expansion applies (`instantiatePrefabIntoWorld`, which the editor's
+ *  `instantiatePrefab` calls, returns 0 when `rootLocalId` maps to nothing), pinned against both by
  *  `engine/tests/editor/missingPrefabPassThrough.test.ts`. */
 
 /** Is `data` a prefab DOCUMENT: an object whose `entities` is an array of row objects (#1813)? The ONE shape check, asked
@@ -64,8 +64,8 @@ export async function fetchedExpandsToRoot(doc: RootDoc, fetch: (source: string)
  *  node from `stackForReferenceNode`, which carries only self-containing ancestors.
  *
  *  When it refuses it logs the refusal, naming the node and the chain it sits in, and the caller spawns nothing for the
- *  node — not a placeholder, which would write the cycle straight back on the next save. The twin spawners
- *  (`spawnNestedInstance`, editor and loader) ask it before they expand a node. `read` is the caller's cache. */
+ *  node — not a placeholder, which would write the cycle straight back on the next save. The one reference-node
+ *  spawner (`spawnReferenceNode`, run by the loader's structure apply and the editor's) asks it before it expands a node. `read` is the caller's cache. */
 export function refuseCyclicReferenceNode(
   ancestors: ReadonlySet<string>,
   node: { prefab?: string; guid?: string; key?: string; traits?: Record<string, unknown> },

@@ -15,7 +15,7 @@
  *  - drop the whole-document check in `serializePrefab` → both save cases go red;
  *  - drop the `members` walk in `expandedPrefabRefs` → the two-frames-down save case (a member row's `own`) and the load
  *    cases go red;
- *  - pass `undefined` for the stack in either `spawnNestedInstance` → that twin's load case goes red (a RangeError);
+ *  - pass `undefined` for the stack in `spawnReferenceNode` (the one spawner, #1783) → the two-file loop case goes red;
  *  - carry every ancestor across a reference node (not only self-containing ones) → the legal-nesting case goes red. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -514,7 +514,8 @@ describe('a self-containing file on disk loads with the cyclic node refused, not
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(() => instantiatePrefab(prefabs.get(EDITED) as PrefabFile, 0)).not.toThrow();
     expect(byName('EditedRoot')).toHaveLength(1);
-    expect(errors.mock.calls.some((c) => String(c[0]).startsWith('[Prefab] cycle: prefab "Edited" contains itself'))).toBe(true);
+    // One walk since #1783, so one prefix: the refusal is the loader's, whichever side called it.
+    expect(errors.mock.calls.some((c) => String(c[0]).startsWith('[loadSceneFile] cycle: prefab "Edited" contains itself'))).toBe(true);
   });
 
   it('a loop through two files (A holds a B node, B holds an A node) is bounded too', () => {

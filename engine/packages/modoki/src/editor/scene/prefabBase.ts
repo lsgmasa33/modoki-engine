@@ -96,12 +96,12 @@ export function captureDoc(root: number, source: string): PrefabFile | null {
   return getCachedPrefabSync(source) ?? levelDoc(root, source).doc;
 }
 
-/** What the layers above a frame FORWARD into its expansion — `instantiatePrefab`'s `_nestedOverrides`, `_layers` and
- *  `_forwardRoots`, as the expansion of the row above hands them to it. The shared fold's (`prefabOverrides.ts`, #1707). */
+/** What the layers above a frame FORWARD into its expansion — its `nestedOverrides`, its `layers`, and what those forward
+ *  to its nested roots, as the expansion of the row above hands them to it. The shared fold's (`prefabOverrides.ts`, #1707). */
 export type ForwardState = SharedForwardState<NestedStructureDelta, SceneMemberRow>;
 
 /** The forward state a template REFERENCE node hands the expansion of its frame, whose document is `doc`: its path-keyed
- *  channels and its member rows, as the editor's spawner hands them (`spawnNestedInstance`) and the loader's twin. */
+ *  channels and its member rows, as the one spawner hands them (`spawnReferenceNode`). */
 export function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
   const layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: node.nestedStructure, rows: node.members }];
   return {

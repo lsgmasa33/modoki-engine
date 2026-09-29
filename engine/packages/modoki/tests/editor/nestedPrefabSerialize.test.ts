@@ -46,6 +46,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   indexEntityGuid: () => {},
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
+  findEntityById: (id: number) => index.get(id),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
@@ -79,7 +80,8 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
 }));
 
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+// The runtime cache holds nothing here: the expansion (the runtime's since #1783) reads nested documents from the editor's.
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 
 beforeEach(() => { testWorld = createWorld(); index.clear(); });
 

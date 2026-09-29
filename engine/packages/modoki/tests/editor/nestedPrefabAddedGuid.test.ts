@@ -1,8 +1,7 @@
 /** A user-added NESTED prefab instance keeps its own guid across an editor rebuild.
  *
- *  Found by the close-out sweep for QA-PREFAB-0004, which fixed the LOADER's copy of this.
- *  `grep -rn spawnNestedInstance` returns exactly two implementations of `StructureApplyOps` —
- *  the runtime loader and this editor path — and only the loader was fixed.
+ *  Found by the close-out sweep for QA-PREFAB-0004, which fixed the LOADER's copy of this, when the editor had its own
+ *  `spawnNestedInstance`. Since #1783 both run the one `spawnReferenceNode`, so this pins the editor's rebuild reaching it.
  *
  *  It matters more here, not less: `captureNestedRef` reads the live guid onto the reference
  *  node precisely so a rebuild can put it back, and `rebuildInstance` already does exactly that
@@ -34,6 +33,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { index.delete(e.id()); e.destroy(); },
   findEntityByGuid: vi.fn(),
+  findEntityById: (id: number) => index.get(id),
   indexEntityGuid: vi.fn(),
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
@@ -73,7 +73,8 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+// The runtime cache holds nothing here: the expansion (the runtime's since #1783) reads nested documents from the editor's.
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 vi.mock('../../src/runtime/ui/uiTreeStore', () => ({ markUIDirty: vi.fn() }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   newGuid: () => 'gen-guid',
