@@ -127,6 +127,36 @@ const DEFAULT_DEPS: UnsavedGateDeps = {
   },
 };
 
+/** Build (or publish) with unsaved work? (#1868, hub call c) A build reads the FILES, so nothing unsaved is in it — an
+ *  undone Apply parked in memory included, whose file still holds the applied prefab until Save. Nothing unsaved: true.
+ *  Otherwise the human is shown every cause and chooses; `ask` answers true for "go ahead anyway". Save is not offered
+ *  here: it can open a Save As dialog, and the build would then run behind it on whatever the human picked. */
+export async function decideUnsavedBeforeBuild(
+  action: string,
+  causes: () => UnsavedCauses,
+  ask: (action: string, lost: string[]) => Promise<boolean>,
+): Promise<boolean> {
+  const lost = describeLostWork(causes(), 'page-unload');
+  return lost.length === 0 || ask(action, lost);
+}
+
+/** The human Build menu's and the OTA dialog's gate — {@link decideUnsavedBeforeBuild} with the editor's modal. `action`
+ *  completes "You are about to …" (e.g. `build for ios`). */
+export function confirmUnsavedBeforeBuild(action: string): Promise<boolean> {
+  return decideUnsavedBeforeBuild(action, unsavedChangeCauses, async (act, lost) => (await openChoiceModal<'build' | 'cancel'>({
+    kind: 'unsaved-gate',
+    title: 'Unsaved changes',
+    message: `You are about to ${act}. The build reads the files on disk, so this is not saved and will not be in it:`,
+    details: lost,
+    choices: [
+      { value: 'cancel', label: 'Cancel' },
+      { value: 'build', label: 'Build anyway', tone: 'danger' },
+    ],
+    cancelValue: 'cancel',
+    focus: 'cancel',
+  })) === 'build');
+}
+
 let _open: Promise<boolean> | null = null;
 
 /** The gate every human world-replacing or page-unloading gesture awaits. `action` completes the

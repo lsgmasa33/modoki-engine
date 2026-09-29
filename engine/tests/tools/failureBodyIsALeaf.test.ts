@@ -38,7 +38,6 @@ const CORPUS: Array<[string, unknown, boolean]> = [
   ['a success with no ok field', { converted: 1 }, false],
   ["/api/reimport's partial bake", { ok: true, converted: 20, errors: ['a.png: bad'] }, false],
   ["/api/delete-asset's partial trash", { ok: true, trashed: 1, failed: ['/assets/b.png'] }, false],
-  ["/api/prefab-member-paths' held files", { rewritten: [], held: ['/p.prefab.json'], changed: [] }, false],
   ["/api/delete-asset's total refusal at 200", { ok: false, trashed: 0, failed: ['/assets/a.png'] }, true],
   ['a C7 refusal: errors with no ok', { errors: ['nothing matched'] }, true],
   ['an error with no ok', { error: 'no project is open' }, true],

@@ -12,12 +12,12 @@ import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
-import { serializeRebuildOver, classifyExistingPrefabId, type PrefabFile } from './prefab';
+import { serializeRebuildOver, classifyExistingPrefabId, parkedPrefabRead, type PrefabFile } from './prefab';
+import { restorePrefabsInMemory } from './prefabMemoryRestore';
 import { commitPrefabWrite, parsePrefabBytes } from './prefabCommit';
 import { readPriorDocument } from '../panels/assetOps';
 import { jsonFileBody } from '../backend/editorBackend';
 import { pushAction, type UndoAction } from '../undo/undoManager';
-import { reportUndoFailure, fileChangedRefusal } from '../undo/undoFailure';
 
 /** Build the SkinnedSprite2D + Bone2D subtree spec for a rig. The root sits at its
  *  local origin — a prefab is placed relative to its instantiation parent. */
@@ -81,7 +81,10 @@ export async function makeRigPrefabAsset(
   // not a free overwrite either (#1692, I10): the update is conditional on what it read, so an unreadable prefab
   // REFUSES the update and is left as it is. A manifest id whose file is gone (a 404, or the SPA fallback's HTML) is a
   // create.
-  const prior = await readPriorDocument(savePath);
+  // A parked prefab is updated over the PARK (#1868 D-i), as Create Prefab's Replace does: it is what the editor shows and
+  // Save would write, so the update is conditional on it and its undo restores it.
+  const parked = parkedPrefabRead(savePath);
+  const prior = parked ? jsonFileBody(parked) : await readPriorDocument(savePath);
   if (prior === null) { console.error(`[skinPrefab] not updating ${savePath} — it could not be read, so it would be overwritten blind`); return null; }
   const prevContent: string | null = prior ?? null;
 
@@ -94,7 +97,6 @@ export async function makeRigPrefabAsset(
   deleteEntity(rootId);
   if (!prefab) return null;
 
-  const content = jsonFileBody(prefab);
   // ONE step (#1692): over what was read at the path (I10), then both caches, then a rebuild of every placed instance
   // — an update keeps the guid precisely so they pick it up, and they used to stay expanded from the old bind pose
   // until a reload, with the next save capturing them against the wrong rows (#1685's sibling).
@@ -103,43 +105,25 @@ export async function makeRigPrefabAsset(
     console.error(`[skinPrefab] ${savePath} was not written — ${written.conflict ? 'it changed on disk since it was read, and was left as it is' : written.error ?? 'the write failed'}`);
     return null;
   }
-  /** `prevContent` as every reader parses it — what the undo's caches hold. */
-  const restored = (): PrefabFile => parsePrefabBytes(prevContent!);
-
   const updated = prevContent != null;
-  const label = `${updated ? 'Update' : 'Make'} prefab "${rootName}"`;
-  // ⚠️ Every half carries a PRECONDITION (#1679), the same four as Create Prefab's (assetOps.ts): the prefab file is
-  // global, and this entry outlives a later save of it (open the skin prefab, edit, Cmd+S, then Cmd+Z here). Each
-  // half changes the file only while it holds what the other half left there, and otherwise REFUSES before anything
-  // moved (`fileChangedRefusal`, the #1664 shape). `applied` tracks which half last landed: an undo that reported a
-  // failed write left `content` on disk, so the redo after it must expect `content`, not the restored bytes. Each half
-  // is one `commitPrefabWrite`, so the placed instances follow it both ways.
-  let applied = true;
+  // A fresh make is a new asset, saved on creation (Unity: "Unity automatically saves new assets"), and nothing in memory
+  // changed that an undo could put back — so it pushes no entry (#1868; #1855's last remnant). An undo that trashed it
+  // was a file write on undo.
+  if (!updated) return { path: savePath, updated };
+  /** `prevContent` as every reader parses it — the document the undo restores. */
+  const restored = (): PrefabFile => parsePrefabBytes(prevContent);
+  const label = `Update prefab "${rootName}"`;
+  const guid = prefab.id!;
+  // Each half restores the prefab IN MEMORY (#1868, D1 = Park): both caches, a rebase of every placed instance, and the
+  // document parked for Save, which writes it. By the prefab's guid, so a Rename since finds it where it is (hub call e).
+  // Refused, before anything changes, when the editor holds another document than the other half left (a prefab-edit
+  // save of the rig prefab since, an outside change) — the #1679 precondition, asked of memory.
   const action: UndoAction = {
     label,
-    // A FILE's edit that also rebuilds the live frames placed from it, as a model import's (#1857, undoManager.ts).
+    // A parked document's edit that also rebuilds the live frames placed from it (undoManager.ts).
     _isFileDirect: true, _rebasesLiveFrames: true,
-    undo: async () => {
-      // Restore the prior prefab verbatim, or delete a fresh create.
-      const wrote = await commitPrefabWrite(savePath, prevContent != null ? restored() : null, {
-        expected: content, ...(prevContent != null ? { bytes: prevContent } : {}),
-      });
-      if (wrote.conflict) throw fileChangedRefusal([savePath]);
-      if (!wrote.ok) {
-        reportUndoFailure({ direction: 'Undo', label, detail: `"${savePath}" was not ${prevContent != null ? 'restored' : 'deleted'}: ${wrote.error ?? 'the write failed'}` });
-        return;
-      }
-      applied = false;
-    },
-    redo: async () => {
-      const wrote = await commitPrefabWrite(savePath, prefab, { expected: applied ? content : prevContent, bytes: content });
-      if (wrote.conflict) throw fileChangedRefusal([savePath]);
-      if (!wrote.ok) {
-        reportUndoFailure({ direction: 'Redo', label, detail: `"${savePath}" was not written: ${wrote.error ?? 'the write failed'}` });
-        return;
-      }
-      applied = true;
-    },
+    undo: () => restorePrefabsInMemory([{ source: guid, doc: restored(), from: prefab }]),
+    redo: () => restorePrefabsInMemory([{ source: guid, doc: prefab, from: restored() }]),
   };
   pushAction(action);
   return { path: savePath, updated };

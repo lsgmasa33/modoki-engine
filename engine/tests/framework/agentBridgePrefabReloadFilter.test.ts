@@ -37,7 +37,8 @@ const PREFAB_PATH = '/games/g/runtime/assets/Crate.prefab.json';
 const OTHER_PATH = '/games/g/runtime/assets/Unrelated.prefab.json';
 const SEED_SCENE_ID = 987_655;
 
-const { initAgentBridge, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher } = await import('../../app/debug/agentBridge');
+const { initAgentBridge, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper } = await import('../../app/debug/agentBridge');
+const { parkPrefab, peekDirtyAsset, keepParkedPrefabOverFileChange, clearDirtyAssets } = await import('../../packages/modoki/src/editor/scene/dirtyAssets');
 
 let handlers: Map<string, Handler[]>;
 const refreshed: string[] = [];
@@ -149,5 +150,34 @@ describe('#1702: a prefab change reloads only a scene that uses it', () => {
     setSceneReloadSuppressor(null);
     await replaySuppressedSceneReloads();
     expect(loadScene).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** #1868 (hub call a): a PARKED prefab keeps its park when its file changes on disk, as a parked material does — the park
+ *  is what every instance shows and what Save writes, and Save's precondition meets the change and asks Overwrite/Cancel.
+ *  Mutation: drop the parked-path filter in `handleSceneChanged` → this case goes red (reloaded, evicted, re-read). */
+describe('#1868: a parked prefab keeps its park across a change on disk', () => {
+  // The keeper the editor installs (`agentEditorOps`).
+  beforeEach(() => { setParkedPrefabKeeper(keepParkedPrefabOverFileChange); });
+  afterEach(() => { clearDirtyAssets(); setParkedPrefabKeeper(null); });
+  it('no reload, no eviction, no re-read', async () => {
+    loaded = new Map<string, Entry>([['main', primary([PREFAB_GUID])]]);
+    parkPrefab(PREFAB_PATH, { id: PREFAB_GUID, entities: [] }, { id: PREFAB_GUID, entities: [] });
+    emit(PREFAB_PATH);
+    await settle();
+    expect(loadScene).not.toHaveBeenCalled();
+    expect(getCachedPrefab(PREFAB_GUID), 'the runtime copy was kept').toBeDefined();
+    expect(refreshed).toEqual([]);
+    // …and the park's baseline is marked no longer the file's, so no restore drops it as "back to the file" (close-out
+    // review F2). Mutation: keep the park without marking it — this goes red.
+    expect(peekDirtyAsset(PREFAB_PATH)?.fileChanged).toBe(true);
+  });
+
+  it('ACCEPT SIDE: once the park is gone, the same change reloads', async () => {
+    loaded = new Map<string, Entry>([['main', primary([PREFAB_GUID])]]);
+    emit(PREFAB_PATH);
+    await settle();
+    expect(loadScene).toHaveBeenCalledTimes(1);
+    expect(refreshed).toEqual([PREFAB_PATH]);
   });
 });

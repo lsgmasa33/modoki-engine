@@ -24,11 +24,14 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 }));
 
 import { getCurrentWorld, setCurrentWorld, setRunMode } from '@modoki/engine/runtime';
-import { setActionCallback, pushAction, clearHistory, undoRefusedReason, getEditVersion } from '@modoki/engine/editor';
+import { setActionCallback, pushAction, clearHistory, undoRefusedReason, getEditVersion, undo } from '@modoki/engine/editor';
 import { swapHistory, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import { makeRigPrefabAsset } from '../../packages/modoki/src/editor/scene/skinPrefab';
 import { setPrefabCache, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
+import { registerAsset } from '@modoki/engine/runtime';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -39,6 +42,7 @@ type Bone = { name: string; parent: number; x?: number; y?: number; rot?: number
 const rig = (bones: Bone[]) => ({ id: 'aaaaaaaa-0000-4000-8000-000000001782', bones: bones.map((b) => ({ x: 0, y: 0, rot: 0, ...b })) }) as never;
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   onDisk.clear();
@@ -126,23 +130,45 @@ describe('the skin-rig update keeps each bone\'s row by its path (#1782)', () =>
   });
 });
 
-describe("the rig writer's undo entry is a FILE edit that rebuilds live frames (#1857)", () => {
-  // Both halves are one `commitPrefabWrite`, as a model import's: the file outlives a discarded world, and the rebase
-  // lands on the live world, so a preview must refuse it.
+describe("the rig writer's undo entry is a parked DOCUMENT's edit that rebuilds live frames (#1857, #1868)", () => {
+  // Both halves restore the prefab in memory and park it (#1868): the document outlives a discarded world, and the rebase
+  // lands on the live world, so a preview must refuse it. A fresh make is a new asset and pushes no entry at all.
   // Mutations: drop `_isFileDirect` from skinPrefab's entry — the discard drops it; drop `_rebasesLiveFrames` — the
-  // preview gate lets it through.
+  // preview gate lets it through; push the fresh make's entry again — the first label check goes red.
   it('survives a discarding history swap, and is refused inside a preview envelope', async () => {
     const v0 = getEditVersion();
+    const empty = undoLabel();
     await build([{ name: 'hips', parent: -1 }]);
+    expect(undoLabel()).toBe(empty); // a fresh make pushes nothing (#1868)
+    await build([{ name: 'hips', parent: -1 }, { name: 'spine', parent: 0 }]);
     // #1858, OBSERVED: Skin "Make prefab" marked the open scene unsaved. It changes a file, not the scene file.
     expect(getEditVersion()).toBe(v0);
-    expect(undoLabel()).toBe('Make prefab "Rig"');
+    expect(undoLabel()).toBe('Update prefab "Rig"');
     swapHistory('/other-1857.json', { discardOutgoing: true });
     swapHistory('');
-    expect(undoLabel()).toBe('Make prefab "Rig"');
+    expect(undoLabel()).toBe('Update prefab "Rig"');
     setRunMode('scrub');
     try {
       expect(undoRefusedReason('undo')).toMatch(/Exit the preview/);
     } finally { setRunMode('stopped'); }
+  });
+});
+
+/** #1868 hub call (e): a rig update's undo restores in memory BY GUID, so a Rename of the prefab since the update does not
+ *  strand it. Mutation: key the restore by `savePath` in skinPrefab's undo — the park lands at the old path. */
+describe('a rig update undone after a Rename (#1868)', () => {
+  it('restores the prior document where the prefab is NOW', async () => {
+    const first = await build([{ name: 'hips', parent: -1 }]);
+    await build([{ name: 'hips', parent: -1 }, { name: 'spine', parent: 0 }]);
+    const MOVED = '/assets/rigs/Moved1868.prefab.json';
+    onDisk.set(MOVED, onDisk.get(SAVE)!);
+    onDisk.delete(SAVE);
+    registerAsset(first.id!, MOVED, 'prefab');
+    applyAssetPathMoves([{ from: SAVE, to: MOVED }]);
+    await undo();
+    expect(peekDirtyAsset(SAVE)).toBeNull();
+    const parkedDoc = peekDirtyAsset(MOVED)?.data as PrefabFile | undefined;
+    expect(parkedDoc?.entities.map((e) => e.name)).not.toContain('spine');
+    expect(parkedDoc?.id).toBe(first.id);
   });
 });

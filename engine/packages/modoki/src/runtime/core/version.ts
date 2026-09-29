@@ -11,7 +11,7 @@
  *  serialization is editor-only and nothing in `runtime/**` reads or writes it (#365, #379)". That
  *  premise was true and is no longer: #1468 gives prefabs a real format GATE, and a census of every
  *  path a `.prefab.json` can reach disk found **5 server-side writers with no client call at all**
- *  (the asset scanner's GUID heal, `/api/prefab-member-paths`, `/api/scene-mutate`,
+ *  (the asset scanner's GUID heal, `/api/prefab-member-paths` (gone since #1868), `/api/scene-mutate`,
  *  `duplicateAssetFile`, `/api/import-file`) plus 4 Node migration scripts. The gate has to be
  *  reachable from `engine/plugins/**`, which cannot import the editor scene module without dragging
  *  koota and the trait registry into the dev server. **Kept beside `SCENE_FORMAT_VERSION` rather

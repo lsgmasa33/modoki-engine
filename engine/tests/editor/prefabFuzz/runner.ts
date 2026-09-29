@@ -14,6 +14,8 @@ import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/
 import path from 'path';
 import { prefabTextIsDocument } from '../../../packages/modoki/src/editor/scene/prefabCommit';
 import type { PrefabFile } from '../../../packages/modoki/src/editor/scene/prefab';
+import { getDirtyAssetPaths, parkedPrefab } from '../../../packages/modoki/src/editor/scene/dirtyAssets';
+import { jsonFileBody } from '../../../packages/modoki/src/editor/backend/editorBackend';
 
 /** `MODOKI_PREFAB_FUZZ_DUMP=<dir>`: write every compared state there, for reading a finding by hand. */
 function dump(name: string, value: unknown): void {
@@ -90,7 +92,17 @@ function taint(seg: Segment, cause: TaintCause): void {
   seg.tainted ??= cause;
 }
 
-const prefabBytes = (be: FuzzBackend) => new Map([...be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')));
+/** Every prefab as the editor holds it: the file's bytes, or — where an undo or redo parked a document for Save to write
+ *  (#1868, D1 = Park) — the park, as the flush would write it. The undo walk compares THESE, since an undone Apply,
+ *  Replace or rig update changes memory and leaves the file until Save. */
+const prefabBytes = (be: FuzzBackend) => {
+  const out = new Map([...be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')));
+  for (const p of getDirtyAssetPaths()) {
+    const parked = parkedPrefab(p);
+    if (parked) out.set(p, jsonFileBody(parked));
+  }
+  return out;
+};
 
 async function segmentHere(be: FuzzBackend): Promise<Segment> {
   return { scene: editing() ? null : await serializeScene(), prefabs: prefabBytes(be), tainted: null };

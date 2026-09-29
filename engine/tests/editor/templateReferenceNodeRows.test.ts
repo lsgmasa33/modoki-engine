@@ -38,7 +38,6 @@ import {
 } from '../../packages/modoki/src/editor/scene/prefab';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
-import { rewritePrefabMemberTokens } from '../../packages/modoki/src/runtime/loaders/memberPaths';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { clearKeptMemberOrphans, deriveInstanceMemberGuids, keptMemberOrphans, setKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { templateKeyOf, TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
@@ -1004,34 +1003,5 @@ describe('#1568: prefab-edit Refresh R2 gaps', () => {
     install(midDoc());
     await openInEditor(outer2());
     await dropAndRestore(() => inMid('InnerRoot')[0]!);
-  });
-});
-
-describe('#1564: an Apply that renumbers member paths re-points every carrier', () => {
-
-  // The repair of the OTHER files: MID renumbers MidNested (2.3 → 3), and OUTER2's node states a move by path in MID's
-  // frame. Mutation: in `framePayload`, skip `templateMoved`.
-  it('a reference node\'s templateMoved follows a renumbered prefab on disk', () => {
-    const outer = { ...outer2({ templateMoved: { '2.3.2': '@member:2' } }) } as unknown as Record<string, unknown>;
-    const midNew = { ...midDoc(), entities: [...midDoc().entities.slice(0, 2), row(3, G_MID_NESTED, 'MidNested', 1, { prefab: INNER })] };
-    const read = (mid: object) => (g: string) => (g === MID ? mid : g === OUTER2 ? outer : prefabs.get(g));
-    const out = rewritePrefabMemberTokens(outer, OUTER2, read(midDoc()), read(midNew)) as unknown as PrefabFile;
-    expect(refNodeOf(out).templateMoved).toEqual({ '3.2': '@member:2' });
-  });
-
-  // A member row keyed by the frame ROOT's own nodeGuid hangs its nodes at the frame itself, as `memberPathRecords`
-  // does; named one level below, a reference node in it matched nothing and kept a stale path. No writer emits this
-  // shape today (a frame root's nodes go in legacy `added`), but the loader reads it. Mutation: in `membersIn`, drop
-  // the root case of `at`.
-  it('a reference node in a member row keyed by the frame root follows a renumbered prefab', () => {
-    const node = { key: KREF, guid: '', name: 'MidRoot', prefab: MID, traits: {}, children: [], templateMoved: { '2.3.2': '@member:2' } };
-    const outer = { ...outer2(), entities: [
-      row(1, G(21), 'OuterRoot', 0), row(2, G(22), 'Panel', 1), row(5, G(25), 'InnerRow', 2, { prefab: INNER, members: { [`/${G(1)}`]: { own: [node] } } }),
-    ] } as unknown as Record<string, unknown>;
-    const midNew = { ...midDoc(), entities: [...midDoc().entities.slice(0, 2), row(3, G_MID_NESTED, 'MidNested', 1, { prefab: INNER })] };
-    const read = (mid: object) => (g: string) => (g === MID ? mid : g === OUTER2 ? outer : prefabs.get(g));
-    const out = rewritePrefabMemberTokens(outer, OUTER2, read(midDoc()), read(midNew)) as unknown as PrefabFile;
-    const rows = out.entities.find((e) => e.prefab === INNER)!.members as Record<string, { own: Array<{ templateMoved: unknown }> }>;
-    expect(rows[`/${G(1)}`]!.own[0]!.templateMoved).toEqual({ '3.2': '@member:2' });
   });
 });

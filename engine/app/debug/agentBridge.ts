@@ -684,6 +684,13 @@ export function setSceneReloadSuppressor(fn: (() => string | null) | null): void
  *  which this module must not import, so the editor installs the refresh the way it installs the
  *  suppressor. */
 let _prefabSourceRefresher: ((urlPath: string) => Promise<void>) | null = null;
+/** The file at `urlPath` changed on disk: is a prefab document PARKED there (#1868 — an undone Apply held in memory until
+ *  Save)? If so the keeper also marks the park's baseline as no longer the file's, and answers true. The editor installs
+ *  it (`agentEditorOps`), like the refresher above: this module does not import the editor. Unset, nothing is parked. */
+let _parkedPrefabKeeper: ((urlPath: string) => boolean) | null = null;
+export function setParkedPrefabKeeper(fn: ((urlPath: string) => boolean) | null): void {
+  _parkedPrefabKeeper = fn;
+}
 
 /** Editor-only: install the editor-side prefab refresh. Called from `agentEditorOps.ts`. */
 export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>) | null): void {
@@ -3143,6 +3150,14 @@ function openSceneUsesPrefab(urlPath: string): boolean {
   return false;
 }
 
+/** Put the prefab at `urlPath` back to its FILE, everywhere — both caches, and a reload of the open scene when it uses
+ *  it — exactly as an outside change of the file does. For a discarded parked prefab (#1868): its caches and live frames
+ *  hold the discarded document, so dropping only the pending write would leave the editor showing one prefab, the file
+ *  holding another, and the editor reporting clean. Call it once the park is gone, or the watcher's branch keeps it. */
+export function reloadPrefabFromDisk(urlPath: string): Promise<void> {
+  return handleSceneChanged({ urlPath, kind: 'prefab' });
+}
+
 /** Hot-reload the active scene when its file (or a prefab it uses) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
 async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly string[] = []): Promise<void> {
@@ -3176,6 +3191,17 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     // surface (Scene2D.tsx, Scene3D.tsx, SceneView.tsx, editor/store/canvas2DDirty.ts,
     // runtime/ui/uiTreeStore.ts) for all eight kinds in the table above, not just material/shader.
     fireDirtyListeners();
+    return;
+  }
+  // A PARKED prefab keeps its park (#1868, hub call a). This deliberately DIVERGES from a parked asset document, whose
+  // park `dropParkedWriteFor` discards when its file changes: a prefab's park is what every live instance was rebuilt
+  // from, and dropping it without a reload would leave them on a document neither the park nor the file holds. So the
+  // file is neither evicted, re-read nor reloaded from; the keeper marks the park's baseline stale, so no later restore
+  // drops it as "back to the file", and Save's precondition meets the change and asks Overwrite or Cancel.
+  const parked = _parkedPrefabKeeper ?? (() => false);
+  const changedPrefabs = (msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso]).filter((p) => !parked(p));
+  if (msg.kind === 'prefab' && !changedPrefabs.length) {
+    console.log(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved prefab edit — kept the edit; saving asks whether to overwrite`);
     return;
   }
   // Suppressed during Play/Pause and inside a scrub/preview envelope: a reload now would rebuild the
@@ -3212,7 +3238,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // that branch runs during Play too, where evicting a prefab breaks the runtime's synchronous
   // `getCachedPrefab` spawns — so the runtime eviction runs only on this path, once suppression is
   // over, and as late as possible (see the re-check below). Keyed by the path form the watcher sends.
-  const prefabPaths = msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso];
+  const prefabPaths = changedPrefabs;
   const evictRuntimePrefabs = (): void => { for (const urlPath of prefabPaths) invalidatePrefab(urlPath); };
   const refreshEditorPrefabs = async (): Promise<void> => {
     const refresh = _prefabSourceRefresher;

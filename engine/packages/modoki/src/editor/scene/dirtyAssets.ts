@@ -46,8 +46,12 @@ import { notifyListeners } from '../../runtime/core/notifyListeners';
  *     really is stale, which is the C7 bug the invalidation exists for. */
 export type AssetWriteOrigin = 'panel' | 'agent';
 
+/** What a parked entry is: an `ASSET_SCHEMA_TYPES` document, written through `/api/asset-write`, or a prefab (#1868),
+ *  written through `commitPrefabWrite` — the one door a `.prefab.json` goes through, which `/api/asset-write` refuses. */
+export type DirtyDocType = AssetSchemaType | 'prefab';
+
 interface DirtyAsset {
-  type: AssetSchemaType;
+  type: DirtyDocType;
   data: unknown;
   origin: AssetWriteOrigin;
   /** OPTIONAL compare-and-swap baseline: the sha256 of the file's bytes as the parker last read
@@ -75,6 +79,16 @@ interface DirtyAsset {
    *  interaction, so the read-to-write gap was one keystroke; now it is however long the human takes
    *  to press Cmd+S. The precondition matters MORE after the fix than before it. */
   ifMatch?: string;
+  /** A prefab only: the document the FILE holds (#1868) — the flush's `commitPrefabWrite` precondition, and what a
+   *  forward write that read the park is checked against instead ({@link parkedPrefabEntry}). */
+  onDisk?: unknown;
+  /** A prefab only: the human chose Overwrite over a conflict, so the next flush writes with no precondition. Cleared
+   *  when that flush ends, whatever it did: an answer is for the conflict it was asked about, not the next one. */
+  overwrite?: boolean;
+  /** A prefab only: its file changed on disk while it was parked, and the watcher kept the park (hub call a). `onDisk`
+   *  no longer says what the file holds, so a restore never drops this park as "back to the file" — it stays for Save,
+   *  whose precondition meets the change and asks (close-out review F2). */
+  fileChanged?: boolean;
 }
 
 const dirty = new Map<string, DirtyAsset>();
@@ -140,6 +154,26 @@ export async function assetWritesSettled(paths: readonly string[]): Promise<void
     if (!pending.length) return;
     await Promise.all(pending);
   }
+}
+/** Enter a prefab commit's writes into the in-flight set (#1868 close-out review): a restore waits on
+ *  {@link assetWritesSettled} for ANY write of its prefab, not only Save's, or a restore landing mid-write parks against a
+ *  file the write is about to change. Returns the release, which the caller runs once its write step has ended. */
+export function beginAssetWrites(paths: readonly string[]): () => void {
+  let end!: () => void;
+  const done = new Promise<void>((r) => { end = r; });
+  const sets = paths.map((p) => {
+    const set = writesInFlight.get(p) ?? new Set<Promise<void>>();
+    set.add(done);
+    writesInFlight.set(p, set);
+    return { p, set };
+  });
+  return () => {
+    for (const { p, set } of sets) {
+      set.delete(done);
+      if (!set.size && writesInFlight.get(p) === set) writesInFlight.delete(p);
+    }
+    end();
+  };
 }
 /** Is a flush writing `path` right now? */
 export function assetWriteInFlight(path: string): boolean { return (writesInFlight.get(path)?.size ?? 0) > 0; }
@@ -291,6 +325,86 @@ export function markAssetDirty(
   bump();
 }
 
+/** Park a PREFAB document (#1868): an undone Apply, Replace or rig-prefab update restores it in memory, and Cmd+S writes
+ *  it. `onDisk` is the document the file holds now; a re-park of a path already parked KEEPS the baseline it carries,
+ *  since the file has not changed in between (the same rule `markAssetDirty` applies to `ifMatch`). The caller has
+ *  already seated the document in both caches — this only records that the file does not hold it. */
+export function parkPrefab(path: string, doc: unknown, onDisk: unknown): void {
+  const prior = dirty.get(path);
+  const kept = prior?.type === 'prefab';
+  dirty.set(path, {
+    type: 'prefab', data: doc, origin: 'panel', onDisk: kept ? prior.onDisk : onDisk,
+    ...(kept && prior.fileChanged ? { fileChanged: true } : {}),
+  });
+  flushErrors.delete(path);
+  bump();
+}
+
+/** The parked prefab document for `path`, or undefined — what every prefab READ takes over the file (#1868, hub call c):
+ *  a scene load, the editor cache's cold read, the prefab-edit open and a placement. Otherwise Apply and Revert would
+ *  compute against the file while Save writes the park. */
+export function parkedPrefab(path: string | undefined): unknown {
+  const d = path ? dirty.get(path) : undefined;
+  return d?.type === 'prefab' ? d.data : undefined;
+}
+
+/** The parked prefab at `path` with the document its file holds, or null (#1868). For a write over it
+ *  (`commitPrefabWrites`): a writer that read the PARK names a document the file does not hold, so it is checked against
+ *  `onDisk` instead. `landed()` is called once ANY write of the path lands, whatever it was checked against: the file and
+ *  both caches now hold the written document, so this park is retired. A writer that read the file (a model re-import,
+ *  the agent's `create`) used to leave the park behind, and every later read took it over the document just written
+ *  (close-out review F3). The park is retired while it still holds the document captured here — the same entry, or the
+ *  same document re-flagged since (Overwrite, the watcher's keeper). A DIFFERENT document parked meanwhile is left as it
+ *  is, baseline and all, so Save conflicts and asks: re-baselining it onto the write made that Save a silent overwrite
+ *  (close-out re-review). A restore cannot park meanwhile — it waits on the write (`beginAssetWrites`). `fileChanged`
+ *  says the watcher kept the park over an outside change (see `DirtyAsset.fileChanged`). */
+export function parkedPrefabEntry(path: string): { doc: unknown; onDisk: unknown; fileChanged: boolean; landed: () => void } | null {
+  const d = dirty.get(path);
+  if (d?.type !== 'prefab') return null;
+  return {
+    doc: d.data,
+    onDisk: d.onDisk,
+    fileChanged: !!d.fileChanged,
+    landed: () => {
+      const now = dirty.get(path);
+      if (now?.type !== 'prefab' || now.data !== d.data) return;
+      dirty.delete(path);
+      flushErrors.delete(path);
+      bump();
+    },
+  };
+}
+
+/** The watcher saw `path` change on disk and KEPT its park (hub call a): mark the park's baseline as no longer the file's
+ *  (see `DirtyAsset.fileChanged`). True when a prefab is parked there — the watcher then leaves the file alone. */
+export function keepParkedPrefabOverFileChange(path: string): boolean {
+  const d = dirty.get(path);
+  if (d?.type !== 'prefab') return false;
+  if (!d.fileChanged) { dirty.set(path, { ...d, fileChanged: true }); bump(); }
+  return true;
+}
+
+/** Re-park `entry` (from {@link peekDirtyAsset}) under `path` whole — every field, the prefab baseline included. The
+ *  Assets move repair's re-park: a rename does not change the bytes, so what the entry says about the file still holds. */
+export function reparkDirtyAsset(path: string, entry: NonNullable<ReturnType<typeof peekDirtyAsset>>): void {
+  dirty.set(path, { ...entry });
+  flushErrors.delete(path);
+  bump();
+}
+
+/** The human read a conflict and chose Overwrite: the next flush of `path` writes whatever the file holds now. An asset
+ *  document drops its `ifMatch` ({@link clearAssetIfMatch}); a prefab writes with `commitPrefabWrite`'s `overwrite`.
+ *  False when nothing is parked there. The same warning as `clearAssetIfMatch`: the human's decision, never the code's. */
+export function overwriteParkedAsset(path: string): boolean {
+  const d = dirty.get(path);
+  if (!d) return false;
+  if (d.type !== 'prefab') { clearAssetIfMatch(path); return true; }
+  dirty.set(path, { ...d, overwrite: true });
+  flushErrors.delete(path);
+  bump();
+  return true;
+}
+
 /** Drop the compare-and-swap baseline on `path`'s parked write, so the next flush writes
  *  UNCONDITIONALLY — i.e. deliberately overwrites whatever the file now holds.
  *
@@ -325,9 +439,9 @@ export function getDirtyAssetPaths(): string[] { return [...dirty.keys()]; }
  *  read that must not report the live cache as though it were the pending one) needs this. */
 export function peekDirtyAsset(
   path: string,
-): { type: AssetSchemaType; data: unknown; origin: AssetWriteOrigin; ifMatch?: string } | null {
+): { type: DirtyDocType; data: unknown; origin: AssetWriteOrigin; ifMatch?: string; onDisk?: unknown; overwrite?: boolean; fileChanged?: boolean } | null {
   const d = dirty.get(path);
-  return d ? { type: d.type, data: d.data, origin: d.origin, ifMatch: d.ifMatch } : null;
+  return d ? { ...d } : null;
 }
 
 /** The EDITOR just wrote this asset's file itself, so any write still parked for that path is
@@ -427,7 +541,7 @@ export interface FlushResult {
   saved: string[];
   /** Paths that failed to write (LEFT in the registry — still pending, still reported by
    *  `hasUnsavedChanges()`/`get_editor_state`, so a failed flush is never silently dropped). */
-  failed: Array<{ path: string; error: string }>;
+  failed: Array<{ path: string; error: string; conflict?: boolean }>;
 }
 
 /** Write every pending asset via the same validated `/api/asset-write` route the file-direct
@@ -442,7 +556,7 @@ export interface FlushResult {
  *  `replace`/`selfWrite` are per-entry and per-origin — see `AssetWriteOrigin` for both. */
 export async function flushDirtyAssets(): Promise<FlushResult> {
   const saved: string[] = [];
-  const failed: Array<{ path: string; error: string }> = [];
+  const failed: FlushResult['failed'] = [];
   /** path → the exact entry object we wrote, so the cleanup below can tell it apart from one that
    *  superseded it mid-flush. */
   const written = new Map<string, DirtyAsset>();
@@ -463,6 +577,18 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
       set.add(thisFlush);
       writesInFlight.set(path, set);
       writing.push({ path, set });
+      if (entry.type === 'prefab') {
+        const landed = await flushPrefab(path, entry);
+        // An Overwrite answers the conflict it was asked about, not the next one (close-out review F6).
+        // Only when this flush wrote WITH it (close-out re-review): an answer given while another flush was writing is
+        // that other flush's to use.
+        const now = dirty.get(path);
+        if (entry.overwrite && now?.type === 'prefab' && now.overwrite) dirty.set(path, { ...now, overwrite: undefined });
+        if (landed.ok) { saved.push(path); written.set(path, entry); continue; }
+        failed.push({ path, error: landed.error, ...(landed.conflict ? { conflict: true } : {}) });
+        errorsByPath.set(path, { error: landed.error, conflict: landed.conflict });
+        continue;
+      }
       try {
         const res = await backendFetch('/api/asset-write', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -478,7 +604,7 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
         const errors = Array.isArray(body?.errors) ? (body.errors as unknown[]).join('; ') : '';
         if (!res.ok || body?.ok === false || errors) {
           const error = errors || (typeof body?.error === 'string' ? body.error : `HTTP ${res.status}`);
-          failed.push({ path, error });
+          failed.push({ path, error, ...(body?.conflict === true ? { conflict: true } : {}) });
           errorsByPath.set(path, { error, conflict: body?.conflict === true });
           continue;
         }
@@ -531,5 +657,25 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
       if (!set.size && writesInFlight.get(path) === set) writesInFlight.delete(path);
     }
     flushEnded();
+  }
+}
+
+/** One parked prefab, written through `commitPrefabWrite` over the document the file held when it was parked — or over
+ *  anything, after the human chose Overwrite. The document itself goes down: the caches and the live frames already hold
+ *  it, so the commit's re-seat and rebase find nothing to change. Imported dynamically: `prefabCommit` reaches the whole
+ *  prefab graph, which this module must not load. */
+async function flushPrefab(path: string, entry: DirtyAsset): Promise<{ ok: true } | { ok: false; error: string; conflict: boolean }> {
+  try {
+    const { commitPrefabWrite } = await import('./prefabCommit');
+    const res = await commitPrefabWrite(path, entry.data as Parameters<typeof commitPrefabWrite>[1], {
+      expected: entry.onDisk as Parameters<typeof commitPrefabWrite>[2]['expected'],
+      ...(entry.overwrite ? { overwrite: true } : {}),
+    });
+    // Written, even when the world was replaced meanwhile (`worldLeft` with `ok`): the caches hold it, and the file does.
+    if (res.ok) return { ok: true };
+    if (res.conflict) return { ok: false, conflict: true, error: `${path} changed on disk since its unsaved edit was made, so it was not overwritten` };
+    return { ok: false, conflict: false, error: res.error ?? `${path} could not be written` };
+  } catch (e) {
+    return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
   }
 }

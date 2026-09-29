@@ -112,22 +112,22 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
       label: 'unwarned writePrefabFile calls in warnInertPrefabSizes (#1251)',
       population: census.filter((w) => !w.warned).map((w) => ({ item: `${w.file}::${w.in}`, site: w.file })),
       exempt: [
-        // Two restores: one file, or every file a two-file Apply wrote as one step (#1693) — a restore either way.
-        { item: 'packages/modoki/src/editor/undo/applyPrefabUndo.ts::restoreSnapshot', count: 2,
-          reason: 'an undo/redo restore (one file, or all of a multi-file Apply\'s as one step, #1693): a warning there blames someone for the value they are reverting' },
+        // Save writing a parked prefab (#1868): an undo or redo restored it in memory, and this is its write.
+        { item: 'packages/modoki/src/editor/scene/dirtyAssets.ts::flushPrefab',
+          reason: 'Save writing a prefab an undo/redo restored in memory (#1868): a warning there blames someone for the value they reverted' },
         // The one-file commit is the several-file one with one file: its CALLERS are this census's rows.
         { item: 'packages/modoki/src/editor/scene/prefabCommit.ts::commitPrefabWrite',
           reason: 'not a writer: the one-file commit hands its one file to commitPrefabWrites — every caller of it is in this census and warns (or is a restore) itself' },
-        ...(['assetOps.ts::undo', 'assetOps.ts::redo',
-          'skinPrefab.ts::undo', 'skinPrefab.ts::redo'].map((at) => ({
-          item: `packages/modoki/src/editor/${at.startsWith('applyPrefabUndo') ? 'undo' : at.startsWith('skinPrefab') ? 'scene' : 'panels'}/${at}`,
-          reason: 'an undo/redo restore: a warning there blames someone for the value they are reverting',
-        }))),
+        // Since #1868 an Apply's, a Replace's and a rig update's undo and redo write nothing: this is Create Prefab's redo
+        // of a CREATE whose file was deleted since, putting back the document it wrote.
+        { item: 'packages/modoki/src/editor/panels/assetOps.ts::redo',
+          reason: 'a redo putting back the document the create wrote: a warning there blames someone for the value they are restoring' },
         // The generated prefabs: a model or rig, not an authored UI — the serializer census holds the same three.
         ...GENERATED_PREFAB_WRITERS,
       ],
       scanned: census.length,
-      floor: 12,
+      // 11 since #1868 took the five undo/redo restores out and added Save's flush of a parked prefab.
+      floor: 11,
       fix: 'call warnInertPrefabSizes(<the prefab>, <the same source>) before the write — it is an authoring write',
     });
   });
@@ -181,12 +181,11 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
   });
 
   it('createPrefabFromEntity (Save-as-Prefab) warns before writing', () => {
-    // Every write is one `commitPrefabWrite` since #1692: the forward one is the authoring write and warns; UNDO of a
-    // Replace writes the REPLACED bytes back and REDO writes the same file again, and those must stay quiet for the
-    // reason above.
+    // Every write is one `commitPrefabWrite` since #1692: the forward one is the authoring write and warns; a CREATE's
+    // REDO writes a deleted file back and must stay quiet for the reason above. A Replace's undo and redo write nothing
+    // since #1868 — they restore in memory.
     expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'commitPrefabWrite').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
       { in: 'createPrefabFromEntity', warned: true },
-      { in: 'undo', warned: false },
       { in: 'redo', warned: false },
     ]);
     expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile'), 'no unguarded write is left in the action').toEqual([]);

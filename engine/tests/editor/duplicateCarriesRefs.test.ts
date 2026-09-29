@@ -31,7 +31,7 @@ import { setPrefabCache, wouldCreateCycle, captureInstanceStructure, captureInst
 import { applyOutcomeNotice } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { buildPrefabEditScene, applyEditWorldMoves } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { recoverTemplateKey as recoverTemplateKeyFrom, type KeyRecoveryNode } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
-import { undo, redo, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { legacyView, legacySceneView } from './memberRowView';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -973,7 +973,7 @@ describe('moved members: review findings (#1437)', () => {
 // the path the moved member (and everything below it) derives its guid from, in EVERY instance, so every ref
 // to one follows: live refs across the refresh, the template's own member tokens, and — through the backend
 // route, checked here by its request — every other file.
-describe('applying a move inside the instance re-parents the row and every ref follows (#1437 P3-a)', () => {
+describe('Apply over a move from before #1869, and what the Apply dialog says (#1437, #1868)', () => {
   const ROOT2 = 'bbbbbbbb-0000-4000-8000-0000000000c9';
   const HOLDER2 = 'bbbbbbbb-0000-4000-8000-0000000000ca';
   const ea = (name: string, parentId: unknown, guid?: string) => ({ EntityAttributes: { name, parentId, ...(guid ? { guid } : {}) } });
@@ -987,10 +987,6 @@ describe('applying a move inside the instance re-parents the row and every ref f
       { id: 4, prefab: OUTER, guid: ROOT2, traits: { ...ea('OuterRoot', HOLDER2), Transform: { x: 0, y: 0, z: 0 } } },
     ],
   } as unknown as SceneData);
-  const repairs: { prefab: string; before: PrefabFile }[] = [];
-  let repairReply: { status: number; body: Record<string, unknown> } = { status: 200, body: { ok: true, rewritten: [], held: [] } };
-  /** How many world-bound operations were held while each repair ran (#1751, #1750's rule). */
-  const heldDuringRepair: number[] = [];
   /** Save, then reload with `doc` as the prefab on disk — what the next session sees. */
   const reloadWith = async (source: string, doc: PrefabFile): Promise<void> => {
     const saved = await serializeScene() as unknown as SceneData;
@@ -1000,35 +996,16 @@ describe('applying a move inside the instance re-parents the row and every ref f
   };
 
   beforeEach(() => {
-    repairs.length = 0;
-    heldDuringRepair.length = 0;
-    repairReply = { status: 200, body: { ok: true, rewritten: [], held: [] } };
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo, init?: RequestInit) => {
-      const url = String(input);
-      if (url.endsWith('/api/prefab-member-paths')) {
-        repairs.push(JSON.parse(String(init?.body)));
-        heldDuringRepair.push(worldBoundOperationsHeld());
-        const reply = repairReply;
-        return { ok: reply.status < 400, status: reply.status, json: async () => reply.body } as unknown as Response;
-      }
-      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
-    }));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }) as unknown as Response));
   });
   afterEach(() => { vi.unstubAllGlobals(); });
 
-  // Review F6: what the Apply dialog tells the person. Mutations: drop either branch of applyOutcomeNotice.
-  it('the dialog\'s notice names skipped moves and unrepaired files, and is silent when nothing was left', () => {
+  // Review F6: what the Apply dialog tells the person. Mutation: drop the skipped branch of applyOutcomeNotice. (The
+  // unrepaired-files branch went with the member-path repair, #1868: no Apply re-paths a member any more.)
+  it('the dialog\'s notice names skipped moves, and is silent when nothing was left', () => {
     expect(applyOutcomeNotice({})).toBeNull();
-    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: ['/a'], held: [] } })).toBeNull();
     expect(applyOutcomeNotice({ skipped: [{ key: '~moved.3', reason: 'its new parent was added in this scene' }] }))
       .toBe('Apply to Prefab: 1 move was not applied: its new parent was added in this scene.');
-    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: ['/p.prefab.json'] } }))
-      .toContain('/p.prefab.json were not repaired');
-    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { failed: true, error: 'no renderer' } })).toContain('could NOT be repaired: no renderer');
-    // #1784: a file the route left because it changed while the repair ran. Mutation: drop the `changed` line in
-    // applyOutcomeNotice — the notice is null.
-    expect(applyOutcomeNotice({ memberPathsChanged: true, fileRepair: { rewritten: [], held: [], changed: ['/h.prefab.json'] } }))
-      .toContain('references in /h.prefab.json were not repaired: the file changed on disk');
   });
 
   // #1468 close-out review F4: a REFUSAL is not a partial outcome. `skipped` means "everything else
@@ -1041,7 +1018,7 @@ describe('applying a move inside the instance re-parents the row and every ref f
     expect(notice).toBe('Apply to Prefab refused: "x.prefab.json" was written by a newer build (prefab format 6; this build writes 5).');
     expect(notice).not.toContain('move');
     // …and it wins over anything else the result happens to carry, because nothing else happened.
-    expect(applyOutcomeNotice({ refused: 'r', skipped: [{ key: 'k', reason: 'why' }], memberPathsChanged: true, fileRepair: { failed: true, error: 'e' } }))
+    expect(applyOutcomeNotice({ refused: 'r', skipped: [{ key: 'k', reason: 'why' }] }))
       .toBe('Apply to Prefab refused: r.');
   });
 
@@ -1119,9 +1096,11 @@ describe('applying a move inside the instance re-parents the row and every ref f
     });
   });
 
-  // Review F1/F8, the prefab's own move: the member's row goes up and its key follows; removing the move's
-  // TARGET drops the entry, which names nothing now. Mutation: drop the stale-entry filter.
-  it('removing rows around a prefab\'s own move: the key follows a lifted row, and a move to nothing is dropped', async () => {
+  // Review F1/F8, the prefab's own move (a file from before #1869): removing the row above the moved member would re-hang
+  // it and re-path it everywhere, so that removal is SKIPPED, naming Revert (#1868, hub ruling B); removing the move's
+  // TARGET drops the entry, which names nothing now. Mutations: drop the removal's skip (the row is removed with its moved
+  // member left hanging from nothing) — the first half goes red; drop the stale-entry filter — the second.
+  it('removing rows around a prefab\'s own move: a removal above the moved row is skipped, and a move to nothing is dropped', async () => {
     const OUTER_M = 'aaaaaaaa-0000-4000-8000-0000000000dc';
     const doc = { ...outerDoc, id: OUTER_M, moved: { '2.3': '@member:4.2' },
       entities: outerDoc.entities.map((r) => (r.localId === 4 ? row(4, 'Nested', 1, { prefab: INNER }) : r)) };
@@ -1135,12 +1114,13 @@ describe('applying a move inside the instance re-parents the row and every ref f
       expect(idAt('Holder/OuterRoot/InnerRoot/Leaf/Button')).toBeGreaterThan(0);
       deleteEntitiesWithUndo([idAt('Holder/OuterRoot/Panel')]);
       const lifted = await applyToPrefabSelective(a, new Set(['-removed.2']));
-      expect(lifted.prefabAfter!.moved).toEqual({ 3: '@member:4.2' });
-      expect(idAt('Holder2/OuterRoot/InnerRoot/Leaf/Button')).toBeGreaterThan(0);
+      expect(lifted.applied).toBe(false);
+      expect(lifted.skipped).toEqual([{ key: '-removed.2', reason: expect.stringMatching(/Revert that move first/) }]);
+      expect(idAt('Holder2/OuterRoot/InnerRoot/Leaf/Button')).toBeGreaterThan(0); // the other instance is untouched
       deleteEntitiesWithUndo([idAt('Holder/OuterRoot/InnerRoot')]);
       const gone = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['-removed.4']));
       expect(gone.prefabAfter!.moved).toBeUndefined();
-      expect(idAt('Holder2/OuterRoot/Button')).toBeGreaterThan(0);
+      expect(idAt('Holder2/OuterRoot/Panel/Button')).toBeGreaterThan(0);
     } finally { prefabs.delete(OUTER_M); setPrefabCache(OUTER_M, null); }
   });
 });

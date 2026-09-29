@@ -30,7 +30,8 @@
 
 import type { World } from 'koota';
 import { sceneManager } from '../../runtime/scene/SceneManager';
-import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { getCachedPrefab, setPrefabReadOverride } from '../../runtime/loaders/meshTemplateCache';
+import { parkedPrefab } from './dirtyAssets';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { isGuid } from '../../runtime/loaders/assetManifest';
 import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, editorPrefabDeleted, type PrefabFile } from './prefab';
@@ -69,9 +70,13 @@ export async function warmEditorPrefabCacheFor(world: World): Promise<void> {
   }
 }
 
-/** Install the hook. Returns the un-installer, for the caller's teardown scope. */
+/** Install the hook — and the runtime loader's read of a PARKED prefab (#1868): an undone Apply is held in memory until
+ *  Save, so a scene load re-reading its file on a swap takes the park instead (`setPrefabReadOverride`), as the editor's
+ *  own reads do (`parkedPrefabRead`). Otherwise Apply and Revert compute against the file while Save writes the park.
+ *  Returns the un-installer, for the caller's teardown scope. */
 export function installEditorPrefabCacheWarm(): () => void {
   const hook = (world: World) => warmEditorPrefabCacheFor(world);
   sceneManager.registerBeforeSwap(hook);
-  return () => sceneManager.unregisterBeforeSwap(hook);
+  setPrefabReadOverride((path) => parkedPrefab(path));
+  return () => { sceneManager.unregisterBeforeSwap(hook); setPrefabReadOverride(null); };
 }

@@ -3872,7 +3872,8 @@ its id, #1468) with no way back from the editor either.
 - **Why not undoable.** Every such undo was an ASYNC file step: 100–150 ms of backend round trips, during which
   the rest of the editor kept running. That window is what needed the preconditions, the shortfall reports, the
   restore owner and the rename-collision refusals, and it produced much of the #1789 campaign's findings. Unity does not undo
-  a delete either. The study, with Unity's behaviour cited per row: [plans/undo-memory-only.md](plans/undo-memory-only.md).
+  a delete either. Unity's behaviour and the owner's rulings: [prefabs.md](prefabs.md) § "Undo changes memory, Save
+  writes files".
 - **What changed for the undo that remains.** A file op pushed an entry, which cleared the redo stack and unwound
   before the steps below it. Now a step recorded before a Rename or a delete runs AFTER it, so a step keyed by a
   PATH must find the asset where it is now, as Unity's undo follows the object:
@@ -4106,9 +4107,10 @@ loss, worth interrupting for whatever caused it.
 **A step that refuses before it changes anything throws an `UndoRefusedError` (#1664).** The drop
 policy is the same. The report is not: the reporter logs that the step was *refused* and nothing was
 applied, and it toasts the error's own `toast` text in place of the generic "FAILED". It also skips the
-dirty signals, since nothing moved. Apply-to-Prefab's undo throws one when the prefab changed on disk
-since the Apply, and when the write failed (#1668) ([prefabs.md](prefabs.md) § Undoing an Apply). Every
-asset-file step in the next section throws one when its precondition fails (#1679).
+dirty signals, since nothing moved. Apply-to-Prefab's undo throws one when the editor holds another document for the
+prefab than the side the Apply left (#1664, asked of memory since #1868, when the undo stopped writing:
+[prefabs.md](prefabs.md) § Undo changes memory, Save writes files). Create Prefab's redo of a deleted file, the one
+undo half left that writes a prefab, throws one when its precondition fails (#1679, next section).
 
 ### A prefab undo that rewrites its file states what it expects there (#1679)
 
@@ -4117,6 +4119,11 @@ elsewhere. Entering prefab edit parks the scene's stack, and Back restores it. S
 it → edit → Cmd+S → Back → Cmd+Z trashed the saved prefab. #1664 fixed the same mechanism for Apply-to-Prefab.
 (The Assets panel's file operations had the widest share of it — a delete's undo restoring over a file
 recreated at its path, a duplicate's undo trashing a painted copy — until #1868 took them out of undo.)
+
+**Since #1868 almost no undo writes a prefab.** Apply's, a Replace's and a rig update's undo and redo restore the
+document in memory, refuse when the editor holds another one than the step left, and park it for Save
+([prefabs.md](prefabs.md) § Undo changes memory, Save writes files). What is left of this rule is Create Prefab's redo
+of a file deleted since, which writes it back over nothing, and every FORWARD write.
 
 **The rule: each step changes the file only while it holds what the step's other half left there, and the
 ROUTE checks that in the same synchronous window as the write.** There is no client read-then-write, because

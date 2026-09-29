@@ -16,7 +16,10 @@
  *  Scene case goes red; let `runStep` push a step that spanned a history swap — the Create Scene and scene-load
  *  cases go red; compare the world only for the untitled key — the half-swapped load case goes red; drop either
  *  in-flight signal — its in-flight case goes red; rederive after a skipped restore — the scene-load cases go red;
- *  resolve instead of throwing on a skipped restore — the half-swapped and in-flight cases go red. */
+ *  resolve instead of throwing on a skipped restore — the half-swapped and in-flight cases go red.
+ *
+ *  #1868: the undo writes no file, so the window these cases land a switch in is the undo's in-memory restore
+ *  (`restorePrefabsInMemory`, entered before the world check), not its file install. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
@@ -31,15 +34,8 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 // Apply writes the prefab through postWriteFile — captured instead of hitting a dev server.
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  // `duringWrite` runs inside the write's await — where an undo's file install waits, and a Create Scene can land.
   postWriteFile: async () => {
-    sm.writing = true; // before `duringWrite`: a switch started there reads the server mid-write
-    const f = sm.duringWrite; sm.duringWrite = null; f?.();
-    // `hold` keeps the write open for a while (#1579), so a world switch started inside it that does not wait for the
-    // undo has swapped the world before the undo resumes — deterministically, not by microtask order.
-    const h = sm.hold; sm.hold = null;
-    sm.writing = true;
-    try { if (h) await h; } finally { sm.writing = false; }
+    await sm.window();
     return { ok: true, json: async () => ({}), text: async () => '' } as Response;
   },
 }));
@@ -62,7 +58,20 @@ const sm = vi.hoisted(() => ({
   next: null as null | object,
   /** A load through the editor's `loadScene` wrapper past its undo wait, as `isSceneLoadSwapping()` reports one. */
   loading: false,
+  /** The undo's FIRST await (#1868: its in-memory restore — it writes no file any more; before, its file install),
+   *  where a Create Scene or a load that bypasses #1579's wait can land before the undo asks whether its world is still
+   *  live. `duringWrite` runs there once; `hold` keeps it open for a while (#1579), so a world switch started inside it
+   *  that does not wait for the undo has swapped the world before the undo resumes — deterministically, not by microtask
+   *  order. Also inside a forward write, which no case arms it for. */
+  window: async () => {},
 }));
+sm.window = async () => {
+  sm.writing = true; // before `duringWrite`: a switch started there reads the server mid-step
+  const f = sm.duringWrite; sm.duringWrite = null; f?.();
+  const h = sm.hold; sm.hold = null;
+  sm.writing = true;
+  try { if (h) await h; } finally { sm.writing = false; }
+};
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return {
@@ -91,7 +100,15 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
 const refreshes = vi.hoisted(() => ({ n: 0 }));
 vi.mock('../../packages/modoki/src/editor/scene/prefab', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
-  return { ...real, refreshBaseInstances: (...a: unknown[]) => { refreshes.n++; return (real.refreshBaseInstances as (...x: unknown[]) => unknown)(...a); } };
+  return {
+    ...real,
+    refreshBaseInstances: (...a: unknown[]) => { refreshes.n++; return (real.refreshBaseInstances as (...x: unknown[]) => unknown)(...a); },
+  };
+});
+// The undo's restore, entered before it asks whether its world is still live — the window (`sm.window`).
+vi.mock('../../packages/modoki/src/editor/scene/prefabMemoryRestore', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabMemoryRestore')>();
+  return { ...real, restorePrefabsInMemory: async (...a: Parameters<typeof real.restorePrefabsInMemory>) => { await sm.window(); return real.restorePrefabsInMemory(...a); } };
 });
 // Play's own awaits, which have nothing to do with the undo (#1579's Play case).
 vi.mock('../../packages/modoki/src/runtime/physics/physicsReady', () => ({ ensurePhysicsReady: async () => {} }));
@@ -211,8 +228,9 @@ const saved = async () => {
   const { id: _id, createdAt: _at, ...doc } = (await serializeScene({ assignGuids: true })) as unknown as Record<string, unknown>;
   return JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
 };
-const midOnDisk = () => getCachedPrefabSync(MID) as PrefabFile;
-const boxOnDisk = () => midOnDisk().entities.find((e) => e.name === 'Box')!.traits.Transform;
+/** MID as the editor holds it — since #1868 an undo restores it in memory and parks it, so this, not the file. */
+const midNow = () => getCachedPrefabSync(MID) as PrefabFile;
+const boxNow = () => midNow().entities.find((e) => e.name === 'Box')!.traits.Transform;
 
 const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
@@ -221,7 +239,7 @@ const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
 
 /** Apply every override instance A holds, of the kinds `pick` selects. */
 async function applyFromA(pick: (keys: ReturnType<typeof collectInstanceOverrideKeys>) => string[]) {
-  const keys = collectInstanceOverrideKeys(rootOf('A'), midOnDisk());
+  const keys = collectInstanceOverrideKeys(rootOf('A'), midNow());
   const res = await quietly(() => applyToPrefabWithUndo(rootOf('A'), new Set(pick(keys))));
   expect(res.applied, JSON.stringify(keys)).toBe(true); // precondition
   return res;
@@ -262,7 +280,7 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
     expect(xOf(inInst('B', 'Box'))).toBe(5); // precondition: B inherits the applied value
 
     await quietly(() => undo());
-    expect(boxOnDisk()).toMatchObject({ x: 0 });
+    expect(boxNow()).toMatchObject({ x: 0 });
     expect(xOf(inInst('A', 'Box'))).toBe(5);
     expect(xOf(inInst('B', 'Box'))).toBe(0);
     expect(await saved()).toEqual(before);
@@ -281,7 +299,7 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
     expect(xOf(inInst('B', 'Box'))).toBe(0); // precondition: the undo took
 
     await quietly(() => redo());
-    expect(boxOnDisk()).toMatchObject({ x: 5 });
+    expect(boxNow()).toMatchObject({ x: 5 });
     expect(xOf(inInst('A', 'Box'))).toBe(5);
     expect(xOf(inInst('B', 'Box'))).toBe(5);
     expect(await saved()).toEqual(after);
@@ -294,7 +312,7 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
     expect(inInst('B', 'Extra')).not.toBe(0); // precondition: B gained the promoted member
 
     await quietly(() => undo());
-    expect(midOnDisk().entities.some((e) => e.name === 'Extra')).toBe(false);
+    expect(midNow().entities.some((e) => e.name === 'Extra')).toBe(false);
     expect(inInst('B', 'Extra')).toBe(0);
     expect(inInst('A', 'Extra')).not.toBe(0);
     expect(await saved()).toEqual(before);
@@ -319,7 +337,7 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     expect(sm.saves).toBe(0);
   });
 
-  it('a Create Scene landing during the undo\'s file install is not overwritten by the untitled snapshot', async () => {
+  it('a Create Scene landing during the undo\'s first await is not overwritten by the untitled snapshot', async () => {
     writeTraitFieldWithUndo(inInst('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
     const blank = createWorld();
@@ -327,17 +345,17 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     sm.duringWrite = () => { setCurrentWorld(blank); swapHistory('', { freshIncoming: true }); };
 
     await quietly(() => undo());
-    expect(sm.duringWrite).toBeNull(); // precondition: the install really awaited a write
+    expect(sm.duringWrite).toBeNull(); // precondition: the undo really awaited
     expect(getCurrentWorld() === blank).toBe(true); // a boolean: a failing `toBe` diffs two whole worlds, out of memory
     expect(all().some((e) => e.guid === ROOT.A)).toBe(false);
-    expect(boxOnDisk()).toMatchObject({ x: 0 }); // the file still came back
+    expect(boxNow()).toMatchObject({ x: 0 }); // the prefab still came back (in memory)
     expect(canRedo()).toBe(false); // the new scene's history does not inherit the Apply
   });
 
   // The review of this fix: the entry of a skipped undo was pushed onto the INCOMING world's redo stack, and its redo
   // reloads under the key live when it runs — so it loaded the old world's snapshot under the new scene and saved it
   // into that scene's file. `runStep` now drops a step that spanned a history swap.
-  it('a scene loaded during the undo\'s file install keeps its own history, and nothing is saved into it', async () => {
+  it('a scene loaded during the undo\'s first await keeps its own history, and nothing is saved into it', async () => {
     const A = '/scenes/A.json';
     const Y = '/scenes/Y.json';
     setCurrentScenePath(A);
@@ -348,7 +366,7 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     sm.duringWrite = () => { setCurrentWorld(other); sm.path = Y; setCurrentScenePath(Y); swapHistory(Y); };
 
     await quietly(() => undo());
-    expect(sm.duringWrite).toBeNull(); // precondition: the install really awaited a write
+    expect(sm.duringWrite).toBeNull(); // precondition: the undo really awaited
     expect(getCurrentWorld() === other).toBe(true);
     expect(canRedo()).toBe(false);
     expect(refreshes.n).toBe(0); // …and the rederive did not rebuild the incoming world's instances
@@ -371,11 +389,11 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     sm.duringWrite = () => { setCurrentWorld(other); }; // the swap; the tail has not run yet
 
     await quietly(() => undo());
-    expect(sm.duringWrite).toBeNull(); // precondition: the install really awaited a write
+    expect(sm.duringWrite).toBeNull(); // precondition: the undo really awaited
     expect(getCurrentWorld() === other).toBe(true);
     expect(sm.saves).toBe(0);
     expect(refreshes.n).toBe(0);
-    expect(boxOnDisk()).toMatchObject({ x: 0 }); // the file still came back
+    expect(boxNow()).toMatchObject({ x: 0 }); // the prefab still came back (in memory)
     // Applied half — the file, not the world — so it is dropped, not left on the redo stack as though undone.
     expect(canRedo()).toBe(false);
   });
@@ -437,7 +455,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
     expect(result).toBe('loaded');
     expect(refreshes.n).toBe(1); // the rederive ran — over A's world, before the swap
     expect(sm.saves).toBe(0); // a field Apply saved no scene, so its undo saves none either (#1695)
-    expect(boxOnDisk()).toMatchObject({ x: 0 });
+    expect(boxNow()).toMatchObject({ x: 0 });
     expect(getCurrentScenePath()).toBe('/scenes/B.json');
   });
 
@@ -481,14 +499,14 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
   it('entering prefab edit: the undo applies whole, and the edit world is built from the restored prefab', async () => {
     writeTraitFieldWithUndo(inInst('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
-    const applied = JSON.stringify(midOnDisk());
-    vi.stubGlobal('fetch', async () => new Response(sm.writing ? applied : JSON.stringify(midOnDisk())));
+    const applied = JSON.stringify(midNow());
+    vi.stubGlobal('fetch', async () => new Response(sm.writing ? applied : JSON.stringify(midNow())));
     try {
       const { did } = await undoDuring(() => openPrefabForEditing({ path: '/assets/prefabs/mid.prefab.json', name: 'Mid' }));
       expect(did).toBe(true);
       expect(refreshes.n).toBe(1);
       expect(isEditingPrefab()).toBe(true);
-      expect(boxOnDisk()).toMatchObject({ x: 0 }); // the editor cache still holds the restored document
+      expect(boxNow()).toMatchObject({ x: 0 }); // the editor cache still holds the restored document
       expect(xOf(all().find((e) => e.name === 'Box')!.id)).toBe(0); // and the edit world was built from it
     } finally {
       vi.unstubAllGlobals();
@@ -508,7 +526,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
     expect(did).toBe(true);
     expect(result.kind).toBe('started');
     await quietly(() => stopPlay());
-    expect(boxOnDisk()).toMatchObject({ x: 0 });
+    expect(boxNow()).toMatchObject({ x: 0 });
     expect(xOf(inInst('B', 'Box'))).toBe(0);
     expect(await saved()).toEqual(before);
   });

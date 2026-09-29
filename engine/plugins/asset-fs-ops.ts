@@ -15,8 +15,7 @@ import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
 import { durableGuid, memberRowNodes, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
 import {
-  derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, memberGuidRemap,
-  rewritePrefabMemberTokens, MAX_INSTANCE_DEPTH, type PrefabReader,
+  derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, MAX_INSTANCE_DEPTH, type PrefabReader,
 } from '../packages/modoki/src/runtime/loaders/memberPaths';
 export { derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, type PrefabReader };
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
@@ -484,49 +483,6 @@ export function remintSceneEntityGuids(
     }
   }
   return remapGuidValues(scene, remap) as Record<string, unknown>;
-}
-
-/** One scene or prefab file as {@link planMemberPathRepair} reads it. */
-export type RepairFile = { key: string; type: 'scene' | 'prefab'; guid?: string; text: string };
-
-/** The files that need rewriting because prefab `prefabGuid` changed from `before` to what `readNew`
- *  returns for it, and each one's new document (#1437: applying a move re-parents a row, which changes
- *  member PATHS). A scene stores each member ref as the guid its path derives, so it gets
- *  `memberGuidRemap`; a prefab stores it as a path token, so it gets `rewritePrefabMemberTokens`. The
- *  changed prefab itself comes back unchanged: its caller rewrote its tokens before writing it, and an old
- *  path never names a different row under the new document (a path ends in the row's own localId).
- *
- *  Only a file that names the prefab, directly or through prefabs that nest it, can hold such a ref,
- *  so the rest are never parsed: the users are found by the guid's TEXT, to a fixpoint. */
-export function planMemberPathRepair(
-  files: readonly RepairFile[], prefabGuid: string, before: unknown, readNew: PrefabReader,
-): { key: string; doc: Record<string, unknown> }[] {
-  const self = prefabGuid.toLowerCase();
-  const readOld: PrefabReader = (g) => (g.toLowerCase() === self ? before : readNew(g));
-  const users = new Set([self]);
-  const names = (f: RepairFile): boolean => { const t = f.text.toLowerCase(); return [...users].some((g) => t.includes(g)); };
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const f of files) {
-      const g = f.guid?.toLowerCase();
-      if (f.type === 'prefab' && g && !users.has(g) && names(f)) { users.add(g); grew = true; }
-    }
-  }
-  const out: { key: string; doc: Record<string, unknown> }[] = [];
-  for (const f of files) {
-    if (!names(f)) continue;
-    let doc: Record<string, unknown>;
-    try { doc = parseJsonText(f.text); } catch { continue; }
-    if (!doc || typeof doc !== 'object') continue;
-    if (f.type === 'prefab') {
-      const next = f.guid ? rewritePrefabMemberTokens(doc, f.guid, readOld, readNew) : null;
-      if (next) out.push({ key: f.key, doc: next });
-    } else {
-      const remap = memberGuidRemap(doc, readOld, readNew);
-      if (remap.size) out.push({ key: f.key, doc: remapGuidValues(doc, remap) as Record<string, unknown> });
-    }
-  }
-  return out;
 }
 
 /** A JSON asset's document with its own identity replaced: `id` set to `guid`, and for a scene every entity guid

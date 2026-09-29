@@ -13,6 +13,7 @@ import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendEventSource } from '../backend/editorBackend';
 import { otaBundleChoices, otaEngineApiNote, type OtaBundleChoice } from './publishOtaTargets';
 import { ModalShell } from '../components/ModalShell';
+import { confirmUnsavedBeforeBuild } from '../scene/unsavedGate';
 
 interface ReleaseInfo { bundles?: Record<string, string>; mandatory?: boolean; minEngineApi?: number }
 interface StatusResponse { ok: boolean; bucket?: string; release?: ReleaseInfo | null; error?: string }
@@ -112,8 +113,10 @@ export default function PublishOtaDialog() {
   const liveVersion = release?.bundles?.[bundleName];
   const choice = choices.find((c) => c.bundleName === bundleName) ?? choices[0];
 
-  const publish = () => {
+  const publish = async () => {
     if (!version.trim()) return;
+    // Unsaved work is not in the bundle, which is built from the files (#1868): the human is told, and chooses.
+    if (!await confirmUnsavedBeforeBuild(`publish OTA ${version.trim()}`)) return;
     setPublishing(true);
     setDone(false);
     setFailed(false);

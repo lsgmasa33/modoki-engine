@@ -63,15 +63,15 @@ answer the same question for themselves. Each place in that column is a place th
 | I4 | A `localId` means something only together with the document it was read from. Across documents a node is named by `nodeGuid`, and translated to the `localId` of the document the frame expands NOW, where it is used. A write never hands a node a number the document it replaces used for another node, nor one an EARLIER write used and freed: a new row takes a number at or above the document's persisted high-water mark, `nextLocalId` (v8, #1774). The exception is a Replace or a rebuild over a pre-v5 document, whose numbers are its only identity and stay positional. **A nested frame's overrides survive a rebuild only while the frame expands the same prefab** (Unity drops them the same way when a nested prefab asset is swapped). Across two prefabs, an edit carries only where both documents hold the same `nodeGuid`, and every link of the frame's chain is found by identity (#1767). One difference from a reload is the rebuild's standing rule, not a translation gap: a scene-ADDED node under a dropped member is re-anchored to the frame root (§ Reconcile in `prefab-structural-overrides.md`), where a reload keeps it in the orphan row. | Numbering: `planPrefabRows`, whose plan `serializePrefab` records against the file it writes. The mark: `runtime/core/localIdCounter.ts`, read by every allocator and kept from going down by `commitPrefabWrites` (§ "The localId high-water mark"). A Replace keeps every matched row's number (`replaceNumbering`, #1759). So does a REBUILD of an existing prefab from a fresh tree, Import Model and the 2D skin-rig update (`serializeRebuildOver`, #1782): it matches each node to a row by its hierarchy PATH, the names from the root down, as Unity's model importer keeps identity across a reimport (hub ruling 2026-09-29). Two same-named nodes under different parents both keep their rows, and a path two nodes share mints. A Replace matches by bare name instead (U22). Then `tagEntityTreeAsInstance` reads its numbering from that file, which `planMatchesFile` checks row by row. **Translation: `runtime/loaders/memberTranslation.ts` (#1771)**, with `docRows`, `resolveMemberChain` and `translateLocalIds`. The callers are `foldMemberRowChannels` on load, R2's `rowBackedTest` (a member-row key is chained frame by frame, #1766), the rebuild's outer carry and each nested capture's re-apply (#1767), and `toLocalIdKeys` for Apply's keys. | Four readers still spell the chain walk themselves; each chains through the frame's current document, so it is duplication, not a defect: `templateFrameKeys` (`loadSceneFile.ts`), the member-path rewrite in `memberPaths.ts`, `byRowDepth` (`prefabEdit.ts`) and the member-row size check in `sceneValidation.ts`. |
 | I5 | Only a write mints identity (a `nodeGuid`, a template `key`), and it carries the existing identity wherever a real correspondence exists. A reader never mints. | `nodeGuidsFor`, the one matcher (#1691): a prefab-edit save's preserved rows, then the live `nodeGuid`, then, on a Replace only, the one old row sharing a node's name (U22). Also `addedNodeIdentity`, whose `readOnly` mode never mints. | None known. Fixed at the owner: the prefab-edit save now remembers where each session-added member was written (#1662); Create Prefab's Replace serializes against the kept id (#1686); Apply's promotion carries the promoted guids (#1660, `carryPromotedGuids`). |
 | I6 | Which frame an entity belongs to, what a frame holds, and where a member sits are decided by IDENTITY, never by the live tree. Delete, promotion, a move, Detach and the save's partition all act on the identity subtree. | `worldIdentityParents` (`ownerOf`, `parentOf`, `moved`, and `frameOf`: the frame an entity is a row of), `identitySubtree` (#1691, both in `identityParents.ts`), `memberRowsIn`, `instanceRowDomain` (the row claims, a partition), `rebuildTeardown`, `endFrames`, `planMoveUnlinks`. Apply's promotion delete, Detach, the save's partition and the scene-move refusal ask them (#1682, #1687). So does a copy: each copied node keeps its link only while the frame it is a row of is in the copy, an owned root whose owner is not (or not CONFIRMED: its owner link, when it has one, must name a copied node, and the owner's document must hold the row that expanded it) becomes an independent instance, and a member whose frame is not becomes a plain added node (`planCopyGuids`' `CopyLink`, applied by `copySnapshot` and the device `duplicate-entity` op, #1756). | `templateReferenceNode` climbs live parents, on purpose, for speed. A user Delete takes the LIVE subtree on purpose: it removes what is shown under the node (Unity's hierarchy delete), and `endFrames` unlinks a member moved out. Duplicate and paste copy the live subtree for the same reason, so a member dragged out of a copied instance is not copied (the copy saves it as removed); which of the copied nodes stay linked is decided by identity (#1756). "The members of frame R" is read as a raw `rootInstanceId` scan at several sites; for a member that field IS identity (stamped at expansion), so those are not bypasses. |
-| I7 | A member's guid is the member row's pin, else the template's, else derived from its anchor through identity parents. Every place that predicts one derives it the same way. | `deriveInstanceMemberGuids` (after `applyStoredMemberRows`) walks up, over `deriveMemberGuid` and `entityStep`. `memberPathIndex` (`runtime/core/ecs/memberHome.ts`) walks the identity tree down, and `stampDerivedMemberGuids`, `promoteOwnedRoots`, `storedMemberGuids` and the loader's move drain share it. Create Prefab's stamp renames through `reloadDerivedGuids`, the loader's coverage walked down: it also continues into a KEYED stored root, a template reference node the reload derives (#1758). `promoteOwnedRoots` deliberately stops there, because such a node under a promoted root is saved with its guid (measured, #1758). **A pin is followed by one sequence**, `deriveMemberGuidsAfterPins` (derive, `dropCollidingPins`, then settle tokens and moves), which the load and every rebuild call (#1761, #1777). | Four sites predict guids with a walk of their own. The derivation's docblock names two: `derivedMemberPaths` (built on `memberPathRecords`, `runtime/loaders/memberPaths.ts`), and `planCopyGuids`, which since #1756 takes frame membership from the resolver's `frameOf` and duplicates only the walk loop. The other two are `liveMemberGuidRemap` and the prefab-edit world's `editGuidAt`. |
+| I7 | A member's guid is the member row's pin, else the template's, else derived from its anchor through identity parents. Every place that predicts one derives it the same way. | `deriveInstanceMemberGuids` (after `applyStoredMemberRows`) walks up, over `deriveMemberGuid` and `entityStep`. `memberPathIndex` (`runtime/core/ecs/memberHome.ts`) walks the identity tree down, and `stampDerivedMemberGuids`, `promoteOwnedRoots`, `storedMemberGuids` and the loader's move drain share it. Create Prefab's stamp renames through `reloadDerivedGuids`, the loader's coverage walked down: it also continues into a KEYED stored root, a template reference node the reload derives (#1758). `promoteOwnedRoots` deliberately stops there, because such a node under a promoted root is saved with its guid (measured, #1758). **A pin is followed by one sequence**, `deriveMemberGuidsAfterPins` (derive, `dropCollidingPins`, then settle tokens and moves), which the load and every rebuild call (#1761, #1777). | Three sites predict guids with a walk of their own. The derivation's docblock names two: `derivedMemberPaths` (built on `memberPathRecords`, `runtime/loaders/memberPaths.ts`), and `planCopyGuids`, which since #1756 takes frame membership from the resolver's `frameOf` and duplicates only the walk loop. The other is the prefab-edit world's `editGuidAt` (a third, Apply's `liveMemberGuidRemap`, went with the applied move in #1868). |
 | I8 | A template holds no identity of one instance: no guids, no member rows or moves, and a ref from one member to another is written as a member token. | `serializePrefab` with `templateTokenizer` and `assertNoRuntimeGuids`; `toTemplateNodes` for a promotion; `templateValueWriter` (`prefabTemplateValue.ts`, #1659) for every value Apply writes. | None known in Apply. `serializePrefab`'s `templateTokenizer` and prefab edit's `editWorldRefs` are further copies of the idea for other carriers. |
 
 #### Change propagation
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply and its undo, the prefab-edit save, Create Prefab (Replace and its undo), the agent `create`, the skin rig and its undo, the model regenerate, and the Assets model import (no undo since #1868). **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names the file that missed (`failed`) and any file it could not put back (`stranded`); both refusals word themselves from those (#1732, § Undoing an Apply). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event: the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). **A server route's own rewrite or move** is marked as the editor's own, so no watcher event runs: the client adopts it instead (§ "A server-side prefab rewrite or move brings the client along", #1751). **A delete** (the Assets panel, the agent's `/api/delete-asset` through its renderer repair, every undo that trashes) is marked as the editor's own too, and evicts the EDITOR cache in the one repair every door runs, `applyAssetPathMoves`' delete branch (`evictDeletedEditorPrefabs`, #1805). A file or a whole folder is evicted: the path key, a guid key the manifest still maps there, and the guid of a document held under one of those. Before it, the editor cache kept answering after the trash while a world swap's re-fetch 404'd in the loader's, and an instantiate expanded a prefab that no longer existed. Live instances stay EXPANDED: that is #1738's evicted state, where every writer captures from the frame record (I18), so a save writes what the reload's Missing Prefab placeholder reads back. **The loader's entry is evicted in the same branch** (`evictDeletedPrefabs`, #1834), by path and every key under a deleted folder, keeping the scene's ownership. It was held back until #1819 landed: evicted, every reload after a trash gives placeholders, and an undo run against a placeholder was #1819's open class (the #1789 fuzzer's seeds 1 and 8); that undo now REFUSES by ruling R (`require`). It was built and backed out once more (hub ruling (B), 2026-09-29), on a diagnosis that the Apply's in-place rebuild dropped a trashed NESTED prefab's live members (hunt seed 6191). Traced, that seed was ruling R inside one fuzzer `undo` op (the Apply's undo reloads, the next undo in the op refuses) judged before its taint, a harness gap; but the in-place drop was real too (37 rebuilds in a 300-seed hunt tore down a nested frame they could not re-expand, invisible to the fuzzer because the save writes the frame's record either way). So an in-place rebuild now KEEPS such a nested frame (#1862, § Unity parity U9b), and the eviction went back in. Before it, a reload of the SAME scene (which acquires before it releases) re-expanded the deleted prefab from the stale entry, where a cold start shows the placeholder. A delete is not undoable (#1868, owner ruling D2): a file put back from the OS Trash is an outside write, which the watcher raises (the hot reload evicts, which forgets a remembered 404, and reloads a scene that uses it). The EDITOR side does not come back from the loader either: the delete tombstones what it evicted, plus every guid the manifest maps into the deleted range (`editorPrefabDeleted`), and a swap's warm (`warmEditorPrefabCacheFor`) reads a tombstoned key from disk instead of seeding it from the loader. That read is a 404 while the file is gone, and the document once it is back (or, where the manifest still maps the guid to the path and a new file took it, that file's, as the loader gave before); seating a document under the guid clears its tombstone. Before the tombstone, the first reload after a delete put the deleted prefab back in the editor cache (close-out review). **The pruned-manifest window is closed** (#1834, found through #1866): the dev editor's pruning manifest load (`createEditor.tsx`, Vite's `asset-manifest-updated`, which the delete's inline rescan broadcasts BEFORE the renderer repair runs) used to leave nothing to trace a prefab held under its guid alone to the deleted path, so the trashed document stayed readable under its guid. The prune now remembers each pruned guid's last path (`lastKnownPathOf`, `assetManifest.ts`), and the repair resolves a guid key through it. A packaged editor's IPC update is additive, so the guid still mapped there anyway. **Only a prefab DOCUMENT enters either cache** (`isPrefabDocument`, an object whose `entities` is an array of rows, #1813): it is asked by the loader's fetch, `replaceCachedPrefab`, the editor's fetch, and the editor cache's one seat `seatEditorEntry`. A file without that shape reads as a prefab that did not load (I18's placeholder), never as an empty document, which would expand to no root (#1768). The ~53 `.entities` readers then assume the shape. |
-| I10 | A write over content the caller did not read is conditional, and a write that does not land changes nothing. A read that began before a write cannot put the older bytes back. | `commitPrefabWrite`'s `expected`, required on every write (#1692). It is one of three things. A document the caller READ is matched by the editor's serialization of it, and when that is refused, by the file re-read and parsed as every reader parses it, then written with `ifMatch` on those bytes; so a hand-formatted, CRLF or BOM file still counts as the document read. Raw bytes are matched as they are. `null` means nothing may be there (`createOnly`). A trash carries `ifMatch` on `/api/delete-asset` (#1679). The Apply undo's SCENE half saves only over what the editor itself last wrote to that file (`saveScene({ ifMatch })` over `lastWrittenSceneBytes`, #1695). `getPrefabSource` carries the runtime cache's revision token across its fetch (#1669), and so does every other read-side seed: a placement and the prefab edit-open refuse when a write landed since their read (`capturePrefabRead`, #1752, § A read-side seed carries its read's token). The runtime cache refuses a stale in-flight fetch (#863). | One deliberate unconditional write: the prefab-edit save's **Overwrite**, after the conflict was shown to the human (or an agent's explicit `overwrite:true`). |
+| I9 | The caches hold the current template for everything that reads them. A synchronous reader never runs over a cold cache: a miss there reads as "not a prefab". A prefab write is one step: once it lands, both caches hold the written bytes under every key they use, and every live frame expanded from the old document is rebuilt or refused. | Warming: `installEditorPrefabCacheWarm` (before a scene swap) and `instantiatePrefabInstance`, with `preloadNestedPrefabs` / `preloadNestedPrefabsForSubtree` at the call sites. **The write step: `commitPrefabWrite(source, doc, { expected })`** (`editor/scene/prefabCommit.ts`, #1692). It is the only function that changes a `.prefab.json`. Once the write lands it seats the editor cache under the guid, the path and the caller's ref, and the runtime cache under the resolved path. Then it runs the caller's own `rebuild` (Apply's refresh, Create Prefab's tag), then `rebaseStaleInstances({ sources })` for every other frame of the source. Every writer goes through it: Apply, the prefab-edit save, Create Prefab (and a create's redo of a deleted file), the agent `create`, the skin rig, the model regenerate, the Assets model import, and Save's flush of a parked prefab. Since #1868 no undo or redo of a prefab write writes: it restores in memory and parks (§ Undo changes memory, Save writes files). **Several files are one step too** (`commitPrefabWrites`, for an Apply that writes an inner prefab and its enclosing one, #1693/U13). Every file's precondition is checked before any is written. Each file is then written only over the bytes checked. A miss part-way puts back what was already written, and names the file that missed (`failed`) and any file it could not put back (`stranded`); both refusals word themselves from those (#1732). Then both caches for each file, one rebuild and one rebase. | No writer. **An outside edit** reaches the editor as a watcher event (except under a PARKED prefab, which keeps its park, § Undo changes memory, Save writes files): the hot reload evicts the runtime cache, refreshes the editor cache (except the prefab open in prefab edit, `refreshPrefabSourceForPath`), reloads, then rebases; leaving prefab edit refreshes that one and rebases (`repairLeftPrefabEdit`, #1666). ⚠️ The commit seats the open prefab's entry too: a first version skipped it so the edit's save kept its baseline, and its own rebase then put the instances an Apply had just refreshed back onto the old document (close-out review). The edit session keeps its OWN baseline (`editBaselineFor`, § Prefab edit mode). **A server route's own move** is marked as the editor's own, so no watcher event runs: the client adopts it instead (§ "A server-side prefab move brings the client along", #1751). **A delete** (the Assets panel, the agent's `/api/delete-asset` through its renderer repair) is marked as the editor's own too, and evicts the EDITOR cache in the one repair every door runs, `applyAssetPathMoves`' delete branch (`evictDeletedEditorPrefabs`, #1805). A file or a whole folder is evicted: the path key, a guid key the manifest still maps there, and the guid of a document held under one of those. Before it, the editor cache kept answering after the trash while a world swap's re-fetch 404'd in the loader's, and an instantiate expanded a prefab that no longer existed. Live instances stay EXPANDED: that is #1738's evicted state, where every writer captures from the frame record (I18), so a save writes what the reload's Missing Prefab placeholder reads back. **The loader's entry is evicted in the same branch** (`evictDeletedPrefabs`, #1834), by path and every key under a deleted folder, keeping the scene's ownership. It was held back until #1819 landed: evicted, every reload after a trash gives placeholders, and an undo run against a placeholder was #1819's open class (the #1789 fuzzer's seeds 1 and 8); that undo now REFUSES by ruling R (`require`). It was built and backed out once more (hub ruling (B), 2026-09-29), on a diagnosis that the Apply's in-place rebuild dropped a trashed NESTED prefab's live members (hunt seed 6191). Traced, that seed was ruling R inside one fuzzer `undo` op (the Apply's undo reloads, the next undo in the op refuses) judged before its taint, a harness gap; but the in-place drop was real too (37 rebuilds in a 300-seed hunt tore down a nested frame they could not re-expand, invisible to the fuzzer because the save writes the frame's record either way). So an in-place rebuild now KEEPS such a nested frame (#1862, § Unity parity U9b), and the eviction went back in. Before it, a reload of the SAME scene (which acquires before it releases) re-expanded the deleted prefab from the stale entry, where a cold start shows the placeholder. A delete is not undoable (#1868, owner ruling D2): a file put back from the OS Trash is an outside write, which the watcher raises (the hot reload evicts, which forgets a remembered 404, and reloads a scene that uses it). The EDITOR side does not come back from the loader either: the delete tombstones what it evicted, plus every guid the manifest maps into the deleted range (`editorPrefabDeleted`), and a swap's warm (`warmEditorPrefabCacheFor`) reads a tombstoned key from disk instead of seeding it from the loader. That read is a 404 while the file is gone, and the document once it is back (or, where the manifest still maps the guid to the path and a new file took it, that file's, as the loader gave before); seating a document under the guid clears its tombstone. Before the tombstone, the first reload after a delete put the deleted prefab back in the editor cache (close-out review). **The pruned-manifest window is closed** (#1834, found through #1866): the dev editor's pruning manifest load (`createEditor.tsx`, Vite's `asset-manifest-updated`, which the delete's inline rescan broadcasts BEFORE the renderer repair runs) used to leave nothing to trace a prefab held under its guid alone to the deleted path, so the trashed document stayed readable under its guid. The prune now remembers each pruned guid's last path (`lastKnownPathOf`, `assetManifest.ts`), and the repair resolves a guid key through it. A packaged editor's IPC update is additive, so the guid still mapped there anyway. **Only a prefab DOCUMENT enters either cache** (`isPrefabDocument`, an object whose `entities` is an array of rows, #1813): it is asked by the loader's fetch, `replaceCachedPrefab`, the editor's fetch, and the editor cache's one seat `seatEditorEntry`. A file without that shape reads as a prefab that did not load (I18's placeholder), never as an empty document, which would expand to no root (#1768). The ~53 `.entities` readers then assume the shape. |
+| I10 | A write over content the caller did not read is conditional, and a write that does not land changes nothing. A read that began before a write cannot put the older bytes back. | `commitPrefabWrite`'s `expected`, required on every write (#1692). It is one of three things. A document the caller READ is matched by the editor's serialization of it, and when that is refused, by the file re-read and parsed as every reader parses it, then written with `ifMatch` on those bytes; so a hand-formatted, CRLF or BOM file still counts as the document read. Raw bytes are matched as they are. `null` means nothing may be there (`createOnly`). A trash carries `ifMatch` on `/api/delete-asset` (#1679). An undo or redo of a prefab write writes nothing since #1868; its precondition is asked of memory (`prefabRestoreRefusal`), and Save's flush of the park is conditional on the file's own baseline, with Overwrite/Cancel on a conflict. `getPrefabSource` carries the runtime cache's revision token across its fetch (#1669), and so does every other read-side seed: a placement and the prefab edit-open refuse when a write landed since their read (`capturePrefabRead`, #1752, § A read-side seed carries its read's token). The runtime cache refuses a stale in-flight fetch (#863). | One deliberate unconditional write: the prefab-edit save's **Overwrite**, after the conflict was shown to the human (or an agent's explicit `overwrite:true`). |
 | I11 | An operation that awaits between its steps lands whole, in the world it began in. | `beginWorldSwitch` / `prepareWorldSwitch`, which wait for what holds the world: an undo step (#1579), and a world-bound operation (`beginWorldBoundOperation`, #1667). The forward Apply holds it from its first line to its undo entry and refuses to start during a switch. Every `commitPrefabWrite` holds it from its write to its rebase. Nothing reachable from a write's rebuild may start a switch, or the two would wait on each other (`prefabCommit.test.ts` counts it). | A world swap that bypasses `beginWorldSwitch` (a hot reload) is read from #1698's adoption record instead. A write starts only once `adoptionsSettled()`, as does the forward Apply. After the write, a route mid-adoption (`pendingAdoptions()`) or a replaced world means it seats the caches and rebuilds nothing, since the new world's load builds from them. |
 
 #### The rest of the model
@@ -719,7 +719,7 @@ the directed move-then-Apply branch, was added precisely so that #1751 F1's rout
 construction. The four: Remove Component draws only from
 entities that have a component (it was a no-op 97% of the time); reparent has a same-frame branch; an outside edit's
 merged row numbers at or above the file's mark; and 20% of Applies first move a frame member under another member (the
-only way `/api/prefab-member-paths` is called, 0 calls in 400 seeds before it). A re-find counts only if its seed passes
+only way the member-path route, gone since #1868, was called: 0 calls in 400 seeds before it). A re-find counts only if its seed passes
 on the unmutated tree and its minimized repro does too. **Since #1869 the same-frame branch and the directed
 move-then-Apply are gone:** a member does not move, so `reparent` and `cut` draw only what may (a scene-added node, a
 stored root, a plain entity), and no fuzzed gesture authors a row move.
@@ -795,7 +795,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | # | Behaviour | Unity | Modoki | Verdict |
 |---|---|---|---|---|
 | U26 | Object identity inside an instance | Objects in a prefab have fileIDs. A reference into an instance goes through a stripped placeholder: the source fileID plus the `PrefabInstance`. [M6 `yaml-prefab-serialization`] | `nodeGuid` names a template node. A member's guid is pinned on its member row (scene v16), so a scene reference survives a template renumber. § "Identity" (I4–I8). | match by design. Open breaks: #1659, #1680. |
-| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). **Create Prefab's undo unlinks the tree and LEAVES the prefab file on disk**, the Hierarchy's as the agent `create` op's (#1795, hub ruling (i) 2026-09-29, Unity: undo reverts the scene object's connection, never the asset's creation). It used to trash the file, and a scene saved in between (a Cmd+S, an Apply's undo) still named it, so the next reload from disk made the tree a Missing Prefab nobody deleted. A file left behind is an ordinary unused asset. The redo re-links to it and writes nothing while it holds the document (its bytes, or the same document under a raised #1774 mark, which is how #1821's refusal went away), reading it where its guid lives NOW: a Rename since moves it, and another prefab created at the freed name may hold the path this step first wrote (hunt seed 6029); it writes it back, over nothing, only when it was deleted since; and a file changed since (a prefab-edit save, an outside edit) refuses the redo before any change (I10), since the re-tag plans the tree against the rows it wrote. The agent `create` op's redo asks the same file question, and writes nothing in any case: an absent file refuses it. Both undos refuse a tree the file's changed document rebuilt since (a prefab-edit save or an outside edit rebases the instance; unlinking it would keep the change as plain entities), `createdFrameRebuiltRefusal`, since the undo has no file write left to be conditional on. **A Replace is the deliberate difference:** its undo RESTORES the bytes it overwrote (#1264). That loses nothing and keeps the prefab's guid, so no scene can dangle, and the ruling was about a CREATED file. **Leaving prefab edit drops its history** (owner, 2026-09-28, #1704): however the edit world is left (Exit, a scene load, opening another prefab, re-opening the same one from inside it), the adoption owner drops its stack instead of parking it (`sceneAdoption.ts`, S8), so a re-open starts with nothing to undo. It used to be kept, and after an outside write (an Apply, a Replace, a checkout) it replayed onto a changed document: an undone delete came back at a number the Apply had given another row. **One deliberate difference:** an asset-document entry recorded there (material, clip, particle…, `_isFileDirect`) survives, parked under the prefab's key as it is across any discard: it edits another file, and dropping it would strand an asset edit with no undo (#1409). Like every asset-document entry, its undo and redo refuse unless the asset still holds that step's side, so an edit made to that asset elsewhere since is not reverted (#1710, [editor.md](editor.md) § An asset-DOCUMENT undo checks the asset still holds its side). Re-opening the prefab you are already editing also drops the history: that rebuilds the world from disk, which an outside write can have changed during the visit (the hot reload skips the edit world). | match, except the asset-document entries above. |
+| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). **Create Prefab's undo unlinks the tree and LEAVES the prefab file on disk**, the Hierarchy's as the agent `create` op's (#1795, hub ruling (i) 2026-09-29, Unity: undo reverts the scene object's connection, never the asset's creation). It used to trash the file, and a scene saved in between (a Cmd+S, an Apply's undo) still named it, so the next reload from disk made the tree a Missing Prefab nobody deleted. A file left behind is an ordinary unused asset. The redo re-links to it and writes nothing while it holds the document (its bytes, or the same document under a raised #1774 mark, which is how #1821's refusal went away), reading it where its guid lives NOW: a Rename since moves it, and another prefab created at the freed name may hold the path this step first wrote (hunt seed 6029); it writes it back, over nothing, only when it was deleted since; and a file changed since (a prefab-edit save, an outside edit) refuses the redo before any change (I10), since the re-tag plans the tree against the rows it wrote. The agent `create` op's redo asks the same file question, and writes nothing in any case: an absent file refuses it. Both undos refuse a tree the file's changed document rebuilt since (a prefab-edit save or an outside edit rebases the instance; unlinking it would keep the change as plain entities), `createdFrameRebuiltRefusal`, since the undo has no file write left to be conditional on. **A Replace is the deliberate difference:** its undo RESTORES the document it overwrote (#1264), in memory since #1868, and Save writes it. That loses nothing and keeps the prefab's guid, so no scene can dangle, and the ruling was about a CREATED file. **Leaving prefab edit drops its history** (owner, 2026-09-28, #1704): however the edit world is left (Exit, a scene load, opening another prefab, re-opening the same one from inside it), the adoption owner drops its stack instead of parking it (`sceneAdoption.ts`, S8), so a re-open starts with nothing to undo. It used to be kept, and after an outside write (an Apply, a Replace, a checkout) it replayed onto a changed document: an undone delete came back at a number the Apply had given another row. **One deliberate difference:** an asset-document entry recorded there (material, clip, particle…, `_isFileDirect`) survives, parked under the prefab's key as it is across any discard: it edits another file, and dropping it would strand an asset edit with no undo (#1409). Like every asset-document entry, its undo and redo refuse unless the asset still holds that step's side, so an edit made to that asset elsewhere since is not reverted (#1710, [editor.md](editor.md) § An asset-DOCUMENT undo checks the asset still holds its side). Re-opening the prefab you are already editing also drops the history: that rebuilds the world from disk, which an outside write can have changed during the visit (the hot reload skips the edit world). | match, except the asset-document entries above. |
 | U28 | Runtime instantiate | `Object.Instantiate` makes no prefab connection. [S6 `Object.Instantiate`] | `spawnPrefabInstance` stamps `PrefabInstance` on every spawned entity, and nested rows expand at load, not at build. | **diverges**, deliberate: the runtime uses `PrefabInstance` for member guids and frame identity. The owner rules on whether it stays. |
 | U29 | Reordering children inside an instance | Not an override since 2022.3. Existing reorder overrides are discarded on upgrade. [M22 `UpgradeGuide2022LTS`, <https://docs.unity3d.com/2022.3/Documentation/Manual/UpgradeGuide2022LTS.html>] | The prefab's own children keep the prefab's order (#1869, U7's predicate with `reorder`): a Hierarchy sibling drop, a reparent that names a `sortOrder`, and a `sortOrder` field write (the Inspector, `set-traits`, `apply-scene-ops`) are refused on one. A node the scene added takes any place among them: the Hierarchy's renumber after a tie leaves the prefab's children where they are and numbers only the rest (`siblingKeepsItsPlace`), and a tie between two of the prefab's children leaves no room between them, refused in its own words (`stuckDropText`) rather than renumbering them. A `sortOrder` override a file already holds loads and saves unchanged (Unity discards one on upgrade; Modoki migrates nothing). An instance ROOT's place among the scene's own entities is still its override (I21). | match (existing overrides kept, not discarded) |
 | U30 | Duplicate a child of an instance that holds a nested instance | The duplicate is an added GameObject override, and the nested prefab instance inside it stays a prefab instance. (No Manual page is cited: this is the hub's reading, recorded with its ruling.) | The same since #1756 (hub ruling on the owner's Unity rule, 2026-09-28): each copied node keeps its link only while the frame it is a row of is in the copy. A nested root whose owner stays behind becomes an independent instance (#1354's ruling, at any depth), a scene-added instance stays one, and the members of the frame left behind become plain added nodes. Before, the whole copy was flattened to plain nodes. | match |
@@ -998,12 +998,9 @@ problem with random fileIDs instead; the owner kept sequential numbers, which ar
   a game panel's `writeAssetFile`, or the Assets panel's OS-drop import over an existing file. The
   editor's own writes never trip it.
 
-Server-side rewriters, the member-path repair, duplicate, the GUID heal and the migration scripts all
-parse and spread the document, so they carry the mark. None of them mints. `/api/prefab-member-paths` used to
-read, wait on the renderer, then write with no precondition, so a commit landing in that window had its content
-reverted, mark included. Since #1784 it re-reads each file after the wait and writes only over the text it planned
-from; a file that changed is left and returned as `changed` (§ "A server-side prefab rewrite or move brings the
-client along").
+Server-side rewriters, duplicate, the GUID heal and the migration scripts all parse and spread the document, so they
+carry the mark. None of them mints. (The member-path repair, `/api/prefab-member-paths`, went in #1868; #1784 had made
+it write only over the text it planned from.)
 
 Tests:
 - `tests/editor/localIdCounter.test.ts` covers the #1774 repro, one case per minting writer, and the
@@ -1622,110 +1619,129 @@ could hold that identity, and a template-keyed node is never pinned (#1426).
 
 Tests: `engine/tests/editor/promotionGuidCarry.test.ts`.
 
+### Undo changes memory, Save writes files (#1868)
+
+> **Illustrates I9 and I10** without a write: the owner ruled D1 = Park and D2 = None (#1868).
+
+**Why, and against Unity.** Modoki had three undo classes. Scene edits and asset-document edits (materials, clips,
+particles, rigs…) were already memory-only: the edit parks, and Save writes it. The third class WROTE files on undo:
+the Assets panel's file operations and the prefab writers. That class produced most of the #1789 campaign's bugs,
+because each of its undo steps was an async HTTP round trip. Unity's behaviour, from its manual, issue tracker and C#
+reference source (INFERRED where it rests on native code Unity does not publish):
+- an asset edit's undo "simply marks the asset dirty, it has nothing to do with saving" (issue 1182899, By Design);
+- a delete is not undoable, "You cannot undo the delete assets action." (`ProjectWindowUtil.DeleteAssets`);
+- create and cut/paste move are meant to be undoable (flaky, UUM-115890); rename and duplicate are unverified;
+- Apply writes the file at once, and its undo snapshots the file's bytes (`Undo.RegisterFileChangeUndo`), so it
+  INFERRED rewrites the file on undo; Revert, Unpack and an instance Replace change only the scene;
+- the Prefab Mode session is one undo step on leaving (2022.2); Modoki drops its history instead (U27), which stays.
+
+The owner's two rulings: **D2 = None** — no Assets file operation keeps an undo ([editor.md](editor.md) § "Assets
+file operations are not undoable"), the one real departure from Unity, since its create and cut/paste move are
+undoable; and **D1 = Park** — an undone Apply, Replace or rig update is restored in memory and waits for Cmd+S, where
+Unity (INFERRED) rewrites the file at once. The owner's framing: *"I think we are making things more complicated than
+necessary."*
+
+The undo and redo of a prefab WRITE (Apply to Prefab, Create Prefab's Replace, a rig-prefab update) restore the
+document IN MEMORY, and Save writes it, as for every other asset document. The forward write still writes the file at
+once, as Unity's Apply does. Only the undo and redo stopped writing. Before, each was an HTTP round trip inside the
+undo step. The rest of the editor ran while it was in flight (#1833), the file could change under it (#1664, #1821),
+it could fail half-way (#1823), and it needed a restore owner for the renderer (#1844). None of that is left to guard
+once no file is written.
+
+`restorePrefabsInMemory` (`editor/scene/prefabMemoryRestore.ts`) is the one restore:
+1. **It refuses first**, changing nothing, when the editor holds another document for a prefab than the side the step
+   left (`prefabRestoreRefusal`). The document it checks is the park, or else the editor cache. That covers a
+   prefab-edit save since, and an outside change the watcher brought in. This is I10's precondition (#1664/#1679),
+   asked of memory instead of the file. The toast reads *"<file> changed since, and was left as it is"*.
+2. **Both caches** then hold the document (`seatCaches`, as a write's would). The caller runs its own `rebuild`
+   (Apply's world reload, Replace's untag or tag), then every other live frame is rebased onto the document.
+3. **The document is parked** in the dirty-asset registry (a `'prefab'` document kind, `dirtyAssets.ts`), with the
+   document its file holds as the baseline. When the restored document IS what the file holds (a redo back to what
+   the forward write put there), the park is dropped instead, and nothing is left unsaved.
+
+**By guid, never by a recorded path** (hub call (e)): each step restores its prefab by the prefab's guid, resolved to
+wherever the file is now, so a Rename since the step does not strand it. A document read from an id-less file keeps
+the id the manifest gave it, or Save would mint a new one and unlink every instance.
+
+**A parked prefab wins every read** (hub call (c)): the runtime loader's re-read on a world swap
+(`setPrefabReadOverride`, installed with `installEditorPrefabCacheWarm`), the editor's cold read (`fetchPrefabSource`),
+the prefab-edit open and a placement (`parkedPrefabRead`). Otherwise Apply and Revert would compute against the file
+while Save writes the park. Two reads stay on the file on purpose: `readPriorDocument` and the commit's precheck. Both
+are preconditions about what the file holds.
+
+**A write over a parked prefab** (`commitPrefabWrites`, D-a) that names the park as its `expected` is checked against
+the park's own baseline, the file; any other `expected` is checked against the file as it is, and a writer that read
+something else conflicts. **Any write that LANDS retires the park**, whatever it was checked against: the file and both
+caches then hold the written document. A writer that read the file (a model re-import, the agent's `create`) used to
+leave the park behind, and every later read took it over the document just written (close-out review F3). The park is
+retired while it holds the document the write captured (re-flagged meanwhile or not); a different document parked
+meanwhile keeps its own baseline, so Save conflicts and asks rather than overwriting the write (close-out re-review).
+Every prefab write is a write in flight (`beginAssetWrites`), so a restore waits for it. A Replace or a rig
+update over a parked prefab reads the park as its "before" (D-i), so its undo brings the park back.
+
+**A restore waits for any write of the same prefab** (`assetWritesSettled`, as an asset-document step waits: Save's
+flush and every `commitPrefabWrites`). Until a Save's write lands, the park's baseline names what the file held BEFORE it, and a redo back to that document read as
+"back to the file": the park was dropped, the file kept the saved document, the editor showed the redone one, and it
+reported clean (F1). **A park kept over an outside change is never dropped by a restore** (`fileChanged`, set by the
+watcher's keeper): its baseline no longer names the file, so the park stays for Save, which meets the change and asks
+(F2). An **Overwrite** answers one conflict: the flush that wrote with it clears it, whatever it did (F6), and a flush
+that did not leaves it for the Save that asked.
+
+**Save** flushes a parked prefab through `commitPrefabWrite` over its baseline. `/api/asset-write` refuses the type.
+A file changed on disk since the park refuses as a conflict. The human's Cmd+S then asks **Overwrite or Cancel** per
+file (`answerParkedConflicts`, `saveCommand.ts`), and Cancel leaves the document parked. An agent `save_all` has no
+dialog and reports the conflict per path. **A hot reload of a parked prefab keeps the park** (`agentBridge`'s parked-prefab keeper),
+DIVERGING from a parked asset document, whose park the watcher drops: a prefab's park is what every live instance was
+rebuilt from, so dropping it without a reload would leave them on a document neither the park nor the file holds. An **agent discard** of a parked prefab reloads it from disk through the
+watcher's own path (D-e); an asset document's discard leaves its live edit. **A build or OTA publish** warns when
+anything is unsaved (`confirmUnsavedBeforeBuild`), since a build reads the files.
+
+What the owner gives up (D1): after undoing an Apply, the file still holds the applied version until Cmd+S. A git
+diff, another clone or a build sees the applied bytes. Save re-serializes the document, so a BOM or hand formatting the
+replaced file had is not kept.
+
 ### Undoing an Apply
 
-> **Illustrates I9, I10 and I11** (a write is one step, is conditional, and lands in the world it began in).
+> **Illustrates I9, I10 and I11** (the document is restored whole, only over the side the step left, and in the world
+> it began in).
 
-An Apply changes two things: the prefab file, and every live instance of it. So its undo
-(`applyPrefabUndo.ts`) puts back both. It installs the prefab snapshot, then reloads the live world from
-the `serializeScene` snapshot taken on that side of the Apply. Only the scene snapshot tells the
-applied instance (an override again after the undo) apart from the ones that merely inherited the
-value (back to the old base). Neither a rebase nor a rebuild from the prefab's document can recover that.
+An Apply changes two things: the prefab, and every live instance of it. So its undo (`applyPrefabUndo.ts`) puts back
+both. It restores the prefab document in memory (§ above), then reloads the live world from the `serializeScene`
+snapshot taken on that side of the Apply. Only the scene snapshot tells the applied instance (an override again after
+the undo) apart from the ones that merely inherited the value (back to the old base). Neither a rebase nor a rebuild
+from the prefab's document can recover that. **Neither the Apply nor its undo or redo saves the scene** (#1868). Unity's
+Apply never does, and the undo dirties the scene as every undo does. Before, a promotion Apply saved the scene, and its
+undo and redo then saved it over the other half's bytes, which needed #1695's precondition to stay safe.
+
+**Every prefab the Apply wrote** (an enclosing prefab's row too, #1693/U13) is restored as one step, and the refusal
+names the prefab whose document changed, not the Apply's primary (#1732).
 
 **The snapshot is reloaded under the key of the world the undo belongs to when it RUNS**
 (`currentSceneKey()`, the key Stop's restore uses), not under a path captured at the Apply (#1575):
-- **a scene's path**: reloaded there, and the editor's path and base re-synced. It is saved only when the Apply saved
-  it (a promotion), and then only over what the editor last wrote there (#1695, below);
-- **the prefab-edit world's synthetic path**: reloaded there, not saved (#1573, § Prefab edit mode);
+- **a scene's path**: reloaded there, and the editor's path and base re-synced;
+- **the prefab-edit world's synthetic path**: reloaded there (#1573, § Prefab edit mode);
 - **an untitled scene** (`null`): reloaded under `''`, as `restoreAuthoredSnapshot` reloads one on
-  Stop. Nothing is fetched, the world is not marked as a loaded scene, the editor's path stays null
-  (so Save still asks where), and nothing is saved. `replaceWorldContent`, which builds an untitled
-  world, cannot do this: its populate callback is synchronous, and a prefab instance needs the async
-  loader.
+  Stop. Nothing is fetched, the world is not marked as a loaded scene, and the editor's path stays null
+  (so Save still asks where). `replaceWorldContent`, which builds an untitled world, cannot do this: its
+  populate callback is synchronous, and a prefab instance needs the async loader.
 
-Before #1575 an untitled scene matched neither captured path, so only the file came back. The other
-instances kept the applied value, the applied one lost its override, and a later Save As wrote that as
-an override on each. Reading the key at undo time also covers an untitled scene saved with **Save As**
-after the Apply. That save sets the editor's path but keeps the undo history, so the Apply entry is
-still undone, now under a real path.
+Before #1575 an untitled scene matched neither captured path, so only the prefab came back. Reading the key at undo
+time also covers an untitled scene saved with **Save As** after the Apply.
 
-**The reload happens only if that world is still live.** The file install and the member-path repair
-before it are awaited. A scene load, an Exit from prefab edit, or a Create Scene can land in that
-window. The reload is skipped in any of three cases, and only the file is restored, with a warning:
-- the key changed;
-- the world object changed (checked for every key);
-- a scene load is swapping the world (`isSceneLoadSwapping()`, or `sceneManager.getNext()`). A load
-  that is only WAITING for this undo does not count: skipping on it recreated the window #1579 closed.
+**The reload happens only if that world is still live.** The restore's nested preload, the member-path repair and the
+reload itself are awaited, and a scene load, an Exit from prefab edit, or a Create Scene that bypasses #1579's wait can
+land there. The reload is skipped, with a warning, when the key changed, the world object changed (checked for every
+key: a scene load swaps the world before it sets the path), or a scene load is swapping the world
+(`isSceneLoadSwapping()`, or `sceneManager.getNext()`; a load only WAITING for this undo does not count). A skipped
+reload also skips `rederiveBaseInstances`. **And the step throws**, since it applied only half (the prefab, not the
+world), so the undo manager drops it with a loud report (#310, [editor.md](editor.md) § A throwing undo/redo closure).
+Since #1579 every user world switch waits for the undo in flight, so these guards are defence in depth
+([editor.md](editor.md) § A user world switch waits for the undo in flight).
 
-The world is compared for every key because a scene load swaps the world first. It sets the path and
-the history only in its tail, after awaiting the scene managers, so for that window the key still
-reads as the old scene's. Every untitled world shares the key `null`, which is why the world check was
-first written for that case. A skipped restore also skips `rederiveBaseInstances`, which would
-otherwise rebuild the prefab's base instances in whatever world is live. **And the step throws.** It
-applied only half, the file and not the world, so the undo manager drops it with a loud report
-(#310's policy, [editor.md](editor.md) § A throwing undo/redo closure). The entry is never left on a
-redo stack as though undone. Where the history has already swapped, the manager would drop it anyway
-(§ A step that awaits across a scene switch). Otherwise its redo would load this snapshot under the
-new scene's key and save it there.
-
-**These are guards at the step, and since #1579 they are defence in depth.** Opening a scene,
-Create Scene, entering or leaving prefab edit, and pressing Play all wait for the undo in flight
-before they swap, and refuse new undo steps until they land. So the undo applies whole, file and
-world, and the switch lands after it. The guards still cover a route that swaps through
-`sceneManager` directly. Mechanism: [editor.md](editor.md) § A user world switch waits for the undo
-in flight.
-
-**The file is written only over the other side of the Apply (#1664).** The prefab file is global, but an
-Apply's entry lives on one scene's history. It survives a prefab-edit round trip (entering prefab edit
-parks the scene's stack, and Back restores it), and it survives another scene's Apply of the same prefab
-or a `git pull`. Before #1664 an undo wrote the pre-Apply document over whatever the file had become, and
-redo brought back only the Apply, so the later edit was lost for good.
-
-Each half is one `commitPrefabWrite` (#1692) with `expected` set to the other side: undo expects the Apply's written
-document, and redo expects the one the undo wrote. The world reload is the commit's rebuild. The write carries
-`ifMatch` on those bytes, which `/api/write-file` checks against the bytes on disk. A file holding the same document
-in other bytes (a formatter, a CRLF checkout) is re-read and compared as a document, so it does not refuse; anything
-else that rewrote the file does. The restore writes the editor's serialization of the snapshot, not the bytes the
-file held before the Apply. That is deliberate: the Apply itself rewrote the whole file that way, and an id-less file
-gets its id minted on both sides up front (so every undo would otherwise re-mint it).
-
-**The scene half is conditional too (#1695).** The forward Apply saves the scene only when a promotion restructured
-it. Its undo and redo then save it only while the file holds what the EDITOR last wrote there, from any save
-(`saveScene({ ifMatch })` over `lastWrittenSceneBytes`, serialize.ts), and they save nothing when the Apply saved nothing: the restore is left unsaved, as any undo leaves it. Unity dirties rather than
-saves. Before, both always saved a titled scene. So a change made to the scene file while its history was parked (leave
-the scene, `modoki_mutate_scene` it, come back, Cmd+Z) was overwritten by the in-memory snapshot. A refused scene save
-leaves the file alone and is reported (#308's report, with a toast: the user can fix it). It is not thrown, because
-the world has already followed the step. ⚠️ Keyed on the editor's LAST write, not on the other half's save: a first
-version was, so the user's own Cmd+S between the Apply and its undo made every later undo refuse — blaming an outside
-change, and offering "reopen it", which would have lost the promoted node for good (close-out review).
-
-**A write that does not land changes nothing, and the step throws (#1668).** This covers a refusal and a
-failed write alike. The editor cache is set only after the write lands. Before #1668 the cache was seeded
-first and the write's result was ignored, so a failed write rebuilt and saved the world against a
-document the disk did not hold.
-
-The throw comes before the member-path repair and the world reload, so nothing is half-applied. The undo
-manager drops the entry (#310). It throws an `UndoRefusedError`, which the reporter renders as "refused"
-with its own toast. The toast reads *"Undo of "Apply to Prefab" refused: the prefab changed on disk since
-the Apply, and was left as it is"*, not the generic *"FAILED … part of it may already have been
-applied"*. It throws rather than using #308's report-and-return because that path moves the entry to the
-other stack as though it had applied. A refused entry would also refuse again on every retry, and so
-block every older undo behind it.
-
-**Several files: the refusal names the file that refused, and any file left stranded (#1732).**
-`commitPrefabWrites` reports `failed` (the file whose precondition or write refused) and `stranded` (the files a
-mid-way failure wrote and whose rollback also failed). The undo's detail names `failed`, not the Apply's primary
-file: after a [P, O] Apply, an outside edit of O was reported as "P changed on disk", naming the file that had not
-changed. The forward Apply says "nothing was applied" only when nothing was stranded, and the dialog's notice no longer
-frames every refusal that way (`applyOutcomeNotice`: "Apply to Prefab refused: <reason>"). Otherwise it names the stranded
-file, which holds the Apply on disk while the editor still holds the document it read, so the next Apply refuses it
-as changed on disk until the scene is reopened. Tests: `applyTwoFileUndo.test.ts` § #1732.
-
-Tests: `engine/tests/editor/untitledApplyUndo.test.ts` (each rule above mutation-checked),
-`prefabEditApplyUndo.test.ts`, `applyPrefabDirtiesBase.test.ts`, and `applyUndoIfMatch.test.ts` for the
-if-match, the failed write, the forward Apply's own precondition and its world hold (#1667). The scene half:
-`engine/packages/modoki/tests/editor/applyToPrefabUndo.test.ts` and `saveSceneIfMatch.test.ts`. That last one runs against a fake route holding the exact bytes it received,
-with the route's own if-match rule.
+Tests: `engine/tests/editor/applyUndoIfMatch.test.ts` (memory, park and refusal), `applyTwoFileUndo.test.ts` (several
+prefabs), `untitledApplyUndo.test.ts` and `prefabEditApplyUndo.test.ts` (the world rules, each mutation-checked),
+`applyPrefabDirtiesBase.test.ts`, `prefabPark.test.ts` (the park across a world swap, the flush, Overwrite/Cancel), and
+`engine/packages/modoki/tests/editor/applyToPrefabUndo.test.ts` (no scene save).
 
 ### A capture reads the document the frame was EXPANDED from (#1483)
 
@@ -2277,68 +2293,36 @@ unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, 
 release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
 call site, and `games/court` had to add it after missing it).
 
-## ⚠️ A server-side prefab rewrite or move brings the client along (#1751)
+## ⚠️ A server-side prefab move brings the client along (#1751)
 
-> **Illustrates I9** (after a write, both caches hold the written bytes) and **I10** (a write is conditional on
-> what it read).
+> **Illustrates I9** (after a write, both caches hold the written bytes).
 
 A server route that changes a prefab or scene file marks the write as the editor's own (`markEditorWrite`), so the
 watcher does not hot-reload the open scene under its live edits. But the watcher event is ALSO what brings the
 client up to date. The mark means two things, "don't reload the world" and "the client already holds these bytes",
-and the second is true only for bytes the client sent. For a SERVER-computed rewrite or a move, something else has
-to take the watcher's place.
+and the second is true only for bytes the client sent. For a move, something else has to take the watcher's place.
 
-A census of every `markEditorWrite` call site found three routes that change bytes or a path behind a prefab or scene
+A census of every `markEditorWrite` call site found the routes that change bytes or a path behind a prefab or scene
 cache:
 
 | Route | What it changes | Who brings the client along |
 |---|---|---|
-| `/api/prefab-member-paths` (#1437) | the member refs of every OTHER scene and prefab using a prefab whose member paths moved | the route returns `written` (each file's new bytes and `prior`); `repairMemberPathsEverywhere` → `adoptServerPrefabRewrites` (`editor/scene/serverPrefabRewrites.ts`) |
 | `/api/move-file` | a prefab's PATH | `applyAssetPathMoves` re-keys both prefab caches (`rekeyCachedPrefab`, `rekeyEditorPrefabCache`) |
-| `/api/delete-asset` | a prefab is gone | deliberately nobody: both caches keep the deleted document until a reload, which takes the missing-prefab load path; a writer that does lose it writes from the frame record (#1738, § "A missing prefab keeps its record") |
+| `/api/delete-asset` | a prefab is gone | the delete's repair evicts both caches (§ Model and invariants, I9); a writer that loses the document writes from the frame record (#1738, § "A missing prefab keeps its record") |
 
-**The member-path repair, end to end:**
-- **The route** asks the renderer which documents an asset view holds unsaved (`dirtyAsset`), and leaves those,
-  named in `held`. It does NOT ask `liveScene`: the live world's own files (the open scene, a loaded base, the prefab
-  open in prefab edit) are rewritten, because the live world already holds the repair (Apply's remap). Nor
-  `pendingBaseScene`: that parks one field, and its flush (`/api/scene-mutate`) re-reads the file, so it lands on the
-  repaired bytes. Holding a scene back for it left the scene unrepaired for good (close-out review).
-- **Each write is conditional on the text the plan read** (#1784). After the renderer wait, each file is re-read and
-  written with no await between them. A file that changed meanwhile is left and returned as `changed`.
-- **The route carries the whole parsed document** (`{ ...doc, entities, moved }`), so the localId mark and any field
-  no writer knows survive.
-- **The client, for a prefab:** both caches through the commit's own `seatCaches`, which REPLACES the runtime entry.
-  Not the watcher's `invalidatePrefab`: that evicts, which is #1308's blank for a pooled scroll view of a prefab the
-  open scene owns.
-- **The client, for the live world's files:** the editor's record moves with the file, but only when it held
-  `prior`:
-  - `lastWrittenSceneBytes` for the open scene (`adoptRewrittenSceneBytes`). Otherwise Apply undo's scene half is
-    refused as an outside change.
-  - The prefab-edit baseline (`adoptRewrittenEditBaseline`), only while that edit is open. Otherwise its save is
-    refused as "changed on disk" against a file that holds exactly what the edit world shows.
-  - A record that said something else stays: that is a real outside change, and the conditional write must still
-    refuse over it.
-- **The client, for any other rewritten scene:** its undo stack is marked stale (`recordSceneFileChanged`), as the
-  watcher would.
-- **The repair runs INSIDE the commit's `rebuild` step** (Apply, and Apply's undo), where world switches are held off
-  (#1750's rule), so the step is whole by itself. From the editor the forward Apply was already held
-  (`applyToPrefabWithUndo` holds it end to end); called unheld (`applyToPrefabSelective` alone), a switch could land
-  between the commit and the repair, and the route would rewrite a file whose new world was loaded from the old
-  bytes. A world that has left never reaches the step. Apply's undo asks whether its world is still live AFTER the route
-  returns (by the same test as its own "still THAT world?" check), and its `worldLeft` tail (a swap that bypassed the
-  #1579 barrier) still repairs the files so they follow the prefab on disk. Either way, when no live world holds the
-  repair, no record moves and every rewritten scene's stack is marked stale.
-
-**The prefab open in prefab edit is rewritten, not refused** (hub, 2026-09-29). Inside the Apply step its world is
-adopted and savable, and it holds the repair. Refusing its file would leave House on disk with dangling tokens if the
-edit were then discarded.
+A third route, `/api/prefab-member-paths`, rewrote the member refs of every OTHER scene and prefab when an Apply
+re-parented a row (#1437), and the client adopted its reply (`serverPrefabRewrites.ts`). It went in #1868 with the
+only Apply that re-parented a row: since #1869 no gesture moves a prefab-supplied object, and an Apply of a move a file
+from before #1869 still holds is skipped, naming Revert (hub ruling B, § "Moved members" in
+[prefab-structural-overrides.md](prefab-structural-overrides.md)).
 
 **A move MOVES both cache entries.** The runtime cache is keyed by PATH and read synchronously, so once the manifest
 mapped the guid to the new path the entry was unreachable: a `UIEntries` pool went blank, and a later write's
 `replaceCachedPrefab(newPath)` found no owner and evicted. `rekeyCachedPrefab` moves the entry, the owners and the
 content revision to the new path. The moved entry always wins at the new key. The owners move with it, so the scene's
 `releaseAllForScene` drops them there. A load of the old path still in flight is refused, and when owners are left with
-no entry the file is fetched where it is now. The editor cache moves its path key too, the same way.
+no entry the file is fetched where it is now. The editor cache moves its path key too, the same way. A parked prefab
+(#1868) moves with its baseline (`applyMovesToParkedDocs`).
 - **The order on the route:** the manifest broadcast reaches the renderer BEFORE the move repair, so the re-key's own
   `registerAsset` is only a backstop. For the frames between the two messages the guid already names the new path
   while the entry is still at the old one. That window predates #1751; closing it means sending the repair first.
@@ -2347,12 +2331,7 @@ no entry the file is fetched where it is now. The editor cache moves its path ke
   never noticed. A swap (A→B, then C→A) read A's document for C. A marked create at the old path is never evicted by
   a watcher `add`, so the stale entry stayed.
 
-Tests:
-- `engine/tests/plugins/prefabMemberPathsRoute.test.ts`: the route.
-- `engine/tests/editor/serverPrefabRewrites.test.ts`: the real route fed into the real adopt step, one case per
-  symptom, the discarded edit included.
-- `engine/tests/editor/duplicateCarriesRefs.test.ts`: "the file repair runs inside the commit step".
-- `engine/packages/modoki/tests/runtime/prefabCacheMoveRekey.test.ts`: the move.
+Tests: `engine/packages/modoki/tests/runtime/prefabCacheMoveRekey.test.ts` (the move).
 
 ## Mesh sharing
 

@@ -43,6 +43,7 @@ import { deleteEntitiesWithUndo, undo } from '@modoki/engine/editor';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -96,6 +97,7 @@ const add = (label: string, parent: number, name: string) =>
   createEntityWithUndo(label, parent, [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name, parentId: parent } }], () => {})!;
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
@@ -287,25 +289,25 @@ describe('#1837: a Replace from a DIFFERENT entity keeps the root\'s identity �
     expect(new Set(doc.entities.map((e) => e.nodeGuid)).size).toBe(doc.entities.length);
   });
 
-  it('undo puts the old document back — localId 1 bound as it was, the mark kept — and redo writes the old root\'s identity again', async () => {
+  it('undo puts the old document back — localId 1 bound as it was, and Save keeps the mark — and redo brings the old root\'s identity again', async () => {
     // Mutation: drop the root binding — redo's row at localId 1 carries a fresh nodeGuid, not G.R.
     const { other } = await setup();
     const before = onDisk.get(ZPATH)!;
     const res = await createPrefabFromEntity(other, ZPATH, 'Create Prefab "Z"', async () => true);
     if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
     pushAction(res.action); // as both panels do with the returned step
-    const replacedBytes = onDisk.get(ZPATH)!;
     expect(await undo()).toBe(true);
-    // The old document's rows, with the high-water mark the Replace raised kept (#1774: a number is never handed out
-    // twice) and the commit's format stamp.
-    const restored = JSON.parse(onDisk.get(ZPATH)!) as PrefabFile & { nextLocalId?: number };
     const old = JSON.parse(before) as PrefabFile;
-    expect({ rows: restored.entities, root: restored.rootLocalId, mark: restored.nextLocalId }).toEqual({ rows: old.entities, root: 1, mark: 6 });
+    // #1868: the old document is back IN MEMORY, parked; Save writes its rows with the high-water mark the Replace raised
+    // kept (#1774: a number is never handed out twice) and the commit's format stamp.
+    expect((peekDirtyAsset(ZPATH)?.data as PrefabFile | undefined)?.entities).toEqual(old.entities);
     expect(readTraitData(other, getTraitByName('PrefabInstance')!) ?? null).toBeNull(); // the source tree is plain again
+    expect((await flushDirtyAssets()).failed).toEqual([]);
+    const restored = JSON.parse(onDisk.get(ZPATH)!) as PrefabFile & { nextLocalId?: number };
+    expect({ rows: restored.entities, root: restored.rootLocalId, mark: restored.nextLocalId }).toEqual({ rows: old.entities, root: 1, mark: 6 });
     const { redo } = await import('@modoki/engine/editor');
     expect(await redo()).toBe(true);
-    expect(onDisk.get(ZPATH)).toBe(replacedBytes);
-    expect(lidGuids(JSON.parse(onDisk.get(ZPATH)!) as PrefabFile)[1]).toBe(G.R);
+    expect(lidGuids(peekDirtyAsset(ZPATH)?.data as PrefabFile)[1]).toBe(G.R);
   });
 });
 

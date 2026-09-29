@@ -38,7 +38,7 @@
 
 import { useEditorStore, type SelectedAsset, type EditingAssetField } from '../store/editorStore';
 import {
-  getDirtyAssetPaths, peekDirtyAsset, markAssetDirty, discardDirtyAssets, remapFlushedAssetRecords,
+  getDirtyAssetPaths, peekDirtyAsset, reparkDirtyAsset, discardDirtyAssets, remapFlushedAssetRecords,
 } from '../scene/dirtyAssets';
 import {
   getPendingMetaPaths, peekPendingMeta, parkMetaEdit, discardPendingMeta, peekMetaBaseline, stampMetaReadPath,
@@ -209,7 +209,8 @@ export function applyMovesToParkedDocs(moves: Iterable<PathMove>): string[] {
       // tree, so "omitted ifMatch preserves what's parked at the destination" (markAssetDirty's
       // rule for same-path re-parks) is the wrong default here. A rename doesn't change bytes
       // (renameSync), so the sha256 captured at `from` still describes the file at `to`.
-      markAssetDirty(to, doc.type, doc.data, doc.origin, doc.ifMatch);
+      // Whole (#1868): a parked prefab carries the document its file holds, which the rename does not change either.
+      reparkDirtyAsset(to, doc);
       notes.push(`moved the unsaved edit parked for ${from} → ${to}`);
     }
   }

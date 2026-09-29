@@ -85,6 +85,7 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markOverride } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -163,6 +164,7 @@ const rootGuidOf = (id: number) => readTraitData(rootOf(id), getTraitByName('Ent
 const slotOf = (rootGuid: string) => getAllEntities().find((e) => e.name === 'Slot' && rootGuidOf(e.id) === rootGuid)!.id;
 
 beforeEach(async () => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   clearSceneDirty(BASE);

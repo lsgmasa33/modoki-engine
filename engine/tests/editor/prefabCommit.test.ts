@@ -6,7 +6,8 @@
  *
  *  - #1685: Create Prefab → Replace left every OTHER live instance expanded from the old document, and the next save
  *    recorded the template's new members as removed from it — for good. Mutation: skip the rebase in
- *    `commitPrefabWrite` — the Replace case and its undo case go red.
+ *    `commitPrefabWrite` — the Replace case goes red; skip it in `restorePrefabsInMemory` — its undo case (#1868: the undo
+ *    restores in memory and parks, and Save writes it).
  *  - The agent `create` sibling (#1685's comment): the writer seated the runtime cache alone, so the editor cache kept
  *    the old document under the guid. Mutation: seat only the ref the caller used — the every-key case goes red.
  *  - #1669: a cold `getPrefabSource` read that began before a write put the older bytes back. Mutation: drop the
@@ -119,6 +120,8 @@ import { writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { readTraitData } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets, parkPrefab } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -215,6 +218,7 @@ beforeEach(async () => {
   route.posts = [];
   route.beforeWrite = null;
   _resetSceneAdoptionForTests(); // a route a failed case left pending must not hold the next case's write
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   heldRead = null;
   holdNextReadOf = null;
   holds.switchesWhileHeld = 0;
@@ -262,26 +266,95 @@ describe('Create Prefab → Replace rebuilds every OTHER live instance (#1685)',
 
   it("the Replace's undo brings the other instance back onto the restored document too", async () => {
     await replaceXFromI2();
-    const mark = (JSON.parse(route.disk.get(X_PATH)!) as PrefabFile).nextLocalId;
+    const written = route.disk.get(X_PATH)!;
+    const mark = (JSON.parse(written) as PrefabFile).nextLocalId;
     await quietly(() => undo()); // the Create Prefab entry (the edits above are their own entries)
-    // Precondition: the replaced document is back — with the Replace's localId high-water mark kept (#1774).
-    expect(route.disk.get(X_PATH)).toBe(restoredOverMark(mark));
+    // #1868: the replaced document is back IN MEMORY and parked; the file keeps the Replace until Save.
+    expect(route.disk.get(X_PATH)).toBe(written);
+    expect((peekDirtyAsset(X_PATH)?.data as PrefabFile | undefined)?.name).toBe('X');
     expect(namesIn(I1)).toEqual(['XA', 'XB', 'XC']);
     const saved = await quietly(() => serializeScene()) as unknown as SceneData;
     expect(JSON.stringify(entryOf(saved, I1))).not.toContain('"removed":true');
+    // …and Save writes it, with the Replace's localId high-water mark kept (#1774).
+    await quietly(() => flushDirtyAssets());
+    expect(JSON.parse(route.disk.get(X_PATH)!)).toEqual(JSON.parse(restoredOverMark(mark)));
   });
 });
 
-describe('#1774 close-out review: the mark across undo and redo', () => {
-  /** Finding 2. The undo raised the mark into the replaced bytes, with the version that claims it; the redo is conditional
-   *  on the bytes it recorded before that. Mutation: compare `version` in `sameDocument` — the redo is refused. */
-  it('Create Prefab → Replace, undo, redo: the redo lands and the Replace\'s content is back', async () => {
+describe('#1868: a Replace\'s undo and redo write nothing', () => {
+  /** The undo parks the replaced document; the redo puts back the Replace's, which is what the file holds, so the park goes
+   *  and nothing is left for Save. Mutation: park the redo's document instead of dropping it → the last line goes red. */
+  it('Create Prefab → Replace, undo, redo: the file never moves, and the redo leaves nothing unsaved', async () => {
     await replaceXFromI2();
     const written = route.disk.get(X_PATH)!;
     await quietly(() => undo());
-    expect(route.disk.get(X_PATH)).not.toBe(written); // precondition: the undo ran
+    expect(peekDirtyAsset(X_PATH)).not.toBeNull(); // precondition: the undo ran
     await quietly(() => redo());
-    expect(JSON.parse(route.disk.get(X_PATH)!)).toEqual(JSON.parse(written));
+    expect(route.disk.get(X_PATH)).toBe(written);
+    expect(getCachedPrefabSync(X)?.name).toBe((JSON.parse(written) as PrefabFile).name);
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+  });
+});
+
+/** #1868 — a Replace's undo restores in memory, so its two file-era guarantees are asked of memory and of the manifest.
+ *  - Hub call (e): after a Rename the undo finds the prefab by its GUID, where it is now — never by the path the Replace
+ *    wrote, which may be empty or hold another prefab. Mutation: restore by `savePath` in the undo — the park lands at the
+ *    old path, and Save writes a second file there.
+ *  - #1679, asked of memory: a save of the prefab since the Replace is kept — the undo refuses and changes nothing.
+ *    Mutation: drop `prefabRestoreRefusal` from `restorePrefabsInMemory` — the later save is undone in memory. */
+describe('#1868: a Replace\'s undo, in memory', () => {
+  it('after a Rename, restores the replaced document where the prefab is NOW, and Save writes it there', async () => {
+    await replaceXFromI2();
+    const MOVED = '/assets/prefabs/Moved1868.prefab.json';
+    route.disk.set(MOVED, route.disk.get(X_PATH)!);
+    route.disk.delete(X_PATH);
+    registerAsset(X, MOVED, 'prefab');
+    applyAssetPathMoves([{ from: X_PATH, to: MOVED }]);
+    await quietly(() => undo());
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+    expect((peekDirtyAsset(MOVED)?.data as PrefabFile | undefined)?.name).toBe('X');
+    expect(namesIn(I1)).toEqual(['XA', 'XB', 'XC']);
+    expect((await quietly(() => flushDirtyAssets())).failed).toEqual([]);
+    expect(route.disk.has(X_PATH)).toBe(false);
+    expect((JSON.parse(route.disk.get(MOVED)!) as PrefabFile).name).toBe('X');
+  });
+
+  // D-i. Mutation: read the replaced document from the FILE when X is parked (`parkedPrefabRead` dropped in
+  // createPrefabFromEntity) — the park outlives the Replace, and the undo brings back the file instead of it.
+  it('a Replace over a PARKED prefab replaces the park: it retires, and the undo brings it back', async () => {
+    const parkedX = xDoc();
+    parkedX.name = 'parked X';
+    parkPrefab(X_PATH, parkedX, xDoc());
+    setPrefabCache(X, JSON.parse(JSON.stringify(parkedX)) as PrefabFile);
+    await replaceXFromI2();
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+    await quietly(() => undo());
+    expect((peekDirtyAsset(X_PATH)?.data as PrefabFile | undefined)?.name).toBe('parked X');
+  });
+
+  // Mutation: drop the manifest id a restore keeps (`doc.id = r.source` in restorePrefabsInMemory) — the park is id-less,
+  // and Save mints the prefab a fresh id, unlinking every instance of it.
+  it('a Replace over an id-less file: its undo keeps the id the manifest gave the prefab, and Save writes that one', async () => {
+    const { id: _id, ...idless } = xDoc();
+    route.disk.set(X_PATH, jsonFileBody(idless as PrefabFile));
+    await replaceXFromI2();
+    await quietly(() => undo());
+    expect((peekDirtyAsset(X_PATH)?.data as PrefabFile | undefined)?.id).toBe(X);
+    expect((await quietly(() => flushDirtyAssets())).failed).toEqual([]);
+    expect((JSON.parse(route.disk.get(X_PATH)!) as PrefabFile).id).toBe(X);
+  });
+
+  it('a save of the prefab since the Replace is kept: the undo refuses and changes nothing', async () => {
+    await replaceXFromI2();
+    const later = JSON.parse(JSON.stringify(getCachedPrefabSync(X))) as PrefabFile;
+    later.name = 'saved later';
+    expect((await quietly(() => commitPrefabWrite(X, later, { expected: getCachedPrefabSync(X)! }))).ok).toBe(true);
+    const bytes = route.disk.get(X_PATH);
+    await quietly(() => undo());
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+    expect(getCachedPrefabSync(X)?.name).toBe('saved later');
+    expect(route.disk.get(X_PATH)).toBe(bytes);
+    expect(namesIn(I1)).toEqual(['New', 'New2', 'New3', 'XB', 'XC']);
   });
 });
 
@@ -427,7 +500,8 @@ describe('holding the world cannot deadlock (#1667)', () => {
     expect(worldBoundOperationsHeld()).toBe(0);
     // …and an undo's rebuild: the Apply's world restore, the field edit, then the Replace's untag and rebase.
     for (let i = 0; i < 3; i++) await quietly(() => undo());
-    expect(route.disk.get(X_PATH)).toBe(restoredOverMark(mark)); // precondition: the Replace's undo ran
+    expect((peekDirtyAsset(X_PATH)?.data as PrefabFile | undefined)?.name).toBe('X'); // precondition: the Replace's undo ran
+    expect(mark).toBeDefined();
     expect(worldBoundOperationsHeld()).toBe(0);
     expect(holds.switchesWhileHeld).toBe(0);
   });

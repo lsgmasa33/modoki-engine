@@ -31,8 +31,8 @@
  *  A census of every path a `.prefab.json` can reach disk (#1468 Phase 2A) found **17 writers**.
  *  Four go through `writePrefabFile`; four more bypass it but still use the client write wrapper;
  *  **five are server-side with no client call at all** — the asset scanner's GUID heal, which fires
- *  from the file watcher with no route, `/api/prefab-member-paths`, which rewrites prefabs the
- *  caller never named, `/api/scene-mutate`, `duplicateAssetFile`, `/api/import-file` — and four are
+ *  from the file watcher with no route, `/api/prefab-member-paths`, which rewrote prefabs the
+ *  caller never named (gone since #1868), `/api/scene-mutate`, `duplicateAssetFile`, `/api/import-file` — and four are
  *  Node migration scripts. A guard in `writePrefabFile` would have covered 4 of 17 while looking
  *  finished, which is this repo's own `family/one-entry-point` defect.
  *
@@ -54,7 +54,6 @@
  *  | `mergeRiggedPrefab` (a 5-field object literal) | **yes** | ✅ via `/api/write-file` |
  *  | `applyToPrefabSelective` (round-trip, but re-stamps `version`) | no, downgrades the stamp | ✅ via `/api/write-file` |
  *  | `writeAssetGuid` (parse → set `id` → write) | no — lossless | ✅ precautionary, see below |
- *  | `planMemberPathRepair` (parse → remap tokens → write) | no — lossless | ❌ deliberate |
  *  | `duplicateAssetFile` (parse → set `id` → write, to a NEW path) | no — lossless | ❌ deliberate |
  *
  *  **`writeAssetGuid` is gated even though it loses nothing today**, because the sidecar refusal
@@ -63,13 +62,9 @@
  *  file WATCHER, so it is also the one write that happens with nobody looking. Stated as
  *  precautionary rather than dressed up as closing a demonstrated loss.
  *
- *  **`planMemberPathRepair` and `duplicateAssetFile` are deliberately NOT gated.** Both are
- *  lossless, and refusing them would break work that is legitimate on a too-new document: you could
- *  not duplicate the file, and a repair of every OTHER prefab would be blocked by one newer one it
- *  merely mentions. ⚠️ **Revisit `planMemberPathRepair` if a future format changes member
- *  ADDRESSING** (Phase 2B does exactly that) — rewriting tokens under the old grammar is a real
- *  hazard, it is simply not the hazard D4 is about, and it needs its own decision rather than being
- *  folded in here.
+ *  **`duplicateAssetFile` is deliberately NOT gated.** It is lossless, and refusing it would break
+ *  work that is legitimate on a too-new document: you could not duplicate the file. (The member-path
+ *  repair, `planMemberPathRepair`, was ungated for the same reason; it went in #1868.)
  *
  *  ## What it refuses, and what it deliberately does NOT
  *

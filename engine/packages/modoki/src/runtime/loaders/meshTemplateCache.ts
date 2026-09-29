@@ -2559,9 +2559,22 @@ export function evictDeletedPrefabs(from: string, prefix = false): number {
   return n;
 }
 
+/** A document that takes precedence over a prefab's FILE — the editor's parked prefab (#1868): an undone Apply is
+ *  restored in memory and written only on Save, so a scene load reads it, not the bytes the file still holds. The editor
+ *  installs it; a shipped build has none. */
+let prefabReadOverride: ((path: string) => unknown) | null = null;
+export function setPrefabReadOverride(fn: ((path: string) => unknown) | null): void { prefabReadOverride = fn; }
+
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
+  const parked = prefabReadOverride?.(prefabPath) as { id?: unknown } | undefined;
+  if (parked) {
+    prefabCache.set(prefabPath, parked);
+    prefabFailures.forget(prefabPath);
+    if (typeof parked.id === 'string') registerAsset(parked.id, prefabPath, 'prefab');
+    return Promise.resolve();
+  }
   if (prefabFailures.blocked(prefabPath)) return Promise.resolve();
 
   // Snapshot liveness so a fetch that resolves AFTER an invalidatePrefab (or full teardown)

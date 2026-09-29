@@ -10,6 +10,8 @@ import {
   clearDirtyAssets, getDirtyAssetPaths, markAssetDirty, saveAll, setCurrentScenePath,
 } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { parkPrefab } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 
@@ -352,6 +354,26 @@ describe('discard-asset-edits — abandoning a parked write', () => {
   const A = '/assets/fx/x.particle.json';
   const B = '/assets/fx/y.particle.json';
   const def = () => ({ emitter: { shape: 'point' }, particle: { lifetime: 1 } });
+
+  // Mutation: discard a prefab like an asset doc (no reload) → this case goes red.
+  it('a parked PREFAB is put back to its file, not left live on the discarded document (#1868 D-e)', async () => {
+    const PG = 'aaaaaaaa-0000-4000-8000-000000001868';
+    const PP = '/assets/prefabs/Parked.prefab.json';
+    const doc = (name: string) => ({ id: PG, version: 6, name, rootLocalId: 1, entities: [{ localId: 1, name, traits: { EntityAttributes: { name, parentId: 0, guid: '' } } }] });
+    registerAsset(PG, PP, 'prefab');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (String(input).endsWith(PP)
+      ? new Response(JSON.stringify(doc('disk')), { status: 200 })
+      : { ok: true, json: async () => ({ ok: true }) } as unknown as Response)));
+    setPrefabCache(PG, doc('parked') as never);
+    parkPrefab(PP, doc('parked'), doc('disk'));
+    try {
+      const r = await runAgentOp('discard-asset-edits', { paths: [PP] }) as { ok: boolean; discarded: string[] };
+      expect(r).toMatchObject({ ok: true, discarded: [PP] });
+      expect(getDirtyAssetPaths()).toEqual([]);
+      // Dropping the write alone left the editor showing the discarded prefab while the file held another, reported clean.
+      expect(getCachedPrefabSync(PG)?.name).toBe('disk');
+    } finally { setPrefabCache(PG, null); }
+  });
 
   it('drops one pending write and leaves the others alone', async () => {
     markAssetDirty(A, 'particle', def());

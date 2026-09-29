@@ -97,9 +97,10 @@ export class UndoRefusedError extends Error {
 
 /** The refusal for an undo/redo step whose file precondition failed (#1679): a file it would overwrite or trash no
  *  longer holds the bytes the step's other half wrote (a later save, an edit, or a different file at that path), or
- *  a file it would re-create is already there. The ROUTE refused (`ifMatch`/`createOnly`/`ifEmpty`), so nothing was
- *  written or trashed — which is what makes this a refusal rather than a failure. #1664's Apply undo has its own
- *  wording in `applyPrefabUndo.ts`; every other asset-file step says it through here. */
+ *  a file it would re-create is already there. The ROUTE refused (`ifMatch`/`createOnly`), so nothing was written or
+ *  trashed — which is what makes this a refusal rather than a failure. Since #1868 the one step left that writes a
+ *  prefab on undo is Create Prefab's redo of a file deleted since; an Apply's, a Replace's and a rig update's undo refuse
+ *  in memory (`prefabRestoreRefusal`). */
 export function fileChangedRefusal(paths: readonly string[]): UndoRefusedError {
   const one = paths.length === 1;
   const name = one ? paths[0].split('/').pop() : `${paths.length} files`;

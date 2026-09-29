@@ -15,7 +15,11 @@
  *
  *  `writeAssetFile`/`deleteAssetFile` live in the module under test, so they cannot
  *  be `vi.mock`ed out — we fail them at the seam they actually use, the global
- *  `fetch` behind `backendFetch`. */
+ *  `fetch` behind `backendFetch`.
+ *
+ *  #1868: a REPLACE's undo and redo no longer write — they restore the document in memory (`restorePrefabsInMemory`,
+ *  recorded here, run unmocked in the engine suites) and Save writes it. The failed-write and file-precondition cases
+ *  below survive only for a CREATE's redo, which still writes a file deleted since (a new asset, over nothing). */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
@@ -32,7 +36,15 @@ const calls: string[] = [];
 const preload = vi.hoisted(() => ({ during: null as null | (() => Promise<void> | void) }));
 const OLD_ID = 'g-old';
 let runtimeExcludedFixture = 0;
+/** A Replace's undo and redo restore in memory (#1868): recorded here, and the caller's rebuild run as the real one runs
+ *  it — the real restore (caches, park, refusal) is driven unmocked in the engine suites (prefabCommit.test.ts). */
+const restoreSpy = vi.fn();
+vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
+  restorePrefabsInMemory: async (restores: unknown, opts?: { rebuild?: () => void | Promise<void> }) => { restoreSpy(restores); await opts?.rebuild?.(); },
+}));
 vi.mock('../../src/editor/scene/prefab', () => ({
+  // Nothing is parked in these trees (#1868): a Replace reads the file.
+  parkedPrefabRead: () => null,
   // No placeholder for a missing prefab in these trees (#1699): Create Prefab's refusal asks this first.
   missingPrefabPlaceholders: () => [],
   // The commit's I16 check reads nested documents through these (#1817, #1866); these trees nest nothing it can read.
@@ -394,30 +406,35 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     expect(detachSpy).toHaveBeenCalledWith(7, { strip: false });
     written = [];
     await res.action.undo();
-    expect(written.map((w) => w.path)).toEqual([ON_DISK]);
-    expect(onDisk.get(ON_DISK)).toBe(OLD_TEXT);
+    // #1868: restored in memory by the prefab's guid — which the manifest maps to the file really there — and nothing
+    // written; the untag names that file.
+    expect(written).toEqual([]);
+    expect(restoreSpy).toHaveBeenLastCalledWith([expect.objectContaining({ source: OLD_ID, doc: expect.objectContaining({ name: 'old thing' }) })]);
+    expect(untagSpy).toHaveBeenLastCalledWith(7, ON_DISK, expect.objectContaining({ id: OLD_ID }));
   });
 
-  // #1684's note on #1692: a Windows tool's leading BOM used to be dropped by the restore, because the prior bytes were
-  // read with `Response.text()`, which strips it. Mutation: read them with `res.text()` again in `readPriorDocument`.
-  it('UNDO of a replace puts a BOM-prefixed file back byte for byte', async () => {
-    const withBom = `\uFEFF${OLD_TEXT}`;
-    onDisk.set(PATH, withBom);
+  // #1684's note on #1692: a Windows tool's leading BOM used to be dropped from the prior bytes, because they were read
+  // with `Response.text()`, which strips it — and a BOM the READ keeps must still parse. Since #1868 the undo restores the
+  // DOCUMENT in memory, and Save re-serializes it (a BOM or hand formatting is Save's serializer's, as for every parked
+  // document). Mutation: parse the prior bytes without dropping the BOM — the restore gets no document.
+  it('UNDO of a replace over a BOM-prefixed file restores its document', async () => {
+    onDisk.set(PATH, `\uFEFF${OLD_TEXT}`);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
     if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     await res.action.undo();
-    expect(onDisk.get(PATH)).toBe(withBom);
+    expect(restoreSpy).toHaveBeenLastCalledWith([expect.objectContaining({ doc: expect.objectContaining({ id: OLD_ID, name: 'old thing' }) })]);
   });
 
-  it('UNDO of a replace RESTORES the replaced bytes and never trashes the file', async () => {
+  it('UNDO of a replace restores the replaced document in memory, and never writes or trashes the file', async () => {
     onDisk.set(PATH, OLD_TEXT);
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
     if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
-    setPrefabCacheSpy.mockClear();
+    const content = onDisk.get(PATH);
+    mockFetch.mockClear();
     await res.action.undo();
-    expect(onDisk.get(PATH)).toBe(OLD_TEXT);
-    expect(mockFetch.mock.calls.some(([u]) => String(u).includes('/api/delete-asset'))).toBe(false);
-    expect(setPrefabCacheSpy).toHaveBeenCalledWith(OLD_ID, expect.objectContaining({ name: 'old thing' }));
+    expect(onDisk.get(PATH)).toBe(content);
+    expect(mockFetch.mock.calls.some(([u]) => /\/api\/(delete-asset|write-file)/.test(String(u)))).toBe(false);
+    expect(restoreSpy).toHaveBeenLastCalledWith([{ source: OLD_ID, doc: expect.objectContaining({ name: 'old thing' }), from: expect.objectContaining({ id: OLD_ID }) }]);
     expect(untagSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -489,31 +506,8 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
   });
 });
 
-describe('a FAILED undo then redo does not overwrite the prior links with the new prefab\'s own (#1264 close-out)', () => {
-  // reportUndoFailure RETURNS, so the undo manager moves the failed undo to the redo stack while the
-  // tree is still tagged. A redo that re-snapshotted then would store THIS prefab's links as "prior",
-  // and the next successful undo re-linked the tree to the prefab it had just been unlinked from.
-  // A REPLACE: since #1795 a create's undo writes nothing, so only a Replace's restore can fail.
-  it('redo after a failed undo tags without re-snapshotting; the next undo still restores the ORIGINAL links', async () => {
-    onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[{"localId":1}]}\n`);
-    const action = await makeAction();   // snapshot #1 → PRIOR_LINKS
-    // Any LATER snapshot is of the tree carrying this prefab's own tags — a distinct value, so the
-    // last assertion can tell which snapshot undo restored.
-    const OWN_LINKS = [{ id: 7, data: { source: 'g-new', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }];
-    detachSpy.mockImplementation(() => OWN_LINKS as never);
-    try {
-      spyError();
-      failing.add('/api/write-file');
-      await action.undo();           // fails — tree stays tagged
-      failing.clear();
-      calls.length = 0;
-      await action.redo();
-      expect(calls, 'no snapshot of a tree that is still tagged').toEqual(['tag']);
-      await action.undo();
-      expect(reattachSpy).toHaveBeenLastCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
-    } finally { detachSpy.mockImplementation(() => PRIOR_LINKS); }
-  });
-});
+// #1264 close-out's "a FAILED undo then redo" case went with #1868: a Replace's undo restores in memory and cannot fail
+// after its refusal (which throws before the tree is touched), so the undo manager never moves a half-run undo to redo.
 
 describe('createPrefabFromEntity — the runtime-exclusion count reaches the caller', () => {
   it('carries what serializePrefab reported, so the panel can surface it', async () => {
@@ -549,13 +543,8 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     expect(onDisk.get(P)).toContain('edited');
   });
 
-  it('undo of a REPLACE refuses to overwrite a prefab saved since', async () => {
-    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
-    const action = await makeAction();
-    onDisk.set(P, '{"id":"g-old","edited":true,"entities":[{"localId":1}]}\n');
-    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
-    expect(onDisk.get(P)).toContain('edited');
-  });
+  // A Replace's undo refusing over a prefab saved since is the in-memory restore's own refusal (#1868,
+  // `prefabRestoreRefusal`), driven unmocked in tests/editor/prefabCommit.test.ts.
 
   it('redo of a CREATE refuses a prefab made at the path since', async () => {
     const action = await makeAction();
@@ -576,9 +565,13 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const replaced = await makeAction();
     const applied = onDisk.get(P);
-    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
-    await replaced.redo(); expect(onDisk.get(P)).toBe(applied);
-    await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
+    const old = expect.objectContaining({ id: 'g-old', before: true });
+    const made = expect.not.objectContaining({ before: true });
+    // #1868: a Replace's halves restore in memory — each from the side the other left — and the file never moves.
+    await replaced.undo(); expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-old', doc: old, from: made }]);
+    await replaced.redo(); expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-old', doc: made, from: old }]);
+    await replaced.undo(); expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-old', doc: old, from: made }]);
+    expect(onDisk.get(P)).toBe(applied);
   });
 
   // #1795's second route (I19): the tagged tree is asked for BEFORE anything changes. Mutation: drop the
@@ -595,33 +588,6 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  // A REPLACE: the flag is a Replace's only since #1795 (a create's redo reads the file instead).
-  it('which bytes the FILE holds is its own flag: a redo that wrote but found no tree to tag, then a failed undo, does not refuse the next redo', async () => {
-    spyError();
-    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
-    const action = await makeAction();
-    await action.undo(); // restored; the tree untagged
-    refState.gone = true;
-    await action.redo(); // the file is written, but there is no tree to tag — `tagged` stays false
-    refState.gone = false;
-    const wrote = onDisk.get(P);
-    expect(wrote).not.toContain('before');
-    failing.add('/api/write-file');
-    await action.undo(); // reported, not applied: the file still holds what the redo wrote
-    failing = new Set();
-    await action.redo(); // must not refuse: it expects the bytes that are really there
-    expect(onDisk.get(P)).toBe(wrote);
-  });
-
-  it('a redo after a Replace undo that FAILED expects the bytes still there, not the replaced ones', async () => {
-    spyError();
-    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
-    const action = await makeAction();
-    const wrote = onDisk.get(P);
-    failing.add('/api/write-file');
-    await action.undo(); // reported, not applied: the prefab still holds what the Replace wrote
-    failing = new Set();
-    await action.redo(); // must not refuse
-    expect(onDisk.get(P)).toBe(wrote);
-  });
+  // The Replace's "which bytes the FILE holds" flag and its failed-undo redo case went with #1868: a Replace's undo and
+  // redo write nothing, so there is no file state for a half-run step to leave behind.
 });

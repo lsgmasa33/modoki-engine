@@ -42,6 +42,12 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 
 /** The live world's synthetic path, and the loader the stubbed swap runs. */
 const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void) }));
+// The undo's in-memory restore (#1868: it writes no file), entered before it asks whether its world is still live — where
+// an Exit can land. `duringWrite` runs there once, as it runs inside a forward write.
+vi.mock('../../packages/modoki/src/editor/scene/prefabMemoryRestore', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabMemoryRestore')>();
+  return { ...real, restorePrefabsInMemory: async (...a: Parameters<typeof real.restorePrefabsInMemory>) => { const f = sm.duringWrite; sm.duringWrite = null; f?.(); return real.restorePrefabsInMemory(...a); } };
+});
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return {
@@ -73,6 +79,7 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -175,6 +182,7 @@ async function applyFromA(pick: (keys: ReturnType<typeof collectInstanceOverride
 }
 
 beforeEach(async () => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   _resetHistoryContexts();
   swapHistory('');
@@ -287,16 +295,16 @@ describe('undoing an Apply in the prefab editor keeps what the session added add
 });
 
 describe('undoing an Apply in the prefab editor after the world has left it (#1573 close-out re-review)', () => {
-  it('an Exit landing during the undo\'s file install is not overwritten by the edit world', async () => {
+  it('an Exit landing during the undo\'s restore is not overwritten by the edit world', async () => {
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     await applyFromA((k) => k.fields);
     const REAL = '/scenes/Real.json';
     sm.duringWrite = () => { sm.path = REAL; swapHistory(REAL); }; // the Exit's reload swaps the real scene and its history in
 
     await quietly(() => undo());
-    expect(sm.duringWrite).toBeNull(); // precondition: the install really awaited a write
+    expect(sm.duringWrite).toBeNull(); // precondition: the undo really ran its restore
     expect(sm.path).toBe(REAL);
-    expect(midOnDisk().entities.find((e) => e.name === 'Box')!.traits.Transform).toMatchObject({ x: 0 }); // the file still came back
+    expect(midOnDisk().entities.find((e) => e.name === 'Box')!.traits.Transform).toMatchObject({ x: 0 }); // the prefab still came back (in memory)
     // …and the Apply is not left on the real scene's redo stack, where a redo would load the edit world under the
     // real scene's key and save it into that file (#1575 close-out review).
     expect(canRedo()).toBe(false);

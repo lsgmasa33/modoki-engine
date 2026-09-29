@@ -3,7 +3,8 @@
  *  Since #1869 no gesture moves or reorders an object a prefab supplies (Unity's rule, `restructureRefusal`), so a moved
  *  member exists only in a file written before it. Such a file is not migrated or rewritten: it loads, a no-op save is
  *  byte-identical, the instance survives a rebuild, and the move stays an override the Apply/Revert dialog lists — so the
- *  owner of an old file can apply it to the prefab or revert it. This is the representative set for that path; the
+ *  owner of an old file can revert it. Apply does NOT write it into the prefab (#1868, hub ruling B): a prefab keeps its
+ *  objects where it places them, as Unity's does, and applying a move re-pathed the member in every other file. This is the representative set for that path; the
  *  authoring-path tests went with the gesture.
  *
  *  The file is made the way the old editor made it: the member's parent is written raw (what a move left in the live
@@ -160,15 +161,17 @@ describe('a file holding a member move (#1437) loads and saves unchanged (#1869)
     expect(JSON.stringify(await saved())).not.toContain('"parent"');
   });
 
-  // Apply writes the move into the prefab: the row now hangs under A, and the scene states nothing.
-  it('Apply writes the move into the prefab', async () => {
+  // Apply does NOT write the move into the prefab (#1868, hub ruling B): the key is skipped, naming Revert, nothing is
+  // written, and the move stays a scene statement. Mutation: drop the `~moved.` skip in `planApply` — the key falls through,
+  // and the skip reason is gone.
+  it('Apply leaves the move out, naming Revert, and writes nothing', async () => {
+    const before = writes.length;
     const res = await applyToPrefabSelective(rootId(), new Set([`~moved.${g(4)}`]));
-    expect(res.applied).toBe(true);
-    const written = JSON.parse(writes.filter((w) => w.path === P).pop()!.content) as PrefabFile;
-    const row = (name: string) => written.entities.find((e) => e.name === name)!;
-    expect((row('C').traits!.EntityAttributes as { parentId: number }).parentId).toBe(row('A').localId);
+    expect(res.applied).toBe(false);
+    expect(res.skipped).toEqual([{ key: `~moved.${g(4)}`, reason: expect.stringMatching(/Revert the move/) }]);
+    expect(writes.length).toBe(before);
     expect(parentName('C')).toBe('A');
-    expect(JSON.stringify(await saved())).not.toContain('"parent"');
+    expect(JSON.stringify(await saved())).toContain('"parent"');
   });
 
   // The file is loaded as it is, but it cannot be restructured further: its moved member is still the prefab's.

@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, setEditorScenePathReader, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -48,7 +48,7 @@ import {
   planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene, PREFAB_EDIT_REFUSAL_TEXT, PrefabEditRefusalError, assertPrefabEditAllows,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
   getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
@@ -1422,6 +1422,8 @@ export function registerEditorAgentOps(): void {
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);
+  // …and a PARKED prefab keeps its park across a change on disk (#1868, hub call a), its baseline marked stale.
+  setParkedPrefabKeeper(keepParkedPrefabOverFileChange);
   // set-traits is the device's raw op; the editor replaces it (#1816), as it replaces create/duplicate/delete, so an
   // agent's write lands the way a human's Inspector edit does (`editorTraitWriter`). The whole call is ONE undo entry.
   // A posed world refuses it before any write, as it refuses every other editor write (a dry run writes nothing).
@@ -2891,7 +2893,23 @@ export function registerEditorAgentOps(): void {
    *  `set_selection` taught us not to ship: there, a bare call cleared the selection, so one
    *  misspelled argument key silently became "clear everything". The caller must name `paths`, or
    *  say `all:true` and mean it. The refusal lists what is pending, so the naming is a copy-paste. */
-  registerAgentOp('discard-asset-edits', (params) => {
+  /** Drop parked asset writes, the agent's way: an asset document's applied def stays LIVE (the op's documented scope),
+   *  so its cache now differs from the file (#1710). A parked PREFAB cannot follow that rule (#1868): its caches AND its
+   *  live frames hold the park, so the editor would show one prefab while the file holds another and report clean. It is
+   *  put back to its file through the watcher's own path instead, as if the file had just changed. `reloaded` settles
+   *  once every prefab reload has. */
+  const discardParkedAssets = (paths: string[] | undefined): { discarded: string[]; notPending: string[]; reloaded: Promise<void> } => {
+    const asked = paths ?? getDirtyAssetPaths();
+    const prefabs = asked.filter((x) => peekDirtyAsset(x)?.type === 'prefab');
+    const docs = discardDirtyAssets(asked.filter((x) => !prefabs.includes(x)), { cacheKeepsEdit: true });
+    const parks = discardDirtyAssets(prefabs);
+    const reloaded = Promise.all(parks.discarded.map((x) => reloadPrefabFromDisk(x).catch((e) => {
+      console.error(`[discard-asset-edits] ${x} was discarded, but reloading it from disk failed:`, e);
+    }))).then(() => undefined);
+    return { discarded: [...docs.discarded, ...parks.discarded], notPending: docs.notPending, reloaded };
+  };
+
+  registerAgentOp('discard-asset-edits', async (params) => {
     const p = (params ?? {}) as { paths?: string[]; all?: boolean };
     const pending = getDirtyAssetPaths();
     // Coded refusals with the choices in `options` (#1212 A-20): these were plain throws — the relay
@@ -2929,7 +2947,8 @@ export function registerEditorAgentOps(): void {
         { options: choices });
     }
     // The applied def stays LIVE (this op's documented scope), so the cache now differs from the file (#1710).
-    const r = discardDirtyAssets(p.all ? undefined : p.paths, { cacheKeepsEdit: true });
+    const { reloaded, ...r } = discardParkedAssets(p.all ? undefined : p.paths);
+    await reloaded;
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
     // that discards "everything" and then re-imports still bakes against the human's unsaved
@@ -2976,7 +2995,8 @@ export function registerEditorAgentOps(): void {
       note: (r.discarded.length
         ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
-          + 'def first if you need the value reverted too.'
+          + 'def first if you need the value reverted too. A discarded PREFAB is the exception: it was '
+          + 'reloaded from its file, so the editor now shows what the file holds.'
         : 'Nothing was pending, so nothing changed.')
         + (leftBehind.length
           ? ` NOT covered by this call — this op owns the dirty-ASSET registry only, and these `
@@ -3662,8 +3682,6 @@ export function registerEditorAgentOps(): void {
           ...(result.targets ? { targets: result.targets } : {}),
           written: (result.writes ?? []).map((w) => w.source),
           ...(result.alsoReverted?.length ? { alsoReverted: result.alsoReverted } : {}),
-          // An applied move changed member paths (#1437): which other files had their refs repaired, and which not.
-          ...(result.memberPathsChanged ? { fileRepair: result.fileRepair ?? { failed: true } } : {}),
           ...(result.warnings?.length ? { warnings: result.warnings } : {}),
         };
       }
@@ -4510,7 +4528,7 @@ export function registerEditorAgentOps(): void {
    *  absent because it is not discardable at all (see the op header), and its absence from
    *  `DiscardableRegistry` is what makes that a type error rather than a runtime surprise. */
   const DISCARDERS = {
-    dirtyAsset: (paths: string[]) => discardDirtyAssets(paths, { cacheKeepsEdit: true }),
+    dirtyAsset: (paths: string[]) => discardParkedAssets(paths),
     pendingMeta: (paths: string[]) => discardPendingMeta(paths),
     pendingBaseScene: (paths: string[]) => discardPendingBaseScenes(paths),
   } as const satisfies Record<DiscardableRegistry, (paths: string[]) => { discarded: string[] }>;

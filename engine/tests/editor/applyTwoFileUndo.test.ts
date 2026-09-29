@@ -93,6 +93,7 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { undo, redo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -159,12 +160,16 @@ const byName = (name: string) => inO(ROOT, name);
 const outerRoot = () => all().find((e) => e.guid === ROOT)!.id;
 const tfX = (id: number) => (getCurrentWorld().entities.find((e) => e.id() === id)!.get(getTraitByName('Transform')!.trait) as { x: number }).x;
 const disk = (id: string) => JSON.parse(fs.disk.get(id)!) as PrefabFile;
+/** What an undo parked for `id` (#1868: the undo restores in memory, and Save writes it), or undefined. */
+const parked = (id: string) => peekDirtyAsset(id)?.data as PrefabFile | undefined;
+const sameDoc = (a: unknown, b: unknown) => expect(JSON.parse(JSON.stringify(a))).toEqual(JSON.parse(JSON.stringify(b)));
 const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
   try { return await fn(); } finally { for (const s of spies) s.mockRestore(); }
 };
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   _resetHistoryContexts();
   swapHistory('scenes/Level.json');
@@ -191,7 +196,7 @@ beforeEach(() => {
 
 describe('U13: a two-file Apply is undone and redone as one', () => {
   it('Apply to P of a value O\'s row sets writes both; undo restores both byte for byte; redo applies both again', async () => {
-    // Mutation: drop `others` from `restoreSnapshot`'s write in the undo (`applyPrefabUndo.ts`) — P goes back and O
+    // Mutation: drop `others` from `restoreSnapshot`'s restore in the undo (`applyPrefabUndo.ts`) — P goes back and O
     // keeps the Apply's side: its row's x = 3 stays reverted after the undo.
     expect(tfX(byName('A'))).toBe(3); // precondition: the row sets it
     writeTraitFieldWithUndo(byName('A'), getTraitByName('Transform')!, 'x', 5);
@@ -206,15 +211,20 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
 
     expect(tfX(inO(ROOT2, 'A'))).toBe(5); // U13: the other O instance shows it too
 
+    const [pApplied, oApplied] = [fs.disk.get(P), fs.disk.get(O)];
     await quietly(() => undo());
-    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
-    expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
-    // The live world follows the files: the edited instance back to its override, the other one to O's row.
+    // #1868: both documents back IN MEMORY, parked for Save; the files keep the Apply until then.
+    sameDoc(parked(P), pDoc());
+    sameDoc(parked(O), oDoc());
+    expect([fs.disk.get(P), fs.disk.get(O)]).toEqual([pApplied, oApplied]);
+    // The live world follows the documents: the edited instance back to its override, the other one to O's row.
     expect([tfX(byName('A')), tfX(inO(ROOT2, 'A'))]).toEqual([5, 3]);
 
     await quietly(() => redo());
-    expect((disk(P).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
-    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
+    // Both back to what the files hold, so nothing is left for Save.
+    expect([parked(P), parked(O)]).toEqual([undefined, undefined]);
+    expect(((getCachedPrefabSync(P) as PrefabFile).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
+    expect((getCachedPrefabSync(O) as PrefabFile).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
     expect([tfX(byName('A')), tfX(inO(ROOT2, 'A'))]).toEqual([5, 5]);
   });
 
@@ -226,8 +236,8 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
     const res = await quietly(() => applyToPrefabWithUndo(outerRoot(), new Set([key]), { perKey: { [key]: P } }));
     expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
     await quietly(() => undo());
-    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
-    expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
+    sameDoc(parked(P), pDoc());
+    sameDoc(parked(O), oDoc());
   });
 });
 
@@ -263,46 +273,32 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
     expect(res.refused).toBe(`the prefab ${O} file could not be written (the disk is full), so nothing was applied.`);
   });
 
-  it('an undo refused because O changed outside names O, the file that changed — not P', async () => {
-    // Mutation: name `where` (the primary source, P) instead of `committed.failed` in the undo's refusal — the detail
+  it('an undo refused because O changed outside names O, the document that changed — not P', async () => {
+    // Mutation: name the first restore instead of the one whose document changed in `prefabRestoreRefusal` — the detail
     // blames P, which is untouched.
     const { nested, key } = editFive();
     const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
     expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
+    // An outside change of O, as the watcher brings it in (both caches re-read).
     const outside = { ...disk(O), name: 'O edited outside' };
     fs.disk.set(O, jsonFileBody(outside as never));
-    const pAfter = fs.disk.get(P);
+    setPrefabCache(O, outside as never);
     const errors: string[] = [];
     const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(' ')); }));
     try { await undo(); } finally { for (const s of spies) s.mockRestore(); }
-    expect(fs.disk.get(P)).toBe(pAfter); // refused whole: P untouched
-    const detail = errors.find((e) => e.includes('changed on disk since the Apply'));
-    expect(detail).toContain(`${O} changed on disk since the Apply`);
-    expect(detail).not.toContain(`${P} changed on disk`);
+    expect([parked(P), parked(O)]).toEqual([undefined, undefined]); // refused whole: nothing restored
+    const detail = errors.find((e) => e.includes('changed since this step'));
+    expect(detail).toContain(`${O} changed since this step`);
+    expect(detail).not.toContain(`${P} changed since`);
   });
-
-  it('an undo whose second file fails and whose first cannot be put back names both, and says the undo did not land', async () => {
-    // Mutation: drop the stranded tail from the undo's refusal — the detail claims the prefab and scene were "left as
-    // they are" while P holds the undo's side on disk.
-    const { nested, key } = editFive();
-    await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
-    fs.failSeq.push(false, true, true); // P lands, O fails, P's rollback fails
-    const errors: string[] = [];
-    const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation((...a: unknown[]) => { errors.push(a.map(String).join(' ')); }));
-    try { await undo(); } finally { for (const s of spies) s.mockRestore(); }
-    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc())); // P really is stranded on the undo's side
-    const detail = errors.find((e) => e.includes('could not be written'));
-    expect(detail).toContain(`${O} could not be written (the disk is full), so the undo did not land.`);
-    expect(detail).toContain(`${P} was written and could not be put back`);
-    expect(detail).not.toMatch(/left as they are/);
-  });
+  // #1732's undo-side case (a second file that fails with the first stranded) went with #1868: an undo writes no file, so
+  // it cannot fail part-way. The forward Apply's two cases above still hold that bar.
 });
 
 describe('#1729: an id-less ENCLOSING prefab written by U13 round-trips through undo and redo', () => {
   it('the Apply stamps O\'s id on both sides, the undo puts back that same id, and the redo is allowed', async () => {
     // Mutation: drop the id stamp in `planApply`'s `docFor` (`if (!doc.id) before.id = doc.id = newGuid()`) — the commit
-    // mints O an id the undo's `before` does not carry, the undo writes O back id-less (another mint), and the redo is
-    // refused as "changed on disk", leaving P and O at their pre-Apply bytes.
+    // mints O an id the undo's `before` does not carry, and the undo parks O id-less.
     const idless = () => { const d = oDoc() as Partial<ReturnType<typeof oDoc>>; delete d.id; return d; };
     prefabs.set(O, idless());
     setPrefabCache(O, idless() as never);
@@ -318,12 +314,13 @@ describe('#1729: an id-less ENCLOSING prefab written by U13 round-trips through 
     expect(disk(O).id).toBe(oWrite.after.id);
 
     await quietly(() => undo());
-    expect(disk(O).id).toBe(oWrite.after.id);
-    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toEqual({ x: 3 });
+    expect(parked(O)?.id).toBe(oWrite.after.id);
+    expect(parked(O)?.entities[1]!.overrides?.[2]?.Transform).toEqual({ x: 3 });
 
     await quietly(() => redo());
-    expect((disk(P).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
-    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
-    expect(disk(O).id).toBe(oWrite.after.id);
+    expect(((getCachedPrefabSync(P) as PrefabFile).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
+    expect((getCachedPrefabSync(O) as PrefabFile).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
+    expect((getCachedPrefabSync(O) as PrefabFile).id).toBe(oWrite.after.id);
+    expect(parked(O)).toBeUndefined();
   });
 });

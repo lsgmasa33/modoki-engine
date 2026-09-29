@@ -48,12 +48,12 @@ import { fingerprintAssets } from '../takeAssets';
 import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
-import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION, sameImportSettings } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, planMemberPathRepair, type RepairFile } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
@@ -637,20 +637,17 @@ function ifMatchRefusal(absPath: string, expected: string | undefined): { ok: fa
   return null;
 }
 
-/** What a `/api/delete-asset` caller expects at each path (#1679), keyed by the request string. `sha256` is the
- *  hash of the bytes the file must hold (the `ifMatchRefusal` rule, BOM-stripped); `empty` is a folder that must
- *  hold nothing but OS litter; `settings` is the committed `.meta.json` document whose IMPORT SETTINGS the sidecar
- *  must still hold (`sameImportSettings`, #1696 — a byte hash would refuse for nothing, since the scanner and every
- *  bake rewrite a sidecar on their own). Single `path`: `ifMatch: string`, `ifEmpty: true`, `ifSettings: {…}`.
- *  Batch `paths`: `ifMatch: {[path]: sha}`, `ifEmpty: [path…]`, `ifSettings: {[path]: {…}}` — every key must be one
- *  of `paths`, or the request is refused, because a precondition on a path the request does not trash is a caller
- *  bug that would otherwise pass silently. An `ifSettings` key must name a `.meta.json`. */
-type DeleteExpectation = { sha256?: string; empty?: true; settings?: { doc: Record<string, unknown> } };
+/** What a `/api/delete-asset` caller expects at each path (#1679), keyed by the request string: `sha256` is the
+ *  hash of the bytes the file must hold (the `ifMatchRefusal` rule, BOM-stripped). Single `path`: `ifMatch: string`.
+ *  Batch `paths`: `ifMatch: {[path]: sha}` — every key must be one of `paths`, or the request is refused, because a
+ *  precondition on a path the request does not trash is a caller bug that would otherwise pass silently. (`ifEmpty`
+ *  and `ifSettings` went with the Assets file-op undo builders, their only callers, #1868.) */
+type DeleteExpectation = { sha256?: string };
 
 function readDeleteExpectations(
   body: unknown, inputs: readonly string[], batch: boolean,
 ): { map: Map<string, DeleteExpectation> } | { error: string } {
-  const { ifMatch, ifEmpty, ifSettings } = (body ?? {}) as { ifMatch?: unknown; ifEmpty?: unknown; ifSettings?: unknown };
+  const { ifMatch } = (body ?? {}) as { ifMatch?: unknown };
   const map = new Map<string, DeleteExpectation>();
   const add = (p: string, e: DeleteExpectation) => map.set(p, { ...map.get(p), ...e });
   if (ifMatch !== undefined) {
@@ -666,46 +663,7 @@ function readDeleteExpectations(
       }
     }
   }
-  if (ifEmpty !== undefined) {
-    if (!batch) {
-      if (ifEmpty !== true) return { error: 'ifEmpty must be true for a single path' };
-      add(inputs[0], { empty: true });
-    } else {
-      if (!Array.isArray(ifEmpty)) return { error: 'ifEmpty must be a list of paths' };
-      for (const p of ifEmpty) {
-        if (typeof p !== 'string' || !inputs.includes(p)) return { error: `ifEmpty names ${String(p)}, which is not in paths` };
-        add(p, { empty: true });
-      }
-    }
-  }
-  if (ifSettings !== undefined) {
-    const isDoc = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
-    const entries: Array<[string, unknown]> = !batch ? [[inputs[0], ifSettings]] : isDoc(ifSettings) ? Object.entries(ifSettings) : [];
-    if (batch && !isDoc(ifSettings)) return { error: 'ifSettings must be a {path: sidecar document} map for paths' };
-    for (const [p, doc] of entries) {
-      if (!inputs.includes(p)) return { error: `ifSettings names ${p}, which is not in paths` };
-      if (!p.endsWith('.meta.json')) return { error: `ifSettings names ${p}, which is not a .meta.json sidecar` };
-      if (!isDoc(doc)) return { error: `ifSettings[${p}] must be a sidecar document (an object)` };
-      add(p, { settings: { doc } });
-    }
-  }
   return { map };
-}
-
-/** Files an OS drops into a folder on its own. A folder holding only these is EMPTY for `ifEmpty`: Finder writes a
- *  `.DS_Store` the moment the folder is viewed, so counting it would refuse every undo of a New Folder someone looked
- *  into. Anything else — a stray `.meta.json` included — is content somebody put there, and is not trashed. */
-const OS_LITTER = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
-
-/** Does the committed sidecar at `abs` no longer hold `expected`'s import settings (#1696)? A sidecar that is GONE
- *  passes — nothing is lost, and the trash skips a missing path anyway. One that does not parse fails: somebody
- *  wrote something there. Read raw, not through `readMetaSidecar`, which merges in the machine-local half. */
-function sidecarSettingsRefusal(abs: string, expected: Record<string, unknown>): boolean {
-  let bytes: Buffer;
-  try { bytes = fs.readFileSync(abs); } catch { return false; }
-  let onDisk: unknown;
-  try { onDisk = JSON.parse(stripUtf8Bom(bytes).toString('utf-8')); } catch { return true; }
-  return !sameImportSettings(expected, onDisk);
 }
 
 /** The request strings whose precondition fails, in request order. Synchronous on purpose — see the call site. */
@@ -714,13 +672,7 @@ function deletePreconditionConflicts(expect: ReadonlyMap<string, DeleteExpectati
   for (const [input, e] of expect) {
     const abs = absOf.get(input);
     if (abs === undefined) { out.push(input); continue; }
-    if (e.sha256 !== undefined && ifMatchRefusal(abs, e.sha256)) { out.push(input); continue; }
-    if (e.settings && sidecarSettingsRefusal(abs, e.settings.doc)) { out.push(input); continue; }
-    if (e.empty) {
-      let entries: string[] | null;
-      try { entries = fs.statSync(abs).isDirectory() ? fs.readdirSync(abs) : null; } catch { entries = null; }
-      if (entries === null || entries.some((n) => !OS_LITTER.has(n))) out.push(input);
-    }
+    if (e.sha256 !== undefined && ifMatchRefusal(abs, e.sha256)) out.push(input);
   }
   return out;
 }
@@ -2766,12 +2718,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // would caveat a correct answer because an unrelated particle doc is dirty. A disclosure that
       // fires on state it does not depend on is the field readers learn to skip.
       //
-      // ⚠️ And it only became reachable in this same change. A prefab is not an `AssetSchemaType`,
-      // so `dirtyAsset` can never hold one; the ONLY registry that can is `liveScene`, via
-      // prefab-edit — which reported nothing at all until `dirtyWorldTarget` gave the prefab-edit
-      // world its own path. Scoped to a registry list this would have been an unreachable
-      // mechanism; ALL_UNSAVED_REGISTRIES costs nothing on a path ask (a path that no registry
-      // holds simply yields no row) and does not go stale if prefabs ever become parkable.
+      // Two registries can hold a prefab: `liveScene`, via prefab-edit (`dirtyWorldTarget` gives the
+      // prefab-edit world its own path), and `dirtyAsset`, since an undone Apply, Replace or rig-prefab
+      // update parks the prefab document until Save (#1868). Asked for every document registry, so a
+      // path that no registry holds simply yields no row.
       const prefabStale = await unsavedGate(ctx, [normalizeAssetUrl(prefabPath!)], {
         registries: DOCUMENT_UNSAVED_REGISTRIES,
       });
@@ -4954,68 +4904,6 @@ async function describeUnresolvedAgainstLiveWorld(
     }
   }
 
-  // ── POST /api/prefab-member-paths {prefab, before} (#1437) ── the prefab on disk changed from `before`
-  // in a way that moved member PATHS (an applied move re-parents a row). Every other scene and prefab
-  // that uses it, transitively, gets its stored member refs re-pointed: see `planMemberPathRepair`.
-  // Marked as the editor's own writes, so the open scene is not reloaded under its live edits — the
-  // editor repairs its live world itself.
-  // ⚠️ **The mark silences the watcher, and the watcher is ALSO what brings the client's caches up to date**
-  // (#1751). These bytes are the SERVER's, not ones the client sent, so the reply carries each file it wrote —
-  // `written` — and the client seats its caches and its per-file records from it (`adoptServerPrefabRewrites`,
-  // prefabCommit.ts). Without that, both prefab caches kept the old tokens and the next write of such a prefab was
-  // refused as a conflict against its own repair.
-  if (urlPath === '/api/prefab-member-paths' && method === 'POST') {
-    try {
-      const { prefab, before } = (body ?? {}) as { prefab?: unknown; before?: unknown };
-      if (typeof prefab !== 'string' || !isGuid(prefab) || !before || typeof before !== 'object') {
-        return json({ error: 'expected { prefab: <guid>, before: <prefab document> }' }, 400);
-      }
-      const files: (RepairFile & { abs: string })[] = [];
-      for (const a of ctx.getManifest().assets) {
-        if (a.type !== 'scene' && a.type !== 'prefab') continue;
-        const abs = ctx.resolveAssetPath(a.path);
-        if (!abs || !fs.existsSync(abs)) continue;
-        files.push({ key: a.path, abs, type: a.type, guid: a.guid, text: fs.readFileSync(abs, 'utf-8') });
-      }
-      const plan = planMemberPathRepair(files, prefab, before, makePrefabResolver(ctx));
-      // A document an asset view holds unsaved would write its own copy back over this repair, so it is left alone
-      // and named. The LIVE world is not asked about (the open scene, a loaded base, the prefab open in prefab edit):
-      // the editor repairs it itself, so its file is rewritten to agree with it, and the client moves its record of
-      // that file along (#1751). Nor is `pendingBaseScene`: it parks one field, not a document, and its flush
-      // (`/api/scene-mutate`) re-reads the file, so it lands on the repaired bytes (close-out review — asking it left a
-      // scene unrepaired for good). A renderer that cannot answer is not "nothing held" — nothing is written.
-      const gate = await unsavedGate(ctx, plan.map((p) => p.key), { registries: ['dirtyAsset'] });
-      if (gate.kind === 'unknown') return json({ ok: false, error: `could not ask the editor about unsaved documents: ${gate.reason}`, rewritten: [] }, 503);
-      const held = new Set(gate.kind === 'held' ? gate.holds.map((h) => h.path) : []);
-      const byKey = new Map(files.map((f) => [f.key, f]));
-      const rewritten: string[] = [];
-      const changed: string[] = [];
-      const written: { path: string; type: 'scene' | 'prefab'; guid?: string; text: string; prior: string }[] = [];
-      for (const { key, doc } of plan) {
-        if (held.has(key)) continue;
-        const f = byKey.get(key)!;
-        // Conditional on the text the plan was computed from (#1784): the gate above awaited the renderer, and a
-        // prefab commit that landed meanwhile would otherwise be overwritten with the older bytes. The re-read and the
-        // write below have no await between them, so nothing on this server can land in between.
-        let now: string | null;
-        try { now = fs.readFileSync(f.abs, 'utf-8'); } catch { now = null; }
-        if (now !== f.text) { changed.push(key); continue; }
-        const bytes = assetJsonBytes(doc);
-        ctx.markEditorWrite(f.abs, crypto.createHash('sha1').update(bytes).digest('hex'));
-        writeJsonAtomic(f.abs, bytes);
-        rewritten.push(key);
-        written.push({
-          path: key, type: f.type, ...(f.guid ? { guid: f.guid } : {}), text: bytes.toString('utf-8'),
-          // What the file held before: the client moves its own record of the file along only when that record still
-          // said these bytes (or, for a prefab-edit baseline, this document).
-          prior: f.text,
-        });
-      }
-      return json({ ok: true, rewritten, held: [...held], ...(changed.length ? { changed } : {}), written });
-    } catch (e) {
-      return json({ error: String(e) }, 500);
-    }
-  }
 
   // ── POST /api/duplicate-asset {from, to} (M) ── copy + regenerate GUID.
   if (urlPath === '/api/duplicate-asset' && method === 'POST') {
@@ -5055,21 +4943,11 @@ async function describeUnresolvedAgainstLiveWorld(
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
       // The editor's own write (#1702) — see `markWrittenFile`. The sidecars it may write never broadcast.
       markWrittenFile(ctx, absTo);
-      // The hash of the copy's bytes as written (#1679), in `ifMatchRefusal`'s own terms: the undo of this duplicate
-      // trashes the copy only while it still holds them. Read back rather than predicted — a JSON copy gets a fresh id,
-      // so the client cannot know its bytes, and a prediction here would be a second serializer to keep in step.
-      const sha256 = crypto.createHash('sha256').update(stripUtf8Bom(fs.readFileSync(absTo))).digest('hex');
-      // And the committed sidecar a BINARY copy got (#1696), read back for the same reason: the undo trashes it only
-      // while its import settings are still these (`ifSettings`). Absent for a text asset, which has none.
-      let sidecar: unknown;
-      try { sidecar = JSON.parse(stripUtf8Bom(fs.readFileSync(`${absTo}.meta.json`)).toString('utf-8')); } catch { sidecar = undefined; }
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({
         ok: true,
         saved: true,
         guid: newGuid,
-        sha256,
-        ...(sidecar !== null && typeof sidecar === 'object' && !Array.isArray(sidecar) ? { sidecar } : {}),
         manifestRebuilt,
         ...(dupGate.kind === 'held'
           ? {

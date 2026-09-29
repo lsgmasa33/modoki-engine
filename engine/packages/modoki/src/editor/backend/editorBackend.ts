@@ -155,39 +155,6 @@ export async function importedFileBytes(dest: string, content: string, claimed: 
   return { content: a.body.content };
 }
 
-/** One file `/api/prefab-member-paths` rewrote (#1751): the bytes it wrote, and the bytes it held before. */
-export interface MemberPathRewrite { path: string; type: 'scene' | 'prefab'; guid?: string; text: string; prior: string }
-
-/** What `/api/prefab-member-paths` did: rewrote (`rewritten`, with the bytes in `written`), left because an asset view
- *  holds it unsaved (`held`), and left because it changed on disk while the route waited (`changed`, #1784). */
-export interface MemberPathRepair { rewritten: string[]; held: string[]; changed: string[]; written: MemberPathRewrite[] }
-
-/** After a prefab changed from `before` in a way that moved member PATHS (#1437: an applied move),
- *  re-point the member refs stored in every OTHER scene and prefab file that uses it
- *  (`/api/prefab-member-paths`). `{error}` with the route's reason when the backend could not do it (#1824 — it was
- *  `null`, with the reason only in the console, so an agent's Apply reply said `fileRepair: {failed:true}` and no more).
- *
- *  ⚠️ The transport only. The route marks its writes as the editor's own, so no watcher event brings the client's
- *  caches along (#1751): call it through `repairMemberPathsEverywhere` (serverPrefabRewrites.ts), which adopts
- *  `written`. */
-export async function requestMemberPathRepair(prefab: string, before: unknown): Promise<MemberPathRepair | { error: string }> {
-  const a = await postBackend('/api/prefab-member-paths', { prefab, before });
-  if (!a.ok) { console.error(`[Prefab] member refs in other files were NOT repaired: ${a.error}`); return { error: a.error }; }
-  const j = a.body as { rewritten?: unknown; held?: unknown; changed?: unknown; written?: unknown };
-  const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
-  // Decoded, never cast: a row missing a field is dropped rather than seated as `undefined`.
-  const written = (Array.isArray(j.written) ? j.written : []).filter((w): w is MemberPathRewrite => {
-    const r = w as Partial<MemberPathRewrite> | null;
-    return !!r && typeof r.path === 'string' && (r.type === 'scene' || r.type === 'prefab')
-      && typeof r.text === 'string' && typeof r.prior === 'string' && (r.guid === undefined || typeof r.guid === 'string');
-  });
-  const out = { rewritten: list(j.rewritten), held: list(j.held), changed: list(j.changed), written };
-  // Said HERE, once, for every caller (apply, undo, redo): a held document's own save would write its old
-  // refs back, and nothing else tells the user which files those are.
-  if (out.held.length) console.warn(`[Prefab] member refs NOT repaired in ${out.held.join(', ')}: open with unsaved edits. Their refs to the moved members will dangle once saved.`);
-  if (out.changed.length) console.warn(`[Prefab] member refs NOT repaired in ${out.changed.join(', ')}: the file changed on disk while the repair ran, so it was left as it is. Its refs to the moved members may dangle.`);
-  return out;
-}
 
 // ── The one reader of a route's answer (#1824, Owner A of docs/refusal-reporting.md) ──────────────
 //

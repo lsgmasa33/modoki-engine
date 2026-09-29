@@ -10,7 +10,7 @@ import { createElement } from 'react';
 import type React from 'react';
 import {
   createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
-  installEditorPrefabCacheWarm, alertInEditor,
+  installEditorPrefabCacheWarm, alertInEditor, confirmUnsavedBeforeBuild,
   type ExtraMenuItem, type DeviceListReply,
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
@@ -74,6 +74,8 @@ async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable', varian
   // refuses first; this stays as the guard for any caller that is not the menu.
   const refusal = buildRefusal(useEditorStore.getState().buildStatus);
   if (refusal) { useEditorStore.getState().showToast(refusal, 'warn'); return; }
+  // Unsaved work is not in a build, which reads the files (#1868): the human is told, and chooses.
+  if (!await confirmUnsavedBeforeBuild(`build for ${platform}${variant === 'release' ? ' (release)' : ''}`)) return;
   // Tool gate: if a native build's required tools aren't installed, OPEN Build Support
   // (where they install with one click / auto-install) instead of starting a build that
   // would just fail at the server preflight. Turns the dead-end into a fix. Web and

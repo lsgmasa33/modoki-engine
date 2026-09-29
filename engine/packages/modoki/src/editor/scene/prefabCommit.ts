@@ -35,6 +35,7 @@ import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { beginWorldBoundOperation } from '../undo/undoManager';
 import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from './adoptionGate';
+import { parkedPrefabEntry, beginAssetWrites } from './dirtyAssets';
 import { localIdCounter, advanceLocalIdCounter, markUnstated, LOCAL_ID_MARK_VERSION } from '../../runtime/core/localIdCounter';
 
 /** What the file must hold for the write to go ahead:
@@ -136,6 +137,7 @@ export async function commitPrefabWrites(
   opts: { overwrite?: boolean; rebuild?: (landed: { paths: string[] }) => void | Promise<void>; rebase?: boolean } = {},
 ): Promise<PrefabCommitsResult> {
   const release = beginWorldBoundOperation();
+  let releaseWrites = () => {};
   try {
     // A route between its world call and its adopt (a hot reload, a scene load past its wait): the world on screen is
     // about to become another scene's, and its history and path with it. Waited for, not raced — the owner registers a
@@ -170,7 +172,12 @@ export async function commitPrefabWrites(
       const asked = prefabPathOf(w.source);
       if (w.doc && !w.doc.id) w.doc.id = newGuid();
       const guid = w.doc?.id ?? (isGuid(w.source) ? w.source : getGuidForPath(asked) ?? idIn(w.expected));
-      return { ...w, asked, guid };
+      // A parked prefab (#1868): every read takes the park, so a writer that read it names a document the file does not
+      // hold. Checked against what the file holds instead, and the park retires once this lands. An `expected` that is
+      // NOT the park is checked against the file as it is — a writer that read something else conflicts, as it should.
+      const park = parkedPrefabEntry(asked);
+      const readPark = !!park && expectsDocument(w.expected, park.doc as PrefabFile);
+      return { ...w, asked, guid, park, ...(readPark ? { expected: park!.onDisk as PrefabExpectation } : {}) };
     });
     // I16 at the ONE door every editor prefab write passes (#1817): no document is written that contains itself, whoever
     // built it — a prefab-edit save, Create Prefab's Replace, Apply's plan (which checks only the nodes it promotes), the
@@ -188,6 +195,9 @@ export async function commitPrefabWrites(
         return { ok: false, paths: plan.map((x) => x.asked), failed: w.asked, error: `"${w.doc.name ?? w.asked}" would contain itself (a prefab cannot contain itself), so nothing was written` };
       }
     }
+    // Every path is a write in flight until this step ends, so a restore of one of these prefabs waits for it rather than
+    // parking against a file this write is about to change (#1868 close-out re-review).
+    releaseWrites = beginAssetWrites(plan.map((w) => w.asked));
     // 1. Every precondition before any write (N > 1).
     const exact = new Map<number, { ifMatch?: string; createOnly?: boolean; prior: string | null }>();
     if (plan.length > 1 && !opts.overwrite) {
@@ -214,6 +224,8 @@ export async function commitPrefabWrites(
       done.push({ path, wrote: 'content' in landed ? landed.content ?? null : null, prior: pre ? pre.prior : priorOf(w.expected) });
     }
     const paths = done.map((d) => d.path);
+    // Whatever it was checked against, a landed write replaces a park at its path (close-out review F3).
+    for (const w of plan) w.park?.landed();
     // 3. Both caches for every file, one rebuild, one rebase.
     for (const [i, w] of plan.entries()) seatCaches(paths[i]!, w.source, w.guid, w.doc);
     for (const w of plan) if (w.doc) await preloadNestedPrefabs(w.doc);
@@ -225,6 +237,7 @@ export async function commitPrefabWrites(
     const rebased = await rebaseStaleInstances({ sources });
     return { ok: true, paths, rebased };
   } finally {
+    releaseWrites();
     release();
   }
 }
@@ -280,12 +293,11 @@ async function hashOrEmpty(text: string): Promise<string> {
  *  frame against the cache, then put the live instances an Apply had just refreshed back onto the OLD document. The
  *  edit session keeps its own baseline instead (`prefabEdit.ts` `editBaselineFor`).
  *
- *  ⚠️ **Exported for the server's own prefab rewrites (#1751), and it is deliberately THIS function, not the watcher's.**
- *  A route that rewrites a prefab marks the write as the editor's own, so the watcher's refresh never runs, and
- *  `adoptServerPrefabRewrites` seats the caches from the route's reply instead. The watcher's runtime half is
- *  `invalidatePrefab`, an EVICTION, which is #1308's blank: a synchronous reader (a pooled scroll view) of a prefab the
- *  open scene owns reads `undefined` until the next scene load. The route already hands over the bytes it wrote, so there
- *  is nothing to refetch. Do not "align" that caller with the watcher by switching it to `invalidatePrefab`. */
+ *  ⚠️ **Exported for the in-memory restore (#1868, `restorePrefabsInMemory`), and it is deliberately THIS function, not the
+ *  watcher's.** An undo that restores a prefab writes no file, so no watcher event runs, and it seats the caches from the
+ *  document it restores. The watcher's runtime half is `invalidatePrefab`, an EVICTION, which is #1308's blank: a
+ *  synchronous reader (a pooled scroll view) of a prefab the open scene owns reads `undefined` until the next scene load.
+ *  Do not "align" that caller with the watcher by switching it to `invalidatePrefab`. */
 export function seatCaches(path: string, source: string, guid: string | undefined, doc: PrefabFile | null): void {
   if (doc?.id) registerAsset(doc.id, path, 'prefab');
   for (const key of new Set([source, path, ...(guid ? [guid] : [])])) seatEditorPrefabCache(key, doc);
@@ -527,6 +539,13 @@ function sameDocument(text: string, expected: PrefabFile): boolean {
     for (const d of [parsed, want] as unknown as Array<Record<string, unknown>>) { delete d.nextLocalId; delete d.version; }
     return canonical(parsed) === canonical(want);
   } catch { return false; }
+}
+
+/** Does `expected` name `doc` — the same object, its bytes, or the same document? */
+function expectsDocument(expected: PrefabExpectation, doc: PrefabFile): boolean {
+  if (expected === null) return false;
+  if (expected === doc) return true;
+  return prefabTextIsDocument(typeof expected === 'string' ? expected : jsonFileBody(expected), doc);
 }
 
 /** JSON with every object's keys sorted: two parses of one document compare equal whatever order a writer put them in. */

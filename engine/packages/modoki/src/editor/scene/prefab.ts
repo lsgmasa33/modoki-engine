@@ -7,17 +7,16 @@ import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { endFrames, relinkDetachedMembers, remapWorldGuidRefs, stampDerivedMemberGuids, applyGuidRemap, identityTree, type DetachedMember, type IdentityTree } from '../../runtime/core/ecs/memberHome';
-import { worldIdentityParents, identitySubtree, linkOwnerBeforeMove, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, noteFrameRootDoc, templateFrameClimber, rewriteNodeMoves, frameDocReader } from '../../runtime/core/ecs/identityParents';
+import { worldIdentityParents, identitySubtree, linkOwnerBeforeMove, setFrameDocFallback, noteFrameDoc, noteNodeMoves, frameRootDoc, noteFrameRootDoc, templateFrameClimber, frameDocReader } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { nestedMoveRef, toLocalIdKeys, memberRef, splitNestedKey, nestedKeyRef } from './overrideKeyGrammar';
 import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRowDiff';
-import { IDENTITY_TRS, mergeTrs, localToWorldTrs, sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
-import { memberPathRecords, deriveMemberChain, rewritePrefabMemberTokens, rewriteFrameMoves, type PrefabReader } from '../../runtime/loaders/memberPaths';
+import { sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
+import { memberPathRecords, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/formatVersion';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import type { MemberPathRepair } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { beginWorldBoundOperation } from '../undo/undoManager';
@@ -27,7 +26,7 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef, getAllAssets, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
-import { durableGuid, memberStepId, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isDerivedMember, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
+import { durableGuid, memberStepId, nodeRowComponent, nodeRowKey, mapStringValues, deriveMemberGuid, remapGuidValues, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, isFrameStep, FRAME_STEP, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
@@ -40,6 +39,7 @@ import { commitPrefabWrites } from './prefabCommit';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
 import { invalidatePrefab, replaceCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { parkedPrefab } from './dirtyAssets';
 import { capturePrefabRead, notePrefabFileChanged, StalePrefabRead } from './prefabRead';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { markOverride, clearOverrideMarks, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
@@ -52,7 +52,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, keptLegacyChannels, setKeptMemberOrphans, rowBackedTest, mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, mergeNestedStructurePaths, descendPathKeyed, nestedPathKey, deriveInstanceMemberGuids, deriveMemberGuidsAfterPins, applyStructureCore, rowPathInPrefab, registerTemplateFrame, memberPathIndex, openTokenScope, closeTokenScope, noteTokens, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, descendStructureLayers, foldStructureLayers, type StructureLayer as StructLayer, type OverrideMap } from '../../runtime/loaders/prefabOverrides';
-import { frameBase, frameForward, nodeForward, chainLayer, templateReferenceNode, docChainLayer, layerAddedTraits, levelDoc, captureDoc, keptLegacyForward, settleKeptLegacy, withKeptLegacy, ownedRootAt, type FrameLayer, type FrameBase, type ForwardState } from './prefabBase';
+import { frameBase, frameForward, nodeForward, chainLayer, templateReferenceNode, layerAddedTraits, levelDoc, captureDoc, keptLegacyForward, settleKeptLegacy, withKeptLegacy, ownedRootAt, type FrameLayer, type FrameBase, type ForwardState } from './prefabBase';
 import { templateValueWriter, type TemplateValueWriter } from './prefabTemplateValue';
 import {
   chainSlots, memberKeyAt, writeStated, dropStated, writeRemoval, writeMemberRemoval, statedFields, traitInside, resolveKeyLevel, carrierOf,
@@ -2275,6 +2275,8 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
   // rejects internal asset paths loudly, so fetch a path ref directly instead.
   const url = isGuid(source) ? resolveRef(source) : assetUrl(source);
   if (!url) return null;
+  const parked = parkedPrefabRead(isGuid(source) ? url : source);
+  if (parked) return parked;
   try {
     const res = await fetch(url, init);
     if (!res.ok) return null;
@@ -2291,6 +2293,13 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
     for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
     return prefab as PrefabFile;
   } catch { return null; }
+}
+
+/** A clone of the prefab parked for `path` (#1868), or null — taken by every editor read of a prefab file in place of
+ *  the file. A clone, as a fetch returns a fresh document: a reader that edits what it read must not edit the park. */
+export function parkedPrefabRead(path: string): PrefabFile | null {
+  const doc = parkedPrefab(path) as PrefabFile | undefined;
+  return doc ? JSON.parse(JSON.stringify(doc)) as PrefabFile : null;
 }
 
 /** Re-read the cached copy of a prefab whose FILE changed on disk from outside the editor (#1169).
@@ -5528,13 +5537,6 @@ export interface ApplyResult {
    *  already shows them; this is for a caller whose reader is not the Console — the agent `apply` op
    *  answers with them (#1258). */
   warnings?: string[];
-  /** True when the apply re-parented a row (#1437: an applied move), which changes member PATHS and so the
-   *  guids refs derive: the files on disk were repaired for it, and an undo/redo must repair them back. */
-  memberPathsChanged?: boolean;
-  /** What the repair of the OTHER files on disk did, when `memberPathsChanged`: the files rewritten, the ones
-   *  left because an asset view holds them unsaved, the ones left because they changed on disk while the repair ran
-   *  (`changed`, #1784), or `null` when the backend could not do it at all. */
-  fileRepair?: { rewritten: string[]; held: string[]; changed?: string[] } | { failed: true; error: string };
   /** Selected keys the apply could not write, each with the reason: a move it cannot express yet, a key
    *  naming no member, a tag it cannot add or a tag spelled as a field (#1491). Not every unwritable key
    *  lands here — a field the trait does not persist, or a key whose member or trait is gone, is still
@@ -5551,77 +5553,6 @@ export interface ApplyResult {
 /** Shared no-op result so every early return is consistent. */
 const NOOP_APPLY: ApplyResult = { promotedAdditions: 0, applied: false };
 
-/** Where a row's POSE lives, read and written in one place (#1490). A plain row holds it in its own
- *  `traits.Transform`. A reference row (`prefab: <child>`) does NOT: both loaders place a nested root from
- *  the child prefab's root row, overlaid by the row's `overrides[<child rootLocalId>].Transform`, and never
- *  read the row's own traits — so a pose written there moved nothing in any instance. */
-function rowPoseRead(row: PrefabEntity): Record<string, unknown> | undefined {
-  if (!row.prefab) {
-    const tf = row.traits.Transform;
-    return tf && tf !== true ? tf : undefined;
-  }
-  const { base, own } = referenceRootPose(row);
-  // No Transform on either side (a UI root — the loader strips Transform from those on purpose): none to carry.
-  if (!base && !own) return undefined;
-  return { ...base, ...own };
-}
-/** A plain row's pose is its own base, so it takes every field. A reference row's pose is an override LAYER
- *  over another document — {@link layerPose}. */
-function rowPoseWrite(row: PrefabEntity, pose: Record<string, unknown>): void {
-  if (!row.prefab) {
-    const had = row.traits.Transform;
-    row.traits.Transform = { ...(had && had !== true ? had : {}), ...pose };
-    return;
-  }
-  const { rootLid, base } = referenceRootPose(row);
-  const ov = layerPose(row.overrides, rootLid, pose, base);
-  if (ov) row.overrides = ov;
-  else delete row.overrides;
-}
-
-type OverrideLayer = Record<number, Record<string, Record<string, unknown>>>;
-/** `layer` with member `lid`'s Transform set to `pose`, written as a layer over `base` — the pose the
- *  documents BELOW this layer give the member. A layer holds only what differs from its base, and drops a
- *  field that now equals it. Pinning the whole TRS froze the lower documents' later edits, and made the
- *  scene capture (which subtracts every field a row's override holds) drop scene edits of them on save
- *  (#1490 review). Position and scale compare per field; ROTATION as one orientation, written all three or
- *  none, because Euler components are coupled and a decomposed pose comes back in another spelling of the
- *  same rotation. Returns undefined when the layer ends up empty. */
-function layerPose(layer: OverrideLayer | undefined, lid: number, pose: Record<string, unknown>, base: Record<string, unknown> | undefined): OverrideLayer | undefined {
-  const schema = (getTraitByName('Transform')?.trait as { schema?: Record<string, unknown> } | undefined)?.schema ?? {};
-  const baseOf = (k: string): unknown => {
-    if (base && hasDocKey(base, k)) return base[k];
-    const d = schema[k];
-    return typeof d === 'function' ? (d as () => unknown)() : d;
-  };
-  const next: Record<string, unknown> = { ...layer?.[lid]?.Transform };
-  const ROT = ['rx', 'ry', 'rz'];
-  for (const [k, v] of Object.entries(pose)) {
-    if (ROT.includes(k)) continue;
-    if (valuesEqual(v, baseOf(k))) delete next[k];
-    else next[k] = v;
-  }
-  if (ROT.some((k) => typeof pose[k] === 'number')) {
-    const cur = mergeTrs(IDENTITY_TRS, { ...next, ...pose });
-    const was = mergeTrs(IDENTITY_TRS, { rx: baseOf('rx'), ry: baseOf('ry'), rz: baseOf('rz') });
-    if (sameOrientation(cur, was)) for (const k of ROT) delete next[k];
-    else for (const k of ROT) next[k] = cur[k as 'rx'];
-  }
-  const out = { ...layer };
-  const rest = { ...out[lid] };
-  delete rest.Transform;
-  out[lid] = Object.keys(next).length ? { ...rest, Transform: next } : rest;
-  if (!Object.keys(out[lid]).length) delete out[lid];
-  return Object.keys(out).length ? out : undefined;
-}
-/** The child root's authored Transform and this row's override of it, each undefined when absent. */
-function referenceRootPose(row: PrefabEntity): { rootLid: number; base?: Record<string, unknown>; own?: Record<string, unknown> } {
-  const child = getCachedPrefabSync(row.prefab!);
-  const rootLid = child?.rootLocalId ?? 1;
-  const tf = child?.entities.find((e) => e.localId === rootLid)?.traits.Transform;
-  const own = row.overrides?.[rootLid]?.Transform;
-  return { rootLid, base: tf && tf !== true ? tf : undefined, own: own && Object.keys(own).length ? own : undefined };
-}
 
 /** Deep-copy a live trait bag before it is written into a prefab TEMPLATE.
  *  Mirrors `cloneTraitValues`, kept local so this module doesn't grow another
@@ -5657,8 +5588,6 @@ export interface ApplyPlan {
     liveAddedRootsToDelete: number[];
     promotedRows: Map<string, number>;
     promotedRefRows: Map<string, number>;
-    /** A row was re-parented: member paths moved, so the refs that derive from them are repaired. */
-    rowsReparented: boolean;
   };
   skipped: { key: string; reason: string }[];
   /** Each applied key (the caller's spelling) and the prefab it was written to (#1693). */
@@ -5847,7 +5776,7 @@ async function planApply(
   // Deep-clone the old prefab and overlay selected live values onto it. A second
   // pristine clone is the `before` snapshot for undo (oldPrefab itself isn't mutated,
   // but cloning guards against any aliasing into the cache).
-  let newPrefab: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
+  const newPrefab: PrefabFile = JSON.parse(JSON.stringify(oldPrefab));
   // Stamp the format version: this rewrites the WHOLE document with today's serializer
   // semantics, so leaving a legacy `1` on it would be the #379 dishonesty in the other
   // direction — a v2-written file claiming v1. Found by the #379 close-out review, which
@@ -5916,20 +5845,17 @@ async function planApply(
   // Above the document's high-water mark, not its rows (#1774): a number an EARLIER write freed at the top is below the
   // mark. Taken before this Apply's removals, so it never hands out a number it frees itself either.
   const nextLocalId = { v: localIdCounter(newPrefab) };
-  let rowsReparented = false;
   const skipped: { key: string; reason: string }[] = [...missingFrameKeys].map(([key, reason]) => ({ key, reason }));
   const innerTags: { key: string; lid: number; tag: string }[] = [];
   const innerRemovals: { key: string; lid: number; trait: string }[] = [];
   /** The frame's own field keys, each with the fields it took out of the instance (`appliedFields`): U13 per key. */
   const innerFields: { key: string; lid: number; trait: string; fields: string[] }[] = [];
-  const movedKeys: string[] = [];
   const promotedRows = new Map<string, number>(); // live guid of a promoted added node → its new row
   const promotedRefRows = new Map<string, number>(); // …and of a promoted reference node → its nested row (#1660)
   // The row a live entity of THIS frame is: the root, a member, or an owned nested root (its row).
   const rowOfEcs = new Map<number, number>([[rootInstanceId, newPrefab.rootLocalId ?? 1]]);
   for (const [lid, ecs] of localToEcs) rowOfEcs.set(ecs, lid);
   for (const [ecs, row] of structure.ownedNested) rowOfEcs.set(ecs, row);
-  const ecsOfRow = new Map([...rowOfEcs].map(([ecs, row]) => [row, ecs]));
 
   // Every key in its localId form against the document this instance was expanded from (#1468 Phase 4,
   // `overrideKeyGrammar.ts`): a key names its member by `nodeGuid` where it can, which survives a template
@@ -6026,9 +5952,11 @@ async function planApply(
   }
 
   for (const key of selectedKeys) {
-    // Structural: a member moved inside its instance (#1437) — after every addition, below, since one of
-    // them may be the new parent.
-    if (key.startsWith('~moved.')) { movedKeys.push(key); continue; }
+    // A member moved inside its instance (#1437) is a statement only a file from before #1869 can hold: no gesture moves a
+    // prefab's object any more. It is not applied (hub ruling B on #1868): a prefab keeps its objects where it placed
+    // them, as Unity's does, and Applying one re-pathed the member in every other file that names it. Revert puts the
+    // member back, and the move stays in the scene meanwhile.
+    if (key.startsWith('~moved.')) { skipped.push({ key, reason: MOVED_MEMBER_NOT_APPLIED }); continue; }
     // Structural: insert an added subtree.
     if (key.startsWith('+added.')) {
       const guid = key.slice('+added.'.length);
@@ -6062,45 +5990,12 @@ async function planApply(
         }
       };
       cut(localId);
+      // A row below it that a move placed elsewhere (#1437) stays, so it would be RE-HUNG under the nearest row that does,
+      // which re-paths it in every other file that names it. Only a file from before #1869 holds such a move (no gesture
+      // makes one now), and it is not applied, for the move-key reason above: the move is reverted first.
+      if (kept.length) { skipped.push({ key, reason: MOVED_MEMBER_UNDER_REMOVAL }); continue; }
       const before = newPrefab.entities.length;
-      const removedRows = new Map(newPrefab.entities.filter((e) => drop.has(e.localId)).map((e) => [e.localId, e]));
       newPrefab.entities = newPrefab.entities.filter((e) => !drop.has(e.localId));
-      // A row the PREFAB's own move places holds a pose relative to that target, not to the removed row — while
-      // the target survives: a move whose target this removal takes is dropped, and the row lands as the rows did.
-      const rowById = new Map(newPrefab.entities.concat([...removedRows.values()]).map((e) => [e.localId, e]));
-      const placedByPrefab = new Set<number>();
-      for (const [key, token] of Object.entries(newPrefab.moved ?? {})) {
-        const t = parseMemberToken(token);
-        const steps = memberPathSteps(key);
-        const lid = steps[steps.length - 1];
-        if (!t || t.up || typeof lid !== 'number'
-          || !movedRowsOf({ ...newPrefab, entities: [...rowById.values()], moved: { [key]: token } }, {}).has(lid)) continue;
-        // The target's steps in THIS frame: rows up to and including the first nested one.
-        let dead = false;
-        for (const st of t.path) {
-          if (typeof st !== 'number' || drop.has(st)) { dead = typeof st === 'number'; break; }
-          if (rowById.get(st)?.prefab) break;
-        }
-        if (!dead) placedByPrefab.add(lid);
-      }
-      const trsOf = (lid: number) => {
-        const tf = removedRows.get(lid)?.traits.Transform;
-        return mergeTrs(IDENTITY_TRS, tf && tf !== true ? tf : {});
-      };
-      for (const lid of kept) {
-        const row = newPrefab.entities.find((e) => e.localId === lid)!;
-        // Its pose was relative to the removed rows: carried through them, so it stays where it was.
-        let up = parentOf.get(lid) ?? 0;
-        const tf = rowPoseRead(row); // a reference row's pose is not its own traits (#1490)
-        let pose = mergeTrs(IDENTITY_TRS, tf ?? {});
-        const was = pose;
-        while (drop.has(up)) { if (!placedByPrefab.has(lid)) pose = localToWorldTrs(pose, trsOf(up)); up = parentOf.get(up) ?? 0; }
-        // The decomposition re-spells a rotation it did not change (`ry: π` → `(-π, ~0, -π)`): keep the row's own.
-        if (sameOrientation(pose, was)) pose = { ...pose, rx: was.rx, ry: was.ry, rz: was.rz };
-        if (tf && !placedByPrefab.has(lid)) rowPoseWrite(row, { ...pose });
-        row.traits.EntityAttributes = { ...(row.traits.EntityAttributes as Record<string, unknown>), parentId: up };
-        rowsReparented = true;
-      }
       if (newPrefab.entities.length !== before) {
         writtenCount++;
         setEffect(key, source, ownName, false, { op: 'removeMember', member: oldPrefab.entities.find((e) => e.localId === localId)?.name || `member ${localId}` });
@@ -6529,129 +6424,6 @@ async function planApply(
     }
   }
 
-  // Moves (#1437). The new parent decides how the prefab says it:
-  //  - a row of this frame, or a node promoted by this apply: the member's row is RE-PARENTED (its path, and so
-  //    its guid and every guid below, change — the ref repair after the write follows them);
-  //  - a member of a NESTED instance, which no row of this prefab is: a prefab-level `moved` entry names it by
-  //    member token (P3-b), and the row keeps its parent — and the member its identity.
-  // Either way the row takes the live Transform, which is relative to the new parent.
-  const addedGuids = new Set<string>();
-  const collectAdded = (nodes: AddedEntity[]) => { for (const n of nodes) { if (n.guid) addedGuids.add(n.guid); collectAdded(n.children ?? []); } };
-  collectAdded(structure.added);
-  let nestedMoves: Map<string, NestedFrameMove> | null = null;
-  let identity: ReturnType<typeof worldIdentityParents> | undefined;
-  for (const key of movedKeys) {
-    // A NESTED instance's member moved out of it (owner's B): this prefab records it as its own move, by path,
-    // and the member's pose as an override on the nested row. The nested prefab is not touched.
-    if (key.includes(':')) {
-      nestedMoves ??= new Map(nestedFrameMoves(rootInstanceId).map((m) => [m.key, m]));
-      const m: NestedFrameMove | undefined = nestedMoves.get(key);
-      if (!m) continue;
-      const memberPath = instancePaths.get(guidForEntityId(m.memberEcs));
-      const targetPath = addedGuids.has(m.parentGuid) ? undefined : instancePaths.get(m.parentGuid);
-      if (!memberPath || !targetPath) {
-        skipped.push({ key, reason: addedGuids.has(m.parentGuid) ? 'its new parent was added in this scene' : 'its new parent is not part of this prefab instance' });
-        continue;
-      }
-      // Back at the parent it derives from — its template parent (`identityParents.ts`): the outer prefab stops
-      // moving it.
-      const tpl = (identity ??= worldIdentityParents(getCurrentWorld())).of(m.memberEcs);
-      const memberPi = readTraitData(m.memberEcs, PrefabInstanceMeta);
-      const pathKey = memberPathKey(memberPath);
-      // Back only when nothing was removed between: past a deleted template row, the ancestor it now walks
-      // from is a new place, not its row (third-review F3).
-      if (!tpl.extra.some((st) => !isFrameStep(st)) && guidForEntityId(tpl.parentId) === m.parentGuid) {
-        if (newPrefab.moved) { delete newPrefab.moved[pathKey]; if (!Object.keys(newPrefab.moved).length) delete newPrefab.moved; }
-      } else {
-        newPrefab.moved = { ...newPrefab.moved, [pathKey]: memberToken(0, targetPath) };
-      }
-      // The pose, as an override on the instance the member is a member of: a plain member's own frame (by its
-      // row), an owned nested ROOT's own instance (by that prefab's root row), below the nested row.
-      const tfMeta = getTraitByName('Transform');
-      const liveTf = tfMeta ? clonePersistable(readTraitDataFull(m.memberEcs, tfMeta)) : null;
-      const nestedRow = newPrefab.entities.find((e) => e.localId === m.chain[0] && e.prefab);
-      const ownRoot: boolean = memberPi?.rootInstanceId === m.memberEcs;
-      const poseChain = ownRoot ? [...m.chain, m.lid] : m.chain;
-      const poseLid = ownRoot ? (getCachedPrefabSync((memberPi?.source as string) || '')?.rootLocalId ?? 1) : m.lid;
-      if (tfMeta && liveTf && nestedRow) {
-        const bag = writer.bag(tfMeta, liveTf);
-        // A layer over what the documents below give the member (#1490 review): its own row there, under
-        // whatever the rows between set on it.
-        let doc = getCachedPrefabSync(nestedRow.prefab!);
-        for (const r of poseChain.slice(1)) doc = getCachedPrefabSync(doc?.entities.find((e) => e.localId === r)?.prefab ?? '');
-        const own = doc?.entities.find((e) => e.localId === poseLid)?.traits.Transform;
-        const between = docChainLayer(getCachedPrefabSync(nestedRow.prefab!), poseChain.slice(1)).overrides[poseLid]?.Transform;
-        const base = { ...(own && own !== true ? own : {}), ...between };
-        if (poseChain.length === 1) {
-          const ov = layerPose(nestedRow.overrides, poseLid, bag, base);
-          if (ov) nestedRow.overrides = ov;
-          else delete nestedRow.overrides;
-        } else {
-          const path = poseChain.slice(1).join('.');
-          const paths = { ...nestedRow.nestedOverrides };
-          const at = layerPose(paths[path], poseLid, bag, base);
-          if (at) paths[path] = at;
-          else delete paths[path];
-          if (Object.keys(paths).length) nestedRow.nestedOverrides = paths;
-          else delete nestedRow.nestedOverrides;
-        }
-      }
-      writtenCount++;
-      setEffect(key, source, ownName, false, { op: 'move', member: (eaMetaForApply ? (readTraitData(m.memberEcs, eaMetaForApply)?.name as string) : '') || 'member' });
-      continue;
-    }
-    const lid = Number(key.slice('~moved.'.length));
-    const parentGuid = structure.moved[lid];
-    const row = newPrefab.entities.find((e) => e.localId === lid);
-    const memberEcs = ecsOfRow.get(lid);
-    if (!parentGuid || !memberEcs) continue;
-    if (!row) { skipped.push({ key, reason: 'its row was removed by this apply' }); continue; }
-    if (prefabMoveTargets(rootInstanceId, { ...oldPrefab, moved: undefined })(memberEcs)) {
-      skipped.push({ key, reason: 'a prefab containing this instance places it — apply the move from that instance' });
-      continue;
-    }
-    // A nested instance's ROOT is a row too, but not one to hang a row under: its children are the nested
-    // prefab's frame, whose own rows step by the same localIds — a moved row's path would equal one of theirs,
-    // and the two would derive one guid. A move there is the prefab's own `moved`, like any nested member.
-    const targetEcs = localToEcsGuid(parentGuid);
-    const parentRow = (structure.ownedNested.has(targetEcs) ? undefined : rowOfEcs.get(targetEcs)) ?? promotedRows.get(parentGuid);
-    // Never a node the SCENE added: the index lists a user-added instance's root as a target, but no other
-    // instance of the prefab has it.
-    const token = parentRow === undefined && !addedGuids.has(parentGuid) && instancePaths.has(parentGuid)
-      ? memberToken(0, instancePaths.get(parentGuid)!) : '';
-    if (parentRow === undefined && !token) {
-      const promotedRef = structure.added.some((n) => n.prefab && n.guid === parentGuid) && selectedKeys.has(`+added.${parentGuid}`);
-      skipped.push({ key, reason: promotedRef
-        ? 'its new parent is a nested instance this apply adds to the prefab — apply the move again afterwards'
-        : addedGuids.has(parentGuid)
-          ? 'its new parent was added in this scene — apply that addition too'
-          : readTraitData(rootInstanceId, PrefabInstanceMeta)?.parentLocalId
-            ? 'its new parent is outside this nested instance — apply it from the instance that contains both'
-            : 'its new parent is not part of this prefab instance' });
-      continue;
-    }
-    const ea = row.traits.EntityAttributes;
-    const eaBag = { ...(ea && ea !== true ? ea : {}) } as Record<string, unknown>;
-    const memberPath = memberPathKey(instancePaths.get(guidForEntityId(memberEcs)) ?? []);
-    if (parentRow !== undefined) {
-      if (eaBag.parentId !== parentRow) rowsReparented = true;
-      row.traits.EntityAttributes = { ...eaBag, parentId: parentRow };
-      if (newPrefab.moved) delete newPrefab.moved[memberPath];
-    } else {
-      newPrefab.moved = { ...newPrefab.moved, [memberPath]: token };
-    }
-    if (newPrefab.moved && !Object.keys(newPrefab.moved).length) delete newPrefab.moved;
-    const tfMeta = getTraitByName('Transform');
-    const liveTf = tfMeta ? clonePersistable(readTraitDataFull(memberEcs, tfMeta)) : null;
-    if (tfMeta && liveTf) {
-      const bag = writer.bag(tfMeta, liveTf);
-      for (const k of Object.keys(bag)) appliedFields.add(`${lid}.Transform.${k}`);
-      rowPoseWrite(row, bag); // a moved nested ROOT's row takes it where the expansion reads it (#1490)
-    }
-    writtenCount++;
-    setEffect(key, source, ownName, false, { op: 'move', member: memberNameIn(rootInstanceId, oldPrefab, lid) });
-  }
-
   // Every key's effect, in the caller's spelling (#1736): a key this Apply skipped says why; each conflict replaces the
   // effect of every key in it — the Apply is then refused whole, so none of them is written.
   const conflictsBySlot = findConflicts();
@@ -6711,15 +6483,8 @@ async function planApply(
     return { result: { ...NOOP_APPLY, ...(skipped.length ? { skipped } : {}), ...(effects.length ? { effects } : {}) } };
   }
 
-  // A re-parented row moves the PATH of it and everything below it, which is what a template's member
-  // tokens name them by (#1437): the prefab's own tokens follow first, then the guids live refs hold.
   const prefabId = newPrefab.id;
-  const readOld: PrefabReader = (g) => (g === prefabId ? oldPrefab : getCachedPrefabSync(g));
   const readNew: PrefabReader = (g) => (g === prefabId ? newPrefab : getCachedPrefabSync(g));
-  if (rowsReparented && prefabId) {
-    await preloadNestedPrefabs(newPrefab);
-    newPrefab = (rewritePrefabMemberTokens(newPrefab as never, prefabId, readOld, readNew) as PrefabFile | null) ?? newPrefab;
-  }
   // A move of the prefab's own whose member or new parent this apply removed names nothing now.
   if (newPrefab.moved && prefabId) {
     const paths = new Set(['', ...memberPathRecords({ prefab: prefabId }, readNew).self.keys()]);
@@ -6745,7 +6510,7 @@ async function planApply(
         ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, fields })) } : {}),
       } })),
     ], sameSource).map((x) => x.w),
-    rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, rowsReparented },
+    rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows },
     skipped,
     applied: appliedTargets,
     alsoReverted: [...alsoReverted].map(([src, keys]) => ({ source: src, keys })),
@@ -6783,6 +6548,11 @@ export function innermostFirst<T extends { level: number; w: { source: string; d
   return out;
 }
 
+/** Why an Apply leaves a legacy move out (#1868, hub ruling B): the member keeps the move as a scene statement, and
+ *  Revert is the way out of it. */
+const MOVED_MEMBER_NOT_APPLIED = 'a moved prefab object is not applied to its prefab (a prefab keeps its objects where it places them, as in Unity) — Revert the move to put it back';
+const MOVED_MEMBER_UNDER_REMOVAL = 'a prefab object below it was moved (a file from before prefab objects stopped moving), and removing it would re-hang that object — Revert that move first (or, for a move the prefab file itself states, remove the row in prefab edit)';
+
 /** The writing half of Apply: writes the plan's documents, sets the caches, and rebuilds every live instance. */
 async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // The frame's own template, when a key was written to it; else the first enclosing prefab stands in for the
@@ -6790,11 +6560,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   const frameWrite = plan.writes.find((w) => w.role === 'frame');
   const { source, expected: oldPrefab, before: prefabBefore, doc: newPrefab } = frameWrite ?? plan.writes[0]!;
   const { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows } = plan.rebuild;
-  const rowsReparented = !!frameWrite && plan.rebuild.rowsReparented;
   const { skipped } = plan;
-  const prefabId = newPrefab.id;
-  const readOld: PrefabReader = (g) => (g === prefabId ? oldPrefab : getCachedPrefabSync(g));
-  const readNew: PrefabReader = (g) => (g === prefabId ? newPrefab : getCachedPrefabSync(g));
 
   const warnings = plan.writes.flatMap((w) => warnInertPrefabSizes(w.doc, w.source));
 
@@ -6802,7 +6568,6 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).
   const promotedGuids = snapshotPromotedGuids(promotedRows, promotedRefRows);
   const rootGuid = guidForEntityId(rootInstanceId);
-  let fileRepair: Omit<MemberPathRepair, 'written'> | { failed: true; error: string } | undefined;
   // ONE step (#1692): the write only over the document this Apply read (I10), both caches, this refresh, then a rebase
   // of every other frame of the source still built from the old document — all in the world the Apply began in (I11).
   // Several files are ONE step (#1692's `commitPrefabWrites`): U13's second file, or an override on an enclosing prefab,
@@ -6835,13 +6600,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // walk never reaches it, and captureNestedInstanceOverrides would then drop its per-copy overrides with no
       // warning at all (#1284).
       for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
-      const remap = rowsReparented && prefabId ? liveMemberGuidRemap(prefabId, readOld, readNew, rootsToRefresh) : new Map<string, string>();
-      // …and each template reference node's live moves, path-keyed in its frame (#1564): the rebuilds below re-queue them — a
-      // rebuilt root's carry, and the moves of the frames around a rebuilt instance — and a stale path names nothing, so the
-      // member went back to its template home and the next save dropped the node's move.
-      if (rowsReparented && prefabId) rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, readOld, readNew));
-      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, remap, { rootId: rootInstanceId, fields: appliedFields });
-      if (remap.size) remapWorldGuidRefs(remap);
+      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, fields: appliedFields });
       rehangPromotionSurvivors(survivors, carryPromotedGuids(rootGuid, promotedGuids));
       // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the
       // scene, on the stored root it is now a member of (#1802, owner ruling D) — the settle Create Prefab runs, which finds
@@ -6849,23 +6608,6 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // By guid: the refresh rebuilt the instance, so `rootInstanceId` may name nothing now.
       const liveRoot = promotedRefRows.size && rootGuid ? localToEcsGuid(rootGuid) : 0;
       if (liveRoot) settleSwallowedKeptState(liveRoot);
-      }
-      // …and every other file that uses the prefab, the live world's own included: it is repaired above, so its file is
-      // rewritten to agree and the editor's record of it follows (#1751). HERE, inside the step, as the undo already runs
-      // it (#1750's rule): the step then holds world switches off by itself. `applyToPrefabWithUndo` holds the whole
-      // Apply too, so from the editor this changes nothing today; but called unheld (`applyToPrefabSelective` alone), a
-      // switch could land between the commit and the repair, and the route would rewrite a file whose new world was
-      // loaded from the old bytes. A world that has left never gets here: the commit returns `worldLeft` first.
-      // Imported here, not at the top: that module reads the prefab-edit session, the scene record and the adoption owner,
-      // and a static import from this file closes a load-time cycle back through `./prefab` (the one `adoptionGate.ts`
-      // exists to avoid) — a partial mock of this module then reached its importers unmocked.
-      if (rowsReparented && prefabId) {
-        const { repairMemberPathsEverywhere } = await import('./serverPrefabRewrites');
-        const repair = await repairMemberPathsEverywhere(prefabId, oldPrefab, { liveWorldRepaired: true });
-        // What was repaired, not the bytes: `written` is for the adopt above, and carried into the result it reached
-        // every MCP Apply reply as two full copies of each rewritten file (the live gate, #1751).
-        // A repair the route refused reaches the agent's Apply reply WITH its reason (#1824), not as a bare failure.
-        fileRepair = 'error' in repair ? { failed: true, error: repair.error } : { rewritten: repair.rewritten, held: repair.held, changed: repair.changed };
       }
     },
   });
@@ -6887,10 +6629,9 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     return { ...NOOP_APPLY, refused: 'the scene changed while the Apply wrote the prefab: the prefab was written, but the instances and the undo history of the scene it began in were not updated.' };
   }
 
-  // Those promoted additions are now prefab members in the live world, but the
-  // scene file on disk still lists them as `added` structural overrides. The
-  // caller must re-save the scene so a later load doesn't re-spawn them on top of
-  // the now-expanded prefab member (the duplicate-flame bug).
+  // Those promoted additions are now prefab members in the live world, but the scene file on disk still lists them as
+  // `added` structural overrides. The Apply's undo entry dirties the scene, and Save writes it (#1868: Apply saves no
+  // scene), so a later load does not re-spawn them on top of the now-expanded prefab member (the duplicate-flame bug).
   return {
     promotedAdditions: liveAddedRootsToDelete.length,
     applied: true,
@@ -6905,7 +6646,6 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     effects: plan.effects,
     ...(plan.alsoReverted.length ? { alsoReverted: plan.alsoReverted } : {}),
     warnings,
-    ...(rowsReparented ? { memberPathsChanged: true, fileRepair } : {}),
     ...(skipped.length ? { skipped } : {}),
   };
 }
@@ -7029,82 +6769,6 @@ function carryPromotedGuids(rootGuid: string, promoted: PromotedGuids): Map<stri
  *  be built through Apply, so its test drives the step directly. */
 export const carryPromotedGuidsForTest = carryPromotedGuids;
 
-/** Old → new guid of every LIVE member of an instance in `roots` whose derived path differs between the
- *  two documents `readOld` and `readNew` give prefab `prefabId` (#1437: an applied move). Members pair by
- *  identity (`memberPathRecords`). A member derives from the anchor the entity above its path gives: a
- *  row's, from its instance root; an ORPHAN row's (parentId 0 or no row, hung off the instance's parent),
- *  from that parent. An entity whose guid is not derived anchors what is below it on its own guid; a
- *  derived one (a member, an owned nested root) hands on its own anchor and path, found by walking up as
- *  `deriveInstanceMemberGuids` did, to the ancestor whose guid derives it. What cannot be recovered maps
- *  nothing. */
-function liveMemberGuidRemap(prefabId: string, readOld: PrefabReader, readNew: PrefabReader, roots: readonly number[]): Map<string, string> {
-  const remap = new Map<string, string>();
-  type Place = { tag: 'self' | 'parent'; path: string };
-  const places = (read: PrefabReader): Map<string, Place> => {
-    const r = memberPathRecords({ prefab: prefabId }, read, { orphans: 'parent' });
-    const out = new Map<string, Place>();
-    for (const tag of ['self', 'parent'] as const) for (const [path, id] of r[tag]) if (!out.has(id)) out.set(id, { tag, path });
-    return out;
-  };
-  const before = places(readOld);
-  const after = places(readNew);
-  const moves: [Place, Place][] = [];
-  for (const [id, was] of before) {
-    const now = after.get(id);
-    if (now && (now.path !== was.path || now.tag !== was.tag)) moves.push([was, now]);
-  }
-  const piMeta = getTraitByName('PrefabInstance');
-  if (!moves.length || !piMeta) return remap;
-  const all = getAllEntities();
-  const byId = new Map(all.map((e) => [e.id, e]));
-  const identity = worldIdentityParents(getCurrentWorld());
-  const derived = (id: number): boolean =>
-    isDerivedMember(readTraitData(id, piMeta) as MemberPi, id, templateKeyOf(findEntity(id)));
-  /** The anchor and path prefix what hangs below `id` derives from. */
-  const below = (id: number): { anchor: string; prefix: string } | null => {
-    const top = byId.get(id);
-    if (!top?.guid) return null;
-    if (!derived(id)) return { anchor: top.guid, prefix: '' };
-    const steps: (number | string)[] = [];
-    for (let cur = top, n = 0; n < 10_000; n++) {
-      const pi = readTraitData(cur.id, piMeta);
-      const key = templateKeyOf(findEntity(cur.id));
-      const at = identity.of(cur.id);
-      steps.unshift(...at.extra, entityStep(pi as MemberPi, key));
-      const up = byId.get(at.parentId);
-      if (!up) return null;
-      if (up.guid && deriveMemberGuid(up.guid, steps) === top.guid) return { anchor: up.guid, prefix: memberPathKey(steps) };
-      cur = up;
-    }
-    return null;
-  };
-  for (const rootId of roots) {
-    const self = below(rootId);
-    // An owned nested root's orphan rows expand under nothing (the loader's rule): only a stored root has them.
-    const parent = readTraitData(rootId, piMeta)?.parentLocalId ? null : below(byId.get(rootId)?.parentId ?? 0);
-    // ⚠️ A member whose identity is STORED does not move with the row (v16, #1468). This whole
-    // function exists because a re-parented row used to change the guid its members DERIVE, so every
-    // ref had to be re-pointed; with a row, `restoreInstanceMembers` puts the member's own guid back
-    // after the rebuild and it never becomes the new derived value. Remapping it anyway sends every
-    // ref to a guid no entity holds — the two repairs fighting, each correct about a different
-    // engine. Only a member that still derives is remapped.
-    const stored = new Set<string>();
-    for (const id of memberRowsToWrite(rootId).keys()) {
-      const g = byId.get(id)?.guid;
-      if (g) stored.add(g);
-    }
-    const at = (p: Place): string | null => {
-      const ctx = p.tag === 'self' ? self : parent;
-      return ctx ? deriveMemberChain(ctx.anchor, ctx.prefix ? `${ctx.prefix}.${p.path}` : p.path) : null;
-    };
-    for (const [was, now] of moves) {
-      const from = at(was);
-      const to = at(now);
-      if (from && to && from !== to && !stored.has(from)) remap.set(from, to);
-    }
-  }
-  return remap;
-}
 
 /** Resolve a live entity id to its stable EntityAttributes.guid ('' if none). Used by
  *  Apply-to-Prefab undo to re-find the selected entity after a scene rebuild (which

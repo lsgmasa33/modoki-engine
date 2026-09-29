@@ -16,6 +16,7 @@ import { registerEditorAgentOps } from '../../../app/editor/agentEditorOps';
 import { registerAsset, clearManifest } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import { loadSceneReporting, saveScene } from '../../../packages/modoki/src/editor/scene/serialize';
 import { installEditorPrefabCacheWarm } from '../../../packages/modoki/src/editor/scene/prefabCacheWarm';
+import { clearDirtyAssets } from '../../../packages/modoki/src/editor/scene/dirtyAssets';
 import { _resetHistoryContexts, activeHistoryKey, rekeyUntitledHistory, undoStepPending, breakUndoCoalescing } from '../../../packages/modoki/src/editor/undo/undoManager';
 import { _resetSceneAdoptionForTests, adoptionsSettled } from '../../../packages/modoki/src/editor/scene/sceneAdoption';
 import { isWorldReplacementInFlight } from '../../../packages/modoki/src/editor/scene/authoringSettle';
@@ -218,6 +219,7 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
   _resetHistoryContexts();
   _resetSceneAdoptionForTests();
   _resetPrefabEditSessionRows();
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own run
   clearKeptMemberOrphans();
   useEditorStore.setState({ editingPrefab: null, showToast: () => {} } as never);
   be.reset();

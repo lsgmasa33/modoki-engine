@@ -95,9 +95,10 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'which says so on the console; the fuzzer reaches it by dropping an enclosing prefab into the one being edited',
   },
   {
-    pattern: /^\[undo\] Undo of "Apply to Prefab" was REFUSED — .* changed on disk since the Apply/,
-    why: 'I10: an Apply undo is conditional on the bytes it wrote, and refuses once an outside edit or a later save has '
-      + 'changed the file (#1664, #1692). A refusal in a segment nothing outside the stack touched still fails, as '
+    pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — \S+\.prefab\.json changed since this step/,
+    why: 'I10, asked of memory since #1868: an Apply\'s or a Replace\'s undo and redo restore the prefab in memory only while '
+      + 'the editor holds the document the other half left, and refuse once a prefab-edit save or an outside edit changed it '
+      + '(#1664, #1679, `prefabRestoreRefusal`). A refusal in a segment nothing outside the stack touched still fails, as '
       + '"undo refused in a clean segment"',
   },
   {
@@ -416,8 +417,10 @@ describe('#1789 prefab fuzz', () => {
     // #1679's Create Prefab refusal, and #1774's route-side mark log.
     expect(expectedError('[undo] Undo of "Save prefab "R"" was REFUSED — /fuzz/r1c6d877e0000/prefabs/R.prefab.json is not what this step left there (changed on disk since, or another file now at that path), so nothing was written or trashed. The entry was dropped from the history; nothing was applied.')).toBe(true);
     expect(expectedError('[Prefab] /var/folders/nt/T/modoki-prefab-fuzz-V2kGoU/r2c7497320000/prefabs/H.prefab.json holds a localId high-water mark of 5, and this write would lower it to 4. Refusing — a number below the mark may have belonged to a deleted member')).toBe(true);
+    // #1868's in-memory refusal of an Apply's undo, as the G1 M2 replay printed it.
+    expect(expectedError('[undo] Undo of "Apply to Prefab" was REFUSED — /fuzz/r4a793a230000/prefabs/H.prefab.json changed since this step (a prefab-edit save, another write, or an outside change), so it was left as it is. The entry was dropped from the history; nothing was applied.')).toBe(true);
     // Neighbours that are findings: Create Prefab's undo that did not fully apply (#1795), and a refusal that is not the
-    // Create Prefab one (Apply's, allowed only as "changed on disk since the Apply").
+    // Create Prefab one (another step's, which is not allowed at all).
     expect(expectedError('[undo] Undo of "Save prefab "M"" did not fully apply — 1 prefab link the tree had before could not be put back')).toBe(false);
     expect(expectedError('[undo] Undo of "Rename" was REFUSED — /fuzz/r0/prefabs/R.prefab.json is not what this step left there')).toBe(false);
     // The cycle line's follow-up is allowed only right after the cycle line.

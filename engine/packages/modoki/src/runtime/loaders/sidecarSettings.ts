@@ -1,8 +1,8 @@
 /** The committed `.meta.json` sidecar's content-cache blocks, and the comparison of two sidecars' IMPORT SETTINGS.
  *
  *  Defined here, beside the settings resolvers, rather than in `plugins/meta-sidecar.ts` (which re-exports both), so the
- *  engine package's own tests can share them: the Assets panel's undo fakes judge `/api/delete-asset`'s `ifSettings`
- *  with the route's exact rule (#1696). Pure — no filesystem — and reached only by the build plugins and tests. */
+ *  engine package's own tests can share them (#1696). Pure — no filesystem — and reached only by the build plugins and
+ *  tests. */
 
 import { resolveTextureSettings, resolveTextureType } from './textureSettings';
 import { resolveModelSettings } from './modelSettings';

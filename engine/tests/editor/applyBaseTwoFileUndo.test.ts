@@ -99,6 +99,7 @@ import { undo, redo, swapHistory, _resetHistoryContexts } from '../../packages/m
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { isSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -142,6 +143,8 @@ const inO = (root: string, name: string) => {
 };
 const tfX = (id: number) => (getCurrentWorld().entities.find((e) => e.id() === id)!.get(getTraitByName('Transform')!.trait) as { x: number }).x;
 const disk = (id: string) => JSON.parse(fs.disk.get(id)!) as PrefabFile;
+/** The document the editor holds for `id`: the one an undo parked for Save (#1868), else the file's. */
+const held = (id: string) => JSON.parse(JSON.stringify(peekDirtyAsset(id)?.data ?? disk(id))) as PrefabFile;
 const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   const spies = (['log', 'warn', 'info', 'error'] as const).map((k) => vi.spyOn(console, k).mockImplementation(() => {}));
   try { return await fn(); } finally { for (const s of spies) s.mockRestore(); }
@@ -153,6 +156,7 @@ const n1 = () => inO(ROOT, 'R');
 const ownKeys = () => collectInstanceOverrideKeys(n1(), getCachedPrefabSync(P) as PrefabFile).fields.filter((k) => k.endsWith('.Transform.x'));
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   _resetHistoryContexts();
   swapHistory('scenes/Level.json');
@@ -202,8 +206,8 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
     expect(ownKeys()).toEqual([]); // U15: the value is O's now, not the instance's
 
     await quietly(() => undo());
-    expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
-    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
+    expect(held(O)).toEqual(oDoc());
+    expect(held(P)).toEqual(pDoc());
     expect(xs()).toEqual([5, 3]);
     expect(ownKeys()).toHaveLength(1); // an override of the instance again, so the dirty base's save writes it
     expect(isSceneDirty(BASE)).toBe(true);
@@ -243,8 +247,8 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
     expect(xs()).toEqual([5, 5]);
 
     await quietly(() => undo());
-    expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
-    expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
+    expect(held(P)).toEqual(pDoc());
+    expect(held(O)).toEqual(oDoc());
     expect(xs()).toEqual([5, 3]);
     expect(ownKeys()).toHaveLength(1);
 
@@ -278,8 +282,8 @@ describe('#1741: undo of a U14 Apply made from the OUTER root keeps the nested f
       expect(nestedKeys()).toEqual([]);
 
       await quietly(() => undo());
-      expect(fs.disk.get(O)).toBe(jsonFileBody(oDoc()));
-      expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
+      expect(held(O)).toEqual(oDoc());
+      expect(held(P)).toEqual(pDoc());
       expect(xs()).toEqual([5, 3]);
       expect(nestedKeys()).toHaveLength(1); // the frame's own edit again, so the dirty base's save writes it
       expect(ownKeys()).toHaveLength(1);

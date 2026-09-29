@@ -237,7 +237,7 @@ routed through the gesture helper goes red).
   compiling and has to be read. `moveFileTo` has four such callers in `Assets.tsx`: three
   `const ok = await moveFileTo(…)` and the paste loop's `if (await moveFileTo(…))`.
 - **A 2xx can be a partial success.** Examples: `/api/reimport`'s `{ok:true, errors}`,
-  `/api/delete-asset`'s `{ok:true, failed}`, `/api/prefab-member-paths`' `held`/`changed`, and
+  `/api/delete-asset`'s `{ok:true, failed}`, and
   `/api/move-file`'s `repairFailed`. The reader returns these as success with notes, as `isFailureBody`
   does, not as a refusal. Treating them as refusals would report a 20-of-21 bake as a failed call.
 - **`writeMetaConditional` calls every 409 "changed on disk".** It sends `rendererWrite`, so the park

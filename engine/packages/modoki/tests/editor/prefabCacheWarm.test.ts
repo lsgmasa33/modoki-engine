@@ -82,7 +82,9 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   replaceCachedPrefab: (...a: unknown[]) => invalidateSpy(...a),
   getCachedPrefab: (ref: string) => runtimeCache.get(ref),
   getPrefabRevision: () => 0,
+  setPrefabReadOverride: (fn: unknown) => overrideSpy(fn),
 }));
+const overrideSpy = vi.fn();
 
 const registerSpy = vi.fn();
 const unregisterSpy = vi.fn();
@@ -260,8 +262,13 @@ describe('#1295 — the swap warm is actually installed', () => {
     expect(registerSpy).toHaveBeenCalledTimes(1);
     const hook = registerSpy.mock.calls[0]![0];
     expect(typeof hook).toBe('function');
+    // …and the loader's read of a parked prefab (#1868): installed with it, cleared with it. Mutation: drop the install →
+    // this goes red, and the swap case in tests/editor/prefabPark.test.ts reads the file.
+    expect(overrideSpy).toHaveBeenCalledTimes(1);
+    expect(typeof overrideSpy.mock.calls[0]![0]).toBe('function');
     dispose();
     expect(unregisterSpy).toHaveBeenCalledWith(hook);
+    expect(overrideSpy).toHaveBeenLastCalledWith(null);
   });
 
   it('is called by the editor entry point — a hook nobody installs warms nothing', () => {

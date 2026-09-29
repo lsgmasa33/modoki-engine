@@ -59,6 +59,7 @@ import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { peekDirtyAsset, flushDirtyAssets, clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -109,6 +110,7 @@ const add = (label: string, parent: number, name: string) =>
   createEntityWithUndo(label, parent, [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name, parentId: parent } }], () => {})!;
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
@@ -394,10 +396,10 @@ describe('#1774: a failed multi-file commit rolls back without lowering the mark
   });
 });
 
-/** Review finding 1, driven the way it was found: two Applies that each promote a node, then undo both. The second
- *  undo's precondition is the document the FIRST Apply wrote, whose mark the first undo already had to raise past, so
- *  the route refuses it as a lower mark — and the commit must treat that as the file it read, re-read, and land. */
-describe('#1774: undoing two minting Applies in a row lands both', () => {
+/** Review finding 1, driven the way it was found: two Applies that each promote a node, then undo both. Since #1868 the
+ *  undos restore the prefab in memory and park it, so the mark question moved to Save: the parked document predates both
+ *  Applies, and its write must not LOWER the mark they raised the file to (the flush's commit raises it from the file). */
+describe('#1774: undoing two minting Applies in a row lands both, and Save keeps the mark', () => {
   const PPATH = '/prefabs/P.prefab.json';
   it('Apply E1, Apply E2, undo, undo — every step lands, and the mark never goes down', async () => {
     install(p3Doc());
@@ -412,13 +414,17 @@ describe('#1774: undoing two minting Applies in a row lands both', () => {
     };
     await applyNew('E1');
     await applyNew('E2');
-    const marks: number[] = [(JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId!];
+    const mark = (JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId!;
     const error = vi.spyOn(console, 'error');
     try {
-      for (let i = 0; i < 4; i++) { await undo(); marks.push((JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId ?? 0); }
+      for (let i = 0; i < 4; i++) await undo();
       expect(error.mock.calls.map((c) => String(c[0])).filter((m) => /REFUSED|could not be written/.test(m))).toEqual([]);
     } finally { error.mockRestore(); }
-    expect((JSON.parse(onDisk.get(PPATH)!) as PrefabFile).entities.map((e) => e.name)).toEqual(['R', 'A', 'B']);
-    expect(marks.every((m) => m === marks[0])).toBe(true);
+    expect((peekDirtyAsset(PPATH)?.data as PrefabFile | undefined)?.entities.map((e) => e.name)).toEqual(['R', 'A', 'B']);
+    // Save writes the parked document over the file the two Applies left, with their mark kept.
+    expect((await flushDirtyAssets()).failed).toEqual([]);
+    const saved = JSON.parse(onDisk.get(PPATH)!) as PrefabFile;
+    expect(saved.entities.map((e) => e.name)).toEqual(['R', 'A', 'B']);
+    expect(saved.nextLocalId).toBe(mark);
   });
 });

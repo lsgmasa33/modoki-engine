@@ -11,7 +11,7 @@ import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
-import { instantiatePrefabInstance, type PrefabFile } from './prefab';
+import { instantiatePrefabInstance, parkedPrefabRead, type PrefabFile } from './prefab';
 import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';
@@ -39,6 +39,9 @@ export function placedPrefabRefusal(placedId: string | undefined, read: { id?: s
 
 /** The file at `path`, or null when it is gone. The read token is the caller's, taken before this fetch. */
 async function readPrefabFile(path: string): Promise<PrefabFile | null> {
+  // A parked prefab places as the park (#1868) — the document its other instances show and Save will write.
+  const parked = parkedPrefabRead(path);
+  if (parked) return parked;
   try {
     return await parseAssetJson(await fetch(path), path) as PrefabFile;
   } catch (e) {

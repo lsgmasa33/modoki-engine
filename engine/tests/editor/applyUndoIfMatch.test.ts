@@ -1,26 +1,23 @@
-/** #1664 + #1668 — Apply's undo and redo write the prefab file only over the other side of the Apply, and a write that
- *  does not land changes nothing.
+/** #1664 + #1668 + #1868 — Apply's undo and redo restore the prefab IN MEMORY and park it for Save (#1868, D1 = Park), and
+ *  refuse, changing nothing, when the editor holds another document than the other side of the Apply.
  *
- *  The prefab file is global, and an Apply's undo entry outlives edits made elsewhere: a prefab-edit save, another
- *  scene's Apply, a `git pull`. Undo used to write the pre-Apply document over whatever the file had become (#1664),
- *  and redo then brought back only the Apply, so the later edit was unrecoverable. It also seeded the editor cache
- *  before the write and ignored the result (#1668), so a failed write rebuilt the world against a document the disk
- *  did not hold.
+ *  The prefab is global, and an Apply's undo entry outlives edits made elsewhere: a prefab-edit save, another scene's
+ *  Apply, a `git pull` the watcher brought in. Undo used to write the pre-Apply document over whatever the file had become
+ *  (#1664), and redo then brought back only the Apply, so the later edit was unrecoverable. The undo then wrote only over
+ *  the other side's bytes (`ifMatch`); since #1868 it writes nothing, and the same precondition is asked of MEMORY — the
+ *  document the editor holds (the park, or its cache) must be the one the step left. A failed write (#1668) cannot happen
+ *  on an undo any more; Save is where a write can fail, and it is conditional on the file's own baseline.
  *
- *  Driven through the real Apply, undo manager and `commitPrefabWrite` (#1692). Only the route is
- *  a fake: a disk keyed by the path `postWriteFile` received, holding exactly the bytes it received, with
- *  `/api/write-file`'s own if-match rule (`ifMatchRefusal`, editorBackendRouter.ts): refuse with 409
- *  `reason:'if-match'` unless the sha256 of the stored bytes equals `ifMatch`. The accept side therefore compares the
- *  hash the undo sent against the bytes the Apply really wrote, not against a recomputation of them.
+ *  Driven through the real Apply, undo manager, `commitPrefabWrite` (#1692) and flush. Only the route is a fake: a disk
+ *  keyed by the path `postWriteFile` received, holding exactly the bytes it received, with `/api/write-file`'s own
+ *  if-match rule (`ifMatchRefusal`, editorBackendRouter.ts).
  *
  *  Mutations, each checked:
- *  - drop the `ifMatch` from `commitPrefabWrite`'s write: the #1664 case goes red.
- *  - ignore the write result (do not throw) there: the #1668 case goes red.
- *  - serialize the Apply's write differently from the undo's hash (one path only): the accept cases go red.
- *  - treat every 409 as the if-match refusal: the format-gate case goes red.
- *  - let a hash failure throw as it comes: the hash case goes red.
- *  - let a refused step mark the world edited (`runStep`): the refusal and hash cases go red.
- *  - mint an id-less file's id on `newPrefab` alone: the id-less case goes red.
+ *  - drop the refusal in `restorePrefabsInMemory` (`prefabRestoreRefusal`): the later-save cases go red.
+ *  - park the redo's document instead of dropping it: the first accept case goes red.
+ *  - let a refused step mark the world edited (`runStep`): the refusal case goes red.
+ *  - mint an id-less file's id on `newPrefab` alone: the id-less case goes red. (The manifest id a restore keeps,
+ *    `doc.id = r.source`, is prefabCommit.test.ts's Replace case: here the Apply stamps both sides, so it cannot fail.)
  *  - let a refused step mark its affected scenes dirty: the base-scene case goes red. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -113,6 +110,7 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { undo, redo, peekUndo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion, beginWorldSwitch } from '../../packages/modoki/src/editor/undo/undoManager';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -189,6 +187,7 @@ async function applyBox(field: 'x' | 'y', v: number) {
 }
 
 beforeEach(() => {
+  clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   _resetHistoryContexts();
   swapHistory('scenes/Level.json');
@@ -217,40 +216,51 @@ beforeEach(() => {
   for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: ROOT });
 });
 
-describe('Apply undo/redo writes the prefab only over the other side of the Apply (#1664)', () => {
-  it('accept side: undo and redo round-trip the file when nothing else wrote it', async () => {
+/** What is parked for P (#1868): the document Save will write, or null. */
+const parkedBox = () => ((peekDirtyAsset(P)?.data as PrefabFile | undefined)?.entities.find((e) => e.name === 'Box')?.traits.Transform ?? null) as { x: number; y: number } | null;
+
+describe('Apply undo/redo change memory only (#1868), and refuse over a document they did not leave (#1664)', () => {
+  it('accept side: the file keeps the Apply, the undo is parked for Save, and the redo leaves nothing unsaved', async () => {
     await applyBox('x', 5);
     const applied = onDisk();
+    const writes = fs.posts.length;
     expect(boxOnDisk().x).toBe(5); // precondition: the Apply wrote
 
     await quietly(() => undo());
-    // The undo's precondition was the hash of the bytes the Apply's write carried, so it wrote.
-    expect(fs.posts.at(-1)!.ifMatch).toBe(createHash('sha256').update(applied).digest('hex'));
-    expect(boxOnDisk().x).toBe(0);
+    expect(fs.posts).toHaveLength(writes); // no write, no save
+    expect(onDisk()).toBe(applied);
     expect(boxInCache().x).toBe(0);
+    expect(parkedBox()?.x).toBe(0);
     expect(canRedo()).toBe(true);
     expect(toast).not.toHaveBeenCalled();
 
     await quietly(() => redo());
-    expect(boxOnDisk().x).toBe(5);
+    expect(fs.posts).toHaveLength(writes);
     expect(boxInCache().x).toBe(5);
     expect(xOf(box())).toBe(5);
+    // The redo put back what the file holds, so nothing is left for Save.
+    expect(peekDirtyAsset(P)).toBeNull();
     expect(toast).not.toHaveBeenCalled();
   });
 
-  it('accept side: two Applies undo in order, each over the one after it', async () => {
+  it('accept side: two Applies undo in order, each over the one after it, and Save writes where the stack stands', async () => {
     await applyBox('x', 5);
     await applyBox('y', 3);
     expect(boxOnDisk()).toMatchObject({ x: 5, y: 3 }); // precondition
 
     // The history is [edit x, Apply x, edit y, Apply y]: the second Apply, its field edit, then the first Apply.
     await quietly(() => undo());
-    expect(boxOnDisk()).toMatchObject({ x: 5, y: 0 });
+    expect(boxInCache()).toMatchObject({ x: 5, y: 0 });
     await quietly(() => undo());
     await quietly(() => undo());
+    expect(boxInCache()).toMatchObject({ x: 0, y: 0 });
+    expect(parkedBox()).toMatchObject({ x: 0, y: 0 });
+    expect(boxOnDisk()).toMatchObject({ x: 5, y: 3 }); // the file is Save's to change
+    expect((await quietly(() => flushDirtyAssets())).failed).toEqual([]);
     expect(boxOnDisk()).toMatchObject({ x: 0, y: 0 });
     for (let i = 0; i < 3; i++) await quietly(() => redo());
-    expect(boxOnDisk()).toMatchObject({ x: 5, y: 3 });
+    expect(boxInCache()).toMatchObject({ x: 5, y: 3 });
+    expect(parkedBox()).toMatchObject({ x: 5, y: 3 });
     expect(toast).not.toHaveBeenCalled();
   });
 
@@ -268,9 +278,10 @@ describe('Apply undo/redo writes the prefab only over the other side of the Appl
 
     await quietly(() => undo());
 
-    // The file still holds the later save — `Extra` included — and the cache agrees.
+    // The file still holds the later save — `Extra` included — and the editor agrees; nothing is parked.
     expect(onDisk()).toBe(laterBytes);
     expect((getCachedPrefabSync(P) as PrefabFile).entities.some((e) => e.name === 'Extra')).toBe(true);
+    expect(peekDirtyAsset(P)).toBeNull();
     // Nothing else ran: the world was not reloaded against the pre-Apply document.
     expect(sm.loads).toBe(loads);
     expect(xOf(box())).toBe(5);
@@ -280,16 +291,17 @@ describe('Apply undo/redo writes the prefab only over the other side of the Appl
     // The entry is dropped (#310), and the toast names the reason rather than a bare failure.
     expect(canRedo()).toBe(false);
     expect(toast).toHaveBeenCalledTimes(1);
-    expect(toast.mock.calls[0]![0]).toMatch(/changed on disk since the Apply/);
+    expect(toast.mock.calls[0]![0]).toMatch(/changed since, and was left as it is/);
   });
 
-  it('redo refuses the same way when the file changed after the undo', async () => {
+  it('redo refuses the same way when the prefab changed after the undo', async () => {
     await applyBox('x', 5);
     await quietly(() => undo());
-    expect(boxOnDisk().x).toBe(0); // precondition
+    expect(parkedBox()?.x).toBe(0); // precondition
+    // A save of the template made from the undone state: it read the park, so it lands over the file and retires it.
     const later = JSON.parse(JSON.stringify(getCachedPrefabSync(P))) as PrefabFile;
     later.name = 'Renamed by a later save';
-    await quietly(() => laterSave(later));
+    expect((await quietly(() => laterSave(later))).ok).toBe(true);
     setPrefabCache(P, later);
     const laterBytes = onDisk();
 
@@ -297,53 +309,28 @@ describe('Apply undo/redo writes the prefab only over the other side of the Appl
 
     expect(onDisk()).toBe(laterBytes);
     expect(boxInCache().x).toBe(0);
-    expect(toast.mock.calls[0]![0]).toMatch(/changed on disk since the Apply/);
+    expect(peekDirtyAsset(P)).toBeNull();
+    expect(toast.mock.calls[0]![0]).toMatch(/changed since, and was left as it is/);
   });
 });
 
-describe('a failed write on Apply undo changes nothing (#1668)', () => {
-  it('the cache and the world stay on the applied side, and the step is reported, not passed as done', async () => {
+/** #1668, #1868: an undo that cannot WRITE cannot half-fail. The route that would refuse it (a full disk, the format gate's
+ *  409, a hash `crypto.subtle` cannot compute) is never asked; those cases went with the write they tested. */
+describe('an Apply undo never touches the file route (#1868)', () => {
+  it('a route that fails every write does not stop the undo, which restores the prefab and the world whole', async () => {
     await applyBox('x', 5);
-    const applied = onDisk();
+    const writes = fs.posts.length;
     const loads = sm.loads;
-    const saves = sm.saves;
     fs.fail = true;
-
-    await quietly(() => undo());
-
-    expect(onDisk()).toBe(applied);
-    // Before #1668 the cache was seeded with the pre-Apply document first, and the world rebuilt and saved against it.
-    expect(boxInCache().x).toBe(5);
-    expect(sm.loads).toBe(loads);
-    expect(sm.saves).toBe(saves);
-    expect(xOf(box())).toBe(5);
-    expect(canRedo()).toBe(false);
-    expect(toast).toHaveBeenCalledTimes(1);
-    expect(toast.mock.calls[0]![0]).toMatch(/could not be written/);
-  });
-});
-
-describe('the refusals that are not a changed file (close-out review)', () => {
-  it('a format-gate 409 is reported as a failed write, not as "changed on disk"', async () => {
-    await applyBox('x', 5);
-    const applied = onDisk();
     fs.tooNew = true;
-    await quietly(() => undo());
-    expect(onDisk()).toBe(applied);
-    expect(boxInCache().x).toBe(5);
-    expect(toast).toHaveBeenCalledTimes(1);
-    expect(toast.mock.calls[0]![0]).toMatch(/could not be written/);
-  });
 
-  it('a hash that cannot be computed writes nothing and is reported as a refusal', async () => {
-    await applyBox('x', 5);
-    const edits = getEditVersion();
-    const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new TypeError('crypto.subtle is unavailable'));
-    try {
-      await quietly(() => undo());
-    } finally { digest.mockRestore(); }
-    expect(getEditVersion()).toBe(edits);
-    expect(toast.mock.calls[0]![0]).toMatch(/refused: the prefab file could not be written/);
+    await quietly(() => undo());
+
+    expect(fs.posts).toHaveLength(writes);
+    expect(boxInCache().x).toBe(0);
+    expect(sm.loads).toBe(loads + 1); // the world was rebuilt from the pre-Apply snapshot
+    expect(canRedo()).toBe(true);
+    expect(toast).not.toHaveBeenCalled();
   });
 });
 
@@ -361,7 +348,7 @@ describe('a refusal on a BASE scene\'s instance dirties no scene (close-out re-r
 
     await quietly(() => undo());
 
-    expect(toast.mock.calls[0]![0]).toMatch(/changed on disk since the Apply/); // precondition: it was refused
+    expect(toast.mock.calls[0]![0]).toMatch(/changed since, and was left as it is/); // precondition: it was refused
     expect(dirtySceneGuidsSnapshot().has(BASE)).toBe(false);
   });
 });
@@ -371,7 +358,7 @@ describe('a prefab file with no id (close-out review)', () => {
   const idless = () => { const { id: _id, ...rest } = pDoc(); return rest; };
   const install2 = () => { prefabs.set(P, idless()); setPrefabCache(P, idless() as never); fs.disk.set(P, jsonFileBody(idless())); };
 
-  it('undo and redo both land, and the file keeps the one id the Apply gave it', async () => {
+  it('undo, Save and redo all keep the one id the Apply gave it', async () => {
     install2();
     await applyBox('x', 5);
     const minted = (JSON.parse(onDisk()) as PrefabFile).id;
@@ -379,11 +366,14 @@ describe('a prefab file with no id (close-out review)', () => {
     expect(minted).not.toBe(P); // …a fresh one, so the document really had none
 
     await quietly(() => undo());
+    expect(parkedBox()?.x).toBe(0);
+    expect((peekDirtyAsset(P)?.data as PrefabFile).id).toBe(minted);
+    expect((await quietly(() => flushDirtyAssets())).failed).toEqual([]);
     expect(boxOnDisk().x).toBe(0);
     expect((JSON.parse(onDisk()) as PrefabFile).id).toBe(minted);
     await quietly(() => redo());
-    expect(boxOnDisk().x).toBe(5);
-    expect((JSON.parse(onDisk()) as PrefabFile).id).toBe(minted);
+    expect(boxInCache().x).toBe(5);
+    expect((getCachedPrefabSync(P) as PrefabFile).id).toBe(minted);
     expect(toast).not.toHaveBeenCalled();
   });
 });

@@ -17,7 +17,7 @@ import {
   saveAll, unsavedChangeCauses, causeSpecs, flushParked,
   type SaveResult, type UnsavedCauses,
 } from './serialize';
-import { type FlushResult } from './dirtyAssets';
+import { type FlushResult, flushDirtyAssets, overwriteParkedAsset, peekDirtyAsset } from './dirtyAssets';
 import { type MetaFlushResult } from './pendingMeta';
 import { isEditingPrefab, savePrefabEditReport } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
@@ -111,8 +111,41 @@ let _inFlight: Promise<SaveOutcome> | null = null;
 
 export function runSaveAll(): Promise<SaveOutcome> {
   if (_inFlight) return _inFlight;
-  _inFlight = runSaveAllOnce().finally(() => { _inFlight = null; });
+  _inFlight = runSaveAllOnce()
+    .then(async (o) => ({ ...o, assets: await answerParkedConflicts(o.assets) }))
+    .finally(() => { _inFlight = null; });
   return _inFlight;
+}
+
+/** Overwrite or Cancel, for one parked document whose file changed on disk since it was parked. */
+async function askOverwrite(path: string): Promise<boolean> {
+  // Dynamic, like the prefab-edit save's own question below: the modal is DOM, and this module is not.
+  return (await import('../utils/saveDialog')).confirmInEditor(
+    `${path.split('/').pop() ?? path} changed on disk`,
+    `${path} changed on disk since your unsaved edit to it was made (a save from somewhere else, an outside edit or a git pull). Overwrite it with your edit, or cancel and keep the file as it is? Your edit stays unsaved if you cancel.`,
+    'Overwrite',
+  );
+}
+
+/** The human's answer to each parked document the save refused as a CONFLICT (#1868, hub call b): the file changed on
+ *  disk since the edit was parked, so it was not written. Each one is asked about — Overwrite writes it over whatever the
+ *  file holds now, Cancel leaves it parked and unsaved. Never written without the answer: a silent overwrite is what the
+ *  precondition exists to stop. Returns the flush result the toast reports, with the overwritten ones moved to `saved`. */
+export async function answerParkedConflicts(
+  assets: FlushResult,
+  ask: (path: string) => Promise<boolean> = askOverwrite,
+  reflush: () => Promise<FlushResult> = flushDirtyAssets,
+): Promise<FlushResult> {
+  // A conflict whose document is no longer parked was settled another way before this asked — the prefab-edit save's
+  // own Overwrite wrote it (close-out review F4) — so it is neither asked about nor reported as unsaved.
+  const settled = new Set(assets.failed.filter((f) => f.conflict && !peekDirtyAsset(f.path)).map((f) => f.path));
+  if (settled.size) assets = { saved: assets.saved, failed: assets.failed.filter((f) => !settled.has(f.path)) };
+  let chose = false;
+  for (const f of assets.failed) if (f.conflict && await ask(f.path) && overwriteParkedAsset(f.path)) chose = true;
+  if (!chose) return assets;
+  // Everything still parked goes again — the overwritten ones, and a cancelled conflict, which refuses again unasked.
+  const again = await reflush();
+  return { saved: [...assets.saved, ...again.saved.filter((p) => !assets.saved.includes(p))], failed: again.failed };
 }
 
 async function runSaveAllOnce(): Promise<SaveOutcome> {
@@ -298,9 +331,15 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   // failure should be. `conflict` is set only by a 409 from the `ifMatch` precondition.
   const metaConflicts = metaFails.filter((f) => f.conflict);
   const metaPlainFails = metaFails.filter((f) => !f.conflict);
-  const failSuffix = (assetFails.length
-    ? ` — ${assetFails.length} asset write(s) FAILED and are still unsaved: ${assetFails.map((f) => f.path).join(', ')}`
+  // A conflict the human chose to keep (Cancel on Overwrite, #1868) is said as what it is: the file changed on disk.
+  const assetConflicts = assetFails.filter((f) => f.conflict);
+  const assetPlainFails = assetFails.filter((f) => !f.conflict);
+  const failSuffix = (assetPlainFails.length
+    ? ` — ${assetPlainFails.length} asset write(s) FAILED and are still unsaved: ${assetPlainFails.map((f) => f.path).join(', ')}`
     : '')
+    + (assetConflicts.length
+      ? ` — ${assetConflicts.length} unsaved edit(s) NOT written: the file changed on disk (${assetConflicts.map((f) => f.path).join(', ')}). The edit is still unsaved; saving again asks whether to overwrite.`
+      : '')
     // Same rule for a refused base-scene ref (#831): it is pending work that stayed pending, and
     // nothing else would have told the human. Its own clause rather than a shared count, because
     // "asset write" is the wrong noun for a one-field scene mutation and a human chasing the wrong

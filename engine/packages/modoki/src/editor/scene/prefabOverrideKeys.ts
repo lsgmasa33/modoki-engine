@@ -366,9 +366,9 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   };
 }
 
-/** What an Apply did NOT do, in a sentence for the person who asked (#1437), or null when it did everything:
- *  moves the prefab could not express, and other files whose refs to moved members were not repaired. */
-export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'memberPathsChanged' | 'fileRepair' | 'refused'>): string | null {
+/** What an Apply did NOT do, in a sentence for the person who asked (#1437), or null when it did everything: the keys
+ *  it skipped, each with its reason (a legacy move among them, #1868). */
+export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'refused'>): string | null {
   // A REFUSAL is not a partial outcome and must not be worded as one: the line below would call it a "move" or a
   // "change" (#1468). Reported alone, and first, because there is nothing else to say. The reason says what landed
   // itself: a multi-file refusal can leave a file written that its rollback could not put back (#1732), so the frame
@@ -379,15 +379,6 @@ export function applyOutcomeNotice(result: Pick<ApplyResult, 'skipped' | 'member
   // "move" only when every skipped key IS one: a tag (#1491) or a key naming no member is not.
   const noun = skipped.every((x) => x.key.startsWith('~moved.')) ? 'move' : 'change';
   if (skipped.length) parts.push(`${skipped.length} ${noun}${skipped.length === 1 ? ' was' : 's were'} not applied: ${skipped.map((x) => x.reason).join('; ')}`);
-  if (result.memberPathsChanged) {
-    // The route's reason, when it refused the repair (#1824) — this said "see the console".
-    if (result.fileRepair && 'failed' in result.fileRepair) parts.push(`references to the moved members in other files could NOT be repaired: ${result.fileRepair.error}`);
-    else {
-      if (result.fileRepair?.held.length) parts.push(`references in ${result.fileRepair.held.join(', ')} were not repaired: open with unsaved edits`);
-      // #1784: left rather than written over a change that landed while the repair ran.
-      if (result.fileRepair?.changed?.length) parts.push(`references in ${result.fileRepair.changed.join(', ')} were not repaired: the file changed on disk while the repair ran`);
-    }
-  }
   return parts.length ? `Apply to Prefab: ${parts.join('. ')}.` : null;
 }
 

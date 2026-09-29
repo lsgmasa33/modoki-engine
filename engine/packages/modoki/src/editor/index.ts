@@ -123,12 +123,14 @@ export {
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors, type SceneLoadOutcome,
 } from './scene/serialize';
 export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
+export { confirmUnsavedBeforeBuild } from './scene/unsavedGate';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets, assetCacheDiverged, assetCacheMatchesFile,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
   subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
   getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, forgetFlushedAssetHash,
-  type AssetWriteOrigin,
+  parkPrefab, parkedPrefab, overwriteParkedAsset, keepParkedPrefabOverFileChange,
+  type AssetWriteOrigin, type DirtyDocType,
 } from './scene/dirtyAssets';
 export {
   markBaseSceneEdit, applyBaseSceneEdit, peekBaseSceneEdit, isBaseSceneDirty, hasPendingBaseScenes,

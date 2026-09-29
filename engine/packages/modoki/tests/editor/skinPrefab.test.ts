@@ -1,18 +1,14 @@
-/** makeRigPrefabAsset's undo/redo closures (#308) — both directions used to discard
- *  writeAssetFile/deleteAssetFile's boolean AND then update `setPrefabCache`
- *  unconditionally, so a failed backend write left the in-memory cache reverted
- *  while the file on disk stayed un-reverted (surfacing only on the next scene
- *  load / editor relaunch, which reads the FILE). The fix guards the cache update
- *  on the write/delete actually succeeding and reports through `reportUndoFailure`.
+/** makeRigPrefabAsset's forward write and its undo entry (#1868, D1 = Park). A FRESH make is a new asset, saved on
+ *  creation, and pushes no entry. An UPDATE's undo and redo restore the prefab IN MEMORY through
+ *  `restorePrefabsInMemory` — by the prefab's guid, from the side the other half left — and write nothing; the park they
+ *  leave is Save's to write. The #308/#1679 cases (a failed or refused backend write inside an undo) went with the write.
  *
- *  The forward (create) flow and its ECS/serialization dependencies are mocked out
- *  entirely — this file is only about the undo/redo closures' handling of a failed
- *  backend call, not about prefab serialization itself (covered elsewhere).
+ *  The forward flow's ECS/serialization dependencies are mocked out entirely; `restorePrefabsInMemory` itself is driven
+ *  unmocked in tests/editor/prefabPark.test.ts and the engine Apply suites.
  *
- *  Since #1692 every write is ONE `commitPrefabWrite`, which seats the caches itself only once the write landed — that
- *  is tested unmocked in prefabCommit.test.ts. Here the commit is a model, so what these cases assert is which document
- *  LANDED (`landedSpy`), and that skinPrefab never seats a cache or registers an asset on its own (afterEach): a spy the
- *  model itself called could only ever measure the model (#1670). */
+ *  The forward write is ONE `commitPrefabWrite`, a model here: what a case asserts is which document LANDED (`landedSpy`),
+ *  and that skinPrefab never seats a cache or registers an asset on its own (afterEach) — a spy the model itself called
+ *  could only ever measure the model (#1670). */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -43,7 +39,10 @@ const setPrefabCacheSpy = vi.fn((..._args: unknown[]) => undefined);
 /** One call per commit the model LANDED: `(path, doc)`, `doc` null for a delete. */
 const landedSpy = vi.fn((..._args: unknown[]) => undefined);
 const serializePrefabSpy = vi.fn((..._args: unknown[]) => ({ id: 'g-new', root: {} }));
+/** Prefabs parked for Save (#1868), by path — what `parkedPrefabRead` answers. */
+const parked = vi.hoisted(() => new Map<string, unknown>());
 vi.mock('../../src/editor/scene/prefab', () => ({
+  parkedPrefabRead: (path: string) => (parked.has(path) ? JSON.parse(JSON.stringify(parked.get(path))) : null),
   serializeRebuildOver: (...args: unknown[]) => serializePrefabSpy(...args),
   setPrefabCache: (...args: unknown[]) => setPrefabCacheSpy(...args),
   // #1468: the existing-id lookup moved off `getGuidForPath` (manifest only, so it minted a fresh
@@ -88,6 +87,12 @@ vi.mock('../../src/editor/scene/prefabCommit', () => ({
   },
 }));
 
+// The undo's restore: recorded, not run — its own behaviour is covered where it runs unmocked.
+const restoreSpy = vi.fn(async (..._args: unknown[]) => {});
+vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
+  restorePrefabsInMemory: (...args: unknown[]) => restoreSpy(...args),
+}));
+
 const pushActionSpy = vi.fn();
 vi.mock('../../src/editor/undo/undoManager', () => ({
   pushAction: (...args: unknown[]) => pushActionSpy(...args),
@@ -105,7 +110,6 @@ const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
   try { return await fn(); } finally { spy.mockRestore(); }
 };
 import { makeRigPrefabAsset } from '../../src/editor/scene/skinPrefab';
-import { UndoRefusedError } from '../../src/editor/undo/undoFailure';
 import { jsonFileBody } from '../../src/editor/backend/editorBackend';
 
 const RIG_BONES = [{ x: 0, y: 0, rot: 0, name: 'root', parent: -1 }];
@@ -123,6 +127,8 @@ beforeEach(() => {
   deleteAssetFileSpy.mockClear();
   pushActionSpy.mockClear();
   reportUndoFailureSpy.mockClear();
+  restoreSpy.mockClear();
+  parked.clear();
   disk.clear();
   writeResult = true; deleteResult = true;
   // Nothing at any path unless a test says so: the prior read is decided by the FILE (#1679), and an unstubbed fetch
@@ -141,206 +147,54 @@ afterEach(() => {
   expect(registerAssetSpy).not.toHaveBeenCalled();
 });
 
-describe('makeRigPrefabAsset undo/redo — fresh create (no prior prefab)', () => {
-  it('redo lands nothing and REPORTS when the write fails', async () => {
-    serializePrefabSpy.mockReturnValue({ id: 'g-new', root: {} } as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/new.prefab.json', 'Rig');
-    expect(result).toEqual({ path: '/new.prefab.json', updated: false });
-    expect(pushActionSpy).toHaveBeenCalledTimes(1);
-    const action = pushActionSpy.mock.calls[0][0];
+const make = async (path: string, prior?: string) => {
+  if (prior !== undefined) {
+    disk.set(path, prior);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(prior, { status: 200 })));
+  }
+  serializePrefabSpy.mockReturnValue({ id: prior !== undefined ? 'g-existing' : 'g-new', root: { v: 2 } } as any);
+  return makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, path, 'Rig');
+};
 
-    landedSpy.mockClear();
-    writeResult = false; // the redo's own write now fails
-    await action.redo();
-
-    expect(reportUndoFailureSpy).toHaveBeenCalledTimes(1);
-    const call = reportUndoFailureSpy.mock.calls[0][0];
-    expect(call.direction).toBe('Redo');
-    expect(call.detail).toContain('/new.prefab.json');
-    // Nothing landed: the model refuses this commit itself, so what this pins is that skinPrefab did not retry into one
-    // that lands (e.g. without its precondition).
-    expect(landedSpy).not.toHaveBeenCalled();
-  });
-
-  it('undo (delete) lands nothing and REPORTS when the delete fails', async () => {
-    serializePrefabSpy.mockReturnValue({ id: 'g-new', root: {} } as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/new2.prefab.json', 'Rig2');
-    expect(result).not.toBeNull();
-    const action = pushActionSpy.mock.calls[0][0];
-
-    landedSpy.mockClear();
-    deleteResult = false; // undo's delete fails
-    await action.undo();
-
-    expect(reportUndoFailureSpy).toHaveBeenCalledTimes(1);
-    const call = reportUndoFailureSpy.mock.calls[0][0];
-    expect(call.direction).toBe('Undo');
-    expect(call.detail).toContain('/new2.prefab.json');
-    expect(landedSpy).not.toHaveBeenCalled();
+describe('makeRigPrefabAsset — a fresh make (#1868)', () => {
+  // Mutation: push the entry for a fresh make again (`if (!updated) return …` removed) — this goes red.
+  it('writes the new asset and pushes NO undo entry: a creation is saved on creation, and nothing in memory changed', async () => {
+    expect(await make('/fresh.prefab.json')).toEqual({ path: '/fresh.prefab.json', updated: false });
+    expect(JSON.parse(disk.get('/fresh.prefab.json')!)).toEqual({ id: 'g-new', root: { v: 2 } });
+    expect(pushActionSpy).not.toHaveBeenCalled();
   });
 });
 
-describe('makeRigPrefabAsset undo — update (a prior prefab existed)', () => {
-  it('undo (restore) does not land the old content and REPORTS when the write fails', async () => {
-    // The prior prefab is ON DISK (the update is conditional on it, #1692) and served by the read.
-    disk.set('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
-    const fetchMock = vi.fn(async () => new Response('{"id":"g-existing","old":true}', { status: 200 }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    serializePrefabSpy.mockReturnValue({ id: 'g-existing', root: {} } as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/rigs/existing.prefab.json', 'Rig3');
-    expect(result).toEqual({ path: '/rigs/existing.prefab.json', updated: true });
-    const action = pushActionSpy.mock.calls[0][0];
-
-    landedSpy.mockClear();
-    writeResult = false; // the restore write fails
+describe('makeRigPrefabAsset — an update\'s undo and redo change memory only (#1868)', () => {
+  // Mutations: swap `doc` and `from` in the undo — the first case goes red; key the restore by the path instead of the
+  // guid — the same (a Rename since would strand it, hub call e).
+  it('undo restores the PRIOR document by guid, from the one the update left; redo the reverse; neither writes', async () => {
+    expect(await make('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}')).toEqual({ path: '/rigs/existing.prefab.json', updated: true });
+    const action = pushActionSpy.mock.calls.at(-1)![0];
+    expect(action).toMatchObject({ label: 'Update prefab "Rig"', _isFileDirect: true, _rebasesLiveFrames: true });
+    const writes = writeAssetFileSpy.mock.calls.length;
+    const after = { id: 'g-existing', root: { v: 2 } };
     await action.undo();
-
-    expect(reportUndoFailureSpy).toHaveBeenCalledTimes(1);
-    const call = reportUndoFailureSpy.mock.calls[0][0];
-    expect(call.direction).toBe('Undo');
-    expect(call.detail).toContain('/rigs/existing.prefab.json');
-    expect(landedSpy).not.toHaveBeenCalled();
-  });
-});
-
-// #C-6 (#308 close-out): all three describe blocks above only assert the FAILURE branch —
-// none pins that a successful write/delete actually updates setPrefabCache/registerAsset with
-// the right arguments. Also adds the redo-UPDATE case, which existed nowhere (only
-// redo-fresh-create and undo restore/delete were covered).
-describe('makeRigPrefabAsset undo/redo — success paths', () => {
-  it('redo (fresh create) lands the content', async () => {
-    const prefab = { id: 'g-new', root: {} };
-    serializePrefabSpy.mockReturnValue(prefab as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/new3.prefab.json', 'Rig4');
-    expect(result).toEqual({ path: '/new3.prefab.json', updated: false });
-    const action = pushActionSpy.mock.calls[0][0];
-
-    writeAssetFileSpy.mockClear();
-    landedSpy.mockClear();
+    expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-existing', doc: { id: 'g-existing', old: true }, from: after }]);
     await action.redo();
-
-    expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/new3.prefab.json', jsonFileBody(prefab));
-    expect(landedSpy).toHaveBeenCalledWith('/new3.prefab.json', prefab);
+    expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-existing', doc: after, from: { id: 'g-existing', old: true } }]);
+    expect(writeAssetFileSpy.mock.calls.length).toBe(writes);
+    expect(deleteAssetFileSpy).not.toHaveBeenCalled();
   });
 
-  it('undo (delete, fresh create) deletes the file at the right path', async () => {
-    const prefab = { id: 'g-new2', root: {} };
-    serializePrefabSpy.mockReturnValue(prefab as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/new4.prefab.json', 'Rig5');
-    expect(result).toEqual({ path: '/new4.prefab.json', updated: false });
-    const action = pushActionSpy.mock.calls[0][0];
-
-    deleteAssetFileSpy.mockClear();
-    landedSpy.mockClear();
-    await action.undo();
-
-    expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(deleteAssetFileSpy).toHaveBeenCalledWith('/new4.prefab.json');
-    expect(landedSpy).toHaveBeenCalledWith('/new4.prefab.json', null);
-  });
-
-  it('undo (restore, update) restores the PRIOR content, as the parsed old doc', async () => {
-    // The prior prefab is ON DISK (the update is conditional on it, #1692) and served by the read.
+  // D-i. Mutation: read the prior from the FILE when parked — the update conflicts, and its undo would restore the file.
+  it('an update over a PARKED prefab reads the park: it is conditional on it, and its undo restores it', async () => {
     disk.set('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
     const fetchMock = vi.fn(async () => new Response('{"id":"g-existing","old":true}', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-
-    serializePrefabSpy.mockReturnValue({ id: 'g-existing', root: { new: true } } as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/rigs/existing.prefab.json', 'Rig6');
-    expect(result).toEqual({ path: '/rigs/existing.prefab.json', updated: true });
-    const action = pushActionSpy.mock.calls[0][0];
-
-    writeAssetFileSpy.mockClear();
-    landedSpy.mockClear();
-    await action.undo();
-
-    expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
-    expect(disk.get('/rigs/existing.prefab.json')).toBe('{"id":"g-existing","old":true}');
-    expect(landedSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', { id: 'g-existing', old: true });
-  });
-
-  // The redo-UPDATE case: forward-writes the NEW content again (not the old snapshot), keyed
-  // by the prefab's (preserved) existing identity — untested anywhere before this.
-  it('redo (update) re-writes the NEW content under the existing id', async () => {
-    // The prior prefab is ON DISK (the update is conditional on it, #1692) and served by the read.
-    disk.set('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
-    const fetchMock = vi.fn(async () => new Response('{"id":"g-existing","old":true}', { status: 200 }));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const newPrefab = { id: 'g-existing', root: { new: true } };
-    serializePrefabSpy.mockReturnValue(newPrefab as any);
-    const result = await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/rigs/existing.prefab.json', 'Rig7');
-    expect(result).toEqual({ path: '/rigs/existing.prefab.json', updated: true });
-    // The mock returns `id: 'g-existing'` whatever it is given, so the id assertions below cannot
-    // tell an update that KEPT the prefab's GUID from one that minted a new one. Pin the argument
-    // the update actually passes (#1670): the kept id, and the bytes it rebuilds over (#1782 — a bone keeps its row by path).
-    expect(serializePrefabSpy).toHaveBeenCalledWith(expect.anything(), 'g-existing', '{"id":"g-existing","old":true}');
-    const action = pushActionSpy.mock.calls[0][0];
-
-    writeAssetFileSpy.mockClear();
-    landedSpy.mockClear();
-    await action.redo();
-
-    expect(reportUndoFailureSpy).not.toHaveBeenCalled();
-    expect(writeAssetFileSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', jsonFileBody(newPrefab));
-    expect(landedSpy).toHaveBeenCalledWith('/rigs/existing.prefab.json', newPrefab);
-  });
-});
-
-/** #1679 — the prefab file is global, and this entry outlives a later save of it (open the skin prefab, edit, Cmd+S,
- *  then Cmd+Z here). Each half changes the file only while it holds what the other half left there, and otherwise
- *  REFUSES with nothing changed. Mutations, each checked red on its own case: the undo expecting the wrong bytes, the
- *  redo expecting nothing after an update's undo (accept case), and the redo ignoring an undo that did not apply. The
- *  preconditions themselves live in `replaceFileIfMatch`, mutation-checked in createPrefabUndo.test.ts. */
-describe('makeRigPrefabAsset — undo/redo preconditions (#1679)', () => {
-  const make = async (path: string, prior?: string) => {
-    if (prior !== undefined) {
-      disk.set(path, prior);
-      vi.stubGlobal('fetch', vi.fn(async () => new Response(prior, { status: 200 })));
-    }
-    serializePrefabSpy.mockReturnValue({ id: prior !== undefined ? 'g-existing' : 'g-new', root: { v: 2 } } as any);
-    expect(await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, path, 'Rig')).not.toBeNull();
-    return pushActionSpy.mock.calls.at(-1)![0];
-  };
-
-  it('undo of a fresh create refuses to delete a prefab saved since, and changes nothing', async () => {
-    const action = await make('/fresh.prefab.json');
-    disk.set('/fresh.prefab.json', '{"edited":true}');
-    landedSpy.mockClear();
-    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
-    expect(disk.get('/fresh.prefab.json')).toBe('{"edited":true}');
-    expect(landedSpy).not.toHaveBeenCalled();
-  });
-
-  it('undo of an update refuses to restore over a prefab saved since', async () => {
-    const action = await make('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
-    disk.set('/rigs/existing.prefab.json', '{"id":"g-existing","edited":true}');
-    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
-    expect(disk.get('/rigs/existing.prefab.json')).toContain('edited');
-  });
-
-  it('redo of a fresh create refuses a prefab made at the path since', async () => {
-    const action = await make('/fresh.prefab.json');
-    await action.undo();
-    disk.set('/fresh.prefab.json', '{"someone":"else"}');
-    await expect(action.redo()).rejects.toBeInstanceOf(UndoRefusedError);
-    expect(disk.get('/fresh.prefab.json')).toBe('{"someone":"else"}');
-  });
-
-  it('accept side: create and update both round-trip undo → redo → undo', async () => {
-    const created = await make('/fresh.prefab.json');
-    const written = disk.get('/fresh.prefab.json');
-    await created.undo(); expect(disk.has('/fresh.prefab.json')).toBe(false);
-    await created.redo(); expect(disk.get('/fresh.prefab.json')).toBe(written);
-    await created.undo(); expect(disk.has('/fresh.prefab.json')).toBe(false);
-
-    const updated = await make('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
-    const after = disk.get('/rigs/existing.prefab.json');
-    await updated.undo(); expect(disk.get('/rigs/existing.prefab.json')).toBe('{"id":"g-existing","old":true}');
-    await updated.redo(); expect(disk.get('/rigs/existing.prefab.json')).toBe(after);
+    parked.set('/rigs/existing.prefab.json', { id: 'g-existing', parked: true });
+    serializePrefabSpy.mockReturnValue({ id: 'g-existing', root: { v: 2 } } as any);
+    // The mocked commit checks `expected` against the FILE; the real one reads a parked `expected` as the park's own
+    // baseline (D-a, prefabPark.test.ts) — here the file is set to hold the park, so the mock lands it too.
+    disk.set('/rigs/existing.prefab.json', jsonFileBody({ id: 'g-existing', parked: true }));
+    expect(await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/rigs/existing.prefab.json', 'Rig')).not.toBeNull();
+    await pushActionSpy.mock.calls.at(-1)![0].undo();
+    expect(restoreSpy).toHaveBeenLastCalledWith([expect.objectContaining({ doc: { id: 'g-existing', parked: true } })]);
   });
 
   // #1692: the update is conditional on what it read, so an unreadable prior refuses the UPDATE itself — before, it
@@ -349,14 +203,13 @@ describe('makeRigPrefabAsset — undo/redo preconditions (#1679)', () => {
     disk.set('/rigs/existing.prefab.json', '{"id":"g-existing","old":true}');
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('backend restarting'); }));
     serializePrefabSpy.mockReturnValue({ id: 'g-existing', root: { v: 2 } } as any);
-    const pushes = pushActionSpy.mock.calls.length;
     expect(await quietly(() => makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/rigs/existing.prefab.json', 'Rig'))).toBeNull();
     expect(disk.get('/rigs/existing.prefab.json')).toBe('{"id":"g-existing","old":true}');
-    expect(pushActionSpy.mock.calls.length).toBe(pushes);
+    expect(pushActionSpy).not.toHaveBeenCalled();
     expect(deleteAssetFileSpy).not.toHaveBeenCalled();
   });
 
-  it('an id-less prefab already at the path is still read and restored — the read is decided by the FILE, not the id', async () => {
+  it('an id-less prefab already at the path is an update — the read is decided by the FILE, not the id — and its undo restores it', async () => {
     const prior = '{"name":"no id yet"}';
     disk.set('/fresh.prefab.json', prior);
     vi.stubGlobal('fetch', vi.fn(async () => new Response(prior, { status: 200 })));
@@ -364,15 +217,6 @@ describe('makeRigPrefabAsset — undo/redo preconditions (#1679)', () => {
     // The mocked classifier calls this path free ('mintable'), as the real one does for an id-less file.
     expect(await makeRigPrefabAsset('/rig.rig2d.json', { bones: RIG_BONES, id: 'g-rig' } as any, '/fresh.prefab.json', 'Rig')).toEqual({ path: '/fresh.prefab.json', updated: true });
     await pushActionSpy.mock.calls.at(-1)![0].undo();
-    expect(disk.get('/fresh.prefab.json')).toBe(prior);
-  });
-
-  it('a redo after an undo that FAILED expects the bytes still there', async () => {
-    const action = await make('/fresh.prefab.json');
-    deleteResult = false;
-    await action.undo(); // reported, not applied
-    deleteResult = true;
-    await action.redo(); // must not refuse
-    expect(disk.has('/fresh.prefab.json')).toBe(true);
+    expect(restoreSpy).toHaveBeenLastCalledWith([{ source: 'g-new', doc: { name: 'no id yet' }, from: { id: 'g-new', root: { v: 2 } } }]);
   });
 });

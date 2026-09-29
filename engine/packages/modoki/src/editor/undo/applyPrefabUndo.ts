@@ -12,9 +12,11 @@
  *  old base. The only record that distinguishes them is the pre-apply scene state.
  *
  *  Therefore undo is "record before/after of BOTH, reverse it": snapshot the prefab
- *  file and the serialized scene before and after, and restore by writing the prefab
- *  snapshot back and rebuilding the scene from its snapshot (which re-instantiates
- *  every instance exactly, preserving each one's overrides).
+ *  document and the serialized scene before and after, and restore by putting the prefab
+ *  document back IN MEMORY and rebuilding the scene from its snapshot (which re-instantiates
+ *  every instance exactly, preserving each one's overrides). The forward Apply writes the file,
+ *  as Unity's does; its undo and redo write nothing (#1868, D1 = Park): the restored document is
+ *  parked, and Save writes it. Neither ever saves the scene.
  *
  *  The snapshot is reloaded under the key of the world the undo belongs to when it RUNS: the scene's
  *  path; the prefab editor's synthetic path, since that world has no scene file (#1573); or '' for an
@@ -22,26 +24,21 @@
  *  substitute, and neither is a rebuild from the prefab's document. */
 
 import { pushAction, beginWorldBoundOperation, isWorldSwitchInProgress, type UndoAction } from './undoManager';
-import { UndoRefusedError, reportUndoFailure } from './undoFailure';
-import { commitPrefabWrite, commitPrefabWrites } from '../scene/prefabCommit';
-import { sha256OfWritten } from '../utils/contentHash';
-import { isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
+import { reportUndoFailure } from './undoFailure';
+import { restorePrefabsInMemory } from '../scene/prefabMemoryRestore';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
-import { serializeScene, saveScene, lastWrittenSceneBytes, getCurrentScenePath, isSceneLoadSwapping } from '../scene/serialize';
+import { serializeScene, isSceneLoadSwapping } from '../scene/serialize';
 import { withAdoption, adoptionsSettled, captureAdoption } from '../scene/sceneAdoption';
 import {
   applyToPrefabSelective, guidForEntityId, entityIdForGuid,
   resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
-  rebuildInstanceFromCapture, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances, getCachedPrefabSync,
+  rebuildInstanceFromCapture, preloadNestedPrefabsForSubtree, refreshBaseInstances, rebaseStaleInstances,
   captureNestedFrames, type ApplyResult, type PrefabFile, type NestedInstanceCapture,
 } from '../scene/prefab';
-import { rewriteNodeMoves } from '../../runtime/core/ecs/identityParents';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
-import { rewriteFrameMoves } from '../../runtime/loaders/memberPaths';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { useEditorStore } from '../store/editorStore';
-import { repairMemberPathsEverywhere } from '../scene/serverPrefabRewrites';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
 import { captureEntityIdentity } from '../../runtime/core/ecs/entityUtils';
@@ -50,20 +47,13 @@ import { currentSceneKey } from '../scene/authoredSnapshot';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
-/** The scene half of an Apply's undo and redo (#1695). The forward Apply saves the scene only when a promotion
- *  restructured it, and then the undo and redo save it too — but only while the file holds what the EDITOR last wrote
- *  there (`lastWrittenSceneBytes`, `ifMatch`), like the prefab half (#1664). The scene file is reachable from outside while
- *  its history is parked (leave the scene, change it with `modoki_mutate_scene`, a hand edit or a `git pull`, come back,
- *  Cmd+Z), and an unconditional save wrote the in-memory snapshot over that change for good. Keyed on the editor's LAST
- *  write, not on the other half's: the user's own Cmd+S in between is not an outside change (close-out review). Without
- *  a promotion nothing is saved: the undo dirties the scene as every undo does, and Unity does the same. */
-/** Restore a (prefab, scene) snapshot: install the prefab base, then rebuild the live
- *  world from the scene snapshot (runtime loadScene — no history clear) and persist it when `sceneSave` says the
- *  Apply did. Re-selects the previously-inspected entity by guid (ids change on rebuild). Resolves `false` when the
- *  world it belongs to is no longer live, having restored the prefab file only.
- *
- *  ONE `commitPrefabWrite` (#1692): the write goes only over `expected`, the other side of the Apply (#1664), and
- *  THROWS a refusal before anything else runs when it does not land; the world reload below is its rebuild.
+/** Restore one side of an Apply (#1868, owner ruling D1 = Park): every prefab it wrote goes back IN MEMORY — both caches,
+ *  and parked for Save, which writes it (`restorePrefabsInMemory`) — and the live world is rebuilt from the scene
+ *  snapshot of that side (runtime loadScene — no history clear). Nothing is written and no scene is saved: Unity's Apply
+ *  never saves the scene either, and the undo dirties it as every undo does. Re-selects the previously-inspected entity
+ *  by guid (ids change on rebuild). Resolves `false` when the world it belongs to is no longer live, having restored the
+ *  prefab documents only. Throws the refusal, before anything changed, when the editor holds another document for one of
+ *  them than the other side of the Apply (a prefab-edit save since, an outside change).
  *
  *  The snapshot goes back to the world this undo stack belongs to NOW — `currentSceneKey()`, the key Stop restores
  *  under — not to a path captured at the Apply (#1575). An untitled world has no path at all, and one saved with
@@ -71,51 +61,26 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 async function restoreSnapshot(
   source: string,
   prefab: PrefabFile,
-  /** The document the file must hold now — the other side of the Apply — or the write refuses and this throws, before
-   *  anything else here runs (#1664). */
+  /** The other side of the Apply — the document the editor must hold for `source` now. */
   expected: PrefabFile,
   scene: SceneData,
   selGuid: string,
-  /** The prefab document the files on disk were last repaired for, when the apply moved member paths
-   *  (#1437): they are repaired from it to `prefab`, the way the apply repaired them the other way. */
-  repairFrom: PrefabFile | undefined,
-  label: string,
-  direction: 'Undo' | 'Redo',
-  /** The Apply saved the scene, so this side saves it too (#1695). */
-  sceneWasSaved: boolean,
-  /** The OTHER prefab files the Apply wrote (#1693: an enclosing prefab's row — an override applied there, or U13's
-   *  revert of one), each put back with this one as ONE step: all of them over what the other side wrote, or none. */
+  /** The OTHER prefabs the Apply wrote (#1693: an enclosing prefab's row — an override applied there, or U13's revert of
+   *  one), each restored with this one as ONE step. */
   others: readonly { source: string; doc: PrefabFile; expected: PrefabFile }[] = [],
 ): Promise<boolean> {
-  // Read before the first await: the file write and the member-path repair below are a window a scene load, an
-  // Exit or a Create Scene can land in, and the snapshot must not be loaded over whatever world that put in.
+  // Read before the first await: the restore's nested preload and the reload below are a window a scene load, an Exit or
+  // a Create Scene can land in, and the snapshot must not be loaded over whatever world that put in.
   const key = currentSceneKey();
   const world = getCurrentWorld();
   let restored = false;
-  const where = isGuid(source) ? (resolveRef(source) || source) : source;
-  // A copy: the editor cache keeps what it is handed, and this entry replays `prefab` again on the next redo/undo.
-  const rebuildOpts = {
+  await restorePrefabsInMemory([
+    { source, doc: prefab, from: expected },
+    ...others.map((o) => ({ source: o.source, doc: o.doc, from: o.expected })),
+  ], {
     // The reload below rebases what it carries itself.
     rebase: false,
     rebuild: async () => {
-      if (repairFrom && prefab.id) {
-        // The live records of each template reference node's moves go back as the apply re-pointed them (#1564): the world
-        // swap below CARRIES a base root (a Persistent one only in Play, #1863) with its record whole, and the rebase then rebuilds it against
-        // `prefab` — with the apply's paths, which name nothing there. Before the await, as the apply does it before its
-        // refresh: nothing that rebuilds in the meantime can read the old paths.
-        const id = prefab.id;
-        const read = (doc: PrefabFile) => (g: string) => (g === id ? doc : getCachedPrefabSync(g));
-        rewriteNodeMoves(getCurrentWorld(), (moved, src) => rewriteFrameMoves(moved, src, read(repairFrom), read(prefab)));
-        // Inside the step, and before the reload below: the snapshot re-expands every prefab this rewrites from the editor
-        // cache, which the adopt seats (#1751) — and the live world after this undo is that snapshot, so its files' records
-        // follow the rewrite. Only while it is still THAT world, asked once the route has returned, by the same test as
-        // the check below (close-out review): a world that replaced it was loaded from the pre-repair bytes.
-        const repaired = await repairMemberPathsEverywhere(prefab.id, repairFrom, {
-          liveWorldRepaired: () => currentSceneKey() === key && getCurrentWorld() === world && !isSceneLoadSwapping() && sceneManager.getNext() === null,
-        });
-        // A post-write miss is a shortfall of this step (#1823), now with the route's reason (#1824).
-        if ('error' in repaired) reportUndoFailure({ direction, label, detail: `member refs in other files were not repaired: ${repaired.error}` });
-      }
       // Still THAT world? An Exit swaps a real scene in under the edit world's undo (#1573 close-out re-review), where
       // loading the synthetic world would leave it under a real path for `saveScene` to write into that file. Every
       // untitled world shares the key `null`, so a Create Scene there is told apart by the world itself (#1575). The
@@ -127,19 +92,17 @@ async function restoreSnapshot(
       // route that swaps through `sceneManager` directly. `isSceneLoadSwapping`, not `isSceneLoadInFlight`: the latter
       // also counts a load still WAITING for this very step, and skipping on it recreated the window #1579 closed.
       if (currentSceneKey() !== key || getCurrentWorld() !== world || isSceneLoadSwapping() || sceneManager.getNext() !== null) {
-        console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} is no longer the live world; restored the prefab file only`);
+        console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} is no longer the live world; restored the prefab only`);
         return;
       }
-      // The world call is one pending adoption (#1698) — registered only around it, AFTER the prefab file write (this is
-      // the write's rebuild step), so a prefab write that waits for adoptions to settle cannot wait on this step's own. Its
-      // world is adopted only while it is still the one on screen; otherwise the switch that replaced it adopts its own,
-      // and this step restored the file only.
+      // The world call is one pending adoption (#1698). Its world is adopted only while it is still the one on screen;
+      // otherwise the switch that replaced it adopts its own, and this step restored the prefab only.
       const adopted = await withAdoption('prefab-undo-restore', async (adoption) => {
         if (key === null) {
           // An untitled world: reloaded under '' as Stop reloads it (`restoreAuthoredSnapshot`) — no file is read and none
-          // is marked loaded, and the editor's scene path stays null, so Save still asks where. Not saved: there is no
-          // file, and the undo itself dirties the scene. Not rebuilt through `replaceWorldContent`, whose populate is
-          // synchronous and cannot instantiate a prefab (#1575). A restore under the same key: it writes nothing.
+          // is marked loaded, and the editor's scene path stays null, so Save still asks where. Not rebuilt through
+          // `replaceWorldContent`, whose populate is synchronous and cannot instantiate a prefab (#1575). A restore under
+          // the same key: it writes nothing.
           const { world: w } = await sceneManager.loadScene('', { preloaded: clone(scene) });
           return adoption.restored(w);
         }
@@ -147,8 +110,8 @@ async function restoreSnapshot(
           // The prefab-edit world has no scene file, so before #1573 the world stayed built from the applied document. It
           // is a scene loaded at a synthetic path, so the same snapshot restores it — with the live guids every other undo
           // entry addresses its entities by, which a rebuild from the edited prefab's document would re-mint (review of
-          // the first #1573 fix). Not saved, and no scene path set: the apply never wrote the edited prefab, and that world
-          // reaches its file through Save alone. A restore under the same key: it writes nothing, the edit session included.
+          // the first #1573 fix). No scene path set: that world reaches its file through Save alone. A restore under the
+          // same key: it writes nothing, the edit session included.
           const { world: w } = await sceneManager.loadScene(key, { preloaded: clone(scene) });
           return adoption.restored(w);
         }
@@ -159,76 +122,19 @@ async function restoreSnapshot(
         return adoption.offer({ world: w, path: key, baseScene: 'loaded' });
       });
       if (!adopted) {
-        console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} was replaced while it was restored; restored the prefab file only`);
+        console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} was replaced while it was restored; restored the prefab only`);
         return;
       }
       restored = true;
-      // The load CARRIES kept base roots flat (a `Persistent` one only in Play, #1863), still built from the document being undone; rebuild them against the one
-      // just restored before anything captures them — the save below included (#1483 review 3).
+      // The load CARRIES kept base roots flat (a `Persistent` one only in Play, #1863), still built from the document being
+      // undone; rebuild them against the one just restored before anything captures them (#1483 review 3).
       await rebaseStaleInstances();
-      // A scene file, when the Apply saved it: only over what the editor last wrote there (#1695).
-      if (sceneWasSaved && key !== null && !key.startsWith(PREFAB_EDIT_SCENE_PREFIX)) await saveSceneOverOtherHalf(key, label, direction);
     },
-  };
-  const committed = others.length
-    ? await commitPrefabWrites([
-      { source, doc: clone(prefab), expected },
-      ...others.map((o) => ({ source: o.source, doc: clone(o.doc), expected: o.expected })),
-    ], rebuildOpts)
-    : await commitPrefabWrite(source, clone(prefab), { expected, ...rebuildOpts });
-  if (!committed.ok) {
-    // Several files (#1732): the one that refused is named, not `source` — after a [P, O] Apply an outside edit of O was
-    // reported as P, the file that did NOT change — and so is any the rollback could not put back.
-    const failed = ('failed' in committed && committed.failed) || where;
-    const stranded = 'stranded' in committed ? committed.stranded ?? [] : [];
-    const tail = stranded.length
-      ? ` ${stranded.join(' and ')} ${stranded.length === 1 ? 'was' : 'were'} written and could not be put back, so it holds this ${direction.toLowerCase()}'s side on disk while the editor still shows the other: reopen the scene to pick that up.`
-      : '';
-    throw committed.conflict
-      ? new UndoRefusedError(
-        `${failed} changed on disk since the Apply (a later save of the prefab, another Apply, or an outside edit), so it was left as it is rather than overwritten.${tail}`,
-        stranded.length ? `a prefab changed on disk since the Apply, and another could not be put back (see console)` : `the prefab changed on disk since the Apply, and was left as it is`,
-      )
-      : new UndoRefusedError(
-        `${failed} could not be written${committed.error ? ` (${committed.error})` : ''}, so ${tail ? `the ${direction.toLowerCase()} did not land.${tail}` : 'the prefab and the scene were left as they are.'}`,
-        `the prefab file could not be written (see console)`,
-      );
-  }
-  // The world was replaced during the write (a swap that bypassed the #1579 barrier): the rebuild did not run, but the
-  // files on disk were repaired for the apply's paths and must follow the prefab that is on disk now.
-  // No live world is known to hold this repair (the one here now was loaded from the files before it), so no record of a
-  // live file moves, and every rewritten scene's stack is marked stale as the watcher would (#1751).
-  if (committed.worldLeft && repairFrom && prefab.id) {
-    const repaired = await repairMemberPathsEverywhere(prefab.id, repairFrom, { liveWorldRepaired: false });
-    if ('error' in repaired) reportUndoFailure({ direction, label, detail: `member refs in other files were not repaired: ${repaired.error}` });
-  }
+  });
   if (!restored) return false;
   const id = selGuid ? entityIdForGuid(selGuid) : 0;
   useEditorStore.getState().selectEntity(id || null);
   return true;
-}
-
-/** Save the restored scene only over what the editor last wrote there (#1695). A refusal leaves the file alone and the
- *  restored world unsaved — the world has already followed the step, so it is reported (#308), not thrown. */
-async function saveSceneOverOtherHalf(path: string, label: string, direction: 'Undo' | 'Redo'): Promise<void> {
-  const bytes = lastWrittenSceneBytes(path);
-  if (bytes === undefined) {
-    reportUndoFailure({ direction, label, detail: `${path} was not saved: the editor has no record of what it last wrote there, so it cannot tell an outside change from its own. The scene is restored in the editor and unsaved.` });
-    return;
-  }
-  let ifMatch: string;
-  try { ifMatch = await sha256OfWritten(bytes); } catch (e) {
-    reportUndoFailure({ direction, label, detail: `${path} was not saved: the bytes it should hold could not be hashed (${e instanceof Error ? e.message : String(e)}). The scene is restored and unsaved.` });
-    return;
-  }
-  const saved = await saveScene({ ifMatch, allowDialog: false });
-  if (saved.saved) return;
-  reportUndoFailure({
-    direction, label, userFixable: saved.reason === 'conflict',
-    detail: saved.reason === 'conflict'
-      ? `${path} changed on disk since the editor last saved it (an outside edit, a scene tool, a git pull), so it was not overwritten. The scene is restored in the editor and unsaved; saving it will replace that change with this state.`
-      : `${path} was not saved (${saved.error ? `${saved.reason}: ${saved.error}` : saved.reason}). The scene is restored in the editor and unsaved.`,
-  });
 }
 
 /** A BASE scene's instance, as it stood on one side of the apply (#1431). `restoreSnapshot` rebuilds
@@ -302,7 +208,7 @@ export async function rederiveBaseInstances(
   if (id) useEditorStore.getState().selectEntity(id);
 }
 
-const worldLeft = () => new Error('the scene changed while it ran, so only the prefab file was restored — the instances were not');
+const worldLeft = () => new Error('the scene changed while it ran, so only the prefab was restored — the instances were not');
 
 function makeApplyPrefabAction(opts: {
   source: string;
@@ -311,18 +217,14 @@ function makeApplyPrefabAction(opts: {
   sceneBefore: SceneData;
   sceneAfter: SceneData;
   selGuid: string;
-  memberPathsChanged?: boolean;
   affectedScenes: string[];
   baseBefore: BaseInstanceSide | null;
   baseAfter: BaseInstanceSide | null;
-  /** The forward Apply saved the scene (a promotion) — see {@link saveSceneOverOtherHalf}. */
-  sceneSaved: boolean;
   /** Every OTHER prefab file the Apply wrote, with its two sides (#1693). */
   others: readonly { source: string; before: PrefabFile; after: PrefabFile }[];
   /** Every prefab file the Apply wrote, innermost first (`ApplyResult.writes`) — the order the base re-derive runs in. */
   writes: readonly { source: string; before: PrefabFile; after: PrefabFile }[];
 }): UndoAction {
-  const paths = opts.memberPathsChanged;
   const label = 'Apply to Prefab';
   return {
     label,
@@ -335,12 +237,12 @@ function makeApplyPrefabAction(opts: {
     // (#310), rather than pushing it to the other stack as if the world had followed.
     undo: async () => {
       const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
-      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, paths ? opts.prefabAfter : undefined, label, 'Undo', opts.sceneSaved, others)) throw worldLeft();
+      if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, others)) throw worldLeft();
       await rederiveBaseInstances(opts.writes.map((w) => ({ source: w.source, from: w.after, to: w.before })), opts.baseBefore, 'Undo');
     },
     redo: async () => {
       const others = opts.others.map((o) => ({ source: o.source, doc: o.after, expected: o.before }));
-      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, paths ? opts.prefabBefore : undefined, label, 'Redo', opts.sceneSaved, others)) throw worldLeft();
+      if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, others)) throw worldLeft();
       await rederiveBaseInstances(opts.writes.map((w) => ({ source: w.source, from: w.before, to: w.after })), opts.baseAfter, 'Redo');
     },
   };
@@ -349,8 +251,7 @@ function makeApplyPrefabAction(opts: {
 const NOT_APPLIED = { promotedAdditions: 0, applied: false } as const;
 
 /** Apply the selected overrides to the prefab AND record one undo entry.
- *  Captures the scene snapshot before the mutation, applies, persists the scene when a
- *  promotion restructured it, captures the after snapshot, and pushes the action. */
+ *  Captures the scene snapshot before the mutation, applies, captures the after snapshot, and pushes the action. */
 export async function applyToPrefabWithUndo(
   rootInstanceId: number,
   selectedKeys: Set<string>,
@@ -390,7 +291,6 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   const sameInstance = captureEntityIdentity(rootInstanceId);
   const settling = adoptionsSettled();
   if (settling) await settling;
-  const scenePath = getCurrentScenePath();
   // assignGuids so every entity (incl. the selection) has a stable guid the snapshot
   // and selection-restore can key on.
   const sceneBefore = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
@@ -404,7 +304,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   })();
 
   // A BASE scene's instance (#1431): the apply rebuilds it and consumes its overrides/additions into
-  // the prefab, so the base's file is stale too — and `saveScene` below writes only the primary.
+  // the prefab, so the base's file is stale too.
   // Carried as the action's `affectedScenes`, so push, undo and redo each dirty the base for Save All.
   // Read BEFORE the apply: it tears the instance down.
   const affectedScenes = resolveAffectedScenes([rootInstanceId]);
@@ -426,10 +326,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     return result; // no-op apply — nothing to undo
   }
 
-  // A promotion deletes the live "added" entity and restructures the scene — persist
-  // it (mirrors the dialog's old behavior) so the AFTER snapshot matches disk.
-  const sceneSaved = result.promotedAdditions > 0 && scenePath ? await saveScene() : null;
-
+  // No scene save, a promotion's included (#1868): Unity's Apply never saves the scene, and the entry below dirties it.
   const sceneAfter = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
   // Every file the Apply wrote, innermost first; the primary's only when the plural list is absent.
   const writes = result.writes ?? [{ source: result.source, before: result.prefabBefore, after: result.prefabAfter }];
@@ -447,11 +344,9 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     sceneBefore,
     sceneAfter,
     selGuid,
-    memberPathsChanged: result.memberPathsChanged,
     affectedScenes,
     baseBefore: baseBefore && liveAfter ? { ...baseBefore, prefab: own?.before ?? baseBefore.prefab } : null,
     baseAfter,
-    sceneSaved: !!sceneSaved?.saved,
     // Every file but the one `result.source` names (writes are innermost first, and a U14 Apply's frame file is not).
     others: writes.filter((w) => w.source !== result.source),
     writes,
