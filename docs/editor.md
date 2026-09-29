@@ -2554,14 +2554,20 @@ contracts are `writeAssetFile → {ok:true} | {ok:false, error, options?}` and
 `writeAssetFileGuarded → {result:'ok'} | {result:'conflict', error} | {result:'failed', error, options?}`.
 ⚠️ **The old contract was a boolean, and an object is always truthy** — a caller still spelling
 `if (!await writeAssetFile(...))` would read every failure as success, so it was converted at every
-site and `npm run typecheck` is what holds it. Each caller STATES the reason where it already
+site. **`npm run typecheck` does NOT hold that** (an earlier version of this paragraph said it did):
+`tsc --strict` accepts a truthiness test of an awaited object, and no lint rule here flags it. The
+conversion was checked by grep, and every current call reads `.ok`/`.result`. A future boolean →
+outcome change renames the function instead ([refusal-reporting.md](./refusal-reporting.md) § "Gotchas
+for the fix"). Each caller STATES the reason where it already
 reported a failure: the scene save (`SaveResult.error` → the save toast, the agent's `save-all`
 refusal, Apply's undo report), the other-scene saves, the asset delete-undo and import-redo reports,
 the dropped-file import, the model import's abort toast, the take recorder, sling's save toast and
 undo refusal. The raw writers (`createAssetDocument`, the texture write, `convertToGLB`) read it too,
 `create_registered_asset` stopped guessing one, and the five New-asset panels toast
-`newAssetRefusalText` instead of returning silently. Still open: an asset undo that reports a
-shortfall without throwing reaches an agent's `undo` as `did:true` (#1823).
+`newAssetRefusalText` instead of returning silently. Still open, and designed in
+[refusal-reporting.md](./refusal-reporting.md): every OTHER route's wrapper still drops the reason
+(#1824), and an asset undo that reports a shortfall without throwing reaches an agent's `undo` as
+`did:true` (#1823).
 
 `AtlasAssetView` is not on this seam at all — since #831 it parks an object through
 `/api/asset-write` and the server produces the bytes, same as the debounced asset-editor
@@ -3864,7 +3870,9 @@ bookkeeping** (see below), so a throw is now survivable — but the entry is sti
 throw still costs the user their way back. The bar is unchanged, and is #291's — report, let the
 stack pop, keep editor state consistent with disk:
 
-- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. `console.error` naming the
+- **`reportUndoFailure`** (`undo/undoFailure.ts`) is the one reporter. (What it does NOT do yet is reach
+  the step's result, so an agent's `undo` reads `did:true`: #1823, designed in
+  [refusal-reporting.md](./refusal-reporting.md) as Owner B.) `console.error` naming the
   direction, the action's label and the paths, always. That log is the user's only hand-recovery
   path, which is why it names paths rather than saying "the operation failed".
 - **A toast on top, for a collision only.** `/api/move-file` never clobbers: it answers **409
