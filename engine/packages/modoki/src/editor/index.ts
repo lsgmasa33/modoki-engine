@@ -96,7 +96,7 @@ export {
 export { capturePrefabRead, StalePrefabRead } from './scene/prefabRead';
 export { existingAssetPath } from './scene/createAssetDocument';
 export { describeEffect, type KeyEffect, type EditEffect, type ApplyConflict } from './scene/prefabApplyEffects';
-export { commitPrefabWrite, commitPrefabWrites, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
+export { commitPrefabWrite, commitPrefabWrites, prefabTextIsDocument, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
 // Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
 // the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`
 // agent op both build their checkbox/discovery list from this ONE walk, so they cannot
@@ -195,7 +195,7 @@ export {
 // #889 — the Clean Up dialog's staleness DECISION, exported for its unit test. The dialog itself
 // is .tsx; the decision is a plain module so it is assertable without a jsdom mount
 // (docs/editor.md § Panels).
-export { readUnusedStaleness, readPriorDocument, type UnusedStaleness } from './panels/assetOps';
+export { readUnusedStaleness, readPriorDocument, createdFrameRebuiltRefusal, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

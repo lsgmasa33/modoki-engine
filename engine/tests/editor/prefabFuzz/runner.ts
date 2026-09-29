@@ -5,13 +5,15 @@ import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/edito
 import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefab';
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
-import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, type Fixture } from './harness';
+import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
 import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory, type Tolerate } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import path from 'path';
+import { prefabTextIsDocument } from '../../../packages/modoki/src/editor/scene/prefabCommit';
+import type { PrefabFile } from '../../../packages/modoki/src/editor/scene/prefab';
 
 /** `MODOKI_PREFAB_FUZZ_DUMP=<dir>`: write every compared state there, for reading a finding by hand. */
 function dump(name: string, value: unknown): void {
@@ -45,7 +47,59 @@ async function setupNest(f: Fixture): Promise<void> {
   if (!id) throw new Error('harness: could not nest Q under H1');
 }
 
-interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: string | null }
+/** Why a segment is TAINTED: a CLOSED list, each a mechanism that legitimately takes the segment out of reach of the
+ *  undo stack, so the walk to its start can no longer be held to the bytes (#1845). A taint is what turns the undo-to-start
+ *  and redo-to-end identities and the clean-segment refusal checks OFF for the rest of the segment, so an unnamed one is
+ *  exactly how #1840 made those checks vacuous on Windows for a day: every editor write read as an outside edit. Anything
+ *  that would taint for another reason FAILS the step instead ("unexpected outside write"), and every taint and every
+ *  check it skipped is counted (`taintCounts`, `skippedChecks`), so two platforms' hunts can be compared.
+ *  - `outsideEdit`: an `outsideEdit` op wrote a prefab file outside the editor (a hand edit, a pull). The simulated
+ *    watcher raises it and the editor reloads; the scene's undo entries recorded against that file refuse by design (I10:
+ *    each is conditional on the bytes it wrote), and nothing on the stack can put the outside bytes back. This is the ONE
+ *    cause a watcher raise may have, and only for the paths the op itself changed.
+ *  - `prefabEditSave`: a prefab edit wrote its prefab. That save is made in the EDIT world, on its own stack, which leaving
+ *    prefab edit drops (U27, #1704), so the scene's stack cannot undo it; and the scene entries recorded against the file
+ *    (Create Prefab's redo, an Apply's undo) refuse after it by the same I10 rule. It is the editor's OWN write, so it is
+ *    marked and never raised by the watcher since #1840: the taint comes from the save itself, not from a reload.
+ *  - `rulingR`: a world swap expanded as a Missing Prefab placeholder something the stack's entries were recorded against
+ *    (owner ruling R, #1819, 2026-09-29): an undo against it refuses and is dropped, by design. Or the swap left a NESTED
+ *    frame of a missing prefab unexpanded (#1790 ruling D: the loader records the row and spawns nothing under it), so
+ *    the entities the stack recorded inside it are gone rather than placeholders: `require` refuses them the same way
+ *    ("is no longer in the scene"), and it is the same ruling (#1849; work-ai3 hunt seeds 6191, 6356).
+ *  - `renameCollision`: a Rename's undo or redo found its destination held by a document a Create Prefab wrote. Create
+ *    Prefab's undo LEAVES its file (#1795, hub ruling (i), Unity), so a prefab created at the name a rename freed still
+ *    holds that path when the rename is undone; the step REFUSES, naming the taken path, and moves nothing
+ *    (`makeRenameUndo`, 409, `destinationTakenRefusal`), so the walk cannot restore the rename (hunt seed 6029). Only
+ *    when the destination holds a create's document: a collision with anything else is not this cause, and fails as the
+ *    refusal in a clean segment it is. */
+export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'renameCollision';
+
+/** A Rename step's collision refusal (`makeRenameUndo`'s `destinationTakenRefusal`): group 1 is the destination. */
+const RENAME_COLLISION = /^\[undo\] (?:Undo|Redo) of "Rename [^"]*" was REFUSED — .* was not moved: another file now holds "([^"]+)"/;
+/** Whether one of `lines` is a Rename collision whose destination holds a document a Create Prefab wrote (`created`). */
+export function collidedWithCreated(lines: readonly string[], be: Pick<FuzzBackend, 'snapshot'>, created: readonly string[]): boolean {
+  const files = be.snapshot();
+  return lines.some((l) => {
+    const dest = RENAME_COLLISION.exec(l)?.[1];
+    const text = dest ? files.get(dest) : undefined;
+    return text !== undefined && created.some((made) => prefabTextIsDocument(text, JSON.parse(made) as PrefabFile));
+  });
+}
+
+interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: TaintCause | null }
+
+/** Across the process, per cause: how many ops tainted a segment, and how many checks a taint turned off (keyed
+ *  `<cause>: <check>`, attributed to the segment's FIRST cause). The hunt prints both. */
+export const taintCounts = new Map<TaintCause, number>();
+export const skippedChecks = new Map<string, number>();
+const skipped = (seg: Segment, check: string) => {
+  const k = `${seg.tainted}: ${check}`;
+  skippedChecks.set(k, (skippedChecks.get(k) ?? 0) + 1);
+};
+function taint(seg: Segment, cause: TaintCause): void {
+  taintCounts.set(cause, (taintCounts.get(cause) ?? 0) + 1);
+  seg.tainted ??= cause;
+}
 
 const prefabBytes = (be: FuzzBackend) => new Map([...be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')));
 
@@ -57,10 +111,16 @@ async function segmentHere(be: FuzzBackend): Promise<Segment> {
  *  `nextLocalId` splices it into the bytes and claims v8 in place (#1774, docs/prefabs.md § "The localId high-water
  *  mark"), so an undo cannot give back the exact bytes by design. Those two fields are set aside; everything else,
  *  formatting included, must match. */
-function diffFiles(a: Map<string, string>, b: Map<string, string>): string | null {
+export function diffFiles(a: Map<string, string>, b: Map<string, string>, created?: readonly string[]): string | null {
   const markFree = (t: string) => { const d = JSON.parse(t) as Record<string, unknown>; delete d.nextLocalId; delete d.version; return d; };
   for (const p of new Set([...a.keys(), ...b.keys()])) {
     if (a.get(p) === b.get(p)) continue;
+    // A file a Create Prefab made, still there at the segment's start: its undo LEAVES the file (#1795, hub ruling (i),
+    // Unity). Only while it holds what a create wrote (the bytes, or the same document under a raised #1774 mark) — a
+    // leftover with any other content is a wrong write under a right path, and still a finding (hub review). Matched by
+    // DOCUMENT, at any path: a Rename of the new prefab moves it, and the move is not undone by the create's undo (hunt
+    // seed 6029, minimized).
+    if (a.get(p) === undefined && created?.some((made) => prefabTextIsDocument(b.get(p)!, JSON.parse(made) as PrefabFile))) continue;
     if (a.get(p) === undefined || b.get(p) === undefined) return `${p}: ${a.has(p) ? 'present' : 'absent'} vs ${b.has(p) ? 'present' : 'absent'}`;
     const d = firstDiff(markFree(a.get(p)!), markFree(b.get(p)!));
     if (d) return `${p}: ${d}`;
@@ -70,36 +130,44 @@ function diffFiles(a: Map<string, string>, b: Map<string, string>): string | nul
 
 /** Undo to the segment's start and compare, then redo to the end and compare. Only a segment nothing outside the
  *  undo stack has touched (an outside edit, a prefab-edit save, a watcher reload) is held to the bytes. */
-async function undoIdentity(be: FuzzBackend, seg: Segment, tolerate: Tolerate): Promise<Failure | null> {
+async function undoIdentity(be: FuzzBackend, seg: Segment, tolerate: Tolerate, created: readonly string[]): Promise<Failure | null> {
   const canon = (scene: unknown) => canonScene(scene, placeholderGuids(), !!tolerate.nodeOrder);
   if (editing()) return null;
   const end = { scene: await serializeScene(), prefabs: prefabBytes(be) };
   let steps = 0;
+  const collided = () => { if (!seg.tainted && collidedWithCreated(consoleErrors, be, created)) taint(seg, 'renameCollision'); };
   for (; steps < 400; steps++) {
     const r = await undoStep('undo');
     await settle();
+    collided();
     if (r.failed && !r.failed.refused) return { check: 'undo threw', detail: `${r.failed.label}: ${r.failed.error}` };
     if (r.refused || r.failed) {
-      if (seg.tainted) return null;
+      if (seg.tainted) { skipped(seg, 'undo refusal forgiven (rest of the walk not run)'); return null; }
       return { check: 'undo refused in a clean segment', detail: String(r.refused ?? r.failed!.error) };
     }
     if (!r.did) break;
   }
+  if (seg.tainted) skipped(seg, 'undo to the start identity');
   if (!seg.tainted) {
     const back = await serializeScene();
     dump('undo-start', seg.scene); dump('undo-back', back);
     const [ca, cb] = [canon(seg.scene), canon(back)];
     const d = firstDiff(ca, cb);
     if (d) return { check: 'undo to the start does not restore the scene', detail: d, moved: nodeMoved(d, ca, cb) };
-    const fd = diffFiles(seg.prefabs, prefabBytes(be));
+    const fd = diffFiles(seg.prefabs, prefabBytes(be), created);
     if (fd) return { check: 'undo to the start does not restore the prefab files', detail: fd };
   }
   for (let i = 0; i < steps; i++) {
     const r = await undoStep('redo');
     await settle();
+    collided();
     if (r.failed && !r.failed.refused) return { check: 'redo threw', detail: `${r.failed.label}: ${r.failed.error}` };
-    if (r.refused || r.failed) return seg.tainted ? null : { check: 'redo refused in a clean segment', detail: String(r.refused ?? r.failed!.error) };
+    if (r.refused || r.failed) {
+      if (seg.tainted) { skipped(seg, 'redo refusal forgiven (rest of the walk not run)'); return null; }
+      return { check: 'redo refused in a clean segment', detail: String(r.refused ?? r.failed!.error) };
+    }
   }
+  if (seg.tainted) skipped(seg, 'redo to the end identity');
   if (!seg.tainted) {
     const again = await serializeScene();
     dump('redo-end', end.scene); dump('redo-again', again);
@@ -120,7 +188,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   const trace: string[] = [];
   consoleErrors.length = 0;
   const f = await startRun(be, setupNest, JSON.stringify(ops));
-  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, prefabBytes: new Map() };
+  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, prefabBytes: new Map(), created: [] };
   for (const [p, t] of be.snapshot()) if (p.endsWith('.prefab.json')) st.prefabBytes!.set(p, t);
   const history: LocalIdHistory = new Map();
   /** Every file content the run has had, at any path: a write of one of these is a verbatim carry (an undo's restore, a
@@ -143,6 +211,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     const label = i < ops.length ? describeOp(op) : 'final save→reload';
     const before = be.snapshot();
     const placeholdersBefore = editing() ? new Set<string>() : placeholderGuids();
+    const unexpandedBefore = editing() ? new Set<string>() : unexpandedRows();
     const worldBefore = getCurrentWorld();
     st.note = undefined;
     st.roundTrip = undefined;
@@ -158,10 +227,21 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     }
     let raised: string[];
     try { raised = await flushWatcher(be, before); } catch (e) { return fail(i, label, { check: 'watcher reload threw', detail: String(e) }); }
+    // A watcher raise has ONE legitimate cause: an outside edit, of the paths that op itself wrote (#1845). Anything else
+    // is a write the router did not mark as the editor's own — the #1840 class (a mark keyed by a string the watcher's
+    // lookup never builds) — and it would taint the segment and silently turn the undo checks off. It fails here instead.
+    const opWrote = op.kind === 'outsideEdit' ? new Set([...be.snapshot()].filter(([p, t]) => before.get(p) !== t).map(([p]) => p)) : new Set<string>();
+    const unexpected = raised.filter((p) => !opWrote.has(p));
+    if (unexpected.length) {
+      return fail(i, label, { check: 'unexpected outside write', detail: `${unexpected[0]} after op ${i} (${label}): the watcher raised a write that no outside edit made${unexpected.length > 1 ? ` (+${unexpected.length - 1} more)` : ''}` });
+    }
     opOutcomes.set(`${op.kind}:${outcome}`, (opOutcomes.get(`${op.kind}:${outcome}`) ?? 0) + 1);
     trace.push(`${i}: ${label} → ${outcome}${st.note ? ` (${st.note})` : ''}${raised.length ? ` [watcher: ${raised.join(', ')}]` : ''}`);
 
-    const errors = consoleErrors.splice(0).filter((m, k, all) => !opts.expectedError(m, all[k - 1]));
+    const logged = consoleErrors.splice(0);
+    // Before the clean-segment refusal check below: the collision IS the refusal that check would report.
+    if (collidedWithCreated(logged, be, st.created!)) taint(seg, 'renameCollision');
+    const errors = logged.filter((m, k, all) => !opts.expectedError(m, all[k - 1]));
     if (errors.length) return fail(i, label, { check: 'console.error', detail: errors[0].slice(0, 300) });
 
     const after = be.snapshot();
@@ -189,12 +269,13 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (!editing()) {
       try { failures.push(...checkScene(await serializeScene(), placeholderGuids(), tolerate)); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
     }
-    if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused' && !seg.tainted) {
-      failures.push({ check: `${op.kind} refused in a clean segment`, detail: st.note ?? '' });
+    if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {
+      if (seg.tainted) skipped(seg, `${op.kind} op refusal forgiven`);
+      else failures.push({ check: `${op.kind} refused in a clean segment`, detail: st.note ?? '' });
     }
     if (failures.length) return fail(i, label, failures[0]);
 
-    if (op.kind === 'outsideEdit' && outcome === 'done') seg.tainted = 'an outside edit';
+    if (op.kind === 'outsideEdit' && outcome === 'done') taint(seg, 'outsideEdit');
     // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
     // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
     // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap:
@@ -202,9 +283,9 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // reference is missing) changes no recorded entity's kind, and tainting there would hide a false refusal for the
     // rest of the segment (#1819 close-out review). The per-step I6/I7 checks run either way.
     const swapped = getCurrentWorld() !== worldBefore;
-    if (swapped && [...placeholderGuids()].some((g) => !placeholdersBefore.has(g))) seg.tainted = 'a world swap expanded a Missing Prefab placeholder (ruling R)';
-    if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) seg.tainted = 'a prefab edit save';
-    if (raised.length) seg.tainted = `a watcher reload (${raised.join(', ')})`;
+    if (swapped && ([...placeholderGuids()].some((g) => !placeholdersBefore.has(g)) || [...unexpandedRows()].some((k) => !unexpandedBefore.has(k)))) taint(seg, 'rulingR');
+    if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) taint(seg, 'prefabEditSave');
+    // A raise got here only as the outside edit's own (checked above), which tainted the segment as `outsideEdit`.
     // The stack was reset (a reload, a scene open): a new segment starts here.
     if (op.kind !== 'undo' && undoDepth() === 0 && !canRedo()) seg = await segmentHere(be);
   }
@@ -212,7 +293,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   // logs, and the world and files it leaves (review: errors logged there were never read).
   const walkStep = all.length;
   const walkBefore = be.snapshot();
-  const u = await undoIdentity(be, seg, tolerate);
+  const u = await undoIdentity(be, seg, tolerate, st.created!);
   if (u) return fail(walkStep, 'undo/redo to the ends', { ...u, console: [...consoleErrors] });
   const walkErrors = consoleErrors.splice(0).filter((m, k, list) => !opts.expectedError(m, list[k - 1]));
   if (walkErrors.length) return fail(walkStep, 'undo/redo to the ends', { check: 'console.error', detail: walkErrors[0].slice(0, 300) });

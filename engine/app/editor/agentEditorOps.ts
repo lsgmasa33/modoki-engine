@@ -50,7 +50,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, readPriorDocument, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
@@ -75,7 +75,7 @@ import {
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
-  reportUndoFailure, isUndoStepInFlight, beginForwardEdit,
+  reportUndoFailure, UndoRefusedError, fileChangedRefusal, isUndoStepInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
 import { recordsUndo, stepRunningRefusal } from './agentOpUndoClass';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -3164,9 +3164,13 @@ export function registerEditorAgentOps(): void {
       // so every sync reader treats this instance as "not a prefab" and drops it silently.
       let rootId: number;
       try {
-        rootId = await instantiatePrefabInstance(prefab as PrefabFile, path, parentId, readAt);
+        // The parent by guid, resolved after the instantiate's own awaits (#1793 review): a world rebuilt during them
+        // re-numbers the raw id.
+        rootId = await instantiatePrefabInstance(prefab as PrefabFile, path, parentRef ? () => parentRef.require() : 0, readAt);
       } catch (e) {
         if (e instanceof StalePrefabRead) throw new OpRefusal('REFUSED_BY_OP', `prefab instantiate refused: ${e.message}`);
+        // The parent is gone or a Missing Prefab placeholder now (ref.require), or not live (#1793): refused, said.
+        if (e instanceof UndoRefusedError) throw new OpRefusal('REFUSED_BY_OP', `prefab instantiate refused: ${e.message}`);
         throw e;
       }
       setSelectionRaw(rootId, [rootId]);
@@ -3178,7 +3182,7 @@ export function registerEditorAgentOps(): void {
           const again = await getPrefabSource(path);
           if (!again) return null;
           // Required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses the redo.
-          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? parentRef.require() : 0, readAgain);
+          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? () => parentRef.require() : 0, readAgain);
           return id;
         },
         remove: (id) => { deleteEntity(id); },
@@ -3346,7 +3350,9 @@ export function registerEditorAgentOps(): void {
             // Its target is the instance root this op tagged (I20): after a world swap it can be gone, or a Missing Prefab
             // placeholder (the prefab trashed and the scene reloaded), and untagging and relinking one reached into a
             // tree that is not the one tagged. `require` refuses both before anything changes (#1795's agent twin).
-            const id = ref.require({ check: isInstanceRootCheck });
+            // …and still the tree this op tagged: a prefab-edit save or an outside edit since rebased it onto the file's new
+            // document, and unlinking it would keep that change as plain entities (#1795 review, the human undo's check).
+            const id = ref.require({ check: (x) => isInstanceRootCheck(x) ?? createdFrameRebuiltRefusal(x, prefab, landedPath) });
             // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
             // snapshotted one line before the tag and addresses each member by the guid it held then,
             // so reattaching ahead of this would resolve nothing (#1461).
@@ -3360,13 +3366,23 @@ export function registerEditorAgentOps(): void {
             if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${unresolved} prior prefab link(s) could not be put back — no longer addressable` });
           },
           redo: async () => {
-            const id = ref.require(); // I19: a target that is gone refuses, rather than reading as done
+            ref.require(); // I19: a target that is gone refuses, rather than reading as done
+            // The file must still hold the document it re-links to, as the human redo asks (#1795 review): after a
+            // prefab-edit save or an outside edit, the tag would plan the tree against rows the file no longer holds
+            // (I10), and after a delete it would link a file that is not there. Read where its guid lives now (a Rename
+            // moves it). This op writes no file on undo or redo, so an absent file refuses too.
+            const at = (prefab.id ? resolveRef(prefab.id) : undefined) ?? landedPath;
+            const onDisk = await readPriorDocument(at);
+            if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });
+            if (onDisk === undefined || !prefabTextIsDocument(onDisk, prefab)) throw fileChangedRefusal([at]);
+            // I9, as the human redo: the key an eviction since the undo left cold is seated with the document the file holds.
+            if (prefab.id && !isEditorPrefabCached(prefab.id)) primeEditorPrefabCache(prefab.id, prefab);
             // tagEntityTreeAsInstance re-runs planPrefabRows, the FLATTEN reader (#1284): cold,
             // the re-planned rows drop the nested instance, planMatchesFile then disagrees with
             // the file written warm, and the redo tags nothing at all.
-            await preloadNestedPrefabsForSubtree(id);
-            const after = ref.require(); // asked again: the await above can span a world swap
-            ({ guidRemap, undoKept } = tagCreatedPrefab(after, landedPath, prefab)); // undo reverses THIS run's rename
+            await preloadNestedPrefabsForSubtree(ref.require()); // asked again: the read above can span a world swap
+            const after = ref.require(); // …and the await above too
+            ({ guidRemap, undoKept } = tagCreatedPrefab(after, at, prefab)); // undo reverses THIS run's rename
 
           },
         });

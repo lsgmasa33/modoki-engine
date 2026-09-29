@@ -408,6 +408,23 @@ async function trashCopies(
   return { trashed: copies.filter((p) => !failed.has(p)) };
 }
 
+/** A single rename's move found its destination TAKEN (409): refused, naming the path, before anything moved (#1795, hub
+ *  review). Create Prefab's undo keeps its file (ruling (i), Unity), so a prefab made at the name a rename freed now
+ *  holds that path when the rename is undone; any file made there since does the same. It was a report that kept the
+ *  entry, so the next redo tried the OTHER file's path; a refusal drops the entry (#310), never overwrites, and says
+ *  which file is in the way. A multi-file move (a paste, a drop) keeps its per-file report: partial progress there is
+ *  useful (`makeDeleteUndo`'s reasoning). */
+function destinationTakenRefusal(what: string, to: string): UndoRefusedError {
+  // The cause named only where it can be it: a prefab path (close-out review — "a prefab Create Prefab made" read as the
+  // reason for a PNG). The toast says the step is gone, since a refusal drops it: "try again" pointed Cmd+Z at the step
+  // BELOW it.
+  const why = to.endsWith('.prefab.json') ? ' — a prefab Create Prefab made at that name is kept by its undo' : '';
+  return new UndoRefusedError(
+    `${what} was not moved: another file now holds "${to}" (made there since${why}). Nothing was moved.`,
+    `"${to.split('/').pop()}" is taken by another file now, so nothing was moved and this step was dropped — rename it by hand if you still want it`,
+  );
+}
+
 /** Build the undo/redo for a single-asset rename (Assets.tsx `handleRename`, #308). The
  *  forward rename already happened by the time this is pushed; `undo`/`redo` each move the
  *  file back/forward and only remap the asset-editor binding when the move actually landed —
@@ -427,11 +444,12 @@ export function makeRenameUndo(params: {
     label,
     undo: async () => {
       const moved = await moveAsset(toPath, originalPath);
+      if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`"${toPath}"`, originalPath); }
       if (moved.ok) {
         applyAssetPathMoves([{ from: toPath, to: originalPath, name: originalName }]);
       } else {
         reportUndoFailure({
-          direction: 'Undo', label, userFixable: moved.status === COLLISION_STATUS,
+          direction: 'Undo', label,
           detail: `"${toPath}" did not move back to "${originalPath}"${because(moved)}`,
         });
       }
@@ -439,11 +457,12 @@ export function makeRenameUndo(params: {
     },
     redo: async () => {
       const moved = await moveAsset(originalPath, toPath);
+      if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`"${originalPath}"`, toPath); }
       if (moved.ok) {
         applyAssetPathMoves([{ from: originalPath, to: toPath, name: newName }]);
       } else {
         reportUndoFailure({
-          direction: 'Redo', label, userFixable: moved.status === COLLISION_STATUS,
+          direction: 'Redo', label,
           detail: `"${originalPath}" did not move to "${toPath}"${because(moved)}`,
         });
       }
@@ -554,12 +573,13 @@ export function makeFolderRenameUndo(params: {
     label,
     undo: async () => {
       const moved = await moveAsset(newPath, oldPath);
+      if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`folder "${newPath}"`, oldPath); }
       if (moved.ok) {
         // (`expanded`/`pendingFolders` are remapped by applyAssetPathMoves itself now — #867.)
         applyAssetPathMoves([{ from: newPath, to: oldPath, prefix: true }]);
       } else {
         reportUndoFailure({
-          direction: 'Undo', label, userFixable: moved.status === COLLISION_STATUS,
+          direction: 'Undo', label,
           detail: `folder "${newPath}" did not move back to "${oldPath}"${because(moved)}`,
         });
       }
@@ -567,11 +587,12 @@ export function makeFolderRenameUndo(params: {
     },
     redo: async () => {
       const moved = await moveAsset(oldPath, newPath);
+      if (!moved.ok && moved.status === COLLISION_STATUS) { refresh(); throw destinationTakenRefusal(`folder "${oldPath}"`, newPath); }
       if (moved.ok) {
         applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]);
       } else {
         reportUndoFailure({
-          direction: 'Redo', label, userFixable: moved.status === COLLISION_STATUS,
+          direction: 'Redo', label,
           detail: `folder "${oldPath}" did not move to "${newPath}"${because(moved)}`,
         });
       }

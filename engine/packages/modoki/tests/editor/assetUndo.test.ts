@@ -15,7 +15,7 @@ import {
   makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
   type DeleteResult, type DupResult,
 } from '../../src/editor/panels/assetUndo';
-import { COLLISION_STATUS } from '../../src/editor/undo/undoFailure';
+import { COLLISION_STATUS, UndoRefusedError } from '../../src/editor/undo/undoFailure';
 import { pushAction, undoStep, _resetHistoryContexts } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { trashAssetFile, deleteAssetFiles, moveAsset, createAssetFolder, duplicateAssetFileReport } from '../../src/editor/panels/assetOps';
@@ -328,6 +328,11 @@ describe('makeDuplicateUndo', () => {
   });
 });
 
+/** What a step threw, or undefined: `UndoAction`'s halves are typed `void | Promise<void>`. */
+async function refusalOf(step: () => void | Promise<void>): Promise<unknown> {
+  try { await step(); return undefined; } catch (e) { return e; }
+}
+
 describe('makeRenameUndo (#308 site 1)', () => {
   const build = (refresh = vi.fn()) => makeRenameUndo({
     originalPath: '/assets/old.png', originalName: 'old.png', toPath: '/assets/new.png', newName: 'new.png', refresh,
@@ -343,18 +348,36 @@ describe('makeRenameUndo (#308 site 1)', () => {
     expect(useEditorStore.getState().toast).toBeNull();
   });
 
-  // #308: a 409 collision (something now occupies the original path) is the ONE case that
-  // gets a toast on top of the console error.
-  it('undo on a 409 collision ERRORS and TOASTS', async () => {
-    const error = spyConsole('error');
+  // #308, then #1795 (hub review): a 409 collision (something now occupies the original path — a prefab Create Prefab
+  // made at that name is kept by its undo) REFUSES, naming the path taken, before anything moved: the entry is dropped
+  // rather than kept for a redo that would aim at the other file. Mutation: report it again (`reportUndoFailure`).
+  it('undo on a 409 collision REFUSES, naming the path that is taken', async () => {
     failNext('/api/move-file', COLLISION_STATUS);
     const refresh = vi.fn();
-    await build(refresh).undo();
-    expect(error).toHaveBeenCalledTimes(1);
-    const toast = useEditorStore.getState().toast;
-    expect(toast).not.toBeNull();
-    expect(toast!.kind).toBe('warn');
-    expect(refresh).toHaveBeenCalledTimes(1); // still refreshes on a partial failure
+    const err = await refusalOf(() => build(refresh).undo());
+    expect(err).toBeInstanceOf(UndoRefusedError);
+    expect((err as UndoRefusedError).message).toContain('another file now holds "/assets/old.png"');
+    expect((err as UndoRefusedError).toast).toContain('"old.png" is taken');
+    // The step is gone after a refusal, so the toast says so rather than "try again" (close-out review 2), and a PNG's
+    // message does not blame a prefab. Mutation: put "then try again" back, or name the prefab cause for every path.
+    expect((err as UndoRefusedError).toast).toContain('this step was dropped');
+    expect((err as UndoRefusedError).message).not.toContain('Create Prefab');
+    expect(calls.filter((c) => c.url === '/api/move-file')).toHaveLength(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('a prefab path names the cause a create\'s kept file can be', async () => {
+    failNext('/api/move-file', COLLISION_STATUS);
+    const err = await refusalOf(() => makeRenameUndo({ originalPath: '/assets/A.prefab.json', originalName: 'A.prefab.json', toPath: '/assets/B.prefab.json', newName: 'B.prefab.json', refresh: vi.fn() })
+      .undo());
+    expect((err as UndoRefusedError).message).toContain('a prefab Create Prefab made at that name is kept by its undo');
+  });
+
+  it('redo on a 409 collision refuses the same way', async () => {
+    failNext('/api/move-file', COLLISION_STATUS);
+    const err = await refusalOf(() => build().redo());
+    expect(err).toBeInstanceOf(UndoRefusedError);
+    expect((err as UndoRefusedError).message).toContain('another file now holds "/assets/new.png"');
   });
 
   // #308: a non-409 backend failure logs but must NOT toast — only a collision is
@@ -512,19 +535,24 @@ describe('makeFolderRenameUndo (#308 site 5 — the worst one)', () => {
   // #308: this was the active-desync bug — setPendingFolders (and, previously, nothing for
   // setExpanded at all) ran UNCONDITIONALLY, remapping the client tree to the OTHER path
   // while the folder stayed physically where the move left it.
-  it('undo does NOT remap EITHER client set when the move fails (a collision), and toasts', async () => {
-    const error = spyConsole('error');
+  // …and a collision REFUSES now (#1795, hub review: the folder's old name is taken), still without remapping either set.
+  it('undo does NOT remap EITHER client set when the move fails (a collision), and refuses naming the path', async () => {
     failNext('/api/move-file', COLLISION_STATUS);
     seed(['/assets/New'], ['/assets/New']);
     const refresh = vi.fn();
-    await build(refresh).undo();
+    const err = await refusalOf(() => build(refresh).undo());
     expect([...getExpanded()]).toEqual(['/assets/New']);      // untouched
     expect([...getPendingFolders()]).toEqual(['/assets/New']);
-    expect(error).toHaveBeenCalledTimes(1);
-    const toast = useEditorStore.getState().toast;
-    expect(toast).not.toBeNull();
-    expect(toast!.kind).toBe('warn');
+    expect(err).toBeInstanceOf(UndoRefusedError);
+    expect((err as UndoRefusedError).message).toContain('another file now holds "/assets/Old"');
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('redo on a collision refuses too, naming the path', async () => {
+    failNext('/api/move-file', COLLISION_STATUS);
+    const err = await refusalOf(() => build().redo());
+    expect(err).toBeInstanceOf(UndoRefusedError);
+    expect((err as UndoRefusedError).message).toContain('another file now holds "/assets/New"');
   });
 
   it('redo does NOT remap either client set on a non-collision failure, and does not toast', async () => {

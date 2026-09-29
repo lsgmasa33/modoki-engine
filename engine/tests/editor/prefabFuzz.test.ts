@@ -40,8 +40,10 @@
  *  - A missing-prefab placeholder is compared by its source across a reload, not by its in-memory record's form (entry
  *    or node follows its position); a lost record still shows as a second save that differs.
  *
- *  - A tainted segment's walk (after an outside edit, a prefab-edit save or a watcher reload) forgives every refusal, so
- *    a write whose #1774 mark-conflict recovery fails there is not caught; only a clean segment holds it.
+ *  - A tainted segment's walk (after an outside edit, a prefab-edit save, or a swap that expanded a placeholder: the
+ *    closed `TaintCause` list, #1845) forgives every refusal, so a write whose #1774 mark-conflict recovery fails there is
+ *    not caught; only a clean segment holds it. A watcher raise no outside edit made fails the step instead of tainting,
+ *    and the checks each taint skipped are counted and printed.
  *  - The renderer's manifest is pushed by a route's inline rebuild, before its renderer repair, as the host's is (#1835),
  *    and by the simulated watcher — but ADDITIVELY, where the host's prunes: a deleted prefab's guid stays resolvable
  *    here. Pruning surfaces #1844. `failManifestRebuilds` reproduces a failed inline rebuild, the editor's one lag window.
@@ -57,7 +59,7 @@
  *  #1777 is not re-found (reusing a number needs a hand edit below the mark, or #1782's rebuilders); #1741 is
  *  unreachable (one scene). The weights were not tuned against these; the generator changes are in the doc. */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
 import fs from 'fs';
 
 // The OS trash, stubbed to delete from the scratch directory as `deleteAssetPreconditions.test.ts` does: the route's
@@ -72,7 +74,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
-import { runOps, shrink, consoleErrors, opOutcomes, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, collidedWithCreated, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, KNOWN_TOLERANCES, REGRESSIONS } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -119,6 +121,13 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
   {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance \(\S+\) a deleted member belongs to is no longer in the scene/,
     why: 'the same ruling, for a delete\'s undo whose members\' instance root is gone (`requireRootLinks`)',
+  },
+  {
+    pattern: /^\[undo\] (Undo|Redo) of "Rename [^"]*" was REFUSED — "[^"]+\.prefab\.json" was not moved: another file now holds "[^"]+\.prefab\.json"/,
+    why: 'a Rename\'s undo or redo whose destination another file now holds REFUSES, naming it, and moves nothing '
+      + '(makeRenameUndo, 409). Create Prefab\'s undo LEAVES its file (#1795, hub ruling (i), Unity), so a prefab created '
+      + 'at the name a rename freed now holds that path when the walk undoes the rename (hunt seed 6029). Only the collision: '
+      + 'any other failed move is still a finding, and the refusal in a segment it does not taint (renameCollision) still fails',
   },
   {
     pattern: /^\[entityActions\] refused: "[^"]*" is a Missing Prefab now/,
@@ -214,6 +223,9 @@ describe('#1789 prefab fuzz', () => {
       }
       const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ');
       realError(`\ncoverage — ops: ${tally(opOutcomes)}\nroutes: ${tally(be.routeCounts)}\n`);
+      // Per cause (#1845), for comparing one platform's hunt with another's: a platform whose taints or skips run far
+      // above another's on the same seeds is turning the undo checks off for a reason the other does not have.
+      process.stderr.write(`taints (ops that tainted a segment, by cause): ${tally(taintCounts) || 'none'}\nchecks skipped by a taint (<cause>: <check>): ${tally(skippedChecks) || 'none'}\n`);
       expect([...bySig.values()]).toEqual([]);
     }, 24 * 3600_000);
     return;
@@ -228,6 +240,13 @@ describe('#1789 prefab fuzz', () => {
       expect(await report(seed, ops, r)).toBe('');
     }, 120_000);
   }
+
+  // #1845: what the taints turned off, said on every verify run, so a platform where it grows is visible. A report, not a
+  // test: the cause list is closed by its type, and the guard is the "unexpected outside write" self-test below.
+  afterAll(() => {
+    const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
+    process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}\n`);
+  });
 
   for (const r of REGRESSIONS) {
     it(`regression #${r.issue}: ${r.what}`, async () => {
@@ -280,6 +299,93 @@ describe('#1789 prefab fuzz', () => {
     } finally {
       be.remove(own); be.remove(outside);
     }
+  });
+
+  // #1845: the #1840 class planted — the router's mark never matches what the watcher looks up, so every editor write
+  // reads as an outside edit. It used to TAINT the segment and silently turn the undo checks off; it must fail the step.
+  // The accept twin: an outside edit's own raise taints, as the one cause a raise may have.
+  it('harness: a raise no outside edit made FAILS the step (#1845), and an outside edit\'s own raise taints as outsideEdit', async () => {
+    const ops = generate(1, VERIFY_LEN);
+    const add = be.marked.add;
+    be.marked.add = function (this: Set<string>) { return this; } as typeof add;
+    let r: RunResult;
+    try { r = await runOps(be, ops, OPTS); } finally { be.marked.add = add; }
+    expect(r.failure?.check).toBe('unexpected outside write');
+    expect(r.failure?.detail).toMatch(/after op \d+ \(.*\): the watcher raised a write that no outside edit made/);
+
+    const outside = ops.find((o) => o.kind === 'outsideEdit') ?? { kind: 'outsideEdit', u: [0.1, 0.2, 0.3, 0.2, 0.5, 0.5, 0.5, 0.5] } as Op;
+    const before = taintCounts.get('outsideEdit') ?? 0;
+    const ok = await runOps(be, [outside], OPTS);
+    expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
+    expect(ok.trace.join(' '), 'premise: the outside edit wrote a file').toMatch(/outsideEdit.* → done/);
+    expect(taintCounts.get('outsideEdit') ?? 0).toBe(before + 1);
+  });
+
+  // #1795 (hub ruling (i)): Create Prefab's undo leaves its file, so the walk to a segment's start may find it — but only
+  // holding what that create wrote (hub review: otherwise the allowance hides a wrong write under a right path).
+  it('harness: a file a Create Prefab made may remain at the segment start only while it holds that create\'s document', () => {
+    const P = '/fuzz/r0/prefabs/N.prefab.json';
+    const doc = { id: 'cccccccc-0000-4000-8000-000000001795', version: 8, name: 'N', rootLocalId: 1, nextLocalId: 2,
+      entities: [{ localId: 1, name: 'N', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001795', traits: { EntityAttributes: { name: 'N', parentId: 0, guid: '' } } }] };
+    const wrote = `${JSON.stringify(doc, null, 2)}\n`;
+    const created = [wrote];
+    const start = new Map<string, string>();
+    expect(diffFiles(start, new Map([[P, wrote]]), created)).toBeNull();
+    // The same document under a raised #1774 mark (an Apply's undo keeps it).
+    expect(diffFiles(start, new Map([[P, `${JSON.stringify({ ...doc, nextLocalId: 7 }, null, 2)}\n`]]), created)).toBeNull();
+    // Reject side: other content at that path, and a file no create made.
+    expect(diffFiles(start, new Map([[P, `${JSON.stringify({ ...doc, name: 'Other' }, null, 2)}\n`]]), created)).toMatch(/absent vs present/);
+    expect(diffFiles(start, new Map([[P, wrote]]), [])).toMatch(/absent vs present/);
+    // The same document at another path: the new prefab renamed (the rename's own undo did not run in that walk).
+    expect(diffFiles(start, new Map([['/fuzz/r0/prefabs/Renamed.prefab.json', wrote]]), created)).toBeNull();
+
+    // `renameCollision` (#1845's list): a Rename collision taints only where a create's document holds the destination.
+    const line = (dest: string) => `[undo] Undo of "Rename N" was REFUSED — "/fuzz/r0/prefabs/R83.prefab.json" was not moved: another file now holds "${dest}" (made there since). Nothing was moved.`;
+    const disk = (text: string) => ({ snapshot: () => new Map([[P, text]]) });
+    expect(collidedWithCreated([line(P)], disk(wrote), created)).toBe(true);
+    expect(collidedWithCreated([line(P)], disk(`${JSON.stringify({ ...doc, name: 'Other' }, null, 2)}\n`), created)).toBe(false);
+    expect(collidedWithCreated([line('/fuzz/r0/prefabs/Gone.prefab.json')], disk(wrote), created)).toBe(false);
+    expect(collidedWithCreated([line(P).replace('another file now holds', 'it could not reach')], disk(wrote), created)).toBe(false);
+  });
+
+  // #1838: the round trip holds a rotation as ONE value, an orientation (#1490's rule), not three numbers.
+  it('harness: the round trip forgives an equal rotation spelled differently, and nothing else (#1838)', () => {
+    const G = '1aaaaaaa-0000-4000-8000-000000001838';
+    const at = (tf: Record<string, number>) => ({ [G]: { traits: { Transform: tf } } });
+    const rt = (b: Record<string, number>, a: Record<string, number>) => ({ before: at(b), after: at(a), firstBytes: '{}', secondBytes: '{}' });
+    // 0.283… = -6 + 2π: the same turn, win's hunt seed 4773.
+    expect(checkRoundTrip(rt({ x: 1, rx: 0.28318530717958645, ry: 0, rz: 0 }, { x: 1, rx: -6, ry: 0, rz: 0 }))).toEqual([]);
+    // (π, 0, π) and (0, π, 0) are one orientation too, spelled across all three fields.
+    expect(checkRoundTrip(rt({ rx: Math.PI, ry: 0, rz: Math.PI }, { rx: 0, ry: Math.PI, rz: 0 }))).toEqual([]);
+    // Reject side: a different orientation, and an equal rotation beside a changed position, still fail.
+    expect(checkRoundTrip(rt({ rx: 0.28, ry: 0, rz: 0 }, { rx: 0.5, ry: 0, rz: 0 }))[0]?.detail).toMatch(/\/traits\/Transform\/rx: 0\.28 vs 0\.5/);
+    expect(checkRoundTrip(rt({ x: 1, rx: 0.28318530717958645 }, { x: 2, rx: -6 }))[0]?.detail).toMatch(/\/traits\/Transform\/x: 1 vs 2/);
+  });
+
+  // #1841: #1823 widened #1795's and #1827(b)'s stops to accept Create Prefab's untag line, which would also have claimed
+  // an UNRELATED root loss under the same op shape. Those entries are gone (#1795 and #1827 fixed); this pins that no stop
+  // claims a planted root loss after a Create Prefab and an undo, in any of the forms a run reports it.
+  it('harness: no KNOWN_OPEN stop claims a planted root loss under Create Prefab + undo (#1841)', () => {
+    const R = '5eeeeeee-0000-4000-8000-000000001841';
+    const u = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+    const op = (kind: Op['kind']) => ({ kind, u, ...(kind === 'prefabEdit' ? { inner: [] } : {}) }) as Op;
+    const shapes: Op[][] = [
+      [op('createPrefab'), op('undo')],
+      [op('createPrefab'), op('saveReload'), op('undo')],
+      [op('createPrefab'), op('trashPrefab'), op('prefabEdit'), op('undo')],
+      [op('addChild'), op('createPrefab'), op('apply'), op('undo'), op('undo')],
+    ];
+    const touched = { drop: [], paste: [], detach: [], create: [R] };
+    const untag = '[undo] Undo of "Save prefab "R"" did not fully apply — the entity linked to /fuzz/r0/prefabs/R.prefab.json no longer exists, so nothing was unlinked';
+    const planted = (ops: Op[]): StepFailure[] => [
+      { check: 'console.error', detail: untag, step: ops.length - 1, op: 'undo(0.5,0.5,0.5,0.5)', touched },
+      { check: 'console.error', detail: untag, step: ops.length, op: 'undo/redo to the ends', touched, console: [untag] },
+      { check: 'save→reload is not the identity', detail: `/${R}: {"traits":{"EntityAttributes":{"name":"R"}}} vs undefined (an entity was lost)`, step: ops.length, op: 'final save→reload', touched },
+      { check: 'undo to the start does not restore the scene', detail: `/entities/${R}: {"traits":{"EntityAttributes":{"guid":"${R}"}}} vs undefined`, step: ops.length, op: 'undo/redo to the ends', touched, console: [untag] },
+      { check: 'redo to the end does not restore the scene', detail: `/entities/${R}: {"traits":{"EntityAttributes":{"guid":"${R}"}}} vs undefined`, step: ops.length, op: 'undo/redo to the ends', touched, console: [untag] },
+    ];
+    const claims = shapes.flatMap((ops) => planted(ops).flatMap((f) => KNOWN_OPEN.filter((k) => k.stops?.(f, ops)).map((k) => `#${k.issue} claims ${f.check} after ${ops.map((o) => o.kind).join(',')}`)));
+    expect(claims).toEqual([]);
   });
 
   it('harness: a signature drops what differs between replays (scratch paths, the run folder, guids) and keeps the message', () => {

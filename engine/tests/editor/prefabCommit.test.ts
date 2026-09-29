@@ -37,7 +37,7 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 }));
 
 /** The fake route's disk: path → the exact text it holds. */
-const route = vi.hoisted(() => ({ disk: new Map<string, string>(), failWrites: false, gate: null as Promise<void> | null, waiting: 0, posts: [] as string[], beforeWrite: null as null | ((path: string) => void) }));
+const route = vi.hoisted(() => ({ disk: new Map<string, string>(), failRead: null as string | null, failWrites: false, gate: null as Promise<void> | null, waiting: 0, posts: [] as string[], beforeWrite: null as null | ((path: string) => void) }));
 const sha = (t: string) => createHash('sha256').update(t.replace(/^\uFEFF/, '')).digest('hex');
 const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
@@ -83,6 +83,7 @@ async function serve(url: string, init?: { body?: string; method?: string }): Pr
     for (const p of b.paths) route.disk.delete(p);
     return answer(200, { ok: true, trashed: b.paths.length, missing: [], failed: [] });
   }
+  if (route.failRead && url.endsWith(route.failRead)) return new Response('', { status: 500 });
   const hit = [...route.disk.keys()].find((p) => url.endsWith(p));
   if (!hit) return url.includes('/api/') ? answer(200, { files: [] }) : answer(404, {});
   const text = route.disk.get(hit)!;
@@ -101,7 +102,7 @@ import {
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, registerAsset, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, deleteEntityWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
-import { setPrefabCache, getCachedPrefabSync, getPrefabSource, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { localIdCounter } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
@@ -513,7 +514,7 @@ describe('several prefab files as ONE step (#1692, for #1693)', () => {
   });
 });
 
-describe('Create Prefab\'s undo asks require before it trashes the file (#1795\'s second route, ruling R)', () => {
+describe('Create Prefab\'s undo asks require before it unlinks (#1795\'s second route, ruling R), and leaves the file (#1795, ruling (i))', () => {
   const N_PATH = '/assets/prefabs/N.prefab.json';
   /** A plain entity P at the root, made into prefab N through the real Create Prefab, its undo entry pushed. */
   const createN = async () => {
@@ -525,8 +526,8 @@ describe('Create Prefab\'s undo asks require before it trashes the file (#1795\'
     return res.prefab;
   };
 
-  // Mutation: remove the `if (tagged) ref.require(...)` line from the undo — the file is trashed although the scene's
-  // entry for P, now a Missing Prefab placeholder, still names it.
+  // Mutation: remove the `ref.require(tagCheck)` from the create branch of the undo — it untags and relinks a placeholder
+  // the scene's entry still names, and reports success.
   it('refused, with the file left on disk, once a world swap made the tree a Missing Prefab placeholder', async () => {
     await createN();
     const saved = JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
@@ -537,11 +538,166 @@ describe('Create Prefab\'s undo asks require before it trashes the file (#1795\'
     expect(route.disk.has(N_PATH)).toBe(true);
   });
 
-  it('(accept) in the same world the undo trashes the file and unlinks P', async () => {
+  const pOf = () => getAllEntities().find((e) => e.name === 'P')!;
+  const linked = () => readTraitData(pOf().id, getTraitByName('PrefabInstance')!) != null;
+
+  // Mutation: put the trash back (the create branch of the undo returning to `commitPrefabWrite(savePath, null, …)`) —
+  // the file is gone after the undo.
+  it('(accept) in the same world the undo unlinks P and LEAVES the file, byte for byte (#1795 route 1)', async () => {
     await createN();
+    const bytes = route.disk.get(N_PATH);
+    route.posts.length = 0;
     expect((await quietly(() => undoStep('undo'))).did).toBe(true);
+    expect(route.disk.get(N_PATH)).toBe(bytes);
+    expect(route.posts).toEqual([]);
+    expect(linked()).toBe(false);
+  });
+
+  // Mutation: drop the create branch of the redo (every redo goes through `commitPrefabWrite` over nothing) — the redo
+  // over the file the undo left is refused as a conflict.
+  it('the redo re-links P to the file the undo left, writing nothing', async () => {
+    await createN();
+    const bytes = route.disk.get(N_PATH);
+    await quietly(() => undoStep('undo'));
+    route.posts.length = 0;
+    expect((await quietly(() => undoStep('redo'))).did).toBe(true);
+    expect(route.posts).toEqual([]);
+    expect(route.disk.get(N_PATH)).toBe(bytes);
+    expect(linked()).toBe(true);
+    // …and undoes again, to the same plain P.
+    expect((await quietly(() => undoStep('undo'))).did).toBe(true);
+    expect(linked()).toBe(false);
+  });
+
+  // #1821's shape: the file holds the same document under a RAISED mark (#1774: an Apply's undo keeps it). Mutation:
+  // compare the bytes only (`onDisk === content`) in the redo — it refuses.
+  it('#1821: the undo is not refused by a raised mark, and the redo re-links through it', async () => {
+    const prefab = await createN();
+    const raised = jsonFileBody({ ...prefab, nextLocalId: 99 } as PrefabFile);
+    route.disk.set(N_PATH, raised);
+    expect((await quietly(() => undoStep('undo'))).did).toBe(true);
+    expect(route.disk.get(N_PATH)).toBe(raised);
+    route.posts.length = 0;
+    expect((await quietly(() => undoStep('redo'))).did).toBe(true);
+    expect(route.posts).toEqual([]);
+    expect(linked()).toBe(true);
+  });
+
+  // Mutation: refuse an absent file in the redo instead of writing it — P stays plain.
+  it('a file deleted after the undo is written back by the redo, over nothing', async () => {
+    const prefab = await createN();
+    const bytes = route.disk.get(N_PATH);
+    await quietly(() => undoStep('undo'));
+    route.disk.delete(N_PATH);
+    expect((await quietly(() => undoStep('redo'))).did).toBe(true);
+    expect(route.disk.get(N_PATH)).toBe(bytes);
+    expect(linked()).toBe(true);
+    expect(prefab.id).toBeTruthy();
+  });
+
+  // #1795 review: the file moved (the manifest says where) and is gone from THERE — the redo refuses rather than write a
+  // second file under the guid at the old path. Mutation: drop the `at !== savePath` refusal — N is written back.
+  it('a document moved and then gone refuses the redo, and writes nothing at the old path', async () => {
+    const prefab = await createN();
+    await quietly(() => undoStep('undo'));
+    const MOVED = '/assets/prefabs/Moved.prefab.json';
+    route.disk.delete(N_PATH);
+    registerAsset(prefab.id!, MOVED, 'prefab');
+    route.posts.length = 0;
+    const r = await quietly(() => undoStep('redo'));
+    expect(r.failed?.refused).toBe(true);
+    expect(route.posts).toEqual([]);
     expect(route.disk.has(N_PATH)).toBe(false);
-    const p = getAllEntities().find((e) => e.name === 'P')!;
-    expect(readTraitData(p.id, getTraitByName('PrefabInstance')!)).toBeNull();
+    expect(linked()).toBe(false);
+  });
+
+  // I9: the no-write redo seats the document every sync reader reads (the commit it no longer runs used to). Mutation:
+  // drop the redo's `primeEditorPrefabCache` — the key stays cold after an eviction between the undo and the redo.
+  it('the no-write redo re-seats an editor cache evicted since the undo', async () => {
+    const prefab = await createN();
+    await quietly(() => undoStep('undo'));
+    evictDeletedEditorPrefabs(N_PATH);
+    expect(getCachedPrefabSync(prefab.id!), 'premise: evicted').toBeNull();
+    expect((await quietly(() => undoStep('redo'))).did).toBe(true);
+    expect(getCachedPrefabSync(prefab.id!)?.id).toBe(prefab.id);
+  });
+
+  // A read that fails is said and left, not refused as "changed" (which drops the entry for good). Mutation: treat
+  // `null` as changed again — the redo is refused.
+  it('an unreadable file reports the redo instead of refusing it', async () => {
+    await createN();
+    await quietly(() => undoStep('undo'));
+    route.failRead = N_PATH;
+    try {
+      const r = await quietly(() => undoStep('redo'));
+      expect(r.failed?.refused).not.toBe(true);
+      expect(linked()).toBe(false);
+    } finally { route.failRead = null; }
+  });
+
+  // #1795 review: the undo writes no file, so it has no file precondition — a prefab-edit save (or an outside edit) of the
+  // new prefab rebases the instance onto the file's new document, and unlinking THAT would keep the change as plain
+  // entities, neither before the create nor after it. Mutation: drop `createdFrameRebuiltRefusal` from the undo's check —
+  // P, and the child the save added, are left plain.
+  it('refuses once the instance was rebuilt from a changed prefab, and changes nothing', async () => {
+    const prefab = await createN();
+    const root = prefab.entities.find((e) => e.localId === prefab.rootLocalId)!;
+    const changed = { ...prefab, entities: [...prefab.entities, { localId: 2, name: 'D', nodeGuid: 'eeeeeeee-0000-4000-8000-00000017950d', traits: { EntityAttributes: { name: 'D', parentId: root.localId, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } }] } as unknown as PrefabFile;
+    const saved = await quietly(() => commitPrefabWrite(N_PATH, changed, { expected: prefab }));
+    expect(saved.ok, 'premise: the save landed').toBe(true);
+    expect(getAllEntities().some((e) => e.name === 'D'), 'premise: the instance was rebased onto it').toBe(true);
+    const r = await quietly(() => undoStep('undo'));
+    expect(r.failed?.refused).toBe(true);
+    expect(r.failed?.error).toMatch(/was rebuilt from a changed .*N\.prefab\.json since/);
+    expect(linked()).toBe(true);
+  });
+
+  // The accept side (close-out review 2): a reload that keeps the history (Play→Stop, a prefab-edit exit) re-expands the
+  // tree from the LOADER's copy of the document — another object, the same content — and the undo must still apply.
+  // Mutation: accept only `rec.doc === doc` in `createdFrameRebuiltRefusal` — this undo is refused and dropped.
+  it('(accept) after a reload re-expanded the tree from a copy of the same document, the undo still unlinks it', async () => {
+    const prefab = await createN();
+    prefabs.set(prefab.id!, JSON.parse(JSON.stringify(prefab))); // what this test's loader reads: a copy, as `fetchPrefab` returns
+    const saved = JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
+    await quietly(() => load(saved));
+    expect(linked(), 'premise: the reload re-expanded P as an instance').toBe(true);
+    const r = await quietly(() => undoStep('undo'));
+    expect(r.failed, r.failed ? String(r.failed.error) : '').toBeFalsy();
+    expect(r.did).toBe(true);
+    expect(linked()).toBe(false);
+    expect(route.disk.has(N_PATH)).toBe(true);
+  });
+
+  // Hunt seed 6029: the new prefab renamed, then ANOTHER prefab created at the name the rename freed. The redo reads its
+  // document where its guid lives now, not at the path it first wrote. Mutation: read `savePath` again in the redo — it
+  // reads the other prefab there and refuses.
+  it('the redo re-links to its document where a Rename moved it, though another prefab now holds the old path', async () => {
+    const prefab = await createN();
+    const MOVED = '/assets/prefabs/N2.prefab.json';
+    const bytes = route.disk.get(N_PATH)!;
+    route.disk.delete(N_PATH);
+    route.disk.set(MOVED, bytes);
+    registerAsset(prefab.id!, MOVED, 'prefab');
+    expect((await quietly(() => undoStep('undo'))).did).toBe(true);
+    const other = jsonFileBody({ ...prefab, id: 'cccccccc-0000-4000-8000-000000006029', entities: prefab.entities.map((e) => ({ ...e, name: 'Other' })) } as PrefabFile);
+    route.disk.set(N_PATH, other);
+    route.posts.length = 0;
+    expect((await quietly(() => undoStep('redo'))).did).toBe(true);
+    expect(route.posts).toEqual([]);
+    expect(route.disk.get(N_PATH)).toBe(other);
+    expect(linked()).toBe(true);
+  });
+
+  // Mutation: drop the `prefabTextIsDocument` refusal — the redo tags P against rows the file no longer holds.
+  it('a file somebody changed after the undo refuses the redo, before any change', async () => {
+    const prefab = await createN();
+    await quietly(() => undoStep('undo'));
+    const edited = jsonFileBody({ ...prefab, entities: prefab.entities.map((e) => ({ ...e, name: 'Edited' })) } as PrefabFile);
+    route.disk.set(N_PATH, edited);
+    const r = await quietly(() => undoStep('redo'));
+    expect(r.failed?.refused).toBe(true);
+    expect(r.failed?.error).toMatch(/N\.prefab\.json/);
+    expect(route.disk.get(N_PATH)).toBe(edited);
+    expect(linked()).toBe(false);
   });
 });

@@ -115,6 +115,10 @@ export interface RunState {
   /** Every guid a drop or a paste introduced, and every guid a detach or a Create Prefab covered, this run (a failure
    *  carries them). */
   touched: { drop: Set<string>; paste: Set<string>; detach: Set<string>; create: Set<string> };
+  /** The bytes each Create Prefab of a FRESH path wrote, one entry per create: its undo leaves the file (#1795, hub
+   *  ruling (i)), so the walk to a segment's start may find it still there — holding exactly this document, at that path
+   *  or wherever a Rename moved it. A list, not keyed by path: a later create can reuse the path a rename freed. */
+  created?: string[];
 }
 
 const liveGuids = () => new Set(authored().map((e) => e.guid).filter((g): g is string => !!g));
@@ -229,6 +233,8 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const nodeGuids = (t: string) => new Set([...t.matchAll(/"nodeGuid":\s*"([^"]+)"/g)].map((m) => m[1]));
       const prior = nodeGuids(priorText);
       for (const g of nodeGuids(st.be.snapshot().get(target) ?? '')) if (!prior.has(g)) st.touched.create.add(g);
+      const wrote = st.be.snapshot().get(result.savePath);
+      if (!priorText && wrote !== undefined) (st.created ??= []).push(wrote);
       return 'done';
     }
     case 'instantiate': {
@@ -474,9 +480,16 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     }
     case 'outsideEdit': {
       // A hand edit of a prefab file, or a pull that merges another clone's edit: not the editor's own write, so the
-      // watcher raises it. Two shapes: a value change, or a new row as a merged editor write numbers it, at or above
-      // the file's mark (`nextLocalId`, #1774). Taking a number BELOW the mark is outside the editor's contract (the mark
-      // exists to stop exactly that), and it produced a false I7 (the hunt's seed 1142).
+      // watcher raises it. ONLY shapes a real producer writes, since a shape nothing writes reports a finding nobody can
+      // hit (#1839). Two:
+      //  - a value change (`Transform.x` of an existing row): a hand edit.
+      //  - a new PLAIN row under a PLAIN row, numbered at or above the file's mark (`nextLocalId`, #1774): what an editor
+      //    Add Child in prefab edit writes, arriving by a merge. Taking a number BELOW the mark is outside the editor's
+      //    contract (the mark exists to stop exactly that), and it produced a false I7 (the hunt's seed 1142).
+      // NOT generated: a plain row under a REFERENCE row (one with `prefab`). The editor writes a child of a nested
+      // instance as a keyed `added` node on the reference row (docs/prefabs.md § reference row), never as a plain row,
+      // and the loader derives such a row's guid from the nested frame's member with the same localId: a false I7 (win's
+      // hunt seed 3130). Whether the loader should refuse that hand-edited shape is a separate, unfiled question.
       const path = pick(u[0], prefabFiles(st));
       if (!path) return 'noop';
       const doc = JSON.parse(st.be.read(path)!) as PrefabFile & { nextLocalId?: number };
@@ -486,7 +499,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         const tf = (row.traits as Record<string, Record<string, number>>).Transform;
         tf.x = Math.round(u[2] * 20 - 10);
       } else {
-        const parent = pick(u[1], doc.entities);
+        const parent = pick(u[1], doc.entities.filter((r) => !(r as { prefab?: unknown }).prefab));
         if (!parent || typeof parent.localId !== 'number') return 'noop';
         const localId = Math.max(doc.nextLocalId ?? 0, Math.max(0, ...doc.entities.map((r) => r.localId ?? 0)) + 1);
         const hex = (x: number, w: number) => Math.floor(x * 16 ** w).toString(16).padStart(w, '0');

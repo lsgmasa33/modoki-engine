@@ -93,7 +93,7 @@ The #1789 design studies proposed these three rules (§ "Undo replayed in a late
 
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
-| I19 | An undo or redo step re-finds every entity it recorded, meaning its target and the parent it restores under, by the guid taken while the entity was alive ([engine-concepts.md](./engine-concepts.md) § Entity, #1222). It never substitutes a raw ECS id, the scene root or any other entity. When a ref the step NEEDS no longer resolves, the step refuses as a whole, before it changes anything (`UndoRefusedError`), and `runStep` drops its entry (#310). It is never a silent no-op reported as done. A ref whose miss the step has shown to be harmless stays tolerant: Create Prefab's prior links for a held nested instance, whose guid a reload re-mints (#1272, "an unresolved ref is not a lost link" in `reattachPrefabInstance`). An entity with no guid is re-found by its raw id only in the World it was recorded in. | `require` on the entity ref (`editor/undo/entityRef.ts`): `ref.require(expect?)`, `requireWith`, `requireAll`. A step asks it for every ref it needs before its first write; the toast names the entity ("is no longer in the scene"). `resolve` stays for readers that may drop a miss (selection, `cutSourceId`, `sceneDropTarget`, #1272's prior links). A delete's undo also asks `requireRootLinks` about each instance root its members link back to, and Detach's undo `requireDetachedLinks`. `reattachPrefabInstance` no longer keeps a raw `rootInstanceId` for a root that misses. | Asked by the field-write family, add/remove, create/subtree/duplicate/paste, both deletes, reparent, the scene move, Revert, Detach, the sibling renumber (`makeSortOrderRenumberAction`), the gizmo/collider-point/UI-handle drags, the Hierarchy drop (`placePrefabFromPath`, parent by guid) and the agent `prefab instantiate`/`prefab create`. **Not yet:** Create Prefab's human undo (#1795's second route), which trashes the file before its untag. |
+| I19 | An undo or redo step re-finds every entity it recorded, meaning its target and the parent it restores under, by the guid taken while the entity was alive ([engine-concepts.md](./engine-concepts.md) § Entity, #1222). It never substitutes a raw ECS id, the scene root or any other entity. When a ref the step NEEDS no longer resolves, the step refuses as a whole, before it changes anything (`UndoRefusedError`), and `runStep` drops its entry (#310). It is never a silent no-op reported as done. A ref whose miss the step has shown to be harmless stays tolerant: Create Prefab's prior links for a held nested instance, whose guid a reload re-mints (#1272, "an unresolved ref is not a lost link" in `reattachPrefabInstance`). An entity with no guid is re-found by its raw id only in the World it was recorded in. | `require` on the entity ref (`editor/undo/entityRef.ts`): `ref.require(expect?)`, `requireWith`, `requireAll`. A step asks it for every ref it needs before its first write; the toast names the entity ("is no longer in the scene"). `resolve` stays for readers that may drop a miss (selection, `cutSourceId`, `sceneDropTarget`, #1272's prior links). A delete's undo also asks `requireRootLinks` about each instance root its members link back to, and Detach's undo `requireDetachedLinks`. `reattachPrefabInstance` no longer keeps a raw `rootInstanceId` for a root that misses. | Asked by the field-write family, add/remove, create/subtree/duplicate/paste, both deletes, reparent, the scene move, Revert, Detach, the sibling renumber (`makeSortOrderRenumberAction`), the gizmo/collider-point/UI-handle drags, the Hierarchy drop (`placePrefabFromPath`, parent by guid, resolved inside `instantiatePrefabInstance` after its awaits) and the agent `prefab instantiate`/`prefab create`, and Create Prefab's human undo (#1795's second route; since the first route's ruling it writes no file at all, and also refuses a tree rebuilt from a changed document, `createdFrameRebuiltRefusal`). |
 | I20 | An undo step also acts only on the same KIND of thing it recorded. A guid names one identity across worlds, but a world swap can turn that identity into another kind of thing: an instance root into a Missing Prefab placeholder (I18), a member into a row of a placeholder's kept record (no entity at all), or a placeholder back into an instance once its prefab returns. A step whose meaning depends on the kind refuses when the kind has changed. **The kind a step expects is the one its own forward step LEFT the entity in** (and a redo expects the kind from before it), not the kind the ref saw when it was taken. | `require`'s kind check: every ref records whether its entity was a placeholder (`EntityRef.kind`), and `require` refuses a change ("is a Missing Prefab now … restore the prefab and reload the scene"). That capture kind IS what the forward step leaves, since no editor step turns an entity into a placeholder or back; only a world swap does. A step with a finer expectation passes `expect.check`: Revert's undo needs an instance root of its source, Create Prefab's (agent) undo an instance root (`isInstanceRootCheck`), Detach's undo a still-plain tree, a delete's relink an instance root. | Create Prefab's human undo (#1795's second route). |
 | I21 | A placeholder takes only the edits its writer saves. The save writes a placeholder as its kept record plus the live name, guid, parent, folder and, in the ENTRY shape, `sortOrder` and `isActive` (`asSceneEntry`'s `placement` and `order`; `asAddedNode` for a node). Every other edit is refused where it is made. | The placeholder gate, `placeholderWriteRefusal` (`editor/undo/placeholderGate.ts`): it lets through `name` plus `PLACEHOLDER_PLACEMENT_FIELDS` (`runtime/loaders/unresolvedPrefabRefs.ts`, the list the writers share), and refuses the rest with a reason. Asked by `writeTraitFieldWithUndo` and its three multi-entity twins (a selection holding a placeholder refuses as a whole), `addTraitToEntitiesWithUndo`, `removeTraitFromEntitiesWithUndo`, and the agents' trait writer (`writeTraitAsEditor`, which apply-scene-ops' setTrait and the editor's set-traits share since #1816, with set-traits asking every target first in `editorTraitWriter.refusal`) and removeTrait. | **A placeholder saved as an added NODE (one inside an instance) keeps no `sortOrder` or `isActive`** (owner ruling, 2026-09-29): a reference node keeps its root's order and flag as an override on the prefab's ROOT ROW, which the placeholder cannot name without its prefab, and a value carried in the node's own traits would hold only until the prefab returned. So the gate refuses both there; the Hierarchy renumber numbers the other siblings around it (`renumberAround`; when two such placeholders tie with a sibling to place between them, the drop is refused, named). A placeholder moved INTO an instance takes `sortOrder` 0, where the load spawns a node placeholder (`spawnUnresolvedReference` sets none), so the editor shows the order the reload will. A top-level placeholder keeps its entry's root traits (a Transform, a UI trait), so the gizmo, collider-point and UI-handle drags, which write live while they run, ask the gate at their commit (`placeholderGestureRefusal`) and put the values back when it refuses. |
 
@@ -241,7 +241,8 @@ Every group 1 bug fits a rule; none fits no rule.
     placeholder, which today carries only the name, the parent and identity.
   - It absorbs #1818.
 - **Create Prefab's undo (#1795's second route) must ask `require` BEFORE `commitPrefabWrite` trashes the file,** as Apply's
-  undo checks its precondition before it writes. Today the file goes first and the relink runs after.
+  undo checks its precondition before it writes. Today the file goes first and the relink runs after. (Built. Since the
+  first route's ruling, a create's undo writes no file at all, and `require` still comes first; see U27.)
 - **Fix size:**
   - `require`: M, about 25 closures. Most are one line. Detach and Create Prefab, whose expectation differs by direction,
     are not. The design work is stating each step's expectation, the tolerant refs, the runtime helpers' miss policy
@@ -261,7 +262,8 @@ Every group 1 bug fits a rule; none fits no rule.
 
 **Out of scope:**
 - **#1795's first route** (the undo trashes a file that a SAVED scene names, with no swap) is its own owner fork,
-  options (i) to (iii) on the issue. This study does not resolve it.
+  options (i) to (iii) on the issue. This study does not resolve it. (Resolved since: hub ruling (i), the undo leaves the
+  file; U27.)
 - **#1805** (the delete's cache eviction, work-ai) triggers these routes upstream. Fixing it closes none of them,
   because a reload expands a placeholder either way. It runs the other way too: **group 1's fix unblocks #1805's
   deferred half**, the follow-up that also evicts the runtime cache on a delete. That half is held because it
@@ -401,7 +403,15 @@ back. These sites add a fallback of their own on top of it.
 - **Fix size:** M, for the nine sites plus the parent fallbacks. Each gets its KNOWN_OPEN self-test as its regression:
   two #1827 entries and five #1793 entries.
 - #1793's defence in depth stays as the issue states it: a liveness check where `instantiatePrefab` parents the root,
-  and a visited set in the instantiate undo's subtree walk. It is a second line, not the owner.
+  and a visited set in the instantiate undo's subtree walk. It is a second line, not the owner. **Built** (hub,
+  2026-09-29), both as LOUD refusals (`UndoRefusedError`), never silent skips:
+  - `instantiatePrefab` refuses a raw parent id no live entity holds at ENTRY, before anything spawns. The second pass
+    alone could not catch #1793's thrown redo: its dead id was recycled by the call's own first-pass spawn, so it read
+    as live there. The second pass also refuses a parent that is no longer the entity the call was handed
+    (`captureEntityIdentity`), and deletes what the call spawned first.
+  - `subtreePaths` refuses a revisit, naming the entity, so a parent cycle is not a stack overflow.
+  - Both are unreachable by any current gesture; `engine/tests/editor/instantiateStaleParent.test.ts` builds each bad
+    input directly (a destroyed id, an id recycled mid-spawn, a cycle).
 
 #### Built: ruling R (#1819, #1827, #1793, #1818; 2026-09-29)
 
@@ -441,8 +451,8 @@ study had not:
   `placePrefabFromPath`. Its oracle taints a segment only when a WORLD SWAP expands a placeholder, since R drops entries
   there by design; I6 and I7 are still checked at every step. With the taint off, every removed KNOWN_OPEN route ends
   in the fix's refusal rather than its original symptom, so the entries stopped because of the fix.
-- **#1795's second route is not built yet**: Create Prefab's human undo is also #1823's partial-undo site, and waits
-  for that change to land.
+- **#1795's second route** was built with `require` (bbb0b370c). Since the first route's ruling (i), the create's undo
+  writes no file, so the question of a partial file write there is gone.
 
 #### Repro seeds
 
@@ -549,8 +559,17 @@ mechanically:
   caches, the undo stack, and the watcher's reload handler.
 - After every step it checks what can be read off a world and its files: I4, I5, I6, I7, I8, I15, I16, I18 and both
   validators.
-- Every save→reload must be the identity, and a second save must write the same bytes.
-- Each run ends by undoing to the start and redoing to the end.
+- Every save→reload must be the identity, and a second save must write the same bytes. A rotation is compared as ONE
+  value, an orientation (#1838, `alignEqualOrientations`, #1490's `sameOrientation`): the save drops a member rotation
+  whose orientation equals the chain's, so the reload may spell the same turn differently (`rx: 0.283…` back as `-6`).
+  It forgives what `sameOrientation` calls equal, which includes a real change under about 1e-4 rad; the second-save
+  byte check still compares the numbers.
+- Each run ends by undoing to the start and redoing to the end. At the start, a file a Create Prefab made may still be
+  there (its undo leaves it, #1795), but only holding that create's document (its bytes, or the same document under a
+  raised #1774 mark); any other content at that path is still a finding.
+- The generator writes only shapes a real producer writes (#1839): an outside edit is a hand edit of a value, or a new
+  plain row under a plain row as a merged editor Add Child numbers it. Never a plain row under a reference row, which no
+  editor write produces and which reads as a false I7.
 
 The test's header lists what it cannot see (no concurrency, a simulated watcher, one scene, no Play). Read it before
 concluding that an area is covered.
@@ -575,8 +594,8 @@ concluding that an area is covered.
   fresh-process replay reproduces the hunt's run.
 
 **The simulated watcher tells the editor's own writes apart by URL (#1840).** After each op the harness raises
-`scene-changed` for every changed file the router did NOT mark as the editor's own, and a raised file taints the segment:
-the file reloads under the op, and the undo-to-start identity and the clean-segment refusal checks are skipped. Until
+`scene-changed` for every changed file the router did NOT mark as the editor's own. Before #1845, a raised file tainted the segment:
+the file reloaded under the op, and the undo-to-start identity and the clean-segment refusal checks were skipped. Until
 #1840 the mark was looked up by `be.dir + url`, a string that never equals the router's `\`-separated path on Windows. So
 on Windows every editor write was raised and every segment with a write was tainted. The reload rebuilt the world from
 the file, which wiped the in-memory loss (marks, links) the KNOWN_OPEN repros need. On the public CI's Windows leg that
@@ -586,6 +605,29 @@ self-test holds both sides: a routed write is not raised, and an outside write i
 #1840 fix found no undo-class failures because of this, not because there were none.** The reloads also changed which
 routes a run reached (#1805 route 2 above), so re-run a finding from such a hunt on a fixed tree before relying on it,
 and read the cost figures above as measured with the extra reloads.
+
+**A taint must name its cause (#1845).** #1840 was one instance of a class: any mismatch between "the editor wrote this"
+and "an outside edit wrote this" silently switched the fuzzer's main checks off. So a taint now comes only from a closed
+list (`TaintCause` in `prefabFuzz/runner.ts`, each with the mechanism that makes it legitimate there):
+- `outsideEdit`: an outside edit wrote a prefab file. Its raise is the ONLY one a run accepts, and only for paths that op
+  wrote.
+- `prefabEditSave`: a prefab edit saved. That is the editor's own write, marked and never raised; it taints because the
+  save lives on the edit world's stack, which leaving drops (U27), and the scene entries recorded against the file refuse
+  after it (I10).
+- `rulingR`: a world swap expanded a Missing Prefab placeholder, or left a NESTED frame of a missing prefab unexpanded
+  (#1790 ruling D records the row and spawns nothing under it). Then the entities the stack recorded inside that frame
+  are gone rather than placeholders, and `require` refuses them the same way (#1849, found with the renderer manifest
+  pruned; hunt seed 6191 reaches it without). A swap that loses an entity with neither record is not this cause.
+- `renameCollision`: a Rename's undo or redo found its destination held by a document a Create Prefab wrote. Since the
+  create's undo leaves its file (#1795), a prefab created at the name a rename freed still holds that path; the rename's
+  step REFUSES, naming the taken path, moves nothing and is dropped (`destinationTakenRefusal`; hunt seed 6029). A
+  collision with any other file is not this cause.
+
+A watcher raise with any other cause FAILS the step, as `unexpected outside write`. Planting #1840 back (the router marking
+by absolute path) turns every verify seed red that way on macOS, which a self-test pins. Every run counts the ops that
+tainted, by cause, and the checks each taint turned off: the verify test prints one line, and a hunt prints both tallies
+after its coverage. **Compare those counts between platforms.** A platform whose taints or skips run far above
+another's, on the same seeds, is turning the checks off for a reason the other does not have.
 
 **A deleted prefab's round trip (#1805).** A live instance of a prefab whose file was deleted stays expanded, while a
 reload gives its Missing Prefab placeholder, as in Unity. So when the run has deleted a prefab (a document that is in no
@@ -717,7 +759,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | # | Behaviour | Unity | Modoki | Verdict |
 |---|---|---|---|---|
 | U26 | Object identity inside an instance | Objects in a prefab have fileIDs. A reference into an instance goes through a stripped placeholder: the source fileID plus the `PrefabInstance`. [M6 `yaml-prefab-serialization`] | `nodeGuid` names a template node. A member's guid is pinned on its member row (scene v16), so a scene reference survives a template renumber. § "Identity" (I4–I8). | match by design. Open breaks: #1659, #1680. |
-| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). The agent `create` op's undo relinks the tree but leaves the file. **Leaving prefab edit drops its history** (owner, 2026-09-28, #1704): however the edit world is left (Exit, a scene load, opening another prefab, re-opening the same one from inside it), the adoption owner drops its stack instead of parking it (`sceneAdoption.ts`, S8), so a re-open starts with nothing to undo. It used to be kept, and after an outside write (an Apply, a Replace, a checkout) it replayed onto a changed document: an undone delete came back at a number the Apply had given another row. **One deliberate difference:** an asset-document entry recorded there (material, clip, particle…, `_isFileDirect`) survives, parked under the prefab's key as it is across any discard: it edits another file, and dropping it would strand an asset edit with no undo (#1409). Like every asset-document entry, its undo and redo refuse unless the asset still holds that step's side, so an edit made to that asset elsewhere since is not reverted (#1710, [editor.md](editor.md) § An asset-DOCUMENT undo checks the asset still holds its side). Re-opening the prefab you are already editing also drops the history: that rebuilds the world from disk, which an outside write can have changed during the visit (the hot reload skips the edit world). | match, except the asset-document entries above. |
+| U27 | Undo | Apply, Revert, Unpack and Replace record undo when run as a user action. Leaving Prefab Mode drops that prefab's undo history. [S6 `InteractionMode`, M22 `EditingInPrefabMode`] | Apply, Revert, Detach and Create Prefab are undoable (`applyToPrefabWithUndo`, `revertOverridesWithUndo`, `detachPrefabInstanceWithUndo`). **Create Prefab's undo unlinks the tree and LEAVES the prefab file on disk**, the Hierarchy's as the agent `create` op's (#1795, hub ruling (i) 2026-09-29, Unity: undo reverts the scene object's connection, never the asset's creation). It used to trash the file, and a scene saved in between (a Cmd+S, an Apply's undo) still named it, so the next reload from disk made the tree a Missing Prefab nobody deleted. A file left behind is an ordinary unused asset. The redo re-links to it and writes nothing while it holds the document (its bytes, or the same document under a raised #1774 mark, which is how #1821's refusal went away), reading it where its guid lives NOW: a Rename since moves it, and another prefab created at the freed name may hold the path this step first wrote (hunt seed 6029); it writes it back, over nothing, only when it was deleted since; and a file changed since (a prefab-edit save, an outside edit) refuses the redo before any change (I10), since the re-tag plans the tree against the rows it wrote. The agent `create` op's redo asks the same file question, and writes nothing in any case: an absent file refuses it. Both undos refuse a tree the file's changed document rebuilt since (a prefab-edit save or an outside edit rebases the instance; unlinking it would keep the change as plain entities), `createdFrameRebuiltRefusal`, since the undo has no file write left to be conditional on. **A Replace is the deliberate difference:** its undo RESTORES the bytes it overwrote (#1264). That loses nothing and keeps the prefab's guid, so no scene can dangle, and the ruling was about a CREATED file. **Leaving prefab edit drops its history** (owner, 2026-09-28, #1704): however the edit world is left (Exit, a scene load, opening another prefab, re-opening the same one from inside it), the adoption owner drops its stack instead of parking it (`sceneAdoption.ts`, S8), so a re-open starts with nothing to undo. It used to be kept, and after an outside write (an Apply, a Replace, a checkout) it replayed onto a changed document: an undone delete came back at a number the Apply had given another row. **One deliberate difference:** an asset-document entry recorded there (material, clip, particle…, `_isFileDirect`) survives, parked under the prefab's key as it is across any discard: it edits another file, and dropping it would strand an asset edit with no undo (#1409). Like every asset-document entry, its undo and redo refuse unless the asset still holds that step's side, so an edit made to that asset elsewhere since is not reverted (#1710, [editor.md](editor.md) § An asset-DOCUMENT undo checks the asset still holds its side). Re-opening the prefab you are already editing also drops the history: that rebuilds the world from disk, which an outside write can have changed during the visit (the hot reload skips the edit world). | match, except the asset-document entries above. |
 | U28 | Runtime instantiate | `Object.Instantiate` makes no prefab connection. [S6 `Object.Instantiate`] | `spawnPrefabInstance` stamps `PrefabInstance` on every spawned entity, and nested rows expand at load, not at build. | **diverges**, deliberate: the runtime uses `PrefabInstance` for member guids and frame identity. The owner rules on whether it stays. |
 | U29 | Reordering children inside an instance | Not an override since 2022.3. Existing reorder overrides are discarded on upgrade. [M22 `UpgradeGuide2022LTS`] | A reorder is an `EntityAttributes.sortOrder` value override ([prefab-structural-overrides.md](./prefab-structural-overrides.md) § Edge cases). | **diverges**, deliberate: sits beside U7. The owner rules on it. |
 | U30 | Duplicate a child of an instance that holds a nested instance | The duplicate is an added GameObject override, and the nested prefab instance inside it stays a prefab instance. (No Manual page is cited: this is the hub's reading, recorded with its ruling.) | The same since #1756 (hub ruling on the owner's Unity rule, 2026-09-28): each copied node keeps its link only while the frame it is a row of is in the copy. A nested root whose owner stays behind becomes an independent instance (#1354's ruling, at any depth), a scene-added instance stays one, and the members of the frame left behind become plain added nodes. Before, the whole copy was flattened to plain nodes. | match |
@@ -1916,7 +1958,7 @@ prefab restored on disk re-expands on the next rebuild.
 **How a live frame's document stops resolving.** Not by an editor trash: `/api/delete-asset` marks the vanished paths as
 the editor's own writes, and nothing evicts either cache, so the deleted prefab stays readable until a reload, and the
 reload takes the load path above (the stale entry is #1751's). The caches are emptied only by `seatCaches(key, null)`
-(`prefabCommit.ts`), which runs on the undo of a Create Prefab, an Import Model or a rig prefab. A live instance of that
+(`prefabCommit.ts`), which runs on the undo of an Import Model or a rig prefab (not a Create Prefab's since #1795: it leaves the file). A live instance of that
 prefab is reached there only past a dropped throwing undo, `worldLeft()` mid-commit, a carried `Persistent` tree, or a
 key the editor never warmed. Create Prefab over such an instance writes a REFERENCE row from the record rather than
 refusing: its placeholder check runs before the nested warm, so a refusal would fire on a merely cold key. The check for

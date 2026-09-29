@@ -60,7 +60,17 @@ function subtreePaths(rootId: number, flat: EntityInfo[]): { id: number; path: S
     arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || a.id - b.id);
   }
   const out: { id: number; path: SubtreePath }[] = [];
+  // ⚠️ A parent cycle REFUSES, naming the entity, instead of recursing until the stack overflows (#1793 defence in
+  // depth, hub 2026-09-29). #1793's redo parented an instance root under its own member, and this walk was where it
+  // threw `Maximum call stack size exceeded`. The drop's parent is resolved by guid now, so this should never fire.
+  const visited = new Set<number>();
   const walk = (id: number, path: SubtreePath) => {
+    if (visited.has(id)) {
+      const name = flat.find((e) => e.id === id)?.name ?? String(id);
+      throw new UndoRefusedError(`[Prefab] refusing to walk the instance under entity ${rootId}: "${name}" (entity ${id}) is its own ancestor — a parent cycle (#1793).`,
+        `"${name}" is inside its own subtree (a parent cycle), so this step was not applied.`);
+    }
+    visited.add(id);
     out.push({ id, path });
     const kids = childrenByParent.get(id) ?? [];
     kids.forEach((k, i) => walk(k.id, `${path}${path ? '/' : ''}${k.name}#${i}`));

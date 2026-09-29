@@ -15,6 +15,7 @@ import { instantiatePrefabInstance, type PrefabFile } from './prefab';
 import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';
+import { UndoRefusedError } from '../undo/undoFailure';
 
 /** The file at `path`, or null when it is gone. The read token is the caller's, taken before this fetch. */
 async function readPrefabFile(path: string): Promise<PrefabFile | null> {
@@ -45,7 +46,8 @@ export async function placePrefabFromPath(path: string, opts: {
     const readAt = capturePrefabRead(path);
     const prefab = await readPrefabFile(path);
     if (!prefab) { console.warn(`[${opts.tag}] ${path} is gone; nothing was instantiated`); return null; }
-    const rootId = await instantiatePrefabInstance(prefab, path, parentId, readAt);
+    // By guid, resolved after the instantiate's own awaits (#1793 review): a world rebuilt during them re-numbers it.
+    const rootId = await instantiatePrefabInstance(prefab, path, parentRef ? () => parentRef.require() : 0, readAt);
     if (!rootId) { console.error(`[${opts.tag}] "${prefab.name}" produced no instance`); return null; }
     opts.onPlaced?.(rootId);
     console.log(`[${opts.tag}] Instantiated prefab "${prefab.name}"${parentId ? ` under parent ${parentId}` : ''}`);
@@ -59,7 +61,7 @@ export async function placePrefabFromPath(path: string, opts: {
         if (!p) return null;
         // Required after the read, right before the spawn: a parent that is gone, or is a placeholder now, refuses the
         // redo (owner ruling R) rather than landing the instance at the scene root or under another entity.
-        const id = await instantiatePrefabInstance(p, path, parentRef ? parentRef.require() : 0, again);
+        const id = await instantiatePrefabInstance(p, path, parentRef ? () => parentRef.require() : 0, again);
         opts.onPlaced?.(id);
         return id;
       },
@@ -72,6 +74,12 @@ export async function placePrefabFromPath(path: string, opts: {
     if (e instanceof StalePrefabRead || e instanceof PrefabEditRefusalError) {
       console.warn(`[${opts.tag}] ${e.message}`);
       useEditorStore.getState().showToast(e.message, 'warn');
+      return null;
+    }
+    // The parent the drop was aimed at is gone, or a Missing Prefab now, or not live (#1793): refused, with its own text.
+    if (e instanceof UndoRefusedError) {
+      console.warn(`[${opts.tag}] ${e.message}`);
+      useEditorStore.getState().showToast(e.toast, 'warn');
       return null;
     }
     console.error(`[${opts.tag}] Instantiate failed:`, e);

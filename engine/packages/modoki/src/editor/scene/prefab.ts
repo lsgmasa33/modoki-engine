@@ -32,6 +32,7 @@ import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdenti
 import { templateKeysOf, recoverTemplateKey as recoverKeyFrom, type KeyRecoveryNode } from '../../runtime/loaders/templateKeyRecovery';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { entityRef, type EntityRef } from '../undo/entityRef';
+import { UndoRefusedError } from '../undo/undoFailure';
 import { commitPrefabWrites } from './prefabCommit';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
@@ -1939,6 +1940,21 @@ export function instantiatePrefab(
   /** What each of `_layers` forwarded to this frame's nested roots when the caller folded it here. */
   _forwardRoots: readonly (ReadonlyMap<number, SceneMemberRow> | undefined)[] = [],
 ): number {
+  // ⚠️ A raw parent id that no live entity holds REFUSES, before anything is spawned (#1793 defence in depth, hub
+  // 2026-09-29). The placements hand `instantiatePrefabInstance` their parent as a guid ref it resolves after its own
+  // awaits (`placePrefabFromPath`, the agent's instantiate), so a dead id here is a new route handing a stale number
+  // down, and it must be loud. It cannot see a stale number that is LIVE in a new world — that is what resolving late is
+  // for. Asked HERE, not in the
+  // second pass: #1793's thrown redo was a DEAD id that koota recycled during this call's own first-pass spawn, so the
+  // second pass saw it live (one of this instance's members) and parented the root under itself.
+  if (parentId > 0 && !findEntity(parentId)) {
+    throw new UndoRefusedError(`[Prefab] refusing to instantiate "${prefab.name ?? prefab.id ?? 'a prefab'}" under entity ${parentId}: no live entity holds that id (a stale parent, #1793).`,
+      `"${prefab.name ?? 'The prefab'}" was not placed: the entity it was to go under is no longer in the scene.`);
+  }
+  // …and the SAME entity at the second pass: nothing in a synchronous spawn destroys it, so a change there is a new route.
+  // The handle carries koota's generation, so a recycled index reads as another entity (`captureEntityIdentity`'s test).
+  const parentHandle = parentId > 0 ? findEntity(parentId) : null;
+  const sameParent = parentHandle ? () => findEntity(parentId) === parentHandle : null;
   // The loader twin's rule (#1768): a document with no root to expand spawns nothing.
   if (!expandsToRoot(prefab, getCachedPrefabSync, _stack)) {
     console.warn(`[Prefab] prefab ${prefab.id ?? '(unnamed)'} expands to no root; nothing spawned`);
@@ -2100,6 +2116,14 @@ export function instantiatePrefab(
   // first pass spawned them all parentless (#1247). Direct findEntity writes — was
   // a full-world query.updateEach per row (O(n²)).
   const attrMeta = getTraitByName('EntityAttributes');
+  if (sameParent && !sameParent()) {
+    // Refused loudly, with what this call spawned taken back out (#1793 defence in depth): parenting the root under
+    // whatever holds the id now is how a redo once parented an instance under its own member.
+    deleteEntities([...localToEcs.values()]);
+    if (outerScope) closeTokenScope(outerScope);
+    throw new UndoRefusedError(`[Prefab] refusing to parent "${prefab.name ?? prefab.id ?? 'a prefab'}" under entity ${parentId}: it is not the entity the instantiate was handed any more (#1793).`,
+      `"${prefab.name ?? 'The prefab'}" was not placed: the entity it was to go under changed while it was being built.`);
+  }
   if (attrMeta) {
     for (const pe of prefab.entities) {
       const ecsId = localToEcs.get(pe.localId);
@@ -2407,7 +2431,11 @@ export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): 
  *  and BEFORE the spawn, so nothing is added and nothing is primed. Never a re-read: the caller asked to place the
  *  copy it read, and placing another one silently is a re-target. */
 export async function instantiatePrefabInstance(
-  prefab: PrefabFile, sourcePath: string, parentId: number = 0,
+  prefab: PrefabFile, sourcePath: string,
+  /** The parent, or a resolver of it (an entity ref's `require`), asked AFTER this function's awaits, right before the
+   *  spawn (#1793 review): a parent resolved before them names, after a world rebuild during them, whatever entity holds
+   *  that number in the new world, which is usually live, so no liveness check can tell. A number is taken as it is. */
+  parent: number | (() => number) = 0,
   /** From `capturePrefabRead(sourcePath)`, taken before the caller's read. Omitted, the window starts here. */
   readAt: () => boolean = capturePrefabRead(sourcePath),
 ): Promise<number> {
@@ -2416,6 +2444,7 @@ export async function instantiatePrefabInstance(
   const { assertPrefabEditAllows } = await import('./prefabEditRefusal');
   await preloadNestedPrefabs(prefab);
   if (!readAt()) throw new StalePrefabRead(prefab.name ?? 'the prefab');
+  const parentId = typeof parent === 'function' ? parent() : parent;
   // In prefab edit (#1817, #1836): an instance outside the root is dropped by the save, and one of the edited prefab — or
   // of any prefab that contains it — would make the save write a file containing itself. After the preload, so the
   // nested documents it walks are cached; before the spawn, so a refusal adds nothing. Every placement (the Hierarchy

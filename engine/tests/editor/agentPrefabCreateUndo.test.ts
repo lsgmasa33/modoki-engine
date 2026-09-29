@@ -19,12 +19,13 @@ import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
   deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction,
 } from '@modoki/engine/runtime';
-import { clearHistory, markSceneSaved, undo } from '@modoki/engine/editor';
-import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { clearHistory, markSceneSaved, undo, redo } from '@modoki/engine/editor';
+import { setPrefabCache, evictDeletedEditorPrefabs, isEditorPrefabCached } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { frameRootDoc, noteFrameRootDoc } from '../../packages/modoki/src/runtime/core/ecs/identityParents';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -44,6 +45,8 @@ const childPrefab = {
 
 let game: TestWorld | undefined;
 let origFetch: typeof globalThis.fetch;
+/** What the op wrote, served back to its reads: the redo re-links only while the file still holds its document. */
+const disk = new Map<string, string>();
 
 beforeEach(() => {
   game = createTestWorld({});
@@ -59,11 +62,14 @@ beforeEach(() => {
   // "absent" apart from "unreadable", a 200 serving zero bytes is a DAMAGED file — which the op now
   // refuses, correctly. The real dev server answers an absent asset with its SPA fallback or a 404,
   // never with an empty 200, so the old stub was modelling a response nothing produces.
-  globalThis.fetch = (async (url: unknown) => (
-    String(url).includes('/api/')
-      ? { ok: true, status: 200, json: async () => ({ ok: true, files: [] }), text: async () => '{}' } as Response
-      : { ok: false, status: 404, json: async () => ({}), text: async () => '' } as Response
-  )) as typeof globalThis.fetch;
+  disk.clear();
+  globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+    const u = String(url);
+    if (u.includes('/api/write-file')) { const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string }; disk.set(b.path, b.content); }
+    if (u.includes('/api/')) return { ok: true, status: 200, json: async () => ({ ok: true, files: [] }), text: async () => '{}' } as Response;
+    const hit = [...disk.keys()].find((p) => u.endsWith(p));
+    return hit !== undefined ? new Response(disk.get(hit)!, { status: 200 }) : { ok: false, status: 404, json: async () => ({}), text: async () => '' } as Response;
+  }) as typeof globalThis.fetch;
 });
 afterEach(() => {
   globalThis.fetch = origFetch;
@@ -169,6 +175,53 @@ describe('agent prefab create — undo restores the links the tree already had (
    *  `packages/modoki/tests/editor/createPrefabUndo.test.ts`, whose mock records the call sequence —
    *  not here, and an earlier version of this comment claimed nothing pinned it, on a mutation run
    *  with `--config engine/vite.config.ts`, which per CLAUDE.md § Tests is NOT the package suite. */
+  // #1795 review: the undo writes no file, so it asks the TREE whether it is still what the create tagged. A prefab-edit
+  // save or an outside edit rebases the instance onto the changed document (the frame's record is where that shows), and
+  // unlinking it then would keep the change as plain entities. Built directly: the record, as a rebase leaves it.
+  // Mutation: drop `createdFrameRebuiltRefusal` from the agent undo's check — the instance is unlinked.
+  it('undo refuses once the instance was rebuilt from a changed prefab, and leaves it linked', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-rb-r' }));
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rb-r', path: NEW_PATH });
+    expect(r.has(PrefabInstance), 'premise: the create linked R').toBe(true);
+    const rec = frameRootDoc(getCurrentWorld(), r)!;
+    expect(rec, 'premise: the tag recorded the frame').toBeDefined();
+    const doc = rec.doc as unknown as { entities: unknown[] };
+    noteFrameRootDoc(getCurrentWorld(), r, { ...rec, doc: { ...doc, entities: [...doc.entities, { localId: 9, name: 'D', traits: { EntityAttributes: { name: 'D', parentId: 1, guid: '' } } }] } as never });
+    await undo(); // refused: reported and dropped by the manager, not thrown here
+    expect(r.has(PrefabInstance)).toBe(true);
+  });
+
+  // #1795 review: the agent redo re-links only while the file still holds the document it wrote, as the human redo does.
+  // Mutation: drop the redo's `prefabTextIsDocument` check — the redo tags R against a file that no longer holds it.
+  it('redo re-links while the file holds the document, and refuses once it was changed', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-rd-r' }));
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rd-r', path: NEW_PATH });
+    expect(disk.has(NEW_PATH), 'premise: the create wrote the file').toBe(true);
+    await undo();
+    expect(r.has(PrefabInstance)).toBe(false);
+    await redo();
+    expect(r.has(PrefabInstance), 'the redo re-links to the file it left').toBe(true);
+    await undo();
+    disk.set(NEW_PATH, disk.get(NEW_PATH)!.replace('"name": "R"', '"name": "Edited"'));
+    expect(disk.get(NEW_PATH), 'premise: the file changed').toContain('Edited');
+    await redo();
+    expect(r.has(PrefabInstance)).toBe(false);
+  });
+
+  // I9, as the human redo (close-out review 2): the redo re-seats a key an eviction left cold. Mutation: drop the agent
+  // redo's `primeEditorPrefabCache` — the key stays cold.
+  it('redo re-seats an editor cache evicted since the undo', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-pr-r' }));
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-pr-r', path: NEW_PATH });
+    const id = (r.get(PrefabInstance) as { source: string }).source;
+    await undo();
+    evictDeletedEditorPrefabs(NEW_PATH);
+    expect(isEditorPrefabCached(id), 'premise: evicted').toBe(false);
+    await redo();
+    expect(r.has(PrefabInstance)).toBe(true);
+    expect(isEditorPrefabCached(id)).toBe(true);
+  });
+
   it('undo puts the members\' original guids back, and every ref with them (#1461)', async () => {
     const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-undo-r' }));
     const a = game!.spawn(Transform(), EntityAttributes({ name: 'A', parentId: r.id(), guid: 'g-undo-a' }));

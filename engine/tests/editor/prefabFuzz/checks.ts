@@ -14,6 +14,7 @@ import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/p
 import { findEntity } from '@modoki/engine/runtime';
 import { unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { piOf } from './harness';
+import { sameOrientation } from '../../../packages/modoki/src/runtime/scene/transformSpace';
 
 /** `console`: every console.error line the end walk logged, allowlisted or not, when the walk's identity check fails —
  *  the line that names the mechanism (a refusal's full text, a "not tagging" reason) is often there, not in `detail`. */
@@ -291,6 +292,34 @@ export function canonScene(scene: unknown, placeholders: ReadonlySet<string>, no
  *  Prefab placeholder (Unity does the same), so the two cannot be equal, and what must hold is that the save lost nothing
  *  the live world holds. The byte check still runs on the plain reload's save, so the placeholder must write its record
  *  back byte for byte. */
+/** `after`, with each entity's rotation spelled as in `before` wherever the two are the SAME orientation (#1838). A
+ *  rotation is one value, not three fields (#1490's `sameOrientation`): the save drops a member's rotation whose
+ *  orientation equals the chain's, and the reload gives the chain's spelling (`rx: 0.283…` comes back `-6`, the same turn
+ *  less 2π). Only the spelling is forgiven — a different orientation is left as it is, and still differs — up to
+ *  `sameOrientation`'s own tolerance (`1 - |q·q'| <= 1e-9`, about 1e-4 rad): a smaller real change is forgiven here, and
+ *  is left to the save→reload→save byte check, which compares the numbers the file holds. */
+export function alignEqualOrientations(before: unknown, after: unknown): unknown {
+  type Tf = { rx?: number; ry?: number; rz?: number };
+  const tfOf = (e: unknown) => (e as { traits?: { Transform?: Tf } } | undefined)?.traits?.Transform;
+  const b = before as Record<string, unknown>;
+  const a = after as Record<string, unknown>;
+  if (!b || !a || typeof b !== 'object' || typeof a !== 'object') return after;
+  let out: Record<string, unknown> | null = null;
+  for (const k of Object.keys(a)) {
+    const tb = tfOf(b[k]); const ta = tfOf(a[k]);
+    if (!tb || !ta) continue;
+    const rot = (t: Tf) => ({ rx: t.rx ?? 0, ry: t.ry ?? 0, rz: t.rz ?? 0 });
+    const [rb, ra] = [rot(tb), rot(ta)];
+    if ((rb.rx === ra.rx && rb.ry === ra.ry && rb.rz === ra.rz) || !sameOrientation(rb, ra)) continue;
+    const e = a[k] as { traits: { Transform: Tf } & Record<string, unknown> } & Record<string, unknown>;
+    const tf: Tf & Record<string, unknown> = { ...e.traits.Transform };
+    for (const f of ['rx', 'ry', 'rz'] as const) { if (f in tb) tf[f] = tb[f]; else delete tf[f]; }
+    out ??= { ...a };
+    out[k] = { ...e, traits: { ...e.traits, Transform: tf } };
+  }
+  return out ?? after;
+}
+
 export function checkRoundTrip(
   rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown }, tolerate: Tolerate = {},
   prefabGone: (source: string) => boolean = () => false,
@@ -301,8 +330,8 @@ export function checkRoundTrip(
   // never expanded); the restored one holds when the live instance is still expanded and the save carried all of it. The
   // restored one alone would fail a correct run whose live world holds a frame the delete left unexpanded: restored, it
   // expands. Reported through the restored comparison, the stricter one for the case it exists for.
-  const restoring = rt.restored !== undefined && firstDiff(rt.before, rt.after) !== null;
-  const reloaded = restoring ? rt.restored : rt.after;
+  const restoring = rt.restored !== undefined && firstDiff(rt.before, alignEqualOrientations(rt.before, rt.after)) !== null;
+  const reloaded = alignEqualOrientations(rt.before, restoring ? rt.restored : rt.after);
   const d = firstDiff(rt.before, reloaded);
   if (d) {
     // Whether a whole entity went missing, and if so whether one with its name took a NEW guid on the other side (a guid

@@ -27,6 +27,7 @@ import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unres
 import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../../../packages/modoki/src/runtime/core/notifyListeners';
+import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { ROOT_URL, type FuzzBackend } from './backend';
 
 type Handler = (data: unknown) => void;
@@ -286,6 +287,20 @@ export function editing(): boolean { return isEditingPrefab(); }
  *  registered trait, so `getAllEntities().traits` never lists it. */
 export function placeholderGuids(): Set<string> {
   return new Set(getAllEntities().filter((e) => e.guid && unresolvedRefOf(findEntity(e.id) as never)).map((e) => e.guid!));
+}
+
+/** Every nested row a live frame's record says its expansion could NOT expand (#1790 ruling D, #1812: the child prefab
+ *  was not there to expand), keyed `<frame root guid>:<localId>`. A world swap that adds one has dropped the rows that
+ *  nested frame held, as the loader does by design when the prefab is gone (#1849). */
+export function unexpandedRows(): Set<string> {
+  const out = new Set<string>();
+  const world = getCurrentWorld();
+  for (const e of getAllEntities()) {
+    const handle = e.guid ? findEntity(e.id) : null;
+    const rec = handle ? frameRootDoc(world, handle) : undefined;
+    for (const localId of rec?.unexpanded ?? []) out.add(`${e.guid}:${localId}`);
+  }
+  return out;
 }
 
 /** The world as a tree, keyed by guid: each entity's parent guid, sibling order, every trait's data (ECS ids read as

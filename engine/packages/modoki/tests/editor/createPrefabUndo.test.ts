@@ -39,6 +39,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   missingPrefabPlaceholders: () => [],
   // The commit's I16 check reads nested documents through this (#1817); these trees nest nothing it can read.
   getCachedPrefabSync: () => null,
+  // The no-write redo seats a cold key (I9); these trees read nothing back from it.
+  primeEditorPrefabCache: () => {},
   // Reports whatever the current test asked for, so the propagation through
   // createPrefabFromEntity -> CreatePrefabResult.runtimeExcluded is asserted at the seam that
   // actually carries it (review F3: nothing downstream of the callback had a test).
@@ -148,6 +150,9 @@ const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
   // A REAL Response over the stored bytes: its `text()` strips a leading BOM, as a browser's does — which is the #1684
   // note's whole point, and a fake `text()` that kept it would hide the defect.
   if (served) return new Response(new TextEncoder().encode(served[1]), { status: 200 });
+  // An asset that is not there is a 404, as the host serves it: a create's redo reads the path and writes back only a
+  // file that is absent (#1795).
+  if (!bad && !String(url).includes('/api/')) return new Response('', { status: 404 });
   return { ok: !bad, status: bad ? 500 : 200, json: async () => ({}) } as any;
 });
 
@@ -186,32 +191,20 @@ async function makeAction() {
 beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('createPrefabFromEntity — undo', () => {
-  it('does not untag the live tree or clear the cache when the trash fails, and reports', async () => {
+  // #1795 (hub ruling (i), Unity): a CREATE's undo unlinks the tree and leaves the prefab — no trash, no write, and the
+  // caches keep the document the file still holds. Mutation: put the trash back in the create branch of the undo.
+  it('a CREATE\'s undo untags and asks the route for nothing: the file and the cache stay', async () => {
     const action = await makeAction();
-    const err = spyError();
+    const bytes = onDisk.get('/p/thing.prefab.json');
     setPrefabCacheSpy.mockClear();
-
-    failing.add('/api/delete-asset');
-    await action.undo();
-
-    expect(err).toHaveBeenCalledTimes(1);
-    const msg = String(err.mock.calls[0][0]);
-    expect(msg).toContain('Undo');
-    expect(msg).toContain('/p/thing.prefab.json');
-    // All-or-nothing: the file is still on disk, so the entities stay linked to it
-    // rather than being half-undone.
-    expect(untagSpy).not.toHaveBeenCalled();
-    expect(setPrefabCacheSpy).not.toHaveBeenCalled();
-  });
-
-  it('untags and clears the cache when the trash succeeds', async () => {
-    const action = await makeAction();
-    setPrefabCacheSpy.mockClear();
+    mockFetch.mockClear();
 
     await action.undo();
 
     expect(untagSpy).toHaveBeenCalledTimes(1);
-    expect(setPrefabCacheSpy).toHaveBeenCalledWith('g-new', null);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(onDisk.get('/p/thing.prefab.json')).toBe(bytes);
+    expect(setPrefabCacheSpy).not.toHaveBeenCalled();
   });
 
   // #1272: the untag is scoped to the prefab being undone, so a held nested instance keeps its
@@ -245,8 +238,26 @@ describe('createPrefabFromEntity — undo', () => {
 });
 
 describe('createPrefabFromEntity — redo', () => {
-  it('does not cache, register or tag when the write fails, and reports', async () => {
+  // The undo left the file (#1795), so the redo re-links to it and writes nothing while it holds the document.
+  // Mutation: drop the create branch of the redo — it writes over the file it expects to be absent, and is refused.
+  it('re-links to the file the undo left, writing and caching nothing', async () => {
     const action = await makeAction();
+    await action.undo();
+    setPrefabCacheSpy.mockClear(); registerAssetSpy.mockClear(); tagSpy.mockClear();
+    written = [];
+
+    await action.redo();
+
+    expect(written).toEqual([]);
+    expect(setPrefabCacheSpy).not.toHaveBeenCalled();
+    expect(tagSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // A file deleted after the undo (the unused asset cleaned up) is written back — and that write is gated (#308).
+  it('does not cache, register or tag when the write of a deleted file fails, and reports', async () => {
+    const action = await makeAction();
+    await action.undo();
+    onDisk.delete('/p/thing.prefab.json');
     const err = spyError();
     setPrefabCacheSpy.mockClear(); registerAssetSpy.mockClear(); tagSpy.mockClear();
 
@@ -263,8 +274,10 @@ describe('createPrefabFromEntity — redo', () => {
     expect(tagSpy).not.toHaveBeenCalled();
   });
 
-  it('caches, registers and tags when the write succeeds', async () => {
+  it('caches, registers and tags when the write of a deleted file succeeds', async () => {
     const action = await makeAction();
+    await action.undo();
+    onDisk.delete('/p/thing.prefab.json');
     setPrefabCacheSpy.mockClear(); registerAssetSpy.mockClear(); tagSpy.mockClear();
 
     await action.redo();
@@ -478,8 +491,10 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
 describe('a FAILED undo then redo does not overwrite the prior links with the new prefab\'s own (#1264 close-out)', () => {
   // reportUndoFailure RETURNS, so the undo manager moves the failed undo to the redo stack while the
   // tree is still tagged. A redo that re-snapshotted then would store THIS prefab's links as "prior",
-  // and the next successful undo re-linked the tree to the file it had just trashed.
+  // and the next successful undo re-linked the tree to the prefab it had just been unlinked from.
+  // A REPLACE: since #1795 a create's undo writes nothing, so only a Replace's restore can fail.
   it('redo after a failed undo tags without re-snapshotting; the next undo still restores the ORIGINAL links', async () => {
+    onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[{"localId":1}]}\n`);
     const action = await makeAction();   // snapshot #1 → PRIOR_LINKS
     // Any LATER snapshot is of the tree carrying this prefab's own tags — a distinct value, so the
     // last assertion can tell which snapshot undo restored.
@@ -487,7 +502,7 @@ describe('a FAILED undo then redo does not overwrite the prior links with the ne
     detachSpy.mockImplementation(() => OWN_LINKS as never);
     try {
       spyError();
-      failing.add('/api/delete-asset');
+      failing.add('/api/write-file');
       await action.undo();           // fails — tree stays tagged
       failing.clear();
       calls.length = 0;
@@ -520,13 +535,17 @@ describe('createPrefabFromEntity — the runtime-exclusion count reaches the cal
 describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
   const P = '/p/thing.prefab.json';
 
-  it('undo of a CREATE refuses to trash a prefab saved since, and changes nothing', async () => {
+  // #1795: a create's undo no longer touches the file, so a save since is simply kept — the undo unlinks the tree, and
+  // it is the REDO that refuses to re-link to a document the file no longer holds (below).
+  it('undo of a CREATE leaves a prefab saved since as it is, and unlinks', async () => {
     const action = await makeAction();
     onDisk.set(P, '{"id":"g-new","edited":true}\n');
     untagSpy.mockClear();
-    await expect(action.undo()).rejects.toBeInstanceOf(UndoRefusedError);
+    await action.undo();
     expect(onDisk.get(P)).toContain('edited');
-    expect(untagSpy).not.toHaveBeenCalled(); // refused before anything moved
+    expect(untagSpy).toHaveBeenCalledTimes(1);
+    await expect(action.redo()).rejects.toBeInstanceOf(UndoRefusedError);
+    expect(onDisk.get(P)).toContain('edited');
   });
 
   it('undo of a REPLACE refuses to overwrite a prefab saved since', async () => {
@@ -545,12 +564,13 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     expect(onDisk.get(P)).toBe('{"id":"someone-else"}\n');
   });
 
-  it('accept side: create and replace both round-trip undo → redo → undo over the bytes really written', async () => {
+  it('accept side: create and replace both round-trip undo → redo → undo over the bytes really there', async () => {
     const created = await makeAction();
     const after = onDisk.get(P);
-    await created.undo(); expect(onDisk.has(P)).toBe(false);
+    await created.undo(); expect(onDisk.get(P)).toBe(after); // #1795: the file stays
     await created.redo(); expect(onDisk.get(P)).toBe(after);
-    await created.undo(); expect(onDisk.has(P)).toBe(false);
+    await created.undo(); expect(onDisk.get(P)).toBe(after);
+    onDisk.delete(P);
 
     onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const replaced = await makeAction();
@@ -560,8 +580,8 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     await replaced.undo(); expect(onDisk.get(P)).toBe('{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
   });
 
-  // #1795's second route (I19): the tagged tree is asked for BEFORE the file moves. Mutation: drop the
-  // `if (tagged) ref.require(...)` line from the undo — the file is trashed first.
+  // #1795's second route (I19): the tagged tree is asked for BEFORE anything changes. Mutation: drop the
+  // `ref.require(tagCheck)` from the create branch of the undo — it untags a tree `require` refuses.
   it('an undo whose tree `require` refuses leaves the file on disk and asks the route for nothing; the redo refuses before it writes', async () => {
     const action = await makeAction();
     const bytes = onDisk.get(P);
@@ -574,28 +594,33 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  // A REPLACE: the flag is a Replace's only since #1795 (a create's redo reads the file instead).
   it('which bytes the FILE holds is its own flag: a redo that wrote but found no tree to tag, then a failed undo, does not refuse the next redo', async () => {
     spyError();
+    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const action = await makeAction();
-    await action.undo(); // trashed; the tree untagged
+    await action.undo(); // restored; the tree untagged
     refState.gone = true;
     await action.redo(); // the file is written, but there is no tree to tag — `tagged` stays false
     refState.gone = false;
-    expect(onDisk.has(P)).toBe(true);
-    failing.add('/api/delete-asset');
+    const wrote = onDisk.get(P);
+    expect(wrote).not.toContain('before');
+    failing.add('/api/write-file');
     await action.undo(); // reported, not applied: the file still holds what the redo wrote
     failing = new Set();
     await action.redo(); // must not refuse: it expects the bytes that are really there
-    expect(onDisk.has(P)).toBe(true);
+    expect(onDisk.get(P)).toBe(wrote);
   });
 
-  it('a redo after an undo that FAILED expects the bytes still there, not an empty path', async () => {
+  it('a redo after a Replace undo that FAILED expects the bytes still there, not the replaced ones', async () => {
     spyError();
+    onDisk.set(P, '{"id":"g-old","before":true,"entities":[{"localId":1}]}\n');
     const action = await makeAction();
-    failing.add('/api/delete-asset');
-    await action.undo(); // reported, not applied: the prefab is still on disk as created
+    const wrote = onDisk.get(P);
+    failing.add('/api/write-file');
+    await action.undo(); // reported, not applied: the prefab still holds what the Replace wrote
     failing = new Set();
     await action.redo(); // must not refuse
-    expect(onDisk.has(P)).toBe(true);
+    expect(onDisk.get(P)).toBe(wrote);
   });
 });
