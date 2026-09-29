@@ -23,7 +23,10 @@
  *    writes the first file); drop the rollback — the race case goes red.
  *  - The hold cannot deadlock (#1667, the hub's condition): nothing a write's rebuild reaches — Apply's refresh, Create
  *    Prefab's tag, the rebase, an undo's rebuild — starts a world switch, which would wait for the hold that waits for
- *    it. Mutation: start one from `commitPrefabWrite`'s rebuild step — that case goes red (and, un-counted, hangs). */
+ *    it. Mutation: start one from `commitPrefabWrite`'s rebuild step — that case goes red (and, un-counted, hangs).
+ *  - #1797: a writer stamped v8 on a clone of a file that had no `nextLocalId`, and nothing stated the mark. The commit
+ *    owns "a document that claims v8 states its mark" for every writer. Mutation: drop `markUnstated` from `contentFor`'s
+ *    early return — the document case and the recorded-bytes case go red, the accept cases stay green. */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createHash } from 'node:crypto';
@@ -104,7 +107,7 @@ import {
 import { setActionCallback, pushAction, clearHistory, deleteEntityWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs, PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
-import { localIdCounter } from '../../packages/modoki/src/runtime/core/localIdCounter';
+import { localIdCounter, markUnstated } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -324,6 +327,57 @@ describe('one write, both caches, every key (#1692; the agent `create` sibling o
     const res = await quietly(() => commitPrefabWrite(X, next, { expected: xDoc() }));
     expect(res.ok).toBe(true);
     expect(route.disk.get(X_PATH)).toBe(jsonFileBody(next));
+  });
+});
+
+describe('a write that claims v8 states its mark, whichever writer stamped the version (#1797)', () => {
+  // X on disk is v6 with no mark, rows 1–4: the mark its rows give is 5, and no prior raises it — the case #1797's
+  // enclosing Apply document hit, where the "raise to the prior" line had nothing to do.
+  const stampedV8 = (): PrefabFile => ({ ...xDoc(), version: PREFAB_FORMAT_VERSION });
+
+  it('a document stamped v8 with no mark is written with the one its rows give, after rootLocalId', async () => {
+    const res = await quietly(() => commitPrefabWrite(X, stampedV8(), { expected: xDoc() }));
+    expect(res.ok).toBe(true);
+    const onDisk = JSON.parse(route.disk.get(X_PATH)!) as PrefabFile;
+    expect(onDisk).toMatchObject({ version: PREFAB_FORMAT_VERSION, nextLocalId: 5 });
+    const keys = Object.keys(onDisk);
+    expect(keys.indexOf('nextLocalId')).toBe(keys.indexOf('rootLocalId') + 1);
+  });
+
+  it('recorded bytes that claim v8 with no mark: the mark is spliced in and every other byte kept', async () => {
+    const bytes = jsonFileBody(stampedV8());
+    const res = await quietly(() => commitPrefabWrite(X, stampedV8(), { expected: xDoc(), bytes }));
+    expect(res.ok).toBe(true);
+    expect(route.disk.get(X_PATH)).toBe(jsonFileBody({ nextLocalId: 5, ...stampedV8() } as never));
+  });
+
+  it('(accept) a document that does not claim v8 goes down exactly as built, with no mark', async () => {
+    const next = xDoc();
+    next.entities.push(row(5, 'XD', 1, g(5)) as never);
+    const res = await quietly(() => commitPrefabWrite(X, next, { expected: xDoc() }));
+    expect(res.ok).toBe(true);
+    expect(route.disk.get(X_PATH)).toBe(jsonFileBody(next));
+  });
+
+  // Pins "a stated mark is never lowered" — a mark ABOVE the rows (9 over rows 1–4, #1774's freed top number) must not be
+  // re-derived from the rows (the hub's check; killed by making contentFor re-derive a stated mark). It does NOT guard
+  // `markUnstated`'s false branch: an over-trigger writes the same bytes here. The `markUnstated` table below does.
+  it('(accept) a v8 document that states its mark keeps it, byte for byte', async () => {
+    const next = { ...stampedV8(), nextLocalId: 9 } as PrefabFile;
+    const res = await quietly(() => commitPrefabWrite(X, next, { expected: xDoc() }));
+    expect(res.ok).toBe(true);
+    expect(route.disk.get(X_PATH)).toBe(jsonFileBody({ ...stampedV8(), nextLocalId: 9 } as never));
+  });
+
+  it('markUnstated: v8 or later without a positive-integer mark, and nothing else', () => {
+    expect(markUnstated({ version: 8 })).toBe(true);
+    expect(markUnstated({ version: 9 })).toBe(true); // a later format still carries the field
+    expect(markUnstated({ version: 8, nextLocalId: 0 })).toBe(true);
+    expect(markUnstated({ version: 8, nextLocalId: 'five' })).toBe(true);
+    expect(markUnstated({ version: 8, nextLocalId: 5 })).toBe(false);
+    expect(markUnstated({ version: 7 })).toBe(false); // before the mark: derived from the rows, legitimately absent
+    expect(markUnstated({})).toBe(false);
+    expect(markUnstated(null)).toBe(false);
   });
 });
 

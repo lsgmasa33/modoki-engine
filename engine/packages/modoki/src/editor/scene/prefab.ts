@@ -6115,10 +6115,8 @@ async function planApply(
       const stale = framesBuiltFromOtherRows(root);
       if (!expected || stale.length) { outerRefusal ||= expected ? staleFramesRefusal(stale) : `Prefab "${src}" is not loaded`; return null; }
       const doc = JSON.parse(JSON.stringify(expected)) as PrefabFile;
+      // Claims v8, so its write states the mark: `contentFor` owns that for every writer (#1797), from the rows here.
       doc.version = PREFAB_FORMAT_VERSION;
-      // v8 states its mark (#1774): a file that had none gets it from its rows here, or the enclosing write claimed v8
-      // without one (#1797). The frame's own document gets its mark where its rows are planned.
-      advanceLocalIdCounter(doc);
       const before = JSON.parse(JSON.stringify(expected)) as PrefabFile;
       // An id-less file gets its id HERE, on both sides, as the frame's own document does above (#1729): minted by the
       // write alone, the undo put `before` back with no id, the next write minted another, and redo always refused.
@@ -6622,7 +6620,8 @@ async function planApply(
   }
 
   // The high-water mark (#1774): past every number this Apply handed out, and never below the document it lands over. An
-  // enclosing document only loses an override here and mints nothing; its mark rides in its clone.
+  // enclosing document only loses an override here and mints nothing: its clone's mark, or the one the commit states
+  // from its rows when the file had none (#1797).
   advanceLocalIdCounter(newPrefab, oldPrefab, nextLocalId.v);
   for (const x of appliedTargets) x.key = spell(x.key);
   return {

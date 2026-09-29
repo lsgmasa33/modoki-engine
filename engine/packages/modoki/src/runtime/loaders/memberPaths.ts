@@ -6,6 +6,7 @@
 import { durableGuid, memberRowNodes, deriveMemberGuid, addedKeyStep, mapStringValues, parseSteps, memberPathSteps, FRAME_STEP, type MemberStep } from '../core/assetRefRules';
 import { isMemberToken, parseMemberToken, memberToken, memberPathKey, MEMBER_TOKEN_PREFIX } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
+import { sceneEntryGuid } from './authoredEntityGuids';
 
 /** Reads a prefab document by its asset guid; `null`/`undefined` when it cannot. */
 export type PrefabReader = (prefabGuid: string) => unknown;
@@ -279,7 +280,8 @@ type SceneEntry = AddedNode & { id?: unknown; traits?: { EntityAttributes?: { gu
  *    which a copy at another path does not share.
  *  Either way nothing below it can be predicted, so its refs are left as they were. */
 export function sceneAnchorOf(entry: SceneEntry, entries: SceneEntry[]): string | null {
-  const ownGuid = (e: SceneEntry): string => durableGuid(String((e.prefab ? e.guid : e.traits?.EntityAttributes?.guid) ?? ''));
+  // The loader's own reader (#1798): EntityAttributes.guid, else the entry's top-level guid, as pass 1 spawns it.
+  const ownGuid = (e: SceneEntry): string => sceneEntryGuid(e);
   const raw = entry.traits?.EntityAttributes?.parentId;
   const parent = typeof raw === 'string'
     ? (raw ? entries.find((x) => ownGuid(x) === raw) : undefined)
@@ -326,7 +328,7 @@ export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberA
   const entries = (Array.isArray(scene.entities) ? scene.entities : []).filter((e): e is Row => !!e && typeof e === 'object');
   for (const entry of entries) {
     if (!entry.prefab && !Array.isArray(entry.children)) continue;
-    const ownGuid = durableGuid(typeof entry.guid === 'string' ? entry.guid : '');
+    const ownGuid = sceneEntryGuid(entry); // the loader's reader (#1798)
     out.push({
       node: entry,
       opts: { guidLess: !!entry.prefab && !ownGuid, orphans: 'parent' },

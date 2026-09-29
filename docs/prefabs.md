@@ -695,8 +695,8 @@ noop for a deleted prefab names it.
 
 **What the hunts found:** #1792 to #1796, #1798, #1800, #1805, #1807 to #1809, #1812's route, #1817 to #1822 and #1826
 to #1830, each observed and minimized. #1817 is a crash: a prefab-edit save writes a file that contains itself. #1827
-is an undo that deletes an unrelated entity: after a world swap it falls back to a raw ECS id. #1797 was a one-line
-fix. Its repro, and those of #1807 and #1812 (fixed on work-ai), are regression cases. Many of the later findings
+is an undo that deletes an unrelated entity: after a world swap it falls back to a raw ECS id. #1797 was first fixed at
+its one writer, then moved into the commit (see "The localId high-water mark"). Its repro, and those of #1807 and #1812 (fixed on work-ai), are regression cases. Many of the later findings
 need the undo stack to survive a reload, which the harness did not do at first: a run's first reload emptied it.
 The diagnoses found two harness defects that review had not: that history key, and an end walk that judged a
 restored fixture as the editor's own old-version write.
@@ -942,11 +942,19 @@ problem with random fileIDs instead; the owner kept sequential numbers, which ar
 - **Advance.** `commitPrefabWrites` is the line under every writer, because every client prefab write
   goes through it (I9). Its `contentFor` raises a document's mark to that of the file it lands over. That
   file is `expected`, or the file re-read when that is what the precondition matched. A write that lowers
-  nothing goes down exactly as built.
-  - **A raised mark claims v8.** The document is stamped v8 so an older build refuses to save over it
+  nothing, and that states its mark whenever it claims v8, goes down exactly as built.
+  - **A raised mark claims v8.** The document is stamped v8 (`LOCAL_ID_MARK_VERSION`, the version the field
+    arrived in, not whatever `PREFAB_FORMAT_VERSION` is by then) so an older build refuses to save over it
     and drop the mark. A document newly given the mark carries it right after `rootLocalId`, where the
     serializer puts it.
-  - **An undo that restores bytes** (#1679) stays verbatim unless it would lower the mark. Undoing a write
+  - **A document that claims v8 states its mark, whoever stamped the version** (#1797). `contentFor`
+    also writes through a document at v8 or later whose `nextLocalId` is absent or not a positive
+    integer (`markUnstated`, `localIdCounter.ts`), and states the mark from its rows. The commit is the
+    ONE owner of that rule. Apply's write into an ENCLOSING prefab stamped v8 on a clone of a file that
+    had no mark, and nothing raised it, because no prior was higher. A writer may still state the mark
+    early, where it records the bytes it will write (`serializePrefab` does), but none has to.
+  - **An undo that restores bytes** (#1679) stays verbatim unless it would lower the mark, or the bytes
+    claim v8 without stating one. Undoing a write
     that minted numbers must not free them: Apply adds C at 4, Cmd+Z, the next Apply adds D at 4, and D
     takes C's guid. When the mark must rise, `withTopLevelNumbers` splices the mark and version into the
     original bytes, keeping formatting, key order and a BOM. It re-serializes only when it cannot prove

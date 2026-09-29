@@ -13,6 +13,7 @@
  *  type checks are skipped (reported once as an info note by the caller). */
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
+import { sceneEntryGuid } from './authoredEntityGuids';
 import { isSizeInert } from '../ui/anchorLayout';
 import {
   isElementMarginInert, MARGIN_KEYS,
@@ -851,13 +852,17 @@ export function validateSceneData(
   //    dangling/self parentId, dangling entity-ref targets, prefab self-reference. (F4)
   const ids = new Set<number>();
   const guids = new Set<string>();
+  // A prefab entry that does not resolve loads as a placeholder, which keeps pass 1's guid (`sceneEntryGuid`).
+  const guidOpts = getPrefab ? { resolves: (ref: string) => getPrefab(ref) != null } : undefined;
   const dupIds = new Set<number>();
   for (const raw of scene.entities) {
     const e = raw as SceneEntityLike;
     if (e == null || typeof e !== 'object') continue;
     if (typeof e.id === 'number') { if (ids.has(e.id)) dupIds.add(e.id); ids.add(e.id); }
-    const g = entAttrs(e)?.guid;
-    if (typeof g === 'string' && g) guids.add(g);
+    // The guid the LOADER gives the entry (#1798): a prefab-instance root and a Missing Prefab placeholder keep theirs at
+    // the entry's top level, with no EntityAttributes.guid, and a child parented to one is not an orphan.
+    const g = sceneEntryGuid(e, guidOpts);
+    if (g) guids.add(g);
   }
   for (const id of dupIds) warnings.push(`duplicate entity id #${id} — ids must be unique`);
 
@@ -866,7 +871,7 @@ export function validateSceneData(
     if (e == null || typeof e !== 'object') return;
     const label = entityLabel(e, idx);
     const attrs = entAttrs(e);
-    const ownGuid = typeof attrs?.guid === 'string' ? attrs.guid : undefined;
+    const ownGuid = sceneEntryGuid(e, guidOpts) || undefined;
 
     // parentId: GUID (current) or numeric file id (legacy); '' / 0 = root.
     const pid = attrs?.parentId;

@@ -13,5 +13,6 @@
   "spriteAnim.frames.0.remove": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
   "spriteEditor.slice.91ba05c8-33d3-4389-936f-892ac9262743": "Authored sprite-slice GUID — project data, not a source-side value.",
   "uiActions.binding.0.action": "Authored array index (`uiActions.binding.${i}.action`, #1170) — same as uiActions.binding.0.kind above.",
-  "uiActions.binding.0.kind": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above."
+  "uiActions.binding.0.kind": "Authored array index (a `*.row.${i}.*` id) — same as particle.bursts.row.0.count above.",
+  "hierarchy.entity.__prefab_edit_root__": "The Hierarchy row of the prefab-edit ROOT: its guid is the fixed sentinel PREFAB_EDIT_ROOT_GUID (`prefabEditGuids.ts`), not a scene guid, so no scene file can derive it. QA-PREFAB-0035 aims at it; observed resolving live 2026-09-29 (#1755)."
 }

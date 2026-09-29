@@ -35,8 +35,7 @@ import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { beginWorldBoundOperation } from '../undo/undoManager';
 import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from './adoptionGate';
-import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
-import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
+import { localIdCounter, advanceLocalIdCounter, markUnstated, LOCAL_ID_MARK_VERSION } from '../../runtime/core/localIdCounter';
 
 /** What the file must hold for the write to go ahead:
  *  - a `PrefabFile`: the document the caller READ. Matched against the editor's own serialization of it first, and —
@@ -306,10 +305,14 @@ type Landed = { ok: true; path?: string; content?: string } | { ok: false; confl
 
 /** The bytes a write of `doc` puts down, with its localId high-water mark (#1774, `localIdCounter.ts`) at least every
  *  prior's — `priors` being the documents it lands over: the one the caller read, or the file re-read when that is what
- *  the precondition matched. So no write LOWERS the mark, whichever writer made it: each writer states the mark itself,
- *  and this is the line under it. Mutates `doc`, so the caches and the caller's own record hold the mark written.
+ *  the precondition matched. So no write LOWERS the mark, whichever writer made it: a writer may state the mark
+ *  itself, and this is the line under it. Mutates `doc`, so the caches and the caller's own record hold the mark written.
  *
- *  A write that lowers nothing is left exactly as built. `bytes` (an undo putting a file back verbatim, #1679) are kept
+ *  It is also the ONE owner of "a document that claims v8 states its mark" (#1797, `markUnstated`): a writer that stamps
+ *  the version on a clone of a file that had no mark (Apply's enclosing document did) gets it stated here, from its
+ *  rows, so no writer can do half of it. A document that does not claim v8 is left without one, as below.
+ *
+ *  A write that lowers nothing, and states its mark if it claims v8, is left exactly as built. `bytes` (an undo putting a file back verbatim, #1679) are kept
  *  verbatim unless they would lower the mark — undoing a
  *  write that minted a number must not free that number for the next write, or it derives the guid the undone node had
  *  (Apply adds C at 4, Cmd+Z, the next Apply adds D at 4). Then the bytes are written with the mark raised and a format
@@ -317,18 +320,20 @@ type Landed = { ok: true; path?: string; content?: string } | { ok: false; confl
  *  splice cannot be shown exact. */
 function contentFor(doc: PrefabFile, bytes: string | undefined, ...priors: Array<PrefabFile | null | undefined>): string {
   const need = Math.max(0, ...priors.map((p) => (p ? localIdCounter(p) : 0)));
-  // Nothing to raise: the document goes down exactly as the caller built it — a writer states its own mark, and a
-  // restore of a file from before v8 stays without one (it derives the same mark from its rows).
+  // Nothing to raise and nothing unstated: the document goes down exactly as the caller built it, and a restore of a
+  // file from before v8 stays without a mark (it derives the same one from its rows).
   // Judged on what is WRITTEN: with `bytes`, the bytes — not `doc`, which an earlier call may already have raised (a redo
   // hands the same document and the same recorded bytes every time; judged on the raised document, the lower bytes went
   // out and were refused for good, close-out re-review).
   const written = bytes === undefined ? doc : parsedOrNull(bytes) ?? doc;
-  if (need <= localIdCounter(written)) return bytes ?? jsonFileBody(doc);
+  if (need <= localIdCounter(written) && !markUnstated(written)) return bytes ?? jsonFileBody(doc);
   const had = doc.nextLocalId !== undefined;
   advanceLocalIdCounter(doc, need);
-  // A raised mark is v8 data, so what is written claims v8 (an older build then refuses to save over it and drop the mark).
-  const claims = !(written.version >= PREFAB_FORMAT_VERSION);
-  if (!(doc.version >= PREFAB_FORMAT_VERSION)) doc.version = PREFAB_FORMAT_VERSION;
+  // A raised mark is v8 data, so what is written claims v8 (an older build then refuses to save over it and drop the
+  // mark). The version the FIELD arrived in, not today's format: a later bump must not be claimed by bytes that carry
+  // nothing of it (close-out review of #1797).
+  const claims = !(written.version >= LOCAL_ID_MARK_VERSION);
+  if (!(doc.version >= LOCAL_ID_MARK_VERSION)) doc.version = LOCAL_ID_MARK_VERSION;
   if (bytes === undefined) {
     if (!had) placeMarkAfterRoot(doc);
     return jsonFileBody(doc);

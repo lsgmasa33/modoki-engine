@@ -505,6 +505,15 @@ while fixing #500. The `sortOrder` half reordered five scene files the editor ha
 correctly (`Warp.scene.json`'s `Mars_planet`, real `sortOrder` 91 via an override, moved from
 index 15 to index 3) and the guard then certified the damage as canonical.
 
+**The one reader of an entry's guid is `sceneEntryGuid` (`runtime/loaders/authoredEntityGuids.ts`, #1798):** the
+guid the loader ends up giving the entity. For a plain entry (and a prefab entry that does not resolve, which loads
+as a placeholder), that is the durable `EntityAttributes.guid`, else the durable top-level `entry.guid`: pass 1's
+order. For a prefab entry that resolves, it is the top-level guid first, which `onInstantiatePrefab` stamps on the
+root. The two orders differ only for an entry stating both, which serialize.ts never writes. The scene validator's orphan and entity-ref checks and the member-path anchors (`memberPaths.ts`) read
+through it, and a parity test holds it to `loadSceneFile`. The validator once read `EntityAttributes` alone,
+so a child of a Missing Prefab placeholder (a compact entry) was reported as an orphan the reload parents
+correctly.
+
 ⚠️ **Content comparison cannot catch this.** A reorder is content-preserving by construction, so
 "same entity set, no entity whose content differs, identical top-level fields" stays true while
 the order is wrong. That check — the one this section used to recommend — proves the rewrite lost
@@ -2631,7 +2640,10 @@ staging world. `SceneManager`:
    they survive the post-swap release even if the new scene doesn't list them.
 3. Drops any scene-file root whose `EntityAttributes.guid` matches a persistent
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
-   file copy, preventing duplicates.
+   file copy, preventing duplicates. ⚠️ **Today it does not fire on a current-format scene
+   (#1863, OBSERVED):** it recognizes a root only by `parentId === 0` (roots are written `''`), and
+   a prefab-instance root keeps `Persistent` in `overrides` and its guid at the top level. Reloading a
+   scene that holds a Persistent root spawns it twice.
 4. Respawns the snapshots into the staging world (tagged `version:
    SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run),
    restoring each entity's override marks and unregistered markers (`Transient`,

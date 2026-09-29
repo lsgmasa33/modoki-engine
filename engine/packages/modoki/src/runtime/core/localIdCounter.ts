@@ -12,13 +12,19 @@
  *    `replaceNumbering`, Apply's promotion, `mergeRiggedPrefab`. Guarded per writer by `localIdCounter.test.ts`.
  *  - **Advance** ({@link advanceLocalIdCounter}): each writer states the mark on what it builds, and
  *    `commitPrefabWrites` — which every editor prefab write goes through — raises it to the document it lands over if a
- *    writer did not, so no write lowers it. Under both, `/api/write-file` refuses any write that would lower it
+ *    writer did not, so no write lowers it, and states it on any document that claims v8 without one
+ *    ({@link markUnstated}, #1797), so no writer can stamp the version and leave the mark out. Under both, `/api/write-file` refuses any write that would lower it
  *    (`classifyPrefabMarkWrite`): the route is reachable raw (an agent's eval, a game panel, the Assets drop import).
  *
  *  A file without the field (every file before v8, a hand edit) derives it from its highest row: no migration pass.
  *  Import-free and in L0, beside `version.ts`, because it is a FORMAT rule with three readers in three places: the
  *  editor's writers, `prefabCommit.ts` (which may not import `editor/scene/prefab.ts`, a load-time cycle), and the
  *  server's write gate (`plugins/prefabWriteGuard.ts`, which refuses a raw write that would lower the mark). */
+
+/** The prefab format version that introduced the mark (v8, `version.ts`): a document claiming it, or any later one,
+ *  states `nextLocalId`. A literal rather than `PREFAB_FORMAT_VERSION`, which moves on with every format bump while this
+ *  stays the version the field arrived in; and this file stays import-free. */
+export const LOCAL_ID_MARK_VERSION = 8;
 
 /** The part of a prefab document the mark reads. */
 export interface CountedDoc {
@@ -48,3 +54,12 @@ export function advanceLocalIdCounter(doc: { nextLocalId?: number } & CountedDoc
   return next;
 }
 
+/** True when `doc` claims a format that carries the mark (v8 or later) but does not state a usable one: absent, or not
+ *  a positive integer. Such a document still reads correctly (the counter derives the mark from its rows), but it breaks
+ *  v8's contract, and a write of it must state the mark (#1797: Apply's write into an enclosing prefab stamped v8 on a
+ *  clone of a file that had none). */
+export function markUnstated(doc: { version?: unknown; nextLocalId?: unknown } | null | undefined): boolean {
+  if (!doc || typeof doc !== 'object') return false;
+  if (!(typeof doc.version === 'number' && doc.version >= LOCAL_ID_MARK_VERSION)) return false;
+  return positiveInt(doc.nextLocalId) === 0;
+}

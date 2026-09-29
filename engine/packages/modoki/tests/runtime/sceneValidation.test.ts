@@ -856,6 +856,12 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor,
     expect(() => validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab)).not.toThrow();
     const res = validateSceneData(instance({ 1: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
     expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
+    // …nor for a COMPACT instance entry (`prefab` at the top level, the serializer's shape) stating two guids: the guid
+    // reader asks the resolver whether the entry resolves (#1798 close-out re-review), and a throw keeps its default.
+    const compact = { version: 16, name: 'S', resources: [], entities: [
+      { id: 1, prefab: 'b1798000-0000-4000-8000-00000000000f', guid: 'a1798000-0000-4000-8000-000000000005', traits: { EntityAttributes: { name: 'I', parentId: '', guid: 'a1798000-0000-4000-8000-000000000003' } } },
+    ] };
+    expect(() => validateSceneData(compact, undefined, getPrefab)).not.toThrow();
   });
 
   it('does not crash and does not warn when the resolver returns garbage', () => {

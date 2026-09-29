@@ -267,7 +267,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
       ...(rt ? checkRoundTrip(rt, tolerate, (src) => { const p = resolveGuidToPath(src); return !p || !after.has(p); }) : []),
     ];
     if (!editing()) {
-      try { failures.push(...checkScene(await serializeScene(), placeholderGuids(), tolerate)); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
+      try { failures.push(...checkScene(await serializeScene())); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
     }
     if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {
       if (seg.tainted) skipped(seg, `${op.kind} op refusal forgiven`);
@@ -304,7 +304,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   const handEditedEnd = new Set([...walkAfter].filter(([, t]) => handTexts.has(t)).map(([p]) => p));
   const endFailures = [...checkWorld(), ...checkFiles(walkAfter, history, written, handEditedEnd)];
   if (!editing()) {
-    try { endFailures.push(...checkScene(await serializeScene(), placeholderGuids(), tolerate)); } catch (e) { endFailures.push({ check: 'serializeScene threw', detail: String(e) }); }
+    try { endFailures.push(...checkScene(await serializeScene())); } catch (e) { endFailures.push({ check: 'serializeScene threw', detail: String(e) }); }
   }
   if (endFailures.length) return fail(walkStep, 'undo/redo to the ends', endFailures[0]);
   return { trace };

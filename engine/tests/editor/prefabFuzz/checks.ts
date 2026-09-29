@@ -190,12 +190,9 @@ export function checkFiles(
 }
 
 /** The serialized scene passes the scene validator (schema, refs, member rows). */
-export function checkScene(scene: unknown, placeholders: ReadonlySet<string>, tolerate: Tolerate = {}): Failure[] {
+export function checkScene(scene: unknown): Failure[] {
   const r = validateSceneData(scene, buildSceneSchema(), (ref) => getCachedPrefabSync(ref) ?? undefined);
-  const orphanOfPlaceholder = (w: string) => { const m = /parentId '([^']+)' references no entity/.exec(w); return !!m && placeholders.has(m[1]); };
-  return r.warnings
-    .filter((w) => !(tolerate.placeholderParent && orphanOfPlaceholder(w)))
-    .map((w) => ({ check: 'scene validator', detail: w }));
+  return r.warnings.map((w) => ({ check: 'scene validator', detail: w }));
 }
 
 // ── Identities ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -255,8 +252,6 @@ export function firstDiff(a: unknown, b: unknown, path = ''): string | null {
 export interface Tolerate {
   /** #1796: nested node lists are written in ECS query order, so two saves of one world can differ in order alone. */
   nodeOrder?: boolean;
-  /** #1798: the validator does not see a compact entry's top-level guid, so a child of a placeholder reads as orphan. */
-  placeholderParent?: boolean;
 }
 
 const NODE_LISTS = new Set(['added', 'children', 'own']);

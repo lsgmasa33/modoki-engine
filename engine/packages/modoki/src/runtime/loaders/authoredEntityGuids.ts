@@ -11,6 +11,49 @@ export interface AuthoredGuidEntry {
   /** A prefab-instance root's scene-authored guid, stored at entry level rather than
    *  inside EntityAttributes. Present ⇒ the entry already has an identity. */
   guid?: string;
+  /** Set on a prefab-instance entry: its top-level `guid` is its identity (see {@link sceneEntryGuid}). */
+  prefab?: string;
+}
+
+/** The durable guid a scene entry has on disk, as the loader gives it to the spawned entity, else `''`:
+ *  - a PREFAB-instance entry (`prefab` set) whose source resolves: its TOP-LEVEL `guid`, where serialize.ts keeps an
+ *    instance root's identity (never in EntityAttributes, since it is never an override). `onInstantiatePrefab` stamps
+ *    exactly that guid on the new root, discarding any `EntityAttributes.guid` the entry states (close-out review of
+ *    #1798). `EntityAttributes.guid` is the fallback. One that does NOT resolve (`opts.resolves`) is a placeholder,
+ *    which keeps pass 1's guid, read as for any other entry. (serialize.ts never writes both guids, so the two orders
+ *    differ only for a hand-edited or merged file.)
+ *  - any other entry: `EntityAttributes.guid`, else the top-level `guid` — pass 1 of `loadSceneFile` injects the
+ *    top-level guid into EntityAttributes only when that holds no durable one, and an entry with no traits spawns a
+ *    stand-in carrying it.
+ *  A runtime guid is no identity (`durableGuid`). The top-level guid is read as the loader reads it, unfiltered.
+ *
+ *  ⚠️ The ONE reader of "which guid names this entry" for everything that reads a scene FILE: the scene validator
+ *  (`sceneValidation.ts`, #1798: it read EntityAttributes alone, so a child of a placeholder read as an orphan the reload
+ *  parents correctly), the member-path anchors (`memberPaths.ts`) and `deriveAuthoredEntityGuids` below.
+ *  `authoredEntityGuids.test.ts`'s parity cases load each entry shape and hold it to the guid the loader spawned. */
+export function sceneEntryGuid(
+  e: { traits?: unknown; guid?: unknown; prefab?: unknown },
+  /** Whether a prefab entry's source resolves, when the caller can tell (the validator's prefab resolver). An entry
+   *  that does NOT resolve loads as a Missing Prefab placeholder, which keeps pass 1's guid: EntityAttributes first
+   *  (close-out re-review of #1798). Omitted: the entry is taken to resolve, the loader's usual case, and the only one
+   *  the member-path anchors derive anything for. ⚠️ A cache-backed resolver's `undefined` means "unknown" as well as
+   *  "missing" (a prefab not cached yet); read as missing, it names such an entry EntityAttributes-first where the
+   *  loader, which fetches, would stamp the top-level guid. Only an entry stating two different guids is affected. */
+  opts?: { resolves?: (prefabRef: string) => boolean },
+): string {
+  const traits = e.traits && typeof e.traits === 'object' ? (e.traits as Record<string, unknown>) : undefined;
+  const ea = traits?.EntityAttributes;
+  const own = ea && typeof ea === 'object' ? (ea as Record<string, unknown>).guid : undefined;
+  const fromAttrs = durableGuid(typeof own === 'string' ? own : '');
+  const top = durableGuid(e.guid as string);
+  if (!e.prefab) return fromAttrs || top;
+  // The two orders differ only for an entry stating two different guids, so the resolver is asked only then. It is the
+  // caller's, and may throw (the validator's never may: its contract is to warn, not to throw): a throw keeps the default.
+  let resolves = true;
+  if (fromAttrs && top && fromAttrs !== top && opts?.resolves) {
+    try { resolves = opts.resolves(String(e.prefab)); } catch { resolves = true; }
+  }
+  return resolves ? top || fromAttrs : fromAttrs || top;
 }
 
 /** Longest ancestor chain walked when building a parent path. A scene hierarchy is
@@ -92,11 +135,7 @@ export function deriveAuthoredEntityGuids(
   const derived = new Map<number, string>();
   if (!scenePath) return derived;
 
-  const guidOf = (e: AuthoredGuidEntry): string => {
-    const ea = e.traits?.EntityAttributes;
-    const own = ea && ea !== true ? (ea as Record<string, unknown>).guid : undefined;
-    return durableGuid(typeof own === 'string' ? own : '') || durableGuid(e.guid);
-  };
+  const guidOf = sceneEntryGuid;
 
   // Ancestors are addressed by GUID on disk (`EntityAttributes.parentId`, v12+), so the
   // path can only be walked through entries that HAVE one. An entry whose parent is itself

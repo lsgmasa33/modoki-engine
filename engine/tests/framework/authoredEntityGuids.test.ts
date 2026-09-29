@@ -17,17 +17,19 @@
  *  - the ABSENT-path exemption (SceneManager's carried-snapshot respawn derives nothing);
  *  - the STRAY guard: an entry with no traits and no guid must still not spawn. */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, loadSceneFile, spawnEntity, getTraitByName,
-  EntityAttributes, findEntityByGuid, type SceneData, SCENE_FORMAT_VERSION,
+  EntityAttributes, findEntityByGuid, instantiatePrefabIntoWorld, type SceneData, SCENE_FORMAT_VERSION,
 } from '@modoki/engine/runtime';
 import { serializeScene } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
-  deriveAuthoredEntityGuids, type AuthoredGuidEntry,
+  deriveAuthoredEntityGuids, sceneEntryGuid, type AuthoredGuidEntry,
 } from '../../packages/modoki/src/runtime/loaders/authoredEntityGuids';
+import { validateSceneData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { sceneAnchorOf } from '../../packages/modoki/src/runtime/loaders/memberPaths';
 import { isRuntimeGuid, durableGuid, isGuid, deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import {
   _getRuntimeGuidGeneration, _setRuntimeGuidGeneration,
@@ -365,3 +367,133 @@ describe('round-trip — the derived guid is what gets STORED, and the file then
     expect(seedOnly(saved.entities as unknown as AuthoredGuidEntry[], SCENE).size).toBe(0);
   });
 });
+
+describe('sceneEntryGuid — the one reader of a scene entry\'s guid, held to the loader (#1798)', () => {
+  beforeEach(() => { swapInFreshWorld(); });
+  afterEach(() => { swapInFreshWorld(); });
+
+  const G = (n: number) => `a1798000-0000-4000-8000-00000000000${n}`;
+  const RUNTIME = '00000000-0001-0002-0000-000000000009';
+  const MISSING = 'b1798000-0000-4000-8000-000000000000'; // a prefab no fetch resolves: the entry loads as a placeholder
+  /** Every shape an entry's identity comes in: EntityAttributes only; top level only; both, differing (the loader keeps
+   *  EntityAttributes'); a runtime guid in EntityAttributes over a top-level one; no traits at all (a stand-in); and a
+   *  Missing Prefab placeholder's record, with a plain child parented to it. */
+  const entries = (): AuthoredGuidEntry[] => ([
+    { id: 1, traits: { EntityAttributes: { name: 'EaOnly', parentId: '', guid: G(1) } } },
+    { id: 2, guid: G(2), traits: { EntityAttributes: { name: 'TopOnly', parentId: '' } } },
+    { id: 3, guid: G(4), traits: { EntityAttributes: { name: 'Both', parentId: '', guid: G(3) } } },
+    { id: 4, guid: G(5), traits: { EntityAttributes: { name: 'RuntimeInEa', parentId: '', guid: RUNTIME } } },
+    { id: 5, guid: G(6), traits: {} },
+    { id: 6, prefab: MISSING, guid: G(7), traits: { EntityAttributes: { name: 'Placeholder', parentId: '' } } },
+    { id: 7, traits: { EntityAttributes: { name: 'Child', parentId: G(7), guid: G(8) } } },
+  ] as AuthoredGuidEntry[]);
+
+  // Mutation: read the top-level guid FIRST in `sceneEntryGuid` → 'Both' names G(4), which the loader never spawned.
+  it('each entry\'s guid is the one the loader spawned it with, and the losing spelling names nothing', async () => {
+    const quiet = [vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    try { await loadInFreshWorld(sceneWith(entries()), SCENE); } finally { for (const q of quiet) q.mockRestore(); }
+    expect(entries().map((e) => sceneEntryGuid(e))).toEqual([G(1), G(2), G(3), G(5), G(6), G(7), G(8)]);
+    for (const e of entries()) expect(findEntityByGuid(sceneEntryGuid(e)), `entry #${e.id}`).toBeDefined();
+    expect(findEntityByGuid(G(4))).toBeUndefined(); // 'Both': EntityAttributes won
+    expect(sceneEntryGuid({ traits: { EntityAttributes: { guid: RUNTIME } } })).toBe(''); // a runtime guid is no identity
+  });
+
+  // #1798, OBSERVED by the #1789 fuzzer (seed 140). Mutation: collect the validator's guid set from
+  // EntityAttributes.guid alone again → the orphan warning for 'Child' comes back.
+  it('a child of a Missing Prefab placeholder is not an orphan: the validator is clean, and the load parents it', async () => {
+    const warnings = validateSceneData(sceneWith(entries())).warnings.filter((w) => /references (no entity|itself)/.test(w));
+    expect(warnings).toEqual([]);
+    const quiet = [vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    try { await loadInFreshWorld(sceneWith(entries()), SCENE); } finally { for (const q of quiet) q.mockRestore(); }
+    const byName = new Map(getAllEntities().map((e) => [e.name, e]));
+    expect(byName.get('Child')?.parentId).toBe(byName.get('Placeholder')?.id);
+  });
+
+  // The member-path repair's anchor reads its parent through the same reader (#1798 close-out sweep). Mutation: read a
+  // plain parent's EntityAttributes.guid alone again (`memberPaths.ts` `sceneAnchorOf`) → it finds no parent here.
+  it('sceneAnchorOf finds a parent by the guid the loader gives it, top-level included', () => {
+    const scene = entries();
+    const under = { id: 9, prefab: MISSING, guid: G(9), traits: { EntityAttributes: { name: 'UnderTop', parentId: G(2) } } };
+    expect(sceneAnchorOf(under as never, [...scene, under] as never)).toBe(G(2)); // 'TopOnly': a plain entry, top-level guid
+    const underBoth = { ...under, traits: { EntityAttributes: { name: 'UnderBoth', parentId: G(3) } } };
+    expect(sceneAnchorOf(underBoth as never, [...scene, underBoth] as never)).toBe(G(3)); // 'Both': EntityAttributes wins
+  });
+
+  // Close-out review of #1798: for a prefab entry whose source RESOLVES, `onInstantiatePrefab` stamps the TOP-LEVEL guid
+  // on the root and the entry's EntityAttributes.guid is discarded — so an entry stating both is named by the top level,
+  // for the loader, the validator and the member-path anchors alike. Mutation: read EntityAttributes first for a prefab
+  // entry in `sceneEntryGuid` → the loader spawns G(4) and every assertion below names G(3).
+  it('a RESOLVED prefab entry stating both guids is named by its top-level guid, as the loader stamps it', async () => {
+    const P = 'b1798000-0000-4000-8000-00000000000f';
+    const prefabDoc = { id: P, version: 8, name: 'P', rootLocalId: 1, nextLocalId: 2, entities: [
+      { localId: 1, nodeGuid: 'b1798000-0000-4000-8000-0000000000a1', traits: { EntityAttributes: { name: 'PR', parentId: 0, guid: '' }, Transform: {} } },
+    ] };
+    const both = { id: 1, prefab: P, guid: G(4), traits: { EntityAttributes: { name: 'Inst', parentId: '', guid: G(3) } } };
+    const child = { id: 2, traits: { EntityAttributes: { name: 'Kid', parentId: G(4), guid: G(8) } } };
+    const scene = sceneWith([both, child] as AuthoredGuidEntry[]);
+    expect(sceneEntryGuid(both)).toBe(G(4));
+    expect(validateSceneData(scene).warnings.filter((w) => /references no entity/.test(w))).toEqual([]);
+    expect(sceneAnchorOf(child as never, [both, child] as never)).toBe(G(4));
+    swapInFreshWorld();
+    const eaMeta = getTraitByName('EntityAttributes')!;
+    const quiet = [vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    try {
+      await loadSceneFile(JSON.parse(JSON.stringify(scene)) as SceneData, {
+        loadModels: false, scenePath: SCENE,
+        fetchPrefab: async (ref: string) => (ref === P ? JSON.parse(JSON.stringify(prefabDoc)) : null),
+        onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure) => {
+          const id = instantiatePrefabIntoWorld(getCurrentWorld(), prefabDoc as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure);
+          if (id && rootGuid) for (const e of getCurrentWorld().entities) if (e.id() === id) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as Record<string, unknown>), guid: rootGuid });
+          return id ?? undefined;
+        },
+      });
+    } finally { for (const q of quiet) q.mockRestore(); }
+    expect(findEntityByGuid(G(4)), 'the loader named the root by its top-level guid').toBeDefined();
+    const all = getAllEntities();
+    expect(all.find((e) => e.name === 'Kid')?.parentId).toBe(all.find((e) => e.guid === G(4))?.id);
+  });
+
+  // Close-out re-review of #1798: an UNRESOLVED prefab entry loads as a placeholder, which keeps pass 1's guid —
+  // EntityAttributes first — so with a resolver the validator names it that way. Mutation: ignore `opts.resolves` in
+  // `sceneEntryGuid` (always top-level first for a prefab entry) → the validator reports the child as an orphan.
+  it('an UNRESOLVED prefab entry stating both guids keeps its EntityAttributes guid, as the placeholder does', async () => {
+    const ph = { id: 1, prefab: MISSING, guid: G(5), traits: { EntityAttributes: { name: 'PhBoth', parentId: '', guid: G(3) } } };
+    const kid = { id: 2, traits: { EntityAttributes: { name: 'KidOfEa', parentId: G(3), guid: G(8) } } };
+    const scene = sceneWith([ph, kid] as AuthoredGuidEntry[]);
+    expect(sceneEntryGuid(ph, { resolves: () => false })).toBe(G(3));
+    expect(sceneEntryGuid(ph)).toBe(G(5)); // no resolver: taken to resolve
+    const orphans = validateSceneData(scene, undefined, () => undefined).warnings.filter((w) => /references no entity/.test(w));
+    expect(orphans).toEqual([]);
+    const quiet = [vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    try { await loadInFreshWorld(scene, SCENE); } finally { for (const q of quiet) q.mockRestore(); }
+    const all = getAllEntities();
+    expect(all.find((e) => e.guid === G(3)), 'the placeholder kept its EntityAttributes guid').toBeDefined();
+    expect(all.find((e) => e.name === 'KidOfEa')?.parentId).toBe(all.find((e) => e.guid === G(3))?.id);
+  });
+
+  // Close-out review of #1798: the top-level guid is read as the loader reads it (`durableGuid(entry.guid)`, unfiltered),
+  // so even a malformed non-string one still counts as an identity — or the entry beside it derives a different guid.
+  // Mutation: filter the top-level guid to strings in `sceneEntryGuid` → Y's guid shifts.
+  it('a malformed non-string top-level guid still counts as an identity, so a same-named neighbour keeps its guid', () => {
+    const y = { id: 2, name: 'A', traits: { Time: {} } } as AuthoredGuidEntry;
+    const alone = seedOnly([y], SCENE).get(2);
+    const beside = seedOnly([{ id: 1, name: 'A', guid: 123 as unknown as string, traits: { Time: {} } }, y], SCENE).get(2);
+    expect(alone).toBeDefined();
+    expect(beside).toBe(alone);
+  });
+
+  // (accept) The warning stays for a parentId that truly names nothing, and for one naming only the LOSING spelling of
+  // an entry that states both — the loader never spawns that guid.
+  it('(accept) a parentId naming no entry\'s loaded guid is still reported', () => {
+    const scene = sceneWith([
+      ...entries(),
+      { id: 8, traits: { EntityAttributes: { name: 'Stray', parentId: 'c1798000-0000-4000-8000-000000000000', guid: G(9) } } },
+      { id: 9, traits: { EntityAttributes: { name: 'UnderLoser', parentId: G(4), guid: 'a1798000-0000-4000-8000-000000000010' } } },
+    ] as AuthoredGuidEntry[]);
+    const orphans = validateSceneData(scene).warnings.filter((w) => /references no entity/.test(w));
+    expect(orphans).toHaveLength(2);
+    expect(orphans.join('\n')).toContain("'Stray'");
+    expect(orphans.join('\n')).toContain("'UnderLoser'");
+  });
+});
+
