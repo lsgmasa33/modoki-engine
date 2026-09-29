@@ -206,7 +206,8 @@ describe('a deleted prefab leaves the editor cache (#1805, I9)', () => {
   // trash while a world swap's re-fetch 404'd in the loader's, and an instantiate expanded a prefab that no longer exists
   // (the #1789 fuzzer's seed 199). The delete repair — `applyAssetPathMoves` with `to: null`, which the route's renderer
   // repair, the panel and every undo trash run — now evicts the EDITOR cache. The loader's entry is left to the next world
-  // swap: evicted, a reload after the delete gave placeholders, and an undo against one is #1819's open class.
+  // swap: evicted, a reload after the delete gave placeholders, and an undo against one was #1819's open class; now
+  // blocked on #1862 (an in-place rebuild would drop a trashed nested prefab's live members).
   afterEach(() => { for (const k of [GUID, OLD, NEW]) setPrefabCache(k, null as never); });
 
   // Mutation: drop the eviction from the delete branch of `applyAssetPathMoves` — both editor keys still answer.

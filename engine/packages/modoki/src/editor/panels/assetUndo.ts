@@ -25,6 +25,7 @@ import { writeAssetFileGuarded, backendFetch, importedFileBytes } from '../backe
 import { sha256OfBytes } from '../utils/contentHash';
 import type { AssetEntry } from '../utils/assetPaths';
 import { unbindDeletedAssetEditors, applyAssetPathMoves } from './assetEditorBindings';
+import { reannounceRestoredFiles } from './assetRestore';
 import type { PathMove } from '../utils/assetPaths';
 import { reportUndoFailure, COLLISION_STATUS, UndoRefusedError, fileChangedRefusal, expectedHash } from '../undo/undoFailure';
 
@@ -222,6 +223,12 @@ export function makeDeleteUndo(
             (unrolled.length ? `. These were restored (a write failed${refusals.length ? `: ${refusals.join('; ')}` : ''}) and could not be taken back: ${unrolled.join(', ')}` : ''),
         });
       }
+      // The files that came back are told to the renderer in this step (#1844, #1834): its manifest pruned their guids at
+      // the delete, and the restore went through `/api/write-file`, which rebuilds nothing — an undo walked straight on
+      // (an agent's back-to-back undos, two quick Cmd+Z) met a guid that resolved to nothing. Own sidecars too: they put
+      // the snapshot's GUID back over the heal's.
+      const told = await reannounceRestoredFiles(restoredPaths);
+      if (!told.ok) reportUndoFailure({ direction: 'Undo', label, detail: `restored, but the editor's asset index was not refreshed (${told.error}); it catches up at the next file-watcher update` });
       // Refresh even on a partial restore — the files that DID come back must appear.
       refresh();
     },
@@ -812,11 +819,12 @@ export type ImportedFile = { path: string; content: string; sha256?: string };
  *  is the settled file. A binary is never rewritten in place (every importer writes to the cache or a sibling), so
  *  it is not read back: its written bytes are the baseline. A read that fails leaves the path out, and the caller
  *  falls back to the written bytes — a refusal later, never an unguarded trash. */
-export async function settledHashes(paths: readonly string[]): Promise<Map<string, string>> {
+export async function settledHashes(paths: readonly string[], opts: { rescanned?: boolean } = {}): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const text = paths.filter(isTextAsset);
   if (text.length === 0) return out;
-  try { await backendFetch('/api/rescan-assets', { method: 'POST' }); } catch { return out; }
+  // `rescanned`: the caller's own rescan just ran the heal (`reannounceRestoredFiles`), so a second full scan buys nothing.
+  if (!opts.rescanned) { try { await backendFetch('/api/rescan-assets', { method: 'POST' }); } catch { return out; } }
   for (const p of text) {
     try {
       // The BYTES, not `res.text()`: decoding replaces invalid UTF-8 with U+FFFD, so a Latin-1 or UTF-16 text file got
@@ -891,8 +899,13 @@ export function makeFileImportUndo(params: {
         else if (w.result === 'conflict') taken.push(f.path);
         else failed.push(`${f.path} (${w.error})`);
       }
+      // The files are back where an undo trashed them, through `/api/write-file`: the renderer is told in this step (the
+      // manifest from one rescan, and a refetch of an owned prefab), not left to the watcher's debounced push (#1844).
+      const told = await reannounceRestoredFiles(wrote);
+      if (!told.ok) reportUndoFailure({ direction: 'Redo', label, detail: `re-imported, but the editor's asset index was not refreshed (${told.error}); it catches up at the next file-watcher update` });
       // Re-take the settled baseline, for a re-written JSON the scanner may still re-stamp (one with no GUID-shaped id).
-      const settled = await settledHashes(wrote);
+      // That rescan already ran the heal, so the read is of the settled file.
+      const settled = await settledHashes(wrote, { rescanned: told.ok });
       for (const p of wrote) onDisk.set(p, settled.get(p));
       if (taken.length > 0) {
         reportUndoFailure({ direction: 'Redo', label, userFixable: true, detail: `not re-imported, because another file is now at ${taken.join(', ')} — it was left as it is` });

@@ -1019,7 +1019,17 @@ function nodeGuidsFor(
   const piMeta = getTraitByName('PrefabInstance');
   const carried = new Map<number, string>();
   const claimed = new Map<string, number>();
+  // A Replace's root IS the replaced document's root (#1837, hub ruling reading 1, Unity: the root always maps to the
+  // root, whatever its name — only children match by name, U22). So it takes the old root row's nodeGuid, as
+  // `replaceNumbering` gives it the old root's localId, and localId 1 stays bound to the one node (I4). Ahead of the live
+  // identity and the name match: a selection that is a MEMBER of an instance of the target carries that member's
+  // nodeGuid, and a new root named like no row would mint — either re-binds the root's localId to another node.
+  const rootLid = replacing?.rootLocalId ?? 1;
+  const rootGuid = replacing?.entities?.find((r) => r.localId === rootLid)?.nodeGuid;
+  if (rootGuid && isGuid(rootGuid)) { claimed.set(rootGuid, selectedEntityId); carried.set(selectedEntityId, rootGuid); }
   const take = (ecsId: number, guid: string): void => {
+    // The root, bound above: its own live nodeGuid (a member's, when the selection is one) must not re-bind it.
+    if (carried.has(ecsId)) return;
     const other = claimed.get(guid);
     if (other !== undefined) {
       // Two live entities claiming one template node — a duplicated member whose copy kept the
@@ -1071,7 +1081,6 @@ function nodeGuidsFor(
       return names.join('\0');
     };
     const rowByLocal = new Map(replacing.entities.map((r) => [r.localId, r] as const));
-    const rootLid = replacing.rootLocalId ?? 1;
     const rowPath = (r: ReplacedRow): string => {
       const names: string[] = [];
       const seen = new Set<number>();
@@ -2527,9 +2536,11 @@ export function rekeyEditorPrefabCache(from: string, to: string, prefix = false)
  *  the loader's, and a sync reader expanded a prefab that no longer exists (an instantiate from the stale entry, which the
  *  reload then showed empty).
  *
- *  ⚠️ The LOADER's entry is left until the scene that owns it lets go, deliberately (#1834): evicted here, any reload after
- *  the delete turned the live instances into Missing Prefab placeholders, and an undo run against a placeholder is #1819's
- *  open class (group 1 of #1789) — trash, reload, Cmd+Z reached it. A reload of the same scene keeps that entry, so what
+ *  ⚠️ The LOADER's entry is left until the scene that owns it lets go, deliberately (#1834). Evicted here, any reload after
+ *  the delete turned the live instances into Missing Prefab placeholders, and an undo run against a placeholder was #1819's
+ *  open class (group 1 of #1789) — trash, reload, Cmd+Z reached it. #1819 landed, and the eviction is now blocked on #1862
+ *  instead: an in-place rebuild (Apply, Revert, Refresh) would drop a trashed NESTED prefab's live members, and the
+ *  gesture's own undo then refuses (hunt seed 6191). A reload of the same scene keeps that entry, so what
  *  this evicts is TOMBSTONED (`editorPrefabDeleted`) and a swap's warm reads it from disk rather than seeding it back from
  *  the loader. Every save captures the live instance from its frame record (I18).
  *

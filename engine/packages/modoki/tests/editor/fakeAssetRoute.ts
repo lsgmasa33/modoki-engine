@@ -12,7 +12,8 @@
  *  - `/api/duplicate-asset`: 409 on an occupied destination; a `.json` copy is RE-MINTED (a fresh `id`), a binary copy
  *    takes its `.meta.json` along (the source's, with a fresh `id` and no `generated`, as `duplicateAssetFile` does);
  *    answers the sha256 of the copy's stored bytes and, for a binary, the sidecar it wrote.
- *  - `/api/rescan-assets`: runs `onRescan` (a test's stand-in for the scanner's GUID heal).
+ *  - `/api/rescan-assets`: runs `onRescan` (a test's stand-in for the scanner's GUID heal), and answers `rescanBody()`
+ *    (the manifest the real route returns; `{}` unless a test supplies one, #1844).
  *  - any other GET: serves the stored bytes.
  *
  *  So a precondition a test sees accepted was compared against the bytes the forward step really wrote, not against a
@@ -31,6 +32,8 @@ export interface FakeAssetRoute {
   /** `/api/write-file` target paths that answer 500 — one file's write failing while the rest land. */
   failWrites: Set<string>;
   onRescan: () => void;
+  /** What `/api/rescan-assets` answers: the manifest the real route returns (`ctx.rebuildManifest()`). */
+  rescanBody: () => unknown;
   put(path: string, content: string | Buffer): void;
   text(path: string): string | undefined;
   fetch: (url: string, init?: { method?: string; body?: string }) => Promise<Response>;
@@ -51,7 +54,7 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
   const under = (p: string) => [...disk.keys(), ...folders].filter((k) => k.startsWith(`${p}/`));
 
   const route: FakeAssetRoute = {
-    disk, folders, calls, fail: new Set(), failWrites: new Set(), onRescan: () => {},
+    disk, folders, calls, fail: new Set(), failWrites: new Set(), onRescan: () => {}, rescanBody: () => ({}),
     put(path, content) { disk.set(path, Buffer.isBuffer(content) ? content : Buffer.from(content)); },
     text(path) { return disk.get(path)?.toString('utf8'); },
     async fetch(url, init) {
@@ -119,7 +122,7 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
         return reply(200, { ok: true, saved: true, sha256: sha256(copy), ...(sidecar ? { sidecar } : {}) });
       }
 
-      if (u.endsWith('/api/rescan-assets')) { route.onRescan(); return reply(200, {}); }
+      if (u.endsWith('/api/rescan-assets')) { route.onRescan(); return reply(200, route.rescanBody()); }
       if (u.includes('/api/')) return reply(200, { ok: true });
 
       const path = u.replace(/^https?:\/\/[^/]+/, '');

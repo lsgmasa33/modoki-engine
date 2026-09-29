@@ -2540,6 +2540,19 @@ export function rekeyCachedPrefab(from: string, to: string, prefix = false): num
   return n;
 }
 
+/** A prefab file an undo or redo PUT BACK at `path` (#1844): a scene that owns it, with no entry and nothing in flight,
+ *  fetches it again now, or every synchronous reader (a `UIEntries` pool) stays blank until the next scene load (#1308).
+ *  The entry is gone when the owning scene let go of it while the file was deleted and then acquired it again (a scene
+ *  switch and back, which remembered the 404); the restore is the editor's own write, which no watcher refresh follows.
+ *  Called by the one restore owner, `reannounceRestoredFiles`. (#1834 would also evict it at the delete; blocked on
+ *  #1862.) */
+export function refetchOwnedPrefab(path: string): void {
+  // A load between the delete and the restore (a reload of the owning scene) remembered the 404, and a remembered failure
+  // blocks `fetchPrefab` until the prefab is invalidated: the file is back, so the memo is wrong now.
+  prefabFailures.forget(path);
+  if (!prefabCache.has(path) && prefabOwners.get(path)?.size && !prefabLoadPromises.has(path)) void fetchPrefab(path);
+}
+
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;

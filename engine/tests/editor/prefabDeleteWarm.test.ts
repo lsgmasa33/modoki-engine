@@ -1,5 +1,5 @@
 /** #1805 close-out review, finding 1: an asset delete evicts the EDITOR prefab cache, but the LOADER keeps its entry until
- *  the scene that owns it lets go (#1834, deliberately). A scene swap's warm (`warmEditorPrefabCacheFor`) seeds a cold
+ *  the scene that owns it lets go (#1834, deliberately; blocked on #1862). A scene swap's warm (`warmEditorPrefabCacheFor`) seeds a cold
  *  editor key from that loader entry, so the first reload after a delete put the deleted prefab straight back in the editor
  *  cache — and an instantiate expanded a prefab that no longer exists (seed 199's route), one reload later. The delete now
  *  tombstones what it evicted (`editorPrefabDeleted`); the warm reads such a key from disk instead: a 404 while the file is

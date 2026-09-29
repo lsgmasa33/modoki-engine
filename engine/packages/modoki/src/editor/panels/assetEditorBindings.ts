@@ -464,7 +464,8 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   // view of a renamed prefab went blank. Both are idempotent, so the panel's own pass after the route's finds nothing.
   // A DELETE evicts the EDITOR cache (#1805, I9): the route marks it as the editor's own too, so no watcher evicted, and the
   // editor's sync readers kept expanding a prefab that no longer exists. The loader's entry stays until its scene lets go
-  // (`evictDeletedEditorPrefabs` says why). Live instances stay expanded (#1738's evicted state).
+  // (#1834, blocked on #1862: an in-place rebuild would then drop a trashed nested prefab's live members). Live instances
+  // stay expanded (#1738's evicted state).
   for (const m of list) {
     if (m.to === null) {
       evictDeletedEditorPrefabs(m.from, !!m.prefix);

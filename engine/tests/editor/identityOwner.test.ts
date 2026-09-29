@@ -259,6 +259,107 @@ describe('#1686: Create Prefab → Replace carries each row\'s nodeGuid — by l
 });
 const idOfGuid = (guid: string) => getAllEntities().find((e) => e.guid === guid)?.id ?? 0;
 
+describe('#1837: a Replace from a DIFFERENT entity keeps the root\'s identity — the new root takes the old root\'s nodeGuid (hub ruling, Unity)', () => {
+  const Z = 'cccccccc-0000-4000-8000-000000183701';
+  const ZPATH = '/prefabs/Z.prefab.json';
+  const I0 = 'dddddddd-0000-4000-8000-000000183701';
+  const G = { R: 'eeeeeeee-0000-4000-8000-000000183701', A: 'eeeeeeee-0000-4000-8000-000000183702', B: 'eeeeeeee-0000-4000-8000-000000183703' };
+  /** Z: R → A (2), B (3). */
+  const zDoc = () => ({ id: Z, version: 5, name: 'Z', rootLocalId: 1, entities: [row(1, 'R', 0, G.R), row(2, 'A', 1, G.A), row(3, 'B', 1, G.B)] });
+
+  const lidGuids = (doc: PrefabFile) => Object.fromEntries(doc.entities.map((e) => [e.localId, e.nodeGuid]));
+  /** One instance I0 of Z with its ROOT moved (an override keyed by localId 1) and its member A moved (keyed by A's
+   *  nodeGuid), and a plain tree Other → A, R, C beside it: a different entity, whose root is named like no row. */
+  const setup = async () => {
+    const doc = zDoc();
+    install(doc);
+    onDisk.set(ZPATH, JSON.stringify(doc));
+    registerAsset(Z, ZPATH, 'prefab');
+    await load({ id: 'r1837', version: 16, name: 'S', resources: [], entities: [
+      { id: 1, prefab: Z, guid: I0, traits: { EntityAttributes: { name: 'I0', parentId: 0 } } },
+    ] } as unknown as SceneData);
+    const { writeTraitFieldWithUndo } = await import('@modoki/engine/editor');
+    const tfMeta = getTraitByName('Transform')!;
+    writeTraitFieldWithUndo(idOfGuid(I0), tfMeta, 'x', 7);
+    const i0A = getAllEntities().find((e) => e.name === 'A' && e.parentId === idOfGuid(I0))!.id;
+    writeTraitFieldWithUndo(i0A, tfMeta, 'y', 3);
+    const saved = await serializeScene() as unknown as SceneData;
+    const other = add('Add Other', 0, 'Other');
+    for (const n of ['A', 'R', 'C']) add(`Add ${n}`, other, n);
+    return { saved, other };
+  };
+
+  it('the new root is written at localId 1 with the OLD root\'s nodeGuid; a child matches by name; one named like the old root is a new node', async () => {
+    // Mutation: drop the root binding in `nodeGuidsFor` — the root row mints a fresh nodeGuid at localId 1 (the I4 re-bind
+    // the fuzzer reported), and the child "R" takes the old root's nodeGuid by the name rule, a second re-bind.
+    const { saved, other } = await setup();
+    const warn = vi.spyOn(console, 'warn');
+    const res = await createPrefabFromEntity(other, ZPATH, 'Create Prefab "Z"', async () => true);
+    const twice = warn.mock.calls.filter((c) => String(c[0]).includes('two rows claim'));
+    warn.mockRestore();
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    expect(res.prefab.id).toBe(Z); // precondition: a Replace that kept the id
+    const written = JSON.parse(onDisk.get(ZPATH)!) as PrefabFile;
+    const rowOf = (name: string) => written.entities.find((e) => e.name === name)!;
+    expect(written.rootLocalId).toBe(1);
+    expect({ lid: rowOf('Other').localId, guid: rowOf('Other').nodeGuid }).toEqual({ lid: 1, guid: G.R });
+    expect({ lid: rowOf('A').localId, guid: rowOf('A').nodeGuid }).toEqual({ lid: 2, guid: G.A }); // U22: by name
+    expect([G.R, G.A, G.B]).not.toContain(rowOf('R').nodeGuid); // named like the old root, but the root is the root
+    expect([G.R, G.A, G.B]).not.toContain(rowOf('C').nodeGuid);
+    expect([rowOf('R').localId, rowOf('C').localId].every((l) => l! > 3)).toBe(true); // above the old document's numbers
+    expect(twice).toEqual([]); // the old root's identity is not a damaged document's duplicate
+    // I4 across the write: every localId the old document bound still names the node it named, or is not written.
+    const after = lidGuids(written);
+    for (const [lid, g] of Object.entries(lidGuids(zDoc() as unknown as PrefabFile))) if (after[lid]) expect(after[lid]).toBe(g);
+    // The live tag names the same root: the new instance's root is the document's root node.
+    const piMeta = getTraitByName('PrefabInstance')!;
+    expect((readTraitData(other, piMeta) as { nodeGuid?: string }).nodeGuid).toBe(G.R);
+
+    // An existing instance keeps its ROOT override and its member's across the Replace, and its root names a node the
+    // document states.
+    prefabs.set(Z, written);
+    await load(saved);
+    const root = idOfGuid(I0);
+    expect((readTraitData(root, getTraitByName('Transform')!) as { x: number }).x).toBe(7);
+    expect((readTraitData(root, piMeta) as { nodeGuid?: string }).nodeGuid).toBe(G.R);
+    const a = getAllEntities().find((e) => e.name === 'A' && e.parentId === root)!.id;
+    expect((readTraitData(a, getTraitByName('Transform')!) as { y: number }).y).toBe(3);
+  });
+
+  it('a Replace from a MEMBER of an instance of the target: the root takes the root\'s nodeGuid, not the member\'s', async () => {
+    // Mutation: drop `nodeGuidsFor`'s `carried.has` early-out in `take` — the live identity pass re-binds the root to A's
+    // nodeGuid, so localId 1 names A's node.
+    await setup();
+    const i0A = getAllEntities().find((e) => e.name === 'A' && e.parentId === idOfGuid(I0))!.id;
+    add('Add D', i0A, 'D');
+    const doc = serializePrefab(i0A, Z, { replacing: zDoc() })!;
+    expect(lidGuids(doc)[1]).toBe(G.R);
+    expect(doc.entities.map((e) => e.nodeGuid)).not.toContain(G.A);
+    expect(new Set(doc.entities.map((e) => e.nodeGuid)).size).toBe(doc.entities.length);
+  });
+
+  it('undo puts the old document back — localId 1 bound as it was, the mark kept — and redo writes the old root\'s identity again', async () => {
+    // Mutation: drop the root binding — redo's row at localId 1 carries a fresh nodeGuid, not G.R.
+    const { other } = await setup();
+    const before = onDisk.get(ZPATH)!;
+    const res = await createPrefabFromEntity(other, ZPATH, 'Create Prefab "Z"', async () => true);
+    if (!res || res === 'declined' || 'refused' in res) throw new Error(`fixture: ${JSON.stringify(res)}`);
+    pushAction(res.action); // as both panels do with the returned step
+    const replacedBytes = onDisk.get(ZPATH)!;
+    expect(await undo()).toBe(true);
+    // The old document's rows, with the high-water mark the Replace raised kept (#1774: a number is never handed out
+    // twice) and the commit's format stamp.
+    const restored = JSON.parse(onDisk.get(ZPATH)!) as PrefabFile & { nextLocalId?: number };
+    const old = JSON.parse(before) as PrefabFile;
+    expect({ rows: restored.entities, root: restored.rootLocalId, mark: restored.nextLocalId }).toEqual({ rows: old.entities, root: 1, mark: 6 });
+    expect(readTraitData(other, getTraitByName('PrefabInstance')!) ?? null).toBeNull(); // the source tree is plain again
+    const { redo } = await import('@modoki/engine/editor');
+    expect(await redo()).toBe(true);
+    expect(onDisk.get(ZPATH)).toBe(replacedBytes);
+    expect(lidGuids(JSON.parse(onDisk.get(ZPATH)!) as PrefabFile)[1]).toBe(G.R);
+  });
+});
+
 describe('#1761: a template\'s member token resolves AFTER the pins are final — a dropped pin does not take the token with it', () => {
   const T = 'cccccccc-0000-4000-8000-000000176101';
   const INST_T = 'dddddddd-0000-4000-8000-000000176101';
