@@ -149,7 +149,12 @@ Algorithm:
    (`PrefabInstance.rootInstanceId === root`), and the `parentId` child map for
    the whole world.
 2. **removed** = `prefab.entities.localId  \  {localIds the walk found}`, reduced
-   to top-most (drop a localId whose prefab-parent is also removed).
+   to top-most: drop a localId under a removed ancestor row, climbing through rows that are absent without
+   being listed (a nested row under a removed nested row reads as present, because its parent member is gone)
+   and stopping at a row that is really live. Not the parent alone (#1765): a plain row under that nested row
+   passed a parent-only test and was stored as a removal of its own, so once the template moved it out from
+   under the removed one it stayed deleted. It stops at a LIVE row because a member the scene moved out from
+   under a removed row carries its subtree, and a removal inside that subtree is its own (#1730's case).
 3. **removedTraits** — for each surviving member, the prefab entity's trait names
    the live entity no longer has (skip `PrefabInstance`). The complement —
    traits the live entity has that the prefab lacks — is already captured as an
@@ -409,9 +414,48 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   - **`removed` / `removedTraits`** lose the chain's own entries.
   - **`added` nodes** are matched to the chain by **template key**: the live marker, or
     `recoverTemplateKey` once a round trip dropped it. A key-less legacy node matches by the durable
-    guid it carried. An unchanged match is dropped: the fresh copy owns it, so a template edit
+    guid it carried. **A node with neither** (hand- or agent-written; no editor writer emits one, but
+    `/api/write-file` and an import take any bytes, and `templateRowOf`/`withKeptLegacy`/`mergeRiggedPrefab`
+    pass one through) matched nothing and was spawned twice by every rebuild (#1779). A live node with no
+    template key is now paired with a chain node of that kind with the same name that it EQUALS (`sameAddedNode`,
+    as any chain node is compared, children included), and is dropped: the fresh copy is it. Each chain node absorbs
+    ONE live copy, so a scene's own guid-less node equal to the template's stays beside it. A scene duplicate holds a
+    durable guid, so it equals none and is kept. Nothing derived from the pairing is stamped or saved.
+    That is deliberate: a key derived from the node's POSITION would be written into a scene's node rows and name a
+    different node once the template inserted a sibling before it. ⚠️ **An EDITED one still comes back twice** (its
+    edit kept, the fresh copy beside it, #1810). It has no identity to find its fresh copy by, and three ways of
+    finding it after the spawn each deleted an untouched sibling's copy (close-out reviews):
+    - id order, because koota recycles ids;
+    - the chain node's content, because some content does not read back verbatim, and same-named nodes can differ
+      only in their children;
+    - the name alone, which drops a duplicate.
+
+    The first prefab-edit save of the template mints it a real key.
+    For a node matched by key or guid: an unchanged match is dropped, because the fresh copy owns it, so a template edit
     reaches it. An EDITED match is kept, and the re-apply deletes the fresh copy first and restores
     the key marker on the survivor. Restating these nodes spawned every row-authored node twice.
+    **A REFERENCE node's values are compared by subtraction, not by spelling (#1781).** Its live capture
+    measures each of its frames against the bare documents, since the node's own statement is not in that base. So a
+    component the statement ADDS came out whole with every schema default, never equalled the sparse
+    statement, and every save pinned the node (a template change to it never reached the instance again).
+    `sameAddedNode`, the one test the scene save's node diff and this subtraction both ask, now re-captures
+    the live node over the base SEEDED with the CHAIN node's statement (`sameNodeValues`: `nodeForward` →
+    `chainLayer`'s seed, per frame, plus the root frame against the node's `overrides`). A node that states
+    nothing beyond it then compares on the rest, with its value channels stripped (`withoutNodeValues`).
+    A REMOVAL of a component the statement adds shows in no live field, so it is compared as structure: the
+    removed-components pass runs over the seeded layer and over the bare one, and a removal only the seeded one
+    finds is the scene's own (`moreRemovals`, close-out review F2). Without that, the node compared unchanged and
+    the save dropped the removal.
+    Over the seeded chain the rule above is the loader's `meta.trait(authored)`, so an unauthored default is
+    the layer's. Two variants were measured and rejected:
+    - Subtracting the statement alone loses a real edit that sets a default back over a lower row's
+      non-default (E13).
+    - Expanding the statement with defaults and comparing literally fails where the live side is already
+      compacted against a lower row (E9).
+
+    The seed is the chain node's, never the live frame's record, because on a Refresh the chain node is the
+    new template's. The template WRITER still writes the unseeded capture, so a prefab-edit save restates the
+    defaults (#1804). Tests: `nestedEnclosingLayer.test.ts` § #1781.
   - ⚠️ **A template node the scene DELETED still comes back.** With no live node there is nothing to
     match, and "deleted here" cannot be told from "added by the refresh" without the old live key set.
     A template node the scene MOVED below another added node also duplicates. Only nodes directly
@@ -1390,6 +1434,31 @@ because `remapWorldGuidRefs` reaches live trait values only.
 The new prefab file still carries no row. #1293's gate keeps scene rows out of a template, and an
 identity-only orphan converts to nothing (`templateRowOf`), so the scene save is the carrier.
 Tests: `createPrefabMemberIdentity.test.ts` § #1778, `tests/ecs/keptOrphanRows.test.ts`.
+
+### R2's store rides in an entity snapshot (#1788)
+
+A rename moves an entry. A COPY needs a second one, and nothing made it. Duplicating an instance whose
+entry held an orphan row or a kept legacy channel gave the copy neither: the store sits beside the tree,
+keyed by the root's guid, and `copySnapshot` copied the tree. The copy's save wrote no row, and when the
+template brought the member (or the frame) back, only the original took the scene's edit.
+
+**The kept state is part of the snapshot** (`EntitySnapshot.kept`), as a frame's document (#1483) and a
+placeholder's record (#1762) already are. `snapshotEntity` takes a deep copy (`keptStateOf`) of each
+node's entry, and `respawnFromSnapshot` puts it back under the node's own guid (`restoreKeptState`). A
+copy then gets it under ITS guid.
+- **The copy states no identity of the original's.** `copySnapshot` mints a fresh guid for every
+  identity the kept state names (`keptGuidMints`: an orphan member's pinned guid, a scene node's) into
+  the copy's one remap before anything is rewritten, then rewrites the kept state through that remap. So
+  the two instances never pin one member guid (#1293). Refs between the kept rows and the entities
+  copied with them follow the copy both ways (#1338). A node whose link is stripped is no instance, so
+  it carries none.
+- **An undone duplicate leaves an entry under a guid nothing holds.** The writers read the store only
+  for a live root, so no save writes it, and the redo puts back the same identities. A delete leaves
+  its entry the same way, which is why delete + undo never needed the carry. The snapshot makes a later
+  prune of a deleted root's entry safe.
+- The device's `duplicate-entity` op (`liveLifecycle.ts`) builds its own snapshot and carries none: a
+  device saves no scene.
+Tests: `missingPrefabPassThrough.test.ts` § #1788.
 
 ### A move inside a template reference node (#1543, prefab v7)
 

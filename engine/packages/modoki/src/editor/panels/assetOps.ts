@@ -14,7 +14,7 @@
 
 import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, warnInertPrefabSizes, classifyExistingDocumentId, parsedPrefabRows, missingPrefabPlaceholders, unexpandedNestedRefusal, tagCreatedPrefab, type PrefabFile } from '../scene/prefab';
 import { commitPrefabWrite, parsePrefabBytes } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef } from '../undo/entityRef';
@@ -654,6 +654,10 @@ export async function createPrefabFromEntity(
   // serialize, so the last check.
   const goneAtWarm = gone('while the prefab was being prepared');
   if (goneAtWarm) return goneAtWarm;
+  // A nested frame that could not be expanded (#1790, owner ruling D) — asked only now, after the warm: a merely cold key
+  // is not a missing prefab.
+  const unexpanded = unexpandedNestedRefusal(entityId);
+  if (unexpanded) return { refused: `Create Prefab refused — ${unexpanded}. Restore it, or leave the instance out of the selection.` };
   let runtimeExcluded = 0;
   // ⚠️ A Replace that keeps the replaced prefab's id serializes AGAINST the document it replaces (#1686): with no id, every
   // row's `nodeGuid` was minted fresh, and every other instance's edits and pinned member guids are keyed by the old ones.
@@ -661,6 +665,7 @@ export async function createPrefabFromEntity(
   // `nodeGuidsFor`). The id is known before the serialize here (the path is decided first), so once is enough. The rows
   // are the replaced BYTES, BOM dropped (`readPriorDocument` keeps one for the verbatim undo).
   const draft = serializePrefab(entityId, keptId, {
+    bakeKeptState: true,
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
     ...(keptId && previousContent ? { replacing: parsedPrefabRows(previousContent.replace(/^\uFEFF/, '')) } : {}),
   });
@@ -679,6 +684,8 @@ export async function createPrefabFromEntity(
   const ref = entityRef(entityId);
   let priorLinks: ReturnType<typeof detachPrefabInstance> | null = null;
   let guidRemap: ReturnType<typeof tagEntityTreeAsInstance> = new Map();
+  // The undo of the tag's kept-state settle (#1790), run before the rename is reversed.
+  let undoKept = () => {};
   // ONE step (#1692): the write only over what the path held when it was read — nothing, or `previousContent` — then
   // both caches (by GUID too: PrefabInstance.source is GUID-only, and the sync nested lookup keys on it), the tag of
   // THIS tree, and a rebuild of every OTHER live instance of a replaced prefab (#1685: they stayed expanded from the
@@ -701,7 +708,7 @@ export async function createPrefabFromEntity(
       if (id == null) return;
       priorLinks = detachPrefabInstance(id, { strip: false });
       // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-      guidRemap = tagEntityTreeAsInstance(id, landed.path, prefab);
+      ({ guidRemap, undoKept } = tagCreatedPrefab(id, landed.path, prefab));
     },
   });
   if (!committed.ok) return null;
@@ -732,7 +739,7 @@ export async function createPrefabFromEntity(
    *  so moving this line is a test failure, not a silent change. Only on a path that actually undoes —
    *  a refused file write leaves the tree
    *  tagged, and must leave the stamp with it. */
-  const unstamp = () => unstampMemberGuids(guidRemap);
+  const unstamp = () => { undoKept(); undoKept = () => {}; unstampMemberGuids(guidRemap); };
   const action: UndoAction = {
     label,
     // Both directions are ALL-OR-NOTHING: the file write/delete is gated, and the
@@ -804,7 +811,7 @@ export async function createPrefabFromEntity(
           // file precisely because a raw id goes stale across a world rebuild (Play->Stop, a
           // watcher reload). Tagging the pre-await id could hit a different entity, or none.
           const tagId = ref.resolve(); if (tagId == null) return;
-          guidRemap = tagEntityTreeAsInstance(tagId, savePath, prefab); // re-stamped, so undo reverses THIS run's rename
+          ({ guidRemap, undoKept } = tagCreatedPrefab(tagId, savePath, prefab)); // re-stamped, so undo reverses THIS run's rename
           tagged = true;
         },
       });

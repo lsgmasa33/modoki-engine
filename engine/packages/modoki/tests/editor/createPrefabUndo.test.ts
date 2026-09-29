@@ -63,6 +63,10 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   preloadNestedPrefabs: async () => {},
   rebaseStaleInstances: async () => 0,
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
+  // Create Prefab's refusal of an unexpandable nested frame and its tag (#1790): nothing to refuse in these trees, and the
+  // tag is the one above (its kept-state settle has nothing to settle here).
+  unexpandedNestedRefusal: () => null,
+  tagCreatedPrefab: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return { guidRemap: new Map([['g-old', 'g-derived']]), undoKept: () => {} }; },
   // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
   // here because this file is the only place the undo's call ORDER is asserted — see the sequences below.
   unstampMemberGuids: (...a: unknown[]) => { calls.push('unstamp'); return unstampSpy(...a); },

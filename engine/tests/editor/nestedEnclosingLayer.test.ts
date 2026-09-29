@@ -33,7 +33,7 @@ import {
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
   setActionCallback, pushAction, clearHistory, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo,
-  addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo,
+  addTraitToEntitiesWithUndo, createEntityWithUndo, writeTraitFieldWithUndo, duplicateEntity,
 } from '@modoki/engine/editor';
 import { reparentEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import {
@@ -1654,5 +1654,222 @@ describe('#1736: an Apply is ONE plan of per-key effects, keyed by SLOT — the 
       expect(ok.applied).toBe(true);
       expect((written(P)!.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x).toBe(6);
     });
+  });
+});
+
+// #1781: a TEMPLATE reference node T (O's row N adds it under P's A; T is a Q: QR → M → D, D a reference row expanding
+// S: SR → K) whose own statement ADDS a component to a member. The live capture measured T's frames against the bare
+// documents, so the added component came out whole with every schema default, never equalled the sparse statement, and
+// `sameAddedNode` read T as edited: an untouched save pinned it into the scene, and a Refresh respawned it from the live
+// capture, so a template change to T never reached the instance. Values are now compared by subtraction over the base
+// SEEDED with the chain node's statement (`sameNodeValues`).
+describe('#1781: a template reference node whose statement adds a component is not pinned', () => {
+  const Q = 'cccccccc-0000-4000-8000-000000001781';
+  const S = 'cccccccc-0000-4000-8000-000000001782';
+  const ref = (localId: number, name: string, parentId: number, nodeGuid: string, prefab: string) =>
+    ({ localId, name, nodeGuid, prefab, traits: { EntityAttributes: { name, parentId, guid: '' } } as Record<string, unknown> } as Record<string, unknown>);
+  const sDoc = () => ({ id: S, version: 5, name: 'S', rootLocalId: 1, entities: [
+    row(1, 'SR', 0, 'eeeeeeee-0000-4000-8000-000000001781'), row(2, 'K', 1, 'eeeeeeee-0000-4000-8000-000000001782'),
+  ] });
+  /** Q: QR → M → D (expanding S). `dOverrides` is what Q's own row D states about S's members. */
+  const qDoc = (dOverrides?: Record<number, unknown>) => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+    row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001783'), row(2, 'M', 1, 'eeeeeeee-0000-4000-8000-000000001784'),
+    { ...ref(3, 'D', 2, 'eeeeeeee-0000-4000-8000-000000001785', S), ...(dOverrides ? { overrides: dOverrides } : {}) },
+  ] });
+  const withT = (node: Record<string, unknown>) => {
+    const o = oWith({});
+    (o.entities[3] as Record<string, unknown>).added = [{
+      parentLocalId: 2, guid: '', key: 'kT1781', name: 'T', prefab: Q, traits: { EntityAttributes: { name: 'T', parentId: 0 } }, children: [], ...node,
+    }];
+    return o;
+  };
+  const named = (name: string) => getAllEntities().filter((e) => e.name === name);
+  const focus = (name: string) => readTraitData(named(name)[0]!.id, meta('UIFocusable')) as { focusable?: boolean; focusOrder?: number } | null;
+  const entryText = async () => JSON.stringify((await saved()).entry);
+
+  for (const [label, stmt] of [['UIFocusable', { UIFocusable: { focusOrder: 3 } }], ['Rotate3D', { Rotate3D: { axis: 'x' } }]] as const) {
+    it(`an untouched load saves nothing for T when its deep statement adds ${label}`, async () => {
+      // Mutation: drop the seed (`opts.seed` in `captureNestedChannels`' chainLayer) — the save writes T whole, the
+      // component with every schema default. Mutation: keep `nestedOverrides` in `withoutNodeValues` — the same.
+      install(sDoc(), qDoc(), pDoc(), withT({ nestedOverrides: { 3: { 2: stmt } } }));
+      await load(scene(O, [ROOT1]));
+      expect(readTraitData(named('K')[0]!.id, meta(label))).toBeTruthy(); // precondition: the statement applied
+      const text = await entryText();
+      expect(text).not.toContain(label);
+      expect(text).not.toContain('"added"');
+    });
+  }
+
+  it('the root-frame twin: T\'s own `overrides` adding a component to M saves nothing either', async () => {
+    // Mutation: measure T's root frame against the seed's fold alone (drop `chain.overrides` from `rootChain`) — T is
+    // pinned with M's UIFocusable written whole.
+    install(sDoc(), qDoc(), pDoc(), withT({ overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }));
+    await load(scene(O, [ROOT1]));
+    expect(focus('M')?.focusOrder).toBe(3); // precondition
+    expect(await entryText()).not.toContain('UIFocusable');
+  });
+
+  it('a Refresh after O changes T\'s statement brings the new value to the instance', async () => {
+    // Mutation: drop the seed — the Refresh respawns T from the live capture, and K keeps focusOrder 3.
+    install(sDoc(), qDoc(), pDoc(), withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }));
+    await load(scene(O, [ROOT1]));
+    install(withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 5 } } } } }));
+    await rebaseStaleInstances();
+    expect(focus('K')?.focusOrder).toBe(5);
+    expect(await entryText()).not.toContain('UIFocusable');
+  });
+
+  it('E13: a real scene edit on top of the statement is still saved, and a reload keeps it', async () => {
+    // Q's row D sets focusable false, T states focusOrder 3, and the scene sets focusable back to TRUE — the schema
+    // default, but not the value below it. Mutation: make `sameNodeValues` answer true — the edit is dropped on save and
+    // the reload shows Q's false. (Subtracting T's statement alone, the variant the design rejected, loses it the same way.)
+    install(sDoc(), qDoc({ 2: { UIFocusable: { focusable: false } } }), pDoc(), withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }));
+    await load(scene(O, [ROOT1]));
+    expect(focus('K')).toMatchObject({ focusable: false, focusOrder: 3 }); // precondition
+    writeTraitFieldWithUndo(named('K')[0]!.id, meta('UIFocusable'), 'focusable', true);
+    const { scene: s } = await saved();
+    expect(JSON.stringify(s)).toContain('"focusable":true');
+    await load(s);
+    expect(focus('K')).toMatchObject({ focusable: true, focusOrder: 3 });
+  });
+
+  it('a scene REMOVAL of a component T\'s statement adds is saved, in the root frame and a nested one (close-out review F2)', async () => {
+    // No live field shows a removal, so the value subtraction alone read T as unchanged and the save dropped it. Mutation:
+    // drop the removal checks in `sameNodeValues` (`moreRemovals`) — the reload brings UIFocusable back.
+    for (const [where, stmt] of [['M', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }], ['K', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }]] as const) {
+      install(sDoc(), qDoc(), pDoc(), withT(stmt));
+      await load(scene(O, [ROOT1]));
+      expect(focus(where), where).toBeTruthy(); // precondition
+      removeTraitFromEntitiesWithUndo([named(where)[0]!.id], meta('UIFocusable'));
+      const { scene: s } = await saved();
+      await load(s);
+      expect(focus(where), where).toBeNull();
+    }
+  });
+
+  it('E9: a component a lower ROW adds, restated by T, saves nothing from an untouched load', async () => {
+    // The case #1386's rule already covered (the row is in the chain): kept as a regression beside the new one.
+    install(sDoc(), qDoc({ 2: { UIFocusable: { focusOrder: 1 } } }), pDoc(), withT({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }));
+    await load(scene(O, [ROOT1]));
+    expect(focus('K')?.focusOrder).toBe(3); // precondition
+    expect(await entryText()).not.toContain('UIFocusable');
+  });
+});
+
+// #1779: a template-added node with NO key and NO durable guid (no editor writer emits one; a hand- or agent-written file
+// can) matched nothing in the rebuild's subtraction, so every rebuild spawned it twice. It is now paired with the one live
+// node without a template key under the same parent with the same name, when that name is unique on both sides — and
+// nothing derived from the pairing is persisted, so a scene statement cannot be keyed on it and re-target.
+describe('#1779: an unkeyed, guid-less template node is spawned once by a rebuild, and nothing re-targets', () => {
+  const Q = 'cccccccc-0000-4000-8000-000000001779';
+  const gC = 'eeeeeeee-0000-4000-8000-000000001779';
+  const gB = 'eeeeeeee-0000-4000-8000-000000001780';
+  const qDoc = () => ({ id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
+    row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001781'), row(2, 'L', 1, 'eeeeeeee-0000-4000-8000-000000001782'),
+  ] });
+  /** P: R → A → C (a reference row expanding Q, carrying `cExtra`); R → B (x = `bx`). */
+  const pWithC = (cExtra: Record<string, unknown> = {}, bx = 0) => {
+    const d = pDoc();
+    const c = { localId: 3, name: 'C', nodeGuid: gC, prefab: Q, traits: { EntityAttributes: { name: 'C', parentId: 2, guid: '' } }, ...cExtra };
+    return { ...d, entities: [...d.entities, c, row(4, 'B', 1, gB, bx)] };
+  };
+  const node = (name: string, x: number) => ({ parentLocalId: 2, guid: '', name, traits: { EntityAttributes: { name, parentId: 0 }, Transform: { x, y: 0, z: 0 } }, children: [] });
+  const xsOf = (name: string) => getAllEntities().filter((e) => e.name === name).map((e) => x(e.id));
+  /** Refresh P after an unrelated change (B.x = 1), keeping C's own list as given. */
+  const refreshP = async (cExtra: Record<string, unknown> = {}) => { install(pWithC(cExtra, 1)); await rebaseStaleInstances(); };
+
+  it('(a) on P\'s own row: a Refresh spawns it once', async () => {
+    // Mutation: drop the pairing (`?? paired` in `subtractChainStructure`) — Extra comes back [5, 5].
+    const own = { added: [node('Extra', 5)] };
+    install(qDoc(), pWithC(own), oWith({}));
+    await load(scene(O, [ROOT1]));
+    await refreshP(own);
+    expect(xsOf('B')).toEqual([1]); // the Refresh did rebuild
+    expect(xsOf('Extra')).toEqual([5]);
+  });
+
+  it('(b) in an enclosing layer\'s slot: a Refresh spawns it once', async () => {
+    // Mutation: as above.
+    const o = oWith({});
+    Object.assign(o.entities[3] as Record<string, unknown>, { nestedStructure: { 3: { added: [node('Extra', 5)] } } });
+    install(qDoc(), pWithC(), o);
+    await load(scene(O, [ROOT1]));
+    await refreshP();
+    expect(xsOf('B')).toEqual([1]);
+    expect(xsOf('Extra')).toEqual([5]);
+  });
+
+  it('an EDITED one keeps its edit through a Refresh (its fresh copy stays beside it: #1810)', async () => {
+    // Not paired: an edited unkeyed node has no identity to find its fresh copy by. Pins that the edit is not LOST, which
+    // a pairing that dropped the live copy as "the template's" would do. Mutation: pair on the name alone (drop
+    // `sameAddedNode` from `sameUnkeyed`) — the live 9 is dropped as the template's, and only 5 comes back.
+    const own = { added: [node('Extra', 5)] };
+    install(qDoc(), pWithC(own), oWith({}));
+    await load(scene(O, [ROOT1]));
+    writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Extra')!.id, meta('Transform'), 'x', 9);
+    await refreshP(own);
+    expect(xsOf('Extra')).toContain(9);
+  });
+
+  it('no re-target: a scene edit to it stays on it after the template puts another unkeyed node before it', async () => {
+    // The hub's question (#1779): a key derived from a node's POSITION would name the inserted node after the shift, and
+    // a scene statement keyed on it would move there. Nothing is keyed on the pairing, so the edit stays on Extra.
+    for (const inserted of ['Other', 'Extra']) {
+      const own = { added: [node('Extra', 5)] };
+      install(qDoc(), pWithC(own), oWith({}));
+      await load(scene(O, [ROOT1]));
+      writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Extra')!.id, meta('Transform'), 'x', 9);
+      const { scene: s } = await saved();
+      install(pWithC({ added: [node(inserted, 7), node('Extra', 5)] }));
+      await load(s);
+      const named = (n: string) => getAllEntities().filter((e) => e.name === n);
+      expect(xsOf('Extra'), `inserted ${inserted}`).toContain(9);
+      if (inserted === 'Other') expect(named('Other').map((e) => x(e.id))).not.toContain(9);
+    }
+  });
+
+  it('a scene DUPLICATE of it, identical in content, is kept', async () => {
+    // The duplicate holds a durable guid, so it equals no chain node. Mutation: pair on the name alone (drop
+    // `sameAddedNode` from `sameUnkeyed`) — the duplicate is dropped as the template's, and is gone.
+    const own = { added: [node('Extra', 5)] };
+    install(qDoc(), pWithC(own), oWith({}));
+    await load(scene(O, [ROOT1]));
+    duplicateEntity(getAllEntities().find((e) => e.name === 'Extra')!.id, () => {});
+    expect(xsOf('Extra')).toEqual([5, 5]); // precondition
+    await refreshP(own);
+    expect(xsOf('Extra')).toEqual([5, 5]);
+  });
+
+  it('a SCENE node written guid-less and equal to it stays beside it: each chain node absorbs one live copy', async () => {
+    // Mutation: let one chain node absorb every equal live copy (drop `usedUnkeyed`) — both are dropped, the fresh
+    // expansion spawns one, and the scene's node is gone ([5]), for good after a save.
+    const own = { added: [node('Extra', 5)] };
+    install(qDoc(), pWithC(own), oWith({}));
+    const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+    sc.entities[1]!.members = { [`/${gN}/${gC}/eeeeeeee-0000-4000-8000-000000001782`]: { own: [{ ...node('Extra', 5), parentLocalId: 0 }] } };
+    await load(sc as unknown as SceneData);
+    expect(xsOf('Extra')).toEqual([5, 5]); // precondition: the template's and the scene's
+    await refreshP(own);
+    expect(xsOf('Extra')).toEqual([5, 5]);
+    const { scene: s } = await saved();
+    await load(s);
+    expect(xsOf('Extra')).toEqual([5, 5]);
+  });
+
+  it('repeated names: each untouched one once, across Refreshes, and children tell same-named nodes apart', async () => {
+    // Mutation: drop the pairing (`sameUnkeyed`) — every untouched one comes back twice.
+    const kid = (name: string) => ({ parentLocalId: 0, guid: '', name, traits: { EntityAttributes: { name, parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } }, children: [] });
+    const withKid = (k: string) => ({ ...node('Extra', 5), children: [kid(k)] });
+    for (const own of [{ added: [node('Extra', 5), node('Extra', 6), node('Extra', 7)] }, { added: [withKid('Kid1'), withKid('Kid2')] }]) {
+      install(qDoc(), pWithC(own), oWith({}));
+      await load(scene(O, [ROOT1]));
+      const before = [xsOf('Extra').sort(), getAllEntities().filter((e) => e.name.startsWith('Kid')).map((e) => e.name).sort()];
+      for (const bx of [1, 2]) {
+        install(pWithC(own, bx));
+        await rebaseStaleInstances();
+        expect(xsOf('B')).toEqual([bx]);
+        expect([xsOf('Extra').sort(), getAllEntities().filter((e) => e.name.startsWith('Kid')).map((e) => e.name).sort()]).toEqual(before);
+      }
+    }
   });
 });

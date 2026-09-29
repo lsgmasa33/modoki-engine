@@ -20,9 +20,10 @@ import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 import { endFrames, relinkDetachedMembers, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, linkOwnerBeforeMove, frameDocReader, frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../../runtime/core/ecs/identityParents';
-import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runtime/core/carriedMarkers';
-import { copyUnresolvedRef, recordGuidMints } from './unresolvedRefCopy';
+import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
+import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
@@ -411,6 +412,10 @@ export interface EntitySnapshot {
    *  duplicated, pasted or undo-restored instance read as expanded from whatever the cache holds, and the
    *  stale-frame guards could not see it. A copy keeps it too: it was built from the same document. */
   frameDoc?: { source: string; doc: TemplateDoc };
+  /** What R2 keeps for it as a stored root — orphan member rows and unreached legacy channels (#1788). The store is keyed
+   *  by the root's guid beside the tree, so a respawn or a copy got none of it: a duplicated instance saved without
+   *  either, and only the original took the scene's edit once the template brought the member or frame back. */
+  kept?: KeptState;
 }
 
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
@@ -434,11 +439,13 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   const marks = getOverrideMarkSet(entity);
   const markers = captureMarkers(entity);
   const frameDoc = frameRootDoc(getCurrentWorld(), entity);
+  const kept = keptStateOf(durableGuidOf(traits));
   return {
     id: entityId, traits, children,
     ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
     ...(markers ? { markers } : {}),
     ...(frameDoc ? { frameDoc } : {}),
+    ...(kept ? { kept } : {}),
   };
 }
 
@@ -488,7 +495,14 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
     if (ref) for (const [g, m] of recordGuidMints(ref, (dataOf(s, 'EntityAttributes')?.guid as string) ?? '', guidOf.get(s)!, newGuid)) fullRemap.set(g, m);
     for (const c of s.children) collectMints(c);
   };
+  // …and every identity a stored root's KEPT state names (#1788): an orphan row pins a member guid no live entity holds,
+  // so `planCopyGuids` never saw it. A guid the plan already moved keeps the plan's.
+  const collectKeptMints = (s: EntitySnapshot): void => {
+    if (s.kept && links.get(s) !== 'strip') for (const [g, m] of keptGuidMints(s.kept, newGuid)) if (!fullRemap.has(g)) fullRemap.set(g, m);
+    for (const c of s.children) collectKeptMints(c);
+  };
   collectMints(snapshot);
+  collectKeptMints(snapshot);
   const markersOf = (s: EntitySnapshot): EntitySnapshot['markers'] => {
     const out: NonNullable<EntitySnapshot['markers']> = {};
     if (keyed.has(s)) out.TemplateAddedKey = { key: keyOf(s) };
@@ -508,9 +522,11 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
       else if (t.meta.name === 'PrefabInstance' && link === 'promote') traits.push({ meta: t.meta, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } });
       else traits.push({ meta: t.meta, data });
     }
-    const { marks, ...rest } = s;
+    const { marks, kept, ...rest } = s;
     return {
       ...rest,
+      // A stripped node is no instance any more, so it has no rows to keep.
+      ...(kept && link !== 'strip' ? { kept: remapGuidValues(kept, fullRemap) as KeptState } : {}),
       // An override mark means something only on a member of an instance: a stripped node is an added node.
       ...(marks && link !== 'strip' ? { marks } : {}),
       markers: markersOf(s),
@@ -545,6 +561,7 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     if (snap.marks) restoreOverrideMarks(entity, snap.marks);
     restoreMarkers(entity, snap.markers);
     if (snap.frameDoc) noteFrameRootDoc(getCurrentWorld(), entity, snap.frameDoc);
+    if (snap.kept) restoreKeptState(durableGuidOf(snap.traits), snap.kept);
     const id = entity.id();
     idMap.set(snap.id, id);
     spawned.push([snap, id]);
@@ -554,6 +571,12 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
   const newId = spawnTree(snapshot, newParentId);
   carryEntityIdFields(spawned.map(([snap, id]) => ({ id, traits: snap.traits.map((t) => ({ name: t.meta.name, data: t.data })) })), idMap);
   return newId;
+}
+
+/** The durable EntityAttributes.guid in a snapshot's traits ('' if none) — the key R2 keeps a stored root's state under. */
+function durableGuidOf(traits: EntitySnapshot['traits']): string {
+  const ea = traits.find((t) => t.data !== true && t.meta.name === 'EntityAttributes');
+  return durableGuid(ea && ea.data !== true ? (ea.data as Record<string, unknown>).guid as string | undefined : '');
 }
 
 /** The EntityAttributes.guid carried in a snapshot's root traits ('' if none).

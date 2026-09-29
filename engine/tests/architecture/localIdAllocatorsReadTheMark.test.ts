@@ -20,7 +20,7 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const SCENE = 'engine/packages/modoki/src/editor/scene/';
 /** file → the functions in it that hand out a NEW localId. */
 const ALLOCATORS: Record<string, string[]> = {
-  [`${SCENE}prefab.ts`]: ['serializePrefab', 'replaceNumbering', 'mergeRiggedPrefab', 'planApply'],
+  [`${SCENE}prefab.ts`]: ['serializePrefabBody', 'replaceNumbering', 'mergeRiggedPrefab', 'planApply'],
   [`${SCENE}prefabEdit.ts`]: ['usedUpTo'],
 };
 const READS_MARK = /\b(?:advanceLocalIdCounter|localIdCounter)\(/;

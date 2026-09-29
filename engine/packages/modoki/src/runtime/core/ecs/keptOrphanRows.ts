@@ -66,6 +66,27 @@ export function dropKeptOrphanRows(rootGuid: string): void {
   keptRows.delete(rootGuid);
 }
 
+/** Everything R2 keeps for one root: its orphan rows and its legacy channels. */
+export type KeptState = { rows?: Record<string, object>; legacy?: KeptLegacy };
+
+/** A deep copy of what is kept for `rootGuid`, for an entity snapshot to carry (#1788): the store sits beside the tree,
+ *  keyed by the root's guid, so a respawn (undo) or a copy (duplicate, paste) got none of it — the copy's save wrote no
+ *  orphan row and no legacy channel, and only the original took the scene's edit when the template brought them back.
+ *  A copy, not the live value: the store is rewritten in place by a later load, settle or rename. */
+export function keptStateOf(rootGuid: string): KeptState | undefined {
+  const rows = rootGuid ? keptRows.get(rootGuid) : undefined;
+  const legacy = rootGuid ? keptLegacy.get(rootGuid) : undefined;
+  if (!rows && !legacy) return undefined;
+  return structuredClone({ ...(rows ? { rows } : {}), ...(legacy ? { legacy } : {}) });
+}
+
+/** Put a snapshot's kept state back under `rootGuid` — the respawn half of {@link keptStateOf}. */
+export function restoreKeptState(rootGuid: string, state: KeptState): void {
+  if (!rootGuid) return;
+  setKeptOrphanRows(rootGuid, structuredClone(state.rows ?? {}));
+  setKeptLegacy(rootGuid, structuredClone(state.legacy ?? {}));
+}
+
 export function clearKeptOrphanRows(): void {
   keptRows.clear();
   keptLegacy.clear();

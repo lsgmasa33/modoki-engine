@@ -44,6 +44,8 @@ import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/sc
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
+import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAsset, resolveRef } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -941,3 +943,328 @@ describe('a child under a node placeholder keeps its parent across a reload (#17
     expect(getAllEntities().find((e) => e.id === rootOf(QINST))!.missingPrefab).toBeUndefined();
   });
 });
+
+// #1788: R2's kept store (orphan member rows, unreached legacy channels) is keyed by a stored root's guid BESIDE the
+// tree, so a duplicate — a new root guid — used to carry none of it: the copy saved with neither, and only the original
+// took the scene's edit once the template brought the member (or frame) back. The kept state now rides in the entity
+// snapshot (`EntitySnapshot.kept`), with every identity it states re-minted for the copy.
+describe('a duplicate carries its stored roots\' kept R2 state, under identities of its own (#1788)', () => {
+  const DEAD = 'eeeeeeee-0000-4000-8000-00000000dead';
+  const BEEF = 'eeeeeeee-0000-4000-8000-00000000beef';
+  const KID = 'dddddddd-0000-4000-8000-000000001788';
+  const T = 'cccccccc-0000-4000-8000-000000001788';
+  const bare = (r: Record<string, unknown>) => { const { nodeGuid: _g, ...rest } = r; return rest; };
+  /** PQ's shape, pre-v5 (no `nodeGuid`): R → A, and row 3 expanding Q. */
+  const tDoc = () => ({ ...pqDoc(), id: T, version: 4, name: 'T', entities: pqDoc().entities.map((e) => bare(e as Record<string, unknown>)) });
+  const channel = { 3: { 2: { Transform: { x: 7 } } } };
+  /** P with the member the orphan row names brought back: R → Gone. */
+  const pBack = () => ({ ...pDoc(), entities: [...pDoc().entities, row(3, 'Gone', 1, DEAD)] });
+  const UIA = (target: string) => ({ bindings: [{ event: 'click', kind: 'call', action: 'noop', target }] });
+  const targetOf = (id: number) => (readTraitData(id, meta('UIAction')) as { bindings: { target: string }[] }).bindings[0]!.target;
+  const guidOfId = (id: number) => getAllEntities().find((e) => e.id === id)!.guid!;
+  const orphanOf = (sd: SceneData, guid: string) => (entryOf(sd, guid)?.members as Record<string, { guid?: string; traits?: Record<string, unknown> }> | undefined)?.[`/${DEAD}`];
+  /** An instance of P whose entry holds an orphan row for DEAD (x = 4). */
+  const withOrphan = (extra: Record<string, unknown> = {}): SceneData => {
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 }, ...extra } } };
+    return sc;
+  };
+  const duplicate = () => guidOfId(duplicateEntity(rootOf(INST), () => {})!);
+
+  it('an orphan member row: the copy saves it under a fresh member guid, and both take the edit when the member returns', async () => {
+    // Mutation: drop `kept` from the snapshot (`snapshotEntity`) — the copy saves no orphan row, and its Gone comes back at
+    // P's 0. Mutation: skip the kept mints (`collectKeptMints`) — the copy's row pins BEEF too, two members one guid (#1293).
+    install(pDoc());
+    await load(withOrphan());
+    const copyGuid = duplicate();
+    const saved = await save();
+    expect(orphanOf(saved, INST)).toEqual({ guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } });
+    const copyRow = orphanOf(saved, copyGuid)!;
+    expect(copyRow.traits).toEqual({ Transform: { x: 4 } });
+    expect(copyRow.guid).toBeTruthy();
+    expect(copyRow.guid).not.toBe(BEEF);
+    install(pBack());
+    await load(saved);
+    expect([x(inside(INST, 'Gone')), x(inside(copyGuid, 'Gone'))]).toEqual([4, 4]);
+    expect(guidOfId(inside(INST, 'Gone'))).toBe(BEEF);
+    expect(guidOfId(inside(copyGuid, 'Gone'))).toBe(copyRow.guid);
+  });
+
+  it('a legacy channel into a missing frame: the copy saves it too, and both apply it once the frame is back', async () => {
+    // Mutation: drop `kept` from the snapshot — the copy saves no `nestedOverrides`, and its QX comes back at Q's 0.
+    install(tDoc());
+    uninstall(Q); // from the EDITOR cache too: a Q an earlier case left there reads as present, and the capture writes row 3 removed
+    const sc = scene(T);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.nestedOverrides = channel;
+    await load(sc);
+    const copyGuid = duplicate();
+    const saved = await save();
+    expect(entryOf(saved, INST)!.nestedOverrides).toEqual(channel);
+    expect(entryOf(saved, copyGuid)!.nestedOverrides).toEqual(channel);
+    install(qDoc());
+    await load(saved);
+    expect([x(inside(INST, 'QX')), x(inside(copyGuid, 'QX'))]).toEqual([7, 7]);
+  });
+
+  it('refs between the kept row and the entities copied with it follow the copy, both ways (#1338)', async () => {
+    // The orphan row's Gone targets member A; Kid (a plain child of the instance) targets Gone's pinned BEEF. Mutation:
+    // rewrite `kept` with planCopyGuids' `remap` instead of `fullRemap` — the copy's Kid still targets the ORIGINAL's Gone.
+    // Mutation: leave `kept` un-remapped — the copy's Gone still targets the original's A.
+    install(pDoc());
+    await load(scene(P));
+    const pinA = Object.values(entryOf(await save(), INST)!.members as Record<string, { guid: string }>)[0]!.guid;
+    const sc = withOrphan({ UIAction: UIA(pinA) });
+    (sc.entities as unknown[]).push({ id: 99, traits: { EntityAttributes: { name: 'Kid', parentId: INST, guid: KID }, UIAction: UIA(BEEF) } });
+    await load(sc);
+    const copyGuid = duplicate();
+    const saved = await save();
+    install(pBack());
+    await load(saved);
+    const copyKid = getAllEntities().find((e) => e.name === 'Kid' && e.guid !== KID)!;
+    expect(targetOf(inside(INST, 'Gone'))).toBe(guidOfId(inside(INST, 'A')));
+    expect(targetOf(inside(copyGuid, 'Gone'))).toBe(guidOfId(inside(copyGuid, 'A')));
+    expect(targetOf(rootOf(KID))).toBe(BEEF);
+    expect(targetOf(copyKid.id)).toBe(guidOfId(inside(copyGuid, 'Gone')));
+  });
+
+  it('an undone duplicate writes nothing of the copy\'s kept state, and its redo brings the same identities back', async () => {
+    // The undo leaves the copy's kept entry in the store under a guid nothing holds; the writers read the store only for
+    // a LIVE root, so no save writes it.
+    install(pDoc());
+    await load(withOrphan());
+    clearHistory();
+    const copyGuid = duplicate();
+    const minted = orphanOf(await save(), copyGuid)!.guid!;
+    await undo();
+    const afterUndo = JSON.stringify(await save());
+    expect(afterUndo).not.toContain(copyGuid);
+    expect(afterUndo).not.toContain(minted);
+    expect(afterUndo.split(BEEF).length - 1).toBe(1);
+    await redo();
+    expect(orphanOf(await save(), copyGuid)!.guid).toBe(minted);
+  });
+
+  it('delete + undo keeps an instance\'s kept state', async () => {
+    // ⚠️ Not falsifiable against the snapshot carry TODAY: a delete leaves the store entry in place, so the undo finds it
+    // either way. It pins the outcome against a later prune of a deleted root's entry, which the carry then makes safe.
+    install(pDoc());
+    await load(withOrphan());
+    const before = entryOf(await save(), INST);
+    expect(orphanOf(await save(), INST)?.guid).toBe(BEEF); // precondition: the row is kept
+    clearHistory();
+    deleteEntitiesWithUndo([rootOf(INST)]);
+    expect(entryOf(await save(), INST)).toBeUndefined();
+    await undo();
+    expect(entryOf(await save(), INST)).toEqual(before);
+  });
+});
+
+// #1790, owner ruling D (relayed by the hub): Create Prefab follows Unity over what R2 keeps. (1) A tree holding an
+// instance whose NESTED prefab could not be expanded is refused, naming the member and the prefab — Unity will not save a
+// missing prefab instance into an asset. (2) Kept UNUSED overrides (a readable template that dropped a member, or has no
+// row yet for a legacy channel) travel with the instance INTO the new template; only their identity stays in the scene.
+// Before, both kinds were written by nobody: the template gate kept scene rows out, and the swallowed root was no longer
+// a stored root for the scene writer to read.
+describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake unused overrides (#1790)', () => {
+  const HOLDER = 'dddddddd-0000-4000-8000-000000001600';
+  const SECOND = 'dddddddd-0000-4000-8000-000000001790';
+  const DEAD = 'eeeeeeee-0000-4000-8000-00000000d790';
+  const BEEF = 'eeeeeeee-0000-4000-8000-00000000b790';
+  const T = 'cccccccc-0000-4000-8000-000000001790';
+  const bare = (r: Record<string, unknown>) => { const { nodeGuid: _g, ...rest } = r; return rest; };
+  /** PQ's shape, pre-v5; `withQ` false leaves out row 3 (the frame a legacy channel names). */
+  const tDoc = (withQ = true) => ({ ...pqDoc(), id: T, version: 4, name: 'T', entities: pqDoc().entities.slice(0, withQ ? 3 : 2).map((e) => bare(e as Record<string, unknown>)) });
+  const channel = { 3: { 2: { Transform: { x: 7 } } } };
+  const pBack = () => ({ ...pDoc(), entities: [...pDoc().entities, row(3, 'Gone', 1, DEAD)] });
+  const holder = () => rootOf(HOLDER);
+  const create = () => createPrefabFromEntity(holder(), 'prefabs/Held.prefab.json', 'Held', async () => true);
+  const refusalOf = (r: Awaited<ReturnType<typeof create>>) => (r && typeof r === 'object' && 'refused' in r ? r.refused : '');
+  const heldDoc = () => JSON.parse(writes.filter((w) => w.path.endsWith('Held.prefab.json')).pop()!.content) as PrefabFile;
+  /** The saved scene with a SECOND instance of the new prefab dropped in beside the first. */
+  const withSecond = (sd: SceneData, prefab: string): SceneData => ({
+    ...sd, entities: [...(sd.entities as unknown[]), { id: 90, prefab, guid: SECOND, traits: { EntityAttributes: { name: 'Held2', parentId: 0 } } }],
+  } as unknown as SceneData);
+
+  it('(1) refuses a tree whose nested frame could not be expanded, naming the member and the prefab — with or without a kept statement', async () => {
+    // Mutation: drop the refusal in `createPrefabFromEntity` — the file is written, and (a)'s channel is lost for good.
+    for (const withChannel of [true, false]) {
+      install(tDoc());
+      uninstall(Q); // from the EDITOR cache too: an earlier case can leave Q there
+      const sc = scene(T);
+      if (withChannel) (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.nestedOverrides = channel;
+      await load(sc);
+      writes.length = 0;
+      const refused = refusalOf(await create());
+      expect(refused).toMatch(/"Qrow" in "R" is a nested prefab that could not be loaded/);
+      expect(refused).toContain(resolveRef(Q) ?? Q); // the prefab named by its path when the manifest knows it
+      expect(writes.length).toBe(0);
+    }
+  });
+
+  it('(1) a v5 instance whose nested prefab went missing after a save is refused too (the issue\'s (b))', async () => {
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    writeTraitFieldWithUndo(inside(INST, 'QX'), meta('Transform'), 'x', 7);
+    const control = await save();
+    uninstall(Q);
+    await load(control);
+    expect(refusalOf(await create())).toMatch(/"Qrow"/);
+  });
+
+  it('(1) the agent prefab create op refuses the same tree, with the same words', async () => {
+    // Mutation: drop the refusal in the agent op — it writes the template.
+    install(tDoc());
+    uninstall(Q);
+    await load(scene(T));
+    await expect(runAgentOp('prefab', { action: 'create', entityGuid: HOLDER, path: 'prefabs/Made.prefab.json' })).rejects.toThrow(/"Qrow" in "R" is a nested prefab that could not be loaded/);
+    expect(writes.length).toBe(0);
+  });
+
+  it('(1) a nested prefab the editor cache has merely not warmed is NOT refused: the check runs after the warm', async () => {
+    // Mutation: ask `unexpandedNestedRefusal` before `preloadNestedPrefabsForSubtree` — Create Prefab refuses a readable Q.
+    registerAsset(Q, '/assets/q1790.prefab.json', 'prefab');
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    setPrefabCache(Q, null); // cold in the editor; readable on disk
+    vi.stubGlobal('fetch', async (url: string) => String(url).includes('q1790')
+      ? { ok: true, status: 200, json: async () => qDoc(), text: async () => JSON.stringify(qDoc()) }
+      : { ok: false, status: 404, json: async () => ({}), text: async () => '' });
+    expect(refusalOf(await create())).toBe('');
+    expect(heldDoc().entities.filter((e) => e.prefab).map((e) => e.prefab)).toEqual([PQ]);
+  });
+
+  it('(2) an orphan row\'s EDIT goes into the new template and its identity stays in the scene; a SECOND instance gets the edit', async () => {
+    // Mutation: drop `bakingKeptState` from the gate in `captureRowChannels` — the template has no row, and neither
+    // instance's Gone gets x = 4. Mutation: skip `settleSwallowedKeptState` — the scene writes no identity row, and the
+    // first instance's Gone comes back under a derived guid, not BEEF.
+    install(pDoc());
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } } };
+    await load(sc);
+    const created = await create();
+    expect(refusalOf(created)).toBe('');
+    const doc = heldDoc();
+    const rowR = doc.entities.find((e) => e.prefab === P)!;
+    expect((rowR.members as Record<string, unknown>)[`/${DEAD}`]).toEqual({ traits: { Transform: { x: 4 } } }); // no guid (#1293)
+    const saved = await save();
+    const heldEntry = entryOf(saved, HOLDER)! as { members: Record<string, { guid?: string; traits?: unknown }> };
+    const identity = Object.entries(heldEntry.members).find(([k]) => k.endsWith(`/${DEAD}`));
+    expect(identity?.[1]).toEqual({ guid: BEEF, name: 'Gone' }); // identity only: a scene edit too would pin the old value
+    expect(JSON.stringify(saved)).not.toContain('"x":4');
+
+    install(pBack(), doc);
+    await load(withSecond(saved, doc.id!));
+    expect(x(inside(HOLDER, 'Gone'))).toBe(4);
+    expect(x(inside(SECOND, 'Gone'))).toBe(4);
+    expect(guidOfEntity(inside(HOLDER, 'Gone'))).toBe(BEEF);
+    expect(guidOfEntity(inside(SECOND, 'Gone'))).not.toBe(BEEF);
+  });
+
+  it('(2) a legacy channel into a row the template does not have yet goes into the new template, and a SECOND instance gets it', async () => {
+    // Mutation: drop `bakingKeptState` from the gate — the template row has no `nestedOverrides`, and QX comes in at 0.
+    install(tDoc(false));
+    const sc = scene(T);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.nestedOverrides = channel;
+    await load(sc);
+    expect(refusalOf(await create())).toBe('');
+    const doc = heldDoc();
+    expect(doc.entities.find((e) => e.prefab === T)!.nestedOverrides).toEqual(channel);
+    const saved = await save();
+    expect(JSON.stringify(saved)).not.toContain('nestedOverrides');
+    install(tDoc(), qDoc(), doc);
+    await load(withSecond(saved, doc.id!));
+    expect([x(inside(HOLDER, 'QX')), x(inside(SECOND, 'QX'))]).toEqual([7, 7]);
+  });
+
+  it('(2) a swallowed scene-added REFERENCE node keeps its edit on this instance too (close-out review F3)', async () => {
+    // It stays a stored root, and the scene save writes it whole over the template's node — so its rows must stay whole.
+    // Mutation: reduce a still-stored root's rows to identity (the first cut) — this instance's Gone comes back at 0.
+    const DEAD2 = 'eeeeeeee-0000-4000-8000-00000000d791';
+    const BEEF2 = 'eeeeeeee-0000-4000-8000-00000000b791';
+    const qBack = () => ({ ...qDoc(), entities: [...qDoc().entities, row(3, 'Gone', 1, DEAD2)] });
+    install(pDoc(), qDoc());
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, members: { [`/${DEAD2}`]: { guid: BEEF2, name: 'Gone', traits: { Transform: { x: 4 } } } },
+      traits: { EntityAttributes: { name: 'QInst', parentId: HOLDER } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    expect(refusalOf(await create())).toBe('');
+    const doc = heldDoc();
+    const saved = await save();
+    install(qBack(), doc);
+    await load(withSecond(saved, doc.id!));
+    const gones = getAllEntities().filter((e) => e.name === 'Gone');
+    expect(gones.map((e) => x(e.id))).toEqual([4, 4]);
+    expect(gones.map((e) => e.guid)).toContain(BEEF2);
+  });
+
+  it('(2) a baked legacy slot states no scene identity: its node\'s guid is not written into the template (close-out review F4)', async () => {
+    // Mutation: bake the kept legacy channels verbatim (`withKeptLegacy`) — the template states SG, and both instances
+    // spawn SN under that one guid (#1293).
+    const SG = 'dddddddd-0000-4000-8000-00000000f004';
+    install(tDoc(false));
+    const sc = scene(T);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.nestedStructure = { 3: { added: [
+      { parentLocalId: 1, guid: SG, name: 'SN', traits: { EntityAttributes: { name: 'SN', parentId: 0, guid: SG }, Transform: { x: 3, y: 0, z: 0 } }, children: [] },
+    ] } };
+    await load(sc);
+    expect(refusalOf(await create())).toBe('');
+    const doc = heldDoc();
+    expect(JSON.stringify(doc)).not.toContain(SG);
+    install(tDoc(), qDoc(), doc);
+    await load(withSecond(await save(), doc.id!));
+    const sns = getAllEntities().filter((e) => e.name === 'SN');
+    expect(sns.map((e) => x(e.id))).toEqual([3, 3]);
+    expect(new Set(sns.map((e) => e.guid)).size).toBe(2);
+  });
+
+  it('(1) a nested row the scene REMOVED, readable but cold (live nowhere), is not refused (close-out review F5)', async () => {
+    // Mutation: drop the nested-document warm in `preloadNestedPrefabsForSubtree` — Create Prefab names Q as missing.
+    registerAsset(Q, '/assets/q1790f5.prefab.json', 'prefab');
+    install(pqDoc(), qDoc());
+    await load(scene(PQ));
+    deleteEntitiesWithUndo([inside(INST, 'QR')]);
+    const saved = await save();
+    await load(saved);
+    setPrefabCache(Q, null); // live nowhere, so no warm has seen it; readable on disk
+    vi.stubGlobal('fetch', async (url: string) => String(url).includes('q1790f5')
+      ? { ok: true, status: 200, json: async () => qDoc(), text: async () => JSON.stringify(qDoc()) }
+      : { ok: false, status: 404, json: async () => ({}), text: async () => '' });
+    expect(refusalOf(await create())).toBe('');
+  });
+
+  it('(2) a tag that REFUSED settles nothing: the unlinked instance keeps its edit (close-out review F6)', async () => {
+    // Mutation: settle whatever the tag did (drop `linked` in `tagCreatedPrefab`) — the orphan row is cut to identity.
+    install(pDoc());
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } } };
+    await load(sc);
+    const mismatched = { id: 'cccccccc-0000-4000-8000-00000000f006', version: 8, name: 'X', rootLocalId: 1, entities: [] } as unknown as PrefabFile;
+    tagCreatedPrefab(holder(), 'prefabs/X.prefab.json', mismatched);
+    const members = entryOf(await save(), INST)!.members as Record<string, unknown>;
+    expect(members[`/${DEAD}`]).toEqual({ guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } });
+  });
+
+  it('(2) undo puts the kept state back on the instance as it was, and redo bakes it again', async () => {
+    // Mutation: drop `undoKept()` from the undo's `unstamp` — after the undo the scene saves the instance with only the
+    // identity row: the edit x = 4 is gone from the scene, and the file that held it is trashed.
+    install(pDoc());
+    const sc = scene(P);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } } };
+    await load(sc);
+    const before = entryOf(await save(), INST);
+    clearHistory();
+    // The undo's precondition re-reads the file (serve what the create wrote), then trashes it.
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/api/delete-asset')) return { ok: true, status: 200, json: async () => ({ ok: true, trashed: 1, missing: [], failed: [] }) };
+      const last = writes.filter((w) => String(url).includes('Held.prefab.json') && w.path.endsWith('Held.prefab.json')).pop();
+      return last ? new Response(last.content, { status: 200 }) : { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+    });
+    const created = await create();
+    pushAction((created as { action: Parameters<typeof pushAction>[0] }).action);
+    await undo();
+    expect(entryOf(await save(), INST)).toEqual(before);
+    await redo();
+    const heldEntry = entryOf(await save(), HOLDER)! as { members: Record<string, unknown> };
+    expect(Object.entries(heldEntry.members).find(([k]) => k.endsWith(`/${DEAD}`))?.[1]).toEqual({ guid: BEEF, name: 'Gone' });
+  });
+});
+const guidOfEntity = (id: number) => getAllEntities().find((e) => e.id === id)!.guid!;

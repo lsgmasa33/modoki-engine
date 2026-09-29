@@ -3711,6 +3711,25 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     expect(getAllEntities().filter((e) => e.name === 'ZRoot' || e.name === 'ZLeaf')).toHaveLength(0);
     expect(idAt('ORoot/QRoot/QA/QB')).toBeGreaterThan(0);
   });
+  // #1765: a PLAIN row under the nested row under the nested row. Deleting QRow's instance stores ONE removal: the plain
+  // row's own removal was written too, so once the template moved that row out from under QRow it stayed deleted.
+  // Mutation: test the direct parent only in the top-most filter (`underRemoved`) — `removed` is [2, 6], and FP stays gone.
+  it('deleting the outer nested instance stores only its own removal, and a row the template later moves out comes back', async () => {
+    const withFP = (fpParent: number) => {
+      const d = docsOf();
+      d[O7].entities.push(row(6, 'FP', fpParent));
+      return d;
+    };
+    use(withFP(3));
+    await loadO();
+    expect(idAt('ORoot/QRoot/ZRoot/FP')).toBeGreaterThan(0); // precondition: FP expands under ZRow's root
+    deleteEntitiesWithUndo([idAt('ORoot/QRoot')]);
+    expect((await oEntry()).removed).toEqual([2]);
+    const saved = await serializeScene() as unknown as SceneData;
+    use(withFP(1)); // the template author moves FP under the root
+    await load(saved);
+    expect(getAllEntities().filter((e) => e.name === 'FP')).toHaveLength(1);
+  });
   // A plain row under the nested row is O's row, not something Q added. Mutation: have `foreignRow` answer false for
   // a member of another instance (Q's capture writes Plain as its own `added`, and a reload spawns it twice).
   it('left in place, nothing is written as removed or added, and a reload holds one of each', async () => {

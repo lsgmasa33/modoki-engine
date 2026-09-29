@@ -104,7 +104,7 @@ export type ForwardState = SharedForwardState<NestedStructureDelta, SceneMemberR
 
 /** The forward state a template REFERENCE node hands the expansion of its frame, whose document is `doc`: its path-keyed
  *  channels and its member rows, as the editor's spawner hands them (`spawnNestedInstance`) and the loader's twin. */
-function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
+export function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
   const layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: node.nestedStructure, rows: node.members }];
   return {
     nestedOverrides: node.nestedOverrides,

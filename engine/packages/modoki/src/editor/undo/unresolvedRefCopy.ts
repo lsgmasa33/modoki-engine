@@ -29,6 +29,16 @@ export function recordGuidMints(data: { record: string }, oldGuid: string, newGu
   return remap;
 }
 
+/** The guids a COPY mints for the R2 state kept for one of its stored roots (#1788): every identity the kept rows and
+ *  legacy channels state — an orphan member's pinned guid, a scene node's — gets a fresh one, so the original and the copy
+ *  never pin one member guid between them once the template brings that member back (#1293). Merged into the copy's
+ *  remap with the record mints above, before anything is rewritten, so a copied entity's ref to the orphan follows too. */
+export function keptGuidMints(kept: unknown, mint: () => string): Map<string, string> {
+  const remap = new Map<string, string>();
+  for (const g of statedGuids(kept, new Set())) remap.set(g, mint());
+  return remap;
+}
+
 /** The marker data for a COPY of a placeholder: its record with every guid in `remap` rewritten, as a value and as a
  *  key. `remap` is the WHOLE copy's (`recordGuidMints` for every record in it, plus `planCopyGuids`' for every entity
  *  copied), so a ref inside the record to an entity copied alongside the placeholder names the copy of it, not the
