@@ -11,10 +11,12 @@
  *  What a snapshot covers, and how each part comes back:
  *   - the PRIMARY scene — reloaded wholesale from its serialization (`preloaded`, no disk read);
  *   - every BASE scene in the chain — replayed field-by-field onto the carried live entities by
- *     guid, because the reload keeps them rather than re-reading them (A5);
- *   - `Persistent` roots of the primary and their subtrees — the same replay, for the same reason:
- *     the reload carries the LIVE root and `filterPersistentDuplicates` drops the snapshot's own
- *     authored copy of it, so without the replay a posed/played Persistent entity kept its value.
+ *     guid, because the reload keeps them rather than re-reading them (A5).
+ *  A `Persistent` root is NOT carried: the restore runs outside Play (Stop sets `stopped` first; a
+ *  preview is never `playing`), and SceneManager carries Persistent roots only in Play (#1863) — as
+ *  Unity destroys DontDestroyOnLoad objects on leaving Play mode. So the snapshot's own copy comes
+ *  back like any other entity. It used to be carried AND respawned: nothing dropped the snapshot's
+ *  copy, and every Stop added one more (a filter meant to never matched a current-format root).
  *  Every trait field the snapshot holds is authored-only already (`serializeScene` skips
  *  `runtimeOnly`), so a replay can never regress runtime state such as `Time.elapsed`. */
 
@@ -89,7 +91,7 @@ export function currentSceneKey(): string | null {
  *
  *  ⚠️ But NOT EntityAttributes wholesale (#1547 close-out review): `isActive` is the field a
  *  cutscene's activation track and a game both toggle most, and skipping the trait left a
- *  Persistent HUD or a base entity hidden after ⏹ Exit / Stop — carried live into the next save.
+ *  base entity (once, a carried Persistent HUD) hidden after ⏹ Exit / Stop — carried live into the next save.
  *
  *  A prefab-instance ROOT writes only `PrefabInstance` in `entry.traits` (Phase 6's
  *  serialize convention) — its actual authored field values (Transform, a custom
@@ -183,29 +185,8 @@ export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
   return { primary, key, bases };
 }
 
-/** The primary's `Persistent` roots and everything under them, as snapshot entries — the part of the
- *  primary the reload CARRIES instead of respawning. Parent links in a snapshot are guids. */
-export function persistentSubtreeEntries(entries: SerializedEntity[]): SerializedEntity[] {
-  const attrs = (e: SerializedEntity) => (e.traits.EntityAttributes && e.traits.EntityAttributes !== true
-    ? e.traits.EntityAttributes as Record<string, unknown> : undefined);
-  const guidOf = (e: SerializedEntity) => e.guid || (attrs(e)?.guid as string | undefined) || '';
-  const inSubtree = new Set<string>();
-  for (const e of entries) if ('Persistent' in e.traits && guidOf(e)) inSubtree.add(guidOf(e));
-  if (inSubtree.size === 0) return [];
-  // Fixed point rather than one pass: nothing promises parents precede children in the list.
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const e of entries) {
-      const g = guidOf(e);
-      const parent = attrs(e)?.parentId;
-      if (g && !inSubtree.has(g) && typeof parent === 'string' && inSubtree.has(parent)) { inSubtree.add(g); grew = true; }
-    }
-  }
-  return entries.filter((e) => inSubtree.has(guidOf(e)));
-}
-
-/** Put the authored world back: reload the primary under the snapshot's key, then replay the parts
- *  the reload carries rather than rebuilds — every base, and the primary's `Persistent` subtrees.
+/** Put the authored world back: reload the primary under the snapshot's key, then replay the part
+ *  the reload carries rather than rebuilds — every base.
  *  The caller has already checked that the key still names the live scene. */
 export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<void> {
   // Counted from the FIRST synchronous line: Stop sets 'stopped' and calls this with no await between,
@@ -219,7 +200,6 @@ export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<v
       adoption.restored(world);
     });
     for (const base of snap.bases.values()) restoreAuthoredEntities(base.entities);
-    restoreAuthoredEntities(persistentSubtreeEntries(snap.primary.entities));
     _restoreFailed = false;
   } catch (e) {
     _restoreFailed = true;

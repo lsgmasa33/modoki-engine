@@ -7,7 +7,7 @@
  *  is a recorded no-op, not an error. A prefab-edit op carries its own inner list, which the shrinker also trims. */
 
 import { createWorld } from 'koota';
-import { getTraitByName, seedRng, rngNext } from '@modoki/engine/runtime';
+import { getTraitByName, seedRng, rngNext, findEntity } from '@modoki/engine/runtime';
 import { pushAction } from '@modoki/engine/editor';
 import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
@@ -36,7 +36,8 @@ import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scen
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
-import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, type Fixture } from './harness';
+import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, getCurrentWorld, type Fixture } from './harness';
+import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import type { FuzzBackend } from './backend';
 
 export type OpKind =
@@ -125,6 +126,24 @@ export interface RunState {
 }
 
 const liveGuids = () => new Set(authored().map((e) => e.guid).filter((g): g is string => !!g));
+
+/** #1820: when a Paste RETURNS — before anything is awaited — every frame it made is on the cached copy of its prefab,
+ *  whenever every prefab in the pasted tree is cached: the rebase is synchronous then, and an async one would be a
+ *  window a world switch can land in (#1833). The settle after the op cannot tell the two apart; this can. */
+function requirePastedFramesCurrent(pre: ReadonlySet<string>): void {
+  const pasted = authored().filter((e) => e.guid && !pre.has(e.guid));
+  const sources = pasted.map((e) => piOf(e.id)?.source).filter((s): s is string => !!s);
+  if (sources.some((src) => !getCachedPrefabSync(src))) return; // a fetch is needed: the async rebase is the right one
+  const world = getCurrentWorld();
+  for (const e of pasted) {
+    const pi = piOf(e.id);
+    if (!pi?.source || pi.rootInstanceId !== e.id) continue;
+    const rec = frameRootDoc(world, findEntity(e.id)!);
+    if (rec && JSON.stringify(rec.doc) !== JSON.stringify(getCachedPrefabSync(pi.source))) {
+      throw new Error(`harness: pasted frame "${e.name}" is still expanded from an older ${pi.source} when the paste returns (#1820)`);
+    }
+  }
+}
 function subtreeGuids(rootId: number): string[] {
   const all = authored(); const out: string[] = []; const ids = new Set([rootId]);
   for (let grew = true; grew;) { grew = false; for (const e of all) if (!ids.has(e.id) && e.parentId !== undefined && ids.has(e.parentId)) { ids.add(e.id); grew = true; } }
@@ -300,7 +319,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       }
       const pre = liveGuids();
       const clip = st.clip;
-      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect); return 'done'; }, st);
+      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect); requirePastedFramesCurrent(pre); return 'done'; }, st);
       for (const g of liveGuids()) if (!pre.has(g)) st.touched.paste.add(g);
       return r;
     }

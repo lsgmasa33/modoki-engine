@@ -86,7 +86,7 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { durableGuid } from '../core/assetRefRules';
+import { getRunMode } from '../core/playState';
 import { setCurrentWorld, getCurrentWorld, spawnEntity, destroyEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { notifyListeners } from '../core/notifyListeners';
@@ -768,7 +768,7 @@ class SceneManagerImpl implements SceneManager {
       // under a live scene id before the post-swap release, exactly as today;
       // kept-base entities need no such re-acquire — their resources are already
       // held under their own (unchanged, untouched-by-this-swap) sceneId.
-      const carriedSnapshots = snapshotPersistentEntities(getCurrentWorld(), keptBaseGuids);
+      const carriedSnapshots = snapshotPersistentEntities(getCurrentWorld(), keptBaseGuids, getRunMode() === 'playing');
       // Capture each carried entity's override marks NOW, while the OLD world is
       // still alive and its marks intact — `clearAllOverrideMarks()` below drops
       // them, and the respawn has nothing to re-seed from (a carried snapshot is
@@ -807,17 +807,13 @@ class SceneManagerImpl implements SceneManager {
 
       if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
-      // 8. Filter each toLoad scene's data to drop entries that collide with a
-      // carried entity's guid (unchanged mechanism — the persistent-shadows-the-
-      // scene-file dedup — applied per toLoad scene now instead of just the primary),
-      // THEN drop entries that collide with a guid an EARLIER scene in this same
+      // 8. Drop entries that collide with a guid an EARLIER scene in this same
       // chain already spawned (A4 — a half-thinned level sharing guids with the
       // base being extracted from it). `seenChainGuids` accumulates across the
       // loop, in `toLoadRefs`' own root-most-base-first/primary-last order.
       const seenChainGuids = new Set<string>();
       for (const ref of toLoadRefs) {
-        const sd = filterPersistentDuplicates(preparedSceneData.get(ref.path)!, carriedSnapshots);
-        preparedSceneData.set(ref.path, filterDuplicateChainGuids(sd, seenChainGuids, ref.path));
+        preparedSceneData.set(ref.path, filterDuplicateChainGuids(preparedSceneData.get(ref.path)!, seenChainGuids, ref.path));
       }
 
       // 9. Create the staging world and spawn every toLoad scene into it, in
@@ -1002,8 +998,7 @@ class SceneManagerImpl implements SceneManager {
             // ⚠️ NO `scenePath` here, deliberately (#1268). These snapshots come from the
             // live world and may originate in SEVERAL different scenes, so there is no one
             // scene identity to seed a derived guid on — and they already carry durable
-            // guids from their own files, which is exactly what filterPersistentDuplicates
-            // matches a carried entity on. Passing a path here would re-key them mid-swap.
+            // guids from their own files. Passing a path here would re-key them mid-swap.
             fetchPrefab: async () => null, // flattened snapshots never carry a `prefab` ref
             loadModels: false,
             // Re-seed the marks captured off the dying world, per entity, against
@@ -1138,7 +1133,7 @@ class SceneManagerImpl implements SceneManager {
         const sceneData = preparedSceneData.get(ref.path);
         // createdAt is an untyped field on the raw parsed JSON (not part of `SceneData`,
         // same pattern as the `id`/guid read at step 3 above) — carried through
-        // `filterPersistentDuplicates`/`filterDuplicateChainGuids`'s `{...data, ...}`
+        // `filterDuplicateChainGuids`'s `{...data, ...}`
         // spreads untouched. Phase 1, scene-loading.md.
         const createdAt = (sceneData as { createdAt?: string } | undefined)?.createdAt;
         this.loadedScenes.set(sid, {
@@ -1756,94 +1751,6 @@ class SceneManagerImpl implements SceneManager {
   }
 }
 
-/** Drop scene-file entries whose root entity has the same EntityAttributes.guid
- *  as a runtime-persistent entity. The persistent entity will be respawned into
- *  the staging world after loadSceneFile runs, so we exclude any scene-file root
- *  whose guid matches (and its entire descendant subtree) to avoid duplicates.
- *
- *  Matching is guid-only — entity names are not considered. This avoids the
- *  silent-shadowing bug where an unrelated scene root with the same name as a
- *  persistent entity would be dropped.
- *
- *  Persistent entities are root-only (enforced by `markPersistent`), so we only
- *  need to compare against scene roots — children of a persistent root come
- *  along when the subtree is respawned. */
-export function filterPersistentDuplicates(
-  data: SceneData,
-  persistentSnapshots: SceneEntityEntry[],
-): SceneData {
-  // Collect guids from persistent root snapshots. Guid lives on EntityAttributes;
-  // we keep the legacy Persistent.guid path as a fallback for snapshots taken
-  // from pre-migration worlds (e.g. tests with mocked traits).
-  const persistentGuids = new Set<string>();
-  for (const snap of persistentSnapshots) {
-    if (!('Persistent' in snap.traits)) continue;
-    const ea = snap.traits['EntityAttributes'] as Record<string, unknown> | undefined;
-    // Defensive: only roots should be persistent
-    if (ea && ((ea.parentId as number) ?? 0) !== 0) continue;
-    // Durable only (#1210): a root tagged Persistent without markPersistent now carries a RUNTIME
-    // guid, which is re-minted on every carry and so can match nothing — it must still warn.
-    let guid = durableGuid(ea?.guid as string);
-    if (!guid) {
-      const p = snap.traits['Persistent'];
-      if (p && typeof p === 'object') guid = ((p as Record<string, unknown>).guid as string) || '';
-    }
-    if (!guid) {
-      console.warn('[SceneManager] Persistent snapshot has empty guid — was markPersistent bypassed?');
-      continue;
-    }
-    persistentGuids.add(guid);
-  }
-  if (persistentGuids.size === 0) return data;
-
-  // Scene root entries whose EntityAttributes.guid matches — these (and their
-  // subtrees) are excluded.
-  const excludedIds = new Set<number>();
-  const childrenByParent = new Map<number, number[]>();
-  for (const entry of data.entities) {
-    const ea = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
-    const parentId = (ea?.parentId as number) ?? 0;
-    if (parentId !== 0) {
-      let arr = childrenByParent.get(parentId);
-      if (!arr) { arr = []; childrenByParent.set(parentId, arr); }
-      arr.push(entry.id);
-    }
-  }
-  for (const entry of data.entities) {
-    const ea = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
-    const parentId = (ea?.parentId as number) ?? 0;
-    if (parentId !== 0) continue; // not a root
-    if (!('Persistent' in entry.traits)) continue;
-    let guid = (ea?.guid as string) || '';
-    if (!guid) {
-      const p = entry.traits['Persistent'];
-      if (p && typeof p === 'object') guid = ((p as Record<string, unknown>).guid as string) || '';
-    }
-    if (!guid || !persistentGuids.has(guid)) continue;
-    const stack = [entry.id];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      if (excludedIds.has(id)) continue;
-      excludedIds.add(id);
-      const children = childrenByParent.get(id);
-      if (children) stack.push(...children);
-    }
-  }
-
-  if (excludedIds.size === 0) return data;
-
-  const names = data.entities
-    .filter((e) => excludedIds.has(e.id))
-    .map((e) => (e.traits['EntityAttributes'] as Record<string, unknown> | undefined)?.name ?? `id:${e.id}`)
-    .join(', ');
-  console.debug(`[SceneManager] Persistent shadowing dropped ${excludedIds.size} scene entities: ${names}`);
-
-  return {
-    ...data,
-    entities: data.entities.filter((e) => !excludedIds.has(e.id)),
-  };
-}
-
 /** Guard against two chain scenes spawning the same guid (base-scene-and-
  *  persistence-plan.md finding A4): before a game's levels are thinned down to
  *  their `FieldSource` + tuning (Phase 10), a level file duplicated from
@@ -1858,8 +1765,7 @@ export function filterPersistentDuplicates(
  *  Called once per `toLoadRefs` entry, in chain order (root-most base first,
  *  primary last) — `seenGuids` accumulates across calls, so the FIRST scene to
  *  spawn a guid keeps it and every later collision is warned about and dropped
- *  (whole subtree, mirroring `filterPersistentDuplicates`). Root-only
- *  comparison, same precedent as `filterPersistentDuplicates` above — a
+ *  (whole subtree). Root-only comparison — a
  *  collision in this scenario is a whole level having been duplicated
  *  wholesale, so the roots collide and their subtrees ride along. */
 export function filterDuplicateChainGuids(
@@ -1927,20 +1833,25 @@ export function snapshotFieldNames(meta: { trait: unknown; fields: Record<string
  *  the entities in another world.
  *
  *  A root is carried if it's tagged Persistent (must be a root — enforced by
- *  markPersistent) OR (base-scene plan, Phase 5) it's a scene root (parentId 0)
+ *  markPersistent) and the load runs in PLAY — `carryPersistent`, which the caller sets from
+ *  `getRunMode() === 'playing'` (#1863): as Unity's DontDestroyOnLoad acts only in Play mode, an
+ *  editor load in Edit mode (open, hot reload, Stop's and a preview Exit's restore) re-reads every
+ *  Persistent root from its file rather than carrying the live one beside the file's own copy.
+ *  Nothing deduplicates a carried root against the incoming file: a game that reloads the scene
+ *  holding its Persistent root guards the duplicate itself, as a Unity singleton does. OR (base-scene plan, Phase 5) it's a scene root (parentId 0)
  *  whose EntityAttributes.sourceScene is in `keptBaseGuids` — a base scene the
  *  new chain is keeping loaded. A kept base's DESCENDANTS aren't matched
  *  separately here; they ride along via the same subtree walk below, keyed off
  *  THEIR OWN sourceScene stamp (set at spawn time for every entity a scene
  *  spawns, not just its roots) — not inferred from their root. */
-function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = new Set()): SceneEntityEntry[] {
+function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = new Set(), carryPersistent = true): SceneEntityEntry[] {
   const allTraits = getAllTraits();
   const attrMeta = allTraits.find((m) => m.name === 'EntityAttributes');
 
   // Step 1: collect carried root entity ids.
   const carriedRootIds: number[] = [];
   try {
-    world.query(Persistent).updateEach((_: unknown[], entity: Entity) => {
+    if (carryPersistent) world.query(Persistent).updateEach((_: unknown[], entity: Entity) => {
       carriedRootIds.push(entity.id());
     });
   } catch {

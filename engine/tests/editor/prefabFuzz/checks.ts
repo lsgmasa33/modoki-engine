@@ -197,6 +197,8 @@ export function checkScene(scene: unknown): Failure[] {
 
 // ── Identities ──────────────────────────────────────────────────────────────────────────────────────────────────
 
+const NODE_LISTS = new Set(['added', 'children', 'own']);
+
 /** The first place two JSON-like values differ, as a path, or null. */
 export function firstDiff(a: unknown, b: unknown, path = ''): string | null {
   if (a === b) return null;
@@ -248,30 +250,15 @@ export function firstDiff(a: unknown, b: unknown, path = ''): string | null {
   return null;
 }
 
-/** What verify mode tolerates while its KNOWN_OPEN issue is open (the self-test proves each still reproduces). */
-export interface Tolerate {
-  /** #1796: nested node lists are written in ECS query order, so two saves of one world can differ in order alone. */
-  nodeOrder?: boolean;
-}
-
-const NODE_LISTS = new Set(['added', 'children', 'own']);
-
 /** A serialized scene made comparable: a placeholder entry's `PrefabInstance.localId`/`nodeGuid` dropped (its record's
  *  FORM follows where it sits, and both fields re-derive once the prefab is back, unresolvedPrefabRefs.ts
- *  `asSceneEntry`), and, with `nodeOrder`, every node list sorted by guid (then key) as the set it is. */
-export function canonScene(scene: unknown, placeholders: ReadonlySet<string>, nodeOrder: boolean): unknown {
-  const walk = (v: unknown, key?: string): unknown => {
-    if (Array.isArray(v)) {
-      const items = v.map((x) => walk(x));
-      if (nodeOrder && key && NODE_LISTS.has(key)) {
-        const k = (x: unknown) => { const o = x as { guid?: string; key?: string }; return `${o?.guid ?? ''}|${o?.key ?? ''}`; };
-        items.sort((a, b) => (k(a) < k(b) ? -1 : k(a) > k(b) ? 1 : 0));
-      }
-      return items;
-    }
+ *  `asSceneEntry`). */
+export function canonScene(scene: unknown, placeholders: ReadonlySet<string>): unknown {
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map((x) => walk(x));
     if (!v || typeof v !== 'object') return v;
     const o: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) o[k] = walk(x, k);
+    for (const [k, x] of Object.entries(v)) o[k] = walk(x);
     const guid = typeof o.guid === 'string' ? o.guid : undefined;
     const pi = (o.traits as { PrefabInstance?: Record<string, unknown> } | undefined)?.PrefabInstance;
     if (guid && placeholders.has(guid) && pi) { delete pi.localId; delete pi.nodeGuid; }
@@ -361,7 +348,7 @@ export function forgiveExpandedFrames(
 }
 
 export function checkRoundTrip(
-  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> }, tolerate: Tolerate = {},
+  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> },
   prefabGone: (source: string) => boolean = () => false,
 ): Failure[] {
   const out: Failure[] = [];
@@ -405,12 +392,7 @@ export function checkRoundTrip(
   }
   if (rt.firstBytes !== rt.secondBytes) {
     const a = JSON.parse(rt.firstBytes); const b = JSON.parse(rt.secondBytes);
-    // The #1796 tolerance forgives the ORDER of the three node lists and nothing else: with only those lists sorted, the
-    // two sides must stringify identically (key order and exact numbers kept) and the files must be the same length (a
-    // formatting change). A comparison that sorted keys or allowed a float epsilon forgave every other churn (review).
-    const same = tolerate.nodeOrder && JSON.stringify(canonScene(a, new Set(), true)) === JSON.stringify(canonScene(b, new Set(), true))
-      && rt.firstBytes.replace(/\s+/g, '').length === rt.secondBytes.replace(/\s+/g, '').length;
-    if (!same) out.push({ check: 'save→reload→save is not byte-identical', detail: firstDiff(a, b) ?? 'formatting or key order only' });
+    out.push({ check: 'save→reload→save is not byte-identical', detail: firstDiff(a, b) ?? 'formatting or key order only' });
   }
   return out;
 }

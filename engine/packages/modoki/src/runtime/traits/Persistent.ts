@@ -14,8 +14,11 @@
  *
  *  `markPersistent` is the only sanctioned way to add this trait. Direct
  *  `entity.add(Persistent)` skips the root-only check and the guid assignment;
- *  the dedup in `SceneManager.filterPersistentDuplicates` and the
- *  selection-restore lookup in the editor depend on guid being populated.
+ *  the selection-restore lookup in the editor depends on guid being populated.
+ *
+ *  As Unity's DontDestroyOnLoad (#1863): carried only by a load in PLAY, and never deduplicated
+ *  against the incoming scene — a game that reloads the scene holding its Persistent root spawns
+ *  it again, and guards that itself (docs/scene-loading.md § Persistent).
  *
  *  Persistent entities must be ECS-pure: trait data only. Anything held in a
  *  closure, an in-flight tween, a Web Audio node, etc. will be lost on swap

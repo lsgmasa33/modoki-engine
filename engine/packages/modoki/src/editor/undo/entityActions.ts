@@ -35,7 +35,7 @@ import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
-import { prefabNestingReader } from '../scene/prefab';
+import { prefabNestingReader, rebaseStaleInstancesSoon } from '../scene/prefab';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -909,6 +909,10 @@ export function duplicateEntity(
     undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
     redo: () => {
       currentId = spawnCopy(parentRef ? parentRef.require() : 0);
+      // The redo respawns the copy after a template change the stack does not hold (a saved prefab edit). The first spawn
+      // needs none: its source is a live frame, which every such change already rebased.
+      rebaseRespawned(snapshot);
+      currentId = liveIdOf(guid, currentId);
       selectEntity(currentId);
     },
     kind: '!duplicate',
@@ -945,6 +949,22 @@ export function cutSourceId(clip: EntityClipboard): number | null {
   return clip.source.resolve();
 }
 
+/** Bring the prefab frames a respawn from these snapshots made onto their prefabs' CURRENT documents (#1820). A snapshot
+ *  outlives a template change that is not on this undo stack — a prefab-edit save, an outside edit, and for the clipboard
+ *  an Apply or a Replace too — so a Paste, a Duplicate's redo and a Delete's undo respawn frames expanded
+ *  from an older document; nothing else rebases them before a reload. Synchronous when every prefab is cached
+ *  (`rebaseStaleInstancesSoon`). A rebuilt frame root is respawned at a NEW id, so a caller re-finds its entity by guid.
+ *  (A create's redo does not call it: its snapshot is of an entity built from trait specs, which holds no prefab frame.) */
+function rebaseRespawned(...snapshots: EntitySnapshot[]): void {
+  const sources = new Set(snapshots.flatMap(snapshotPrefabs));
+  if (sources.size) rebaseStaleInstancesSoon({ sources });
+}
+
+/** The live id of the entity `guid` names, else `fallback` (an un-guidable entity keeps its respawned id). */
+function liveIdOf(guid: string, fallback: number): number {
+  return (guid && findEntityByGuid(guid)?.id()) || fallback;
+}
+
 /** Paste a copied snapshot under `parentId` (0 = the root) as a fresh deep copy: the Hierarchy's ⌘V after a Copy.
  *  Fresh guids ONCE and each node's prefab link by its frame (`copySnapshot`, #1756, shared with duplicate), a
  *  unique sortOrder at the end of the parent's children, and the TARGET's scene (#1760): the parent's, or the
@@ -960,20 +980,23 @@ export function pasteEntityCopy(
   assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: prefabNestingReader(), scaffold: isScaffoldSnapshot(snapshot) });
   const copy = copySnapshot(snapshot);
   const parentRef = parentId ? entityRef(parentId) : null;
+  // The clipboard outlives a template change (an Apply, a Replace, a prefab-edit save, an outside edit): `rebaseRespawned`.
+  let selfRef: EntityRef | null = null;
   const spawn = (p: number): number => {
     const id = respawnFromSnapshot(copy, p);
     adoptParentScene(id);
     assignFreshSortOrder(id, p);
-    return id;
+    selfRef ??= entityRef(id);
+    rebaseRespawned(copy);
+    return selfRef.resolve() ?? id;
   };
   let currentId = spawn(parentId);
-  const selfRef = entityRef(currentId);
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
     label: 'Paste Entity',
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
+    undo: () => { deleteEntity(selfRef!.require()); selectEntity(null); },
     redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0); selectEntity(currentId); },
     affectedScenes,
   });
@@ -1057,7 +1080,9 @@ export function deleteEntitiesWithUndo(
       // snapshot's raw `rootInstanceId`, stale after a world swap (#1819 close-out re-review). The relink reads no link.
       relinkDetachedMembersMarked(detached);
       restoreRootLinks(rootLinks);
-      setSelection?.(liveIds);
+      // After the links are back: a prefab-edit save or an outside edit since the delete changed a template (#1820).
+      rebaseRespawned(...snaps.map((x) => x.snapshot));
+      setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
     },
     redo: () => {
       // Resolve each entity by its (restored) root guid — robust across rebuild + id reuse. All of them before the first

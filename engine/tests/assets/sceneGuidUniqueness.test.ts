@@ -4,11 +4,10 @@
  *  agent tool aim, `EntityAttributes.parentId` is a guid reference in the v12 shape, and
  *  the prefab/override machinery keys on it. Two entries in ONE scene answering to the
  *  same guid therefore mean an arbitrary winner for every lookup and an ambiguous parent
- *  for every child that points at it. Nothing in the load path catches this: the two
- *  dedup filters in `SceneManager` (`filterPersistentDuplicates`,
- *  `filterDuplicateChainGuids`) both compare a scene against something ELSE already
- *  loaded — a carried persistent entity, or an earlier scene in the same chain — so a
- *  collision inside one file passes straight through and both entities spawn.
+ *  for every child that points at it. Nothing in the load path catches this: the dedup
+ *  filter in `SceneManager` (`filterDuplicateChainGuids`) compares a scene against an
+ *  earlier scene in the same chain, so a collision inside one file passes straight
+ *  through and both entities spawn.
  *
  *  It is a copy-paste defect, and it is not hypothetical. Two were found by sweeping for
  *  it on 2026-08-18 (Testboard bug 1ZKKvYtC90o6Lmfdu9BZ, work-qa):
@@ -22,9 +21,7 @@
  *  (a scene-file duplicate copied guids verbatim until #1293; a new duplicate remints them),
  *  and some of it is load-bearing —
  *  `games/sling`'s Lvl-0001/Lvl-0002 are level variants of the same authored entities,
- *  `games/space-console`'s three scenes share one UI shell, and the `Persistent`
- *  carry-across-swap mechanism REQUIRES both scene files to name the entity by the same
- *  guid for `filterPersistentDuplicates` to recognise it. The 2026-08-18 sweep found ~80
+ *  and `games/space-console`'s three scenes share one UI shell. The 2026-08-18 sweep found ~80
  *  cross-scene shares and only two same-file ones; a repo-wide uniqueness rule would fail
  *  on the design and teach the next reader that the design is wrong. Cross-scene stays
  *  uncovered on purpose — the honest signal there is "different entity NAME", which is

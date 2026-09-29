@@ -213,16 +213,18 @@ describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)
    *  surviving one (C). That ordering is what makes the two numberings diverge: C is row 5
    *  in the file and used to be tagged 6. A shallower tree hides the bug, because BFS puts a
    *  nested instance's members last. */
+  // Siblings are visited in SIBLING order (sortOrder, then guid, then name — #1796), so sortOrder carries the order the
+  // case needs: A, Hull, B.
   const buildTree = () => {
-    const mk = (name: string, parentId: number, guid: string, x = 0) => {
-      const e = testWorld.spawn(Transform({ x }), EntityAttributes({ name, parentId, guid }));
+    const mk = (name: string, parentId: number, guid: string, x = 0, sortOrder = 0) => {
+      const e = testWorld.spawn(Transform({ x }), EntityAttributes({ name, parentId, guid, sortOrder }));
       index.set(e.id(), e);
       return e;
     };
     const r = mk('R', 0, 'g-r');
-    const a = mk('A', r.id(), 'g-a');
-    const hull = mk('Hull', r.id(), 'g-hull');
-    const b = mk('B', r.id(), 'g-b');
+    const a = mk('A', r.id(), 'g-a', 0, 0);
+    const hull = mk('Hull', r.id(), 'g-hull', 0, 1);
+    const b = mk('B', r.id(), 'g-b', 0, 2);
     const bolt = mk('Bolt', hull.id(), 'g-bolt', 1);
     const c = mk('C', b.id(), 'g-c');
     // Make Hull a live instance of INNER: the root is self-rooted, the member points at it.

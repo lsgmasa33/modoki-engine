@@ -77,6 +77,8 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
   detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
   reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
+  // #1820: the re-link's rebase (nothing stale here) — not what this file tests (the file and cache half).
+  rebaseStaleInstancesSoon: () => false,
   warnInertPrefabSizes: () => undefined,
 }));
 

@@ -497,7 +497,7 @@ async function openPrefabForEditingSwitching(
   // NESTED prefab (both have a null current path) — which would pop a Save-As picker.
   // The undo in flight finishes first (#1579), and then a preview envelope comes down, restored
   // (#1548 re-review): the swap below goes straight through SceneManager, so `loadScene`'s own takedown
-  // never runs — the session was abandoned at the swap, a posed Persistent root rode the carry into
+  // never runs — the session was abandoned at the swap, a posed Persistent root rode the carry (before #1863 kept it to Play) into
   // prefab-edit and back, and the save just below was silently refused ("a preview session is open")
   // instead of persisting the round trip. The undo goes first because it reloads the world this save
   // writes and this swap replaces.

@@ -93,7 +93,7 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
      list of its own, and holds each ref plus the path it resolved to at load.
    - **A LIVE instance uses it** (`PrefabInstance.source`). ⚠️ Load-bearing, found in #1702's
      close-out review: `prefabRefs` is fixed at load, so an instance gained since (dragged in, saved
-     or not; a carried `Persistent` root; a Create Prefab) is in no file ref. Skipping the reload
+     or not; a `Persistent` root carried in Play; a Create Prefab) is in no file ref. Skipping the reload
      left it built from the OLD prefab while the editor copy was re-read to the new one, and the
      next save diffed one against the other and wrote the old values back as overrides.
    - **Residual, one host:** after an EXTERNAL delete in browser dev, the Vite manifest update prunes

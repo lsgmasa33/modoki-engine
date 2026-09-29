@@ -88,7 +88,7 @@ let _stopRequested = false;
  *
  *  ⚠️ A FOURTH, because "past the swap the world is right" (above) is false for an AUTHORED restore
  *  — Stop's, or a preview Exit's once its load starts (#1572). `restoreAuthoredSnapshot` replays the
- *  Persistent roots and bases only AFTER `sceneManager.loadScene` resolves, and that load awaits
+ *  kept bases (and, before #1863 kept the carry to Play, the Persistent roots) only AFTER `sceneManager.loadScene` resolves, and that load awaits
  *  manager dispose/init after its swap, with `getNext()` already null. Play pressed in that tail
  *  snapshotted Persistent roots and kept bases still at the previous run's values, and the next Stop put them back
  *  as authored. `authoredRestoreInFlight()` spans the whole restore, replay included. */
@@ -345,8 +345,8 @@ export async function stopPlay(): Promise<StopOutcome> {
     // Guard: if the active scene changed since Play, the snapshot is for a
     // different scene — reverting it would clobber the current one. Skip.
     if (snap.key !== currentSceneKey()) return { kind: 'stopped', reverted: false, reason: 'the scene changed during Play, so its snapshot was not restored over the new one — the live world keeps whatever Play did to it' };
-    // Reload the captured authored scene in place, then replay what the reload carries (bases,
-    // Persistent roots). preloaded skips the fetch, so disk is never touched. The world is rebuilt
+    // Reload the captured authored scene in place, then replay what the reload carries (kept bases;
+    // a Persistent root is carried only in Play since #1863, so the reload respawns it from the snapshot). preloaded skips the fetch, so disk is never touched. The world is rebuilt
     // (new ECS ids), but undo actions resolve their targets by stable guid (see entityRef.ts), so
     // PRE-Play history survives — we only truncate the during-Play edits the revert discarded.
     await restoreAuthoredSnapshot(snap);

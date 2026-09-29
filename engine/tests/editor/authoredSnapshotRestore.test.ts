@@ -1,12 +1,13 @@
 /** #1547 — the ONE restore both editor envelopes use (`authoredSnapshot.ts`) puts back everything
  *  the reload does not rebuild.
  *
- *  `sceneManager.loadScene(key, { preloaded })` rebuilds the PRIMARY from the snapshot but CARRIES two
- *  things across from the live, posed world: kept BASE scenes, and the primary's `Persistent` roots
- *  (`filterPersistentDuplicates` drops the snapshot's own authored copy of those). Play/Stop replayed
- *  the bases (A5); the preview session replayed nothing, and neither replayed Persistent roots. So the
- *  reload is stubbed here — what is under test is exactly the replay that has to follow it — and the
- *  live world is posed the way a preview or a play session would leave it. */
+ *  `sceneManager.loadScene(key, { preloaded })` rebuilds the PRIMARY from the snapshot but CARRIES kept
+ *  BASE scenes across from the live, posed world. Play/Stop replayed the bases (A5); the preview session
+ *  replayed nothing. So the reload is stubbed in most of these — what is under test is the replay that
+ *  has to follow it — and the live world is posed the way a preview or a play session would leave it.
+ *
+ *  A `Persistent` root is the exception, driven through the REAL reload (#1863): outside Play it is not
+ *  carried at all, so the snapshot's own copy comes back — once. */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { Entity } from 'koota';
@@ -18,9 +19,11 @@ import { Persistent } from '../../packages/modoki/src/runtime/traits/Persistent'
 import { Time } from '../../packages/modoki/src/runtime/core/traits/Time';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import {
-  captureAuthoredSnapshot, restoreAuthoredSnapshot, persistentSubtreeEntries, type AuthoredSnapshot,
+  captureAuthoredSnapshot, restoreAuthoredSnapshot, type AuthoredSnapshot,
 } from '../../packages/modoki/src/editor/scene/authoredSnapshot';
-import type { SerializedEntity } from '../../packages/modoki/src/editor/scene/serialize';
+import { getAllEntities } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 
 registerAllTraits();
 
@@ -32,27 +35,47 @@ const CAM = 'bbbbbbbb-0000-4000-8000-000000001547';
 afterEach(() => { vi.restoreAllMocks(); });
 
 const xOf = (e: Entity) => (e.get(Transform) as { x: number }).x;
+/** Every live entity's name, grouped by guid — a duplicate shows as two names under one guid. */
+const namesByGuid = () => {
+  const out: Record<string, string[]> = {};
+  for (const e of getAllEntities()) if (e.guid && !e.isResource) (out[e.guid] ??= []).push(e.name);
+  return out;
+};
 const setX = (e: Entity, x: number) => e.set(Transform, { ...(e.get(Transform) as object), x } as never);
 
 describe('restoreAuthoredSnapshot replays what the reload carries (#1547)', () => {
-  it('a Persistent root AND its child get their authored values back; a rebuilt entity is left to the reload', async () => {
+  // #1863: the reload used to CARRY the live Persistent root and ALSO spawn the snapshot's own copy — a filter meant to drop
+  // that copy never matched a current-format root — so every Stop added one more (measured: HUD, Other, HUD, HUD after two).
+  // Unity destroys DontDestroyOnLoad objects on leaving Play mode; SceneManager now carries a Persistent root only in Play.
+  for (const mode of ['stopped', 'preview'] as const) {
+    it(`restored in "${mode}" (${mode === 'stopped' ? 'Stop' : 'a preview Exit'}), a Persistent root comes back ONCE, with its authored values`, async () => {
+      const g = createTestWorld({});
+      try {
+        const hud = g.spawn(EntityAttributes({ name: 'HUD', guid: HUD } as never), Transform({ x: 0 } as never), Persistent());
+        g.spawn(EntityAttributes({ name: 'HUD child', guid: HUD_CHILD, parentId: hud.id() } as never), Transform({ x: 0 } as never));
+        g.spawn(EntityAttributes({ name: 'Other', guid: OTHER } as never), Transform({ x: 0 } as never));
+        const snap = { ...(await captureAuthoredSnapshot()), key: '/restore1863.json' };
+        setX(hud, 5);                                                      // posed / played
+        setRunMode(mode);
+        await restoreAuthoredSnapshot(snap);
+        await restoreAuthoredSnapshot(snap);                               // a second Stop
+        // MUTATION TARGET: carry Persistent roots whatever the mode (`carryPersistent` always true) and these are
+        // HUD ×3 and HUD child ×3 — the carried subtrees beside each reload's own copy.
+        expect(namesByGuid()).toEqual({ [HUD]: ['HUD'], [HUD_CHILD]: ['HUD child'], [OTHER]: ['Other'] });
+        expect(xOf(findEntityByGuid(HUD)!)).toBe(0);                       // the authored value, from the snapshot's copy
+      } finally { setRunMode('playing'); g.dispose(); }
+    });
+  }
+
+  it('in Play, a scene reload carries the Persistent root AND spawns its file copy — the game guards it, as in Unity', async () => {
     const g = createTestWorld({});
     try {
-      const hud = g.spawn(EntityAttributes({ name: 'HUD', guid: HUD } as never), Transform({ x: 0 } as never), Persistent());
-      const child = g.spawn(EntityAttributes({ name: 'HUD child', guid: HUD_CHILD, parentId: hud.id() } as never), Transform({ x: 0 } as never));
-      const other = g.spawn(EntityAttributes({ name: 'Other', guid: OTHER } as never), Transform({ x: 0 } as never));
-      const snap = await captureAuthoredSnapshot();                 // the authored world, as either envelope takes it
-      const load = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({} as never); // the carry is what we test
-      setX(hud, 5); setX(child, 6); setX(other, 7);                 // posed / played
-      await restoreAuthoredSnapshot(snap);
-      expect(load).toHaveBeenCalledTimes(1);
-      expect(load.mock.calls[0][1]).toEqual({ preloaded: snap.primary });
-      // MUTATION TARGET: drop the Persistent replay from restoreAuthoredSnapshot and these stay 5 / 6 —
-      // the carried live root outranks the snapshot's own copy, so the pose survived Exit and Stop.
-      expect(xOf(hud)).toBe(0);
-      expect(xOf(child)).toBe(0);
-      // Not Persistent: the real reload rebuilds it from the snapshot, so the replay must not touch it.
-      expect(xOf(other)).toBe(7);
+      g.spawn(EntityAttributes({ name: 'HUD', guid: HUD } as never), Transform({ x: 0 } as never), Persistent());
+      const snap = { ...(await captureAuthoredSnapshot()), key: '/restore1863.json' };
+      setRunMode('playing');
+      await sceneManager.loadScene(snap.key, { preloaded: snap.primary as never });
+      // The accept side of the gate: DontDestroyOnLoad semantics, no engine dedupe (docs/scene-loading.md § Persistent).
+      expect(namesByGuid()[HUD]).toEqual(['HUD', 'HUD']);
     } finally { g.dispose(); }
   });
 
@@ -93,25 +116,13 @@ describe('restoreAuthoredSnapshot replays what the reload carries (#1547)', () =
   });
 });
 
-describe('persistentSubtreeEntries', () => {
-  const e = (guid: string, parentId: string, persistent = false): SerializedEntity => ({
-    guid, traits: { EntityAttributes: { guid, parentId }, ...(persistent ? { Persistent: true } : {}) },
-  } as never);
-
-  it('takes the whole subtree whatever the listing order, and nothing outside it', () => {
-    const entries = [e('grandchild', 'child'), e('child', 'root'), e('root', '', true), e('stranger', ''), e('strangerKid', 'stranger')];
-    // MUTATION TARGET: a single pass instead of the fixed point loses `grandchild`, listed before its parent.
-    expect(persistentSubtreeEntries(entries).map((x) => x.guid).sort()).toEqual(['child', 'grandchild', 'root']);
-    expect(persistentSubtreeEntries([e('a', ''), e('b', 'a')])).toEqual([]);
-  });
-});
-
 describe('restoreAuthoredSnapshot — EntityAttributes state, and a restore that fails (#1547/#1548 close-out review)', () => {
-  it('isActive on a carried Persistent root is restored; its structural fields are not', async () => {
+  it('isActive on a carried base entity is restored; its structural fields are not', async () => {
     const g = createTestWorld({});
     try {
-      const hud = g.spawn(EntityAttributes({ name: 'HUD', guid: HUD, isActive: true, sortOrder: 0 } as never), Transform({ x: 0 } as never), Persistent());
-      const snap = await captureAuthoredSnapshot();
+      const hud = g.spawn(EntityAttributes({ name: 'HUD', guid: HUD, isActive: true, sortOrder: 0 } as never), Transform({ x: 0 } as never));
+      const base = { entities: [{ guid: HUD, traits: { EntityAttributes: { name: 'HUD', guid: HUD }, Transform: {} } }] };
+      const snap: AuthoredSnapshot = { primary: { entities: [] } as never, key: '/l.json', bases: new Map([['b', base as never]]) };
       vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({} as never);
       // An activation track hid it; an editor reorder moved it (structure the replay does not own).
       hud.set(EntityAttributes, { ...(hud.get(EntityAttributes) as object), isActive: false, sortOrder: 9 } as never);

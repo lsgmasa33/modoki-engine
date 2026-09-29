@@ -1415,16 +1415,14 @@ it has already sent one sweep in the wrong direction (2026-08-18):
 
 - **Within one scene file, a guid must be unique.** Two entries answering to the same guid mean
   an arbitrary winner for every `findEntityByGuid`, and an ambiguous parent for any child naming
-  that guid as its `parentId`. Nothing in the load path catches it — both `filterPersistentDuplicates`
-  and `filterDuplicateChainGuids` compare a scene against something ELSE already loaded (a carried
-  entity, an earlier chain scene), so a collision *inside* one file passes straight through and
-  both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
+  that guid as its `parentId`. Nothing in the load path catches it — `filterDuplicateChainGuids`
+  compares a scene against an earlier chain scene, so a collision *inside* one file passes straight
+  through and both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
 - **Across scene files, sharing a guid is LEGACY — and sometimes load-bearing.** A sweep of the 54
   committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
   `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
-  scenes share one UI shell; and the `Persistent` carry-across-swap mechanism **depends** on both
-  scene files naming the entity by the same guid — that is precisely how `filterPersistentDuplicates`
-  recognises the carried entity and drops the scene's copy.
+  scenes share one UI shell. (The `Persistent` carry once depended on it too, to drop a scene's copy
+  of a carried entity; nothing deduplicates that since #1863 — see [Persistent entities](#persistent-entities).)
 - **Duplicating a scene FILE no longer creates new sharing (#1293).** Those shares exist because a
   file duplicate used to copy every entity guid verbatim. `duplicateAssetFile` now remints every guid
   the copy DEFINES — `EntityAttributes.guid`, a prefab-instance root's row-level `guid`, and each
@@ -1788,7 +1786,7 @@ Three things about it that are easy to get wrong:
 - ⚠️ **No `scenePath` means no derivation**, and that exemption is load-bearing. `SceneManager`'s
   carried-snapshot respawn synthesises its `SceneData` from live entities drawn from several scenes,
   so it has no single scene identity — and those entities already hold durable guids from their own
-  files, which is exactly what `filterPersistentDuplicates` matches them on. A base-scene chain is
+  files, which every guid lookup keys on. A base-scene chain is
   the opposite case: one `loadSceneFile` call per file, each with its own path, so a base entity
   derives the same guid whichever level extends it.
 - ⚠️ **The path is PROJECT-RELATIVE, so the same derived guid appears in several projects.** After
@@ -2683,8 +2681,27 @@ file is covered: its hot reload drops the stack (#1744).
 ## Persistent entities
 
 `runtime/traits/Persistent.ts` is a **marker trait** (no fields). It tells
-`SceneManager` to carry a root entity across a scene swap. Use
-`markPersistent(entity, guid?)`:
+`SceneManager` to carry a root entity across a scene swap — Unity's `DontDestroyOnLoad`, with
+Unity's two rules (#1863):
+
+- **Carried only in Play.** A load while the run mode is anything but `playing` — an editor open,
+  a hot reload, Stop's and a preview Exit's restore (`authoredSnapshot.ts`) — carries NO Persistent
+  root: each is re-read from its own file, as the scene is authored. Unity destroys
+  DontDestroyOnLoad objects on leaving Play mode. Before, the editor carried the live root AND
+  spawned the file's copy, so every Stop of a scene holding one added another (OBSERVED, #1863), and
+  the next Cmd+S saved the duplicate.
+- **Never deduplicated against the incoming scene.** Reloading, in a running game, the scene that
+  holds a Persistent root spawns it again beside the carried one — both with the same guid. As in
+  Unity, **the game guards it**: check for the live one before (or instead of) authoring it into a
+  scene that is reloaded, the singleton check in Unity's own example
+  ([Object.DontDestroyOnLoad](https://docs.unity3d.com/ScriptReference/Object.DontDestroyOnLoad.html)).
+  The engine used to try (`filterPersistentDuplicates`), but it recognised a root only by
+  `parentId === 0` while every current scene writes `''`, so it never fired on a current-format file,
+  and missed a prefab-instance root (whose `Persistent` sits in `overrides`) and its top-level guid
+  besides. It was removed rather than widened. No game or demo authors a `Persistent` root
+  (checked 2026-09-30).
+
+Use `markPersistent(entity, guid?)`:
 
 - Assigns a UUID to `EntityAttributes.guid` if the entity lacks one (explicit
   `guid` arg wins; returns the final guid).
@@ -2704,13 +2721,7 @@ staging world. `SceneManager`:
    carried scene's later save matches what a cold load would have produced.
 2. Acquires the resources those snapshots reference under the new `sceneId`, so
    they survive the post-swap release even if the new scene doesn't list them.
-3. Drops any scene-file root whose `EntityAttributes.guid` matches a persistent
-   guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
-   file copy, preventing duplicates. ⚠️ **Today it does not fire on a current-format scene
-   (#1863, OBSERVED):** it recognizes a root only by `parentId === 0` (roots are written `''`), and
-   a prefab-instance root keeps `Persistent` in `overrides` and its guid at the top level. Reloading a
-   scene that holds a Persistent root spawns it twice.
-4. Respawns the snapshots into the staging world (tagged `version:
+3. Respawns the snapshots into the staging world (tagged `version:
    SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run),
    restoring each entity's override marks and unregistered markers (`Transient`,
    `TemplateAddedKey`) against its fresh id (#1427).

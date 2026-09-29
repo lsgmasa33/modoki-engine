@@ -7,7 +7,7 @@ import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/s
 import { getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, worldTree, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory, type Tolerate } from './checks';
+import { checkWorld, checkFiles, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, type Failure, type LocalIdHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -28,7 +28,6 @@ export interface StepFailure extends Failure { step: number; op: string }
 export interface RunOpts {
   /** A console.error the editor is expected to print; `prev` is the error logged just before it in the same step. */
   expectedError: (msg: string, prev?: string) => boolean;
-  tolerate?: Tolerate;
 }
 export interface RunResult { failure?: StepFailure; trace: string[] }
 
@@ -137,8 +136,8 @@ export function diffFiles(a: Map<string, string>, b: Map<string, string>, create
 
 /** Undo to the segment's start and compare, then redo to the end and compare. Only a segment nothing outside the
  *  undo stack has touched (an outside edit, a prefab-edit save, a watcher reload) is held to the bytes. */
-async function undoIdentity(be: FuzzBackend, seg: Segment, tolerate: Tolerate, created: readonly string[]): Promise<Failure | null> {
-  const canon = (scene: unknown) => canonScene(scene, placeholderGuids(), !!tolerate.nodeOrder);
+async function undoIdentity(be: FuzzBackend, seg: Segment, created: readonly string[]): Promise<Failure | null> {
+  const canon = (scene: unknown) => canonScene(scene, placeholderGuids());
   if (editing()) return null;
   const end = { scene: await serializeScene(), prefabs: prefabBytes(be) };
   let steps = 0;
@@ -188,7 +187,6 @@ const FINAL_ROUND_TRIP: Op = { kind: 'saveReload', u: [0, 0, 0, 0, 0, 0, 0, 0] }
 
 /** Run `ops` from a fresh fixture; the first failed check ends the run. */
 export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts): Promise<RunResult> {
-  const tolerate = opts.tolerate ?? {};
   const trace: string[] = [];
   consoleErrors.length = 0;
   const f = await startRun(be, setupNest, JSON.stringify(ops));
@@ -269,7 +267,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     const failures = [
       ...checkWorld(),
       ...checkFiles(after, history, written, handEdited),
-      ...(rt ? checkRoundTrip(rt, tolerate, (src) => { const p = resolveGuidToPath(src); return !p || !after.has(p); }) : []),
+      ...(rt ? checkRoundTrip(rt, (src) => { const p = resolveGuidToPath(src); return !p || !after.has(p); }) : []),
     ];
     if (!editing()) {
       try { failures.push(...checkScene(await serializeScene())); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
@@ -313,7 +311,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   // logs, and the world and files it leaves (review: errors logged there were never read).
   const walkStep = all.length;
   const walkBefore = be.snapshot();
-  const u = await undoIdentity(be, seg, tolerate, st.created!);
+  const u = await undoIdentity(be, seg, st.created!);
   if (u) return fail(walkStep, 'undo/redo to the ends', { ...u, console: [...consoleErrors] });
   const walkErrors = consoleErrors.splice(0).filter((m, k, list) => !opts.expectedError(m, list[k - 1]));
   if (walkErrors.length) return fail(walkStep, 'undo/redo to the ends', { check: 'console.error', detail: walkErrors[0].slice(0, 300) });

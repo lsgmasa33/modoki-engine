@@ -1742,11 +1742,37 @@ member's row: false overrides, and Apply wrote one member's value into another's
 - **The reload rebuilds stale carried instances.** `adoptWorldReloadedFromDisk` (the editor's
   hot-reload hook, now awaited by `agentBridge.ts`) calls `rebaseStaleInstances()`. That runs the
   refresh Apply uses on every instance FRAME root, stored or owned nested (#1493), whose recorded
-  document differs from the cache (by content), inner frames first (see below). Kept bases are not the only carried roots: a `Persistent` root is carried
-  whatever scene owns it. Everything the reload re-expanded from disk compares equal and is left
+  document differs from the cache (by content), inner frames first (see below). Kept bases are not the only carried roots: in Play a `Persistent` root is carried
+  whatever scene owns it (in Edit mode it is re-read from its file, #1863). Everything the reload re-expanded from disk compares equal and is left
   alone. A world replaced while the nested prefabs load rebuilds nothing. A reload that is deferred
   (Play, a preview envelope) rebuilds when it finally runs, because the record, not a remembered
   baseline, says what each frame was built from.
+- **A respawn or re-link from a RECORD is rebased at once** (#1820, #1859). The clipboard outlives an Apply,
+  a Replace, a prefab-edit save and an outside edit, so a Paste (and its redo) respawns frames expanded from
+  an older document; an undo snapshot outlives a template change the scene's stack does not hold (a SAVED
+  prefab edit, an outside edit), so Delete's undo and Duplicate's redo do too (the close-out sweep, OBSERVED:
+  23 of 192 grid draws); Create Prefab's undo re-links a tree to the template it was built from. The respawns
+  call `rebaseRespawned` (`entityActions.ts`; Delete's undo after it restores its root links), the re-link
+  `rebaseStaleInstancesSoon` directly: the same rebuild, SYNCHRONOUS when every prefab it reads is cached (as right after
+  an in-session change), and the async rebase under a world hold only when one has to be fetched. As in Unity,
+  an instance always merges against the CURRENT asset. Before, the live paste showed the old template until a
+  reload, and edits to a stale member were lost there. Detach's undo already rebased (`reattachDetachedInstance`).
+  ⚠️ When Create Prefab's undo DID rebase (the template changed since the create), the tree is no longer what the
+  create's rows describe, in shape or only in value, so its **redo refuses** before anything is written. Re-linked
+  anyway, it tagged nothing while reporting success (a shape change) or its reload reverted the new value (a value
+  change) — both OBSERVED by the close-out reviews.
+  ⚠️ **Still open (KNOWN_OPEN under #1820):** Delete's undo of a ROW of a frame that SURVIVES the delete (a member, an
+  owned nested root) after a saved edit of that frame's template. The rebase rebuilds frames whose OWN record is stale;
+  the enclosing frame was already rebased when prefab edit exited, so the respawned row follows the old document and
+  nothing sees it (16 of 528 review-grid draws: a value, a lost entity, a parent link). The fix is the snapshot
+  recording its enclosing frame's document, and the undo translating the row or refusing.
+- **Written lists follow SIBLING order, never ECS query order** (#1796). `captureInstanceStructure`'s child
+  lists (a scene's `added`/`own`/`children`) and `collectTree` (Create Prefab's writer and its redo's re-tag)
+  sort children by `compareSiblings` — sortOrder, then guid — as the top-level `entities` list already did
+  (#500, `entityOrder.ts`). Query order is not stable across a reload (koota reuses slots), so a save → reload
+  → save flipped those lists forever, and Create Prefab's redo re-tagged by position over a reordered tree
+  and was refused. A prefab-edit re-save keeps every existing localId (`planPrefabRows`' preserve map), so
+  only NEW rows are numbered in the new order. A committed file reorders once, on its next save.
 - **Every refresh captures a root against ITS document.** `refreshInstances` (Apply's fan-out, its
   undo/redo, the rebase) uses each root's own record as the capture baseline, and falls back to the
   caller's `oldPrefab` only when there is no record. `rebuildInstance` translates from that baseline by
@@ -1784,7 +1810,7 @@ member's row: false overrides, and Apply wrote one member's value into another's
   exit without saving, the editor's copy could be older than the file the scene had just loaded from.
   Every instance of it was then refused, and a later rebase rebuilt carried ones back to the old
   template. The repair re-reads it once the edit flag no longer names it, then rebases, because a
-  `Persistent` root is carried through prefab-edit mode and back, so a SAVED edit reaches it only there.
+  `Persistent` root was carried through prefab-edit mode and back (no longer: outside Play it is re-read from its file, #1863), so a SAVED edit reached it only there.
   Until #1666 it ran only in `exitPrefabEditing`, so the Assets double-click, the Inspector's Open Scene
   and agent `load-scene` (all `serialize.loadScene`) left the carried instance built from the old
   template and the prefab's copy stale for the session. Since #1698 the adoption owner RECORDS the
@@ -2064,7 +2090,7 @@ save) and the file-direct `/api/scene-mutate` (its file graph has no placeholder
 the editor's own writes, and nothing evicts either cache, so the deleted prefab stays readable until a reload, and the
 reload takes the load path above (the stale entry is #1751's). The caches are emptied only by `seatCaches(key, null)`
 (`prefabCommit.ts`), which runs on the undo of an Import Model or a rig prefab (not a Create Prefab's since #1795: it leaves the file). A live instance of that
-prefab is reached there only past a dropped throwing undo, `worldLeft()` mid-commit, a carried `Persistent` tree, or a
+prefab is reached there only past a dropped throwing undo, `worldLeft()` mid-commit, a `Persistent` tree carried in Play, or a
 key the editor never warmed. Create Prefab over such an instance writes a REFERENCE row from the record rather than
 refusing: its placeholder check runs before the nested warm, so a refusal would fire on a merely cold key. The check for
 a NESTED frame that did not expand (#1790, U24) runs after the warm for the same reason, and refuses.

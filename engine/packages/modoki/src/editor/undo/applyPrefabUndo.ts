@@ -100,7 +100,7 @@ async function restoreSnapshot(
     rebuild: async () => {
       if (repairFrom && prefab.id) {
         // The live records of each template reference node's moves go back as the apply re-pointed them (#1564): the world
-        // swap below CARRIES a Persistent or base root with its record whole, and the rebase then rebuilds it against
+        // swap below CARRIES a base root (a Persistent one only in Play, #1863) with its record whole, and the rebase then rebuilds it against
         // `prefab` — with the apply's paths, which name nothing there. Before the await, as the apply does it before its
         // refresh: nothing that rebuilds in the meantime can read the old paths.
         const id = prefab.id;
@@ -163,7 +163,7 @@ async function restoreSnapshot(
         return;
       }
       restored = true;
-      // The load CARRIES `Persistent` roots flat, still built from the document being undone; rebuild them against the one
+      // The load CARRIES kept base roots flat (a `Persistent` one only in Play, #1863), still built from the document being undone; rebuild them against the one
       // just restored before anything captures them — the save below included (#1483 review 3).
       await rebaseStaleInstances();
       // A scene file, when the Apply saved it: only over what the editor last wrote there (#1695).

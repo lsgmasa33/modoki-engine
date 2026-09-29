@@ -168,7 +168,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // argument for minted identity (#1468 design record, the root cause) and it is what the row has to survive.
     const { scene } = await placedInstance();
     const storedBadge = guidOf('Badge');
-    const panelsOldGuid = guidOf('Panel');
+    const othersOldGuids = [guidOf('Panel'), guidOf('Label')];
 
     templateWithout('Panel');
 
@@ -176,10 +176,11 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     expect(guidOf('Badge')).toBe(storedBadge);
 
     // The control, and it asserts the WRONG ANSWER rather than merely a different one: with the rows
-    // stripped, Badge comes back wearing Panel's identity. If this said `not.toBe(storedBadge)` it
-    // would also pass on a build where the guid merely dangled.
+    // stripped, Badge comes back wearing ANOTHER member's old identity. If this said `not.toBe(storedBadge)`
+    // it would also pass on a build where the guid merely dangled. Which member's it wears follows the
+    // positional renumber's sibling order (sortOrder, then guid — #1796), so the set is asserted, not one name.
     await load(withoutRows(scene));
-    expect(guidOf('Badge')).toBe(panelsOldGuid);
+    expect(othersOldGuids).toContain(guidOf('Badge'));
   });
 
   it('derives a member with no row, so a partial map is a fallback and not a wipe (R3)', async () => {

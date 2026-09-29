@@ -327,7 +327,8 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
   if (_pending && _pendingLive()) { await _pending; return _snap !== null; }
   // #1167's refusal covers ANY authored restore, not only a preview one (#1572). Stop sets 'stopped'
   // before its restore, so a scrub in that window saw a world the editor itself calls not-authored
-  // (Persistent roots still at their Play values until the post-swap replay) and snapshotted it.
+  // (kept bases — and, before #1863, Persistent roots — still at their Play values until the post-swap replay) and
+  // snapshotted it.
   if (_restoresInFlight > 0 || authoredRestoreInFlight()) return false;
   const stillLive = beginLiveness.capture();
   // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an

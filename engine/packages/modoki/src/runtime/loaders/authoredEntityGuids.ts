@@ -114,14 +114,14 @@ const MAX_PARENT_DEPTH = 64;
  *    is derived and the caller falls back to the runtime guid — the carried-snapshot load
  *    (`SceneManager`'s respawn after a world swap) synthesises its `SceneData` from live
  *    entities drawn from several different scenes, so it has no single scene identity, and
- *    its entities already carry durable guids from their originating files. Re-keying one
- *    there would defeat `filterPersistentDuplicates`, which matches a carried entity to the
- *    incoming scene's row BY GUID.
+ *    its entities already carry durable guids from their originating files, which every guid
+ *    lookup keys on; re-keying one there would break them.
  *  @param reserved Guids that are already spoken for but are NOT in `entities` — in practice the
  *    durable guids of entities already ALIVE in the target world. ⚠️ Load-bearing, not belt-and-
- *    braces: `SceneManager` runs `filterPersistentDuplicates` and `filterDuplicateChainGuids`
- *    BEFORE handing the data over, and both *remove rows*. A row dropped because a carried
- *    `Persistent` entity already covers it takes its guid out of `entities` with it — while that
+ *    braces: `SceneManager` runs `filterDuplicateChainGuids` BEFORE handing the data over, and it
+ *    *removes rows*; and a carried `Persistent` entity is alive in the target world without a row
+ *    here at all (the dedupe that once dropped its file row went in #1863). Either way its guid is
+ *    absent from `entities` — while that
  *    entity is very much alive — so without this a guid-less twin in the same file derives exactly
  *    the carried entity's guid, and the result depends on the approach path (cold open vs. a swap
  *    that carried it) rather than on the file's bytes.

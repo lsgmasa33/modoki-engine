@@ -1,5 +1,5 @@
 /** markPersistent unit tests (ecs-core P2) — the root-only + guid-assignment invariants
- *  that SceneManager.filterPersistentDuplicates and editor selection-restore depend on.
+ *  that the carry across a swap and editor selection-restore depend on.
  *  Mocks ONLY the trait registry (so markPersistent resolves a test-local EntityAttributes)
  *  and uses a single koota world to stay well under koota's 16-world cap. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

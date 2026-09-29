@@ -341,7 +341,7 @@ export interface LoadSceneOptions {
    *  ⚠️ OPTIONAL on purpose, and absent means "derive nothing". `SceneManager`'s carried-snapshot
    *  respawn synthesises its `SceneData` from live entities drawn from SEVERAL scenes, so it has no
    *  single scene identity — and those entities already hold durable guids from their originating
-   *  files, which `filterPersistentDuplicates` matches on. A base-scene chain is the opposite case:
+   *  files, which every guid lookup keys on. A base-scene chain is the opposite case:
    *  it runs one call PER FILE, each with its own path, so a base entity derives the same guid no
    *  matter which level pulls it in. */
   scenePath?: string;

@@ -19,6 +19,8 @@ import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/for
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import type { MemberPathRepair } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
+import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
+import { beginWorldBoundOperation } from '../undo/undoManager';
 import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
@@ -197,15 +199,26 @@ export interface PrefabFile {
 
 // ── Save as Prefab ──────────────────────────────────────
 
-/** Collect an entity and all its descendants (flat list) — O(n) via Map lookup */
-function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] {
-  const byParent = new Map<number, EntityInfo[]>();
-  const byId = new Map<number, EntityInfo>();
-  for (const e of allEntities) {
-    byId.set(e.id, e);
-    if (!byParent.has(e.parentId)) byParent.set(e.parentId, []);
-    byParent.get(e.parentId)!.push(e);
+/** Each parent's children in SIBLING order (`compareSiblings`: sortOrder, then guid), never raw ECS query order (#1796).
+ *  Query order is not stable across a reload — koota's slot reuse can invert a pair — so a list written or matched in
+ *  it churns: a save → reload → save swapped an instance's `added`/`own`/`children` forever, and Create Prefab's redo
+ *  re-tagged by BFS position over a tree whose siblings the reload had reordered, and refused. */
+function childrenBySibling(entities: readonly EntityInfo[]): Map<number, EntityInfo[]> {
+  const out = new Map<number, EntityInfo[]>();
+  for (const e of entities) {
+    const list = out.get(e.parentId);
+    if (list) list.push(e); else out.set(e.parentId, [e]);
   }
+  const bySibling = compareSiblings<EntityInfo>((e) => e.guid ?? '');
+  for (const list of out.values()) list.sort(bySibling);
+  return out;
+}
+
+/** Collect an entity and all its descendants (flat list, breadth-first, siblings in sibling order) — O(n) via Map lookup */
+function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] {
+  const byParent = childrenBySibling(allEntities);
+  const byId = new Map<number, EntityInfo>();
+  for (const e of allEntities) byId.set(e.id, e);
   const result: EntityInfo[] = [];
   const queue = [entityId];
   while (queue.length > 0) {
@@ -3710,12 +3723,8 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // of them must answer this the same way (#1301/#1306).
   const allEntities = filterAuthoringVisible(getAllEntities());
   const byId = new Map<number, EntityInfo>();
-  const childrenOf = new Map<number, EntityInfo[]>();
-  for (const e of allEntities) {
-    byId.set(e.id, e);
-    if (!childrenOf.has(e.parentId)) childrenOf.set(e.parentId, []);
-    childrenOf.get(e.parentId)!.push(e);
-  }
+  for (const e of allEntities) byId.set(e.id, e);
+  const childrenOf = childrenBySibling(allEntities);
 
   // Where each entity's TEMPLATE puts it (`identityParents.ts`) — asked for moves below.
   const identity = worldIdentityParents(getCurrentWorld());
@@ -3982,7 +3991,11 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   }
 
   const added: AddedEntity[] = [];
-  for (const [ecsId, localId] of ecsToLocal) {
+  // By localId: the member map is built in query order too (#1796). The scene writer splits `added` per member row
+  // (`moveChannelsOntoRows`), but a prefab file's nested REFERENCE row writes the whole list (`serializePrefab`), and Apply
+  // All numbers its promoted rows in this order. TRACED by the close-out review, not driven: the fuzzer has no prefab-edit
+  // save → reopen → save identity check, so no test can make this line fail today.
+  for (const [ecsId, localId] of [...ecsToLocal].sort((a, b) => a[1] - b[1])) {
     for (const child of childrenOf.get(ecsId) || []) {
       if (isMember(child.id) || movedIn(child.id) || foreign(child.id) || editRow(child.id)) continue;
       const node = captureChild(child.id, localId);
@@ -8832,12 +8845,53 @@ export async function rebaseStaleInstances(
   /** Only frames of these refs (a prefab write rebuilds what IT changed, not every other prefab's stale frames). */
   opts: { sources?: ReadonlySet<string> } = {},
 ): Promise<number> {
+  const world = getCurrentWorld();
+  const stale = staleFrames(opts);
+  for (const s of stale) {
+    await preloadNestedPrefabs(s.to);
+    await preloadNestedPrefabsForSubtree(s.root);
+  }
+  if (getCurrentWorld() !== world) return 0;
+  return rebuildStaleFrames(stale);
+}
+
+/** {@link rebaseStaleInstances} with no wait when it needs none (#1820): a frame re-linked or respawned from a record — a
+ *  Paste of a copy taken before its template changed, Create Prefab's undo — is brought onto the current template
+ *  before the caller's step returns, when every prefab its rebuild reads is already cached (as it is right after an
+ *  in-session Apply, Replace or prefab-edit save). An async step is a window a world switch can land in (#1833), so the
+ *  async rebase runs only when a prefab has to be fetched, and it holds the world until it lands. True when it found a
+ *  stale frame to rebuild (Create Prefab's undo remembers it: its redo cannot re-link a tree the rebase changed). */
+export function rebaseStaleInstancesSoon(opts: { sources?: ReadonlySet<string> } = {}): boolean {
+  const stale = staleFrames(opts);
+  if (!stale.length) return false;
+  const cached = (src: string) => prefabCache.has(src);
+  const docCached = (doc: PrefabFile, seen = new Set<string>()): boolean => doc.entities.every((e) => {
+    if (!e.prefab || seen.has(e.prefab)) return true;
+    seen.add(e.prefab);
+    const child = prefabCache.get(e.prefab);
+    return !!child && docCached(child, seen);
+  });
+  const pi = getTraitByName('PrefabInstance')!;
+  const subtreeCached = (root: number) => collectTree(root, getAllEntities())
+    .every((e) => !e.traits.includes('PrefabInstance') || cached(readTraitData(e.id, pi)?.source as string));
+  if (stale.every((s) => docCached(s.to) && subtreeCached(s.root))) { rebuildStaleFrames(stale); return true; }
+  const release = beginWorldBoundOperation();
+  void rebaseStaleInstances(opts)
+    .catch((e) => console.error('[Prefab] rebasing a re-linked instance onto its current prefab failed:', e))
+    .finally(release);
+  return true;
+}
+
+interface StaleFrame { root: number; source: string; from: PrefabFile; to: PrefabFile }
+
+/** Every live frame root whose own record says it was expanded from a document other than the cached copy of its source. */
+function staleFrames(opts: { sources?: ReadonlySet<string> }): StaleFrame[] {
   const pi = getTraitByName('PrefabInstance');
-  if (!pi) return 0;
+  if (!pi) return [];
   const world = getCurrentWorld();
   const all = getAllEntities();
   const runtimeIds = collectTransientSubtreeIds(all);
-  const stale: { root: number; source: string; from: PrefabFile; to: PrefabFile }[] = [];
+  const stale: StaleFrame[] = [];
   world.query(pi.trait).updateEach(([data], entity) => {
     const d = data as { source?: string; rootInstanceId?: number };
     // Every frame root — stored or owned (#1493) — not only the stored ones.
@@ -8848,11 +8902,13 @@ export async function rebaseStaleInstances(
     if (!rec || rec.source !== d.source || !cached || sameDocument(rec.doc, cached)) return;
     stale.push({ root: entity.id(), source: d.source, from: rec.doc as PrefabFile, to: cached });
   });
-  for (const s of stale) {
-    await preloadNestedPrefabs(s.to);
-    await preloadNestedPrefabsForSubtree(s.root);
-  }
-  if (getCurrentWorld() !== world) return 0;
+  return stale;
+}
+
+/** Rebuild `stale` onto the documents it names, every nested prefab those read already cached. */
+function rebuildStaleFrames(stale: StaleFrame[]): number {
+  const pi = getTraitByName('PrefabInstance')!;
+  const world = getCurrentWorld();
   // ORDER: a frame is rebuilt only once no other stale frame is left in what its teardown destroys (#1499). Its
   // nested capture reads every frame in that set against the CACHED rows, so a stale one captured there had its
   // edits moved onto other members (a row the cache gained read as removed). Deepest-first by live depth got this

@@ -1,18 +1,16 @@
 /** Known OPEN prefab bugs the fuzzer finds (#1789), and how verify mode lives with each until it is fixed.
  *
- *  Two kinds:
- *  - `stops`: a seed whose first failure this predicate matches ends there as a pass (its prefix was checked). The
- *    predicate names the check AND the op shape that reaches it, so it cannot swallow an unrelated failure of the same
- *    check.
- *  - `tolerate`: a normalization verify mode applies while the issue is open (`Tolerate` in checks.ts).
+ *  `stops`: a seed whose first failure this predicate matches ends there as a pass (its prefix was checked). The
+ *  predicate names the check AND the op shape that reaches it, so it cannot swallow an unrelated failure of the same
+ *  check. (A second kind, a normalization verify mode applied while its issue was open, had one user — #1796's node-list
+ *  order — and went with its fix.)
  *
- *  Every entry carries a minimized repro. The self-test in prefabFuzz.test.ts runs it with the entry's tolerance OFF and
+ *  Every entry carries a minimized repro. The self-test in prefabFuzz.test.ts runs it and
  *  asserts it still fails as described: once the bug is fixed that test goes red, which forces the entry out. Keep an
  *  entry only while its issue is open. */
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
-import type { Tolerate } from './checks';
 
 export interface KnownOpen {
   issue: number;
@@ -21,14 +19,8 @@ export interface KnownOpen {
   /** The failure the repro must still produce (with this entry's tolerance off). */
   reproduces: (f: StepFailure) => boolean;
   stops?: (f: StepFailure, ops: readonly Op[]) => boolean;
-  tolerate?: keyof Tolerate;
 }
 
-/** Create Prefab's redo refused to tag the tree it rewrote because a reload reordered its siblings (#1796's route). */
-const POSITIONAL_RETAG = /^\[Prefab\] not tagging "[^"]+" — the live tree no longer matches the prefab just written \((".*" was written at localId \d+, but sits where row \d+ was written|row \d+ changed between a nested reference and a plain member)\)/;
-
-/** The entity a round-trip diff is on (`/<guid>/…`). */
-const subjectGuid = (f: StepFailure) => /^\/([0-9a-f]{8}-[0-9a-f-]{27})(\/|:)/.exec(f.detail)?.[1];
 /** The ONE node or entry a scene diff is about — not every guid in it (review: a path now carries its top-level entry's
  *  guid, so "any guid named" claimed a diff inside a dropped entry whichever node moved). A top-level entry gone, new
  *  or re-parented names itself in the path; a node gone from or new to a list names itself first in its value. */
@@ -53,47 +45,74 @@ const touchedBy = (f: StepFailure, kind: 'drop' | 'paste' | 'detach' | 'create',
  *  keying on that op being LAST is what keeps a stop from claiming any later failure in a list that merely holds it. */
 const lastOp = (ops: readonly Op[]) => ops.filter((o) => o.kind !== 'saveReload').at(-1)?.kind;
 
-/** #1796's Create Prefab redo route, as the walk's scene diff: keyed on the refusal the walk logged. */
-const positionalRetagRedo = (f: StepFailure, ops: readonly Op[]): boolean => f.check === 'redo to the end does not restore the scene'
-  && f.op === 'undo/redo to the ends' && /\/(own|added|children)(\/\d+)*: /.test(f.detail)
-  && !!f.console?.some((l) => POSITIONAL_RETAG.test(l)) && touchedBy(f, 'create', diffSubject(f))
-  && ops.some((o) => o.kind === 'createPrefab');
-
 /** A node in a node list (or a template-added key's record, or a slot) that differs across the redo walk. */
 const NODE_LIST_DIFF = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(parentLocalId|own)":.* vs undefined$|undefined vs \[?\{"(parentLocalId|own)":)|\/(own|added|children)(\/\d+)+\/guid: "[^"]+" vs "[^"]+"$/;
 
-/** The suffix a round-trip difference carries when it was measured with the run's deleted prefabs RESTORED (#1805,
- *  `checkRoundTrip`): the same difference, seen through the stricter comparison — optional, so a route with no deletion
- *  keeps matching. */
-const RESTORED = String.raw`( \(with the deleted prefab restored\))?`;
 
 // Retired by #1869, whose refusals (a supplied object is not moved, reordered, detached out of its instance or saved as
 // a prefab of its own — Unity's rule) left their only route unreachable, and which a 300-seed hunt with the re-aimed ops
 // and a sweep of legal variants did not re-find: #1792 (every route refused; closed), #1808, #1826, #1829, #1851, and one
 // route each of #1796 (two: Create Prefab on a member), #1809 (Create Prefab on a member, then the directed Apply) and
-// #1820 (Create Prefab's undo, on a member).
+// #1820 (Create Prefab's undo, on a member). Also a route #1796's fix unmasked (outsideEdit → reparent → createPrefab: its
+// redo tagged, then a template-added node row read removed; kept under #1830, mechanism unconfirmed): with #1869 merged one
+// of its draws lands on a refused gesture and it no longer reproduces.
+/** The last three ops (reloads aside) are a delete, a SAVED prefab edit (`u[1] < 0.65` saves) and an undo: Delete's undo
+ *  respawning a snapshot older than the template the edit saved. Adjacent, so a list that merely holds the three somewhere
+ *  is not claimed (the planted-regression guard). */
+const deleteThenSavedEditThenUndo = (ops: readonly Op[]) => {
+  const [d, e, u] = ops.filter((o) => o.kind !== 'saveReload').slice(-3);
+  return d?.kind === 'delete' && e?.kind === 'prefabEdit' && e.u[1] < 0.65 && u?.kind === 'undo';
+};
+const CHANGED_GUID = /\(an entity changed guid\)$/;
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
-    issue: 1796,
-    what: 'nested node lists are saved in ECS query order, so a save after a reload reorders them',
+    issue: 1820,
+    what: "(close-out review) Delete's undo of a ROW of a frame that survives the delete, after a saved edit of that frame's template: the row respawns on the old document",
+    // rebaseRespawned rebuilds frames whose OWN record is stale; a deleted member or owned nested root belongs to an enclosing
+    // frame that leaving prefab edit already rebased, so no stale frame is left to see. Three OBSERVED routes (a value, a lost
+    // entity, a parent link). Fix direction: the snapshot records the enclosing frame's document and the undo translates or
+    // refuses. Keyed off the guid-change shape, which is #1809's.
     repro: [
-      { kind: 'duplicate', u: [0.38699243287555873, 0.5160500674974173, 0.7015982300508767, 0.7498073864262551, 0.12323614209890366, 0.09115325007587671, 0.3395281918346882, 0.4878639730159193] },
+      { kind: 'delete', u: [0.7, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.15, 0.5, 0.9, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
     ],
-    reproduces: (f) => f.check === 'save→reload→save is not byte-identical',
-    tolerate: 'nodeOrder',
+    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/Transform\/z: /.test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
   },
   {
-    issue: 1796,
-    what: "the same redo, reported as the scene diff (the walk's identity check runs before its console errors are read)",
+    issue: 1820,
+    what: "the same, where the respawned row's template dropped a member: the entity is lost on reload",
     repro: [
-      { kind: 'outsideEdit', u: [0.6936206261161715, 0.17782395984977484, 0.5137411751784384, 0.7149697851855308, 0.9969790095929056, 0.16907001845538616, 0.6203795957844704, 0.5160340690053999] },
-      { kind: 'reparent', u: [0.315277598798275, 0.917392787989229, 0.9138918148819357, 0.2863043069373816, 0.8894691378809512, 0.4289656088221818, 0.22244959813542664, 0.5512217737268656] },
-      { kind: 'createPrefab', u: [0.9434425951912999, 0.18627188983373344, 0.7050830235239118, 0.7845574729144573, 0.4535193827468902, 0.8970362835098058, 0.007119981572031975, 0.06791658839210868] },
-      { kind: 'reparent', u: [0.926001786487177, 0.07603803905658424, 0.059589676558971405, 0.6357310710009187, 0.21650824113748968, 0.9080651458352804, 0.8035988812334836, 0.2351431674323976] },
+      { kind: 'delete', u: [0.4, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
     ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && /\/added: undefined vs \[/.test(f.detail),
-    // Keyed on the refusal the walk logged (the runner hands the walk's console lines to the predicate).
-    stops: positionalRetagRedo,
+    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(an entity was lost\)$/.test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
+  },
+  {
+    issue: 1820,
+    what: "the same, where the respawned row is an owned nested root: its parent link reverts on reload",
+    repro: [
+      { kind: 'delete', u: [0.3, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/PrefabInstance\/parentLocalId: /.test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && !CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
+  },
+  {
+    issue: 1809,
+    what: "the anchor-row guid change, through Delete's undo after a saved prefab edit dropped the anchor row (close-out review)",
+    repro: [
+      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+    reproduces: (f) => f.check === 'save→reload is not the identity' && CHANGED_GUID.test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
   },
   {
     issue: 1809,
@@ -109,46 +128,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       const e = ops.findIndex((o, i) => i > d && o.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((x) => x.kind === 'delete'));
       return d >= 0 && e >= 0 && ops.slice(e + 1).some((o) => o.kind === 'undo');
     })(),
-  },
-  {
-    issue: 1820,
-    what: "a paste of an instance copied before its template changed respawns the stale frame, and nothing rebases it",
-    repro: [
-      { kind: 'copy', u: [0.003, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'editField', u: [0.656, 0.0, 0.75, 0, 0, 0, 0, 0] },
-      { kind: 'apply', u: [0.2, 0.1, 0, 0.9, 0, 0.9, 0, 0] },
-      { kind: 'paste', u: [0.1, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/traits\/Transform\/x: /.test(f.detail),
-    // A copy, then a template change (Apply, Create Prefab Replace, a prefab-edit save, an outside edit), then a paste.
-    // Keyed on a member lost or a transform value the reload changed.
-    stops: (f, ops) => f.check === 'save→reload is not the identity'
-      && (new RegExp(String.raw`\(an entity was lost\)${RESTORED}$`).test(f.detail) || /^\/[^/]+\/traits\/Transform\/(x|y|z|rx|ry|rz|sx|sy|sz): /.test(f.detail)) && (() => {
-        const c = ops.findIndex((o) => o.kind === 'copy');
-        const ch = ops.findIndex((o, i) => i > c && ['apply', 'createPrefab', 'prefabEdit', 'outsideEdit'].includes(o.kind));
-        return c >= 0 && ch >= 0 && ops.slice(ch + 1).some((o) => o.kind === 'paste') && lastOp(ops) === 'paste' && touchedBy(f, 'paste', subjectGuid(f));
-      })(),
-  },
-  {
-    issue: 1820,
-    what: "the same, through Paste's redo: the walk undoes and redoes a paste made before the template changed",
-    repro: [
-      { kind: 'instantiate', u: [0.611175028141588, 0.6514599523507059, 0.2609965375158936, 0.13653228152543306, 0.08117494895122945, 0.229994123801589, 0.19415682554244995, 0.2312458292581141] },
-      { kind: 'prefabEdit', u: [0.0025320895947515965, 0.5545158837921917, 0.3194682211615145, 0.6602701237425208, 0.8647226733155549, 0.30973603832535446, 0.06382799847051501, 0.20962068950757384], inner: [] },
-      { kind: 'reparent', u: [0.05289468914270401, 0.5114942493382841, 0.9024173587094992, 0.7742977037560195, 0.22715402184985578, 0.8201705161482096, 0.34489292302168906, 0.49780966504476964] },
-      { kind: 'copy', u: [0.27074809931218624, 0.14453188236802816, 0.6524580360855907, 0.7346509259659797, 0.5130745004862547, 0.6953973234631121, 0.5576475753914565, 0.6048628408461809] },
-      { kind: 'paste', u: [0.2788585058879107, 0.6411802317015827, 0.13857184490188956, 0.7241594886872917, 0.5755924703553319, 0.21859576366841793, 0.999815168324858, 0.40587658691219985] },
-      { kind: 'prefabEdit', u: [0.6, 0.6434368717018515, 0.49586298945359886, 0.5223652205895633, 0.1734591640997678, 0.8727238741703331, 0.5582645458634943, 0.7902071727439761], inner: [{ kind: 'duplicate', u: [0.2632118870969862, 0.7401458392851055, 0.20006573991850019, 0.8598092638421804, 0.1768859124276787, 0.5392143279314041, 0.14166608965024352, 0.4079057138878852] }] },
-      { kind: 'revert', u: [0.2899708952754736, 0.8689476081635803, 0.3784734313376248, 0.317490870365873, 0.01880230032838881, 0.8135771653614938, 0.9818330009002239, 0.4641318661160767] },
-    ],
-    reproduces: (f) => f.check === 'console.error' && /^\[undo\] Redo of "Revert prefab overrides" was REFUSED — a prefab nested in this instance of "[^"]+" has changed since it was built/.test(f.detail),
-    // The Revert's refusal is right (the frame was built from old rows); the defect is the paste redo that built it.
-    stops: (f, ops) => f.check === 'console.error' && f.op === 'undo/redo to the ends'
-      && /^\[undo\] Redo of "Revert prefab overrides" was REFUSED — a prefab nested in this instance of "[^"]+" has changed since it was built/.test(f.detail) && (() => {
-        const c = ops.findIndex((o) => o.kind === 'copy'); const p = ops.findIndex((o, i) => i > c && o.kind === 'paste');
-        const ch = ops.findIndex((o, i) => i > c && ['apply', 'createPrefab', 'prefabEdit', 'outsideEdit'].includes(o.kind));
-        return c >= 0 && p >= 0 && ch >= 0 && ops.slice(ch + 1).some((o) => o.kind === 'revert');
-      })(),
   },
   {
     issue: 1822,
@@ -173,10 +152,10 @@ export const KNOWN_OPEN: KnownOpen[] = [
       { kind: 'createPrefab', u: [0.14, 0.5, 0, 0, 0, 0, 0, 0] },
     ],
     reproduces: (f) => f.check === 'redo to the end does not restore the scene' && NODE_LIST_DIFF.test(f.detail),
-    // A node of a tree Create Prefab tagged (touched.create) moved in a node list across the redo, with no re-tag refusal
-    // logged (that is #1796) and not a drop's node (#1793).
+    // A node of a tree Create Prefab tagged (touched.create) moved in a node list across the redo, and not a drop's node
+    // (#1793).
     stops: (f, ops) => f.check === 'redo to the end does not restore the scene' && f.op === 'undo/redo to the ends'
-      && NODE_LIST_DIFF.test(f.detail) && !f.console?.some((l) => POSITIONAL_RETAG.test(l))
+      && NODE_LIST_DIFF.test(f.detail)
       && (touchedBy(f, 'create', diffSubject(f)) || memberKeys(f).some((k) => touchedBy(f, 'create', k)))
       && !(['drop', 'paste', 'detach'] as const).some((k) => touchedBy(f, k, diffSubject(f)))
       && ops.some((o) => o.kind === 'createPrefab'),
@@ -186,6 +165,253 @@ export const KNOWN_OPEN: KnownOpen[] = [
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1820,
+    what: "(close-out review) Create Prefab, a saved edit of the tree's template (a member added), undo, redo: the redo is REFUSED, not a re-link to stale rows",
+    repro: [
+      { kind: 'createPrefab', u: [0.1, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'duplicate', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'redo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out review) Create Prefab, a saved edit of the tree's template (only a VALUE changed (the shape-only check missed it)), undo, redo: the redo is REFUSED, not a re-link to stale rows",
+    repro: [
+      { kind: 'createPrefab', u: [0.1, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.15, 0.9, 0.9, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'redo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Delete's undo after a SAVED prefab edit (duplicate) respawns the deleted instance on the current template",
+    repro: [
+      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'duplicate', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Delete's undo after a SAVED prefab edit (addChild) respawns the deleted instance on the current template",
+    repro: [
+      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'addChild', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Delete's undo after a SAVED prefab edit (delete) respawns the deleted instance on the current template",
+    repro: [
+      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Duplicate's redo after a SAVED prefab edit (duplicate) respawns the copy on the current template",
+    repro: [
+      { kind: 'duplicate', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'duplicate', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'redo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Duplicate's redo after a SAVED prefab edit (addChild) respawns the copy on the current template",
+    repro: [
+      { kind: 'duplicate', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'addChild', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'redo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(close-out sweep) Duplicate's redo after a SAVED prefab edit (delete) respawns the copy on the current template",
+    repro: [
+      { kind: 'duplicate', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'redo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "Create Prefab over a tree holding a prefab instance (a legal pick after #1869), a SAVED prefab edit, then the create's undo re-links: the live tree gains the member the saved edit duplicated (a legal route, after #1869)",
+    repro: [
+      { kind: 'createPrefab', u: [0.02, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'duplicate', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "Create Prefab over a tree holding a prefab instance (a legal pick after #1869), a SAVED prefab edit, then the create's undo re-links: the live tree gains the child the saved edit added (a legal route, after #1869)",
+    repro: [
+      { kind: 'createPrefab', u: [0.02, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'addChild', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "Create Prefab over a tree holding a prefab instance (a legal pick after #1869), a SAVED prefab edit, then the create's undo re-links: the live tree loses the member the saved edit deleted (a legal route, after #1869)",
+    repro: [
+      { kind: 'createPrefab', u: [0.02, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.3, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.5, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "a paste of an instance copied before its template changed respawns the stale frame, and nothing rebases it",
+    repro: [
+      { kind: 'copy', u: [0.003, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'editField', u: [0.656, 0.0, 0.75, 0, 0, 0, 0, 0] },
+      { kind: 'apply', u: [0.2, 0.1, 0, 0.9, 0, 0.9, 0, 0] },
+      { kind: 'paste', u: [0.1, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "the same missing rebase, through Create Prefab's undo: it re-links the tree to its old template's stale expansion",
+    repro: [
+      { kind: 'createPrefab', u: [0.9428159724920988, 0.9500395997893065, 0.8217625359538943, 0.2986950015183538, 0.315559288719669, 0.43765105050988495, 0.01984696416184306, 0.9973117003683001] },
+      { kind: 'createPrefab', u: [0.0017358909826725721, 0.3970535541884601, 0.538624168606475, 0.21942522306926548, 0.32584577915258706, 0.5943802592810243, 0.018516797805204988, 0.8010917166247964] },
+      { kind: 'prefabEdit', u: [0.4197337697260082, 0.45629017311148345, 0.9499380351044238, 0.30179717764258385, 0.4023724365979433, 0.017604060005396605, 0.281649986281991, 0.47618820145726204], inner: [{ kind: 'instantiate', u: [0.7530755579937249, 0.7304247959982604, 0.6359159634448588, 0.5732636176981032, 0.24562921142205596, 0.715872710570693, 0.18062788620591164, 0.5258615149650723] }] },
+      { kind: 'undo', u: [0.9111525018233806, 0.4756720804143697, 0.2995174073148519, 0.8736095151398331, 0.7850008409004658, 0.6371805649250746, 0.5273122461512685, 0.5875295428559184] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "the same, through Paste's redo: the walk undoes and redoes a paste made before the template changed",
+    repro: [
+      { kind: 'instantiate', u: [0.611175028141588, 0.6514599523507059, 0.2609965375158936, 0.13653228152543306, 0.08117494895122945, 0.229994123801589, 0.19415682554244995, 0.2312458292581141] },
+      { kind: 'prefabEdit', u: [0.0025320895947515965, 0.5545158837921917, 0.3194682211615145, 0.6602701237425208, 0.8647226733155549, 0.30973603832535446, 0.06382799847051501, 0.20962068950757384], inner: [] },
+      { kind: 'reparent', u: [0.05289468914270401, 0.5114942493382841, 0.9024173587094992, 0.7742977037560195, 0.22715402184985578, 0.8201705161482096, 0.34489292302168906, 0.49780966504476964] },
+      { kind: 'copy', u: [0.27074809931218624, 0.14453188236802816, 0.6524580360855907, 0.7346509259659797, 0.5130745004862547, 0.6953973234631121, 0.5576475753914565, 0.6048628408461809] },
+      { kind: 'paste', u: [0.2788585058879107, 0.6411802317015827, 0.13857184490188956, 0.7241594886872917, 0.5755924703553319, 0.21859576366841793, 0.999815168324858, 0.40587658691219985] },
+      { kind: 'prefabEdit', u: [0.6, 0.6434368717018515, 0.49586298945359886, 0.5223652205895633, 0.1734591640997678, 0.8727238741703331, 0.5582645458634943, 0.7902071727439761], inner: [{ kind: 'duplicate', u: [0.2632118870969862, 0.7401458392851055, 0.20006573991850019, 0.8598092638421804, 0.1768859124276787, 0.5392143279314041, 0.14166608965024352, 0.4079057138878852] }] },
+      { kind: 'revert', u: [0.2899708952754736, 0.8689476081635803, 0.3784734313376248, 0.317490870365873, 0.01880230032838881, 0.8135771653614938, 0.9818330009002239, 0.4641318661160767] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "a paste after an Apply removed a member of the copied instance keeps the member out (the body's member-lost repro)",
+    repro: [
+      { kind: 'delete', u: [0.831,  0,  0,  0,  0,  0,  0,  0] },
+      { kind: 'copy', u: [0.003,  0,  0,  0,  0,  0,  0,  0] },
+      { kind: 'apply', u: [0.78,  0.1,  0,  0.9,  0,  0.9,  0,  0] },
+      { kind: 'paste', u: [0.577,  0.746,  0.068,  0.977,  0,  0,  0,  0] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(win seed 4483) copy, paste, Apply, paste: the second paste takes the nodes the Apply added",
+    repro: [
+      { kind: 'copy', u: [0.14698627777397633,  0.8868070221506059,  0.6764130680821836,  0.12952746218070388,  0.9193068437743932,  0.6101939009968191,  0.5648398445919156,  0.9099759007804096] },
+      { kind: 'paste', u: [0.37339868303388357,  0.44922571652568877,  0.5820887528825551,  0.49615396675653756,  0.9435655698180199,  0.13738775975070894,  0.12296006875112653,  0.7920071498956531] },
+      { kind: 'apply', u: [0.8779937496874481,  0.456387547776103,  0.8912423599977046,  0.7217436714563519,  0.495892170118168,  0.6126101936679333,  0.787758517311886,  0.608392120571807] },
+      { kind: 'paste', u: [0.04270838829688728,  0.0985837762709707,  0.7681965220253915,  0.36397526366636157,  0.6696740563493222,  0.19381232536397874,  0.8067189394496381,  0.904827953549102] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(win seed 3166) a paste after a saved prefab-edit Duplicate takes the node it added",
+    repro: [
+      { kind: 'copy', u: [0.04884834960103035,  0.9628134244121611,  0.6216103117913008,  0.943275434197858,  0.3188887434080243,  0.49192826147191226,  0.01156065403483808,  0.1593283291440457] },
+      { kind: 'prefabEdit', u: [0.6315673277713358,  0.14461058238521218,  0.11123886378481984,  0.7670094554778188,  0.8188522597774863,  0.0583918709307909,  0.013477355008944869,  0.12268179678358138], inner: [{ kind: 'duplicate', u: [0.2379663127940148, 0.45252525829710066, 0.1845254492945969, 0.7645223236177117, 0.5730074837338179, 0.899197322782129, 0.7565395457204431, 0.7873528709169477] }] },
+      { kind: 'paste', u: [0.9393777602817863,  0.099418064346537,  0.08656460558995605,  0.9402495534159243,  0.2995231195818633,  0.0953779045958072,  0.24812181666493416,  0.1979106201324612] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(win seed 4174) a stale paste's parentId",
+    repro: [
+      { kind: 'instantiate', u: [0.817225489532575,  0.6150298537686467,  0.43410562071949244,  0.8474213990848511,  0.6080710273236036,  0.3496287034358829,  0.8644047558773309,  0.6105031108018011] },
+      { kind: 'delete', u: [0.7614817498251796,  0.6651264014653862,  0.30778774223290384,  0.6466251155361533,  0.7594433417543769,  0.3746901412960142,  0.2749748737551272,  0.4335338482633233] },
+      { kind: 'delete', u: [0.4055223378818482,  0.785919364541769,  0.9767264937981963,  0.07617654372006655,  0.9242184786126018,  0.44334669318050146,  0.9296723406296223,  0.5644315637182444] },
+      { kind: 'copy', u: [0.08672260493040085,  0.0018634560983628035,  0.5823962264694273,  0.045332242269068956,  0.43199025304056704,  0.18286233744584024,  0.08787737437523901,  0.23212941782549024] },
+      { kind: 'reparent', u: [0.8342625887598842,  0.4582651359960437,  0.7787502971477807,  0.6373671570327133,  0.9003852005116642,  0.5240210210904479,  0.5465208550449461,  0.62540562893264] },
+      { kind: 'paste', u: [0.7858088326174766,  0.14560177107341588,  0.7896528092678636,  0.3082289642188698,  0.8933009491302073,  0.5416892601642758,  0.6897593471221626,  0.8406567722558975] },
+      { kind: 'apply', u: [0.1184677709825337,  0.4642320699058473,  0.25585719337686896,  0.2426652645226568,  0.11545071564614773,  0.204954867484048,  0.5391937966924161,  0.16870146454311907] },
+      { kind: 'paste', u: [0.21386439935304224,  0.6408156936522573,  0.15152453840710223,  0.8387568793259561,  0.10223349533043802,  0.4221818440128118,  0.686126304557547,  0.35632232297211885] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(win seed 3097) a stale paste's override marks",
+    repro: [
+      { kind: 'editField', u: [0.44951570802368224,  0.344752277713269,  0.999486313899979,  0.2983108488842845,  0.5319882414769381,  0.9581097902264446,  0.5708246517460793,  0.9445934095419943] },
+      { kind: 'copy', u: [0.08305942406877875,  0.5127813585568219,  0.33668679813854396,  0.29134805290959775,  0.04606970283202827,  0.6994702997617424,  0.7973081469535828,  0.8558187852613628] },
+      { kind: 'apply', u: [0.5542727666907012,  0.9195215618237853,  0.3982940942514688,  0.6734568581450731,  0.5898221214301884,  0.316782349254936,  0.16543398541398346,  0.34312310721725225] },
+      { kind: 'paste', u: [0.8655595844611526,  0.11952090612612665,  0.3953531668521464,  0.2899504494853318,  0.147352792089805,  0.3629837108310312,  0.20817722426727414,  0.7508443302940577] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(win seed 3356) a stale paste's added component",
+    repro: [
+      { kind: 'addChild', u: [0.6022028226871043,  0.4916789522394538,  0.5374829324427992,  0.7261641579680145,  0.3992758134845644,  0.12593218218535185,  0.4906459131743759,  0.3929682292509824] },
+      { kind: 'copy', u: [0.29138847370631993,  0.34229610906913877,  0.5704484961461276,  0.27208092506043613,  0.9787884801626205,  0.2521947417408228,  0.88076506042853,  0.6224663273897022] },
+      { kind: 'reparent', u: [0.4728145166300237,  0.250552580691874,  0.9423649744130671,  0.6085743457078934,  0.5756158044096082,  0.7312585986219347,  0.18250082153826952,  0.6265484702307731] },
+      { kind: 'addComponent', u: [0.08710776804946363,  0.0006227344274520874,  0.8525324119254947,  0.4319694945588708,  0.7389313839375973,  0.4417040063999593,  0.30046098539605737,  0.21890126774087548] },
+      { kind: 'revert', u: [0.4148508314974606,  0.1469713319092989,  0.0740816555917263,  0.5004145568236709,  0.15684673166833818,  0.8724640819709748,  0.6221436758060008,  0.5350111455190927] },
+      { kind: 'apply', u: [0.35009047063067555,  0.8993905920069665,  0.5499130950774997,  0.28416696353815496,  0.09081994113512337,  0.5930697214789689,  0.9242638661526144,  0.09549329965375364] },
+      { kind: 'paste', u: [0.1993531279731542,  0.8867862697225064,  0.02726888144388795,  0.8469348920043558,  0.6183840627782047,  0.9696976784616709,  0.34751853812485933,  0.0024959484580904245] },
+    ],
+  },
+  {
+    issue: 1820,
+    what: "(#1859, hunt seed 250) copy, outside edit, paste: the reload gains no entity",
+    repro: [
+      { kind: 'copy', u: [0.07701369072310627,  0.7822557620238513,  0.4572561925742775,  0.28865382075309753,  0.7458809961099178,  0.5401038848794997,  0.2584418347105384,  0.8851113333366811] },
+      { kind: 'outsideEdit', u: [0.9907738657202572,  0.8173439735546708,  0.17939582420513034,  0.874272549059242,  0.2045294945128262,  0.5903447051532567,  0.7981432392261922,  0.7445750313345343] },
+      { kind: 'paste', u: [0.22224835772067308,  0.7978167883120477,  0.6313734378200024,  0.970457072602585,  0.4196247239597142,  0.7648493445012718,  0.1068376547191292,  0.39006769354455173] },
+    ],
+  },
+  {
+    issue: 1796,
+    what: "a Duplicate inside an instance: save → reload → save is byte-identical (nested node lists in sibling order)",
+    repro: [
+      { kind: 'duplicate', u: [0.38699243287555873, 0.5160500674974173, 0.7015982300508767, 0.7498073864262551, 0.12323614209890366, 0.09115325007587671, 0.3395281918346882, 0.4878639730159193] },
+    ],
+  },
+  {
+    issue: 1796,
+    what: "Create Prefab's redo after a reload re-tags the tree it rewrote (collectTree in sibling order, as the write was)",
+    repro: [
+      { kind: 'duplicate', u: [0.0005, 0.7639, 0.1438, 0.6678, 0.7747, 0.344, 0.5285, 0.0697] },
+      { kind: 'saveReload', u: [0.9055, 0.5241, 0.2558, 0.4764, 0.7382, 0.6179, 0.362, 0.2463] },
+      { kind: 'createPrefab', u: [0.2822, 0.0907, 0.9868, 0.1901, 0.0497, 0.3445, 0.7354, 0.5284] },
+      { kind: 'prefabEdit', u: [0.7606, 0.2686, 0.3478, 0.6593, 0.9336, 0.4852, 0.8874, 0.3418], inner: [] },
+    ],
+  },
+  {
+    issue: 1796,
+    what: "the same redo, where the walk's scene diff showed the tree's added node missing",
+    repro: [
+      { kind: 'duplicate', u: [0.033303552540019155, 0.6072016530670226, 0.17860231618396938, 0.36060059955343604, 0.24519648379646242, 0.01585288904607296, 0.7660753296222538, 0.0734335642773658] },
+      { kind: 'createPrefab', u: [0.20849957410246134, 0.6444018911570311, 0.005679936148226261, 0.3887866751756519, 0.5991325152572244, 0.022242528619244695, 0.49629448540508747, 0.33016981394030154] },
+    ],
+  },
+  {
+    issue: 1796,
+    what: "the same redo after an outside edit and a reparent: Create Prefab's redo re-tags instead of refusing",
+    repro: [
+      { kind: 'outsideEdit', u: [0.6936206261161715, 0.17782395984977484, 0.5137411751784384, 0.7149697851855308, 0.9969790095929056, 0.16907001845538616, 0.6203795957844704, 0.5160340690053999] },
+      { kind: 'reparent', u: [0.315277598798275, 0.917392787989229, 0.9138918148819357, 0.2863043069373816, 0.8894691378809512, 0.4289656088221818, 0.22244959813542664, 0.5512217737268656] },
+      { kind: 'createPrefab', u: [0.9434425951912999, 0.18627188983373344, 0.7050830235239118, 0.7845574729144573, 0.4535193827468902, 0.8970362835098058, 0.007119981572031975, 0.06791658839210868] },
+      { kind: 'reparent', u: [0.926001786487177, 0.07603803905658424, 0.059589676558971405, 0.6357310710009187, 0.21650824113748968, 0.9080651458352804, 0.8035988812334836, 0.2351431674323976] },
+    ],
+  },
   {
     issue: 1831,
     what: "(G1 M2) a prefab dropped under a Missing Prefab placeholder in prefab edit is refused, where the save wrote it as a row every expansion re-homed outside the instance (hunt seed 315, #1861)",
@@ -543,5 +769,3 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   },
 ];
 
-/** Every tolerance, on: what verify and hunt modes run with while the entries are open. */
-export const KNOWN_TOLERANCES: Tolerate = Object.fromEntries(KNOWN_OPEN.filter((k) => k.tolerate).map((k) => [k.tolerate, true]));

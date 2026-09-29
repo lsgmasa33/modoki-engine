@@ -395,7 +395,8 @@ export function moveToTrash(
  *  docs/scene-loading.md.
  *
  *  ⚠️ **Accepted cost (owner ruling, #1293):** a `Persistent` entity in the copy no longer matches
- *  its original by guid, so `filterPersistentDuplicates` stops treating the two as one. */
+ *  its original by guid. (Nothing deduplicates a carried Persistent root against a file since #1863, so
+ *  the guid no longer decides anything there.) */
 export function remintSceneEntityGuids(
   scene: Record<string, unknown>,
   genGuid: () => string = randomUUID,

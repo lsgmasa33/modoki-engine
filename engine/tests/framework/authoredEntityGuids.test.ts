@@ -154,9 +154,8 @@ describe('deriveAuthoredEntityGuids — every part of the seed participates', ()
   });
 
   // `reserved` covers the guids that are spoken for but NOT in `entities` — SceneManager filters the
-  // list before the loader sees it (`filterPersistentDuplicates`, `filterDuplicateChainGuids`), and
-  // a row dropped because a carried Persistent entity already covers it takes its guid out with it
-  // while that entity is very much alive.
+  // list before the loader sees it (`filterDuplicateChainGuids`), and a carried Persistent entity is
+  // alive in the target world with no row of its own here.
   // Mutation: drop the `for (const g of reserved ?? [])` loop.
   it('does not derive a guid passed in as reserved', () => {
     const wouldDerive = seedOnly([bareTimeEntry()], SCENE).get(1)!;

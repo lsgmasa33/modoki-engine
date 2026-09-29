@@ -640,7 +640,10 @@ describe('SceneManager — persistent entities', () => {
     expect(preservedName).toBe('Player');
   });
 
-  it('shadows a scene root by matching guid (no duplicate)', async () => {
+  // #1863: as Unity's DontDestroyOnLoad, a carried root is NOT deduplicated against the incoming file — a game that
+  // reloads the scene holding it guards the duplicate itself (docs/scene-loading.md). The dedupe that once lived here
+  // matched only legacy-format roots (numeric parentId 0) and was removed.
+  it('does NOT shadow a scene root with the carried root\'s guid: both spawn (#1863, the Unity rule)', async () => {
     // Define a scene whose root carries the same Persistent guid as our runtime entity
     fetchResponses['/sceneWithDuplicate.json'] = {
       version: 6,
@@ -678,16 +681,11 @@ describe('SceneManager — persistent entities', () => {
     // Load the scene that also has a Player with matching guid
     await sceneManager.loadScene('/sceneWithDuplicate.json');
 
-    // After swap: only ONE Player (the persistent one) and one Tree
+    // After swap: TWO Players — the carried one (score 99) and the file's (score 0) — and one Tree
     const newWorld = getCurrentWorld();
-    let playerCount = 0;
-    let preservedScore = -1;
-    newWorld.query(PlayerProfile).updateEach(([p]: any[]) => {
-      playerCount++;
-      preservedScore = (p as any).score;
-    });
-    expect(playerCount).toBe(1);
-    expect(preservedScore).toBe(99); // persistent value, not the scene's 0
+    const scores: number[] = [];
+    newWorld.query(PlayerProfile).updateEach(([p]: any[]) => { scores.push((p as any).score); });
+    expect(scores.sort((a, b) => a - b)).toEqual([0, 99]);
 
     // Tree should still be present
     let treeCount = 0;
@@ -863,200 +861,6 @@ describe('SceneManager — persistent entities', () => {
     );
 
     expect(() => markPersistent(child)).toThrow(/only root entities/);
-  });
-});
-
-// ── filterPersistentDuplicates — direct unit tests ──────────────────────
-//
-// The happy path is covered by the 'shadows a scene root by matching guid'
-// integration test above. These unit tests pin down the edge cases of the
-// pure function without spinning up the full SceneManager/fetch pipeline.
-
-describe('filterPersistentDuplicates', () => {
-  // Helper to build a scene entry tersely
-  const entry = (
-    id: number,
-    name: string,
-    parentId: number = 0,
-    extra: Record<string, Record<string, unknown>> = {},
-  ) => ({
-    id,
-    traits: {
-      EntityAttributes: { name, parentId },
-      ...extra,
-    },
-  });
-
-  /** Build a persistent entry with a guid — shorthand for scene roots that
-   *  carry the Persistent trait. */
-  const persistentEntry = (
-    id: number,
-    name: string,
-    guid: string,
-    parentId: number = 0,
-    extra: Record<string, Record<string, unknown>> = {},
-  ) => ({
-    id,
-    traits: {
-      EntityAttributes: { name, parentId },
-      Persistent: { guid },
-      ...extra,
-    },
-  });
-
-  /** Build a persistent snapshot (simulates snapshotPersistentEntities output). */
-  const snap = (id: number, name: string, guid: string, parentId: number = 0) => ({
-    id,
-    traits: {
-      EntityAttributes: { name, parentId },
-      Persistent: { guid },
-    },
-  });
-
-  async function getFilter() {
-    const mod = await import('../../src/runtime/scene/SceneManager');
-    return mod.filterPersistentDuplicates;
-  }
-
-  it('returns data unchanged when there are no persistent snapshots', async () => {
-    const filter = await getFilter();
-    const data = { version: 6, resources: [], entities: [entry(1, 'A'), entry(2, 'B')] };
-    const out = filter(data as any, []);
-    expect(out).toBe(data);
-  });
-
-  it('returns data unchanged when no scene root guid matches a persistent guid', async () => {
-    const filter = await getFilter();
-    const data = { version: 6, resources: [], entities: [entry(1, 'A'), entry(2, 'B')] };
-    const snapshots = [snap(10, 'NotInScene', 'guid-x')];
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('excludes a scene root with matching guid', async () => {
-    const filter = await getFilter();
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [persistentEntry(1, 'Player', 'guid-1'), entry(2, 'Tree'), entry(3, 'Rock')],
-    };
-    const snapshots = [snap(10, 'Player', 'guid-1')];
-    const out = filter(data as any, snapshots as any);
-    expect(out).not.toBe(data);
-    expect(out.entities.map((e: any) => e.id).sort()).toEqual([2, 3]);
-  });
-
-  it('excludes the full descendant subtree of a guid-matched root', async () => {
-    const filter = await getFilter();
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [
-        persistentEntry(1, 'Player', 'guid-1'),  // root, guid matches
-        entry(2, 'Hand', 1),                      // child
-        entry(3, 'Finger', 2),                    // grandchild
-        entry(4, 'Thumb', 2),                     // grandchild
-        entry(5, 'Nail', 4),                      // great-grandchild
-        entry(6, 'UnrelatedRoot'),                // unrelated root, kept
-        entry(7, 'Sibling', 6),                   // kept
-      ],
-    };
-    const snapshots = [snap(10, 'Player', 'guid-1')];
-    const out = filter(data as any, snapshots as any);
-    expect(out.entities.map((e: any) => e.id).sort()).toEqual([6, 7]);
-  });
-
-  it('does NOT shadow a scene root with the same name but no Persistent trait', async () => {
-    const filter = await getFilter();
-    // Scene root "Player" has no Persistent trait — should NOT be pruned
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [entry(1, 'Player'), entry(2, 'Tree')],
-    };
-    const snapshots = [snap(10, 'Player', 'guid-1')];
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('does NOT shadow a scene root with the same name but different guid', async () => {
-    const filter = await getFilter();
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [persistentEntry(1, 'Player', 'guid-other'), entry(2, 'Tree')],
-    };
-    const snapshots = [snap(10, 'Player', 'guid-1')];
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('handles multiple persistent roots matching multiple scene roots', async () => {
-    const filter = await getFilter();
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [
-        persistentEntry(1, 'Player', 'guid-1'),
-        entry(2, 'PlayerHand', 1),
-        persistentEntry(3, 'Camera', 'guid-2'),
-        entry(4, 'CameraRig', 3),
-        entry(5, 'KeepMe'),
-      ],
-    };
-    const snapshots = [
-      snap(10, 'Player', 'guid-1'),
-      snap(20, 'Camera', 'guid-2'),
-    ];
-    const out = filter(data as any, snapshots as any);
-    expect(out.entities.map((e: any) => e.id)).toEqual([5]);
-  });
-
-  it('ignores persistent snapshot entries that are not roots (parentId !== 0)', async () => {
-    const filter = await getFilter();
-    // A snapshot child with a guid — only root snapshots should drive exclusion
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [persistentEntry(1, 'Hand', 'guid-hand')],
-    };
-    const snapshots = [snap(10, 'Hand', 'guid-hand', 99)]; // non-root snapshot
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('skips persistent snapshots that are missing the Persistent trait', async () => {
-    const filter = await getFilter();
-    const data = { version: 6, resources: [], entities: [persistentEntry(1, 'Player', 'guid-1')] };
-    // Malformed snapshot: no Persistent trait at all
-    const snapshots = [{ id: 10, traits: { EntityAttributes: { name: 'Player', parentId: 0 } } }];
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('skips persistent snapshots with empty guid', async () => {
-    const filter = await getFilter();
-    const data = { version: 6, resources: [], entities: [persistentEntry(1, 'Player', 'guid-1')] };
-    const snapshots = [
-      { id: 10, traits: { EntityAttributes: { name: 'Player', parentId: 0 }, Persistent: { guid: '' } } },
-    ];
-    const out = filter(data as any, snapshots as any);
-    expect(out).toBe(data);
-  });
-
-  it('ignores scene entries that are missing EntityAttributes', async () => {
-    const filter = await getFilter();
-    const data = {
-      version: 6,
-      resources: [],
-      entities: [
-        { id: 1, traits: { Transform: { x: 0 } } }, // no EntityAttributes
-        persistentEntry(2, 'Player', 'guid-1'),
-      ],
-    };
-    const snapshots = [snap(10, 'Player', 'guid-1')];
-    const out = filter(data as any, snapshots as any);
-    expect(out.entities.map((e: any) => e.id)).toEqual([1]);
   });
 });
 

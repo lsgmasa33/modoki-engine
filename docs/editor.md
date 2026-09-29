@@ -1795,8 +1795,9 @@ enter-play / revert-on-stop:
   capture's edit version (serialized before the press, landed after it), which holds the snapshot itself — and only
   when no edit landed during the snapshot's own awaits, which the snapshot may lack. Such an edit voids "clean at
   the press" too (`captureWorldDirtyBaseline` is handed the version read before the snapshot). The reload
-  **carries** kept bases and the primary's `Persistent` roots instead of rebuilding them, so
-  `restoreAuthoredSnapshot` replays their authored fields afterwards (#1547). ⚠️ A snapshot is
+  **carries** kept bases instead of rebuilding them, so `restoreAuthoredSnapshot` replays their
+  authored fields afterwards (#1547). A `Persistent` root is NOT carried — the restore runs outside
+  Play, and SceneManager carries one only in Play (#1863), so the snapshot's own copy comes back. ⚠️ A snapshot is
   SPARSE — the serializer omits every field at its trait default — so the replay fills schema
   defaults back in (skipping `runtimeOnly` and `entityId` fields); replaying only the keys present
   silently skipped every posed field whose authored value was the default. `EntityAttributes` is
@@ -1947,7 +1948,7 @@ makes ONE place answer a question several used to answer separately.
   so the panel stands down fully (loop, ▶ flag, recording). A scene load reaches it through
   `registerBeforeSceneLoad`, awaited inside the load's token BEFORE the load flips the mode — it used
   to drop the mode and leave the session to the swap, so a REFUSED or failed load stranded an
-  owner-less session, and a successful one carried posed bases/Persistent roots across. A load that a
+  owner-less session, and a successful one carried posed bases (and, then, Persistent roots) across. A load that a
   newer one superseded while it waited returns `'superseded'` without reaching SceneManager.
   `openPrefabForEditing`, which swaps through SceneManager directly, runs the same takedown
   (through `prepareWorldSwitch`, after the undo wait — § A user world switch waits for the undo in

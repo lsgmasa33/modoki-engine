@@ -917,7 +917,7 @@ export function worldHasUnsavedEdits(): boolean {
  *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`, which hands over the
  *  RELOAD itself, so the whole world switch is one pending adoption (#1692 reads that).
  *
- *  A kept base (and any `Persistent` root) is CARRIED flat, so when the reload was a PREFAB change its
+ *  A kept base (and, in Play, any `Persistent` root — #1863) is CARRIED flat, so when the reload was a PREFAB change its
  *  instances are still the old document's expansion while the editor's copy is already the new one — rebuilt
  *  here from the document each was expanded from (#1483), or every capture would match its members with
  *  another member's rows. A reload whose world was replaced before it adopted rebuilds nothing: the route that
@@ -930,7 +930,7 @@ export async function adoptWorldReloadedFromDisk(scenePath: string, reload: () =
     // The path and base too: a reload that overtakes an adopted prefab edit-open (which takes no replacement token)
     // replaces an edit world, whose path is null (close-out review of #1698).
     if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids } })) return;
-    // Not only kept bases: a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0).
+    // Not only kept bases: in Play a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0; #1863).
     // Everything the reload re-expanded from disk compares equal and is left alone.
     const rebuilt = await rebaseStaleInstances();
     if (rebuilt) console.log(`[Prefab] rebuilt ${rebuilt} carried instance(s) from the prefab that changed`);
