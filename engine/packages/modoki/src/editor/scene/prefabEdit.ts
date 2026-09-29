@@ -993,6 +993,23 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
  *  back to (the store flag is cleared either way, so the editor is never left
  *  stuck in a prefab-edit mode with no prefab world). */
 export async function exitPrefabEditing(): Promise<string | null> {
+  const target = returnSceneTarget();
+  const since = adoptionCount();
+  if (target) await loadScene(target);
+  // The flag is the adoption owner's to write (#1690, Exit variant). A world adopted since Exit began — the scene its
+  // load landed, or an edit world another route opened in that load's tail — already owns it: the first cleared it and
+  // recorded this prefab's repair, and the second must keep its own session. With no adoption since — no return scene,
+  // or a load that installed nothing — the session ends here, in place, and owes its repair here. Judged by adoption,
+  // not by the outcome: a load superseded by one that then failed reads 'superseded' and still adopted.
+  await endPrefabEditInPlace(since);
+  return target;
+}
+
+/** The scene an Exit from the current prefab edit would reload, or null for none: the one choice `exitPrefabEditing`
+ *  makes, for anything that reports it ahead of the Exit. The agent edit-open's reply is one (#1806): it answered with the
+ *  path current BEFORE the open, which is null inside another prefab's edit world, while this session's Exit went back
+ *  to the scene the first open banked. */
+export function returnSceneTarget(): string | null {
   const { prefabReturnScenePath } = useEditorStore.getState();
   // #478: was the UNSCOPED `modoki-last-scene` key — global across every project sharing this
   // origin, so a boot with no scene loaded still held the PREVIOUS project's path and this would
@@ -1005,17 +1022,8 @@ export async function exitPrefabEditing(): Promise<string | null> {
   // dev server answered with index.html") and strands the editor in the prefab world with no scene.
   // `resolveReturnScene` keeps one out of the store in the first place; this skips it whichever
   // candidate carries it, so the fallback can never reintroduce the same dead end.
-  const target = [prefabReturnScenePath, stored]
+  return [prefabReturnScenePath, stored]
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
-  const since = adoptionCount();
-  if (target) await loadScene(target);
-  // The flag is the adoption owner's to write (#1690, Exit variant). A world adopted since Exit began — the scene its
-  // load landed, or an edit world another route opened in that load's tail — already owns it: the first cleared it and
-  // recorded this prefab's repair, and the second must keep its own session. With no adoption since — no return scene,
-  // or a load that installed nothing — the session ends here, in place, and owes its repair here. Judged by adoption,
-  // not by the outcome: a load superseded by one that then failed reads 'superseded' and still adopted.
-  await endPrefabEditInPlace(since);
-  return target;
 }
 
 /** True when the editor is currently in prefab-edit mode.

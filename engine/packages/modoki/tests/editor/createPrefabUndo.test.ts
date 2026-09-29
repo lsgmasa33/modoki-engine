@@ -401,7 +401,8 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     onDisk.set(PATH, childText);
     const err = spyError();
     const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
-    expect(res).toBeNull();
+    // Said, not a bare null (#1776 close-out review): both panels only logged a null, so the human saw nothing happen.
+    expect(res).toMatchObject({ refused: expect.stringMatching(/cannot contain itself/) });
     expect(written).toEqual([]);
     expect(onDisk.get(PATH)).toBe(childText);
     expect(String(err.mock.calls[0]?.[0])).toMatch(/inside itself/);

@@ -55,6 +55,8 @@ export interface PrefabCommitResult {
   conflict?: boolean;
   /** Why it did not land, when the route or the hash said so. */
   error?: string;
+  /** What to do instead, when the route's refusal said (#1776) — handed to an agent refusal as its `options`. */
+  options?: string[];
   /** The world the step began in was replaced while it wrote: the caches hold the new document, which is what the
    *  new world's load reads, and nothing was rebuilt. */
   worldLeft?: boolean;
@@ -99,6 +101,8 @@ export interface PrefabCommitsResult {
   /** A precondition refused: some file is not what its caller read. With `stranded` empty, nothing changed. */
   conflict?: boolean;
   error?: string;
+  /** What to do instead, when the route's refusal said (#1776). */
+  options?: string[];
   /** The file whose precondition or write refused or failed (`conflict`/`error`) — the one a refusal names (#1732): with
    *  several files it is not necessarily the first. */
   failed?: string;
@@ -187,7 +191,8 @@ export async function commitPrefabWrites(
       if (!landed.ok) {
         const stranded = await rollBack(done);
         return { ok: false, paths: plan.map((x) => x.asked), failed: w.asked, ...('conflict' in landed && landed.conflict ? { conflict: true } : {}),
-          ...('error' in landed && landed.error ? { error: landed.error } : {}), ...(stranded.length ? { stranded } : {}) };
+          ...('error' in landed && landed.error ? { error: landed.error } : {}),
+          ...('options' in landed && landed.options?.length ? { options: landed.options } : {}), ...(stranded.length ? { stranded } : {}) };
       }
       const path = landed.path ?? w.asked;
       done.push({ path, wrote: 'content' in landed ? landed.content ?? null : null, prior: pre ? pre.prior : priorOf(w.expected) });
@@ -282,7 +287,7 @@ export function seatCaches(path: string, source: string, guid: string | undefine
 /** `path`: the route's own spelling of the file it wrote, when it names one — a create inside a folder typed in another
  *  case lands in the folder that exists (#1273), and the caches and the manifest must key on THAT. `content`: the bytes a
  *  document write put down, which the high-water mark can make differ from the caller's (`contentFor`). */
-type Landed = { ok: true; path?: string; content?: string } | { ok: false; conflict?: boolean; error?: string };
+type Landed = { ok: true; path?: string; content?: string } | { ok: false; conflict?: boolean; error?: string; options?: string[] };
 
 /** The bytes a write of `doc` puts down, with its localId high-water mark (#1774, `localIdCounter.ts`) at least every
  *  prior's — `priors` being the documents it lands over: the one the caller read, or the file re-read when that is what
@@ -429,14 +434,18 @@ async function post(path: string, content: string, pre: { createOnly?: boolean; 
     }
     // READ THE BODY (#1468 close-out review F5): the format gate answers 409 with its reason in `error`, and it is the
     // one thing only the human can act on. Only an if-match / if-none-match 409 is a conflict; the gate's is not.
-    const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown } | null;
+    const body = await res.json().catch(() => null) as { error?: unknown; reason?: unknown; options?: unknown } | null;
     const why = typeof body?.error === 'string' ? body.error : typeof body?.reason === 'string' ? body.reason : '';
     // `prefab-mark-lowered` (#1774) is a conflict too: the file's localId high-water mark rose past what this write was
     // raised to, so it is not the file the caller read — and the fallback below re-reads it and raises from it.
     const conflict = res.status === 409 && (body?.reason === 'if-match' || body?.reason === 'if-none-match' || body?.reason === 'prefab-mark-lowered');
+    // A refusal whose body names nothing still fails WITH a reason (#1776): the route's empty 403 reached the agent's
+    // create as a bare ok:false, and every caller only reports what `error` says.
+    const reason = why || `the write was refused (HTTP ${res.status})`;
     // Not logged here: every caller reports its own failure, once, in its own words (an undo's #308 report, Apply's
     // refusal, the prefab-edit save's warnings) — a second line here doubled each one.
-    return { ok: false, ...(conflict ? { conflict } : {}), ...(why && !conflict ? { error: why } : {}) };
+    const options = Array.isArray(body?.options) ? body.options.filter((o): o is string => typeof o === 'string') : [];
+    return { ok: false, ...(conflict ? { conflict } : { error: reason, ...(options.length ? { options } : {}) }) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

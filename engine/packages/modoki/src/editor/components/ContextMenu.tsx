@@ -6,6 +6,9 @@ export interface ContextMenuItem {
   onClick?: () => void;
   danger?: boolean;
   disabled?: boolean;
+  /** Hover text. A DISABLED row that is inert for a reason says it here (#1764): a greyed row with no reason leaves
+   *  the human guessing what to do instead. */
+  title?: string;
   children?: ContextMenuItem[];  // submenu items
   /** Render a horizontal divider instead of a clickable row (label ignored). */
   separator?: boolean;
@@ -166,6 +169,7 @@ function MenuItemRow({ item, onClose }: { item: ContextMenuItem; onClose: () => 
       data-ui-id={`contextmenu.item.${item.label}`}
       data-ui-kind="menu-item"
       data-ui-disabled={item.disabled ? 'true' : undefined}
+      title={item.title}
       onClick={(e) => {
         e.stopPropagation();
         if (hasChildren || item.disabled) return;

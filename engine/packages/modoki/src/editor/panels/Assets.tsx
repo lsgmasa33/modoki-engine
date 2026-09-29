@@ -24,7 +24,7 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 import {
   deleteAssetFile as deleteAsset, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
-  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createFolderApi, moveFileTo, createPrefabFromEntity,
+  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createFolderApi, moveFileTo, createPrefabFromEntity, firstWritableAssetRoot,
   reimportTargets, planImports, writeDroppedImport, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
@@ -1604,20 +1604,19 @@ export default function Assets() {
     if (!raw) return;
     const { id, name } = JSON.parse(raw) as { id: number; name: string };
 
-    // Determine save path — the drop-target folder (or /prefabs as a fallback).
-    // Everything else (serialize → write → register/cache/tag → undo descriptor)
-    // is shared with the Hierarchy "Create Prefab" flow via createPrefabFromEntity
-    // (F7); only the asset-panel refresh() is layered on here.
+    // Determine save path — the drop-target folder, or (category view, which has none) a writable root's /prefabs, as
+    // the Hierarchy's Create Prefab does. The fallback was a bare `/prefabs/…`, which is under no asset root, so a drop
+    // in category view wrote nothing (#1776, observed). Everything else (serialize → write → register/cache/tag → undo
+    // descriptor) is shared with the Hierarchy flow via createPrefabFromEntity (F7); only refresh() is layered on here.
     const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const savePath = targetFolder
-      ? `${targetFolder}/${safeName}.prefab.json`
-      : `/prefabs/${safeName}.prefab.json`;
+    const folder = targetFolder ?? (await firstWritableAssetRoot().then((root) => root && `${root}/prefabs`));
+    if (!folder) { useEditorStore.getState().showToast('Create Prefab failed — this project has no writable asset root.', 'warn'); return; }
+    const savePath = `${folder}/${safeName}.prefab.json`;
 
     // Asked when a prefab of that name is already in the folder; a Replace keeps its guid (#1264).
     const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`, confirmReplaceAsset);
     if (result === 'declined') return;
     if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
-    if (!result) { console.error(`[Assets] Failed to create prefab ${savePath}`); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     refresh();

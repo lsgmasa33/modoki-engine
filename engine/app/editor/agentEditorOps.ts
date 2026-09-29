@@ -42,7 +42,7 @@ import {
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
-  isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
+  isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing, returnSceneTarget,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, ensureGuid, type TraitSpec,
   planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene,
   buildEntityCreateSpecs, type CreateEntitySpec,
@@ -53,7 +53,7 @@ import {
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
-  detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo,
+  detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
@@ -3134,6 +3134,12 @@ export function registerEditorAgentOps(): void {
       if (!committed.ok && committed.conflict) {
         throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${path} changed on disk while this create was writing it, so it was left as it is. Retry to write over the new content.`);
       }
+      // Any other failed write refuses WITH the commit's reason (#1776) — it answered a bare ok:false. The one channel a
+      // write's refusal travels in is `committed.error`, whoever produced it.
+      if (!committed.ok) {
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${path} was not written — ${committed.error ?? 'the write failed'}. Nothing was linked.`,
+          committed.options?.length ? { options: committed.options } : undefined);
+      }
       const ok = committed.ok;
       // The path the prefab really landed on (#1753 F4) — the existing file's own spelling after a Replace. The undo and
       // redo below and the reply key on it, as the tag did.
@@ -3185,6 +3191,16 @@ export function registerEditorAgentOps(): void {
       refuseEditOfPosedWorld('prefab detach');
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // both given → refused (#1223 D1)
+      // A member is refused, naming its root, with the text the Hierarchy's greyed row shows (#1764): it unpacked only the
+      // member and answered ok, while Detach — like Unity's Unpack — acts on a whole instance from its root.
+      const refused = detachRefusal(entityId);
+      if (refused) {
+        // The root's guid as it stands — not `ensureGuid`, which would mint one, dirtying the scene of a call that
+        // changed nothing (close-out review).
+        const rootGuid = getAllEntities().find((e) => e.id === refused.rootId)?.guid;
+        throw new OpRefusal('REFUSED_BY_OP', `prefab detach refused: ${refused.reason} Nothing was detached.`,
+          rootGuid ? { options: [`modoki_prefab {action:'detach', entityGuid:'${rootGuid}'} — the instance root`] } : undefined);
+      }
       const name = getAllEntities().find(e => e.id === entityId)?.name ?? String(entityId);
       // Same entry the Hierarchy "Detach Prefab" menu pushes (`detachPrefabInstanceWithUndo`).
       const snapshot = detachPrefabInstanceWithUndo(entityId, `Detach prefab "${name}"`, '[prefab detach]');
@@ -3470,8 +3486,11 @@ export function registerEditorAgentOps(): void {
       return {
         ok: true,
         editing: { path: editing.path, guid: editing.guid, name: editing.name },
-        /** The scene remembered on the way in, and saved unless the caller discarded its edits; 'edit-exit' reloads it. */
-        returnScene: scenePathBefore,
+        /** The scene 'edit-exit' will reload — asked of the session after the open, by the choice the Exit itself makes
+         *  (#1806). The path current before the open is null inside another prefab's edit world, where the session keeps
+         *  the scene the first open banked. */
+        returnScene: returnSceneTarget(),
+        /** Whether THIS open saved the current scene on the way in: never from inside an edit world, which has no file. */
         savedReturnScene: scenePathBefore != null && !discard,
         ...editorStateFields('scenePath', 'prefabEditWorld', 'worldEntityTotal'),
       };

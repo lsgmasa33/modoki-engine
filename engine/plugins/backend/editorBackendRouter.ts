@@ -98,7 +98,8 @@ export const RENDER_SEQUENCE_MAX_FPS = 60;
  *  agent to `modoki_identity` — which then matched, leaving it with a refusal whose only explanation was false.
  *  Route-authored options win over that fallback, so every ASSET-ROOT path refusal in this file goes through here. The
  *  project-root and /@fs-accepting routes (`/api/write-file`, `/api/read-file`, `/api/adopt-file`, `/api/open-file`…) do
- *  not: they accept a different set of paths, so this advice would be wrong there, and no MCP tool reaches them. */
+ *  not: they accept a different set of paths, so this advice would be wrong there. (An MCP tool CAN reach
+ *  `/api/write-file`, through the agent prefab create: its refusal carries a reason of its own, #1776.) */
 function outsideAssetRoots(error: string): BackendResult {
   return json({
     error,
@@ -4790,9 +4791,16 @@ async function describeUnresolvedAgainstLiveWorld(
   if (urlPath === '/api/write-file' && method === 'POST') {
     try {
       const { path: filePath, content, encoding, ifMatch, ifNoneMatch } = (body ?? {}) as { path: string; content: unknown; encoding?: string; ifMatch?: string; ifNoneMatch?: string };
-      // Asset URL or in-project /@fs path; null → 403 (see resolveWritableFilePath).
+      // Asset URL or in-project /@fs path; null → 403 (see resolveWritableFilePath), with the reason (#1776): an empty
+      // body reached the agent's prefab create as ok:false and nothing else. Not `outsideAssetRoots` — this route also
+      // takes an in-project /@fs path, which that advice calls unaccepted.
       const absPath = resolveWritableFilePath(ctx, filePath);
-      if (!absPath) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      if (!absPath) {
+        return json({
+          error: `${JSON.stringify(filePath)} is outside this project's asset roots${String(filePath).startsWith('/@fs/') ? ' (a /@fs/ path must be inside the project)' : ''}, so nothing was written`,
+          options: ["pass an asset-root URL of THIS project (e.g. /assets/prefabs/enemy.prefab.json) — modoki_list_assets lists the roots' paths"],
+        }, 403);
+      }
       // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
       // compare-and-swap caller gets the compare and the write as ONE atomic operation instead
       // of doing its own read-then-write with a gap a second write can land in between. Absent

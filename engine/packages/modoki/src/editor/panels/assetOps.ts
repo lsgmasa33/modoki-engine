@@ -593,7 +593,7 @@ export async function createPrefabFromEntity(
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
   confirmReplace: (path: string) => Promise<boolean>,
-): Promise<CreatePrefabResult | 'declined' | { refused: string } | null> {
+): Promise<CreatePrefabResult | 'declined' | { refused: string }> {
   // The live subtree is what gets written, so it must be authored (#1548) — a posed or played
   // entity saved as a prefab carries the pose into every future instance.
   const notAuthored = whyWorldNotAuthored();
@@ -628,9 +628,9 @@ export async function createPrefabFromEntity(
     // ⚠️ REFUSE rather than mint over a document that is THERE and unreadable (#1468, #896's class): the human
     // confirmed replacing the file's content, not re-identifying it, and every instance of it would unlink.
     const existing = await classifyExistingDocumentId(at);
-    if (existing.kind === 'refuse') { console.error(`[Asset] not replacing ${at} — ${existing.reason}`); return null; }
+    if (existing.kind === 'refuse') return { refused: `Create Prefab refused — ${at} was not replaced: ${existing.reason}.` };
     const prior = await readPriorDocument(at);
-    if (prior === null) { console.error(`[Asset] not replacing ${at} — it could not be read, so it would be overwritten blind`); return null; }
+    if (prior === null) return { refused: `Create Prefab refused — ${at} could not be read, so it was not overwritten blind.` };
     savePath = at;
     if (prior !== undefined) {
       replaced = true;
@@ -669,7 +669,9 @@ export async function createPrefabFromEntity(
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
     ...(keptId && previousContent ? { replacing: parsedPrefabRows(previousContent.replace(/^\uFEFF/, '')) } : {}),
   });
-  if (!draft) return null;
+  // A refusal said, like every other (#1776 close-out review): the tree is empty, or holds an instance of the prefab it
+  // would replace — a prefab that would contain itself. It was a bare null both panels only logged.
+  if (!draft) return { refused: `Create Prefab refused — the selection could not be written as a prefab: it is empty, or it holds an instance of ${at ?? savePath}, which cannot contain itself.` };
   // An authoring write, so it reports an inert size (#42, #1251) — named by the file it lands on.
   warnInertPrefabSizes(draft, savePath);
   // A Replace serializes WITH the kept id, so `serializePrefab`'s own cycle guard refuses (null, above) a tree holding an
@@ -711,7 +713,13 @@ export async function createPrefabFromEntity(
       ({ guidRemap, undoKept } = tagCreatedPrefab(id, landed.path, prefab));
     },
   });
-  if (!committed.ok) return null;
+  // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only
+  // logged, so a Create Prefab that wrote nothing looked like one that did nothing.
+  if (!committed.ok) {
+    return { refused: committed.conflict
+      ? `Create Prefab refused — ${savePath} changed on disk while it was being written, so it was left as it is.`
+      : `Create Prefab failed — ${savePath} was not written: ${committed.error ?? 'the write failed'}.` };
+  }
   // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
   // (#1273). The instance tags and both undo directions key on it.
   savePath = committed.path;

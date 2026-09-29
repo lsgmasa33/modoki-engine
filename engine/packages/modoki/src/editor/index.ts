@@ -114,7 +114,7 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 // …and `revertOverridesWithUndo` the only way to revert them with one (#1671: the dialog and the agent op each
 // carried a copy of its closures).
 export { revertOverridesWithUndo } from './undo/revertPrefabUndo';
-export { detachPrefabInstanceWithUndo } from './undo/detachPrefabUndo';
+export { detachPrefabInstanceWithUndo, detachRefusal, detachPrefabMenuItem } from './undo/detachPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, loadSceneReporting, type SceneLoadReport, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
@@ -199,7 +199,7 @@ export { readUnusedStaleness, readPriorDocument, type UnusedStaleness } from './
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
-export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, savePrefabEditReport, type PrefabEditSaveReport, type PrefabEditSaveOptions, exitPrefabEditing } from './scene/prefabEdit';
+export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, savePrefabEditReport, type PrefabEditSaveReport, type PrefabEditSaveOptions, exitPrefabEditing, returnSceneTarget } from './scene/prefabEdit';
 // The PURE predicate, and the ground truth `isEditingPrefab`'s store flag only approximates.
 // Exported because a PROBE must not use the self-healing one — see its docblock (#889 close-out).
 export { isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';

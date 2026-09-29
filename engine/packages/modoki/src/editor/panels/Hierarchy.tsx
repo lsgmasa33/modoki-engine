@@ -15,7 +15,7 @@ import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWi
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { placePrefabFromPath } from '../scene/prefabPlace';
-import { detachPrefabInstanceWithUndo } from '../undo/detachPrefabUndo';
+import { detachPrefabInstanceWithUndo, detachPrefabMenuItem } from '../undo/detachPrefabUndo';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -1114,7 +1114,6 @@ export default function Hierarchy() {
     const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`, confirmReplaceAsset);
     if (result === 'declined') return;
     if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
-    if (!result) { console.error(`[Hierarchy] Failed to create prefab ${savePath}`); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     pushAction(result.action);
@@ -1122,17 +1121,17 @@ export default function Hierarchy() {
 
   // ── Detach Prefab — sever the prefab link, turning an instance into plain
   //    entities (Unity-style "Unpack Completely"). Detaches the WHOLE subtree
-  //    rooted at the instance root (nested instances included). ──
+  //    rooted at the instance root (nested instances included). Offered on the
+  //    root only: on a member the row is greyed and names the root (#1764). ──
   const handleDetachPrefab = useCallback((entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    const piMeta = getAllTraits().find(t => t.name === 'PrefabInstance');
-    if (!piMeta) return;
-    // Resolve the instance root from whichever member was clicked.
-    const pi = readTraitData(entity.id, piMeta);
-    const rootId = (pi?.rootInstanceId as number) || entity.id;
-    const name = getAllEntities().find(e => e.id === rootId)?.name ?? entity.name;
-    // One undo entry, shared with the agent op: undo reattaches onto the current template, redo re-snapshots.
-    detachPrefabInstanceWithUndo(rootId, `Detach prefab "${name}"`, '[Hierarchy]');
+    // One undo entry, shared with the agent op: undo reattaches onto the current template, redo re-snapshots. It refuses
+    // a member; the row is greyed for one, but a menu left open across an undo can still offer it, so said, not thrown.
+    try {
+      detachPrefabInstanceWithUndo(entity.id, `Detach prefab "${entity.name}"`, '[Hierarchy]');
+    } catch (e) {
+      useEditorStore.getState().showToast(e instanceof Error ? e.message : String(e), 'warn');
+    }
   }, []);
 
   // Keyboard shortcut: Cmd+Backspace (Mac) / Delete (Windows) to delete selected entity
@@ -1524,7 +1523,7 @@ export default function Hierarchy() {
       { label: 'Focus', shortcut: 'F', onClick: () => handleFocus(entity) },
       { label: isActive ? 'Deactivate' : 'Activate', onClick: () => handleToggleActive(entity), disabled: dis },
       { label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: dis },
-      ...(isPrefabInstance ? [{ label: 'Detach Prefab', onClick: () => handleDetachPrefab(entity), disabled: dis }] : []),
+      ...(isPrefabInstance ? [detachPrefabMenuItem(entity.id, !!dis, () => handleDetachPrefab(entity))] : []),
       { label: '', separator: true },
       { label: 'Find References', onClick: () => openFindReferences(guid, entity.name), disabled: !guid },
       { label: '', separator: true },

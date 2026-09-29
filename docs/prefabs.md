@@ -140,7 +140,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | # | Behaviour | Unity | Modoki | Verdict |
 |---|---|---|---|---|
 | U16 | Unpack | Makes the instance plain GameObjects with its overrides baked in. **Nested instances stay instances.** [M6 `UnpackingPrefabInstances`] | None. | **missing**, M: the nested frames become stored roots that carry their enclosing layer's edits as their own. The building block exists: `promoteOwnedRoots` / `endFrames` already turn owned nested roots into stored roots. |
-| U17 | Unpack Completely | Repeats until only plain GameObjects remain. Undoable. [M6 `UnpackingPrefabInstances`, S6 `PrefabUtility.UnpackPrefabInstance`] | "Detach Prefab" (Hierarchy menu, agent `detach`): `detachPrefabInstance` strips `PrefabInstance` from the frame and every nested frame, bakes the values, and is undoable (`detachPrefabInstanceWithUndo`). | match |
+| U17 | Unpack Completely | Repeats until only plain GameObjects remain. Undoable. Acts on an instance root: `UnpackPrefabInstance` throws on a non-root, and the Hierarchy greys Unpack on one. [M6 `UnpackingPrefabInstances`, S6 `PrefabUtility.UnpackPrefabInstance`] | "Detach Prefab" (Hierarchy menu, agent `detach`): `detachPrefabInstance` strips `PrefabInstance` from the frame and every nested frame, bakes the values, and is undoable (`detachPrefabInstanceWithUndo`). A MEMBER is refused on both surfaces, naming its root (#1764, hub ruling on the owner's Unity rule): `detachRefusal` is the one predicate. The agent refuses with its text, the Hierarchy's row is greyed with it as hover text, and the shared wrapper refuses a member itself. Before, the Hierarchy quietly detached the root, and the agent unpacked only the member and answered ok. | match |
 | U18 | Prefab Mode, isolation | The scene is hidden and the prefab is edited alone. [M6 `EditingInPrefabMode`] | Double-click opens it alone (`openPrefabForEditing`). § "Prefab edit mode". | match |
 | U19 | Prefab Mode, in context | The scene stays visible but locked, shown gray, normal or hidden. It is the default for Open from the Inspector. [M6 `EditingInPrefabMode`] | None. | **missing**, L |
 | U20 | Opening and nesting Prefab Mode | Open button / P key on an instance; opening a nested prefab stacks a breadcrumb. [M22 `EditingInPrefabMode`] | Only from the Assets panel. `editingPrefab` holds one prefab, and the breadcrumb is always `scene › prefab`. The Inspector's source link only selects the asset. | **missing**: Open S, the stack M |
@@ -635,7 +635,12 @@ that was also losing `Animator.clips`.
   back it.
 - **`getPrefabSource(source)`** — fetch (and cache) a prefab file by GUID or path; a fetch that a write or a
   trash overtook is not seated (#1669, the token below). A WRITE is `commitPrefabWrite` (prefabCommit.ts, #1692), never a
-  cache set. The cache lets the serialize loop and the
+  cache set. A write that does not land is a `conflict` or carries a reason in `error` (#1776), the one channel a refusal travels
+  in whoever produced it: the route's own (`/api/write-file` refuses a path outside the asset roots with `{error,
+  options}`, where it once sent an empty body), else `the write was refused (HTTP <status>)`. The agent `create` refuses
+  with it (and the route's `options`), and `createPrefabFromEntity` returns it as `refused`, which both panels toast, as it
+  does its other refusals (an unreadable file it would replace, a tree that cannot be serialized); before, all of these
+  reached the human as a bare `null` the panels only logged. The cache lets the serialize loop and the
   Inspector read override diffs synchronously. (The runtime resource cache uses
   its own `getCachedPrefab()` in `meshTemplateCache.ts`.)
 - **`applyToPrefab` / `applyToPrefabSelective`** — write live overrides back into
@@ -1712,7 +1717,12 @@ exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'ed
 exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
 non-destructive. It skips that save when the caller passed `discardUnsaved`, whose work is meant to be
-gone from the file too, and when a newer scene request superseded it while it waited (#1745). In prefab-edit mode `modoki_save_all` writes any parked work (asset docs, base-scene
+gone from the file too, and when a newer scene request superseded it while it waited (#1745). Its reply's
+`returnScene` is the scene `edit-exit` will reload: `returnSceneTarget()`, the one choice `exitPrefabEditing` makes
+(the banked return scene, else the project's last scene), asked after the open. It used to be the path current before
+the open, which is null inside another prefab's edit world, while that session kept the scene the first open banked and
+the Exit went back to it (#1806). `savedReturnScene` still means "this open saved the current scene on the way in", which
+is never true from an edit world. In prefab-edit mode `modoki_save_all` writes any parked work (asset docs, base-scene
 refs, import settings) and then refuses the scene half, because `edit-save` is the save for that
 world.
 `edit-exit` refuses the same way while the prefab world holds unsaved edits, because its reload of
