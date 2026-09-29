@@ -215,6 +215,9 @@ export interface BinaryAssetMeta {
 
 const guidToEntry = new Map<string, AssetEntry>();
 const pathToGuid = new Map<string, string>();
+/** The path a pruning load last saw `guid` at, once it pruned it; cleared when the guid is registered again. */
+const prunedPaths = new Map<string, string>();
+
 
 // Pure ref predicates live in assetRefRules.ts (zero imports, Node-safe) so they
 // can be shared with the dev-server plugin + scene validator/mutator. Imported
@@ -266,6 +269,7 @@ export function registerAsset(
   if (prior && prior.path !== path) {
     pathToGuid.delete(prior.path);
   }
+  prunedPaths.delete(guid);
   // A RE-IMPORT that changes what this texture's URL resolves to must invalidate every cached
   // resolution of it, exactly as a re-slice does. `_spriteEpochByTexture` was bumped only by
   // `registerSprite`, so a retype+reimport left the epoch untouched and every consumer that
@@ -525,6 +529,14 @@ export function resolveGuidToPath(guid: string): string | undefined {
   return guidToEntry.get(guid)?.path;
 }
 
+/** Where `guid` lives, or LIVED when a pruning manifest load has since dropped it (#1834): a delete's inline rescan pushes
+ *  the pruned manifest BEFORE the renderer's delete repair runs (the Vite dev editor's `asset-manifest-updated`, which
+ *  `createEditor.tsx` loads with `prune`), so the repair could no longer tell which guid-keyed cache entries named the
+ *  deleted file. Only for a cleanup that needs the deleted path; a reader resolving a live ref uses `resolveGuidToPath`. */
+export function lastKnownPathOf(guid: string): string | undefined {
+  return guidToEntry.get(guid)?.path ?? prunedPaths.get(guid);
+}
+
 /** Look up the guid registered for a path, or undefined. */
 export function getGuidForPath(path: string): string | undefined {
   return pathToGuid.get(path);
@@ -645,6 +657,8 @@ export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: 
     for (const guid of [..._manifestGuids]) {
       if (present.has(guid)) continue;
       _manifestGuids.delete(guid);
+      const was = guidToEntry.get(guid)?.path;
+      if (was) prunedPaths.set(guid, was);
       unregisterAsset(guid);
     }
   }
@@ -716,6 +730,7 @@ export function serializeManifest(): AssetManifestFile {
 
 /** Clear the manifest. Used in tests + when reloading. */
 export function clearManifest(): void {
+  prunedPaths.clear();
   guidToEntry.clear();
   pathToGuid.clear();
   _manifestGuids.clear();

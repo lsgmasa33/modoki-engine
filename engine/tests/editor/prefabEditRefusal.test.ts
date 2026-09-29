@@ -455,6 +455,25 @@ describe('the save checks the WHOLE document for I16 (#1817)', () => {
       expect(writes()).toHaveLength(0);
     });
 
+    it('a prefab no cache holds any more (trashed mid-session) is read from what its live frame was expanded from (#1866)', async () => {
+      // Hunt seed 6031's shape: P nests Q; P is trashed (both caches evicted) while an instance of it is live, and an Apply
+      // promotes that instance into Q. Read through the caches alone, P nested nothing, so Q → P → Q was written, and it
+      // showed as "P nests itself" once P was restored. Mutation: read only the cache in `commitPrefabWrites`' I16 reader
+      // (`batch.get(g) ?? getCachedPrefabSync(g)`) — the document is written.
+      const P = 'aaaaaaaa-0000-4000-8000-0000000018c1';
+      const Q = 'aaaaaaaa-0000-4000-8000-0000000018c2';
+      const pDoc = doc(P, 'P', [row(1, 'PRoot', 0), row(2, 'HoldsQ', 1, { prefab: Q })]);
+      install(doc(Q, 'Q', [row(1, 'QRoot', 0)]), pDoc);
+      const live = instantiatePrefab(pDoc, 0); // records the frame's document, as every expansion does
+      setPrefabSource(live, pDoc);
+      prefabs.delete(P);
+      setPrefabCache(P, null); // the trash
+      const r = await commitPrefabWrite(Q, doc(Q, 'Q', [row(1, 'QRoot', 0), row(3, 'R', 1, { prefab: P })]), { expected: null });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain('would contain itself');
+      expect(writes()).toHaveLength(0);
+    });
+
     it('writes a document holding an unrelated prefab', async () => {
       await commitPrefabWrite(EDITED, doc(EDITED, 'Edited', [row(1, 'EditedRoot', 0), row(2, 'Held', 1, { prefab: OTHER })]), { expected: null });
       expect(writes().length).toBeGreaterThan(0);

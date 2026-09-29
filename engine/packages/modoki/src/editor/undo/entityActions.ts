@@ -36,7 +36,7 @@ import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
-import { getCachedPrefabSync } from '../scene/prefab';
+import { prefabNestingReader } from '../scene/prefab';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -853,7 +853,7 @@ export function duplicateEntity(
   const parentId = (attrData?.parentId as number) || 0;
   // Prefab edit (#1817, #1836): a duplicate of the root lands beside it, outside what the save writes, and a copy
   // holding an instance of the edited prefab would nest it in itself. Asked before anything spawns.
-  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(captured), read: getCachedPrefabSync });
+  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(captured), read: prefabNestingReader() });
 
   // copySnapshot already minted a fresh root guid; use it as the
   // stable handle so undo/redo survive a world rebuild. Parent resolved by ref.
@@ -926,7 +926,7 @@ export function pasteEntityCopy(
 ): number {
   // Prefab edit (#1817, #1836): a paste outside the root is lost on save, and one holding an instance of the edited
   // prefab nests it in itself — the clipboard outlives the world, so it can carry one copied from a scene.
-  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: getCachedPrefabSync, scaffold: isScaffoldSnapshot(snapshot) });
+  assertPrefabEditAllows({ kind: 'add', parentId, prefabs: snapshotPrefabs(snapshot), read: prefabNestingReader(), scaffold: isScaffoldSnapshot(snapshot) });
   const copy = copySnapshot(snapshot);
   const parentRef = parentId ? entityRef(parentId) : null;
   const spawn = (p: number): number => {

@@ -205,20 +205,22 @@ describe('a deleted prefab leaves the editor cache (#1805, I9)', () => {
   // An Assets delete is marked as the editor's own, so no watcher evicted: the editor's sync cache kept answering after the
   // trash while a world swap's re-fetch 404'd in the loader's, and an instantiate expanded a prefab that no longer exists
   // (the #1789 fuzzer's seed 199). The delete repair — `applyAssetPathMoves` with `to: null`, which the route's renderer
-  // repair, the panel and every undo trash run — now evicts the EDITOR cache. The loader's entry is left to the next world
-  // swap: evicted, a reload after the delete gave placeholders, and an undo against one was #1819's open class; now
-  // blocked on #1862 (an in-place rebuild would drop a trashed nested prefab's live members).
+  // repair, the panel and every undo trash run — now evicts the EDITOR cache, and the LOADER's entry too since #1834
+  // (held back until #1819's `require` made an undo against the resulting placeholder refuse), keeping the scene's
+  // ownership so an undo that puts the file back refetches it (`restoreReannounce.test.ts`).
   afterEach(() => { for (const k of [GUID, OLD, NEW]) setPrefabCache(k, null as never); });
 
-  // Mutation: drop the eviction from the delete branch of `applyAssetPathMoves` — both editor keys still answer.
-  it('evicts every editor key — the path, and the guid — and leaves the loader\'s entry to the next swap', async () => {
+  // Mutation: drop the eviction from the delete branch of `applyAssetPathMoves` — both editor keys still answer. Mutation:
+  // drop `evictDeletedPrefabs` there (#1834) — the loader still serves the deleted prefab.
+  it('evicts every editor key — the path, and the guid — and the loader\'s entry, keeping its owner', async () => {
     await acquirePrefab(1, GUID);
     primeEditorPrefabCache(GUID, doc as never);
     primeEditorPrefabCache(OLD, doc as never);
     applyAssetPathMoves([{ from: OLD, to: null }]);
     expect(getCachedPrefabSync(GUID)).toBeNull();
     expect(getCachedPrefabSync(OLD)).toBeNull();
-    expect(getCachedPrefab(GUID)).toEqual(doc); // the loader's: dropped when its scene lets go, not here
+    expect(getCachedPrefab(GUID)).toBeUndefined();
+    expect(getResourceStats().prefabs).toEqual({ [OLD]: 1 }); // the scene still references it: its release stays its own
   });
 
   // Mutation: drop the document-id match in `evictDeletedEditorPrefabs` — the guid key survives a pruned manifest.

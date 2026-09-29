@@ -53,13 +53,36 @@ export function keepUnresolvedEntry(world: World, placeholderId: number, source:
   const pi = getTraitByName('PrefabInstance');
   if (pi && e.has(pi.trait)) e.remove(pi.trait);
   const ea = getTraitByName('EntityAttributes');
-  if (ea && entry.name && e.has(ea.trait)) {
+  if (ea && e.has(ea.trait)) {
     const data = e.get(ea.trait) as Record<string, unknown>;
-    if (!data.name) e.set(ea.trait, { ...data, name: entry.name });
+    const next = { ...data };
+    if (entry.name && !data.name) next.name = entry.name;
+    // Where the ENTRY states its root's sibling position or active flag as a root override (#1850) — as a live
+    // instance's save writes them — the placeholder loads with them: pass 1 read only the entry's own traits and left
+    // the trait default, so the save ordered it as sortOrder 0 and a save→reload→save moved it among its siblings.
+    for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+      const stated = rootOverrideOf(entry, k);
+      if (stated.has && !hasOwn(entryAttributes(entry), k)) next[k] = stated.value;
+    }
+    e.set(ea.trait, next);
   }
   // `id` is the loader's per-load key (the array index), never written back.
   const { id: _loadKey, ...record } = entry;
   markUnresolved(e, source, 'entry', record);
+}
+
+const hasOwn = (o: object | undefined, k: string): boolean => !!o && Object.prototype.hasOwnProperty.call(o, k);
+const entryAttributes = (record: Record<string, unknown>): Record<string, unknown> | undefined =>
+  ((record.traits as Record<string, unknown> | undefined)?.EntityAttributes as Record<string, unknown> | undefined);
+
+/** What an ENTRY record states for its root's `field` as a ROOT OVERRIDE (#1850): `overrides[<root localId>]
+ *  .EntityAttributes[field]`, the root localId being the entry's own `PrefabInstance.localId`. A live instance's save
+ *  writes a reordered or deactivated root there, not in the entry's traits. */
+function rootOverrideOf(record: Record<string, unknown>, field: string): { has: boolean; value?: unknown } {
+  const pi = (record.traits as Record<string, unknown> | undefined)?.PrefabInstance as { localId?: unknown } | undefined;
+  const lid = typeof pi?.localId === 'number' ? pi.localId : 0;
+  const bag = lid ? ((record.overrides as Record<string, Record<string, Record<string, unknown>>> | undefined)?.[lid]?.EntityAttributes) : undefined;
+  return hasOwn(bag, field) ? { has: true, value: bag![field] } : { has: false };
 }
 
 /** Spawn the placeholder for an added reference node whose prefab does not resolve, under `parentEcsId`, carrying the
@@ -118,15 +141,32 @@ export function asSceneEntry(
   delete ea.parentId;
   delete ea.editorFolder;
   Object.assign(ea, live.placement);
+  const base: Record<string, unknown> = kind === 'entry' ? { ...record } : { prefab: source, ...channelsOf(record) };
   if (live.order) {
     for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+      // A field the entry states as a root OVERRIDE is written back there (#1850): the placeholder loaded with it, so
+      // an unedited one writes the bytes it read, and an edit lands where the prefab's return reads it — written into
+      // the traits beside the override instead, the override would win again the moment the instance re-expanded.
+      const stated = kind === 'entry' && !(k in ea) ? rootOverrideOf(record, k) : { has: false };
+      if (stated.has) {
+        // Onto what an earlier field of this loop wrote, not the record: both changed, the second undid the first (close-out review).
+        if (live.order[k] !== stated.value) base.overrides = withRootOverride(record, base.overrides as Record<string, unknown>, k, live.order[k]);
+        continue;
+      }
       if (k in ea || live.order[k] !== PLACEMENT_DEFAULTS[k]) ea[k] = live.order[k];
     }
   }
   if (Object.keys(ea).length) traits.EntityAttributes = ea;
   else delete traits.EntityAttributes;
-  const base = kind === 'entry' ? { ...record } : { prefab: source, ...channelsOf(record) };
   return { ...base, name: live.name, traits, prefab: source, ...(live.guid ? { guid: live.guid } : {}) };
+}
+
+/** `current` (the entry's `overrides` as written so far) with the root's `EntityAttributes[field]` set to `value`, copied
+ *  along the path it changes. */
+function withRootOverride(record: Record<string, unknown>, current: Record<string, unknown>, field: string, value: unknown): Record<string, unknown> {
+  const lid = ((record.traits as Record<string, unknown>).PrefabInstance as { localId: number }).localId;
+  const overrides = current as Record<string, Record<string, Record<string, unknown>>>;
+  return { ...overrides, [lid]: { ...overrides[lid], EntityAttributes: { ...overrides[lid]!.EntityAttributes, [field]: value } } };
 }
 
 /** The record as an ADDED reference node under `parentLocalId`, identity (guid, or key) and name from the live

@@ -37,8 +37,9 @@ let runtimeExcludedFixture = 0;
 vi.mock('../../src/editor/scene/prefab', () => ({
   // No placeholder for a missing prefab in these trees (#1699): Create Prefab's refusal asks this first.
   missingPrefabPlaceholders: () => [],
-  // The commit's I16 check reads nested documents through this (#1817); these trees nest nothing it can read.
+  // The commit's I16 check reads nested documents through these (#1817, #1866); these trees nest nothing it can read.
   getCachedPrefabSync: () => null,
+  prefabNestingReader: () => () => null,
   // The no-write redo seats a cold key (I9); these trees read nothing back from it.
   primeEditorPrefabCache: () => {},
   // Reports whatever the current test asked for, so the propagation through

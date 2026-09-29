@@ -21,7 +21,7 @@
  *     write (`pendingAdoptions`). */
 
 import {
-  preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, getCachedPrefabSync, type PrefabFile,
+  preloadNestedPrefabs, rebaseStaleInstances, seatEditorPrefabCache, prefabNestingReader, type PrefabFile,
 } from './prefab';
 import { expandedPrefabRefs, prefabNests } from '../../runtime/loaders/prefabNesting';
 import { postWriteFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
@@ -175,9 +175,11 @@ export async function commitPrefabWrites(
     // I16 at the ONE door every editor prefab write passes (#1817): no document is written that contains itself, whoever
     // built it — a prefab-edit save, Create Prefab's Replace, Apply's plan (which checks only the nodes it promotes), the
     // agent's create. Read through this batch's own documents first, so a cycle across two files of one Apply is seen.
-    // A verbatim restore (`bytes`: an undo putting back what was on disk) is exempt — it writes no new shape.
+    // A verbatim restore (`bytes`: an undo putting back what was on disk) is exempt — it writes no new shape. A prefab no
+    // cache holds (trashed mid-session) is read from what its live frames were expanded from, not as nesting nothing (#1866).
     const batch = new Map(plan.filter((w) => w.doc && w.guid).map((w) => [w.guid!, w.doc!]));
-    const read = (g: string) => batch.get(g) ?? getCachedPrefabSync(g);
+    const nesting = prefabNestingReader();
+    const read = (g: string) => batch.get(g) ?? nesting(g);
     for (const w of plan) {
       if (!w.doc || w.bytes !== undefined || !w.guid) continue;
       const cyclic = expandedPrefabRefs(w.doc.entities).find((ref) => prefabNests(w.guid!, ref, read));

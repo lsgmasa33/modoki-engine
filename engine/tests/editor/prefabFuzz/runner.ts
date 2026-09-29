@@ -269,6 +269,18 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (!editing()) {
       try { failures.push(...checkScene(await serializeScene())); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
     }
+    // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
+    // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
+    // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap:
+    // a same-world op that makes a placeholder (a duplicate or paste of one, a delete's undo, a drop whose nested
+    // reference is missing) changes no recorded entity's kind, and tainting there would hide a false refusal for the
+    // rest of the segment (#1819 close-out review). The per-step I6/I7 checks run either way.
+    // ⚠️ Taken BEFORE the op's own refusal is judged (#1862): one `undo` op runs up to three steps, so its first step can
+    // swap (an Apply's undo reloads its snapshot) and its second refuse on what that swap left unexpanded — ruling R inside
+    // one op, which judged first read as a refusal in a clean segment (seed 6191). Sound either way round: a refused step
+    // changes nothing, so every swap this op made came before its refusal.
+    const swapped = getCurrentWorld() !== worldBefore;
+    if (swapped && ([...placeholderGuids()].some((g) => !placeholdersBefore.has(g)) || [...unexpandedRows()].some((k) => !unexpandedBefore.has(k)))) taint(seg, 'rulingR');
     if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {
       if (seg.tainted) skipped(seg, `${op.kind} op refusal forgiven`);
       else failures.push({ check: `${op.kind} refused in a clean segment`, detail: st.note ?? '' });
@@ -276,14 +288,6 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (failures.length) return fail(i, label, failures[0]);
 
     if (op.kind === 'outsideEdit' && outcome === 'done') taint(seg, 'outsideEdit');
-    // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
-    // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
-    // its entry is dropped, so the walk to the start can no longer restore the segment's scene, by design. Only a swap:
-    // a same-world op that makes a placeholder (a duplicate or paste of one, a delete's undo, a drop whose nested
-    // reference is missing) changes no recorded entity's kind, and tainting there would hide a false refusal for the
-    // rest of the segment (#1819 close-out review). The per-step I6/I7 checks run either way.
-    const swapped = getCurrentWorld() !== worldBefore;
-    if (swapped && ([...placeholderGuids()].some((g) => !placeholdersBefore.has(g)) || [...unexpandedRows()].some((k) => !unexpandedBefore.has(k)))) taint(seg, 'rulingR');
     if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) taint(seg, 'prefabEditSave');
     // A raise got here only as the outside edit's own (checked above), which tainted the segment as `outsideEdit`.
     // The stack was reset (a reload, a scene open): a new segment starts here.

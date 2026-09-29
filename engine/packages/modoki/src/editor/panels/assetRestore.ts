@@ -1,12 +1,11 @@
-/** The ONE owner for a file an undo or redo PUTS BACK at a path a step before it trashed (#1844).
+/** The ONE owner for a file an undo or redo PUTS BACK at a path a step before it trashed (#1844, #1834).
  *
  *  Such a restore goes through `/api/write-file`, the generic write route, which does not rebuild the manifest inline:
  *  only the routes that delete, move, duplicate or save-as do (M2, docs/prefabs.md § "A prefab named by PATH through the
  *  renderer manifest"). And it is the editor's OWN write, so the watcher sends no `scene-changed` for it and nothing
- *  invalidates or refetches the loader's entry. The delete had pruned the file's guid from the renderer's manifest (its
- *  inline rebuild) and evicted the prefab from the editor cache (`applyAssetPathMoves`); the loader's entry stays while
- *  its scene owns it (#1834 is blocked on #1862), but a scene that let go of it and took it back remembered a 404. So
- *  until the watcher's debounced push, the restored file's guid resolves to nothing — an Apply's undo read the prefab's path as
+ *  invalidates or refetches the loader's entry. The delete itself had done both halves at once: its inline rebuild pruned
+ *  the file's guid from the renderer's manifest, and `applyAssetPathMoves` evicted the prefab from both caches. So until
+ *  the watcher's debounced push, the restored file's guid resolves to nothing — an Apply's undo read the prefab's path as
  *  the raw guid and was refused, a scene step re-created nothing — and an owned prefab stays out of the loader's cache.
  *
  *  ⚠️ **The manifest is loaded from the rescan's REPLY, not left to the push.** The routes that rebuild inline are safe
@@ -36,15 +35,18 @@
 import { backendFetch } from '../backend/editorBackend';
 import { loadManifestJson } from '../../runtime/loaders/assetManifest';
 import { refetchOwnedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { reexpandRestoredRows } from '../scene/prefab';
 
 export type ReannounceResult =
   | { ok: true }
   | { ok: false; error: string };
 
 /** Tell the renderer about `paths`, which this step just put back: ONE rescan, whose reply is loaded into the manifest
- *  (additively), then a refetch of each restored prefab a scene owns. The refetch runs even when the rescan
- *  failed — it is by path, and needs no manifest. A failed rescan is returned for the caller to report: the files ARE
- *  back, and the next watcher push brings the manifest level. */
+ *  (additively), then a refetch of each restored prefab a scene owns, then an in-place re-expansion of every live frame
+ *  that recorded a restored prefab's row as unexpanded (`reexpandRestoredRows`, #1864). Both run even when the rescan
+ *  failed: the refetch is by path, and the re-expansion reads each restored file itself, which registers its own guid. A
+ *  failed rescan is returned for the caller to report: the files ARE back, and the next watcher push brings the manifest
+ *  level. */
 export async function reannounceRestoredFiles(paths: readonly string[]): Promise<ReannounceResult> {
   if (paths.length === 0) return { ok: true };
   let result: ReannounceResult = { ok: true };
@@ -56,5 +58,8 @@ export async function reannounceRestoredFiles(paths: readonly string[]): Promise
     result = { ok: false, error: `the rescan failed: ${e instanceof Error ? e.message : String(e)}` };
   }
   for (const p of paths) if (p.endsWith('.prefab.json')) refetchOwnedPrefab(p);
+  // …and every live frame that recorded a restored prefab's row as unexpanded re-expands it now (#1864): Unity reconnects a
+  // Missing Prefab instance when its asset returns. In the step, so an undo walked straight on finds the frame's members.
+  await reexpandRestoredRows(paths);
   return result;
 }

@@ -405,6 +405,65 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
   });
 });
 
+describe('a placeholder takes the sibling position its entry states as a ROOT override (#1850)', () => {
+  const sortOrder = (id: number) => (readTraitData(id, meta('EntityAttributes')) as { sortOrder: number }).sortOrder;
+  const rootOverride = (entry: Record<string, unknown>) => {
+    const lid = ((entry.traits as Record<string, unknown>).PrefabInstance as { localId: number }).localId;
+    return (entry.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[lid]?.EntityAttributes;
+  };
+  async function reorderedThenMissing() {
+    install(pDoc());
+    await load(scene(P));
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 3);
+    const control = await save();
+    const entry = entryOf(control, INST)!;
+    expect(rootOverride(entry)?.sortOrder).toBe(3); // precondition: a live instance's save states it as a root override
+    expect(((entry.traits as Record<string, unknown>).EntityAttributes as Record<string, unknown>).sortOrder).toBeUndefined();
+    uninstall(P);
+    await load(control);
+    clearHistory();
+    return entry;
+  }
+
+  it('the placeholder loads with it, so the save orders it as the live instance was ordered, byte for byte', async () => {
+    // Mutation: drop the root-override seat in `keepUnresolvedEntry` — the placeholder loads at sortOrder 0.
+    const entry = await reorderedThenMissing();
+    expect(sortOrder(rootOf(INST))).toBe(3);
+    expectSameBytes(entryOf(await save(), INST), entry);
+  });
+
+  it('a reorder of the placeholder is written INTO the root override, and the prefab\'s return keeps it', async () => {
+    // Mutation: write the live value into the traits in `asSceneEntry` (skip the override branch) — the override (3)
+    // stays beside it, and wins again once the prefab re-expands.
+    await reorderedThenMissing();
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 5);
+    const saved = await save();
+    const entry = entryOf(saved, INST)!;
+    expect(rootOverride(entry)?.sortOrder).toBe(5);
+    expect(((entry.traits as Record<string, unknown>).EntityAttributes as Record<string, unknown> | undefined)?.sortOrder).toBeUndefined();
+    install(pDoc());
+    await load(saved);
+    expect(sortOrder(rootOf(INST))).toBe(5);
+  });
+
+  it('both fields changed on the placeholder are both written: the second does not undo the first', async () => {
+    // Mutation: build `withRootOverride` from `record.overrides` instead of what the loop wrote so far — the isActive pass
+    // writes the record's sortOrder (3) back over the reorder (close-out review).
+    install(pDoc());
+    await load(scene(P));
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 3);
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'isActive', false);
+    const control = await save();
+    expect(rootOverride(entryOf(control, INST)!)).toMatchObject({ sortOrder: 3, isActive: false }); // precondition
+    uninstall(P);
+    await load(control);
+    clearHistory();
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 5);
+    writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'isActive', true);
+    expect(rootOverride(entryOf(await save(), INST)!)).toMatchObject({ sortOrder: 5, isActive: true });
+  });
+});
+
 describe('a rebuild respawns a missing added node\'s placeholder (#1699, the editor twin)', () => {
   it('an Apply that rebuilds the instance keeps the node', async () => {
     // Mutation: drop `spawnUnresolvedReference` from the EDITOR's `spawnNestedInstance` — the rebuild spawns nothing

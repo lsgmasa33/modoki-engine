@@ -55,7 +55,7 @@ import {
   preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
   detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
-  applyToPrefabWithUndo, revertOverridesWithUndo, staleInstanceRefusal, resolveInstanceContext, previewApply, describeEffect,
+  applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
@@ -3641,7 +3641,7 @@ export function registerEditorAgentOps(): void {
       // entry (rebuildInstance is a raw teardown+rebuild), so the wrapper records one, whose undo/redo rebuild
       // onto the prefab as it is THEN (#1665).
       // A refusal states its own cause (#1483) — Revert's bare null would be reported below as a lost instance.
-      const refusal = staleInstanceRefusal(ctx.rootInstanceId);
+      const refusal = await revertRefusal(ctx.rootInstanceId);
       if (refusal) throw new Error(`prefab revert refused: ${refusal}`);
       const result = await revertOverridesWithUndo(ctx.rootInstanceId, keySet);
       if (!result) {

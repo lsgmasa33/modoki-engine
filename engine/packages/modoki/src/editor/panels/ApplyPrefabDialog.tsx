@@ -12,7 +12,7 @@ import {
   getPrefabSource,
   preloadNestedPrefabsForSubtree,
   ownInstanceStructure,
-  staleInstanceRefusal,
+  revertRefusal,
   previewApply,
   type PrefabFile,
   type ApplyPreview,
@@ -334,8 +334,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       await runOnPinnedSubject({
         subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
         act: async (liveId) => {
-          // Revert's own refusal is a bare null (#1483); say why here, as Apply's notice does.
-          const refusal = staleInstanceRefusal(liveId);
+          // Revert's own refusal is a bare null (#1483, #1862); say why here, as Apply's notice does.
+          const refusal = await revertRefusal(liveId);
           if (refusal) { useEditorStore.getState().showToast(`Revert: nothing was reverted — ${refusal}`, 'warn'); return; }
           await revertOverridesWithUndo(liveId, checked);
           closeDialog();

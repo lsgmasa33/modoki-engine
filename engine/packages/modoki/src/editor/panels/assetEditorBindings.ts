@@ -49,7 +49,7 @@ import {
 import type { PathKeyedCause } from '../scene/serialize';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
-import { rekeyCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
 import { rekeyEditorPrefabCache, evictDeletedEditorPrefabs } from '../scene/prefab';
 
 /** The display name a repaired item should carry after `move`.
@@ -462,13 +462,14 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   // …and both prefab caches, which are keyed by PATH (#1751 F6). `/api/move-file` marks the move as the editor's own,
   // so the watcher never evicts the old entry, and the manifest's new path then names no entry at all: a pooled scroll
   // view of a renamed prefab went blank. Both are idempotent, so the panel's own pass after the route's finds nothing.
-  // A DELETE evicts the EDITOR cache (#1805, I9): the route marks it as the editor's own too, so no watcher evicted, and the
-  // editor's sync readers kept expanding a prefab that no longer exists. The loader's entry stays until its scene lets go
-  // (#1834, blocked on #1862: an in-place rebuild would then drop a trashed nested prefab's live members). Live instances
-  // stay expanded (#1738's evicted state).
+  // A DELETE evicts both (#1805, #1834, I9): the route marks it as the editor's own too, so no watcher evicted, and the
+  // editor's sync readers kept expanding a prefab that no longer exists, and a reload of the owning scene re-expanded it
+  // from the loader's entry. The loader keeps the scene's ownership, so an undo that puts the file back refetches it
+  // (`reannounceRestoredFiles`). Live instances stay expanded (#1738's evicted state).
   for (const m of list) {
     if (m.to === null) {
       evictDeletedEditorPrefabs(m.from, !!m.prefix);
+      evictDeletedPrefabs(m.from, !!m.prefix);
       continue;
     }
     rekeyCachedPrefab(m.from, m.to, !!m.prefix);

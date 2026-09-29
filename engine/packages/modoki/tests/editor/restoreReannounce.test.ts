@@ -1,11 +1,10 @@
-/** #1844: a file an undo or redo PUTS BACK is re-announced to the renderer in the same step.
+/** #1844 + #1834: a file an undo or redo PUTS BACK is re-announced to the renderer in the same step.
  *
  *  The delete pruned the file's guid from the renderer's manifest and evicted the prefab from both caches; the restore goes
  *  through `/api/write-file`, which rebuilds nothing, and is the editor's own write, which no watcher refresh follows. So
  *  the step itself loads the manifest from ONE rescan's reply and refetches an owned prefab (`reannounceRestoredFiles`),
- *  and leaves an unsavable world to the undo manager's GATE, which refuses before it pops the entry. The loader's refetch
- *  of a restored prefab a scene owns is asserted here too, against the same fake disk (#1834's eviction at the delete is
- *  blocked on #1862, so the entry is gone only after a scene let go of it and took it back).
+ *  and leaves an unsavable world to the undo manager's GATE, which refuses before it pops the entry. The loader's half of
+ *  #1834 (the delete evicts its entry, keeping the owners) is asserted here too, against the same fake disk.
  *
  *  The fake route's rescan answers a manifest built from its disk, and nothing PUSHES one: a guid that resolves after the
  *  step resolved through the reply. Each case names the mutation that turns it red. */
@@ -15,7 +14,7 @@ import { makeFakeAssetRoute, sha256, type FakeAssetRoute } from './fakeAssetRout
 import { makeDeleteUndo, makeFileImportUndo, type DeleteResult } from '../../src/editor/panels/assetUndo';
 import { applyAssetPathMoves } from '../../src/editor/panels/assetEditorBindings';
 import { clearManifest, loadManifestJson, registerAsset, resolveGuidToPath } from '../../src/runtime/loaders/assetManifest';
-import { acquirePrefab, getCachedPrefab, getResourceStats, releaseAllForScene, disposeAllCachedResources } from '../../src/runtime/loaders/meshTemplateCache';
+import { acquirePrefab, getCachedPrefab, getResourceStats, disposeAllCachedResources } from '../../src/runtime/loaders/meshTemplateCache';
 import { pushAction, undoStep, canUndo, setPreviewUndoSession, _resetHistoryContexts } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { useEditorStore } from '../../src/editor/store/editorStore';
@@ -186,29 +185,32 @@ describe('an import\'s redo re-announces what it put back (#1844, the second sit
   });
 });
 
-describe('the loader refetches a restored prefab a scene owns (#1844)', () => {
+describe('the loader\'s cache follows a delete and its undo (#1834)', () => {
   const settle = () => new Promise((r) => setTimeout(r, 0));
 
-  it('a scene switch and back while the file was deleted remembered a 404: the undo forgets it and refetches', async () => {
+  it('a delete evicts the owned entry and keeps the owner; the undo refetches it', async () => {
+    // Mutation: drop `evictDeletedPrefabs` from `applyAssetPathMoves`' delete branch — the deleted prefab is still served.
     // Mutation: drop `refetchOwnedPrefab` from `reannounceRestoredFiles` — the owner reads nothing until the next load.
-    // Mutation: drop `prefabFailures.forget` from `refetchOwnedPrefab` — the remembered 404 blocks the fetch.
     await acquirePrefab(1, G);
+    expect(getCachedPrefab(G)).toBeDefined(); // precondition
     trashQ();
-    registerAsset(G, P, 'prefab'); // Electron's additive view: G still maps to the gone path
-    releaseAllForScene(1); // a scene switch lets go of it…
-    await acquirePrefab(1, G); // …and coming back acquires it again: 404, remembered
-    expect(getCachedPrefab(G)).toBeUndefined(); // precondition
+    registerAsset(G, P, 'prefab'); // Electron's additive view: G still maps, so only the eviction can make this miss
+    expect(getCachedPrefab(G)).toBeUndefined();
+    expect(getResourceStats().prefabs[P]).toBe(1); // the scene still owns it
     await makeDeleteUndo([deleted()], vi.fn()).undo();
     await settle();
     expect((getCachedPrefab(G) as { name?: string } | undefined)?.name).toBe('Q');
   });
 
-  it('a delete leaves the loader\'s entry in place (#1834 is blocked on #1862)', async () => {
-    // Pins the backed-out eviction: it goes back in with #1862's fix, which then flips this case.
+  it('a load that met the 404 between the delete and the undo does not block the refetch', async () => {
+    // Mutation: drop `prefabFailures.forget` from `refetchOwnedPrefab` — the remembered 404 blocks the fetch.
     await acquirePrefab(1, G);
     trashQ();
-    registerAsset(G, P, 'prefab');
+    loadManifestJson({ ...manifestOfDisk(), assets: [...manifestOfDisk().assets, { path: P, type: 'prefab', guid: G }] }); // Electron's additive view: G still maps
+    await acquirePrefab(1, G); // a reload of the owning scene: 404, remembered
+    expect(getCachedPrefab(G)).toBeUndefined();
+    await makeDeleteUndo([deleted()], vi.fn()).undo();
+    await settle();
     expect((getCachedPrefab(G) as { name?: string } | undefined)?.name).toBe('Q');
-    expect(getResourceStats().prefabs[P]).toBe(1);
   });
 });

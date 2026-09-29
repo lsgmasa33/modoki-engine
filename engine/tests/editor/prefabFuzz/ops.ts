@@ -13,7 +13,7 @@ import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, 
 import { makeDeleteUndo, makeRenameUndo, snapshotFromBytes, type DeleteResult } from '../../../packages/modoki/src/editor/panels/assetUndo';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
 import {
-  getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, staleInstanceRefusal,
+  getCachedPrefabSync, preloadNestedPrefabsForSubtree, previewApply, revertRefusal,
   type PrefabFile,
 } from '../../../packages/modoki/src/editor/scene/prefab';
 import { placePrefabFromPath } from '../../../packages/modoki/src/editor/scene/prefabPlace';
@@ -354,7 +354,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const sel = selectKeys(root, prefab, op.kind, directed ? 0 : u[1], u[2]);
       if (sel.size === 0) return 'noop';
       if (op.kind === 'revert') {
-        const refusal = staleInstanceRefusal(root);
+        const refusal = await revertRefusal(root);
         if (refusal) { st.note = refusal; return 'refused'; }
         return (await revertOverridesWithUndo(root, sel)) ? 'done' : 'refused';
       }

@@ -2540,12 +2540,29 @@ export function rekeyCachedPrefab(from: string, to: string, prefix = false): num
   return n;
 }
 
-/** A prefab file an undo or redo PUT BACK at `path` (#1844): a scene that owns it, with no entry and nothing in flight,
+/** A prefab FILE was deleted (#1834, I9): every file under `from` when `prefix` (a folder delete). Its entry goes, as a
+ *  move re-keys it ({@link rekeyCachedPrefab}); the cache is keyed by the resolved path, so the path is the whole key. An
+ *  Assets delete is the editor's own write, so the watcher never evicted, and a reload of the owning scene (which acquires
+ *  before it releases) re-expanded the deleted prefab from this entry — the editor showed a live instance where a cold
+ *  start shows a Missing Prefab placeholder. Owners stay, as `invalidatePrefab` leaves them: the scene still references
+ *  the prefab, and an undo that puts the file back fetches it again ({@link refetchOwnedPrefab}). Idempotent: every
+ *  repair pass may call it. Returns how many keys it evicted. */
+export function evictDeletedPrefabs(from: string, prefix = false): number {
+  if (!from) return 0;
+  const dir = from.endsWith('/') ? from : `${from}/`;
+  let n = 0;
+  for (const key of new Set([...prefabCache.keys(), ...prefabOwners.keys(), ...prefabLoadPromises.keys()])) {
+    if (key !== from && !(prefix && key.startsWith(dir))) continue;
+    invalidatePrefab(key);
+    n++;
+  }
+  return n;
+}
+
+/** A prefab file an undo or redo PUT BACK at `path` (#1834): a scene that owns it, with no entry and nothing in flight,
  *  fetches it again now, or every synchronous reader (a `UIEntries` pool) stays blank until the next scene load (#1308).
- *  The entry is gone when the owning scene let go of it while the file was deleted and then acquired it again (a scene
- *  switch and back, which remembered the 404); the restore is the editor's own write, which no watcher refresh follows.
- *  Called by the one restore owner, `reannounceRestoredFiles`. (#1834 would also evict it at the delete; blocked on
- *  #1862.) */
+ *  The delete evicted it ({@link evictDeletedPrefabs}), and the restore is the editor's own write, which no watcher
+ *  refresh follows. Called by the one restore owner, `reannounceRestoredFiles`. */
 export function refetchOwnedPrefab(path: string): void {
   // A load between the delete and the restore (a reload of the owning scene) remembered the 404, and a remembered failure
   // blocks `fetchPrefab` until the prefab is invalidated: the file is back, so the memo is wrong now.
