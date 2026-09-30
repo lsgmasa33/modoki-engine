@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
-import { SCENE_FORMAT_VERSION, PREFAB_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, PREFAB_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
 const REAL_REPO_ROOT = path.resolve(__dirname, '../../..');
@@ -124,7 +124,31 @@ describe('migrate-assets refuses a document a newer build wrote (#1468)', () => 
     seedFloor(tmp);
     const file = writeJson(tmp, SCENE, sceneDoc(1));
     expect(run(tmp)).toMatch(/1 file\(s\) would be |migrated/);
-    expect(readJson(file).version).toBe(SCENE_FORMAT_VERSION);
+    // Forward, but no further than the rung before the first one only the loader can take (next case).
+    expect(readJson(file).version).toBe(FLAT_KEYED_GUIDS_SCENE_VERSION - 1);
+  });
+
+  it('stops a scene below v18 at 17: the keyed-guid rename needs the loaded world, and an 18 stamp skips it for good (#1876 ⑩-5)', () => {
+    // v18 changes what a keyed node's guid MEANS (#1809); the loader renames a file's old guids only when the file says
+    // it is below 18. Stamped here, the file would claim a rename it never had, and every ref to a keyed node dangles.
+    expect(FLAT_KEYED_GUIDS_SCENE_VERSION).toBeLessThanOrEqual(SCENE_FORMAT_VERSION); // fixture premise, stated
+    tmp = makeRepo();
+    seedFloor(tmp);
+    const file = writeJson(tmp, SCENE, sceneDoc(FLAT_KEYED_GUIDS_SCENE_VERSION - 1));
+    const before = fs.readFileSync(file, 'utf8');
+    const out = run(tmp);
+    expect(readJson(file).version).toBe(FLAT_KEYED_GUIDS_SCENE_VERSION - 1);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before); // nothing to do, so not rewritten
+    expect(out).toMatch(/^1 scene\(s\) held at v\d+/m); // anchored: the filler (current) and prefab files are not held
+    expect(out).toMatch(/^HOLD .*a\.scene\.json: /m); // and it is NAMED, though it was not rewritten
+  });
+
+  it('holds a scene whose version is not a NUMBER too — the loader reads it as below 18, so the rename still runs', () => {
+    tmp = makeRepo();
+    seedFloor(tmp);
+    const file = writeJson(tmp, SCENE, sceneDoc(String(FLAT_KEYED_GUIDS_SCENE_VERSION) as unknown as number));
+    run(tmp);
+    expect(readJson(file).version).toBe(FLAT_KEYED_GUIDS_SCENE_VERSION - 1);
   });
 
   it('leaves a scene ALREADY at the current version alone, and does not report it as skipped', () => {

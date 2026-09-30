@@ -290,11 +290,12 @@ export function resolveInstanceContext(entityId: number): { source: string; root
  *  mode save, the agent `create` op — #1251), never from `commitPrefabWrite`. That is the single choke point for prefab writes AND the
  *  undo/redo restore path (Apply's undo), so hooking it warns while someone REVERTS the
  *  value. Guarded by tests/editor/warnInertPrefabSizes.test.ts. */
-export function warnInertPrefabSizes(prefab: unknown, source: string): string[] {
+export function warnInertPrefabSizes(prefab: unknown, source: string, readPrefab?: (guid: string) => unknown): string[] {
   // Name the FILE even when the caller holds the GUID (PrefabInstance.source and prefab edit mode both
   // do) — the same resolution `commitPrefabWrite` applies before it writes.
   const where = isGuid(source) ? (resolveRef(source) || source) : source;
-  const { warnings } = validatePrefabData(prefab);
+  // `readPrefab`: the nested documents the template-key check walks (#1876); every caller passes the editor cache's.
+  const { warnings } = validatePrefabData(prefab, readPrefab);
   for (const w of warnings) {
     console.warn(`[Editor] ${where}: ${w}`);
   }

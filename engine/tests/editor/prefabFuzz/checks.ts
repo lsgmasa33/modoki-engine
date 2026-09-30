@@ -138,6 +138,12 @@ export function checkFiles(
 ): Failure[] {
   const out: Failure[] = [];
   const docs = new Map<string, Doc>();
+  // Every document by id, for the validator's template-key walk into NESTED prefabs (#1876).
+  const byId = new Map<string, Doc>();
+  for (const [path, text] of files) {
+    if (!path.endsWith('.prefab.json')) continue;
+    try { const d = JSON.parse(text) as Doc; if (d.id) byId.set(d.id, d); } catch { /* reported below */ }
+  }
   for (const [path, text] of files) {
     if (!path.endsWith('.prefab.json')) continue;
     let doc: Doc;
@@ -146,7 +152,13 @@ export function checkFiles(
     // A file whose current bytes an outside edit wrote is held to nothing but the cycle check: what it says is the hand
     // edit's, and the editor's next write of it is what these rules bind.
     if (handEdited.has(path)) continue;
-    for (const w of validatePrefabData(doc).warnings) out.push({ check: 'prefab validator', detail: `${path}: ${w}` });
+    for (const w of validatePrefabData(doc, (g) => byId.get(g)).warnings) {
+      // Saying which frames it could not check is coverage, not a violation — true after a trash. Only when every prefab
+      // it names really is gone from the files: one this reader failed to give is a harness gap, and stays a finding.
+      const unread = /not checked below nested prefab\(s\) (.*) — they could not be read$/.exec(w);
+      if (unread && unread[1]!.split(', ').every((g) => !byId.has(g))) continue;
+      out.push({ check: 'prefab validator', detail: `${path}: ${w}` });
+    }
     try { assertNoRuntimeGuids(doc, path); } catch (e) { out.push({ check: 'I8 runtime guid in a template', detail: String((e as Error).message).split('\n')[0] }); }
     if (written.has(path) && doc.version !== PREFAB_FORMAT_VERSION) out.push({ check: 'I15 written at an old version', detail: `${path}: v${doc.version}` });
     const rows = doc.entities ?? [];

@@ -2722,7 +2722,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       const absPath = prefabPath ? ctx.resolveAssetPath(prefabPath) : null;
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `prefab not found: ${prefabPath}` }, 404);
       const parsed = parseForValidation(absPath, prefabPath!);
-      const result = 'data' in parsed ? validatePrefabData(parsed.data) : { warnings: [parsed.warning] };
+      // The template-key check walks the NESTED prefabs (#1876): read each by guid through the manifest, as the file is.
+      const pathOfGuid = new Map(ctx.getManifest().assets.filter((a) => a.guid).map((a) => [a.guid!, a.path]));
+      const readPrefab = (guid: string): unknown => {
+        const abs = pathOfGuid.has(guid) ? ctx.resolveAssetPath(pathOfGuid.get(guid)!) : null;
+        if (!abs || !fs.existsSync(abs)) return undefined;
+        const nested = parseForValidation(abs, pathOfGuid.get(guid)!);
+        return 'data' in nested ? nested.data : undefined;
+      };
+      const result = 'data' in parsed ? validatePrefabData(parsed.data, readPrefab) : { warnings: [parsed.warning] };
       // ── #889 phase 2: this validates the file on DISK. ──
       // DISCLOSE, do not refuse (owner, 2026-09-09) — a read that refuses is worse than one that
       // caveats, and this route backs the human's own prefab tooling. §8's "refuses when that work

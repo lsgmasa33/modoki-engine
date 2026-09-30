@@ -33,6 +33,7 @@ import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
 import { TemplateAddedKey, templateKeyOf, setTemplateKey } from '../core/templateIdentity';
 import { noteTemplateDoc, templateKeysIn, recoverTemplateKey, healMissesIn, type KeyRecoveryNode } from './templateKeyRecovery';
+import { frameRespell } from './frameRespell';
 import { packedOf, isPackedAlive, type PackedEntity } from '../core/ecs/entityTable';
 import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, memberPathLookup, type MemberStep } from '../core/templateRefs';
 import { mapStringValues } from '../core/assetRefRules';
@@ -40,6 +41,7 @@ import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { keptOrphanRowsOf, setKeptOrphanRows, dropKeptOrphanRows, clearKeptOrphanRows, keptLegacyOf, setKeptLegacy, type KeptLegacy } from '../core/ecs/keptOrphanRows';
 import { memberPathIndex, identityTree, applyGuidRemap, keyedGuidUpgrade } from '../core/ecs/memberHome';
+import { onGuidRemap } from '../core/ecs/guidRemap';
 import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityOptions, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
@@ -838,13 +840,14 @@ export function applyStructureCore(
   // legacy map, or the editor's in-memory view REDUCED by a Revert (which is why a rebuild cannot
   // simply re-assert the rows it carried). The writer never states one member in both; where a
   // hand-made or mixed document does, the ROW wins (skipped below).
+  // Both name the new parent by the FILE's guid, so they are held (`holdFileGuid`) across a rename before the drain.
   for (const [ecs, parentGuid] of rowMoves) {
-    afterDeriveQueue(ops.world).moves.push({ ecsId: ecs, parentGuid, frameRoot: 0, logPrefix: ops.logPrefix });
+    afterDeriveQueue(ops.world).moves.push(holdFileGuid(ops.world, { ecsId: ecs, parentGuid, frameRoot: 0, logPrefix: ops.logPrefix }, 'parentGuid'));
   }
   for (const lid of movedSet) {
     const ecs = localToEcs.get(lid);
     const parentGuid = structure.moved?.[lid];
-    if (ecs && parentGuid && !rowMoves.has(ecs)) afterDeriveQueue(ops.world).moves.push({ ecsId: ecs, parentGuid, frameRoot: 0, logPrefix: ops.logPrefix });
+    if (ecs && parentGuid && !rowMoves.has(ecs)) afterDeriveQueue(ops.world).moves.push(holdFileGuid(ops.world, { ecsId: ecs, parentGuid, frameRoot: 0, logPrefix: ops.logPrefix }, 'parentGuid'));
   }
 
   // 3. Additions (depth-first, parent before child). Not tagged PrefabInstance —
@@ -920,6 +923,30 @@ function afterDeriveQueue(world: World): AfterDerive {
   if (!q) { q = { moves: [], deletes: [] }; afterDerive.set(world, q); }
   return q;
 }
+
+/** Raw FILE guids a load still holds while it builds the world, each read only once the derive is done: a queued move's
+ *  new parent (a member row's `parent`, a legacy `moved`) and a pass-2 parent retried after every expansion. A guid
+ *  RENAME in between must reach them, or they name a guid no entity holds any more — the scene v18 upgrade renames
+ *  every keyed node a v17 file names by the old rule (`keyedGuidUpgrade`, #1809), and a v17 move under one was lost
+ *  on load, then for good on the next save (#1876 S2). ONE registry and ONE listener, the #1785 seam every holder of
+ *  an entity guid outside the world uses: a new holder of a file guid registers here rather than being patched by
+ *  the upgrade. Per world and apart from the move queue, because a drain (every instantiate derives) consumes that
+ *  queue mid-load while a pass-2 miss waits for the end. A holder leaves when it is read. */
+const fileGuidHolders = new WeakMap<World, Map<object, string>>();
+function holdFileGuid<T extends object>(world: World, holder: T, field: keyof T & string): T {
+  let held = fileGuidHolders.get(world);
+  if (!held) { held = new Map(); fileGuidHolders.set(world, held); }
+  held.set(holder, field);
+  return holder;
+}
+function releaseFileGuid(world: World, holder: object): void { fileGuidHolders.get(world)?.delete(holder); }
+onGuidRemap('sceneLoadPending', (remap, world) => {
+  for (const [holder, field] of fileGuidHolders.get(world) ?? []) {
+    const h = holder as Record<string, unknown>;
+    const next = typeof h[field] === 'string' ? remap.get(h[field] as string) : undefined;
+    if (next !== undefined) h[field] = next;
+  }
+});
 /** Queue a prefab document's own moves (#1437 P3-b/P3-c): member path → member token of the new parent, both
  *  in the frame of the instance rooted at `frameRoot`, resolved once every guid is derived. The base of each
  *  member: an instance's own move of it overrides one, and the move of a prefab that nests the instance —
@@ -935,6 +962,7 @@ function drainAfterDerive(world: World): void {
   const q = afterDerive.get(world);
   if (!q) return;
   afterDerive.delete(world);
+  for (const m of q.moves) releaseFileGuid(world, m);
   const attrMeta = getTraitByName('EntityAttributes');
   const links: [number, number][] = [];
   if (attrMeta) for (const e of world.entities as Iterable<EntityHandle>) {
@@ -954,12 +982,13 @@ function drainAfterDerive(world: World): void {
   const chosen = new Map<number, { m: AfterDerive['moves'][number]; parentGuid: string }>();
   for (const m of q.moves) {
     // Through the lookup, so a move key written before #1809 (a keyed node's path through its anchor) still names it.
-    const ecsId = m.ecsId ?? (m.memberPath !== undefined ? memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, memberPathSteps(m.memberPath))?.id() : undefined);
+    const respell = m.frameRoot ? frameRespell(world, m.frameRoot) : undefined;
+    const ecsId = m.ecsId ?? (m.memberPath !== undefined ? memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, memberPathSteps(m.memberPath), respell)?.id() : undefined);
     if (!ecsId) continue; // the instance removed the member its prefab moves: nothing to move
     const prev = chosen.get(ecsId);
     if (prev && !prev.m.base && m.base) continue;
     const t = isMemberToken(m.parentGuid) ? parseMemberToken(m.parentGuid) : null;
-    const parentGuid = !t ? m.parentGuid : t.up ? '' : guidOfHandle(memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, t.path) ?? null);
+    const parentGuid = !t ? m.parentGuid : t.up ? '' : guidOfHandle(memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, t.path, respell) ?? null);
     if (!parentGuid) console.warn(`${m.logPrefix} a prefab's move names ${m.parentGuid}, which is no member; left at its row`);
     chosen.set(ecsId, { m: { ...m, ecsId }, parentGuid });
   }
@@ -1881,7 +1910,7 @@ function resolveTemplateFrames(world: World): void {
       const frame = t.up ? (climb ??= templateFrameClimber(world))(rootId, t.up) : rootId;
       if (!frame) return token;
       const within = t.up ? indexOf(frame) : index;
-      const target = memberPathLookup((k) => within.get(k), t.path);
+      const target = memberPathLookup((k) => within.get(k), t.path, frameRespell(world, frame));
       const guid = target ? ((target.get(attrMeta.trait) as { guid?: string }).guid ?? '') : '';
       return guid || token;
     };
@@ -2947,7 +2976,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // author time, so no runtime warning here.
         (patch ??= {})[fieldName] = 0;
         const raw = traitData[fieldName];
-        if (typeof raw === 'string' && meta.name === 'EntityAttributes' && fieldName === 'parentId') guidParentMisses.push({ entity, trait: meta.trait, field: fieldName, guid: raw });
+        if (typeof raw === 'string' && meta.name === 'EntityAttributes' && fieldName === 'parentId') guidParentMisses.push(holdFileGuid(world, { entity, trait: meta.trait, field: fieldName, guid: raw }, 'guid'));
       }
       if (!stripped && patch) {
         entity.set(meta.trait, { ...(entity.get(meta.trait) as Record<string, unknown>), ...patch });
@@ -3162,6 +3191,7 @@ interface GuidParentMiss { entity: Entity; trait: NonNullable<ReturnType<typeof 
 function retryGuidParents(world: World, misses: readonly GuidParentMiss[]): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta || !misses.length) return;
+  for (const miss of misses) releaseFileGuid(world, miss);
   for (const { entity, trait, field, guid } of misses) {
     // Held across the load's awaits: an entity destroyed since pass 2 (a placeholder the prefab loop replaced) must not
     // hand its index to whatever reclaimed it.

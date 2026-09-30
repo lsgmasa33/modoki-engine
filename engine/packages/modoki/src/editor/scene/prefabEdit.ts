@@ -35,7 +35,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
 import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
-import { flatKeyedSteps, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
+import { flatKeyedSteps, walkFramePath, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Guid prefix stamped on EVERY member of the synthetic edit scene, carrying that member's
@@ -202,19 +202,27 @@ function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | n
   const sentinel = (localId: number) => localId === prefab.rootLocalId ? PREFAB_EDIT_ROOT_GUID : `${PREFAB_EDIT_LOCAL_GUID_PREFIX}${localId}`;
   if (!path.length) return sentinel(prefab.rootLocalId);
   const rows = new Map(prefab.entities.map((e) => [e.localId, e]));
+  // Where the path is, frame by frame (`walkFramePath`: a nested row enters its frame, `@` leaves it). A step in the
+  // edited prefab's own frame (depth 0) is one of its rows, each its own sentinel; a nested row is a scene instance whose
+  // ROOT is its sentinel, and past it the rest derives from that root as a loaded instance's members do — the steps AS
+  // WRITTEN, save that a keyed node's are its frame's plus its key (#1809), and every `@` inside kept, since those frames
+  // are real here. A `@` that leaves the nested row returns to the prefab's own rows (#1484, a row hung under a nested
+  // row): deriving past it from the nested row's sentinel named no entity, and the save wrote that guid back raw over
+  // the token (#1876 S1).
+  const read = (g: string) => getCachedPrefabSync(g) as TemplateKeyDoc | null | undefined;
+  const walk = walkFramePath(path, prefab as unknown as TemplateKeyDoc, read);
+  if (!walk) return null;
+  const depthBefore = (i: number) => (i === 0 ? 0 : walk.depth[i - 1]!);
   for (let i = 0; i < path.length; i++) {
-    const row = typeof path[i] === 'number' ? rows.get(path[i] as number) : undefined;
-    if (!row) return null;
-    // Past a nested row, a keyed node's path is its frame's plus its key (#1809); a token written before that spells the
-    // anchor's steps too, and derived as written it named no entity, which the save then wrote back raw.
-    if (row.prefab) {
-      if (i === path.length - 1) return sentinel(row.localId);
-      const read = (g: string) => getCachedPrefabSync(g) as TemplateKeyDoc | null | undefined;
-      return deriveMemberGuid(sentinel(row.localId), flatKeyedSteps(path.slice(i + 1), read(row.prefab), read));
-    }
-    if (i === path.length - 1) return sentinel(row.localId);
+    if (depthBefore(i) === 0 && (typeof path[i] !== 'number' || !rows.has(path[i] as number))) return null;
   }
-  return null;
+  const last = path.length - 1;
+  if (walk.depth[last] === 0) return sentinel(path[last] as number);
+  let enter = last;
+  while (enter > 0 && !(depthBefore(enter) === 0 && walk.depth[enter] === 1)) enter--;
+  const row = rows.get(path[enter] as number)!;
+  if (enter === last) return sentinel(row.localId); // the nested row's root itself
+  return deriveMemberGuid(sentinel(row.localId), flatKeyedSteps(path.slice(enter + 1), read(row.prefab!), read));
 }
 
 /** A payload `depth` frames below the prefab's root, with every member token that climbs back to the
@@ -827,7 +835,7 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   const savedAtEditVersion = getEditVersion();
   // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
   // the call sits here and not in commitPrefabWrite.
-  const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid);
+  const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid, getCachedPrefabSync);
   if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
   // ONE step (#1692): written only over the document this edit was opened from — or last saved as — which is the session's
   // own baseline (`editBaselineFor`): it moves only with this save's own writes. A file changed under the edit (an Apply

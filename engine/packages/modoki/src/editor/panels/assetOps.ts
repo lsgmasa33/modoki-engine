@@ -710,7 +710,7 @@ export async function createPrefabFromEntity(
   // would replace — a prefab that would contain itself. It was a bare null both panels only logged.
   if (!draft) return { refused: `Create Prefab refused — the selection could not be written as a prefab: it is empty, or it holds an instance of ${at ?? savePath}, which cannot contain itself.` };
   // An authoring write, so it reports an inert size (#42, #1251) — named by the file it lands on.
-  warnInertPrefabSizes(draft, savePath);
+  warnInertPrefabSizes(draft, savePath, getCachedPrefabSync);
   // A Replace serializes WITH the kept id, so `serializePrefab`'s own cycle guard refuses (null, above) a tree holding an
   // instance of the very prefab it replaces — a prefab that would contain itself.
   const guid = keptId ?? draft.id ?? newGuid();

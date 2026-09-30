@@ -19,6 +19,7 @@ import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
 import { durableGuid, nodeRowComponent, deriveMemberGuid, memberPathSteps, isStoredRoot } from '../../runtime/core/assetRefRules';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
+import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
@@ -356,10 +357,11 @@ export function templateMoves(
   for (const f of frames) {
     if (!f.moved) continue;
     const index = memberPathIndex(getCurrentWorld(), f.id);
+    const respell = frameRespell(getCurrentWorld(), f.id);
     for (const [key, token] of Object.entries(f.moved)) {
       const t = parseMemberToken(token);
-      const member = memberPathLookup((k) => index.get(k), memberPathSteps(key));
-      const target = t && !t.up ? memberPathLookup((k) => index.get(k), t.path) : null;
+      const member = memberPathLookup((k) => index.get(k), memberPathSteps(key), respell);
+      const target = t && !t.up ? memberPathLookup((k) => index.get(k), t.path, respell) : null;
       if (member && target) base.set(member.id(), target.id());
     }
   }

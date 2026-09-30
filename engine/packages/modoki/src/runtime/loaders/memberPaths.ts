@@ -75,7 +75,12 @@ type Step = MemberStep;
  *  rule before #1809. ⚠️ The file-walk twin of `IdentityParents`' flag of the same name, and one of the only two places
  *  that rule survives: the duplicate remint of a raw v17 scene file, whose refs name the old guids
  *  (`engine/plugins/asset-fs-ops.ts`). Nothing else may pass it. */
-export type MemberWalkOptions = { guidLess?: boolean; orphans?: 'parent' | 'skip'; legacyKeyedParent?: boolean };
+/** `onKeyedNode`: told every template-KEYED node the walk derives, with the path it derives at (the {@link derivedMemberPathsByAnchor}
+ *  key, prefixed by its anchor group) — the validator's repeat check ({@link repeatedTemplateKeys}). */
+export type MemberWalkOptions = {
+  guidLess?: boolean; orphans?: 'parent' | 'skip'; legacyKeyedParent?: boolean;
+  onKeyedNode?: (path: string, node: object) => void;
+};
 
 /** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
  *  {@link deriveMemberChain}) a member can derive at below
@@ -127,6 +132,11 @@ export function memberPathRecords(
     if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
   };
   const under = (b: Base, id: string, ...steps: Step[]): Base => ({ tag: b.tag, done: b.done, path: [...b.path, ...steps], id });
+  /** A keyed node derived at `b`, for `onKeyedNode`. Each node is walked by ONE route (a nested row's member rows by its
+   *  expansion, a plain row's by the loop below), so a second call at a path is a second node. */
+  const keyedAt = (b: Base, n: object): void => {
+    if (b.tag !== 'skip') opts.onKeyedNode?.(`${b.tag}:${[...b.done, b.path].map(memberPathKey).join('|')}`, n);
+  };
   /** The base a derived stored root at `b` gives its members: its own guid is the next anchor. */
   const anchoredAt = (b: Base): Base => ({ tag: b.tag, done: [...b.done, b.path], path: [], id: b.id });
   const SKIP: Base = { tag: 'skip', done: [], path: [], id: '' };
@@ -228,11 +238,16 @@ export function memberPathRecords(
     const id = `${flat ? inFrame.id : owner}/a${key || (n.prefab ? 'r' : '0')}`;
     if (n.prefab) {
       const child = docOf(n.prefab);
-      if (!child) return;
+      // A MISSING prefab still leaves a keyed node its guid: the loader spawns its placeholder at the frame's path plus
+      // the key, which needs no document of the child's. Only the members below it are unknowable. Skipped, a duplicate
+      // of the scene kept the original's guid for it, so a child the scene hung under it, and every ref to it, dangled
+      // in the copy (#1876, found fixing S2).
+      if (!child) { if (key) { const at = under(from, id, key); emit(at); keyedAt(at, n); } return; }
       // With its own guid it is its own anchor: its root and members belong to its own walk. Its
       // orphan rows do not — `spawnNestedInstance` parents them to `base`, which is ours.
       const here = ownGuid ? SKIP : under(from, id, key || (child.rootLocalId ?? 1));
       emit(here);
+      if (key) keyedAt(here, n);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
       expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1, id, slotsOf(n.nestedStructure), rowsOf(n.members));
@@ -241,7 +256,7 @@ export function memberPathRecords(
     // A plain node with its own guid anchors everything below it (its own walk).
     if (ownGuid) return;
     const here = under(from, id, key || 0);
-    if (key) emit(here);
+    if (key) { emit(here); keyedAt(here, n); }
     if (Array.isArray(n.children)) for (const c of n.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, here, depth, id, inFrame);
   };
 
@@ -271,6 +286,33 @@ export function deriveMemberChain(anchor: string, key: string): string {
   // `parseSteps`, not `memberPathSteps`: an empty SEGMENT has always seeded `deriveMemberGuid` with
   // `'0'` rather than with nothing, and that output is persisted and frozen (#1468 Phase 1).
   return key.split('|').reduce((a, seg) => deriveMemberGuid(a, parseSteps(seg)), anchor);
+}
+
+/** Every template key `doc` gives two NODES at one derived path — two nodes on one guid (I7), wherever they sit: in one
+ *  row's list, in two lists of one frame, or declared by two documents into one frame (#1876 L5). What
+ *  `validatePrefabData` reports (#1809, owner ruling (A): reported, never rewritten). It asks the WALK the derive
+ *  mirrors (`memberPathRecords`, the file twin of `IdentityParents.derivesFrom`), not a frame model of its own: a label
+ *  per list reported two nodes that derive apart as a repeat (#1876 L4), and missed a repeat across documents.
+ *  `unread`: the nested prefabs `readPrefab` could not give — the frames below them are not checked, and the caller
+ *  says so rather than calling the document clean. */
+export function repeatedTemplateKeys(doc: unknown, readPrefab: PrefabReader): { repeats: Array<{ key: string; path: string }>; unread: string[] } {
+  const SELF = '\0validated-prefab';
+  const unread = new Set<string>();
+  const seen = new Set<string>();
+  const repeats: Array<{ key: string; path: string }> = [];
+  memberPathRecords({ prefab: SELF } as AddedNode, (g) => {
+    if (g === SELF) return doc;
+    const d = readPrefab(g);
+    if (!d) unread.add(g);
+    return d;
+  }, {
+    orphans: 'parent',
+    onKeyedNode: (path, node) => {
+      if (!seen.has(path)) { seen.add(path); return; }
+      if (!repeats.some((r) => r.path === path)) repeats.push({ key: String((node as { key?: unknown }).key), path });
+    },
+  });
+  return { repeats, unread: [...unread] };
 }
 
 /** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */

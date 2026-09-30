@@ -34,7 +34,7 @@ import { getCachedPrefabSync, getPrefabSource, preloadNestedPrefabsForSubtree, w
 import { settleSwallowedKeptState } from './prefabTokens';
 import { collectComparableTraits } from './prefabInstanceOverrides';
 import { captureInstanceStructure, toTemplateNodes } from './prefabCapture';
-import { declaredTemplateKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
+import { declaredTemplateKeys, flatKeyedSteps, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { layerAuthoredStructureKeys } from './prefabChain';
 import {
   collectInstanceRoots, framesBuiltFromOtherRows, missingNestedFrameKeys, missingPrefabInstance, missingSourceRefusal,
@@ -1147,7 +1147,8 @@ async function planApply(
     const live = Object.entries(newPrefab.moved).filter(([k, v]) => {
       const t = parseMemberToken(v);
       const has = (p: string) => (paths.has(p) ? true : undefined);
-      return !!memberPathLookup(has, memberPathSteps(k)) && !!t && !t.up && !!memberPathLookup(has, t.path);
+      const respell = (p: readonly MemberStep[]) => flatKeyedSteps(p, newPrefab as TemplateKeyDoc, readNew as (g: string) => TemplateKeyDoc | null);
+      return !!memberPathLookup(has, memberPathSteps(k), respell) && !!t && !t.up && !!memberPathLookup(has, t.path, respell);
     });
     if (live.length !== Object.keys(newPrefab.moved).length) newPrefab.moved = live.length ? Object.fromEntries(live) : undefined;
     if (!newPrefab.moved) delete newPrefab.moved;
@@ -1221,7 +1222,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   const { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions } = plan.rebuild;
   const { skipped } = plan;
 
-  const warnings = plan.writes.flatMap((w) => warnInertPrefabSizes(w.doc, w.source));
+  const warnings = plan.writes.flatMap((w) => warnInertPrefabSizes(w.doc, w.source, getCachedPrefabSync));
 
   // Who the promoted entities are, read while they still exist: the refresh re-expands each as a member with a
   // DERIVED guid, and `carryPromotedGuids` below gives it back the one every ref names (#1660).

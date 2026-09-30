@@ -1571,7 +1571,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     is hierarchy, not identity. Keys are unique within one prefab document (a prefab-edit copy mints a fresh key for
     every keyed node no NESTED prefab declares; a promotion through `toTemplateNodes` does not carry a live marker
     whose key its target declares or already wrote). A SAME-frame repeat a hand edit or a merge brings in is
-    reported by the prefab validator (`sameFrameRepeatedKeys`, `modoki_validate_prefab`) and never rewritten: a
+    reported by the prefab validator and never rewritten. The validator asks the walk the derive mirrors
+    (`repeatedTemplateKeys` over `memberPathRecords`, with the NESTED documents): two keyed nodes at one derived path are
+    two nodes on one guid, whichever lists or documents they come from, and a nested prefab it cannot read is named as
+    not checked (#1876 L4/L5; a per-list label reported nodes that derive apart and missed a repeat across documents). A
     load-time re-key was built and dropped (owner ruling (A)), because it renamed keys the scenes' statements name
     (#1872's pinned whole lists and `a+<key>` node rows). No ordinary edit on an older build makes one (a copy of a
     keyed node took no key; a nested row's duplicate is a new frame, and a cross-frame repeat collides on no guid).
@@ -1582,10 +1585,22 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     - **Upgrading what the old rule wrote.** Scene v18: a load of a file below 18 re-heals keys under
       `legacyKeyedParent` (a node the file pinned at an old-rule guid), then renames every old guid to today's
       (`keyedGuidUpgrade`: the reload walk under both rules, rowed members included, applied with
-      `applyGuidRemap`) before pins are checked and tokens settle; the next save writes 18. Prefab v9: a member token
-      naming a keyed node is written flat (`@member:3.+B`, where v8 wrote `@member:3.5.+A.+B`); `memberPathLookup`
-      still reads the old spelling, and the write gate stops a v8 build saving over a v9 file, whose prefab edit would
-      turn a flat token into a dangling guid.
+      `applyGuidRemap`) before pins are checked and tokens settle; the next save writes 18. The rename also reaches the
+      FILE guids the load still holds for later (`holdFileGuid` in `loadSceneFile.ts`: a queued move's new parent, a
+      pass-2 parent retried after the expansions), through one `onGuidRemap` listener; before it, a v17 move under a
+      keyed node, and a child of a missing keyed reference node, still named the old guid and were lost (#1876 S2). ⚠️ Only the LOADER can take a file
+      to 18, since the rename needs the expanded world: a raw-JSON rewriter (`migrate-assets.mjs`,
+      `migrate-anchor-zindex.mjs`) stamps a scene below 18 no further than 17 and names it (#1876 ⑩-5). Stamped 18
+      on disk, a file claims a rename it never had, and its refs to keyed nodes dangle for good. Prefab v9: a member token
+      naming a keyed node is written flat (`@member:3.+B`, where v8 wrote `@member:3.5.+A.+B`); every reader
+      still reads the old spelling through ONE walker, `walkFramePath` (`templateKeyRecovery.ts`): a nested row enters its
+      frame, `@` leaves it, and each `+key` keeps only its frame's steps (a keyed reference node's members anchor on
+      its own guid, a new segment, so no written path continues past one). `memberPathLookup`
+      takes it as a respell (`frameRespell`) and the prefab-edit world's `editGuidAt` walks it too; a path the documents
+      cannot place names nothing, never a guess. (Before #1876 the lookup tried prefixes, so a key a deeper frame also
+      used took the ref (L1), and `editGuidAt` never left a frame at `@`, so a no-op prefab-edit save wrote a dangling
+      guid over a ref to a row hung under a nested row (S1).) The write gate stops a v8 build saving over a v9 file,
+      whose prefab edit would turn a flat token into a dangling guid.
     - ⚠️ **Accepted cost (owner):** a node that already hit #1809 in a saved file may change its guid once more on
       first load, and a ref already broken stays broken. Keyed nodes shipped in v0.7.2 and v0.7.3; the committed corpus held none when this landed.
     - ⚠️ **One residual in the rule:** a node anchored AT a nested row hangs at that row's root and takes that nested

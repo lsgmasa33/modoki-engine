@@ -14,7 +14,9 @@ import { getAllEntities, deleteEntities, readTraitData, writeTraitField, findEnt
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { newGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { durableGuid, nodeRowKey, remapGuidValues } from '../../runtime/core/assetRefRules';
+import { durableGuid, nodeRowKey, remapGuidValues, memberPathSteps } from '../../runtime/core/assetRefRules';
+import { memberPathLookup } from '../../runtime/core/templateRefs';
+import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeNestedOverridePaths, deriveMemberGuidsAfterPins, memberPathIndex, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
@@ -844,8 +846,10 @@ export function rebuildInstance(
       const moved = frameMovesOf(f.root, f.doc);
       if (!moved) continue;
       const index = memberPathIndex(getCurrentWorld(), f.root);
+      const respell = frameRespell(getCurrentWorld(), f.root);
       const mine = Object.fromEntries(Object.entries(moved).filter(([key]) => {
-        const member = index.get(key);
+        // Through the lookup, so a key written before #1809 (a keyed node's path through its anchor) still names it.
+        const member = memberPathLookup((k) => index.get(k), memberPathSteps(key), respell);
         return !!member && respawned.has(member.id());
       }));
       if (Object.keys(mine).length) queuePrefabMoves(getCurrentWorld(), f.root, mine, '[Prefab]');

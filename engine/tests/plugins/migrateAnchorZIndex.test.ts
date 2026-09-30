@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
-import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { PREFAB_FORMAT_VERSION } from '../../packages/modoki/src/editor/scene/prefab';
 
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
@@ -142,7 +142,9 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
     expect(out).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
 
     const after = readJson(file);
-    expect(after.version).toBe(SCENE_FORMAT_VERSION); // not a literal: the script stamps this constant
+    // Not a literal: the script stamps the constant, but a scene below the first loader-only rung no further than the
+    // rung before it (#1876 ⑩-5 — the v18 keyed-guid rename needs the loaded world).
+    expect(after.version).toBe(FLAT_KEYED_GUIDS_SCENE_VERSION - 1);
     expect(after.entities[0].traits.UIElement.zIndex).toBe(5);
     expect(after.entities[0].traits.UIAnchor).not.toHaveProperty('zIndex');
   });

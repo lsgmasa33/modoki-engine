@@ -49,6 +49,7 @@ import { templateKeyOf, setTemplateKey } from '../../packages/modoki/src/runtime
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { templateKeysOf, type TemplateKeyDoc } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { validatePrefabData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { memberPathRecords } from '../../packages/modoki/src/runtime/loaders/memberPaths';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -155,24 +156,74 @@ beforeEach(() => {
 });
 afterAll(() => { for (const id of [P, O]) setPrefabCache(id, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
 
-describe('the prefab validator reports a key repeated within ONE frame, and only that', () => {
-  // #1872's fixture shape: a merge brought `k-dup` in twice under N's own list. Mutation: `sameFrameRepeatedKeys` keyed
-  // by the key alone (one frame label for the whole document) — the cross-frame case is reported too; or never noting a
-  // repeat — the same-frame case goes silent.
-  const dup = (x: number) => ({ parentLocalId: 1, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 }, Transform: { x } }, children: [] });
-  it('a same-frame repeat is an error naming the prefab, the frame and the key', () => {
+describe('the prefab validator reports two nodes at one DERIVED path, and only that (#1876 L4/L5)', () => {
+  // It asks the walk the derive mirrors (`repeatedTemplateKeys`, `memberPaths.ts`), with the nested documents. Mutations:
+  // `onKeyedNode` never called — every repeat goes silent; the repeat keyed by the key alone (not the path) — the
+  // cross-frame and different-frame cases are reported too; a member row walked by two routes — the last case reports a
+  // node as a repeat of itself.
+  const docs = (...extra: Array<{ id: string }>): ((g: string) => unknown) => {
+    const m = new Map<string, unknown>([[P, pDoc()], [S, sDoc()], [O, oDoc()], ...extra.map((d) => [d.id, d] as [string, unknown])]);
+    return (g) => m.get(g);
+  };
+  const errorsOf = (doc: unknown, read: (g: string) => unknown) => validatePrefabData(doc, read).warnings.filter((w) => w.startsWith('ERROR:'));
+  const dup = (x: number, parentLocalId = 1) => ({ parentLocalId, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 }, Transform: { x } }, children: [] });
+  /** PN: R ← A (a nested S row) ← B (a plain row under it). O2: a PN row N that adds `added`. */
+  const PN = 'cccccccc-0000-4000-8000-000000018761';
+  const pnDoc = (aAdded: unknown[] = []) => ({ id: PN, version: 9, name: 'PN', rootLocalId: 1, nextLocalId: 4, entities: [
+    row(1, 'R', 0, 'eeeeeeee-0000-4000-8000-0000000187b1'),
+    row(2, 'A', 1, 'eeeeeeee-0000-4000-8000-0000000187b2', { prefab: S, added: aAdded }),
+    row(3, 'B', 2, 'eeeeeeee-0000-4000-8000-0000000187b3'),
+  ] });
+  const o2Doc = (added: unknown[]) => ({ id: 'cccccccc-0000-4000-8000-000000018762', version: 9, name: 'O2', rootLocalId: 1, nextLocalId: 3, entities: [
+    row(1, 'OR', 0, 'eeeeeeee-0000-4000-8000-0000000187c1'),
+    row(2, 'N', 1, 'eeeeeeee-0000-4000-8000-0000000187c2', { prefab: PN, added }),
+  ] });
+
+  it('a same-frame repeat (a merge brought k-dup in twice under N\'s own list) is an error naming the prefab and the key', () => {
     const doc = oDoc();
     (doc.entities.find((e) => e.localId === 2) as unknown as { added: unknown[] }).added.push(dup(1), dup(2));
-    const errors = validatePrefabData(doc).warnings.filter((w) => w.startsWith('ERROR:'));
+    const errors = errorsOf(doc, docs());
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain('"O"');
-    expect(errors[0]).toContain('k-dup');
-    expect(errors[0]).toContain('row localId=2');
+    expect(errors[0]).toContain('+k-dup');
   });
   it('the same key in two frames (two rows of P) is not reported', () => {
-    expect(validatePrefabData(oDoc({ n2Key: KX })).warnings.filter((w) => w.startsWith('ERROR:'))).toEqual([]);
+    expect(errorsOf(oDoc({ n2Key: KX }), docs())).toEqual([]);
+  });
+  it('L4: one row\'s list, one node under plain B and one AT nested row A — two frames, two guids, no error', () => {
+    // The old check labelled the whole list one frame; the derive puts a node anchored AT a nested row in that row's frame.
+    expect(errorsOf(o2Doc([dup(1, 3), dup(2, 2)]), docs(pnDoc()))).toEqual([]);
+    // …and both under B share N's frame: reported.
+    expect(errorsOf(o2Doc([dup(1, 3), dup(2, 3)]), docs(pnDoc()))).toHaveLength(1);
+  });
+  it('L5: O adds a node AT nested row A with a key PN\'s row A also declares — one frame, two documents, reported on O', () => {
+    const read = docs(pnDoc([dup(9)]));
+    expect(errorsOf(o2Doc([dup(1, 2)]), read)).toHaveLength(1);
+    expect(errorsOf(pnDoc([dup(9)]), read)).toEqual([]); // PN alone holds one node there
+  });
+  it('a keyed node in a MEMBER ROW\'s own list is walked once on every route (under a plain row, a nested row, its member)', () => {
+    // The check reads a second call at one path as a second node, so this is what keeps it from reporting a node as a
+    // repeat of itself (the walk spreads a row's node to re-anchor it, so there is no object identity to fall back on).
+    const own = (key: string) => ({ own: [{ guid: '', key, name: 'K', traits: {}, children: [] }] });
+    const [, a, b] = pnDoc().entities.map((e) => e.nodeGuid);
+    const sa = sDoc().entities[1]!.nodeGuid;
+    for (const members of [{ [`/${b}`]: own('k1') }, { [`/${a}`]: own('k2') }, { [`/${a}/${sa}`]: own('k3') }]) {
+      const doc = { ...o2Doc([]), entities: o2Doc([]).entities.map((e) => (e.localId === 2 ? { ...e, members } : e)) };
+      const calls: string[] = [];
+      memberPathRecords({ prefab: doc.id } as never, (g) => (g === doc.id ? doc : docs(pnDoc())(g)), { onKeyedNode: (path) => calls.push(path) });
+      expect(calls).toHaveLength(1);
+      expect(errorsOf(doc, docs(pnDoc()))).toEqual([]);
+    }
+  });
+  it('a nested prefab it cannot read is SAID, not passed over as clean', () => {
+    const doc = o2Doc([dup(1, 2)]);
+    const warnings = validatePrefabData(doc, docs()).warnings; // PN missing
+    expect(warnings.filter((w) => w.startsWith('ERROR:'))).toEqual([]);
+    expect(warnings).toEqual([expect.stringMatching(new RegExp(`not checked below nested prefab\\(s\\) ${PN}`))]);
+    expect(validatePrefabData(doc).warnings).toEqual([expect.stringMatching(/not checked below nested prefab/)]); // no reader at all
   });
 });
+
 
 describe('I7: two nested copies of one prefab keep their keyed nodes apart by FRAME', () => {
   // The same key under N and under N2 (a file from before keys were unique; the mocked cache skips the load-path re-key,

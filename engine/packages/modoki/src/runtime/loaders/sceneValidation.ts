@@ -14,7 +14,8 @@
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { sceneEntryGuid } from './authoredEntityGuids';
-import { sameFrameRepeatedKeys, type TemplateKeyDoc } from './templateKeyRecovery';
+import { declaredTemplateKeys, type TemplateKeyDoc } from './templateKeyRecovery';
+import { repeatedTemplateKeys, type PrefabReader } from './memberPaths';
 import { isSizeInert } from '../ui/anchorLayout';
 import {
   isElementMarginInert, MARGIN_KEYS,
@@ -1375,7 +1376,7 @@ function localIdMarkWarnings(doc: { nextLocalId?: unknown }, entities: readonly 
   return mark > top ? [] : [`nextLocalId is ${mark}, not above the highest row's localId (${top}) — a new row is numbered from ${top + 1} regardless, and the next write corrects the mark`];
 }
 
-export function validatePrefabData(data: unknown): ValidationResult {
+export function validatePrefabData(data: unknown, readPrefab: PrefabReader = () => undefined): ValidationResult {
   const warnings: string[] = [];
   const entities = (data as { entities?: unknown })?.entities;
   // A document with no `entities` array is not a prefab, and "no warnings" would call it clean
@@ -1403,11 +1404,17 @@ export function validatePrefabData(data: unknown): ValidationResult {
     warnings.push(...collapsedNewlineWarnings(e.traits, prefabLabel));
   }
   warnings.push(...localIdMarkWarnings(data as { nextLocalId?: unknown }, entities));
-  // A template key twice in one frame is a DEFECT, not advice: the two nodes derive one guid (#1809). Reported, never
-  // rewritten (owner ruling (A)); only a hand edit or a merge makes one. The validator has one tier, so it says so.
+  // A template key two nodes derive at one path is a DEFECT, not advice: they get one guid (#1809). Reported, never
+  // rewritten (owner ruling (A)); only a hand edit, a merge or an old build's carry makes one. The validator has one tier,
+  // so it says so. Asked of the walk the derive mirrors, so it needs the NESTED documents (`readPrefab`): a frame below
+  // one it cannot read is not checked, and that is said, not passed over (#1876 L4/L5).
   const name = typeof (data as { name?: unknown }).name === 'string' ? ` "${(data as { name: string }).name}"` : '';
-  for (const { frame, key } of sameFrameRepeatedKeys(data as TemplateKeyDoc)) {
-    warnings.push(`ERROR: prefab${name} declares template key ${key} twice in one frame (${frame}) — the two nodes derive the same guid, so every ref to either lands on one of them; give one a new key (a hand edit or a merge made this; the editor never writes it)`);
+  const { repeats, unread } = repeatedTemplateKeys(data, readPrefab);
+  for (const { key, path } of repeats) {
+    warnings.push(`ERROR: prefab${name} gives template key ${key} to two nodes at one derived path (${path}) — they derive the same guid, so every ref to either lands on one of them; give one a new key (a hand edit, a merge or an old build's carry made this; the editor never writes it)`);
+  }
+  if (unread.length && declaredTemplateKeys(data as TemplateKeyDoc).size) {
+    warnings.push(`prefab${name}: its template keys were not checked below nested prefab(s) ${unread.join(', ')} — they could not be read`);
   }
   // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
   // would tell a caller its type checks ran when they did not.

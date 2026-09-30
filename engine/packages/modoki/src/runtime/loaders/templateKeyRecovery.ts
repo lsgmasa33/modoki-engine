@@ -15,7 +15,7 @@
  *  nothing matches — so the result depends only on the world and the prefab documents. */
 
 import type { World } from 'koota';
-import { deriveMemberGuid, addedKeyStep, entityStep, memberRowNodes, type MemberStep } from '../core/assetRefRules';
+import { deriveMemberGuid, addedKeyStep, entityStep, memberRowNodes, isFrameStep, type MemberStep } from '../core/assetRefRules';
 import type { PackedEntity } from '../core/ecs/entityTable';
 
 /** The slice of a prefab document the key walk reads (a `PrefabFile` / loader doc fits structurally). */
@@ -40,9 +40,14 @@ export function templateKeysOf(doc: TemplateKeyDoc): string[] {
 /** Every node of `doc` carrying a template key, in DOCUMENT order — the one walk {@link templateKeysOf},
  *  {@link declaredTemplateKeys} and {@link nestedDeclaredKeys} share. */
 function eachKeyedNode(doc: TemplateKeyDoc, visit: (n: KeyedNode) => void): void {
+  // Defensive at every level: the prefab VALIDATOR reads through this (`declaredTemplateKeys`), and its contract is
+  // warn-but-load, never throw, on any shape a hand edit leaves (#1876 close-out review).
+  const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
   const nodes = (list: KeyedNode[] | undefined): void => {
-    for (const n of list ?? []) {
-      if (n.key) visit(n);
+    if (!Array.isArray(list)) return;
+    for (const n of list) {
+      if (!isObj(n)) continue;
+      if (typeof n.key === 'string' && n.key) visit(n);
       nodes(n.children);
       nodes(n.added);
       structure(n.nestedStructure);
@@ -50,36 +55,70 @@ function eachKeyedNode(doc: TemplateKeyDoc, visit: (n: KeyedNode) => void): void
     }
   };
   const rows = (members: MemberRows | undefined): void => {
-    for (const row of Object.values(members ?? {})) nodes(memberRowNodes(row) as KeyedNode[]);
+    if (!isObj(members)) return;
+    for (const row of Object.values(members)) if (isObj(row)) nodes(memberRowNodes(row) as KeyedNode[]);
   };
   const structure = (paths: StructurePaths | undefined): void => {
-    for (const delta of Object.values(paths ?? {})) nodes(delta?.added);
+    if (!isObj(paths)) return;
+    for (const delta of Object.values(paths)) if (isObj(delta)) nodes(delta.added as KeyedNode[] | undefined);
   };
-  for (const pe of doc.entities ?? []) {
+  for (const pe of Array.isArray(doc?.entities) ? doc.entities : []) {
+    if (!isObj(pe)) continue;
     nodes(pe.added);
     structure(pe.nestedStructure);
     rows(pe.members);
   }
 }
 
-/** `steps` — a member path inside the frame of `doc`, ending in a template key — respelled as #1809 derives it: the
- *  steps up to the last one that ENTERS a frame (a nested row, or a keyed reference node), then the key. A path written
- *  before #1809 spells the steps to the node's anchor and any keyed parent (`2.3.+K` for today's `+K`); a flat one comes
- *  back unchanged. Walks the documents (`readPrefab`), so it answers where no live world exists yet: the prefab-edit
- *  world's token mapping (`editGuidAt`), which runs before anything is spawned. Anything else comes back as it is. */
-export function flatKeyedSteps(steps: readonly MemberStep[], doc: TemplateKeyDoc | null | undefined, readPrefab: (guid: string) => TemplateKeyDoc | null | undefined): MemberStep[] {
-  const last = steps[steps.length - 1];
-  if (typeof last !== 'string' || !last.startsWith('+') || !doc) return [...steps];
-  let cur: TemplateKeyDoc | null | undefined = doc;
-  let keep = 0;
-  for (let i = 0; i < steps.length - 1 && cur; i++) {
-    const s = steps[i];
-    let enters: string | undefined;
-    if (typeof s === 'number') enters = cur.entities.find((e) => e.localId === s)?.prefab;
-    else if (s.startsWith('+')) eachKeyedNode(cur, (n) => { if (!enters && n.key === s.slice(1) && n.prefab) enters = n.prefab; });
-    if (enters) { cur = readPrefab(enters); keep = i + 1; }
+/** `steps` — a member path inside the frame of `doc` — walked through the frames it passes (#1484, #1809), as the live
+ *  walks spell it: a numeric step naming a NESTED row enters that prefab's frame; `@` (FRAME_STEP) returns to the
+ *  enclosing one, and the next step is a row of that document again; any other step stays where it is. `flat`: the path respelled as #1809 derives it — at each `+key`, the steps back to the root of
+ *  the frame it is in are dropped, since a keyed node's guid is its frame plus its key and never its anchor or a keyed
+ *  parent (`3.5.+A.+B` for today's `3.+B`, `2.2.@.3.+K` for `2.+K`); a flat path comes back unchanged. `depth`: how many
+ *  frames deep the walk is after each step. `null` when a document the walk needs cannot be read, or a `@` has no frame
+ *  to leave — the path cannot be told apart then, and a caller keeps it as written. ONE walker for every reader of a
+ *  written path (`flatKeyedSteps`, the prefab-edit world's `editGuidAt`, `memberPathLookup`'s respell): each used to
+ *  guess on its own, and the guesses never left a frame at `@` (#1876 S1) or tried prefixes (#1876 L1). */
+export function walkFramePath(
+  steps: readonly MemberStep[], doc: TemplateKeyDoc | null | undefined, readPrefab: (guid: string) => TemplateKeyDoc | null | undefined,
+): { flat: MemberStep[]; depth: number[] } | null {
+  if (!doc) return null;
+  const stack: Array<{ doc: TemplateKeyDoc; at: number }> = [{ doc, at: 0 }];
+  const flat: MemberStep[] = [];
+  const depth: number[] = [];
+  const enter = (prefab: string | undefined): boolean => {
+    if (!prefab) return true;
+    const d = readPrefab(prefab);
+    if (!d) return false;
+    stack.push({ doc: d, at: flat.length });
+    return true;
+  };
+  for (const s of steps) {
+    const top = stack[stack.length - 1]!;
+    if (isFrameStep(s)) {
+      if (stack.length < 2) return null;
+      stack.pop();
+      flat.push(s);
+    } else if (typeof s === 'string' && s.startsWith('+')) {
+      // A keyed node derives from its frame's root, never its anchor or a keyed parent (#1809). A keyed REFERENCE node
+      // enters no frame here: its members anchor on its own guid (a new `|` segment, `memberPaths.ts`), so no written
+      // path continues past one.
+      flat.length = top.at;
+      flat.push(s);
+    } else {
+      flat.push(s);
+      if (typeof s === 'number' && !enter(top.doc.entities.find((e) => e.localId === s)?.prefab)) return null;
+    }
+    depth.push(stack.length - 1);
   }
-  return [...steps.slice(0, keep), last];
+  return { flat, depth };
+}
+
+/** {@link walkFramePath}'s `flat`, or `steps` as written when the walk cannot tell. Walks the documents, so it answers
+ *  where no live world exists yet: the prefab-edit world's token mapping (`editGuidAt`), which runs before anything is
+ *  spawned. */
+export function flatKeyedSteps(steps: readonly MemberStep[], doc: TemplateKeyDoc | null | undefined, readPrefab: (guid: string) => TemplateKeyDoc | null | undefined): MemberStep[] {
+  return walkFramePath(steps, doc, readPrefab)?.flat ?? [...steps];
 }
 
 /** The keys the prefabs `doc` NESTS declare — every document reachable through its rows' and its reference nodes'
@@ -112,63 +151,6 @@ export function nestedDeclaredKeys(doc: TemplateKeyDoc, readPrefab: (guid: strin
 export function declaredTemplateKeys(doc: TemplateKeyDoc): Set<string> {
   const out = new Set<string>();
   eachKeyedNode(doc, (n) => { out.add(n.key!); });
-  return out;
-}
-
-/** Every template key `doc` declares twice within ONE frame, with that frame — what `validatePrefabData` reports (#1809,
- *  owner ruling (A)). A keyed node's guid is its frame's path plus its key, so two nodes of one frame sharing a key
- *  share a guid (I7). Keys are kept unique at the sources (a prefab-edit copy mints every key no nested prefab declares;
- *  a promotion does not carry a key its target declares or already wrote), and no ordinary edit on an older build made a
- *  same-frame repeat either (a copy of a keyed node or of a member above it took no key; a nested row's duplicate is a
- *  new frame). So such a repeat comes from a hand edit or a merge, and is REPORTED, never rewritten: a load-time re-key
- *  was built and dropped, since it renamed keys the scenes' statements name (#1872's pinned lists and node rows). A
- *  repeat across two frames collides on no guid and is not reported.
- *
- *  The frame of a node, as a label: a row's own `added` and each `nestedStructure` path of it; a member row's nodes by
- *  the row key's frame chain (every component but the member's own); a keyed REFERENCE node's `added`, slots and rows
- *  in its own frame; `children` in their parent's. Two lists the label cannot tell apart as one frame (a row's own
- *  `added` beside its member rows) are two labels, so the check under-reports there rather than invent a repeat. */
-export function sameFrameRepeatedKeys(doc: TemplateKeyDoc): Array<{ frame: string; key: string }> {
-  const seen = new Map<string, Set<string>>();
-  const out: Array<{ frame: string; key: string }> = [];
-  const note = (frame: string, key: string): void => {
-    let keys = seen.get(frame);
-    if (!keys) seen.set(frame, (keys = new Set()));
-    if (!keys.has(key)) { keys.add(key); return; }
-    if (!out.some((o) => o.frame === frame && o.key === key)) out.push({ frame, key });
-  };
-  // Defensive at every level: the validator's contract is warn-but-load, never throw, on any shape (a hand edit).
-  const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-  const nodes = (list: unknown, frame: string): void => {
-    if (!Array.isArray(list)) return;
-    for (const n of list as KeyedNode[]) {
-      if (!isObj(n)) continue;
-      if (typeof n.key === 'string' && n.key) note(frame, n.key);
-      nodes(n.children, frame);
-      const own = n.prefab && n.key ? `${frame} / node ${n.key}` : frame;
-      nodes(n.added, own);
-      structure(n.nestedStructure, own);
-      rows(n.members, own);
-    }
-  };
-  const rows = (members: unknown, frame: string): void => {
-    if (!isObj(members)) return;
-    for (const [k, row] of Object.entries(members)) {
-      const chain = k.split('/').filter(Boolean).slice(0, -1);
-      nodes(memberRowNodes(row), chain.length ? `${frame} / ${chain.join('/')}` : frame);
-    }
-  };
-  const structure = (paths: unknown, frame: string): void => {
-    if (!isObj(paths)) return;
-    for (const [path, delta] of Object.entries(paths)) nodes(isObj(delta) ? delta.added : undefined, `${frame} / slot ${path}`);
-  };
-  for (const pe of Array.isArray(doc?.entities) ? doc.entities : []) {
-    if (!isObj(pe)) continue;
-    const frame = `row localId=${String(pe.localId)}`;
-    nodes(pe.added, frame);
-    structure(pe.nestedStructure, frame);
-    rows(pe.members, frame);
-  }
   return out;
 }
 

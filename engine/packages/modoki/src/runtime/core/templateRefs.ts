@@ -75,21 +75,22 @@ export function memberPathKey(path: readonly MemberStep[]): string {
   return path.map(formatStep).join('.');
 }
 
-/** What `get` holds under the member path `path` (a token's, or a `moved` key's). A path ending in a template key that
- *  names nothing is also tried with the steps before that key dropped, longest prefix first: a template-keyed node's
- *  path is its frame's plus its key (#1809), while a document written before it spells the steps to its anchor and any
- *  keyed parent (`3.5.+A.+B` for today's `3.+B`). Keys are unique within a document, so the first hit is the node;
- *  prefabs have no migration ladder, so the reader is what upgrades them, and the next write writes the flat form.
+/** What `get` holds under the member path `path` (a token's, or a `moved` key's): exactly, else under `respell(path)` — the
+ *  spelling #1809 derives, read from the frame's documents (`frameRespell` / `flatKeyedSteps`, `templateKeyRecovery.ts`).
+ *  A template-keyed node's path is its frame's plus its key, while a document written before it spells the steps to its
+ *  anchor and any keyed parent (`3.5.+A.+B` for today's `3.+B`); prefabs have no migration ladder, so the reader is what
+ *  upgrades them, and the next write writes the flat form. It used to GUESS the flat form, trying the path with the steps
+ *  before the key dropped, longest prefix first — and the first node holding that key on any prefix won, so a key a
+ *  deeper frame also uses re-pointed the ref silently (#1876 L1). Now a path the documents cannot place names nothing.
  *  `undefined` when nothing matches; a `null` hit (a path two nodes share) is returned as found. */
-export function memberPathLookup<T>(get: (key: string) => T | undefined, path: readonly MemberStep[]): T | undefined {
-  const exact = get(memberPathKey(path));
-  const last = path[path.length - 1];
-  if (exact !== undefined || typeof last !== 'string' || !last.startsWith('+')) return exact;
-  for (let i = path.length - 2; i >= 0; i--) {
-    const hit = get(memberPathKey([...path.slice(0, i), last]));
-    if (hit !== undefined) return hit;
-  }
-  return undefined;
+export function memberPathLookup<T>(
+  get: (key: string) => T | undefined, path: readonly MemberStep[], respell?: (path: readonly MemberStep[]) => readonly MemberStep[],
+): T | undefined {
+  const key = memberPathKey(path);
+  const exact = get(key);
+  if (exact !== undefined || !respell) return exact;
+  const flat = memberPathKey(respell(path));
+  return flat === key ? undefined : get(flat);
 }
 
 /** `value` with every member token rebased onto `segments`: the path from the top call's root to

@@ -10,7 +10,9 @@
  *  `uiAnchorZIndexMigration.ts`) — this script is the one-time on-disk rewrite for the
  *  committed corpus; the runtime migration is what future old scenes go through.
  *
- *  Also bumps each rewritten scene's `version` to `SCENE_FORMAT_VERSION` and each rewritten
+ *  Also bumps each rewritten scene's `version` to `SCENE_FORMAT_VERSION` (a scene below
+ *  `FLAT_KEYED_GUIDS_SCENE_VERSION` to the rung before it, as `migrate-assets.mjs` does: only the loader renames
+ *  keyed-node guids, #1876) and each rewritten
  *  prefab's to `PREFAB_FORMAT_VERSION`, both read from `runtime/core/version.ts` as TEXT rather
  *  than hardcoded — and never DOWNWARDS: a document stamped higher than the target is skipped
  *  untouched, because a newer build wrote it and this one cannot claim to understand it (#1468).
@@ -51,6 +53,14 @@ if (!sceneVersionMatch) {
   process.exit(1);
 }
 const SCENE_FORMAT_VERSION = Number(sceneVersionMatch[1]);
+// The first scene rung only the LOADER can take (#1809's keyed-guid rename); a scene below it is stamped to the rung
+// before, never past it (#1876 ⑩-5, the same rule as migrate-assets.mjs).
+const loaderRungMatch = versionSrc.match(/FLAT_KEYED_GUIDS_SCENE_VERSION\s*=\s*(\d+)/);
+if (!loaderRungMatch) {
+  console.error('could not read FLAT_KEYED_GUIDS_SCENE_VERSION from runtime/core/version.ts');
+  process.exit(1);
+}
+const LOADER_RUNG = Number(loaderRungMatch[1]);
 // ⚠️ READ, for the same reason as the scene version one line up — this script STAMPS both, so a
 // stale literal here downgrades every PREFAB it rewrites. The scene half was unpinned and this was
 // left behind in the same function; version.ts says in as many words to check BOTH.
@@ -236,7 +246,7 @@ async function migrateFile(file) {
     console.log(`SKIP ${file.slice(ROOT.length + 1)}: format ${json.version} is newer than ${target} — written by a newer build`);
     return;
   }
-  json.version = target;
+  json.version = isPrefab || (typeof json.version === 'number' && json.version >= LOADER_RUNG) ? target : LOADER_RUNG - 1;
 
   changedFiles++;
   console.log(`${WRITE ? 'rewrote' : 'would rewrite'} ${file.slice(ROOT.length + 1)}`);

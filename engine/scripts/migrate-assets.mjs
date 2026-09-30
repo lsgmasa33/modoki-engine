@@ -7,6 +7,9 @@
  * current `SCENE_FORMAT_VERSION` (read from `runtime/core/version.ts` — the single source of
  * truth, so this tool never goes stale). Prefab files carry an independent schema
  * `version` and are NOT version-stamped here; their trait data is still migrated.
+ * ⚠️ Except a scene below `FLAT_KEYED_GUIDS_SCENE_VERSION` (18): it is stamped no further than 17,
+ * because v18 is the first rung raw JSON cannot take (#1809's keyed-guid rename needs the expanded
+ * world), and a file stamped 18 without it is never renamed by the loader (#1876 ⑩-5).
  *
  * This is the PHYSICAL companion to the runtime migration chain in `loadSceneFile.ts`:
  * scenes are also upgraded at load, but prefab files are not, so they must be rewritten
@@ -14,7 +17,8 @@
  *
  * Adding a future migration: extend `TRANSFORMS` with another deep transform and bump
  * `SCENE_FORMAT_VERSION` in `runtime/core/version.ts`; re-running this tool upgrades every
- * committed file in place.
+ * committed file in place — up to the first rung only the loader can take (below). A future rung that
+ * also needs the loaded world must be held back here the same way.
  *
  * Usage:  node engine/scripts/migrate-assets.mjs [--dry]
  */
@@ -37,6 +41,13 @@ const SCENE_FORMAT_VERSION = Number(m[1]);
 const mp = versionSrc.match(/PREFAB_FORMAT_VERSION\s*=\s*(\d+)/);
 if (!mp) { console.error('could not read PREFAB_FORMAT_VERSION from runtime/core/version.ts'); process.exit(1); }
 const PREFAB_FORMAT_VERSION = Number(mp[1]);
+// The first scene rung that needs the LOADER (#1809): below it, a scene's keyed-node guids are renamed only by
+// `keyedGuidUpgrade` over the expanded world, which runs when the file says it is below this number. Stamping such a
+// file past it here would skip that rename for good, so this script stamps it to the rung before (#1876 ⑩-5); the
+// editor's next load + save takes it the rest of the way.
+const mk = versionSrc.match(/FLAT_KEYED_GUIDS_SCENE_VERSION\s*=\s*(\d+)/);
+if (!mk) { console.error('could not read FLAT_KEYED_GUIDS_SCENE_VERSION from runtime/core/version.ts'); process.exit(1); }
+const LOADER_RUNG = Number(mk[1]);
 
 // ── Field transforms (mirror loadSceneFile.ts migrations) ──────────────────────────
 const RENDERABLE_TRAITS = new Set([
@@ -99,7 +110,7 @@ const prefabs = repoFiles({
 });
 const files = new Set([...scenes, ...prefabs].map(({ rel }) => rel));
 
-let rewritten = 0, bumped = 0, skippedTooNew = 0;
+let rewritten = 0, bumped = 0, skippedTooNew = 0, heldForLoader = 0;
 for (const rel of [...files].sort()) {
   const abs = path.join(REPO_ROOT, rel);
   let json;
@@ -136,7 +147,12 @@ for (const rel of [...files].sort()) {
   // FORWARD. It was the whole downgrade before that guard existed. Left as one mechanism rather than
   // two — a `<` here as well would be unfalsifiable (mutating it back to `!==` leaves every test
   // green, which is exactly what a redundant guard looks like from the outside).
-  if (isScene && json.version !== SCENE_FORMAT_VERSION) { json.version = SCENE_FORMAT_VERSION; didBump = true; }
+  const stampTo = typeof json.version === 'number' && json.version >= LOADER_RUNG ? SCENE_FORMAT_VERSION : LOADER_RUNG - 1;
+  if (isScene && stampTo < SCENE_FORMAT_VERSION) {
+    heldForLoader++;
+    console.log(`HOLD ${rel}: stamped no further than v${stampTo} — v${LOADER_RUNG} renames keyed-node guids over the loaded world`);
+  }
+  if (isScene && json.version !== stampTo) { json.version = stampTo; didBump = true; }
 
   if (changed || didBump) {
     // Match the editor's writer: 2-space indent AND a trailing newline — otherwise the next
@@ -149,10 +165,11 @@ for (const rel of [...files].sort()) {
     if (!DRY) writeFileSync(abs, JSON.stringify(json, null, 2) + '\n');
     rewritten++;
     if (didBump) bumped++;
-    console.log(`${DRY ? 'would migrate' : 'migrated'}${changed ? ' (fields)' : ''}${didBump ? ` (v→${SCENE_FORMAT_VERSION})` : ''}: ${rel}`);
+    console.log(`${DRY ? 'would migrate' : 'migrated'}${changed ? ' (fields)' : ''}${didBump ? ` (v→${json.version})` : ''}: ${rel}`);
   }
 }
 console.log(`\n✓ ${rewritten} file(s) ${DRY ? 'would be ' : ''}rewritten (${bumped} scene version stamps) → format v${SCENE_FORMAT_VERSION}.`);
 // Counted and reported, never silent: a skipped file still holds whatever this script exists to
 // migrate, so a run that rewrites nothing and says nothing else would read as a clean corpus.
+if (heldForLoader > 0) console.log(`${heldForLoader} scene(s) held at v${LOADER_RUNG - 1} — v${LOADER_RUNG} renames keyed-node guids over the loaded world; open and save each (HOLD lines above) in the editor to finish.`);
 if (skippedTooNew > 0) console.log(`${skippedTooNew} file(s) SKIPPED — written by a newer build; update this checkout and re-run.`);

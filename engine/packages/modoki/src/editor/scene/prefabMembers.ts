@@ -14,6 +14,7 @@ import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptMemberOrphans, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { levelDoc } from './prefabBase';
 import { parseMemberToken, memberPathLookup } from '../../runtime/core/templateRefs';
+import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { type PrefabFile } from './prefab';
 
 // ── Instance-keyed scan cost (review F11 — measured, no index threaded) ──────
@@ -117,7 +118,7 @@ export function enclosingFrames(rootInstanceId: number): { root: number; doc: Pr
 
 export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (ecsId: number) => string {
   const eaMeta = getTraitByName('EntityAttributes');
-  type Frame = { index: ReturnType<typeof memberPathIndex>; movedOf: Map<number, string> };
+  type Frame = { index: ReturnType<typeof memberPathIndex>; movedOf: Map<number, string>; respell: ReturnType<typeof frameRespell> };
   let frames: Frame[] | null = null;
   const frameChain = (): Frame[] => {
     const world = getCurrentWorld();
@@ -125,14 +126,15 @@ export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (
       .map((f) => ({ root: f.root, moved: frameMovesOf(f.root, f.doc) }))
       .filter((f): f is { root: number; moved: Record<string, string> } => !!f.moved).map((f) => {
         const index = memberPathIndex(world, f.root);
+        const respell = frameRespell(world, f.root);
         // Each move by the member its key names — through the lookup, so a key written before #1809 (a keyed node's path
         // through its anchor) still finds it.
         const movedOf = new Map<number, string>();
         for (const [key, token] of Object.entries(f.moved)) {
-          const member = memberPathLookup((k) => index.get(k), memberPathSteps(key));
+          const member = memberPathLookup((k) => index.get(k), memberPathSteps(key), respell);
           if (member) movedOf.set(member.id(), token);
         }
-        return { index, movedOf };
+        return { index, movedOf, respell };
       });
   };
   return (ecsId) => {
@@ -141,7 +143,7 @@ export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (
     let base = '';
     for (const f of frames) {
       const t = parseMemberToken(f.movedOf.get(ecsId) ?? '');
-      const target = t && !t.up ? memberPathLookup((k) => f.index.get(k), t.path) : null;
+      const target = t && !t.up ? memberPathLookup((k) => f.index.get(k), t.path, f.respell) : null;
       if (target) base = (target.get(eaMeta.trait) as { guid?: string }).guid ?? '';
     }
     return base;

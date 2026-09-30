@@ -14,6 +14,7 @@ import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadScen
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { templateReferenceNode } from './prefabBase';
 import { isMemberToken, parseMemberToken, memberToken, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
+import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
 
 /** Which entities of `tree` become ROWS of the prefab, and what localId each one gets.
@@ -302,7 +303,7 @@ export function baseTokenResolver(rootInstanceId: number): (value: unknown) => u
     let index = indexes.get(frame);
     if (!index) { index = memberPathIndex(world, frame); indexes.set(frame, index); }
     const within = index;
-    const target = memberPathLookup((k) => within.get(k), t.path);
+    const target = memberPathLookup((k) => within.get(k), t.path, frameRespell(world, frame));
     const guid = target ? ((target.get(eaMeta.trait) as { guid?: string }).guid ?? '') : '';
     return guid || token;
   };

@@ -78,6 +78,12 @@ describe('validatePrefabData — inert UI size inside a .prefab.json', () => {
     for (const bad of [null, undefined, 42, 'nope', {}, { entities: 'no' }, { entities: [null, 7, {}] }]) {
       expect(() => validatePrefabData(bad)).not.toThrow();
     }
+    // …and deep in a keyed node list, where the template-key check reads (#1876 close-out review): with a nested prefab
+    // it cannot read, it walks the document's own keys, and that walk threw on a hand-edited list.
+    const nested = (added: unknown) => ({ entities: [{ localId: 1, prefab: 'x', added }] });
+    for (const added of [7, [{ key: 'K', children: 5 }], [{ key: 'K' }, null], [{ key: 'K', members: 3, nestedStructure: [1] }]]) {
+      expect(() => validatePrefabData(nested(added))).not.toThrow();
+    }
     // #1214 A-3: junk ENTRIES inside a real entities array are reported — skipped silently, the
     // document validated with no warnings. An empty object IS an entity (nothing on it to check).
     expect(validatePrefabData({ entities: [null, 7, {}, 'x', []] }).warnings).toEqual([
