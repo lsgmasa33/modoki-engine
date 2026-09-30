@@ -28,9 +28,7 @@ import { pushAction, type EditDetail } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
-import { placeholderWriteRefusal, placeholderWriteRefusalAny, isMissingPrefabPlaceholder, isUnderPrefabInstance, placeholderRefusalWords, entityNameOf } from './placeholderGate';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
-import { sortOrderAsNode } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
 import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
@@ -54,13 +52,11 @@ function markFieldOverrideIfInstance(entityId: number, meta: TraitMeta, field: s
  *  `respawnFromSnapshot` copies the source's EntityAttributes verbatim, sortOrder included, so the copy would
  *  collide with its source and break drag-to-reorder's distinct-position math. Excludes the copy itself from the max
  *  so the copied value can't inflate the result. Written marked: a copied instance ROOT saves its sortOrder only
- *  when marked (#1709). */
+ *  when marked (#1709). A copy of a Missing Prefab placeholder takes one too, wherever it lands: both shapes its save
+ *  writes keep it (#1901). */
 export function assignFreshSortOrder(newId: number, parentId: number): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return;
-  // A copy of a Missing Prefab placeholder saved as an added node keeps the copied value (#1818): its save cannot keep a
-  // `sortOrder`, so a fresh one would show an order the reload undoes. The gate says which placeholders those are.
-  if (placeholderWriteRefusal(newId, 'EntityAttributes', 'sortOrder')) return;
   const siblings = getAllEntities().filter((e) => e.parentId === parentId && e.id !== newId);
   const nextSort = siblings.length > 0 ? Math.max(...siblings.map((e) => e.sortOrder)) + 1 : 0;
   writeTraitFieldMarked(newId, attrMeta, 'sortOrder', nextSort);
@@ -69,24 +65,20 @@ export function assignFreshSortOrder(newId: number, parentId: number): void {
 /** Why the Hierarchy's sibling drop of `moverId` under `targetParent` must not run, decided BEFORE its renumber writes
  *  anything, so a refused drop leaves no renumber entry behind (#1818 close-out re-review). `reparent`: the reparent's
  *  own refusal (self-parent, cycle, prefab edit: `planReparent`), which the caller leaves to `requestReparent` to report
- *  as it always has. `placeholder`: a Missing Prefab placeholder reordered inside its own instance, whose save cannot
- *  keep the order (`reparentEntity` refuses it too). */
-export function siblingDropRefusal(moverId: number, targetParent: number): { kind: 'reparent' } | { kind: 'placeholder' | 'restructure'; reason: string } | null {
+ *  as it always has. `restructure`: an object a prefab supplies, whose place is the prefab's (#1869). A Missing Prefab
+ *  placeholder is reordered like any entity: both shapes its save writes keep the order (#1901). */
+export function siblingDropRefusal(moverId: number, targetParent: number): { kind: 'reparent' } | { kind: 'restructure'; reason: string } | null {
   if (planReparent(moverId, targetParent).kind === 'refused') return { kind: 'reparent' };
   // A sibling drop gives the mover a new place, so a prefab-supplied mover is refused even under its own parent (#1869).
   const restructure = restructureRefusal({ id: moverId, parentId: targetParent, reorder: true });
-  if (restructure) return { kind: 'restructure', reason: restructure };
-  const ea = getTraitByName('EntityAttributes');
-  const parent = ea ? Number((readTraitData(moverId, ea) as { parentId?: number } | null)?.parentId ?? 0) : 0;
-  const reason = parent === targetParent ? placeholderWriteRefusal(moverId, 'EntityAttributes', 'sortOrder') : null;
-  return reason ? { kind: 'placeholder', reason } : null;
+  return restructure ? { kind: 'restructure', reason: restructure } : null;
 }
 
 /** Whether the Hierarchy's renumber after a tie leaves sibling `id`'s `sortOrder` where it is, numbering the rest around
- *  it (`planCollidingDrop`'s `fixed`): a Missing Prefab placeholder inside an instance, whose save cannot keep one (#1818),
- *  and an object a prefab supplies, whose place is the prefab's — a renumber would reorder the instance (#1869). */
+ *  it (`planCollidingDrop`'s `fixed`): an object a prefab supplies, whose place is the prefab's — a renumber would reorder
+ *  the instance (#1869). */
 export function siblingKeepsItsPlace(id: number, supplied: (id: number) => boolean = isSuppliedByPrefab): boolean {
-  return !!placeholderWriteRefusal(id, 'EntityAttributes', 'sortOrder') || supplied(id);
+  return supplied(id);
 }
 
 /** {@link siblingKeepsItsPlace} for one renumber's siblings, asked against one world (`suppliedByPrefabChecker`). */
@@ -95,12 +87,10 @@ export function siblingsKeepingTheirPlace(): (id: number) => boolean {
   return (id) => siblingKeepsItsPlace(id, supplied);
 }
 
-/** The words for a colliding drop `planCollidingDrop` found no room for, naming the sibling that keeps its place. */
+/** The words for a colliding drop `planCollidingDrop` found no room for, naming the sibling that keeps its place: an
+ *  object a prefab supplies, the one kind that does since a Missing Prefab placeholder's order is saved (#1901). */
 export function stuckDropText(stuck: number): string {
-  const name = entityNameOf(stuck);
-  return isSuppliedByPrefab(stuck)
-    ? `Can't place it here: "${name}" and its neighbour share one place in the prefab's order, so there is no room between them, and the prefab's own objects are not renumbered. Place it before or after both.`
-    : `Can't place it here: "${name || 'Missing Prefab'}" is a Missing Prefab inside this instance, and its place in the order can't be saved, so there is no room to place anything beside it. Restore the prefab and reload the scene to reorder them.`;
+  return `Can't place it here: "${entityNameOf(stuck)}" and its neighbour share one place in the prefab's order, so there is no room between them, and the prefab's own objects are not renumbered. Place it before or after both.`;
 }
 
 /** Say a write was refused before it changed anything (#1818): the console for the record, and a toast, since the
@@ -1475,15 +1465,6 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const oldFolder = ((findEntity(entityId)?.get(attrMeta.trait as never) as { editorFolder?: string } | undefined)?.editorFolder) || '';
 
   const parentChanged = oldParentId !== newParentId;
-  // A Missing Prefab placeholder that lands inside an instance is saved as an added node, which keeps no USER `sortOrder`
-  // (#1818, `PLACEHOLDER_ENTRY_ONLY_FIELDS`); the load spawns it at what its node record states (the template's value,
-  // #1897), else 0 (`sortOrderAsNode`). So the move puts it there, where the reload will, rather than at the dropped
-  // position or its old entry order, and a reorder alone is refused, named.
-  if (isMissingPrefabPlaceholder(entityId) && isUnderPrefabInstance(newParentId, entityId)) {
-    if (!parentChanged) { reportWriteRefusal(placeholderRefusalWords(entityNameOf(entityId))); return false; }
-    const ref = unresolvedRefOf(findEntity(entityId));
-    newSortOrder = ref ? sortOrderAsNode(ref.kind, ref.record) : 0;
-  }
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
   if (!parentChanged && !orderChanged) return false;
   // A prefab-supplied object neither moves nor takes a new place (#1869). The backstop for a direct caller, as the checks

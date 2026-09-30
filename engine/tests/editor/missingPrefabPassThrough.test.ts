@@ -51,11 +51,12 @@ import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/sc
 import { buildPrefabEditScene, serializePrefabEditWorld, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { applyAssetPathMoves } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { snapshotEntity, respawnFromSnapshot, copySnapshot } from '../../packages/modoki/src/editor/undo/entityActions';
+import { snapshotEntity, respawnFromSnapshot, copySnapshot, pasteEntityCopy, siblingDropRefusal } from '../../packages/modoki/src/editor/undo/entityActions';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { registerAsset, resolveRef, resolveGuidToPath, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
-import { asAddedNode } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
+import { asAddedNode, nodePlacement } from '../../packages/modoki/src/runtime/loaders/unresolvedPrefabRefs';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -244,9 +245,17 @@ describe('a scene-added reference node whose prefab is missing keeps its node (#
 describe('a missing-prefab reference node is re-emitted in the writer\'s key order (#1722)', () => {
   it('an entry record dragged under a member: identity first, then the channels in their own order', () => {
     const entry = { name: 'Old', traits: { EntityAttributes: { name: 'Old' } }, prefab: Q, overrides: { 1: { Transform: { x: 2 } } }, members: { '/g': { name: 'QX' } }, guid: QINST };
-    const node = asAddedNode('entry', entry, Q, { name: 'QInst', parentLocalId: 2, identity: { guid: QINST } });
+    const node = asAddedNode('entry', entry, Q, { name: 'QInst', parentLocalId: 2, identity: { guid: QINST }, order: { sortOrder: 0, isActive: true } });
     expect(Object.keys(node)).toEqual(['parentLocalId', 'guid', 'name', 'traits', 'children', 'prefab', 'overrides', 'members']);
     expect(node.traits).toEqual({}); // an entry's root traits are not a node's (docs/prefabs.md § A missing prefab keeps its record)
+  });
+
+  it('a node record keeps its traits\' key order, with the live order written in place (#1901)', () => {
+    // Mutation: build the node's EntityAttributes from the live order first, then the record's — a record stating
+    // isActive before sortOrder is re-emitted the other way round, and a no-edit save churns the file.
+    const rec = { parentLocalId: 1, guid: QINST, name: 'QInst', traits: { EntityAttributes: { isActive: false, sortOrder: 2 } }, children: [], prefab: Q };
+    const node = asAddedNode('node', rec, Q, { name: 'QInst', parentLocalId: 1, identity: { guid: QINST }, order: { sortOrder: 4, isActive: false } });
+    expect(JSON.stringify(node.traits)).toBe(JSON.stringify({ EntityAttributes: { isActive: false, sortOrder: 4 } }));
   });
 });
 
@@ -517,7 +526,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   });
 
   it('an inactive root the same way', async () => {
-    // Mutation: `PLACEHOLDER_ENTRY_ONLY_FIELDS` loop in `placementForMissing` skips isActive — the placeholder reloads active.
+    // Mutation: `PLACEHOLDER_ORDER_FIELDS` loop in `placementForMissing` skips isActive — the placeholder reloads active.
     await liveThenTrashed({ isActive: false });
     const first = await save();
     expect(traitsEa(entryOf(first, INST)!)).toEqual({ isActive: false, parentId: HOLDER });
@@ -563,8 +572,8 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
 
   // NOT RULED (#1818's channel, recorded here as observed, not fixed): a placeholder reordered while its prefab is
   // missing states the new order in the entry's own traits, which a resolving root's load reads nothing of but
-  // `parentId`. So the prefab's return drops the reorder, and the root takes its template's value. I21's owner ruling
-  // covers the NODE shape (refused there for this reason); the ENTRY shape's is open.
+  // `parentId`. So the prefab's return drops the reorder, and the root takes its template's value. The NODE shape does the
+  // same since #1901 (owner ruling, shape 2: the placeholder keeps what it shows while the prefab is missing).
   it('OBSERVED: a reorder made while the prefab is missing does not survive the prefab\'s return', async () => {
     await liveThenTrashed({ sortOrder: 3 });
     await load(await save());
@@ -577,8 +586,8 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   });
 
   // #1897 (owner ruling A, 2026-09-30), #1895's nested twin: a scene-added reference NODE whose prefab is trashed states
-  // its TEMPLATE's sortOrder / isActive in its own traits, and its placeholder is spawned with them. I21 is narrowed, not
-  // reversed: a user edit of either on the node placeholder is still refused.
+  // its TEMPLATE's sortOrder / isActive in its own traits, and its placeholder is spawned with them. Since #1901 a user
+  // edit of either on the node placeholder is kept the same way (I21).
   const nodeUnderA = async (qFields: Record<string, unknown>) => {
     const q = qDoc();
     Object.assign(q.entities[0]!.traits.EntityAttributes, qFields);
@@ -632,8 +641,8 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   });
 
   it('a node reordered while its prefab was live keeps that order once it is trashed; the override still applies on return (#1897 review F2)', async () => {
-    // Mutation: pass the node's `ch.overrides` to `placementForMissing` in `captureNestedRef` (skip an override-stated
-    // field) — the node's traits are empty, the placeholder reloads at 0 and A's added list reorders.
+    // Mutation: in `nodePlacement`, skip a field a root override states even when the prefab is missing (the resolving
+    // rule applied to the missing case) — the node's traits are empty, the placeholder reloads at 0 and A's added list reorders.
     await nodeUnderA({});
     install(qDoc());
     writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'sortOrder', 5); // a marked reorder: a root override
@@ -650,9 +659,9 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     expect([...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])]).toEqual(liveMarks);
   });
 
-  it('a node placeholder moved under another member takes the sortOrder its reload spawns it at (#1897 review F1)', async () => {
-    // Mutation: `newSortOrder = 0` in `reparentEntity` (the old premise) — it shows at 0, and the reload's 2 reorders R's
-    // added list on the second save.
+  it('a node placeholder moved under another member keeps its sortOrder, and reloads at it (#1897 review F1, #1901)', async () => {
+    // Mutation: give a placeholder moved into an instance a seat of 0 in `reparentEntity` (#1897's premise, before #1901
+    // let the node keep what it shows) — it shows at 0, not 2.
     await nodeUnderA({ sortOrder: 2 });
     await load(await save());
     const R = rootOf(INST);
@@ -665,15 +674,218 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     expect(entitiesText(await save())).toBe(entitiesText(first));
   });
 
-  it('a node at the template default states nothing; a user edit of the placeholder\'s order is still refused (I21, #1897)', async () => {
-    // Mutation: drop the `PLACEMENT_DEFAULTS` skip — the node's traits gain sortOrder: 0, isActive: true.
+  it('a node at the template default states nothing; a user edit of the placeholder\'s order is let through (I21, #1897, #1901)', async () => {
+    // Mutation: drop the `PLACEMENT_DEFAULTS` skip in `nodePlacement` — the node's traits gain sortOrder: 0, isActive: true.
     await nodeUnderA({});
     const first = await save();
     expect(addedUnderA(first).find((n) => n.guid === QINST)!.traits).toEqual({});
     await nodeUnderA({ sortOrder: 2 });
     await load(await save());
-    expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'sortOrder')).toMatch(/Missing Prefab/);
-    expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'isActive')).toMatch(/Missing Prefab/);
+    // #1901 (owner ruling, shape 2): the node shape keeps both now, so the gate lets them through.
+    expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'sortOrder')).toBeNull();
+    expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'isActive')).toBeNull();
+    expect(placeholderWriteRefusal(rootOf(QINST), 'Transform', 'x')).toMatch(/Missing Prefab/); // the rest stays refused
+  });
+});
+
+// #1901 (owner ruling 2026-10-01, shape 2: the placeholder keeps what it shows). A Missing Prefab placeholder that lands
+// INSIDE an instance is saved as an added node (`asAddedNode`), which states its live `sortOrder` / `isActive` in the
+// node's own traits, and the reload seats them (`nodeSpawnPlacement`). One test per route the issue names.
+describe('a Missing Prefab placeholder that lands inside an instance reloads as it is shown (#1901)', () => {
+  const BOX = 'dddddddd-0000-4000-8000-000000001901';
+  const SIB = 'dddddddd-0000-4000-8000-000000001902';
+  const ea = (id: number) => readTraitData(id, meta('EntityAttributes')) as { sortOrder: number; isActive: boolean };
+  const idOf = (guid: string) => getAllEntities().find((e) => e.guid === guid)!.id;
+  const placement = (id: number) => ({ sortOrder: ea(id).sortOrder, isActive: ea(id).isActive });
+  const entitiesText = (s: SceneData) => JSON.stringify(s.entities);
+  /** Holder → Inst (P = R → A); Box, a plain top-level entity, holding an ENTRY of the missing Q loaded at sortOrder 3,
+   *  inactive; Sib, a plain top-level entity. */
+  async function loadWithQMissing() {
+    install(pDoc()); // Q is not installed: missing
+    await load(scene(P, [
+      { id: 3, guid: BOX, traits: { EntityAttributes: { name: 'Box', parentId: 0 } } },
+      { id: 4, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: BOX, sortOrder: 3, isActive: false } } },
+      { id: 5, guid: SIB, traits: { EntityAttributes: { name: 'Sib', parentId: 0 } } },
+    ]));
+    clearHistory();
+    expect(getAllEntities().find((e) => e.guid === QINST)?.missingPrefab).toBe(true); // precondition
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 3, isActive: false });
+  }
+  /** Save, reload, and assert a second save writes the first's bytes. Returns the first save. */
+  async function roundTrip(): Promise<SceneData> {
+    const first = await save();
+    await load(first);
+    expect(entitiesText(await save())).toBe(entitiesText(first));
+    return first;
+  }
+
+  it('T1: a placeholder inside a MOVED subtree keeps its order and flag', async () => {
+    // Mutation: `asAddedNode` ignores `live.order` — the entry record is written as a node with no traits, and the
+    // placeholder reloads at {0, true}.
+    await loadWithQMissing();
+    expect(reparentEntity(idOf(BOX), inside(INST, 'A'))).toBe(true);
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 3, isActive: false });
+    await roundTrip();
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 3, isActive: false });
+  });
+
+  it('T2: a paste and a duplicate into an instance take a fresh sortOrder, and reload at it', async () => {
+    // Mutation: return early from `assignFreshSortOrder` for every placeholder (`isMissingPrefabPlaceholder`, #1818's
+    // shape) — the paste keeps the copied 3, and a sibling at 4 sorts after it.
+    await loadWithQMissing();
+    const A = inside(INST, 'A');
+    expect(reparentEntity(idOf(SIB), A, 4)).toBe(true);
+    const pasted = pasteEntityCopy(snapshotEntity(idOf(QINST))!, A, () => {});
+    const pastedGuid = getAllEntities().find((e) => e.id === pasted)!.guid!;
+    expect(placement(pasted)).toEqual({ sortOrder: 5, isActive: false });
+    const dup = duplicateEntity(pasted, () => {})!;
+    const dupGuid = getAllEntities().find((e) => e.id === dup)!.guid!;
+    expect(placement(dup)).toEqual({ sortOrder: 6, isActive: false });
+    await roundTrip();
+    expect(placement(idOf(pastedGuid))).toEqual({ sortOrder: 5, isActive: false });
+    expect(placement(idOf(dupGuid))).toEqual({ sortOrder: 6, isActive: false });
+  });
+
+  it('T3: a placeholder moved INTO an instance keeps its flag, and takes the sortOrder it was dropped at', async () => {
+    // Mutation: restore `reparentEntity`'s placeholder seat (`sortOrderAsNode`) — it shows at 0, not 7.
+    await loadWithQMissing();
+    expect(reparentEntity(idOf(QINST), inside(INST, 'A'), 7)).toBe(true);
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 7, isActive: false });
+    await roundTrip();
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 7, isActive: false });
+  });
+
+  it('T4: once inside, a toggle and a reorder of the placeholder are let through, and kept', async () => {
+    // Mutation: restore the gate's node-shape refusal of sortOrder / isActive — both writes are refused.
+    await loadWithQMissing();
+    const A = inside(INST, 'A');
+    expect(reparentEntity(idOf(QINST), A, 7)).toBe(true);
+    expect(writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'isActive', true)).toBeNull();
+    expect(writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'sortOrder', 9)).toBeNull();
+    expect(siblingDropRefusal(idOf(QINST), A)).toBeNull();
+    await roundTrip();
+    expect(placement(idOf(QINST))).toEqual({ sortOrder: 9, isActive: true });
+  });
+
+  it('a placeholder at the defaults moved inside states nothing, so its node is the bytes a live save wrote', async () => {
+    // Mutation: drop the `PLACEMENT_DEFAULTS` test in `asAddedNode` — the node gains sortOrder: 0, isActive: true.
+    await loadWithQMissing();
+    writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'sortOrder', 0);
+    writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'isActive', true);
+    expect(reparentEntity(idOf(QINST), inside(INST, 'A'))).toBe(true);
+    const node = (entryOf(await save(), INST)!.members as Record<string, { added?: Array<{ guid: string; traits?: unknown }> }>)[`/${gA}`]!
+      .added!.find((n) => n.guid === QINST)!;
+    expect(node.traits).toEqual({});
+  });
+
+  it('cold load: a node reordered and deactivated while live, its prefab deleted outside the editor, loads as it was', async () => {
+    // Mutation: `nodePlacement` states nothing while the prefab resolves (the #1897 rule) — the live save carries only
+    // the root override, which a node placeholder cannot read, and it loads at {0, true}.
+    install(pDoc(), qDoc());
+    await load(scene(P, [
+      { id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } },
+      { id: 4, guid: SIB, traits: { EntityAttributes: { name: 'Sib', parentId: 'dddddddd-0000-4000-8000-000000001600', sortOrder: 1 } } },
+    ]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    reparentEntity(idOf(SIB), inside(INST, 'A'), 1);
+    writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'sortOrder', 5);
+    writeTraitFieldWithUndo(rootOf(QINST), meta('EntityAttributes'), 'isActive', false);
+    const liveMarks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort();
+    const live = await save();
+    uninstall(Q); // deleted outside the editor: the next load is cold
+    await load(live);
+    expect(getAllEntities().find((e) => e.guid === QINST)?.missingPrefab).toBe(true); // precondition
+    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 5, isActive: false });
+    expect(entitiesText(await save())).toBe(entitiesText(live));
+    install(qDoc()); // the prefab's return: the root override applies, and the marks are the live instance's
+    await load(live);
+    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 5, isActive: false });
+    expect([...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])].sort()).toEqual(liveMarks);
+  });
+
+  // #1901 close-out review F1: a node the TEMPLATE declares (a keyed node, supplied by the prefab) is the template's, and
+  // its frame's save states nothing of it, so the gate refuses every field there — a toggle, a reorder and a rename
+  // (the rename was dropped before #1901 too). PK = R → row 3 expanding P, whose `added` authors QK (Q) under P's A.
+  it('a placeholder of a TEMPLATE-keyed node takes no edit: the gate refuses, and the save still writes what the file said', async () => {
+    // Mutation: drop the `isSuppliedByPrefab` branch of `placeholderSavedFields` — the toggle is accepted, shows, and is
+    // gone after the reload.
+    const PK = 'cccccccc-0000-4000-8000-000000001740';
+    const pk = { id: PK, version: 5, name: 'PK', rootLocalId: 1, entities: [
+      row(1, 'KR', 0, 'eeeeeeee-0000-4000-8000-000000001741'),
+      { localId: 3, name: 'Prow', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001742', prefab: P,
+        added: [{ parentLocalId: 2, key: 'eeeeeeee-0000-4000-8000-000000001743', name: 'QK', prefab: Q, traits: {}, children: [] }],
+        traits: { EntityAttributes: { name: 'Prow', parentId: 1, guid: '' } } },
+    ] };
+    install(pDoc(), pk);
+    await load(scene(PK));
+    const qk = getAllEntities().find((e) => e.name === 'QK')!;
+    expect(qk.missingPrefab).toBe(true); // precondition
+    const before = await save();
+    for (const [field, value] of [['isActive', false], ['sortOrder', 4], ['name', 'Renamed']] as const) {
+      expect(writeTraitFieldWithUndo(qk.id, meta('EntityAttributes'), field, value)).toMatch(/Missing Prefab/);
+    }
+    expect(placement(qk.id)).toEqual({ sortOrder: 0, isActive: true });
+    expect(entitiesText(await save())).toBe(entitiesText(before));
+    // (The accept side, a node the SCENE added, is T4 above.)
+  });
+
+  // NOT FIXED (#1918, pre-existing, recorded as observed): in PREFAB EDIT the row writer takes only the name (and a parent
+  // inside the document) off a row placeholder, while the gate asks the scene writers' list, so a reorder and a toggle
+  // are accepted and the saved row states neither. When #1918 lands, this pin flips.
+  it('OBSERVED: a prefab-edit ROW placeholder takes a reorder and a toggle that the row writer drops', async () => {
+    const doc = pqDoc() as unknown as PrefabFile;
+    install(doc);
+    await load(buildPrefabEditScene(doc) as SceneData);
+    const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${PQ}` } as never);
+    try {
+      const q = getAllEntities().find((e) => e.name === 'Qrow')!;
+      expect(q.missingPrefab).toBe(true); // precondition
+      expect(writeTraitFieldWithUndo(q.id, meta('EntityAttributes'), 'sortOrder', 9)).toBeNull();
+      expect(writeTraitFieldWithUndo(q.id, meta('EntityAttributes'), 'isActive', false)).toBeNull();
+      expect(writeTraitFieldWithUndo(q.id, meta('EntityAttributes'), 'name', 'QrowRenamed')).toBeNull();
+      const out = serializePrefabEditWorld(PQ);
+      if ('error' in out) throw new Error(out.error);
+      expect(out.prefab.entities.find((e) => e.prefab === Q)!.traits.EntityAttributes).toEqual({ name: 'QrowRenamed', parentId: 1, guid: '' });
+    } finally {
+      editWorld.mockRestore();
+    }
+  });
+
+  // Review F3: the resolving rule on its own, so #1916's fix flipping the OBSERVED pin below does not leave it unguarded.
+  it('nodePlacement: while the prefab resolves only a root override\'s fields are stated; while it is missing, every non-default one', () => {
+    // Mutation: delete `if (resolves && !hasOwn(rootOverride, k)) continue;` — the first line states both fields.
+    const live = { sortOrder: 2, isActive: false };
+    expect(nodePlacement(true, undefined, live)).toEqual({});
+    expect(nodePlacement(true, { sortOrder: 2 }, live)).toEqual({ sortOrder: 2 });
+    expect(nodePlacement(false, undefined, live)).toEqual({ sortOrder: 2, isActive: false });
+    expect(nodePlacement(false, undefined, { sortOrder: 0, isActive: true })).toEqual({});
+  });
+
+  // NOT FIXED (a follow-up, recorded as observed): a value the TEMPLATE gives a live root carries no mark and no
+  // override, so a save while the prefab resolves states it nowhere, for either shape. A prefab deleted outside the
+  // editor then loads the placeholder at the defaults. docs/prefabs.md I21 names it.
+  it('OBSERVED: a root placed by its TEMPLATE, its prefab deleted outside the editor, loads cold at the defaults', async () => {
+    const q = qDoc();
+    Object.assign(q.entities[0]!.traits.EntityAttributes, { sortOrder: 2, isActive: false });
+    install(pDoc(), q);
+    await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
+    reparentEntity(rootOf(QINST), inside(INST, 'A'));
+    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 2, isActive: false }); // precondition: from the template, unmarked
+    const live = await save();
+    uninstall(Q);
+    await load(live);
+    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 0, isActive: true });
+  });
+  it('OBSERVED: the same for a top-level ENTRY placed by its template', async () => {
+    const p = pDoc();
+    Object.assign(p.entities[0]!.traits.EntityAttributes, { sortOrder: 2, isActive: false });
+    install(p);
+    await load(scene(P));
+    expect(placement(rootOf(INST))).toEqual({ sortOrder: 2, isActive: false }); // precondition: from the template, unmarked
+    const live = await save();
+    uninstall(P);
+    await load(live);
+    expect(placement(rootOf(INST))).toEqual({ sortOrder: 0, isActive: true });
   });
 });
 

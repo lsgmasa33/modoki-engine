@@ -370,10 +370,10 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
             // siblings first so we can compute a unique midpoint.
             const targetParent = entity.parentId;
             // Refused before the renumber below can push an entry of its own (`siblingDropRefusal`): a reparent refusal
-            // goes on to `requestReparent`, which reports it as it always has; a placeholder's reorder is said here.
+            // goes on to `requestReparent`, which reports it as it always has; a prefab-supplied mover's is said here.
             const dropRefused = siblingDropRefusal(id, targetParent);
             if (dropRefused?.kind === 'reparent') { onReparent(id, targetParent); return; }
-            if (dropRefused?.kind === 'placeholder' || dropRefused?.kind === 'restructure') { reportWriteRefusal(dropRefused.reason); return; }
+            if (dropRefused?.kind === 'restructure') { reportWriteRefusal(dropRefused.reason); return; }
             const loSort = zone === 'before' ? prevSiblingSort : entity.sortOrder;
             const hiSort = zone === 'before' ? entity.sortOrder : nextSiblingSort;
             const collides = loSort !== null && hiSort !== null && loSort === hiSort;
@@ -393,8 +393,8 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
                 // undo). Previously a raw writeTraitField loop bypassed undo, so
                 // Cmd+Z left every sibling rewritten (Hierarchy F1). Pushed before
                 // the reparent so undo peels reparent → renumber in order.
-                // A sibling that keeps its place (`siblingKeepsItsPlace`: a Missing Prefab placeholder inside an instance,
-                // #1818, or an object the prefab supplies, #1869) keeps its value, and the rest are numbered around it. The
+                // A sibling that keeps its place (`siblingKeepsItsPlace`: an object the prefab supplies, #1869) keeps its
+                // value, and the rest are numbered around it. The
                 // whole placement is decided before anything is written (`planCollidingDrop`), so a drop it refuses leaves
                 // no renumber entry behind.
                 const keeps = siblingsKeepingTheirPlace();

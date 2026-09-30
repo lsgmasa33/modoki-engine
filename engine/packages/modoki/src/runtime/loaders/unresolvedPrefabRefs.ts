@@ -38,8 +38,8 @@ export interface UnresolvedNode {
   guid?: string;
   key?: string;
   name?: string;
-  /** Only `EntityAttributes.sortOrder` / `isActive` are read: the template's placement a save states while the prefab
-   *  does not resolve (#1897). */
+  /** Only `EntityAttributes.sortOrder` / `isActive` are read: the placement a save states for the placeholder
+   *  (`nodeSpawnPlacement`; #1897, #1901). */
   traits?: Record<string, unknown>;
 }
 
@@ -63,7 +63,7 @@ export function keepUnresolvedEntry(world: World, placeholderId: number, source:
     // Where the ENTRY states its root's sibling position or active flag as a root override (#1850) — as a live
     // instance's save writes them — the placeholder loads with them: pass 1 read only the entry's own traits and left
     // the trait default, so the save ordered it as sortOrder 0 and a save→reload→save moved it among its siblings.
-    for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+    for (const k of PLACEHOLDER_ORDER_FIELDS) {
       const stated = rootOverrideOf(entry, k);
       if (stated.has && !hasOwn(entryAttributes(entry), k)) next[k] = stated.value;
     }
@@ -107,22 +107,16 @@ export function spawnUnresolvedReference(world: World, node: UnresolvedNode, par
   return entity.id();
 }
 
-/** The `sortOrder` / `isActive` a node placeholder is SPAWNED with: what the node states in its own traits (#1897) — the
- *  save writes the template's while the prefab does not resolve, since the placeholder has no template to take them from.
- *  Empty when it states none, and the trait defaults stand. */
+/** The `sortOrder` / `isActive` a node placeholder is SPAWNED with: what the node states in its own traits — the one
+ *  channel a node placeholder reads, since it has no template and no root localId to find a root override by. A live
+ *  node's save states them there when its prefab is missing (#1897) or a root override states them (#1901,
+ *  `nodePlacement`), and a placeholder's save writes its live ones (`asAddedNode`). Empty when it states none, and the
+ *  trait defaults stand. */
 export function nodeSpawnPlacement(node: { traits?: Record<string, unknown> }): Record<string, unknown> {
   const stated = (node.traits?.EntityAttributes ?? {}) as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) if (hasOwn(stated, k)) out[k] = stated[k];
+  for (const k of PLACEHOLDER_ORDER_FIELDS) if (hasOwn(stated, k)) out[k] = stated[k];
   return out;
-}
-
-/** The `sortOrder` a placeholder takes when it is moved INTO an instance: the one its reload spawns it at, since the
- *  save writes it there as an added node (`asAddedNode`). A node record keeps its own traits, so whatever it states
- *  (#1897); an entry record is written with none, so 0. */
-export function sortOrderAsNode(kind: 'entry' | 'node', record: Record<string, unknown>): number {
-  const stated = kind === 'node' ? nodeSpawnPlacement(record as { traits?: Record<string, unknown> }).sortOrder : undefined;
-  return typeof stated === 'number' ? stated : 0;
 }
 
 /** The record's edit channels, the part a scene entry and a reference node or row share. */
@@ -135,18 +129,20 @@ export const channelsOf = (record: Record<string, unknown>): Record<string, unkn
 /** The `EntityAttributes` fields of a placeholder that its writers take from the LIVE entity rather than the record
  *  (#1818, I21): what the Hierarchy can change on it. `name` and `guid` ride identity beside these. The editor's write
  *  gate (`editor/undo/placeholderGate.ts`) lets exactly these through, so an edit it allows is one the save keeps.
- *  ⚠️ A USER edit of `sortOrder` and `isActive` is carried by the ENTRY shape only (`asSceneEntry`): a reference node keeps
- *  its root's order and active flag as an override on the prefab's root row, which a placeholder cannot name without its
- *  prefab. The gate refuses them on a placeholder the save writes as a node (`placeholderWrittenAsNode`). A node carries
- *  only its TEMPLATE's values, stated while the prefab is missing (#1897, `nodeSpawnPlacement`). */
-export const PLACEHOLDER_ENTRY_ONLY_FIELDS = ['sortOrder', 'isActive'] as const;
-export const PLACEHOLDER_PLACEMENT_FIELDS = ['parentId', 'editorFolder', ...PLACEHOLDER_ENTRY_ONLY_FIELDS] as const;
-type EntryOnlyField = (typeof PLACEHOLDER_ENTRY_ONLY_FIELDS)[number];
+ *  The ORDER fields, `sortOrder` and `isActive`, are carried by both SCENE shapes (#1901, owner ruling: the placeholder
+ *  keeps what it shows): an entry in its traits or its root override (`asSceneEntry`), a node the scene added in its own
+ *  traits (`asAddedNode`). A node the TEMPLATE declares (keyed) is written by a writer that keeps none of them, and the
+ *  gate asks the writer (`placeholderSavedFields`); a prefab-edit row's writer keeps less too (#1918).
+ *  ⚠️ A node's live value holds while its prefab is missing: once the prefab returns, a resolving node's load reads none
+ *  of its traits, and the root takes its template's value or its root override (which the placeholder cannot name). */
+export const PLACEHOLDER_ORDER_FIELDS = ['sortOrder', 'isActive'] as const;
+export const PLACEHOLDER_PLACEMENT_FIELDS = ['parentId', 'editorFolder', ...PLACEHOLDER_ORDER_FIELDS] as const;
+type OrderField = (typeof PLACEHOLDER_ORDER_FIELDS)[number];
 
 /** What a live placeholder's `sortOrder` / `isActive` load as when the record does not state them: the trait's
  *  defaults, which a pass-1 spawn leaves. A save writes them only when the record states them or the live value
  *  differs, so a save with no edit writes the bytes it read (#1722). */
-const PLACEMENT_DEFAULTS: Readonly<Record<EntryOnlyField, unknown>> = { sortOrder: 0, isActive: true };
+const PLACEMENT_DEFAULTS: Readonly<Record<OrderField, unknown>> = { sortOrder: 0, isActive: true };
 
 /** The record as a TOP-LEVEL scene entry, identity and placement from the live placeholder. An entry record is
  *  returned whole, with only those replaced; a node record (a reference node dragged to the scene root) keeps its
@@ -154,7 +150,7 @@ const PLACEMENT_DEFAULTS: Readonly<Record<EntryOnlyField, unknown>> = { sortOrde
  *  `sortOrder` and `isActive` (#1818), written in place of the record's own so the key order holds. */
 export function asSceneEntry(
   kind: 'entry' | 'node', record: Record<string, unknown>, source: string,
-  live: { name: string; guid?: string; placement: Record<string, unknown>; order?: Readonly<Record<EntryOnlyField, unknown>> },
+  live: { name: string; guid?: string; placement: Record<string, unknown>; order?: Readonly<Record<OrderField, unknown>> },
 ): Record<string, unknown> {
   const traits: Record<string, unknown> = kind === 'entry' && record.traits && typeof record.traits === 'object'
     ? { ...(record.traits as Record<string, unknown>) }
@@ -166,7 +162,7 @@ export function asSceneEntry(
   Object.assign(ea, live.placement);
   const base: Record<string, unknown> = kind === 'entry' ? { ...record } : { prefab: source, ...channelsOf(record) };
   if (live.order) {
-    for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+    for (const k of PLACEHOLDER_ORDER_FIELDS) {
       // A field the entry states as a root OVERRIDE is written back there (#1850): the placeholder loaded with it, so
       // an unedited one writes the bytes it read, and an edit lands where the prefab's return reads it — written into
       // the traits beside the override instead, the override would win again the moment the instance re-expanded.
@@ -185,9 +181,8 @@ export function asSceneEntry(
 }
 
 /** The `sortOrder` / `isActive` a save states on the entry's OWN `traits.EntityAttributes` for a LIVE instance whose
- *  prefab no longer resolves (#1895): each one the entry does not already state as a root override (`overrides`; the
- *  node caller passes none, since a node placeholder cannot read one, #1897) and whose live value is not the
- *  placeholder's default. A root whose value equals its template row's carries no mark and no override
+ *  prefab no longer resolves (#1895): each one the entry does not already state as a root override (`overrides`) and
+ *  whose live value is not the placeholder's default. A reference NODE's twin is `nodePlacement`. A root whose value equals its template row's carries no mark and no override
  *  (the template restores it), but this instance's next load has no template: it comes back as a Missing Prefab
  *  placeholder, which loaded the default, and the save moved the entry among its siblings. Stated here, the pass-1
  *  spawn seats it, and `asSceneEntry` writes it back in place (`k in ea`), so the second save writes the first's bytes.
@@ -203,7 +198,7 @@ export function placementForMissing(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const stated = overrides?.[rootLocalId]?.EntityAttributes;
-  for (const k of PLACEHOLDER_ENTRY_ONLY_FIELDS) {
+  for (const k of PLACEHOLDER_ORDER_FIELDS) {
     if (hasOwn(stated, k) || live?.[k] === undefined || live[k] === PLACEMENT_DEFAULTS[k]) continue;
     out[k] = live[k];
   }
@@ -218,19 +213,52 @@ function withRootOverride(record: Record<string, unknown>, current: Record<strin
   return { ...overrides, [lid]: { ...overrides[lid], EntityAttributes: { ...overrides[lid]!.EntityAttributes, [field]: value } } };
 }
 
+/** The `sortOrder` / `isActive` a LIVE scene reference node's save states in its own `traits.EntityAttributes`, for the
+ *  placeholder its next load spawns if the prefab is gone by then (`nodeSpawnPlacement`). A field whose live value is
+ *  the placeholder's default is never stated: the spawn leaves the default. Otherwise:
+ *   - the prefab is MISSING at this save (#1897: a trash mid-session, #1862's kept frame): every one, since the next
+ *     load has no template to take them from;
+ *   - it RESOLVES (#1901, the cold-load route): each one a ROOT OVERRIDE states (`rootOverride`, the captured
+ *     `overrides[<root localId>].EntityAttributes`). The override is what a node placeholder cannot read, so a prefab
+ *     deleted outside the editor loaded the reordered node at 0. A resolving node's load reads none of its traits, so
+ *     the statement costs the live instance nothing, and the override still applies once the prefab returns. The
+ *     parity of #1850, where an entry placeholder reads its root override itself. A value the TEMPLATE gives is not
+ *     stated while the prefab resolves, for either shape: see docs/prefabs.md I21. */
+export function nodePlacement(
+  resolves: boolean, rootOverride: Record<string, unknown> | undefined, live: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of PLACEHOLDER_ORDER_FIELDS) {
+    if (live?.[k] === undefined || live[k] === PLACEMENT_DEFAULTS[k]) continue;
+    if (resolves && !hasOwn(rootOverride, k)) continue;
+    out[k] = live[k];
+  }
+  return out;
+}
+
 /** The record as an ADDED reference node under `parentLocalId`, identity (guid, or key) and name from the live
  *  placeholder. A node record is returned whole with those replaced; an entry record (a top-level placeholder dragged
- *  under a member) keeps its channels. */
+ *  under a member) keeps its channels. `live.order` is the placeholder's `sortOrder` / `isActive` (#1901): written into
+ *  the node's own traits, where the reload's spawn reads them (`nodeSpawnPlacement`), so a placeholder that lands inside
+ *  an instance by ANY route reloads where and as it was shown. A field is written when the record states it or the live
+ *  value is not the default, so a save with no edit writes the bytes it read (#1722). */
 export function asAddedNode(
   kind: 'entry' | 'node', record: Record<string, unknown>, source: string,
-  live: { name: string; parentLocalId: number; identity: Record<string, unknown> },
+  live: { name: string; parentLocalId: number; identity: Record<string, unknown>; order: Readonly<Record<OrderField, unknown>> },
 ): Record<string, unknown> {
   const base: Record<string, unknown> = kind === 'node' ? { ...record } : { traits: {}, children: [], ...channelsOf(record) };
   // In the order `captureNestedRef` writes a reference node, so a save with no edit writes the bytes it read (#1722):
   // the node's own record came from that writer, and deleting its identity then re-spreading it moved `guid` to the end.
   const { parentLocalId: _p, guid: _g, key: _k, name: _n, traits, children, prefab: _s, ...channels } = base;
+  const nodeTraits = { ...((traits as Record<string, unknown> | undefined) ?? {}) };
+  const ea = { ...((nodeTraits.EntityAttributes as Record<string, unknown> | undefined) ?? {}) };
+  for (const k of PLACEHOLDER_ORDER_FIELDS) {
+    if (k in ea || live.order[k] !== PLACEMENT_DEFAULTS[k]) ea[k] = live.order[k];
+  }
+  if (Object.keys(ea).length) nodeTraits.EntityAttributes = ea;
+  else delete nodeTraits.EntityAttributes;
   return {
-    parentLocalId: live.parentLocalId, ...live.identity, name: live.name, traits: traits ?? {}, children: children ?? [],
+    parentLocalId: live.parentLocalId, ...live.identity, name: live.name, traits: nodeTraits, children: children ?? [],
     prefab: source, ...channels,
   };
 }

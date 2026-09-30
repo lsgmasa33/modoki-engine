@@ -434,36 +434,41 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     expect(r3.ok).toBe(true);
   });
 
-  it('sortOrder and isActive are refused on a placeholder saved as an added node (inside an instance)', async () => {
+  // #1901 (owner ruling, shape 2): the node shape keeps both, in the node's own traits, so the gate lets them through.
+  // Mutation: restore the gate's node-shape refusal of the order fields — both are refused.
+  it('sortOrder and isActive are let through on a placeholder saved as an added node (inside an instance)', async () => {
     install();
     await load(await save()); // P back: INST is a live instance again
     const holderUnderInst = idOf(INST);
     const node = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'Node', parentId: holderUnderInst, guid: 'ffffffff-0000-4000-8000-000000001818' }));
     const { markUnresolved } = await import('../../packages/modoki/src/runtime/core/unresolvedPrefabRef');
     markUnresolved(node as never, 'cccccccc-0000-4000-8000-00000000dead', 'node', { prefab: 'cccccccc-0000-4000-8000-00000000dead' });
-    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'sortOrder')).toMatch(/Missing Prefab/);
-    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'isActive')).toMatch(/Missing Prefab/);
-    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'name')).toBeNull(); // accept
+    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'sortOrder')).toBeNull();
+    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'isActive')).toBeNull();
+    expect(placeholderWriteRefusal(node.id(), 'EntityAttributes', 'name')).toBeNull();
+    expect(placeholderWriteRefusal(node.id(), 'Transform', 'x')).toMatch(/Missing Prefab/); // the rest is still refused
   });
 
-  // Mutation: in reparentEntity, set `newSortOrder = undefined` instead of 0 for a placeholder landing inside an instance —
-  // it keeps its old entry order (7), which the node save drops, so the reload shows 0 while the editor showed 7.
-  it('a placeholder moved into an instance takes sortOrder 0, where a node placeholder reloads; a plain entity keeps the drop\'s order', async () => {
+  // #1901: the node save keeps the placeholder's live order, so a move into an instance places it where it was dropped,
+  // as it does any entity. Mutation: seat a placeholder landing inside an instance at 0 in `reparentEntity` (#1897's
+  // premise) — it shows at 0, not 3.
+  it('a placeholder moved into an instance takes the drop\'s order, as a plain entity does', async () => {
     install();
     await load(await save());
     const ph = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'Loose', parentId: 0, sortOrder: 7, guid: 'ffffffff-0000-4000-8000-000000001834' }));
     const { markUnresolved } = await import('../../packages/modoki/src/runtime/core/unresolvedPrefabRef');
     markUnresolved(ph as never, 'cccccccc-0000-4000-8000-00000000dead', 'entry', { prefab: 'cccccccc-0000-4000-8000-00000000dead' });
     expect(reparentEntity(ph.id(), idOf(INST), 3)).toBe(true);
-    expect(getAllEntities().find((e) => e.id === ph.id())!.sortOrder).toBe(0);
+    expect(getAllEntities().find((e) => e.id === ph.id())!.sortOrder).toBe(3);
     const plain = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'PlainOne', parentId: 0, sortOrder: 7 }));
     expect(reparentEntity(plain.id(), idOf(INST), 3)).toBe(true); // accept
     expect(getAllEntities().find((e) => e.id === plain.id())!.sortOrder).toBe(3);
   });
 
-  // Mutation: remove the gate line from `assignFreshSortOrder` — the copy gets a fresh sortOrder its save cannot keep, and
-  // the reload puts it back to the copied value (fuzzer hunt seed 3233).
-  it('a duplicate of a node-shape placeholder keeps the copied sortOrder; a plain duplicate gets a fresh one', async () => {
+  // #1901: the node save keeps the copy's order, so a copy of a node placeholder is placed last like any copy (fuzzer hunt
+  // seed 3233 was the old shape: a fresh order its save could not keep). Mutation: return early from `assignFreshSortOrder`
+  // for every placeholder (`isMissingPrefabPlaceholder`) — the copy keeps the copied 0 and collides with its source.
+  it('a duplicate of a node-shape placeholder gets a fresh sortOrder, as a plain duplicate does', async () => {
     install();
     await load(await save());
     const inst = idOf(INST);
@@ -471,7 +476,7 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     const { markUnresolved } = await import('../../packages/modoki/src/runtime/core/unresolvedPrefabRef');
     markUnresolved(node as never, 'cccccccc-0000-4000-8000-00000000dead', 'node', { prefab: 'cccccccc-0000-4000-8000-00000000dead' });
     const copy = duplicateEntity(node.id(), () => {})!;
-    expect(getAllEntities().find((e) => e.id === copy)!.sortOrder).toBe(0);
+    expect(getAllEntities().find((e) => e.id === copy)!.sortOrder).toBeGreaterThan(0);
     const plainCopy = duplicateEntity(idOf(HOLDER), () => {})!; // accept: a plain copy is placed last
     expect(getAllEntities().find((e) => e.id === plainCopy)!.sortOrder).toBeGreaterThan(0);
   });
@@ -512,7 +517,7 @@ describe('a live-writing gesture on a placeholder is refused at its commit (#181
 });
 
 describe('renumberAround: the Hierarchy renumber leaves a fixed sibling\'s sortOrder alone (#1818)', () => {
-  // Mutation: ignore `fixed` in renumberAround — the placeholder is renumbered to 10.
+  // Mutation: ignore `fixed` in renumberAround — the fixed sibling is renumbered to 10.
   it('numbers the rest around it, in display order', () => {
     const r = renumberAround([{ id: 1, sortOrder: 0 }, { id: 2, sortOrder: 0, fixed: true }, { id: 3, sortOrder: 0 }]);
     expect(Array.isArray(r)).toBe(true);
@@ -532,7 +537,7 @@ describe('renumberAround: the Hierarchy renumber leaves a fixed sibling\'s sortO
     expect(changes.some((c) => c.id === 2)).toBe(false);
     const plan = planCollidingDrop(sibs, 4, 'after');
     expect('newSort' in plan).toBe(true);
-    // A drop INTO the span is refused, naming a real placeholder (3), never the plain sibling (2).
+    // A drop INTO the span is refused, naming a real kept sibling (3), never the plain sibling (2).
     expect(planCollidingDrop(sibs, 2, 'after')).toEqual({ stuck: 3 });
   });
 });
@@ -569,14 +574,14 @@ describe('requireWith follows a guid rename (#1819 close-out review)', () => {
 
 describe('siblingDropRefusal: the Hierarchy drop refused before its renumber writes (#1818 close-out re-review)', () => {
   // Mutation: drop the planReparent line — a drop beside a child of the mover renumbers first and leaves a stray entry.
-  it('names a reparent refusal (a drop under itself) and a placeholder reordered in its own instance; a plain drop passes', async () => {
+  it('names a reparent refusal (a drop under itself); a plain drop and a placeholder reordered in its own instance pass (#1901)', async () => {
     expect(siblingDropRefusal(idOf(HOLDER), idOf(HOLDER))).toEqual({ kind: 'reparent' });
     expect(siblingDropRefusal(idOf(HOLDER), 0)).toBeNull(); // accept
     const inst = idOf(INST);
     const node = spawnEntity(getCurrentWorld(), meta('EntityAttributes').trait({ name: 'Node', parentId: inst, guid: 'ffffffff-0000-4000-8000-000000001835' }));
     const { markUnresolved } = await import('../../packages/modoki/src/runtime/core/unresolvedPrefabRef');
     markUnresolved(node as never, 'cccccccc-0000-4000-8000-00000000dead', 'node', { prefab: 'cccccccc-0000-4000-8000-00000000dead' });
-    expect(siblingDropRefusal(node.id(), inst)).toMatchObject({ kind: 'placeholder' });
+    expect(siblingDropRefusal(node.id(), inst)).toBeNull(); // the node shape keeps its order since #1901
   });
 });
 

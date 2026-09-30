@@ -23,7 +23,7 @@ import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { asAddedNode, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap } from '../../runtime/loaders/prefabOverrides';
@@ -814,15 +814,17 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       const t = translateCarried(lid, moved.channels.overrides ?? {}, { added: moved.channels.added, removed: moved.channels.removed, removedTraits: moved.channels.removedTraits });
       return { ...moved.channels, overrides: t.overrides, added: t.structure.added, removed: t.structure.removed, removedTraits: t.structure.removedTraits };
     })() : moved.channels;
-    // A node whose prefab no longer resolves (trashed mid-session, its frame kept, #1862) states its root's LIVE sibling
-    // position and active flag in its own traits (#1897, owner ruling A): its next load has no template to take them from,
-    // and spawns a placeholder, which seats them (`spawnUnresolvedReference`). The template's value, or a root override
-    // made while the prefab was live — stated here even so, since a node placeholder reads only its traits (it has no
-    // `PrefabInstance.localId` to find a root override by), while a resolving node ignores them, so the override still
-    // applies once the prefab returns. Not a user edit on a placeholder: the gate still refuses those on a node (I21).
+    // A scene node states its root's LIVE sibling position and active flag in its own traits for the placeholder its next
+    // load spawns if the prefab is gone by then (`spawnUnresolvedReference` seats them): every one when the prefab no
+    // longer resolves (trashed mid-session, its frame kept, #1862; #1897, owner ruling A), and each one a ROOT OVERRIDE
+    // states while it does (#1901: a prefab deleted outside the editor, then a cold load). A node placeholder reads only
+    // its traits (it has no `PrefabInstance.localId` to find a root override by), while a resolving node ignores them, so
+    // the override still applies once the prefab returns (`nodePlacement`). The override is read in the live document's
+    // numbering, the one `pi.localId` is in (`moved`, before `translateLocalIds`).
     // Every live source is fetched before the save captures, so an empty cache here is a prefab that does not resolve.
-    const placement = getCachedPrefabSync(source) ? {} : placementForMissing(
-      undefined, pi?.localId as number,
+    const placement = nodePlacement(
+      !!getCachedPrefabSync(source),
+      (moved.channels.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[pi?.localId as number]?.EntityAttributes,
       readTraitData(ecsId, getTraitByName('EntityAttributes')!) as Record<string, unknown> | undefined,
     );
     return {
@@ -848,8 +850,12 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     if (unresolved) {
       if (opts.template) return null;
       consumedEcsIds.add(childEcsId);
+      // Its live order and flag go with it (#1901), whichever route put it here: a node's traits are the one place its
+      // reload reads them from.
+      const live = readTraitData(childEcsId, getTraitByName('EntityAttributes')!) as { sortOrder?: number; isActive?: boolean } | null;
       return asAddedNode(unresolved.kind, unresolved.record, unresolved.source, {
         name: byId.get(childEcsId)?.name || '', parentLocalId, identity: addedNodeIdentity(childEcsId, false, opts.readOnly),
+        order: { sortOrder: live?.sortOrder ?? 0, isActive: live?.isActive ?? true },
       }) as unknown as AddedEntity;
     }
     const kind = nestedRootKind(childEcsId);

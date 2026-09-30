@@ -50,11 +50,10 @@ export function makeReorderSiblingsAction(
 export interface RenumberSibling { id: number; sortOrder: number; fixed?: boolean }
 
 /** Renumber `siblings` (already in display order) to distinct, increasing `sortOrder`s `step` apart, leaving each
- *  `fixed` sibling's value where it is and numbering the rest around it. A Missing Prefab placeholder inside an
- *  instance is fixed: its save cannot keep a `sortOrder` (#1818, `placeholderWriteRefusal`), so writing one would show a
- *  reorder the reload undoes. Where two fixed siblings share a value (a node placeholder loads at 0 unless its record carries its template's, #1897) with others between
- *  them, those keep the value too: only a drop INTO that span is refused (`planCollidingDrop`), not every drop in the
- *  group. */
+ *  `fixed` sibling's value where it is and numbering the rest around it. An object a prefab supplies is fixed: its place
+ *  is the prefab's, and a renumber would reorder the instance (#1869, `siblingKeepsItsPlace`). Where two fixed siblings
+ *  share a value with others between them, those keep the value too: only a drop INTO that span is refused
+ *  (`planCollidingDrop`), not every drop in the group. */
 export function renumberAround(siblings: readonly RenumberSibling[], step = 10): SiblingSortChange[] {
   // Display order sorts by sortOrder first, so the fixed values never decrease along it. Between two that tie, the even
   // split below is a gap of 0: the siblings there keep the shared value, which is the span no number fits.
@@ -75,11 +74,11 @@ export function renumberAround(siblings: readonly RenumberSibling[], step = 10):
 }
 
 /** The Hierarchy's drop beside `targetId` when its neighbours' `sortOrder`s collide: the renumber to apply and the value
- *  the dropped entity takes, or `{ stuck }` naming the kept placeholder that leaves no room. Decided BEFORE anything is
+ *  the dropped entity takes, or `{ stuck }` naming the kept sibling that leaves no room. Decided BEFORE anything is
  *  written, so a refusal leaves no renumber entry behind (#1818 close-out re-review). `siblings` is the display order
  *  with the mover left out. The value is the midpoint with the renumbered neighbour, not a fixed ±5: `renumberAround`
  *  spaces the siblings between two kept values by less than 10, and ±5 then landed past the neighbour. Two kept
- *  placeholders side by side at one value (a node placeholder loads at 0) leave no number between them. */
+ *  siblings side by side at one value leave no number between them. */
 export function planCollidingDrop(
   siblings: readonly RenumberSibling[], targetId: number, zone: 'before' | 'after',
 ): { changes: SiblingSortChange[]; newSort: number } | { stuck: number } {
@@ -92,7 +91,7 @@ export function planCollidingDrop(
   if (!neighbour) return { changes: renumbered, newSort: zone === 'before' ? target - 5 : target + 5 };
   const other = next.get(neighbour.id)!;
   if (other === target) {
-    // Name a real placeholder: the drop's neighbour or its target when fixed, else the nearest fixed sibling (a plain
+    // Name a real kept sibling: the drop's neighbour or its target when fixed, else the nearest fixed sibling (a plain
     // one kept inside a tied span is not one).
     const nb = siblings.indexOf(neighbour);
     const order = [nb, at, ...siblings.map((_, i) => i).sort((x, y) => Math.abs(x - at) - Math.abs(y - at))];
