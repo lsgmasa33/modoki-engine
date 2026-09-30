@@ -143,6 +143,18 @@ export function getAssetWriteEpoch(path: string): number { return writeEpoch.get
  *  review 3). The START epoch, so a write already in flight when an outside change was held does not count as after it. */
 const landedWriteEpoch = new Map<string, number>();
 
+/** A prefab file write is starting (`prefabCommit`'s file landing, the door every editor prefab write passes — Save's
+ *  flush, the prefab-edit save's Overwrite, Apply): its start epoch, for {@link prefabWriteLanded}. The prefab twin of
+ *  the flush's own count, so a held outside change of a prefab can be superseded by any of them (#1889). */
+export function prefabWriteStarting(path: string): number {
+  writeEpoch.set(path, getAssetWriteEpoch(path) + 1);
+  return getAssetWriteEpoch(path);
+}
+/** The prefab write that started at `startedAt` LANDED on `path` (see {@link prefabWriteStarting}). */
+export function prefabWriteLanded(path: string, startedAt: number): void {
+  landedWriteEpoch.set(path, Math.max(landedWriteEpoch.get(path) ?? 0, startedAt));
+}
+
 /** The flushes writing each path right now, settled when that FLUSH ends (its bookkeeping included — the park is
  *  dropped and `lastFlushed` recorded only after the whole loop). An asset-doc undo waits on these before reading the
  *  file (#1710 close-out review): a step that read the pre-save bytes while the save was in flight discarded its park
@@ -434,18 +446,21 @@ export function clearAssetIfMatch(path: string): boolean {
 /** A baseline no file's sha256 can equal: the file under this park changed OUTSIDE the editor. */
 export const CHANGED_OUTSIDE_BASELINE = 'changed-outside-the-editor';
 
-/** Outside changes to asset files the watcher HOLDS until a focus gain or `modoki_refresh` (#1879), each with the
- *  editor's write count (`writeEpoch`) for that path when it was held. The park and the held change must not meet
- *  silently in either direction (#1879 close-out reviews):
+/** Outside changes to asset and PREFAB files the watcher HOLDS until a focus gain or `modoki_refresh` (#1879), each with
+ *  the editor's write count (`writeEpoch`) for that path when it was held. The park and the held change must not meet
+ *  silently in either direction (#1879 close-out reviews; a prefab since #1889 — its park is marked by the watcher's
+ *  keeper instead of a baseline, so only the second rule applies to it):
  *  - a Save before the release must not write a park over the outside change — so a park of a held path, made before
  *    the hold or after it, gets a baseline no file matches, and Cmd+S asks Overwrite or Cancel;
  *  - once the editor HAS written the file since (the human chose Overwrite), the outside change is gone from disk, and the
  *    release must apply nothing — dropping the park then threw away edits made after that save. */
-const heldOutside = new Map<string, number>();
+const heldOutside = new Map<string, { at: number; seq?: number }>();
 
-/** The watcher holds an outside change of `path` (a newer one restarts its count). Marks a park already there. */
-export function noteOutsideChangeHeld(path: string): boolean {
-  heldOutside.set(path, getAssetWriteEpoch(path));
+/** The watcher holds an outside change of `path` (a newer one restarts its count). Marks an asset-doc park already there
+ *  (a prefab's is the keeper's to mark — `keepParkedPrefabOverFileChange`). `seq` names the hold, so that only the change
+ *  it belongs to ends it ({@link endOutsideChangeHold}). */
+export function noteOutsideChangeHeld(path: string, seq?: number): boolean {
+  heldOutside.set(path, { at: getAssetWriteEpoch(path), seq });
   const d = dirty.get(path);
   if (!d || d.type === 'prefab') return false;
   dirty.set(path, { ...d, ifMatch: CHANGED_OUTSIDE_BASELINE });
@@ -456,12 +471,21 @@ export function noteOutsideChangeHeld(path: string): boolean {
 /** Has a write of the editor LANDED on `path` since its outside change was held (a refused Save does not count)? Then
  *  that change is no longer on disk. */
 export function outsideChangeSuperseded(path: string): boolean {
-  const at = heldOutside.get(path);
+  const at = heldOutside.get(path)?.at;
   return at !== undefined && (landedWriteEpoch.get(path) ?? 0) > at;
 }
 
-/** The release applied (or skipped) `path`'s held change: parks made from now on are ordinary. */
-export function endOutsideChangeHold(path: string): void { heldOutside.delete(path); }
+/** The release applied (or skipped) `path`'s held change `seq`: parks made from now on are ordinary. Only while the note
+ *  is that hold's or an OLDER one's (#1889 close-out reviews): a NEWER hold of the same file restarted it, and its change
+ *  is still to come — a change Play deferred, replayed at Stop, used to end the newer write's note by path. An older one
+ *  goes: a later hold REPLACES the earlier held change of its file, and one that notes nothing (a shader body's,
+ *  `viaSibling`) left the earlier note standing forever — every later park conflicted, every later body change skipped
+ *  as "saved over". */
+export function endOutsideChangeHold(path: string, seq?: number): void {
+  const noted = heldOutside.get(path);
+  if (!noted) return;
+  if (noted.seq === seq || (noted.seq !== undefined && seq !== undefined && noted.seq <= seq)) heldOutside.delete(path);
+}
 
 /** Is an outside change of `path` held and still on disk? A park made now must not be written over it unasked. */
 function outsideChangeStands(path: string): boolean {
@@ -628,7 +652,8 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
         // that other flush's to use.
         const now = dirty.get(path);
         if (entry.overwrite && now?.type === 'prefab' && now.overwrite) dirty.set(path, { ...now, overwrite: undefined });
-        if (landed.ok) { saved.push(path); written.set(path, entry); landedWriteEpoch.set(path, startedAt); continue; }
+        // Its landed epoch is stamped by the write door itself (`prefabWriteLanded`), as for every editor prefab write.
+        if (landed.ok) { saved.push(path); written.set(path, entry); continue; }
         failed.push({ path, error: landed.error, ...(landed.conflict ? { conflict: true } : {}) });
         errorsByPath.set(path, { error: landed.error, conflict: landed.conflict });
         continue;

@@ -71,6 +71,20 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   wins) — the same end an outside write had before #1879, only later. **Overwrite** writes the park, and the editor's
   write supersedes the held change (`outsideChangeSuperseded`: a write of the editor that LANDED after the hold; a Save
   refused by the conflict does not count): the release then applies nothing, so edits made after that save survive it.
+  A **prefab**'s hold is noted the same way (#1889) — its park is marked by the watcher's keeper rather than by a
+  baseline — and any editor prefab write that lands after it supersedes it, stamped at `prefabCommit`'s file door:
+  [prefabs.md](prefabs.md) § "Undo changes memory, Save writes files".
+  ⚠️ **Each change ends its OWN hold's note, right after the replay applies it** (`endDisposedOutsideHolds`). The note
+  is one per file, and each hold is numbered (`SceneChangedMsg.heldSeq`, recorded with the note): ended by path, a
+  change Play deferred and replayed at Stop deleted the note of a NEWER write held meanwhile, whose release then no
+  longer knew the editor had saved over it (#1889 close-out review F1), and two overlapping replays could do the same to
+  each other. It also ends an OLDER hold's note: a later hold replaces the earlier held change of its file, and one that
+  notes nothing (a shader body's, `viaSibling`) otherwise left that note standing forever — every later park conflicted,
+  every later body change skipped as "saved over" (third re-review). A change the replay defers again keeps its note,
+  and so do the prefabs collapsed into its reload (F2).
+  Ended at the END of the replay instead, an applied asset's note outlived it by the batch's later reloads, and a park
+  taken meanwhile started conflicted, so Save asked for no reason (the re-review). The newest note is the one that
+  counts.
 - **Only where the editor is.** `agentEditorOps.ts` turns the hold on (`enableOutsideChangeHold`), with the `refresh` op
   that applies it; a game page in dev has neither, and applies changes as they arrive.
 - **What Play or a hold deferred at a release stays in `pendingOutsideChanges`** until it replays; a refresh cannot

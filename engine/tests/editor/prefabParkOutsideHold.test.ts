@@ -12,13 +12,14 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
 
-const route = vi.hoisted(() => ({ disk: new Map<string, string>() }));
+const route = vi.hoisted(() => ({ disk: new Map<string, string>(), refuse: new Set<string>() }));
 const sha = (t: string) => createHash('sha256').update(t.replace(/^\uFEFF/, '')).digest('hex');
 const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   postWriteFile: async (path: string, content: string, _enc?: string, opts?: { ifMatch?: string }) => {
     const cur = route.disk.get(path);
+    if (route.refuse.has(path)) return answer(409, { reason: 'if-match' }); // changed between the step's read and its write
     if (opts?.ifMatch !== undefined && (cur === undefined || sha(cur) !== opts.ifMatch)) return answer(409, { reason: 'if-match' });
     route.disk.set(path, content);
     return answer(200, { ok: true, path });
@@ -40,7 +41,7 @@ import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, m
 import { acquirePrefab, getCachedPrefab, releaseAllForScene } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, getCachedPrefabSync, getPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { clearDirtyAssets, peekDirtyAsset, flushDirtyAssets, overwriteParkedAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { installEditorPrefabCacheWarm } from '../../packages/modoki/src/editor/scene/prefabCacheWarm';
@@ -50,7 +51,7 @@ import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
   holdOutsideChange, releaseOutsideChanges, enableOutsideChangeHold, _resetOutsideChangesForTests, heldOutsideChanges,
 } from '../../app/debug/agentBridge';
-import { resetPrefabMarkRecord, parkPrefabChanges } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { resetPrefabMarkRecord, parkPrefabChanges, commitPrefabWrites, commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { UndoRefusedError } from '../../packages/modoki/src/editor/undo/undoFailure';
@@ -147,13 +148,18 @@ const outsideWrite = (): void => {
   (doc.entities.find((e) => e.name === 'XA')!.traits as { Transform: { z: number } }).Transform.z = 7;
   route.disk.set(X_PATH, jsonFileBody(doc));
 };
+/** A second prefab, Y, that no instance uses: registered and on disk. */
+const Y = 'cccccccc-0000-4000-8000-0000000018a9';
+const Y_PATH = '/assets/prefabs/YH.prefab.json';
+const yDoc = (): PrefabFile => ({ id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(9))] } as unknown as PrefabFile);
+const addY = (): void => { registerAsset(Y, Y_PATH, 'prefab'); route.disk.set(Y_PATH, jsonFileBody(yDoc())); };
 /** The watcher's message for that write: held (the editor's hold is on), or applied at once (`arrives`, the hold off —
  *  how every outside change met the editor before #1879, and the behaviour a held change must reproduce). */
-async function watcherSees(mode: 'held' | 'arrives'): Promise<void> {
+async function watcherSees(mode: 'held' | 'arrives', urlPath = X_PATH): Promise<void> {
   enableOutsideChangeHold(mode === 'held');
-  try { holdOutsideChange({ urlPath: X_PATH, kind: 'prefab' }); } finally { enableOutsideChangeHold(true); }
+  try { holdOutsideChange({ urlPath, kind: 'prefab' }); } finally { enableOutsideChangeHold(true); }
   await quietly(async () => { for (let i = 0; i < 20; i++) await new Promise<void>((r) => setImmediate(r)); });
-  if (mode === 'held') expect(heldOutsideChanges(), 'precondition: the change is held').toEqual([X_PATH]);
+  if (mode === 'held') expect(heldOutsideChanges(), 'precondition: the change is held').toContain(urlPath);
 }
 /** XA's z in the editor's cached X: 7 once the outside change is adopted. */
 const cachedXAz = () => ((getCachedPrefabSync(X)!.entities.find((e) => e.name === 'XA')!.traits as { Transform: { z: number } }).Transform.z);
@@ -167,6 +173,7 @@ beforeEach(async () => {
   _resetSceneAdoptionForTests();
   _resetOutsideChangesForTests();
   route.disk.clear();
+  route.refuse.clear();
   vi.stubGlobal('fetch', serve);
   registerAsset(X, X_PATH, 'prefab');
   route.disk.set(X_PATH, jsonFileBody(diskDoc()));
@@ -208,6 +215,146 @@ describe('an outside change to a PARKED prefab meets the park the same way held 
     const saved = await quietly(() => flushDirtyAssets());
     expect(diskRow('XA').z, 'the outside change is still on disk').toBe(7);
     expect(saved.saved).not.toContain(X_PATH);
+  });
+});
+
+describe('an Overwrite Save SUPERSEDES the held change: the release marks no park made after it', () => {
+  it.each(['arrives', 'held'] as const)('%s: after Overwrite, a redo re-parks and its undo back to the file drops the park', async (mode) => {
+    const d1 = await applyXB4();
+    await restore(diskDoc(), d1); // undo the Apply: D0 parked over D1
+    outsideWrite();
+    await watcherSees(mode);
+    const asked = await quietly(() => flushDirtyAssets());
+    expect(asked.failed, 'precondition: Save meets the outside change and asks').toEqual([expect.objectContaining({ path: X_PATH, conflict: true })]);
+    expect(overwriteParkedAsset(X_PATH)).toBe(true); // the human reads it and picks Overwrite
+    const over = await quietly(() => flushDirtyAssets());
+    expect(over.saved, 'precondition: the Overwrite wrote the park').toEqual([X_PATH]);
+    expect(diskRow('XB').x, 'precondition: the file holds the editor\'s D0').toBe(0);
+    expect(peekDirtyAsset(X_PATH), 'precondition: the write retired the park').toBeNull();
+    await restore(d1, diskDoc()); // redo: D1 parked, the file (D0, the editor's own write) its baseline
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'precondition: the new park starts on the file').toBeFalsy();
+    await release();
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'the file still holds the new park\'s baseline').toBeFalsy();
+    await restore(diskDoc(), d1); // undo: back on exactly what the file holds
+    expect(peekDirtyAsset(X_PATH), 'nothing unsaved: the file holds the document').toBeNull();
+    expect(await quietly(() => flushDirtyAssets())).toEqual({ saved: [], failed: [] });
+  });
+
+  /** Up to the Overwrite of the case above: the file holds the editor's D0, nothing parked, the held change superseded. */
+  async function overwriteHeld(): Promise<PrefabFile> {
+    const d1 = await applyXB4();
+    await restore(diskDoc(), d1);
+    outsideWrite();
+    await watcherSees('held');
+    await quietly(() => flushDirtyAssets());
+    overwriteParkedAsset(X_PATH);
+    expect((await quietly(() => flushDirtyAssets())).saved, 'precondition: the Overwrite wrote the park').toEqual([X_PATH]);
+    return d1;
+  }
+
+  // The accept side: only a change held BEFORE the editor's write is superseded by it. One held after it is on disk.
+  it('a change held AFTER the Overwrite still marks a park made after it: its undo keeps the park, and Save asks', async () => {
+    const d1 = await overwriteHeld();
+    await restore(d1, diskDoc()); // redo: D1 parked over the editor's D0
+    outsideWrite();
+    await watcherSees('held');
+    await release();
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'the file no longer holds the park\'s baseline').toBe(true);
+    await restore(diskDoc(), d1);
+    expect(peekDirtyAsset(X_PATH)?.type, 'the undo is still unsaved: the file holds the outside change').toBe('prefab');
+    const saved = await quietly(() => flushDirtyAssets());
+    expect(saved.failed).toEqual([expect.objectContaining({ path: X_PATH, conflict: true })]);
+    expect(diskRow('XA').z, 'nothing written over it unasked').toBe(7);
+  });
+
+  it('a change held AFTER the Overwrite, with nothing parked, is adopted on release', async () => {
+    await overwriteHeld();
+    outsideWrite();
+    await watcherSees('held');
+    expect(cachedXAz(), 'held: nothing applied yet').toBe(0);
+    await release();
+    expect(cachedXAz(), 'the release adopts it').toBe(7);
+    expect(tf(I1, 'XA').z, 'the instances take it in place').toBe(7);
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+  });
+});
+
+describe('what supersedes a held prefab change, and what does not (#1889 close-out review)', () => {
+  it('F1: a change DEFERRED by Play and replayed at Stop does not end a newer hold of the same file', async () => {
+    await applyXB4();
+    outsideWrite(); // A
+    await watcherSees('held');
+    setRunMode('playing');
+    const deferred = await release();
+    expect(deferred.deferred, 'precondition: Play defers A').toEqual([X_PATH]);
+    const b = JSON.parse(route.disk.get(X_PATH)!) as PrefabFile; // B: a second outside write, held during Play
+    (b.entities.find((e) => e.name === 'XA')!.traits as { Transform: { z: number } }).Transform.z = 8;
+    route.disk.set(X_PATH, jsonFileBody(b));
+    await watcherSees('held');
+    setRunMode('stopped'); // A replays once authoring settles (the editor's own signal), adopting what the file holds: B
+    await quietly(async () => { for (let i = 0; i < 40; i++) await new Promise<void>((r) => setImmediate(r)); });
+    expect(cachedXAz(), 'precondition: A\'s replay adopted the file').toBe(8);
+    expect(heldOutsideChanges(), 'precondition: B is still held').toEqual([X_PATH]);
+    const onB = getCachedPrefabSync(X)!;
+    await restore(diskDoc(), onB); // an undo parks P over the file (B)…
+    expect((await quietly(() => flushDirtyAssets())).saved, 'precondition: …and Save writes it').toEqual([X_PATH]);
+    await restore(onB, diskDoc()); // a redo parks B's document over the editor's own write
+    await release(); // B, which that Save wrote over
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'the file still holds the park\'s baseline').toBeFalsy();
+    await restore(diskDoc(), onB);
+    expect(peekDirtyAsset(X_PATH), 'back on the file: nothing unsaved').toBeNull();
+  });
+
+  it('F3: two prefabs released together — the one collapsed into the other\'s reload is superseded too', async () => {
+    addY();
+    const d1 = await applyXB4();
+    await restore(diskDoc(), d1);
+    outsideWrite();
+    await watcherSees('held'); // X, then Y: X is replayed as Y's `evictAlso`
+    const y = yDoc();
+    (y.entities[0]!.traits as { Transform: { x: number } }).Transform.x = 3;
+    route.disk.set(Y_PATH, jsonFileBody(y));
+    await watcherSees('held', Y_PATH);
+    await quietly(() => flushDirtyAssets());
+    overwriteParkedAsset(X_PATH);
+    expect((await quietly(() => flushDirtyAssets())).saved, 'precondition: the Overwrite wrote X').toEqual([X_PATH]);
+    await restore(d1, diskDoc());
+    await release();
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'X\'s file still holds the park\'s baseline').toBeFalsy();
+  });
+
+  it('F3: an Overwrite that is not Save\'s flush (the prefab-edit save\'s) supersedes the held change too', async () => {
+    await applyXB4();
+    outsideWrite();
+    await watcherSees('held');
+    const mine = diskDoc();
+    (mine.entities.find((e) => e.name === 'XB')!.traits as { Transform: { x: number } }).Transform.x = 5;
+    const wrote = await quietly(() => commitPrefabWrite(X, mine, { expected: diskDoc(), overwrite: true }));
+    expect(wrote.ok, 'precondition: the Overwrite wrote X').toBe(true);
+    expect(diskRow('XA').z, 'precondition: over the outside change').toBe(0);
+    const w = getCachedPrefabSync(X)!;
+    await restore(diskDoc(), w); // an undo parks over the editor's write
+    await release();
+    expect(peekDirtyAsset(X_PATH)?.fileChanged, 'the file holds the park\'s baseline').toBeFalsy();
+  });
+});
+
+describe('a write step REFUSED part-way supersedes nothing: its rollback puts the held change back', () => {
+  it('X written over its held change, Y refused, X rolled back: the release still adopts X', async () => {
+    addY();
+    outsideWrite();
+    await watcherSees('held');
+    // A writer that read the files as they are now (the outside change included) writes both; Y changes in between.
+    const onDisk = JSON.parse(route.disk.get(X_PATH)!) as PrefabFile;
+    const mine = JSON.parse(route.disk.get(X_PATH)!) as PrefabFile;
+    (mine.entities.find((e) => e.name === 'XB')!.traits as { Transform: { x: number } }).Transform.x = 9;
+    route.refuse.add(Y_PATH);
+    const res = await quietly(() => commitPrefabWrites([{ source: X, doc: mine, expected: onDisk }, { source: Y, doc: yDoc(), expected: yDoc() }]));
+    expect(res.ok, 'precondition: the step is refused at Y').toBe(false);
+    expect(diskRow('XB').x, 'precondition: X was rolled back').toBe(0);
+    expect(diskRow('XA').z, 'precondition: X holds the outside change again').toBe(7);
+    await release();
+    expect(cachedXAz(), 'the release adopts the outside change the rollback put back').toBe(7);
   });
 });
 

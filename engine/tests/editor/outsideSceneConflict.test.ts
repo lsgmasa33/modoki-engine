@@ -37,7 +37,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher, startRun, settle, piOf, type Fixture } from './prefabFuzz/harness';
-import { getAllEntities, getTraitByName, readTraitData } from '@modoki/engine/runtime';
+import { getAllEntities, getTraitByName, readTraitData, setRunMode } from '@modoki/engine/runtime';
 import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { getCachedPrefabSync, preloadNestedPrefabsForSubtree } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -55,7 +55,12 @@ import {
 import { makeSceneConflictResolver } from '../../app/editor/outsideRefresh';
 
 const be = makeFuzzBackend();
-vi.stubGlobal('fetch', be.fetch);
+/** Called with every URL fetched, before it is served: a test can act in the middle of a release. */
+const onFetch = { fn: null as null | ((url: string) => void) };
+vi.stubGlobal('fetch', (input: string | URL, init?: { method?: string; body?: string }) => {
+  onFetch.fn?.(String(input));
+  return be.fetch(input, init);
+});
 vi.stubGlobal('window', { __modokiElectron: { bridge } });
 vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
@@ -88,6 +93,7 @@ beforeEach(() => {
   dialog.answer = null;
   _setEditorFocusedForTests(() => false);
   _resetOutsideChangesForTests();
+  onFetch.fn = null;
 });
 
 /** Kid added under P1 (saved first when `saveFirst`), then applied to P. */
@@ -356,6 +362,83 @@ describe('a parked asset under a held outside write (review F1)', () => {
     expect((peekDirtyAsset(path)?.data as { maxParticles: number } | undefined)?.maxParticles, 'the edit made after the save').toBe(7);
     expect(pendingOutsideChanges()).toEqual([]);
     discardDirtyAssets([path]);
+  });
+});
+
+describe('each change ends its OWN hold, right after it is applied (#1889 close-out reviews)', () => {
+  const particle = (maxParticles: number) => ({ id: 'eeeeeeee-0000-4000-8000-0000000019f2', version: 1, maxParticles });
+  const body = (n: number) => `${JSON.stringify(particle(n), null, 2)}\n`;
+
+  it('a change Play deferred, replayed at Stop, leaves a NEWER held write of the file standing', async () => {
+    const f = await startRun(be, async () => {}, 'c-own-hold');
+    const path = `${f.root}/fx/f1.particle.json`;
+    be.write(path, body(1));
+    be.write(path, body(50)); // A
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    await settle();
+    setRunMode('playing');
+    try {
+      expect((await releaseOutsideChanges()).deferred, 'precondition: Play defers A').toEqual([path]);
+      be.write(path, body(60)); // B, held during Play
+      bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+      for (let i = 0; i < 20; i++) await new Promise<void>((r) => setImmediate(r)); // `settle` waits on the deferral
+    } finally { setRunMode('stopped'); }
+    await settle();
+    expect(pendingOutsideChanges(), 'precondition: A replayed, B still held').toEqual([path]);
+    markAssetDirty(path, 'particle', particle(5), 'panel'); // a park while B is held
+    expect(peekDirtyAsset(path)?.ifMatch, 'B stands: the park starts conflicted').toBe(CHANGED_OUTSIDE_BASELINE);
+    const saved = await flushDirtyAssets();
+    expect(saved.saved).toEqual([]);
+    expect(JSON.parse(be.read(path)!).maxParticles, 'Save did not write over B').toBe(60);
+    discardDirtyAssets([path]);
+  });
+
+  it('a shader BODY change replacing a held descriptor change ends the descriptor\'s note with it', async () => {
+    const f = await startRun(be, async () => {}, 'c-own-sibling');
+    const path = `${f.root}/fx/s.shader.json`;
+    const shader = (label: string) => ({ id: 'eeeeeeee-0000-4000-8000-0000000019f3', version: 1, label });
+    be.write(path, `${JSON.stringify(shader('a'), null, 2)}\n`);
+    be.write(path, `${JSON.stringify(shader('b'), null, 2)}\n`); // the descriptor itself, written outside: noted
+    bridge.emit('scene-changed', { urlPath: path, kind: 'shader' });
+    await settle();
+    bridge.emit('scene-changed', { urlPath: path, kind: 'shader', viaSibling: true }); // then its .wgsl: replaces it, notes nothing
+    await settle();
+    expect(pendingOutsideChanges(), 'precondition: one change held').toEqual([path]);
+    await releaseOutsideChanges();
+    await settle();
+    markAssetDirty(path, 'shader', shader('mine'), 'panel');
+    expect(peekDirtyAsset(path)?.ifMatch, 'nothing held: the park is ordinary').not.toBe(CHANGED_OUTSIDE_BASELINE);
+    discardDirtyAssets([path]);
+  });
+
+  it('a park made while a LATER change of the same release is still loading is ordinary', async () => {
+    const f = await startRun(be, async () => {}, 'c-own-window');
+    const path = `${f.root}/fx/w.particle.json`;
+    be.write(path, body(1));
+    // A git pull: the particle and prefab P change outside, both held.
+    be.write(path, body(99));
+    const pDoc = JSON.parse(be.read(f.prefabs.P.path)!) as { entities: { name: string; traits: { Transform: { x: number } } }[] };
+    pDoc.entities.find((e) => e.name === 'A')!.traits.Transform.x = 7;
+    be.write(f.prefabs.P.path, `${JSON.stringify(pDoc, null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    bridge.emit('scene-changed', { urlPath: f.prefabs.P.path, kind: 'prefab' });
+    await settle();
+    expect(pendingOutsideChanges().sort()).toEqual([path, f.prefabs.P.path].sort());
+    let parked = 0;
+    const pFile = f.prefabs.P.path.split('/').pop()!;
+    onFetch.fn = (url) => {
+      if (parked || !url.includes(pFile)) return;
+      parked++; // the particle's change is applied already (the prefab replays last): a panel edit now
+      markAssetDirty(path, 'particle', particle(5), 'panel');
+    };
+    await releaseOutsideChanges();
+    await settle();
+    onFetch.fn = null;
+    expect(parked, 'precondition: the release fetched P after applying the particle').toBe(1);
+    expect(peekDirtyAsset(path)?.ifMatch, 'the park is over the file as the editor loaded it').not.toBe(CHANGED_OUTSIDE_BASELINE);
+    const r = await flushDirtyAssets();
+    expect(r.failed).toEqual([]);
+    expect(JSON.parse(be.read(path)!).maxParticles).toBe(5);
   });
 });
 

@@ -1904,7 +1904,14 @@ watcher's keeper): its baseline no longer names the file, so the park stays for 
 hold). Marked only at the release, a redo during the hold back to the park's baseline dropped the park, and the release
 then adopted the outside file over the unsaved document silently, where Save used to ask (the #1879 × #1868 seam,
 `prefabParkOutsideHold.test.ts`, which runs each case with the change held AND arriving and requires the same outcome).
-A held change to an UNPARKED prefab is untouched until the release, which adopts it silently as before. An **Overwrite** answers one conflict: the flush that wrote with it clears it, whatever it did (F6), and a flush
+A held change to an UNPARKED prefab is untouched until the release, which adopts it silently as before. **An editor
+write landing after the hold supersedes the held change** (#1889, the prefab twin of `outsideChangeSuperseded` — see
+[editor-hmr.md](editor-hmr.md)): the release neither marks a park nor adopts the file. Without it, Save → Overwrite →
+redo parked a new document over the editor's own write, the release's keeper marked THAT park, and an undo back to the
+file kept it "unsaved" — Save then rewrote identical bytes unasked; on arrival the change was consumed before the
+Overwrite, so held and arriving diverged. Every editor prefab write counts, not only Save's flush: the epoch is stamped
+at the one file door (`prefabCommit`'s `landFiles` — `prefabWriteStarting` / `prefabWriteLanded`), so the prefab-edit
+save's Overwrite supersedes too. A change held AFTER that write is on disk, and is marked or adopted as ever. An **Overwrite** answers one conflict: the flush that wrote with it clears it, whatever it did (F6), and a flush
 that did not leaves it for the Save that asked.
 
 **Save** flushes a parked prefab through `commitPrefabWrite` over its baseline. `/api/asset-write` refuses the type.

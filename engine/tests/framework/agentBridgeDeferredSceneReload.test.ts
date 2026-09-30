@@ -172,6 +172,37 @@ describe('a change that becomes suppressed DURING its fetch is deferred again (#
   });
 });
 
+describe('a HELD change deferred again mid-replay keeps its hold\'s note (#1889 close-out review F2)', () => {
+  // The note says whether the editor wrote the file since the change was held. Ended as the replay moves on, a change the
+  // replay deferred again (Play pressed inside its fetch) replayed later with no note — so a prefab the editor had saved
+  // over since was no longer superseded, and its release marked a park made over that save.
+  it('the collapsed prefab the editor saved over stays superseded through the re-deferral', async () => {
+    const { enableOutsideChangeHold, setHeldPrefabSuperseded, releaseOutsideChanges, _resetOutsideChangesForTests } = bridgeMod;
+    const { outsideChangeSuperseded, prefabWriteStarting, prefabWriteLanded, clearDirtyAssets } = await import('../../packages/modoki/src/editor/scene/dirtyAssets');
+    const editor = await import('@modoki/engine/editor'); // loaded before the holds: their notes import it
+    expect(editor.outsideChangeSuperseded, 'fixture: one module instance').toBe(outsideChangeSuperseded);
+    const OTHER = '/games/g/runtime/assets/Other.prefab.json';
+    enableOutsideChangeHold(true);
+    setHeldPrefabSuperseded(outsideChangeSuperseded);
+    try {
+      emit(OTHER, 'prefab');
+      emit(PREFAB_PATH, 'prefab'); // last: OTHER replays collapsed into Crate's reload, which the scene uses
+      await settle();
+      prefabWriteLanded(OTHER, prefabWriteStarting(OTHER)); // the editor saves over OTHER's held change
+      expect(outsideChangeSuperseded(OTHER), 'precondition: superseded').toBe(true);
+      fetchSuppressesOnScene = true; // Play is pressed while the reload reads the scene
+      const report = await releaseOutsideChanges();
+      expect(report.deferred.sort(), 'precondition: both deferred again').toEqual([OTHER, PREFAB_PATH].sort());
+      expect(outsideChangeSuperseded(OTHER), 'its note outlives the deferral: the replay still knows').toBe(true);
+    } finally {
+      enableOutsideChangeHold(false);
+      setHeldPrefabSuperseded(null);
+      _resetOutsideChangesForTests();
+      clearDirtyAssets();
+    }
+  });
+});
+
 describe('a prefab change evicts the cached prefab before its reload (#1169)', () => {
   it('while stopped: the cache entry is gone by the time the scene reloads', async () => {
     let cachedAtLoad: unknown = 'not-called';

@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
 import { startCountdown } from '../debug/countdownBanner';
 import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
@@ -50,7 +50,7 @@ import {
   planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene, PREFAB_EDIT_REFUSAL_TEXT, PrefabEditRefusalError, assertPrefabEditAllows,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
-  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, discardDirtyAssets,
+  runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, outsideChangeSuperseded, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
   getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, createPrefabFromEntity,
   runtimeExcludedMessage,
@@ -1464,6 +1464,8 @@ export function registerEditorAgentOps(): void {
   });
   // …and a PARKED prefab keeps its park across a change on disk (#1868, hub call a), its baseline marked stale.
   setParkedPrefabKeeper(keepParkedPrefabOverFileChange);
+  // …unless the editor wrote the file since its change was held (#1889): then the change is gone from disk.
+  setHeldPrefabSuperseded(outsideChangeSuperseded);
   // #1879 part 3 (owner ruling 2026-09-30, amends #1164 for the dirty case): an outside change to a scene with unsaved
   // edits ASKS "Reload / Keep mine" instead of letting the disk win. Unsaved = that scene's OWN edits: the primary's
   // `sceneDirty` (the world's edit version against its save), a loaded base's dirty flag. Not the scene-guid registry

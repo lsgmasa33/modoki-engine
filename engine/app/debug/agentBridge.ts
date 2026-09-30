@@ -696,6 +696,15 @@ export function setParkedPrefabKeeper(fn: ((urlPath: string) => boolean) | null)
   _parkedPrefabKeeper = fn;
 }
 
+/** Has the editor written `urlPath` since its outside change was HELD (#1889 — `outsideChangeSuperseded`)? The prefab
+ *  twin of {@link heldAssetSuperseded}, installed like the keeper and SYNCHRONOUS like it: the prefab branch of
+ *  `handleSceneChanged` reads the keeper in the tick the change arrives, and an await in front of it moved every later
+ *  step. Only asks, as that one does. Unset (a game page), nothing is superseded. */
+let _heldPrefabSuperseded: ((urlPath: string) => boolean) | null = null;
+export function setHeldPrefabSuperseded(fn: ((urlPath: string) => boolean) | null): void {
+  _heldPrefabSuperseded = fn;
+}
+
 /** Editor-only: install the editor-side prefab refresh. Called from `agentEditorOps.ts`. */
 export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>) | null): void {
   _prefabSourceRefresher = fn;
@@ -3060,15 +3069,28 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
   } catch { /* not an editor context — no registry to clear */ }
 }
 
-/** Ends the hold of `urlPath`'s outside asset change, answering whether the editor wrote the file since
- *  (`outsideChangeSuperseded`). False where there is no editor (a game page applies changes as they arrive). */
+/** Has the editor written `urlPath` since its outside asset change was held (`outsideChangeSuperseded`)? False where there
+ *  is no editor (a game page applies changes as they arrive). Only asks: the hold's note is ended where the change is
+ *  disposed of, {@link endDisposedOutsideHolds}. */
 async function heldAssetSuperseded(urlPath: string): Promise<boolean> {
   try {
-    const { outsideChangeSuperseded, endOutsideChangeHold } = await import('@modoki/engine/editor');
-    const superseded = outsideChangeSuperseded(urlPath);
-    endOutsideChangeHold(urlPath);
-    return superseded;
+    const { outsideChangeSuperseded } = await import('@modoki/engine/editor');
+    return outsideChangeSuperseded(urlPath);
   } catch { return false; }
+}
+
+/** End the editor's note of each of `msgs`' holds, once the replay has disposed of the change — applied or skipped, not
+ *  deferred again (#1889 close-out reviews). Each ends ITS OWN hold (`heldSeq`): the note is per file, and ended by path, a
+ *  change Play deferred and replayed at Stop deleted the note of a NEWER write held meanwhile, whose release then no
+ *  longer knew the editor had saved over it (F1). Ended right after its change, not at the end of the replay: an applied
+ *  asset's note, alive until the batch's later reloads finished, made a park taken meanwhile start conflicted (re-review). */
+async function endDisposedOutsideHolds(msgs: readonly SceneChangedMsg[]): Promise<void> {
+  const noted = msgs.filter((m) => m.heldSeq !== undefined && _suppressedReloads.get(m.urlPath)?.heldSeq !== m.heldSeq);
+  if (!noted.length) return;
+  try {
+    const { endOutsideChangeHold } = await import('@modoki/engine/editor');
+    for (const m of noted) endOutsideChangeHold(m.urlPath, m.heldSeq);
+  } catch { /* not an editor context — nothing was noted */ }
 }
 
 /** `inPlace`: a prefab the editor itself put back to its file (a discarded park, #1873 S2) — replayed as an in-place
@@ -3079,6 +3101,9 @@ type SceneChangedMsg = {
   /** An agent's answer (`modoki_refresh`'s `scene`) for a scene over unsaved work, carried ON the change: a release that
    *  Play or an undo step defers replays later, outside the release that was given it. */
   decision?: 'reload' | 'keep';
+  /** Which hold this is (`holdOutsideChange` numbers them): the editor's note of it (`noteOutsideChangeHeld`) is ended by
+   *  this change and no other ({@link endDisposedOutsideHolds}). */
+  heldSeq?: number;
 };
 
 /** Scene/prefab changes that arrived while the reload was suppressed, keyed by `urlPath`, in the
@@ -3114,15 +3139,17 @@ export async function replaySuppressedSceneReloads(): Promise<number> {
   _suppressedReloads.clear();
   console.log(`[agentBridge] replaying ${pending.length} held scene/asset change(s)`);
   // One change that throws must not drop the rest of the batch: the map is already cleared (review U3).
-  const apply = (m: SceneChangedMsg, evict: readonly string[] = []) => handleSceneChanged(m, evict)
-    .catch((e) => console.error(`[agentBridge] applying the change to ${m.urlPath} failed:`, e));
+  const apply = async (m: SceneChangedMsg, evict: readonly SceneChangedMsg[] = []) => {
+    await handleSceneChanged(m, evict).catch((e) => console.error(`[agentBridge] applying the change to ${m.urlPath} failed:`, e));
+    await endDisposedOutsideHolds([m, ...evict]);
+  };
   for (const m of pending) if (m.kind !== 'prefab') await apply(m);
   // A prefab the editor put back to its file is RE-IMPORTED in place (#1873 S2) — keyed by path, so an outside write of
   // the same file since replaced its entry and takes the watcher's path below instead. Last: a reload replayed above
   // rebuilds these prefabs from the runtime cache, which still holds the discarded document, and this puts them right.
   const prefabs = pending.filter((m) => m.kind === 'prefab' && !m.inPlace);
   const last = prefabs.at(-1);
-  if (last) await apply(last, prefabs.slice(0, -1).map((m) => m.urlPath));
+  if (last) await apply(last, prefabs.slice(0, -1));
   const inPlace = pending.filter((m) => m.kind === 'prefab' && m.inPlace).map((m) => m.urlPath);
   if (inPlace.length) {
     // Suppressed again part-way (Play pressed mid-replay): held for the next replay, as a reload would be.
@@ -3211,8 +3238,10 @@ let _holdEnabled = false;
 export function enableOutsideChangeHold(on: boolean): void { _holdEnabled = on; }
 
 /** A change the watcher raised: held until a focus gain or `modoki_refresh`, never applied on arrival (#1879). */
-export function holdOutsideChange(msg: SceneChangedMsg): void {
-  if (!_holdEnabled) { void handleSceneChanged(msg); return; }
+let _holdSeq = 0;
+export function holdOutsideChange(arrived: SceneChangedMsg): void {
+  if (!_holdEnabled) { void handleSceneChanged(arrived); return; }
+  const msg: SceneChangedMsg = { ...arrived, heldSeq: ++_holdSeq };
   _outsideHold.hold(msg);
   // A PARKED prefab's baseline goes stale NOW, as it did when the change applied on arrival (`handleSceneChanged`'s
   // keeper). Marked only at the release, a restore during the hold (a redo back to the park's baseline) dropped the park
@@ -3224,10 +3253,12 @@ export function holdOutsideChange(msg: SceneChangedMsg): void {
   // one there now, or one made before the release — gets a baseline no file matches, so that Save asks Overwrite or
   // Cancel instead (#1879 close-out reviews, `noteOutsideChangeHeld`). Not a sibling-raised
   // change (a shader body): the descriptor file itself did not change (see `dropParkedWriteFor`'s caller).
-  if (!msg.viaSibling && hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind)) {
+  // A prefab's hold is noted too, for its write count only (#1889): an editor write landing on it before the release
+  // (Save's Overwrite) supersedes the change, which the release then skips (`handleSceneChanged`).
+  if (!msg.viaSibling && (msg.kind === 'prefab' || hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind))) {
     void import('@modoki/engine/editor')
       .then(({ noteOutsideChangeHeld }) => {
-        if (noteOutsideChangeHeld(msg.urlPath)) {
+        if (noteOutsideChangeHeld(msg.urlPath, msg.heldSeq)) {
           console.warn(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved edit — saving now asks whether to overwrite; the change applies at the next refresh`);
         }
       })
@@ -3377,7 +3408,8 @@ export function _watcherPrefabChangedForTests(urlPath: string): Promise<void> {
 
 /** Hot-reload the active scene when its file (or a prefab it uses) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly string[] = []): Promise<void> {
+async function handleSceneChanged(msg: SceneChangedMsg, evictMsgs: readonly SceneChangedMsg[] = []): Promise<void> {
+  const evictAlso = evictMsgs.map((m) => m.urlPath);
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
   // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
@@ -3422,10 +3454,16 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // from, and dropping it without a reload would leave them on a document neither the park nor the file holds. So the
   // file is neither evicted, re-read nor reloaded from; the keeper marks the park's baseline stale, so no later restore
   // drops it as "back to the file", and Save's precondition meets the change and asks Overwrite or Cancel.
+  // A HELD prefab change the editor has written over since (the human chose Overwrite and saved) is gone from disk, as for
+  // an asset document above (#1889): not marked on a park made after that write, whose baseline IS the file — a restore
+  // back to it then kept the park, and Save rewrote identical bytes unasked — and not adopted.
+  const released = msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso];
+  const superseded = new Set(released.filter((p) => _heldPrefabSuperseded?.(p)));
+  if (superseded.size) console.log(`[agentBridge] ${[...superseded].join(', ')}: the editor saved over its outside change since — nothing to apply`);
   const parked = _parkedPrefabKeeper ?? (() => false);
-  const changedPrefabs = (msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso]).filter((p) => !parked(p));
+  const changedPrefabs = released.filter((p) => !superseded.has(p) && !parked(p));
   if (msg.kind === 'prefab' && !changedPrefabs.length) {
-    console.log(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved prefab edit — kept the edit; saving asks whether to overwrite`);
+    if (!superseded.has(msg.urlPath)) console.log(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved prefab edit — kept the edit; saving asks whether to overwrite`);
     return;
   }
   // Suppressed during Play/Pause and inside a scrub/preview envelope: a reload now would rebuild the
@@ -3435,7 +3473,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // once authoring settles. Checked BEFORE `current`, so a change arriving with no scene loaded is
   // still recorded rather than lost the same way.
   const defer = (reason: string): void => {
-    const held = [msg, ...evictAlso.map((urlPath): SceneChangedMsg => ({ urlPath, kind: 'prefab' }))];
+    const held = [msg, ...evictMsgs]; // each keeps its `heldSeq`: its hold's note stays until this replays
     for (const m of held) {
       _suppressedReloads.delete(m.urlPath); // re-insert, so replay order follows the latest write
       _suppressedReloads.set(m.urlPath, m);

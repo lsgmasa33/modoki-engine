@@ -40,7 +40,7 @@ import { isPrefabDocument } from '../../runtime/loaders/prefabRoot';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { beginWorldBoundOperation } from '../undo/undoManager';
 import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from './adoptionGate';
-import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardDirtyAssets, assetWritesSettled } from './dirtyAssets';
+import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardDirtyAssets, assetWritesSettled, prefabWriteStarting, prefabWriteLanded } from './dirtyAssets';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { useEditorStore } from '../store/editorStore';
 import { localIdCounter, advanceLocalIdCounter, markUnstated, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
@@ -706,6 +706,8 @@ async function landFiles(
   // Every path is a write in flight until this step ends, so a park of one of these prefabs waits for it rather than
   // parking against a file this write is about to change (#1868 close-out re-review).
   holdWrites(beginAssetWrites(paths0));
+  // Counted from here, before the read: an outside change held once this step has started does not count as written over.
+  const startedAt = paths0.map(prefabWriteStarting);
   // 2–4. What each file holds, read now, and every precondition before any write.
   const exact: Array<{ ifMatch?: string; createOnly?: boolean; prior: string | null; fileDoc: PrefabFile | null; read?: boolean }> = [];
   for (const w of plan) {
@@ -749,6 +751,10 @@ async function landFiles(
     if (w.doc) recordMark(w.guid ?? path, localIdCounter(w.doc as CountedDoc));
   }
   const paths = done.map((d) => d.path);
+  // Every file now holds this step's write, so an outside change held before it started is gone from disk: its release
+  // applies nothing (#1889). Only once the whole step has landed — a refusal above rolls the files already written back,
+  // which may put that very change back.
+  for (const [i, w] of plan.entries()) prefabWriteLanded(w.asked, startedAt[i]!);
   // Whatever it was checked against, a landed write replaces a park at its path (close-out review F3).
   for (const w of plan) w.now.park?.landed();
   // 8. Both caches for every file, one rebuild, one rebase.
