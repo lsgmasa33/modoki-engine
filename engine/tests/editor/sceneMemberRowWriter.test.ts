@@ -756,7 +756,13 @@ describe('a P instance dropped inside another P instance, through an Apply fan-o
 
     it(`Apply of the promoted node from the OUTER instance reaches both (${order})`, async () => {
       await setUp(order);
+      // Refreshed as ONE entry (#1880 F6-U): the inner instance is stale against the written P until that same load
+      // rebuilds it, so the outer one is not refused for holding it. Mutation: drop `except` from `refreshInstances`'
+      // refusal — the outer is refused with a "reload its scene" warning, though the inner's rebuild rebuilds it anyway.
+      const warn = vi.spyOn(console, 'warn');
       const result = await applyToPrefabSelective(idOfGuid(ROOT), new Set([`+added.${gD}`]));
+      expect(warn.mock.calls.flat().join('\n')).not.toMatch(/not refreshing an instance/);
+      warn.mockRestore();
       expect(result.applied).toBe(true);
       expect(getAllEntities().filter((e) => e.name === 'D')).toHaveLength(2);
       expect(await noneRemoved()).toBe(false);

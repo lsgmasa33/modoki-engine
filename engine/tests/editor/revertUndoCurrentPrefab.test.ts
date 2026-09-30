@@ -42,7 +42,7 @@ import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/r
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefabChain';
-import { undo, redo, canUndo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion, undoDepth, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -168,6 +168,10 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
 
     const before = getAllEntities().map((e) => e.id).sort();
     const edits = getEditVersion();
+    // The Revert's selection of the rebuilt root is an undo entry of its own when the selection changed — whether it did
+    // depended on the id an EARLIER test left selected (the editor store outlives a test). Counted, not assumed away.
+    expect(undoLabel()).toBe('Revert prefab overrides');
+    const depth = undoDepth();
     const toast = vi.spyOn(useEditorStore.getState(), 'showToast');
     await quietly(() => undo());
     // A REFUSAL, as Apply's undo refuses (#1664): nothing changed, so nothing is marked edited, and the toast says why.
@@ -176,7 +180,8 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
     toast.mockRestore();
     expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0); // not put back over the stale frame
     expect(getAllEntities().map((e) => e.id).sort()).toEqual(before); // nothing rebuilt
-    expect(canUndo()).toBe(false); // the entry was dropped, not moved to the redo stack
+    expect(undoDepth()).toBe(depth - 1); // the entry was dropped, not moved to the redo stack
+    expect(undoLabel()).not.toBe('Revert prefab overrides');
     expect(canRedo()).toBe(false);
   });
 });

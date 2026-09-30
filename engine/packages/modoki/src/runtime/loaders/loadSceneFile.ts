@@ -1348,11 +1348,11 @@ export function unreachedLegacy(source: string, channels: KeptLegacy, read: Pref
 
 /** Keep, for the stored root `rootEcsId` (an instance of `source`), the legacy channels no frame of its document takes —
  *  reset every load, as the rows are (#1535 F4). */
-function keepUnreachedLegacy(world: World, rootEcsId: number, source: string, channels: KeptLegacy): void {
+function keepUnreachedLegacy(world: World, rootEcsId: number, source: string, channels: KeptLegacy, read: PrefabDocReader = getCachedPrefab): void {
   const attrMeta = getTraitByName('EntityAttributes');
   const root = attrMeta ? findEntityById(rootEcsId, world) as EntityHandle | undefined : undefined;
   const rootGuid = durableGuid(root?.has(attrMeta!.trait) ? (root.get(attrMeta!.trait) as { guid?: string }).guid : '');
-  if (rootGuid) setKeptLegacy(rootGuid, unreachedLegacy(source, channels));
+  if (rootGuid) setKeptLegacy(rootGuid, unreachedLegacy(source, channels, read));
 }
 
 /** The legacy channels kept for the stored root with this guid, for a writer to put back (#1780). */
@@ -1436,6 +1436,71 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
   return out;
 }
 
+/** What one spawned instance ENTRY hands the load's post-pass ({@link settleEntryRows}): the rows it states for its root,
+ *  the legacy channels it states, and every reference node it states — by guid, and a TEMPLATE one by key (#1542). */
+export interface EntryRows {
+  root: number;
+  source: string;
+  members: Record<string, SceneMemberRow>;
+  legacy: KeptLegacy;
+  referenceRows: ReferenceNodeRows[];
+  templateNodeRows: ReferenceNodeRows[];
+}
+
+/** {@link EntryRows} of an entry the spawner just expanded as `root`. Every channel a reference node can hang in: the
+ *  entry's `added`, its `nestedStructure` deltas', and each member row's nodes (`memberRowNodes`: `added` AND `own`). */
+export function entryRowsOf(
+  root: number, source: string,
+  entry: { added?: AddedEntity[]; members?: Record<string, SceneMemberRow>; nestedOverrides?: unknown; nestedStructure?: NestedStructurePaths },
+): EntryRows {
+  const referenceRows: ReferenceNodeRows[] = [];
+  const templateNodeRows: ReferenceNodeRows[] = [];
+  collectReferenceNodeRows(entry.added, referenceRows, templateNodeRows);
+  for (const delta of Object.values(entry.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, referenceRows, templateNodeRows);
+  for (const r of Object.values(entry.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), referenceRows, templateNodeRows);
+  return {
+    root, source, members: entry.members ?? {},
+    legacy: { nestedOverrides: entry.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: entry.nestedStructure as KeptLegacy['nestedStructure'] },
+    referenceRows, templateNodeRows,
+  };
+}
+
+/** The load's post-pass over the entries it spawned: stored member identity goes on FIRST (v16, #1468), so the derive
+ *  fills only what no row named — derivation is the fallback now, not the rule — and the kept-orphan store (R2) is left
+ *  as these rows say. The load runs it over every entry of a file; the editor's rebuild (#1880 F6) over the one entry it
+ *  respawned, so what a rebuild leaves is what a load leaves. `pinned` collects every guid a row pinned (the caller may
+ *  have pinned more before), and only those can be dropped by the collision guard (`dropCollidingPins`): an entity
+ *  outside these entries is never touched. */
+export function settleEntryRows(
+  world: World, entries: readonly EntryRows[],
+  /** `read`: the cache R2's orphan tests read documents from — the runtime's (a load), or the editor's (its rebuild, which
+   *  measures against the documents the editor holds: the runtime cache can lag an edit save). */
+  opts: { pinned?: Set<number>; fromSceneVersion?: number; read?: PrefabDocReader } = {},
+): void {
+  const pinned = opts.pinned ?? new Set<number>();
+  // Lazy: a caller that mocks the prefab cache module wholesale need not supply this reader unless a row reads it.
+  const read: PrefabDocReader = opts.read ?? ((guid) => getCachedPrefab(guid));
+  for (const { root: rootEcsId, members, source, legacy } of entries) {
+    applyStoredMemberRows(world, rootEcsId, members, source, pinned, false, read);
+    keepUnreachedLegacy(world, rootEcsId, source, legacy, read);
+  }
+  // A reference node's root is addressed by the guid the node stores; `applyRootGuid` has already put
+  // it on the spawned root, so it resolves here.
+  for (const [rootGuid, members, source, node] of entries.flatMap((e) => e.referenceRows)) {
+    const root = findEntityByGuid(rootGuid, world) as EntityHandle | undefined;
+    // A placeholder for a node whose prefab is missing (#1699) carries its rows in its record. Kept here as orphans too,
+    // they outlived the node's re-expansion and overwrote a later edit of its members (close-out review).
+    if (!root || unresolvedRefOf(root)) continue;
+    applyStoredMemberRows(world, root.id(), members, source, pinned, false, read);
+    keepUnreachedLegacy(world, root.id(), source, { nestedOverrides: node?.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: node?.nestedStructure as KeptLegacy['nestedStructure'] }, read);
+  }
+  // …then give every remaining member a stable, addressable GUID so entities can reference into
+  // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
+  // name all land here, deriving exactly what they always did.
+  deriveMemberGuidsAfterPins(world, pinned, { fromSceneVersion: opts.fromSceneVersion });
+  for (const e of entries) if (e.templateNodeRows.length) keepTemplateNodeOrphans(world, e.root, e.templateNodeRows, read);
+}
+
 /** R2 for a TEMPLATE reference node (#1542): the node's rows the template it expands no longer backs are kept under its
  *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleKeptOrphans`) read it
  *  by. Runs after the derive, because until then the root has no guid to key by.
@@ -1445,7 +1510,7 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
  *  the instantiation and never reaches that walk, so its rows are never kept here: they are that template's, and no
  *  save of this file writes them. The root is found by its key below the entry's root — a key is minted per node, so
  *  one entry declares it once. */
-function keepTemplateNodeOrphans(world: World, entryRootId: number, keyed: readonly ReferenceNodeRows[]): void {
+function keepTemplateNodeOrphans(world: World, entryRootId: number, keyed: readonly ReferenceNodeRows[], read: PrefabDocReader = getCachedPrefab): void {
   const eaMeta = getTraitByName('EntityAttributes');
   const piMeta = getTraitByName('PrefabInstance');
   if (!eaMeta || !piMeta || !keyed.length) return;
@@ -1464,9 +1529,9 @@ function keepTemplateNodeOrphans(world: World, entryRootId: number, keyed: reado
   for (const [key, members, source, node] of keyed) {
     const roots = (byKey.get(key) ?? []).filter(under);
     if (roots.length !== 1) continue;
-    applyStoredMemberRows(world, roots[0]!, members, source, undefined, true);
+    applyStoredMemberRows(world, roots[0]!, members, source, undefined, true, read);
     // …and its legacy channels no frame of its document takes (#1780's legacy half, a pre-v5 node's #1738 member 3).
-    keepUnreachedLegacy(world, roots[0]!, source, { nestedOverrides: node?.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: node?.nestedStructure as KeptLegacy['nestedStructure'] });
+    keepUnreachedLegacy(world, roots[0]!, source, { nestedOverrides: node?.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: node?.nestedStructure as KeptLegacy['nestedStructure'] }, read);
   }
 }
 
@@ -1498,6 +1563,8 @@ function applyStoredMemberRows(
   /** Keep the orphans only (R2), pinning no guid: a TEMPLATE node's rows, read after the derive (`keepTemplateNodeOrphans`),
    *  carry no member identity, and a guid one held anyway must not land past the collision guard. */
   keepOnly = false,
+  /** The cache the orphan test reads documents from: the runtime's for a load, the editor's for its rebuild (#1880 F6). */
+  read: PrefabDocReader = getCachedPrefab,
 ): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!attrMeta) return;
@@ -1529,7 +1596,7 @@ function applyStoredMemberRows(
   const root = findEntityById(rootEcsId, world) as EntityHandle | undefined;
   const rootGuid = durableGuid(root?.has(attrMeta.trait) ? (root.get(attrMeta.trait) as { guid?: string }).guid : '');
   if (!rootGuid) return;
-  const { backed, complete } = rowBackedTest(source);
+  const { backed, complete } = rowBackedTest(source, read);
   const orphans: Record<string, SceneMemberRow> = {};
   let count = 0;
   for (const [key, row] of Object.entries(members)) {
@@ -3057,14 +3124,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
     }
   }
 
-  /** Rows to pin once EVERY instance has finished expanding (v16, #1468) — see the apply below.
+  /** Rows to pin once EVERY instance has finished expanding (v16, #1468) — `settleEntryRows`, below.
    *  Declared out here so a base-scene chain's per-file calls each pin their own instances. */
-  const storedMembers: [number, Record<string, SceneMemberRow>, string, KeptLegacy][] = [];
-  /** The same, for every nested instance a REFERENCE node spawns (`collectReferenceNodeRows`). */
-  const addedInstanceRows: ReferenceNodeRows[] = [];
-  /** …and every TEMPLATE reference node in an entry's own statements, per entry root (#1542, `keepTemplateNodeOrphans`). */
-  const templateNodeRows: [number, ReferenceNodeRows[]][] = [];
-  const collectAddedRows = (nodes: unknown, keyed?: ReferenceNodeRows[]): void => { collectReferenceNodeRows(nodes, addedInstanceRows, keyed); };
+  const spawnedEntries: EntryRows[] = [];
   // Re-instantiate prefab instances — delegated to caller (editor vs runtime specific)
   if (options.onInstantiatePrefab) {
     // Every placeholder a prefab entry below may still replace (#1353). Over-inclusive on purpose —
@@ -3163,12 +3225,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // Every instance, rows or not: a load is what makes the kept-orphan store current for this root (R2), and
         // one whose entry states no rows keeps none — a stale set left behind would be replayed by the editor's
         // next rebuild (`settleKeptOrphans`, #1535 close-out review F4).
-        storedMembers.push([rootEcsId, entry.members ?? {}, source, { nestedOverrides: entry.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: entry.nestedStructure as KeptLegacy['nestedStructure'] }]);
-        const keyed: ReferenceNodeRows[] = [];
-        collectAddedRows(entry.added, keyed);
-        for (const delta of Object.values(entry.nestedStructure ?? {})) collectAddedRows(delta?.added, keyed);
-        for (const r of Object.values(entry.members ?? {})) collectAddedRows(memberRowNodes<AddedEntity>(r), keyed);
-        if (keyed.length) templateNodeRows.push([rootEcsId, keyed]);
+        spawnedEntries.push(entryRowsOf(rootEcsId, source, entry));
       } else {
         // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a
         // later entry's numeric parent must resolve to 0 too, not to the freed id.
@@ -3198,29 +3255,8 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
     }
   }
 
-  // All prefab instances are now expanded with correct parentIds. Stored member identity goes on
-  // FIRST (v16, #1468), so the derive below fills only what no row named — derivation is the
-  // fallback now, not the rule.
-  const pinned = new Set<number>();
-  for (const [rootEcsId, members, source, legacy] of storedMembers) {
-    applyStoredMemberRows(world, rootEcsId, members, source, pinned);
-    keepUnreachedLegacy(world, rootEcsId, source, legacy);
-  }
-  // A reference node's root is addressed by the guid the node stores; `applyRootGuid` has already put
-  // it on the spawned root, so it resolves here.
-  for (const [rootGuid, members, source, node] of addedInstanceRows) {
-    const root = findEntityByGuid(rootGuid, world) as EntityHandle | undefined;
-    // A placeholder for a node whose prefab is missing (#1699) carries its rows in its record. Kept here as orphans too,
-    // they outlived the node's re-expansion and overwrote a later edit of its members (close-out review).
-    if (!root || unresolvedRefOf(root)) continue;
-    applyStoredMemberRows(world, root.id(), members, source, pinned);
-    keepUnreachedLegacy(world, root.id(), source, { nestedOverrides: node?.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: node?.nestedStructure as KeptLegacy['nestedStructure'] });
-  }
-  // …then give every remaining member a stable, addressable GUID so entities can reference into
-  // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
-  // name all land here, deriving exactly what they always did.
-  deriveMemberGuidsAfterPins(world, pinned, { fromSceneVersion: sourceVersion });
-  for (const [entryRootId, keyed] of templateNodeRows) keepTemplateNodeOrphans(world, entryRootId, keyed);
+  // All prefab instances are now expanded with correct parentIds: their rows settle (`settleEntryRows`).
+  settleEntryRows(world, spawnedEntries, { fromSceneVersion: sourceVersion });
   retryGuidParents(world, guidParentMisses);
 }
 

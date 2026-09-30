@@ -52,13 +52,17 @@ import {
 import { collectComparableTraits } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
 import { memberOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabChain';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { rebaseStaleInstances, refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { _setUndoClock, undoDepth, undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { buildPrefabEditScene, serializePrefabEditWorld } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -314,7 +318,10 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
   });
 
   it('Revert of a scene override of a field the row sets gives the ROW\'s value, not the template\'s', async () => {
-    // Mutation: drop the enclosing-row put-back in `revertOverridesSelective` — A reverts to P's 0.
+    // The Revert rebuilds N's outermost entry with x taken out of N's delta, and the load applies O's row under it, as a
+    // reload does (#1880 F6d/F6-U). The enclosing-row put-back in `revertOverridesSelective` is load-bearing only on the
+    // per-frame route, which this frame no longer takes: dropping it leaves this test green. Mutation: keep the reverted
+    // key in an owned frame's delta (`subtractFieldOverrides` skipped) — A stays 5.
     install(pDoc(), oWith({ 2: { Transform: { x: 3 } } }));
     await load(scene(O, [ROOT1]));
     setTf(inInstance(ROOT1, 'A'), 'x', 5);
@@ -1314,17 +1321,52 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(hasAction()).toBe(true);
     });
 
-    it('a kept `removed: false` stays kept through the Refresh and applies on the next load (not replayed live)', async () => {
-      // Pins the documented gap: the chain already cut the member, so there is no live target, and the row is not lost.
+    it('a kept `removed: false` applies through the Refresh as it does on the next load (#1880 F6 closed the documented gap)', async () => {
+      // FLIPPED by #1880 F6 (reason on #1880): this pinned a documented GAP — the old rebuild folded the kept row over a
+      // fresh expansion by hand (`replayRowsLive`), found no live target for A (the chain had cut it), and left A out
+      // until the next load put it back. The rebuild now IS that load (`rebuildFromEntry`): the row un-removes A live, as
+      // the reload does. The row is still not lost. Mutation: keep the old gap (skip the `members` of the respawned entry)
+      // — A stays out live.
       const removesA = () => oRow({ removed: [2] });
       install(pDoc(), oNoN());
       await load(orphanedScene({ [`/${gN}/${gA}`]: { removed: false } }));
       install(removesA());
       expect(await rebaseStaleInstances()).toBe(1);
-      expect(getAllEntities().filter((e) => e.name === 'A')).toEqual([]);
-      const entry = await reloadUnder(removesA());
-      expect(rows(entry)[`/${gN}/${gA}`]).toEqual({ removed: false });
       expect(getAllEntities().filter((e) => e.name === 'A')).toHaveLength(1);
+      const entry = await reloadUnder(removesA());
+      // A is live, so the save states its identity too (`guid`, `name`), as after any load that shows it.
+      expect(rows(entry)[`/${gN}/${gA}`]).toMatchObject({ removed: false, name: 'A' });
+      expect(getAllEntities().filter((e) => e.name === 'A')).toHaveLength(1);
+    });
+
+    it('…and in the PREFAB EDITOR, where the entry is a ROW of the edited prefab, the Refresh gives what a save and reopen give (#1880 F6f)', async () => {
+      // The prefab-edit world rebuilt its rows by the old path until F6f, which left A out, as the scene's gap did. Its
+      // entries are rows now, rebuilt through the same load (`rebuildFromEntry`) as a scene entry. Mutation: refuse the
+      // edit world in `isOutermostEntry` again (the row takes the old path) — A stays out live.
+      const W = 'cccccccc-0000-4000-8000-0000000018f6';
+      const wDoc = { id: W, version: 6, name: 'W', rootLocalId: 1, entities: [
+        row(1, 'WR', 0, 'eeeeeeee-0000-4000-8000-0000000018f6'),
+        { localId: 2, name: 'ORow', nodeGuid: 'eeeeeeee-0000-4000-8000-0000000018f7', prefab: O,
+          members: { [`/${gN}/${gA}`]: { removed: false } }, traits: { EntityAttributes: { name: 'ORow', parentId: 1, guid: '' } } },
+      ] };
+      const removesA = () => oRow({ removed: [2] });
+      const as = () => getAllEntities().filter((e) => e.name === 'A');
+      install(pDoc(), oNoN(), wDoc);
+      const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${W}` } as never);
+      try {
+        await load(buildPrefabEditScene(wDoc as unknown as PrefabFile) as SceneData);
+        expect(as(), 'premise: O has no N, so nothing is A').toHaveLength(0);
+        install(removesA());
+        expect(await rebaseStaleInstances()).toBe(1);
+        expect(as()).toHaveLength(1);
+        const saved = serializePrefabEditWorld(W);
+        if ('error' in saved) throw new Error(saved.error);
+        expect(saved.prefab.entities.find((e) => e.prefab === O)!.members).toEqual({ [`/${gN}/${gA}`]: { removed: false } });
+        await load(buildPrefabEditScene(saved.prefab) as SceneData); // rebuild ≡ save and reopen
+        expect(as()).toHaveLength(1);
+      } finally {
+        editWorld.mockRestore();
+      }
     });
 
     it('a scene-ADDED node under a member a Refresh drops VANISHES with it, kept in its row, and comes back ONCE (review F1, #1880 F3a B′)', async () => {
@@ -1388,6 +1430,128 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       await load((await serializeScene()) as unknown as SceneData);
       expect(ys()).toHaveLength(1);
       } finally { warn.mockRestore(); err.mockRestore(); }
+    });
+
+    it('hunt seed 1127\'s shape: a REFERENCE node under a NESTED frame\'s member the inner template drops vanishes into its row and comes back once (#1880 F6)', async () => {
+      // 1127's fuzz lists stopped reaching this case under F6 — the outermost-entry rebuild renumbers the entry's ids, and
+      // the lists pick their targets in id order (2 of 109 recorded lists drifted; neither can be re-aimed, one `u` slot
+      // serves two picks). This states it without the ids: Y (an S instance the scene dropped under A, a member of O's
+      // nested frame N) goes with A when P drops it, is kept in N/A's row, and a P that brings A back brings Y back once,
+      // guid intact, as a reload does. Mutation: drop the kept orphan rows from the entry (`captureInstanceEntry` without
+      // prefabCapture's kept merge) — Y does not come back.
+      const S = 'cccccccc-0000-4000-8000-000000001127';
+      const sDoc = { id: S, version: 6, name: 'S', rootLocalId: 1, entities: [
+        { localId: 1, name: 'SR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001127', traits: { EntityAttributes: { name: 'SR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] };
+      const gY = 'ffffffff-0000-4000-8000-000000001127';
+      const yNode = { parentLocalId: 0, guid: gY, name: 'SR', prefab: S, traits: {}, children: [] };
+      const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gN}/${gA}`]: { added: [yNode] } };
+      const ys = () => getAllEntities().filter((e) => e.guid === gY);
+      install(pDoc(), oDoc(), sDoc);
+      await load(sc as unknown as SceneData);
+      expect(ys(), 'premise: Y is live under N\'s A').toHaveLength(1);
+      install(pNoA());
+      expect(await rebaseStaleInstances()).toBeGreaterThan(0);
+      expect(ys()).toHaveLength(0);
+      expect(JSON.stringify(rows(await entryOf(O))[`/${gN}/${gA}`])).toContain(gY);
+      await load((await serializeScene()) as unknown as SceneData); // rebuild ≡ reload
+      expect(ys()).toHaveLength(0);
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBeGreaterThan(0);
+      expect(ys()).toHaveLength(1);
+      await load((await serializeScene()) as unknown as SceneData);
+      expect(ys()).toHaveLength(1);
+    });
+
+    it('…and through an Apply and its UNDO: the P that drops A takes Y into its row, and the undo brings Y back ONCE (#1880 F6 close-out review F3)', async () => {
+      // The id-free twin of the retired fuzz guard "1127 + an undo of its Apply" (#1568 C2's duplicate): the Apply's
+      // refresh rebuilds ROOT1's entry with Y kept in N/A's row, and the undo brings Y back exactly once. TWO mechanisms
+      // bring it back, each alone: the undo's reload of the scene snapshot (`restoreSnapshot`), and its rebase of the frames
+      // the restored P leaves stale, which replays N/A's kept row. Mutation, measured: break BOTH — load no snapshot
+      // (untitled branch) AND drop the kept orphan rows from the entry (`captureInstanceMembers`) — Y stays gone; either
+      // alone leaves this green.
+      const S = 'cccccccc-0000-4000-8000-000000011127';
+      const sDoc = { id: S, version: 6, name: 'S', rootLocalId: 1, entities: [
+        { localId: 1, name: 'SR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000011127', traits: { EntityAttributes: { name: 'SR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] };
+      const gY = 'ffffffff-0000-4000-8000-000000011127';
+      const yNode = { parentLocalId: 0, guid: gY, name: 'SR', prefab: S, traits: {}, children: [] };
+      const sc = scene(O, [ROOT1, ROOT2]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gN}/${gA}`]: { added: [yNode] } };
+      const ys = () => getAllEntities().filter((e) => e.guid === gY);
+      install(pDoc(), oDoc(), sDoc);
+      await load(sc as unknown as SceneData);
+      expect(ys(), 'premise: Y is live under ROOT1\'s N/A').toHaveLength(1);
+      const n2 = inInstance(ROOT2, 'R');
+      deleteEntitiesWithUndo([inInstance(ROOT2, 'A')]);
+      const key = collectInstanceOverrideKeys(n2, getCachedPrefabSync(P) as PrefabFile).all.find((k) => k.startsWith('-removed.'))!;
+      expect(key, 'premise: the deletion is listed on ROOT2\'s N').toBeTruthy();
+      expect((await applyToPrefabWithUndo(n2, new Set([key]), { default: P })).applied).toBe(true);
+      expect(ys()).toHaveLength(0);
+      await undo();
+      expect(ys()).toHaveLength(1);
+      await redo();
+      expect(ys()).toHaveLength(0);
+      await undo();
+      expect(ys()).toHaveLength(1);
+      await load((await serializeScene()) as unknown as SceneData);
+      expect(ys()).toHaveLength(1);
+    });
+
+    it('a rebuild ends the undo coalescing chain: an edit on the entity that took a rebuilt id is an entry of its own (#1880 F6, hub rider (1)(c))', async () => {
+      // A rebuild that pushes no undo entry (an outside prefab change re-imported in place) used to leave the 500 ms chain
+      // open, and the chain is keyed by RAW id: the respawn takes back the id its teardown freed, so the next edit of the
+      // same field on it merged into the first edit's entry. Mutation: drop `breakUndoCoalescing()` from the rebuild's
+      // teardown (`destroyTornDown`) — one entry.
+      _setUndoClock(() => 0); // one instant: every step is inside the window
+      try {
+        install(pDoc());
+        await load(scene(P, [ROOT1]));
+        clearHistory();
+        const a = inInstance(ROOT1, 'A');
+        setTf(a, 'x', 1);
+        const doc = getCachedPrefabSync(P) as PrefabFile;
+        expect(refreshInstances(P, [rootOf(ROOT1)], doc, doc)).toBe(1);
+        const a2 = inInstance(ROOT1, 'A');
+        expect(a2, 'premise: the respawned A took back the id of the A the first edit was made on').toBe(a);
+        setTf(a2, 'x', 2);
+        expect(undoDepth()).toBe(2);
+      } finally { _setUndoClock(() => performance.now()); }
+    });
+
+    it('the rebuild settles ITS entry only: a pin colliding with an entity OUTSIDE it drops the rebuilt pin, never the outside one (#1880 F6 rider 3)', async () => {
+      // The load's post-pass (`settleEntryRows`) runs over the world, and it has only ever run on a world the load built:
+      // its collision guard (`dropCollidingPins`) drops a PIN that meets another holder of its guid. Rebuilding one entry,
+      // only that entry's rows are pins. Plant ROOT1's A on the guid ROOT2's A holds, rebuild ROOT1 alone: ROOT1's pin
+      // yields (re-derived), and ROOT2 — ids, guids, everything — is untouched. Mutation: let the guard drop every
+      // holder of a colliding guid (`ids`, not the pinned ones) — ROOT2's A loses its guid.
+      // ROOT2's A holds a STORED guid (its row pins it), which no derivation gives back: a guard that cleared it would show.
+      const g = 'ffffffff-0000-4000-8000-00000000f6c3';
+      const sc = scene(P, [ROOT1, ROOT2]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[2]!.members = { [`/${gA}`]: { guid: g, name: 'A' } };
+      install(pDoc());
+      await load(sc as unknown as SceneData);
+      const eaMeta = meta('EntityAttributes');
+      expect(getAllEntities().find((e) => e.id === inInstance(ROOT2, 'A'))!.guid, 'premise: ROOT2\'s row pins A').toBe(g);
+      const a1 = inInstance(ROOT1, 'A');
+      for (const e of getCurrentWorld().entities) if (e.id() === a1) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as Record<string, unknown>), guid: g });
+      const root2 = rootOf(ROOT2);
+      const subtree2 = () => {
+        const all = getAllEntities();
+        const byId = new Map(all.map((e) => [e.id, e]));
+        return all.filter((e) => { for (let c: typeof e | undefined = e; c; c = byId.get(c.parentId)) if (c.id === root2) return true; return false; })
+          .map((e) => [e.id, e.guid, e.name]).sort();
+      };
+      const before = subtree2();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const doc = getCachedPrefabSync(P) as PrefabFile;
+        expect(refreshInstances(P, [rootOf(ROOT1)], doc, doc)).toBe(1);
+        expect(warn.mock.calls.some(([m]) => String(m).includes(`pins guid ${g}`)), 'premise: the rebuilt entry pinned the colliding guid').toBe(true);
+      } finally { warn.mockRestore(); }
+      expect(subtree2()).toEqual(before);
+      expect(getAllEntities().filter((e) => e.guid === g).map((e) => e.id)).toEqual([inInstance(ROOT2, 'A')]);
     });
 
     it('a kept `false` on an owned nested ROOT restores the trait the row removes from it (review F2)', async () => {

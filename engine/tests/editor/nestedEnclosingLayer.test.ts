@@ -487,6 +487,30 @@ describe('#1693 P5–P6 close-out review: the cases the second review drove', ()
     expect(listed()).toEqual([]);
   });
 
+  it('Revert of ONE scene-added node on an OWNED nested frame takes that node out and keeps its sibling (#1880 F6 close-out review F1)', async () => {
+    // The Revert rebuilds the nested frame's outermost entry with the node taken out of the frame's statement. The frame's
+    // added nodes are stated on its member rows by `frameAddedDiff`, which read the LIVE structure again and so wrote the
+    // reverted node back; a lone node hid it (nothing to state on either side). Mutation: in `frameAddedDiff`, skip the
+    // frame's own `structure` edit — Extra comes back.
+    install(pDoc(), oDoc());
+    await load(scene(O, [ROOT1]));
+    const a = inInstance(ROOT1, 'A');
+    const add = (name: string) => createEntityWithUndo(`Add ${name}`, a, [
+      { name: 'EntityAttributes', data: { name, parentId: a } }, { name: 'Transform', data: {} },
+    ], () => {})!;
+    const extra = add('Extra');
+    add('Keep');
+    const count = (name: string) => getAllEntities().filter((e) => e.name === name).length;
+    await revertOverridesWithUndo(nestedRoot(), new Set([`+added.${guidOf(extra)}`]));
+    expect([count('Extra'), count('Keep')]).toEqual([0, 1]);
+    await undo();
+    expect([count('Extra'), count('Keep')]).toEqual([1, 1]);
+    await redo(); // the reduced side, stated by the same writer
+    expect([count('Extra'), count('Keep')]).toEqual([0, 1]);
+    await load(await serializeScene() as unknown as SceneData);
+    expect([count('Extra'), count('Keep')]).toEqual([0, 1]);
+  });
+
   it('a promoted node\'s PROMOTED child has a path: a ref to it is a token, and instance 2\'s copy names its own', async () => {
     // Mutation: drop \`rowPaths.set\` in \`insertAddedSubtree\` — Kid gets no path, and instance 2's Extra points at
     // instance 1's Kid.
@@ -1345,6 +1369,30 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       expect(count()).toEqual(before);
       await revertRemovedA();
       expect(count()).toEqual(before);
+    });
+
+    it('#1880 F6: a later write subtracts what it applied from a nested frame an EARLIER write rebuilt with the whole entry', async () => {
+      // A U14 Apply of B's x into P and L's x into Q writes Q first (innermost): its refresh rebuilds QR's frame as the load
+      // of ROOT1's whole entry, R's frame included, before P's refresh subtracts B's applied x from R. Mutation: drop the
+      // Apply's frame edit from `refreshInstances`' entry route — R keeps B's x as its own override, listed and saved.
+      // Rider (1d) finds that frame by its guid (`appliedFrom[].rootGuid`), not the id it had when the Apply was planned.
+      // ⚠️ TRACED, NOT DRIVEN for the guid: koota hands a torn-down entry its ids back in allocation order, so R came back
+      // as the same id through every perturbation tried (a node added after the load, at the root or under a member; a
+      // duplicate of ROOT1; ids freed below it first), and matching by id alone leaves this test green.
+      install(qDoc(), pWithC(), oWith({}));
+      await load(scene(O, [ROOT1, ROOT2]));
+      writeTraitFieldWithUndo(inInstance(ROOT1, 'B'), meta('Transform'), 'x', 4);
+      writeTraitFieldWithUndo(inInstance(ROOT1, 'L'), meta('Transform'), 'x', 6);
+      const listed = () => collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(O) as PrefabFile).nested;
+      const bKey = `${gN}:${gB}.Transform.x`;
+      const lKey = `${gN}.${gC}:eeeeeeee-0000-4000-8000-000000001738.Transform.x`;
+      expect(listed().sort()).toEqual([bKey, lKey].sort()); // precondition: one edit in P's frame R, one in Q's frame QR
+      const res = await applyToPrefabSelective(rootOf(ROOT1), new Set([bKey, lKey]), { perKey: { [bKey]: P, [lKey]: Q } });
+      expect(res.applied).toBe(true);
+      expect(writes.map((w) => (JSON.parse(w.content) as PrefabFile).id)).toEqual([Q, P]); // innermost first
+      expect([x(inInstance(ROOT1, 'B')), x(inInstance(ROOT2, 'B')), x(inInstance(ROOT1, 'L')), x(inInstance(ROOT2, 'L'))]).toEqual([4, 4, 6, 6]);
+      expect(listed()).toEqual([]);
+      expect(JSON.stringify((await saved()).entry)).not.toContain('"x":4');
     });
 
     describe('a TEMPLATE reference node\'s frame gets the node\'s channels as its forward state', () => {

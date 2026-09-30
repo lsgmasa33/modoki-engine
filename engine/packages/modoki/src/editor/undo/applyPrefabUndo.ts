@@ -36,7 +36,7 @@ import { captureInstanceOverrides } from '../scene/prefabInstanceOverrides';
 import { captureInstanceStructure } from '../scene/prefabCapture';
 import {
   rebuildInstanceFromCapture, refreshBaseInstances, rebaseStaleInstances, captureNestedFrames, captureStructureForRespawn,
-  type NestedInstanceCapture,
+  type NestedInstanceCapture, captureEntrySide, type EntrySide,
 } from '../scene/prefabRebuild';
 import { applyToPrefabSelective, type ApplyResult } from '../scene/prefabApply';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
@@ -157,14 +157,19 @@ export interface BaseInstanceSide {
    *  capture reads the live frames, which by then show the other side — a U14 Apply from the outer root moved the frame's
    *  own edit into a prefab (`took`), so its undo read nothing of it and re-derived the frame from the restored row. */
   nested: NestedInstanceCapture[];
+  /** The side as its outermost entry states it (`captureEntrySide`, #1880 F6d, F6-U): the undo rebuilds that entry by
+   *  loading this, and the fields above go unread. */
+  entry?: EntrySide;
 }
 
 export function captureSide(rootInstanceId: number, rootGuid: string, source: string, prefab: PrefabFile): BaseInstanceSide {
+  const entry = captureEntrySide(rootInstanceId);
   return {
     rootGuid, source, prefab,
     overrides: captureInstanceOverrides(rootInstanceId, prefab),
     structure: captureStructureForRespawn(rootInstanceId, prefab), // respawned by the undo's rebuild (#1826)
     nested: captureNestedFrames(rootInstanceId, source, prefab),
+    ...(entry ? { entry } : {}),
   };
 }
 
@@ -179,7 +184,7 @@ async function restoreBaseInstance(side: BaseInstanceSide | null, direction: 'Un
   // enclosing prefab, nothing restored the frame's own, and it may have changed since (a prefab-edit save, another
   // scene's Apply, a pull). Rebuilt from the captured copy, a member it gained since vanished from this instance, and
   // the frame read as stale, so Apply and Revert refused it. `null`: a frame nested in it is stale — the refresh's refusal.
-  if (rebuildInstanceFromCapture(id, side.source, side.prefab, side.overrides, side.structure, side.nested) === null) {
+  if (rebuildInstanceFromCapture(id, side.source, side.prefab, side.overrides, side.structure, side.nested, side.entry) === null) {
     // Reported, not thrown: the files and the world have already followed the step (#308). Reachable only with a frame
     // the restore's rebase left stale, i.e. a damaged tree — but then the instance keeps the other side's edits, and a
     // dirty base would save them.

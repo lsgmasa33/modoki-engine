@@ -4,7 +4,7 @@
 
 import { rowAt } from '../../runtime/core/prefabRowAt';
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
-import { placedAnchor } from '../../runtime/loaders/memberTranslation';
+import { placedAnchor, translateLocalIds, translateCarried } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
@@ -517,6 +517,37 @@ export interface StructureCaptureOpts {
    *  is measured against the document's row AND these: without them a component only an enclosing row added was never
    *  captured as removed, so the save, a Refresh and a prefab-edit save all brought it back. */
   layerTraits?: Record<number, string[]>;
+  /** A caller's edit of chosen frames' statements, by frame root ecs id (#1880 F6): applied where the capture makes each
+   *  frame's statement — a reference node's (`captureInstanceReference`), an owned nested frame's (`captureNestedChannels`).
+   *  A rebuild of a scene entry to a state the live tree does not show (a Revert's reduced set, an Apply's subtraction) is
+   *  then still stated by the save's one writer. Only the scene writer's rows form sets it. */
+  frameEdits?: ReadonlyMap<number, FrameEdit>;
+  /** Members (by ecs id) whose move a Revert takes back: the row a writer states for each carries no `parent`. */
+  dropParents?: ReadonlySet<number>;
+  /** A REBUILD's capture (#1880 F6e): a reference node is stated against the document it was expanded from (its frame
+   *  record), as an owned frame always is (`levelDoc`), and its localId channels are translated into the cache's
+   *  numbering — the numbering the load expands it in. The save's capture reads the cache first (`captureDoc`), so a
+   *  stale node was stated against rows it was not built from: the old rebuild refused it, or rebuilt it first. */
+  againstRecords?: boolean;
+}
+
+/** An edit of ONE frame's statement ({@link StructureCaptureOpts.frameEdits}): each a transform of what the capture read. */
+export interface FrameEdit {
+  overrides?: (captured: Record<number, Record<string, Record<string, unknown>>>) => Record<number, Record<string, Record<string, unknown>>>;
+  structure?: (captured: InstanceStructure) => InstanceStructure;
+}
+
+/** `members` (the rows a writer states for `rootId`) without the `parent` of each member in `drop`. */
+export function withoutRowParents(rootId: number, members: Record<string, SceneMemberRow>, drop: ReadonlySet<number> | undefined): Record<string, SceneMemberRow> {
+  if (!drop?.size) return members;
+  const out = { ...members };
+  for (const [ecsId, key] of memberRowKeysIn(rootId)) {
+    const row = out[key];
+    if (!drop.has(ecsId) || !row?.parent) continue;
+    const { parent: _taken, ...rest } = row;
+    out[key] = rest;
+  }
+  return out;
 }
 
 /** An added node's identity in the document being written: the live durable guid (scene form), or
@@ -726,7 +757,8 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     const pi = readTraitData(ecsId, PrefabInstanceMeta);
     const source = pi?.source as string | undefined;
     if (!source) return null;
-    const childPrefab = captureDoc(ecsId, source);
+    const recorded = opts.againstRecords ? levelDoc(ecsId, source) : null;
+    const childPrefab = recorded?.fromRecord ? recorded.doc : captureDoc(ecsId, source);
     if (!childPrefab) {
       console.warn(`[Prefab] user-added nested instance "${source}" not cached; exact placement not captured`);
       return null;
@@ -748,7 +780,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     // The node is the OUTERMOST layer for its own nested rows, so it carries their scene edits itself
     // — the same two channels a top-level entry carries (#1369). Without them an edit inside a row
     // expansion of a DRAGGED-IN prefab was captured by nothing and came back on reload.
-    const captured = captureNestedChannels(ecsId, source, ref.ownedNested, { template: opts.template, rows: opts.rows });
+    const captured = captureNestedChannels(ecsId, source, ref.ownedNested, { template: opts.template, rows: opts.rows, frameEdits: opts.frameEdits, againstRecords: opts.againstRecords });
     for (const c of captured.consumedEcsIds) consumedEcsIds.add(c);
     // A SCENE node is a stored root: what the load kept of its legacy channels goes back out with it (#1780). A template
     // capture of one writes its scene statements nowhere (I8).
@@ -773,15 +805,23 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       const members = captureInstanceMembers(ecsId, childPrefab);
       return { ...node, ...(Object.keys(members).length ? { members } : {}) };
     }
-    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames);
+    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits });
     const nonEmpty = <T,>(v: T | undefined): T | undefined =>
       v === undefined || (Array.isArray(v) ? v.length : Object.keys(v as object).length) ? v : undefined;
+    // Stated against its record: what is left by localId goes into the numbering the load expands it in.
+    const cached = recorded?.fromRecord ? getCachedPrefabSync(source) : null;
+    const lid = cached && cached !== childPrefab ? translateLocalIds(childPrefab, cached) : null;
+    const ch = lid ? (() => {
+      const t = translateCarried(lid, moved.channels.overrides ?? {}, { added: moved.channels.added, removed: moved.channels.removed, removedTraits: moved.channels.removedTraits });
+      return { ...moved.channels, overrides: t.overrides, added: t.structure.added, removed: t.structure.removed, removedTraits: t.structure.removedTraits };
+    })() : moved.channels;
     return {
       ...node,
-      overrides: nonEmpty(moved.channels.overrides), added: nonEmpty(moved.channels.added),
-      removed: nonEmpty(moved.channels.removed), removedTraits: nonEmpty(moved.channels.removedTraits),
+      ...(lid && node.moved ? { moved: translateCarried(lid, {}, { moved: node.moved }).structure.moved } : {}),
+      overrides: nonEmpty(ch.overrides), added: nonEmpty(ch.added),
+      removed: nonEmpty(ch.removed), removedTraits: nonEmpty(ch.removedTraits),
       nestedOverrides: nonEmpty(moved.channels.nestedOverrides), nestedStructure: nonEmpty(moved.channels.nestedStructure),
-      ...(Object.keys(moved.members).length ? { members: moved.members } : {}),
+      ...(Object.keys(moved.members).length ? { members: withoutRowParents(ecsId, moved.members, opts.dropParents) } : {}),
     };
   };
 
@@ -999,6 +1039,11 @@ export function captureNestedChannels(
     /** What a layer ENCLOSING `top` forwards into it, subtracted from every frame's values with the chain (`chainLayer`'s
      *  seed) — a comparison asking whether a live reference node states only what a CHAIN node states (#1781). */
     seed?: ForwardState;
+    /** `StructureCaptureOpts.frameEdits`: an owned frame's own delta and structure are edited here, and the reference
+     *  nodes inside each interior through its structure capture. */
+    frameEdits?: ReadonlyMap<number, FrameEdit>;
+    /** `StructureCaptureOpts.againstRecords`, handed on to each frame's structure capture. */
+    againstRecords?: boolean;
   } = {},
 ): {
   nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths; consumedEcsIds: Set<number>;
@@ -1066,7 +1111,9 @@ export function captureNestedChannels(
       // Subtract what the whole prefab chain applies to this instance (not just the immediate row)
       // so a deep scene edit stores only its own delta.
       const chain = chainLayer(top, source, at, undefined, opts.seed);
-      const delta = captureNestedSceneDelta(ecsId, childPrefab, chain.overrides);
+      const edit = opts.frameEdits?.get(ecsId);
+      const liveDelta = captureNestedSceneDelta(ecsId, childPrefab, chain.overrides);
+      const delta = edit?.overrides ? edit.overrides(liveDelta) : liveDelta;
       const layerTraits = layerAddedTraits(chain, childPrefab);
       if (Object.keys(delta).length > 0) overrides.set(key, delta);
       // The STRUCTURAL interior (#1358). Skipped ONLY when the live interior and the prefab chain's
@@ -1077,8 +1124,9 @@ export function captureNestedChannels(
       // (the two documents are not comparable — the live side is compacted by `snapshotAddedTraits` —
       // and dropping an empty list made "the row's own list no longer applies" unrepresentable, so
       // deleting the last member of a row-authored `added` came back on reload).
-      const structure = captureInstanceStructure(ecsId, childPrefab, { template: opts.template, rows: opts.rows, readOnly: opts.readOnly, layerTraits });
-      for (const id of structure.consumedEcsIds) consumedEcsIds.add(id);
+      const liveStructure = captureInstanceStructure(ecsId, childPrefab, { template: opts.template, rows: opts.rows, readOnly: opts.readOnly, layerTraits, frameEdits: opts.frameEdits, againstRecords: opts.againstRecords });
+      for (const id of liveStructure.consumedEcsIds) consumedEcsIds.add(id);
+      const structure = edit?.structure ? edit.structure(liveStructure) : liveStructure;
       const live = {
         added: structure.added, removed: structure.removed, removedTraits: structure.removedTraits,
         ...(Object.keys(structure.unrowed ?? {}).length ? { moved: structure.unrowed } : {}),
@@ -1088,7 +1136,7 @@ export function captureNestedChannels(
       if (opts.omitUnchanged && opts.baselinesOut) {
         if (!unchanged) { structures.set(key, live); opts.baselinesOut.set(key, baseline); }
       } else if (!unchanged && !(opts.omitUnchanged && sameStructure(live, baseline))) structures.set(key, live);
-      walk(structure.ownedNested, at);
+      walk(liveStructure.ownedNested, at);
     }
   };
   walk(ownedNested, []);
@@ -1167,6 +1215,10 @@ export function moveChannelsOntoRows(
      *  template states no guid, so the scene's durable-guid gate has nothing to protect), and nodes are
      *  written in TEMPLATE form — keyed, no live guid — from `ch`'s template capture. */
     template?: boolean;
+    /** `StructureCaptureOpts.againstRecords` and `frameEdits`: each frame's added nodes are compared with the chain's as the
+     *  rebuild states them ({@link frameAddedDiff}) — a template reference node's statement is made there. */
+    againstRecords?: boolean;
+    frameEdits?: ReadonlyMap<number, FrameEdit>;
   } = {},
 ): { channels: InstanceChannels; members: Record<string, SceneMemberRow> } {
   const piMeta = getTraitByName('PrefabInstance');
@@ -1296,7 +1348,7 @@ export function moveChannelsOntoRows(
       }
       // Added nodes per NODE (v17, #1516): see `diffFrameAdded`. A member's list is restated whole (`added`) only
       // where it cannot be stated node by node.
-      const nodes = frameAddedDiff(f.root, f.doc, base.added, live.added, liveLids);
+      const nodes = frameAddedDiff(f.root, f.doc, base.added, live.added, liveLids, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits });
       for (const lid of nodes.whole) touch(lid).added = true;
       for (const lid of nodes.own.keys()) if (!nodes.whole.has(lid)) touch(lid).own = true;
       if (!touched.size && !nodes.nodeRows.size) continue;
@@ -1365,8 +1417,11 @@ export function captureInstanceReference(
   prefab: PrefabFile,
   opts: StructureCaptureOpts = {},
 ): InstanceReference {
-  const overrides = captureInstanceOverrides(rootInstanceId, prefab);
-  const structure = captureInstanceStructure(rootInstanceId, prefab, opts);
+  const edit = opts.frameEdits?.get(rootInstanceId);
+  const liveOverrides = captureInstanceOverrides(rootInstanceId, prefab);
+  const overrides = edit?.overrides ? edit.overrides(liveOverrides) : liveOverrides;
+  const liveStructure = captureInstanceStructure(rootInstanceId, prefab, opts);
+  const structure = edit?.structure ? edit.structure(liveStructure) : liveStructure;
   const memberEcsIds = new Set<number>();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (PrefabInstanceMeta) {
@@ -1382,8 +1437,8 @@ export function captureInstanceReference(
     removedTraits: Object.keys(structure.removedTraits).length ? structure.removedTraits : undefined,
     moved: Object.keys(structure.unrowed ?? {}).length ? structure.unrowed : undefined,
     memberEcsIds,
-    consumedEcsIds: structure.consumedEcsIds,
-    ownedNested: structure.ownedNested,
+    consumedEcsIds: liveStructure.consumedEcsIds,
+    ownedNested: liveStructure.ownedNested,
   };
 }
 
@@ -1833,11 +1888,18 @@ export function liveTemplateKeys(nodes: readonly AddedEntity[], deep = false, in
  *  with the chain's member tokens resolved to the guids the live side holds. */
 function frameAddedDiff(
   frameRoot: number, doc: PrefabFile, chainAdded: AddedEntity[] | undefined, liveAdded: AddedEntity[] | undefined, liveLids: ReadonlySet<number>,
+  /** A rebuild's comparison (`StructureCaptureOpts`): a reference node captured against its own record, so a stale
+   *  template node reads as the chain's node rather than as one the scene edited; and the caller's edits of frames. */
+  rebuild: { againstRecords?: boolean; frameEdits?: ReadonlyMap<number, FrameEdit> } = {},
 ): FrameAddedDiff {
   const resolved = resolveAddedNodeTokens(baseTokenResolver(frameRoot), chainAdded) ?? [];
   const chain = chainNodesAsPlaced(resolved, doc, liveLids);
   if (!chain.length && !liveAdded?.length) return { nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() };
-  const full = captureInstanceStructure(frameRoot, doc);
+  // …with the caller's edit of THIS frame made in it, as the writer made it in `liveAdded` (#1880 F6 close-out review F1):
+  // read live alone, a Revert's reverted node was stated again and the load spawned it back.
+  const live = captureInstanceStructure(frameRoot, doc, rebuild);
+  const edit = rebuild.frameEdits?.get(frameRoot)?.structure;
+  const full = edit ? edit(live) : live;
   return diffFrameAdded(full.added, chain, nodeDiffDeps(liveTemplateKeys(full.added, true)), reanchoredKeys(resolved, doc));
 }
 

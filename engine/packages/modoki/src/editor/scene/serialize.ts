@@ -27,11 +27,9 @@ import { beginWorldReplacement } from './authoringSettle';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
-import { captureInstanceOverrides } from './prefabInstanceOverrides';
-import { captureInstanceMembers } from './prefabMembers';
-import { captureInstanceStructure, captureNestedChannels, moveChannelsOntoRows } from './prefabCapture';
+import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
 import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
-import { levelDoc, withKeptLegacy } from './prefabBase';
+import { levelDoc } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -338,11 +336,8 @@ async function serializeSceneScoped(opts?: {
   // entities + removed traits, and fold the added entities' live ECS ids into the
   // skip set so they aren't ALSO written as standalone scene entities (which is
   // how they used to leak out and orphan on reload).
-  const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]>; moved: Record<number, string> }>();
-  // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
-  const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
-  const nestedStructureByTop = new Map<number, NestedStructurePaths>();
-  const nestedFramesByTop = new Map<number, Map<string, { root: number; path: number[] }>>();
+  // Each root's ENTRY — the one writer the rebuild respawns from too (`captureInstanceEntry`, #1880 F6).
+  const entries = new Map<number, InstanceEntry>();
   for (const [rootId, { source }] of prefabRootInfo) {
     // A prefab that stopped resolving mid-session is written from the document the instance was expanded from (#1738).
     const current = (await getPrefabSource(source)) ?? levelDoc(rootId, source).doc;
@@ -352,18 +347,9 @@ async function serializeSceneScoped(opts?: {
     // A nested row whose instance is gone is recorded as removed only when its prefab is cached
     // (#1355), and a deleted instance's source is not among the live ones preloaded above.
     await preloadNestedPrefabs(prefab);
-    // Scene FILE form (#1468 Phase 4): a reference node inside writes its edits on its own rows.
-    const s = captureInstanceStructure(rootId, prefab, { rows: true });
-    for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    const channels = captureNestedChannels(rootId, source, s.ownedNested, { rows: true });
-    for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
-    if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
-    if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
-    nestedFramesByTop.set(rootId, channels.frames);
-    const unrowed = s.unrowed ?? {};
-    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(unrowed).length) {
-      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: unrowed });
-    }
+    const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guidForId(rootId));
+    for (const ecsId of consumedEcsIds) prefabChildIds.add(ecsId);
+    entries.set(rootId, entry);
   }
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
@@ -429,33 +415,10 @@ async function serializeSceneScoped(opts?: {
     // user-added traits, root or child) so the entry needs only PrefabInstance.
     if (rootInfo) {
       entry.prefab = rootInfo.source;
-      const current = (await getPrefabSource(rootInfo.source)) ?? levelDoc(info.id, rootInfo.source).doc;
-      if (current) {
-        const prefab = savedFrameDoc(info.id, rootInfo.source, current);
-        const struct = rootStructure.get(info.id);
-        // v16 (#1468): each member's guid, STORED under its minted identity instead of re-derived
-        // from its position on the next load — plus, since Phase 3, `parent` for a member that has
-        // been moved inside the instance. Absent when the template predates prefab v5; see
-        // `memberRowKeysIn` for the full exclusion list.
-        // ⚠️ The template is passed, and it is what makes `parent` writable at all: the move is a
-        // DIFF against where this document puts the member, so a capture with no document can only
-        // carry the rows it is handed (`memberRowParents`).
-        // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is
-        // left in the localId channels below is the root's own edits and what no row can address.
-        const moved = moveChannelsOntoRows(info.id, prefab, rootInfo.source, {
-          overrides: captureInstanceOverrides(info.id, prefab),
-          added: struct?.added, removed: struct?.removed, removedTraits: struct?.removedTraits,
-          nestedOverrides: nestedOverridesByTop.get(info.id), nestedStructure: nestedStructureByTop.get(info.id),
-        }, captureInstanceMembers(info.id, prefab), nestedFramesByTop.get(info.id));
-        const ch = withKeptLegacy(moved.channels, guidForId(info.id));
-        if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
-        if (ch.added?.length) entry.added = ch.added;
-        if (ch.removed?.length) entry.removed = ch.removed;
-        if (ch.removedTraits && Object.keys(ch.removedTraits).length) entry.removedTraits = ch.removedTraits;
-        if (struct && Object.keys(struct.moved).length) entry.moved = struct.moved;
-        if (ch.nestedOverrides && Object.keys(ch.nestedOverrides).length) entry.nestedOverrides = ch.nestedOverrides;
-        if (ch.nestedStructure && Object.keys(ch.nestedStructure).length) entry.nestedStructure = ch.nestedStructure;
-        if (Object.keys(moved.members).length) entry.members = moved.members;
+      // Captured in the pre-pass (`captureInstanceEntry`), which skips a root no document can be read for.
+      const captured = entries.get(info.id);
+      if (captured) {
+        Object.assign(entry, captured);
         // Persist the root's stable guid on the node. The trait loop below writes
         // ONLY PrefabInstance for a captured root (EntityAttributes never gets
         // written, and guid is never an override), so this is the only place the

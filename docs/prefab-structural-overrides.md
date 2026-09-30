@@ -358,6 +358,11 @@ relies on.
 
 ## Refresh reconciliation
 
+> **Since #1880 F6 a refresh LOADS its outermost scene entry** — [prefabs.md § A rebuild is the LOAD of its outermost
+> scene entry](prefabs.md#a-rebuild-is-the-load-of-its-outermost-scene-entry-1880-f6). What this document says of
+> `rebuildInstance` and its re-apply (`captureNestedInstanceOverrides`, the carried `nestedMoves`) describes the old
+> per-frame route, which is now only the fallback for an entry that cannot be loaded, and goes in #1880 F7.
+
 `refreshInstances` already does *capture(old) → destroy → re-instantiate(new) →
 re-apply*. Extend the captured blob to include `{ added, removed }` and have the
 re-apply step run the same **load/re-expand** logic above against the new tree.
@@ -1444,6 +1449,12 @@ without a word, and the writer's re-emit had nothing to read.
   key intact (#1568 C2's duplicate stays fixed: there is no live copy to duplicate). The settle still leaves out a
   row's node that is live anyway. A pre-v5 member writes no row, so its additions keep the root as their home. Hub's
   first ruling (A, re-anchor to the frame root) was retracted the same day: it reversed fork 2.
+  ⚠️ **Only the SCENE's own nodes** (hub, 2026-09-30, F6's precondition hunt, seeds 1171 / 3090). An owned nested
+  root's capture also carries the nodes its ENCLOSING layer adds at its own frame (the forwarded layers never spawn
+  there). Such a node is in no row of the scene, and a reload re-anchors it at the frame root, so the rebuild keeps
+  "anchor missing → root" for it (`layerAuthoredNodeGuids`: the capture minus `ownInstanceStructure`). Dropped with the
+  scene's nodes, as F3a first did, it vanished for good where the reload showed it. A guid match against the save's
+  rows cannot tell the two apart: a runtime-guid node, and a template-form row in the prefab-edit world, carry none.
 - **A rebuild carries every torn-down node's key (#1567).** `rebuildInstance` respawns from a scene-form
   capture, which holds a node's guid and never its key, and only a guid DERIVED from the key can recover
   it. So a node whose guid is not derived — a reference node the user dropped this session (a v4 guid),
@@ -1728,8 +1739,8 @@ reading a newer prefab, because nothing there saves.
   - a row it no longer backs is kept, minus any `added`/`own` node the re-apply RE-HOMED. An addition
     whose anchor is gone moves to the instance root live (the Refresh reconciliation rule), and is saved
     there. Kept in the row too, a restore of the member spawned it a second time, with the same guid.
-    ⚠️ This is the one place a Refresh and a reload still differ: a reload leaves such a node inside the
-    orphan row (gone until the member returns), while a Refresh keeps it at the root;
+    ⚠️ Superseded by #1880 F3a (B′): the Refresh no longer re-homes it — it vanishes into the orphan row, as a
+    reload leaves it (the B′ entry above);
   - a kept row it backs again is replayed onto its target and leaves the store (`replayRowsLive`: the
     loader's fold, outside in, then node rows, then guids and moves). Left in, a save would re-emit it
     over a later live edit;
@@ -1738,9 +1749,10 @@ reading a newer prefab, because nothing there saves.
   The replay folds over an empty lower layer, where the loader folds over the chain's. So a trait the
   row keeps that the CHAIN removed is added back from the target's template row: named by a `false` in
   `traitRemovals`, or left out of a v16 `removedTraits` list. For an owned nested root, that is its child
-  document's root row. ⚠️ **Not replayed live:** a kept `removed: false`. The chain has already cut the
-  member from the fresh expansion, so there is nothing to apply it to. The row stays kept, the save
-  writes it, and it applies on the next load.
+  document's root row. A kept `removed: false` used to be the one row this replay could not apply live (the chain had
+  already cut the member from the fresh expansion) — a documented gap until the next load. **Closed by #1880 F6:** a
+  scene entry is rebuilt by LOADING its entry (`rebuildFromEntry`), so the row un-removes the member live, as the
+  reload does (nestedRowFieldSave, flipped with the reason on #1880).
 
   The store must be CURRENT for this to be safe, since a replay acts on whatever holds the key. So every
   load resets it for every instance root and reference node it loads, an entry with no rows included (it

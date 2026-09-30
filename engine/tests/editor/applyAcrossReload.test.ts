@@ -340,9 +340,13 @@ describe('#1750 fourth review: the agent `prefab create` whose tree is rebuilt D
     fs.hold = { holdPath: 'FromIB2', gate, reached };
     const create = quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: ROOT_B, path: 'prefabs/FromIB2.prefab.json' }).catch((e: Error) => ({ ok: false, error: e.message })));
     await atWrite; // past every check of its own, inside the commit's write
-    const before = rootIdOf(ROOT_B);
+    const handleOf = (id: number) => getCurrentWorld().entities.find((x) => x.id() === id);
+    const before = handleOf(rootIdOf(ROOT_B));
     expect((await quietly(() => applyToPrefabWithUndo(rootA, new Set([keyOf(rootA)])))).applied, 'premise: the fan-out re-minted IB').toBe(true);
-    expect(rootIdOf(ROOT_B), 'premise: IB is at a new id now').not.toBe(before);
+    // A NEW entity — its handle carries a new generation. Since #1880 F6 the respawn can take back the very index its
+    // teardown freed (koota recycles the last freed id first), so the raw id may coincide: the raw-id mutation above is
+    // caught only while the index moves (it did before F6: 2 → 4). What stays true is that the old handle is dead.
+    expect(handleOf(rootIdOf(ROOT_B)), 'premise: IB is a new entity now').not.toBe(before);
     release();
     const r = await create as { ok?: boolean; warnings?: string[] };
     expect(r.ok, 'the file landed').toBe(true);

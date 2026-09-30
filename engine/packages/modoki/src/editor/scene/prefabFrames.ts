@@ -186,8 +186,8 @@ function sameDocument(a: object, b: object): boolean {
  *  refusing on content would block Apply over any byte difference between two copies of one file. */
 export function framesBuiltFromOtherRows(
   rootInstanceId: number,
-  /** `nestedOnly`: skip the instance's own frame. */
-  opts: { nestedOnly?: boolean } = {},
+  /** `nestedOnly`: skip the instance's own frame. `except`: frames (by root id) the caller rebuilds in the same load. */
+  opts: { nestedOnly?: boolean; except?: ReadonlySet<number> } = {},
 ): string[] {
   const pi = getTraitByName('PrefabInstance');
   if (!pi) return [];
@@ -206,6 +206,7 @@ export function framesBuiltFromOtherRows(
     const data = readTraitData(e.id, pi) as { rootInstanceId?: number; source?: string } | null;
     if (!data?.source || data.rootInstanceId !== e.id || !inside.has(e.id) || runtimeIds.has(e.id)) continue;
     if (opts.nestedOnly && e.id === rootInstanceId) continue;
+    if (opts.except?.has(e.id)) continue;
     const handle = findEntity(e.id);
     const rec = handle ? frameRootDoc(world, handle) : undefined;
     const cached = prefabCache.get(data.source);

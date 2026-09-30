@@ -11,7 +11,7 @@
  *  code. It does not see the other re-link and re-add undos (Detach's reattach, Remove Component's revert): those are
  *  pinned by the save→reload undo tests in `tests/editor/overrideMarkUndo.test.ts`.
  *
- *  One call is allowed: the in-place rebuild (`prefab.ts`, `rebuildInstance`) relinks the members inside a kept frame
+ *  One call is allowed: the in-place rebuild's teardown (`prefabRebuild.ts`, `destroyTornDown`, which both rebuild paths carry out) relinks the members inside a kept frame
  *  straight after its own delete, in the same world, with nothing in between to lose the marks. */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
@@ -35,7 +35,7 @@ function fnName(call: ts.CallExpression): string {
 /** The one call pardoned, keyed `file#function`. */
 const EXEMPT = [
   {
-    item: 'packages/modoki/src/editor/scene/prefabRebuild.ts#rebuildInstance',
+    item: 'packages/modoki/src/editor/scene/prefabRebuild.ts#destroyTornDown',
     count: 1,
     reason: 'the in-place rebuild relinks the members inside a kept frame straight after its own delete, in the same '
       + 'world and the same call, so nothing between the frame-ending and the relink can drop their marks.',

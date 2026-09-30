@@ -10,6 +10,7 @@ import { toLocalIdKeys, memberRef, splitNestedKey, nestedKeyRef } from './overri
 import { memberPathRecords, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { snapshotUnkeyed, dropOnThrow } from './capturedKeys';
 import { newGuid, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { memberPathSteps, addedKeyStep } from '../../runtime/core/assetRefRules';
@@ -47,6 +48,10 @@ import {
   carryPromotedGuids, deletePromotedNodes, insertAddedSubtree, movedRowsOf, promoteReferenceMoves,
   rehangPromotionSurvivors, snapshotPromotedGuids,
 } from './prefabApplyStructure';
+
+/** A frame root's durable guid ('' when it has none): what an Apply's plan names a frame by, since the ids it holds can be
+ *  dead or recycled once an earlier write's refresh has rebuilt the scene entry around it (#1880 F6). */
+const rootGuidOf = (id: number): string => durableGuid((readTraitData(id, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid);
 
 /** Does this added subtree hold an instance of `target` — a promotion that would make the prefab contain
  *  itself (#1446)? Only the slots that expand count ({@link expandedPrefabRefs}), never trait data. The expansion refuses a cyclic row, so the promoted instance came back empty after the refresh and
@@ -137,7 +142,10 @@ export interface ApplyPlan {
     source: string; expected: PrefabFile; before: PrefabFile; doc: PrefabFile; role: 'frame' | 'outer';
     /** The frames whose OWN edits this file took, and the keys (`localId.Trait.field`, `+trait.localId.Tag`): the refresh
      *  takes them out of those frames' captures (#1469, U15) — a U14 key written into a nested frame's own prefab. */
-    appliedFrom?: { rootId: number; fields: ReadonlySet<string> }[];
+    /** Each frame an Apply copied `fields` FROM, by the frame root's durable GUID (#1880 F6, hub rider (1)(d)): the ids are
+     *  taken when the plan is built, and an earlier write's refresh rebuilds whole scene entries, so a later write's id
+     *  can name a dead or recycled entity. `rootId` only for a root with no durable guid. */
+    appliedFrom?: { rootId: number; rootGuid: string; fields: ReadonlySet<string> }[];
   }[];
   rebuild: {
     rootInstanceId: number;
@@ -1184,7 +1192,7 @@ async function planApply(
       ...(writtenCount ? [{ level: n, w: { source, expected: oldPrefab, before: prefabBefore, doc: newPrefab, role: 'frame' as const } }] : []),
       ...outerWrites.map((e) => ({ level: Math.max(...e.levels), w: {
         source: e.source, expected: e.expected, before: e.before, doc: e.doc, role: 'outer' as const,
-        ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, fields })) } : {}),
+        ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, rootGuid: rootGuidOf(rootId), fields })) } : {}),
       } })),
     ], sameSource).map((x) => x.w),
     rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions },
@@ -1280,7 +1288,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // walk never reaches it, and captureNestedInstanceOverrides would then drop its per-copy overrides with no
       // warning at all (#1284).
       for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
-      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, fields: appliedFields });
+      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields });
       for (const [from, to] of carryPromotedGuids(rootGuid, promotedGuids)) follow.set(from, to);
       rehangPromotionSurvivors(survivors, follow);
       // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the

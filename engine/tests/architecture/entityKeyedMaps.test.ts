@@ -827,6 +827,10 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
   ...['SerializedEntity.overrides', 'SerializedEntity.removedTraits', 'SerializedEntity.moved', 'SerializedEntity.nestedOverrides'].map((f) => ({
     item: `engine/packages/modoki/src/editor/scene/serialize.ts::${f}`,
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
+  { item: 'engine/packages/modoki/src/editor/scene/prefabCapture.ts::StructureCaptureOpts.frameEdits',
+    reason: 'scratch: keyed by a frame root\'s ecs id, built by one rebuild\'s caller and read within one synchronous capture (captureInstanceEntry in rebuildTargetsByEntry / captureEntrySide, #1880 F6); no recycled id outlives it; editor/scene/prefabCapture.ts StructureCaptureOpts' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefabCapture.ts::StructureCaptureOpts.dropParents',
+    reason: 'scratch: the member ecs ids one rebuild\'s caller drops, read within one synchronous capture (captureInstanceEntry in rebuildTargetsByEntry / captureEntrySide, #1880 F6); no recycled id outlives it; editor/scene/prefabCapture.ts StructureCaptureOpts' },
   { item: 'engine/packages/modoki/src/editor/scene/prefabCapture.ts::StructureCaptureOpts.layerTraits',
     reason: 'not-entity: keyed by a prefab member\'s row localId (the frame document\'s own id space), valued by trait names the enclosing layer adds to it; built for one capture (#1676); editor/scene/prefabCapture.ts StructureCaptureOpts' },
   ...['LayerStructure.removedTraits', 'LayerStructure.moved', 'FrameLayer.overrides', 'LayerLists.removedTraits'].map((f) => ({

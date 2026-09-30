@@ -21,7 +21,8 @@ import {
 import {
   framesBuiltFromOtherRows, missingSourceRefusal, staleFramesRefusal, staleInstanceRefusal,
 } from './prefabFrames';
-import { captureStructureForRespawn, rebuildInstance } from './prefabRebuild';
+import { captureStructureForRespawn, rebuildInstance, isOutermostEntry, captureEntrySide, rebuildEntrySide, type EntrySide } from './prefabRebuild';
+import { getAllEntities, readTraitData } from '../../runtime/core/ecs/entityUtils';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
  *  not load (#1862). That is a live frame kept across a rebuild after its prefab was trashed, a nested one or #1738's
@@ -165,6 +166,11 @@ export interface RevertResult {
   fullStructure: InstanceStructure;
   reducedOverrides: Record<number, Record<string, Record<string, unknown>>>;
   reducedStructure: InstanceStructure;
+  /** Both sides as the instance's outermost entry states them (#1880 F6d, F6-U — `captureEntrySide`): the Revert, its undo
+   *  and its redo rebuild that entry by loading these, and the four fields above go unread. Absent where the frame keeps
+   *  its own rebuild (the prefab-edit world). */
+  fullSide?: EntrySide;
+  reducedSide?: EntrySide;
   /** The BASE scene(s) that own the instance — pass as the undo action's `affectedScenes`. A base's
    *  file is written by Save All only when it is dirty, and nothing else marks it: without this a
    *  revert on a base's instance reads saved and is lost on reload (#1431). [] for a primary one. */
@@ -277,6 +283,45 @@ export async function revertOverridesSelective(
     fullStructure = { ...fullStructure, nestedMoves: { set: Object.fromEntries(revertedNested.map((m) => [m.key, m.parentGuid])) } };
   }
 
+  // The instance is rebuilt by loading its outermost scene entry (#1880 F6d, F6-U): the reduced side is the save's statement
+  // with what the Revert takes out taken out of this frame's — the fields, the structure, and a reverted move's `parent`
+  // (a move is a member row's `parent` in the rows form, at this frame and inside frames nested in it alike). A nested
+  // frame's fields are its DELTA over the layers enclosing it (`captureNestedChannels`), so taking a key out of it puts
+  // back what those layers state (#1492), and a reverted removal comes back as they state it (#1730) — the load applies
+  // them, as a reload does.
+  const fullSide = captureEntrySide(rootInstanceId);
+  if (fullSide) {
+    const piMeta = getTraitByName('PrefabInstance');
+    const eaMeta = getTraitByName('EntityAttributes');
+    const movedLids = new Set([...selectedKeys].filter((k) => /^~moved\.\d+$/.test(k)).map((k) => Number(k.slice('~moved.'.length))));
+    const dropParents = new Set(revertedNested.map((m) => m.memberEcs));
+    if (movedLids.size && piMeta) {
+      for (const e of getAllEntities()) {
+        const pi = readTraitData(e.id, piMeta) as { rootInstanceId?: number; localId?: number } | null;
+        if (pi?.rootInstanceId === rootInstanceId && e.id !== rootInstanceId && movedLids.has(pi.localId ?? 0)) dropParents.add(e.id);
+      }
+    }
+    // An OWNED frame states a delta over its layers; every other (the entry's root, a reference node) states its fields
+    // whole, and a template node's reverted field is the node's (#1506) — `reducedOverrides` holds exactly that.
+    const pi = piMeta ? readTraitData(rootInstanceId, piMeta) as MemberPi | null : null;
+    const owned = !isOutermostEntry(rootInstanceId) && !!pi && isOwnedRoot(pi, rootInstanceId);
+    const reducedSide = captureEntrySide(rootInstanceId, {
+      frames: new Map([[rootInstanceId, {
+        overrides: owned ? (o: Record<number, Record<string, Record<string, unknown>>>) => subtractFieldOverrides(o, selectedKeys) : () => reducedOverrides,
+        structure: (s: InstanceStructure) => ({
+          ...s, ...subtractRevertedStructure(s, selectedKeys),
+          ...(s.unrowed ? { unrowed: Object.fromEntries(Object.entries(s.unrowed).filter(([lid]) => !movedLids.has(Number(lid)))) } : {}),
+        }),
+      }]]),
+      dropParents,
+    })!;
+    const guid = eaMeta ? ((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid ?? '') : '';
+    const newRootId = rebuildEntrySide(reducedSide, guid);
+    return {
+      newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, fullSide, reducedSide,
+      affectedScenes: resolveAffectedScenes([newRootId]),
+    };
+  }
   const newRootId = rebuildInstance(rootInstanceId, source, prefab, reducedOverrides, reducedStructure);
 
   return { newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes: resolveAffectedScenes([newRootId]) };

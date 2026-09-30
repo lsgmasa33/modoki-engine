@@ -41,6 +41,7 @@ import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSe
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { templateKeysOf } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { clearKeptMemberOrphans, deriveInstanceMemberGuids, keptMemberOrphans, setKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
@@ -112,6 +113,9 @@ async function load(scene: SceneData): Promise<void> {
 
 const openInEditor = async (doc: PrefabFile): Promise<number> => {
   install(doc);
+  // The prefab-edit world is known by its path (`isPrefabEditWorld`), as the editor's is: its rows are entries of their own,
+  // rebuilt through the same load as a scene entry, with their kept rows keyed for the template (#1880 F6f).
+  editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${doc.id}` } as never);
   await load(buildPrefabEditScene(doc) as SceneData);
   const root = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!;
   expect(root).toBeDefined();
@@ -157,7 +161,10 @@ async function eachExpansion(outer: PrefabFile, check: (where: string) => void):
   check('editor instantiate');
 }
 
+let editWorld: ReturnType<typeof vi.spyOn> | undefined;
 beforeEach(() => {
+  editWorld?.mockRestore();
+  editWorld = undefined;
   prefabs.clear();
   writes.length = 0;
   install(innerDoc);
@@ -719,6 +726,25 @@ describe('#1541/#1542 close-out review', () => {
 
   // The same after an innocuous Refresh: a dropped node row's own node goes back as a template node, its key kept.
   // Mutations: in `keepsTemplateRows`, read the marker alone; in `templateRowOf`, keep scene nodes as they are.
+  // …and one the ROW itself hangs under its member, in the row's own rows rather than a reference node's (#1880 F6f: the
+  // row is the entry a Refresh rebuilds, and its rows are keyed before the teardown). Mutation: in `keyEntryRows`, key only
+  // the reference nodes' rows — the row's own kept row mints a new key on every save.
+  it('a node the ROW hangs under a member a Refresh drops keeps its authored key across saves', async () => {
+    const KK = 'dddddddd-0000-4000-8000-0000000618f6';
+    const kid = { parentLocalId: 0, guid: '', key: KK, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: { x: 4 } }, children: [] };
+    const doc = outer2();
+    (doc.entities.find((e) => e.prefab === INNER) as unknown as Record<string, unknown>).members = { [`/${G_LEAF}`]: { own: [kid] } };
+    const root = await openInEditor(doc);
+    expect(all().filter((e) => e.name === 'Kid')).toHaveLength(1); // precondition: the row's node spawned
+    install(innerNoLeaf());
+    await quietly(() => rebaseStaleInstances());
+    expect(all().filter((e) => e.name === 'Kid')).toHaveLength(0); // gone with Leaf (R2, fork 2)
+    const rowRows = () => JSON.stringify(serializePrefab(root, OUTER2)!.entities.find((e) => e.prefab === INNER)!.members ?? {});
+    const first = rowRows();
+    expect(first).toContain(KK);
+    expect(rowRows()).toBe(first); // a second save: same bytes
+  });
+
   it('a node row dropped after an earlier Refresh keeps its node as a template node', async () => {
     const KK = 'dddddddd-0000-4000-8000-000000051538';
     const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };

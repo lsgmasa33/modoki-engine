@@ -9,8 +9,10 @@ import { worldIdentityParents, noteNodeMoves, frameRootDoc, noteFrameRootDoc } f
 import { memberRowKeysIn, memberRowsIn, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { diffFrameAdded } from './nodeRowDiff';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { beginWorldBoundOperation } from '../undo/undoManager';
-import { getAllEntities, deleteEntities, readTraitData, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { beginWorldBoundOperation, breakUndoCoalescing } from '../undo/undoManager';
+import { getAllEntities, deleteEntities, readTraitData, writeTraitField, findEntity, markStructureDirty, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { markUIDirty } from '../../runtime/ui/uiTreeStore';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { newGuid, resolveRef, isGuid } from '../../runtime/loaders/assetManifest';
@@ -18,9 +20,9 @@ import { durableGuid, nodeRowKey, remapGuidValues, memberPathSteps } from '../..
 import { memberPathLookup } from '../../runtime/core/templateRefs';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
-import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, deriveMemberGuidsAfterPins, memberPathIndex, queuePrefabMoves, collectReferenceNodeRows, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
-import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
+import type { AddedEntity, ExpansionReader, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, deriveMemberGuidsAfterPins, memberPathIndex, queuePrefabMoves, collectReferenceNodeRows, mapNodeChannels, nodeChannels, instantiatePrefabIntoWorld, settleEntryRows, entryRowsOf } from '../../runtime/loaders/loadSceneFile';
+import { translateLocalIds, translateCarried, docRows } from '../../runtime/loaders/memberTranslation';
 import { foldMemberRowChannels, mergeTraitRemovals, rowAt } from '../../runtime/loaders/prefabOverrides';
 import { frameForward, chainLayer, layerAddedTraits, levelDoc, keptLegacyForward, settleKeptLegacy } from './prefabBase';
 import { collectTree, localToEcsGuid, type PrefabFile } from './prefab';
@@ -38,12 +40,14 @@ import {
   type KeptNodeReplace, liveTemplateKeys, moveChannelsOntoRows, nodeDiffDeps, resolveAddedNodeTokens,
   subtractChainOverrides, subtractChainStructure,
 } from './prefabCapture';
-import { subtractFieldOverrides } from './prefabChain';
+import { captureWithLayer, ownInstanceStructure, subtractFieldOverrides } from './prefabChain';
 import {
   collectInstanceRoots, framesBuiltFromOtherRows, isLiveInstanceRoot, type KeptFrame, rebuildTeardown, type StaleFrame,
   staleFrames,
 } from './prefabFrames';
 import { applyStructureByRootInstance, instantiatePrefab, spawnAddedUnder } from './prefabInstantiate';
+import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
+import type { FrameEdit } from './prefabCapture';
 
 /** `rows` with every scene node in them carrying the template key of the live entity it is — marker, else recovered,
  *  else minted once here — so `templateRowOf` can write it after that entity is gone. The guid stays: the settle's live
@@ -316,6 +320,8 @@ function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: Nested
     let { overrides, structure } = cap;
     // Against the document the frame expands NOW (`childPrefab`, a re-pointed row's new prefab included), recording what
     // it leaves out for the settle, which reads `dropped` after this re-apply (#1880 close-out re-review 1).
+    // No layer set: this capture already subtracted its chain (`captureNestedInstanceOverrides`), so every node left in it
+    // is one the save writes into the frame's rows — the scene's own, B′'s scope.
     if (settles && structure.added) structure = { ...structure, added: withoutGoneMemberNodes(structure.added, cap.doc, childPrefab, dropped)! };
     const lid = translateLocalIds(cap.doc, childPrefab, { acrossPrefabs: nowSource !== cap.source });
     if (lid) ({ overrides, structure } = translateCarried(lid, overrides, structure));
@@ -423,8 +429,16 @@ function rowsSettleActive(rootInstanceId: number): boolean {
  *  a template that brings the member back brings them back, once. The rebuild used to re-anchor them at the frame root
  *  (`applyStructureCore`'s "anchor missing" rule) while a reload of the same scene kept them in the row: rebuild ≠
  *  reload (hunt seed 1127). Only a member with a `nodeGuid` qualifies — a pre-v5 row writes no member row, so nothing
- *  would keep the node, and the root stays its home. Asked in `from`'s numbering, before translation. */
-function withoutGoneMemberNodes(added: AddedEntity[] | undefined, from: PrefabFile, to: PrefabFile, dropped: Set<string>): AddedEntity[] | undefined {
+ *  would keep the node, and the root stays its home. Asked in `from`'s numbering, before translation.
+ *
+ *  ⚠️ Only the SCENE's own nodes. B′'s scope is what the member's row keeps, and a node an ENCLOSING layer adds (`layerNodes`,
+ *  by guid: {@link layerAuthoredNodeGuids}) is in no row of this scene — the capture of an owned nested root carries it only
+ *  because the respawn's forwarded layers never spawn at the root's own frame. It keeps the loader's "anchor missing →
+ *  root" re-anchor, as a reload re-anchors it. Dropped as well, it vanished for good where the reload showed it (#1880 F6
+ *  precondition, hunt seeds 1171 / 3090). */
+function withoutGoneMemberNodes(
+  added: AddedEntity[] | undefined, from: PrefabFile, to: PrefabFile, dropped: Set<string>, layerNodes: ReadonlySet<string> = new Set(),
+): AddedEntity[] | undefined {
   if (!added?.length || from === to) return added;
   const kept = new Set((to.entities ?? []).map((e) => e.nodeGuid).filter((g): g is string => !!g && isGuid(g)));
   const gone = (lid: number): boolean => {
@@ -432,11 +446,20 @@ function withoutGoneMemberNodes(added: AddedEntity[] | undefined, from: PrefabFi
     return !!row && row.localId !== (from.rootLocalId ?? 1) && !!row.nodeGuid && isGuid(row.nodeGuid) && !kept.has(row.nodeGuid);
   };
   const out = added.filter((n) => {
-    if (!gone(n.parentLocalId)) return true;
+    if ((n.guid && layerNodes.has(n.guid)) || !gone(n.parentLocalId)) return true;
     if (n.guid) dropped.add(n.guid);
     return false;
   });
   return out.length === added.length ? added : out;
+}
+
+/** The guid of every `added` node the layers ENCLOSING instance `rootInstanceId` author rather than the instance itself
+ *  (its capture against `baseline` minus {@link ownInstanceStructure}), through `remap`. Empty for an instance nothing
+ *  encloses. Read on the live tree, so before the teardown. */
+function layerAuthoredNodeGuids(rootInstanceId: number, baseline: PrefabFile, remap: ReadonlyMap<string, string>): Set<string> {
+  const full = captureWithLayer(rootInstanceId, baseline);
+  const own = new Set(ownInstanceStructure(rootInstanceId, baseline, full).added.map((n) => n.guid));
+  return new Set(full.added.filter((n) => n.guid && !own.has(n.guid)).map((n) => remap.get(n.guid!) ?? n.guid!));
 }
 
 /** The kept-orphan store (R2, `keptMemberOrphans`) across a rebuild, left exactly as a RELOAD of the same scene would
@@ -629,32 +652,6 @@ export function savedFrameDoc(rootId: number, source: string, current: PrefabFil
   return levelDoc(rootId, source).doc ?? current;
 }
 
-/** {@link translateLocalIds} applied to everything a rebuild carries by localId. */
-function translateCarried<S extends { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> }>(
-  lid: (n: number) => number,
-  overrides: Record<number, Record<string, Record<string, unknown>>>,
-  structure: S,
-): { overrides: typeof overrides; structure: S } {
-  const keys = <V,>(m: Record<number, V> | undefined): Record<number, V> | undefined => {
-    if (!m) return m;
-    const out: Record<number, V> = {};
-    for (const [k, v] of Object.entries(m)) { const n = lid(Number(k)); if (n) out[n] = v; }
-    return out;
-  };
-  return {
-    overrides: keys(overrides)!,
-    structure: {
-      ...structure,
-      removed: structure.removed?.map(lid).filter((n) => n > 0),
-      removedTraits: keys(structure.removedTraits),
-      // An anchor the template dropped reads as 0 — "merely absent", which `applyStructureCore`
-      // re-anchors to the root with a warning, rather than an anchor some other member now holds.
-      added: structure.added?.map((n) => ({ ...n, parentLocalId: lid(n.parentLocalId) })),
-      ...(structure.moved ? { moved: keys(structure.moved) } : {}),
-    },
-  };
-}
-
 /** The template key marker of every entity in `ids` that carries one, by durable guid (old → new through `remap`). A key
  *  is identity, the same kind as the guid and `Transient`, and a rebuild's scene-form capture carries the guid alone
  *  (#1567). The marker only: a node that reached a rebuild without one lost it earlier, and the loader's heal and
@@ -678,6 +675,26 @@ function restoreTemplateKeys(keys: ReadonlyMap<string, string>): void {
     const entity = findEntityByGuid(guid);
     if (entity && !templateKeyOf(entity)) setTemplateKey(entity, key);
   }
+}
+
+/** Carry out a rebuild's teardown (`rebuildTeardown`'s answer): what it parks and keeps is lifted to the scene root, the
+ *  rest is deleted, and what the delete's frame ending detaches INSIDE a kept frame is put straight back (close-out
+ *  review): a kept root that was ever moved carries an `ownerGuid` link naming the root torn down here, so
+ *  `promoteOwnedRoots` promoted it to a stored root (its row link cleared, its members renamed) and `seatKeptFrames` then
+ *  found no owner and dropped it. The one bare relink in the editor (`relinkPutsMarksBack.test.ts`): straight after its
+ *  own delete, in the same world and call, so nothing between the frame ending and the relink can drop their marks. */
+function destroyTornDown({ toDestroy, parked, kept }: Pick<ReturnType<typeof rebuildTeardown>, 'toDestroy' | 'parked' | 'kept'>): void {
+  // The ids freed here are handed straight back to the respawn (koota recycles the last freed first), and the undo
+  // coalescing chain is keyed by raw id: an edit on whatever takes id X next would merge into the entry of the edit on
+  // the old X. A Revert or an Apply pushes an entry of its own and ends the chain; a rebuild that pushes none (an outside
+  // prefab change re-imported in place, #1873 R1 / #1879) did not (#1880 F6, hub rider (1)(c)).
+  breakUndoCoalescing();
+  const eaMeta = getTraitByName('EntityAttributes');
+  for (const p of [...parked, ...kept]) if (eaMeta) writeTraitField(p.id, eaMeta, 'parentId', 0);
+  const keptSubtree = new Set(kept.length ? collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), kept.map((k) => k.id)) : []);
+  const keptGuids = new Set(getAllEntities().filter((e) => keptSubtree.has(e.id) && e.guid).map((e) => e.guid!));
+  const detached = deleteEntities([...toDestroy]);
+  if (kept.length) relinkDetachedMembers(detached.filter((d) => keptGuids.has(d.guid)));
 }
 
 /** Tear down a single live prefab instance and re-instantiate it cleanly from
@@ -730,7 +747,10 @@ export function rebuildInstance(
   // The guids it leaves out: they are gone from the world once the rebuild ends, whatever holds them for a moment (a
   // missing-prefab node the teardown KEEPS, then drops as unnamed, `seatKeptFrames`), so the settle keeps them in the row.
   const dropped = new Set<string>();
-  if (settles) structure = { ...structure, added: withoutGoneMemberNodes(structure.added, baseline, prefab, dropped) };
+  // …the scene's OWN nodes only: one an enclosing layer adds re-anchors as a load re-anchors it (`withoutGoneMemberNodes`).
+  if (settles && baseline !== prefab) {
+    structure = { ...structure, added: withoutGoneMemberNodes(structure.added, baseline, prefab, dropped, layerAuthoredNodeGuids(rootInstanceId, baseline, remap)) };
+  }
   const lidOf = translateLocalIds(baseline, prefab);
   if (lidOf) ({ overrides, structure } = translateCarried(lidOf, overrides, structure));
 
@@ -822,14 +842,7 @@ export function rebuildInstance(
   // must not take its "nothing can change" shortcut (#1880 close-out review 3).
   const mayDrop = dropped.size > 0 || (settles && nestedCaptures.some((c) => c.doc !== getCachedPrefabSync(c.source)));
   const settleKeptOrphans = captureRowsForSettle(rootInstanceId, baseline, prefab, toDestroy, remap, dropped, mayDrop);
-  for (const p of [...parked, ...kept]) if (eaMeta) writeTraitField(p.id, eaMeta, 'parentId', 0);
-  // What the delete's frame ending detaches INSIDE a kept frame is put straight back (close-out review): a kept root that
-  // was ever moved carries an `ownerGuid` link naming the root torn down here, so `promoteOwnedRoots` promoted it to a
-  // stored root (its row link cleared, its members renamed) and `seatKeptFrames` then found no owner and dropped it.
-  const keptSubtree = new Set(kept.length ? collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), kept.map((k) => k.id)) : []);
-  const keptGuids = new Set(getAllEntities().filter((e) => keptSubtree.has(e.id) && e.guid).map((e) => e.guid!));
-  const detached = deleteEntities([...toDestroy]);
-  if (kept.length) relinkDetachedMembers(detached.filter((d) => keptGuids.has(d.guid)));
+  destroyTornDown({ toDestroy, parked, kept });
 
   // A kept scene-added reference node IS that node's live expansion: its respawn from the structure (a placeholder, the
   // prefab being missing) is skipped, wherever the structure states it, this root's or a nested frame's. One the
@@ -1036,6 +1049,304 @@ function seatKeptFrames(kept: readonly KeptFrame[], newRootId: number, unnamed: 
   if (drop.length) deleteEntities(drop);
 }
 
+/** Whether stored root `rootId` is a scene ENTRY of its own — the rebuild unit (#1880 F6-U, hub ruling (i)): a stored
+ *  root no instance encloses, which the save writes as its own entry (`serializeScene`'s `prefabRootInfo`, less what an
+ *  enclosing capture consumes). Not an owned nested root, not a stored root under any instance's node, not a
+ *  missing-prefab placeholder. In the prefab-edit world an entry is a ROW of the edited prefab (`buildPrefabEditScene`):
+ *  a nested row's root, whose ancestors are the plain entities the edited prefab's own rows spawn as (F6f). */
+export function isOutermostEntry(rootId: number): boolean {
+  const piMeta = getTraitByName('PrefabInstance');
+  const pi = piMeta ? readTraitData(rootId, piMeta) as { rootInstanceId?: number } | null : null;
+  if (!pi || pi.rootInstanceId !== rootId) return false;
+  if (unresolvedRefOf(findEntity(rootId))) return false;
+  if (worldIdentityParents(getCurrentWorld()).frameOf(rootId)) return false;
+  const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+  for (let p = parentOf.get(rootId) ?? 0, hops = 0; p && hops < 10_000; p = parentOf.get(p) ?? 0, hops++) {
+    if (readTraitData(p, piMeta!)) return false;
+  }
+  return true;
+}
+
+/** The scene entry frame `frameRoot` rebuilds through (#1880 F6-U, hub ruling (i)): itself when it is one
+ *  ({@link isOutermostEntry}), else the entry enclosing it — an owned root climbs to its owner (identity, #1437), a stored
+ *  root inside an instance to the frame of the member it hangs under. 0 when none is found (a damaged tree). */
+export function outermostEntryOf(frameRoot: number): number {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return 0;
+  const identity = worldIdentityParents(getCurrentWorld());
+  const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+  let cur = frameRoot;
+  for (let hops = 0; cur && hops < 10_000; hops++) {
+    if (isOutermostEntry(cur)) return cur;
+    if (identity.frameOf(cur)) { cur = identity.ownerOf(cur); continue; }
+    let frame = 0;
+    for (let p = parentOf.get(cur) ?? 0, h = 0; p && h < 10_000; p = parentOf.get(p) ?? 0, h++) {
+      const pi = readTraitData(p, piMeta) as { rootInstanceId?: number } | null;
+      if (pi) { frame = pi.rootInstanceId || 0; break; }
+    }
+    cur = frame;
+  }
+  return 0;
+}
+
+/** The entry `frameRoot` rebuilds through ({@link outermostEntryOf}), when every prefab that entry's load reads is in
+ *  the editor's cache — each frame's source in its live tree. 0
+ *  otherwise: the frame keeps its own rebuild, which reads only what is inside it. */
+function readableEntryOf(frameRoot: number): number {
+  const outer = outermostEntryOf(frameRoot);
+  if (!outer) return 0;
+  const pi = getTraitByName('PrefabInstance')!;
+  for (const e of collectTree(outer, getAllEntities())) {
+    if (!e.traits.includes('PrefabInstance')) continue;
+    const src = readTraitData(e.id, pi)?.source as string | undefined;
+    if (src && !prefabCache.has(src)) return 0;
+  }
+  return outer;
+}
+
+/** Entry `outer` (of `source`, guid `outerGuid`) as a rebuild loads it: the save's own statement ({@link captureInstanceEntry})
+ *  with `edit` made in it and every reference node against its own record (`againstRecords`). In the prefab-edit world
+ *  the entry is a ROW, and the rows the load keeps for it (R2) go back into the TEMPLATE through the edit save's row
+ *  writer (`captureRowChannels` → `templateRowOf`), which states a node by its template KEY: so each scene node in its
+ *  member rows carries the key of the live entity it is, read now, while it is live (`keySceneNodes`; #1541/#1542, #1567)
+ *  — gated as that writer gates the re-emit (`keepsTemplateRows`). The rest stays in the rows form: a payload's refs are
+ *  live guids, which the load resolves as it did at the open (`editWorldRefs` turned the file's tokens into them). */
+function captureRebuildEntry(
+  outer: number, source: string, from: PrefabFile, outerGuid: string,
+  edit: { frames?: ReadonlyMap<number, FrameEdit>; dropParents?: ReadonlySet<number> } = {},
+): InstanceEntry {
+  const { entry } = captureInstanceEntry(outer, source, from, outerGuid, { ...edit, againstRecords: true });
+  return keepsTemplateRows(outer, outerGuid) ? keyEntryRows(entry) : entry;
+}
+
+/** `entry` with every member-row set in it keyed ({@link keySceneNodes}): its own, and each reference node's, at any depth
+ *  (a template reference node inside a row keeps its orphan rows under its own root, `keepTemplateNodeOrphans`). */
+function keyEntryRows(entry: InstanceEntry): InstanceEntry {
+  const walk = (list: AddedEntity[]): AddedEntity[] => list.map((n) => {
+    const { members, ...rest } = n;
+    const out = mapNodeChannels(rest as AddedEntity, walk);
+    return members ? { ...out, members: keySceneNodes(members) } : out;
+  });
+  const asNode = mapNodeChannels({ added: entry.added, nestedStructure: entry.nestedStructure } as AddedEntity, walk);
+  return {
+    ...entry,
+    ...(entry.added ? { added: asNode.added } : {}),
+    ...(entry.nestedStructure ? { nestedStructure: asNode.nestedStructure } : {}),
+    ...(entry.members ? { members: keySceneNodes(entry.members) } : {}),
+  };
+}
+
+/** One frame a rebuild is asked for, and what the caller edits of its statement ({@link FrameEdit}). */
+interface RebuildTarget { root: number; edit?: FrameEdit }
+
+/** Rebuild the scene entry around each of `targets` ONCE, by loading its entry with the targets' edits in it (#1880 F6-U):
+ *  every frame inside is re-expanded from the editor's current documents, as a reload does, so a frame another
+ *  target in the same entry names is rebuilt by the same load. Returns the targets it covered (by their id at the call),
+ *  and the new id each root has after (by guid; 0 when it has none to be found by). */
+function rebuildTargetsByEntry(
+  targets: readonly RebuildTarget[], remap: ReadonlyMap<string, string> = new Map(), dropParents?: ReadonlySet<number>,
+  /** A refresh of `source` from `from` to `to`: an outer entry of that source is expanded from `to`, and captured against
+   *  `from` where it has no record of its own — the documents `refreshInstances` was handed, not the cache's. */
+  refresh?: { source: string; from: PrefabFile; to: PrefabFile },
+): Map<number, number> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const done = new Map<number, number>();
+  if (!piMeta || !eaMeta) return done;
+  const groups = new Map<number, RebuildTarget[]>();
+  for (const t of targets) {
+    const outer = outermostEntryOf(t.root);
+    if (!outer) continue;
+    const list = groups.get(outer);
+    if (list) list.push(t); else groups.set(outer, [t]);
+  }
+  const world = getCurrentWorld();
+  const guidOfId = (id: number) => durableGuid((readTraitData(id, eaMeta) as { guid?: string } | null)?.guid);
+  for (const [outer, group] of groups) {
+    const source = (readTraitData(outer, piMeta)?.source as string) || '';
+    const handle = findEntity(outer);
+    const rec = handle ? frameRootDoc(world, handle) : undefined;
+    const refreshed = refresh?.source === source ? refresh : undefined;
+    const now = refreshed?.to ?? getCachedPrefabSync(source);
+    const baseline = rec && rec.source === source ? rec.doc as PrefabFile : refreshed?.from ?? now;
+    if (!now || !baseline) continue;
+    const guids = new Map(group.map((t) => [t.root, guidOfId(t.root)] as const));
+    const frames = new Map(group.filter((t) => t.edit).map((t) => [t.root, t.edit!] as const));
+    const entry = captureRebuildEntry(outer, source, baseline, guidOfId(outer), { frames, dropParents });
+    const newOuter = rebuildFromEntry(outer, source, now, entry, remap, baseline);
+    for (const t of group) {
+      const g = guids.get(t.root)!;
+      done.set(t.root, t.root === outer ? newOuter : (g ? findEntityByGuid(remap.get(g) ?? g)?.id() ?? 0 : 0));
+    }
+  }
+  return done;
+}
+
+/** A frame's statement as a rebuild through its outermost entry keeps it (#1880 F6-U), for a step that rebuilds it again
+ *  later — a Revert and its undo, an Apply's undo sides: the entry's root by durable guid (ids do not survive the
+ *  rebuilds in between), its source, the document the entry was captured against, and the entry. */
+export interface EntrySide { outerGuid: string; source: string; from: PrefabFile; entry: InstanceEntry }
+
+/** The entry `frameRoot` rebuilds through, stated as the save states it with `edit` made in it — every reference node
+ *  against its own record ({@link captureRebuildEntry}). null where the frame has no such entry (a document the load could
+ *  not read — {@link readableEntryOf}), or the entry's root has no durable
+ *  guid to be found by again: the caller keeps the frame's own rebuild. */
+export function captureEntrySide(
+  frameRoot: number, edit: { frames?: ReadonlyMap<number, FrameEdit>; dropParents?: ReadonlySet<number> } = {},
+): EntrySide | null {
+  const outer = isOutermostEntry(frameRoot) ? frameRoot : readableEntryOf(frameRoot);
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!outer || !piMeta || !eaMeta) return null;
+  const outerGuid = durableGuid((readTraitData(outer, eaMeta) as { guid?: string } | null)?.guid);
+  const source = (readTraitData(outer, piMeta)?.source as string) || '';
+  const handle = findEntity(outer);
+  const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
+  const from = rec && rec.source === source ? rec.doc as PrefabFile : getCachedPrefabSync(source);
+  if (!outerGuid || !from) return null;
+  return { outerGuid, source, from, entry: captureRebuildEntry(outer, source, from, outerGuid, edit) };
+}
+
+/** Rebuild `side`'s entry by loading it onto the current documents. Returns the new id of the frame named `frameGuid`
+ *  (the entry's own root when it names none, or when that frame is not found after), 0 when the entry's root is not
+ *  live — nothing is rebuilt then. */
+export function rebuildEntrySide(side: EntrySide, frameGuid = ''): number {
+  const outer = findEntityByGuid(side.outerGuid)?.id() ?? 0;
+  if (!outer) return 0;
+  const newOuter = rebuildFromEntry(outer, side.source, getCachedPrefabSync(side.source) ?? side.from, side.entry, new Map(), side.from);
+  return (frameGuid && frameGuid !== side.outerGuid ? findEntityByGuid(frameGuid)?.id() : 0) || newOuter;
+}
+
+/** `entry` without the reference nodes {@link rebuildFromEntry} keeps live (by guid), in every list it holds. */
+function entryWithoutKeptNodes(entry: InstanceEntry, keep: ReadonlyMap<string, unknown>, found: Set<string>): InstanceEntry {
+  const asNode = { added: entry.added, nestedStructure: entry.nestedStructure, members: entry.members } as AddedEntity;
+  const out = mapNodeChannels(asNode, (list) => withoutKeptNodes(list, keep, found)!);
+  return { ...entry, ...(entry.added ? { added: out.added } : {}), ...(entry.nestedStructure ? { nestedStructure: out.nestedStructure } : {}), ...(entry.members ? { members: out.members as InstanceEntry['members'] } : {}) };
+}
+
+/** #1880 F6: rebuild the scene entry rooted at `rootInstanceId` (of `source`) by LOADING `entry` — the save's own
+ *  statement of it (`captureInstanceEntry`) — onto `prefab`, through the loader's spawner and post-pass
+ *  (`settleEntryRows`). A rebuild is then the load of what a save writes: nothing folds a capture into a fresh
+ *  expansion by hand, so nothing can fold it differently from a reload.
+ *
+ *  Only the live-world machinery no document holds is the rebuild's own, and it is the old rebuild's, unchanged: the
+ *  teardown and what it parks and keeps (`rebuildTeardown`: a member of another instance moved in, #1437/#1484; a frame
+ *  whose prefab cannot be expanded, #1862), the root's durable guid, `Transient` and scene ownership, and each torn-down
+ *  node's template key (#1567). `remap`: old → new member guid (#1437). */
+export function rebuildFromEntry(
+  rootInstanceId: number, source: string, prefab: PrefabFile, entry: InstanceEntry, remap: ReadonlyMap<string, string> = new Map(),
+  /** The document `entry` was captured against, when it is not `prefab`. Its rows are keyed by identity and need nothing,
+   *  but its localId channels do: the root's own edits, a pre-v5 member's, and — unlike a saved scene's, whose guid pass
+   *  gives every member a durable guid first — a member still on a RUNTIME guid, which no row may name. They are
+   *  translated by nodeGuid (`translateLocalIds`), so a template re-save that renumbers its rows hands no edit to the
+   *  member that inherited the number (#1468 Phase 4). */
+  from: PrefabFile = prefab,
+): number {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!piMeta || !eaMeta) return rootInstanceId;
+  if (!expandsToRoot(prefab, getCachedPrefabSync)) {
+    console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root`);
+    return rootInstanceId;
+  }
+  if (remap.size) entry = remapGuidValues(entry, remap) as InstanceEntry;
+  const lidOf = from !== prefab ? translateLocalIds(from, prefab) : null;
+  if (lidOf) entry = translateEntryLocalIds(entry, lidOf);
+  const oldRootEa = readTraitData(rootInstanceId, eaMeta);
+  const parentId = (oldRootEa?.parentId as number) ?? 0;
+  const wasTransient = !!findEntity(rootInstanceId)?.has(Transient);
+
+  const { toDestroy, parked, kept } = rebuildTeardown(rootInstanceId, remap);
+  const carriedKeys = templateKeysByGuid(toDestroy, remap);
+  destroyTornDown({ toDestroy, parked, kept });
+  // A kept scene-added reference node IS that node's live expansion: the entry's statement of it is not respawned.
+  const keptNodes = new Map(kept.filter((k) => !k.owned).map((k) => {
+    const g = durableGuid((readTraitData(k.id, eaMeta) as { guid?: string } | null)?.guid);
+    return [remap.get(g) ?? g, k] as const;
+  }));
+  // The SPAWN skips it; the settle below reads the whole entry, so R2 keeps it in its row as a load would.
+  const namedNodes = new Set<string>();
+  const spawned = keptNodes.size ? entryWithoutKeptNodes(entry, keptNodes, namedNodes) : entry;
+
+  // The load's spawn of a scene entry (`onInstantiatePrefab`), from the editor's cache.
+  const world = getCurrentWorld();
+  const newRootId = instantiatePrefabIntoWorld(
+    world, prefab, parentId, undefined, source, spawned.overrides,
+    { added: spawned.added, removed: spawned.removed, removedTraits: spawned.removedTraits, moved: spawned.moved, members: spawned.members },
+    undefined, spawned.nestedOverrides, spawned.nestedStructure, { read: getCachedPrefabSync as ExpansionReader },
+  );
+  markStructureDirty();
+  markUIDirty();
+  if (durableGuid(oldRootEa?.guid as string)) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa!.guid as string);
+  if (wasTransient) findEntity(newRootId)?.add(Transient);
+  setPrefabSource(newRootId, prefab);
+  // Keys first: a scene node carries its guid from the spawn, and a keyed node derives through its key.
+  restoreTemplateKeys(carriedKeys);
+  // …and the load's post-pass for this one entry: its rows' pins, R2's kept store, the reference nodes' rows, the derive.
+  const settled = entryRowsOf(newRootId, source, entry);
+  settleEntryRows(world, [settled], { pinned: new Set(), read: getCachedPrefabSync });
+  restoreTemplateKeys(carriedKeys);
+  // A kept reference node the entry states under a row the new template no longer backs is in that row now (R2, B′), as
+  // a load leaves it: it goes with its member rather than being re-seated at the root.
+  const orphaned = orphanedNodeGuids(settled);
+
+  const sourceScene = (oldRootEa?.sourceScene as string) || '';
+  if (sourceScene) {
+    const links = getAllEntities().map((e) => [e.id, e.parentId] as const);
+    const stamped = new Set(collectSubtreeIds(links, [newRootId]));
+    const rebuilt = worldIdentityParents(world);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const e of getAllEntities()) {
+        if (stamped.has(e.id) || !rebuilt.moved(e.id) || !stamped.has(rebuilt.parentOf(e.id))) continue;
+        for (const id of collectSubtreeIds(links, [e.id])) stamped.add(id);
+        grew = true;
+      }
+    }
+    for (const id of stamped) writeTraitField(id, eaMeta, 'sourceScene', sourceScene);
+  }
+  const after = parked.length ? worldIdentityParents(world) : null;
+  for (const p of parked) {
+    const live = new Map(getAllEntities().filter((e) => e.guid).map((e) => [e.guid!, e.id]));
+    const back = live.get(p.parentGuid);
+    const templateParent = after!.parentOf(p.id);
+    const to = back ?? (templateParent && templateParent !== p.id ? templateParent : undefined);
+    if (to) writeTraitField(p.id, eaMeta, 'parentId', to);
+    else console.warn(`[Prefab] rebuild: the parent ${p.parentGuid} of a member moved in here is gone, and so is its template parent; it stays at the scene root`);
+  }
+  seatKeptFrames(kept, newRootId, new Set([...keptNodes].filter(([g]) => !namedNodes.has(g) || orphaned.has(g)).map(([, k]) => k.id)));
+  return newRootId;
+}
+
+/** `entry` with its localId channels put through `lid` ({@link translateCarried}); its rows are keyed by identity. */
+function translateEntryLocalIds(entry: InstanceEntry, lid: (n: number) => number): InstanceEntry {
+  const { overrides, structure } = translateCarried(lid, entry.overrides ?? {}, {
+    added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved,
+  });
+  const out: InstanceEntry = { ...entry };
+  if (entry.overrides) out.overrides = overrides;
+  if (entry.added) out.added = structure.added;
+  if (entry.removed) out.removed = structure.removed;
+  if (entry.removedTraits) out.removedTraits = structure.removedTraits;
+  if (entry.moved) out.moved = structure.moved;
+  return out;
+}
+
+/** Every node guid the kept-orphan store (R2) now holds for the stored roots `rows` settled — the entry's own root and
+ *  each reference node it states — at any depth inside a kept row. */
+function orphanedNodeGuids(rows: ReturnType<typeof entryRowsOf>): Set<string> {
+  const eaMeta = getTraitByName('EntityAttributes');
+  const out = new Set<string>();
+  const walk = (list: readonly AddedEntity[] | undefined): void => {
+    for (const n of list ?? []) { if (n.guid) out.add(n.guid); for (const inner of nodeChannels(n)) walk(inner); }
+  };
+  const rootGuid = eaMeta ? durableGuid((readTraitData(rows.root, eaMeta) as { guid?: string } | null)?.guid) : '';
+  for (const guid of [rootGuid, ...rows.referenceRows.map(([g]) => g)]) {
+    for (const row of Object.values(guid ? keptMemberOrphans(guid) ?? {} : {})) walk([...(row.added ?? []), ...(row.own ?? [])]);
+  }
+  return out;
+}
+
 /** Rebuild instance `rootInstanceId` to `overrides`/`structure` — a state captured against `capturedFrom`, an earlier
  *  copy of its document — onto the editor's CURRENT copy of `source` (#1665). What a Revert's undo and redo put back:
  *  the template can have changed since the Revert (a prefab-edit save, an Apply from another instance), and a rebuild
@@ -1062,9 +1373,20 @@ export function rebuildInstanceFromCapture(
    *  first link is a row of `capturedFrom` and goes to `live` with the rest; each capture's own members are translated
    *  by the re-apply, from the document it holds. */
   nested?: readonly NestedInstanceCapture[],
+  /** The same side as its outermost entry states it ({@link captureEntrySide}, #1880 F6d/F6-U): that entry is rebuilt by
+   *  loading it onto the current documents. Its rows are keyed by identity, and the loader resolves them against the
+   *  current documents as a reload of an older save does (I4); its localId channels were put into the numbering of the
+   *  document each was stated against. */
+  side?: EntrySide,
 ): number | null {
   if (framesBuiltFromOtherRows(rootInstanceId, { nestedOnly: true }).length) return null;
   const now = prefabCache.get(source) ?? capturedFrom;
+  if (side) {
+    const eaMeta = getTraitByName('EntityAttributes');
+    const guid = eaMeta ? ((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid ?? '') : '';
+    const id = rebuildEntrySide(side, guid);
+    if (id) return id;
+  }
   const handle = findEntity(rootInstanceId);
   const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
   const live = rec && rec.source === source ? rec.doc as PrefabFile : now;
@@ -1104,7 +1426,9 @@ export function refreshInstances(
   /** The instance(s) an Apply copied `fields` (`localId.Trait.field`, `oldPrefab`'s numbering) FROM (#1469):
    *  they are subtracted from its capture, or their marks would carry them over as overrides. Several for a U14 Apply
    *  that wrote nested frames' own edits into their prefab (#1693). */
-  appliedFrom?: { rootId: number; fields: ReadonlySet<string> } | readonly { rootId: number; fields: ReadonlySet<string> }[],
+  /** Each named by the frame root's durable guid, taken when the Apply was planned — an id taken then can be dead or
+   *  recycled by the time a later write refreshes (#1880 F6). `rootId` only where the root had no durable guid. */
+  appliedFrom?: { rootId: number; rootGuid?: string; fields: ReadonlySet<string> } | readonly { rootId: number; rootGuid?: string; fields: ReadonlySet<string> }[],
 ): number {
   if (rootIds.length === 0) return 0;
 
@@ -1123,6 +1447,14 @@ export function refreshInstances(
   const depth = (id: number) => { let n = 0; for (let at = parentOf.get(id) ?? 0; at && n < 10_000; at = parentOf.get(at) ?? 0) n++; return n; };
   rootIds = [...rootIds].sort((a, b) => depth(b) - depth(a));
 
+  // A frame is rebuilt as the LOAD of its outermost scene entry (#1880 F6-U, hub ruling (i)): every target in one entry
+  // by the same load, each with the Apply's subtraction made in its own statement. Collected here and rebuilt after the
+  // loop, once per entry. The old per-frame rebuild stays for a frame whose entry reads a prefab the editor has not cached
+  // (`readableEntryOf`), and for a nested frame whose cached document is not `newPrefab` — the load expands a nested frame
+  // from the cache, not from what it was handed.
+  const cachedIsNew = getCachedPrefabSync(source) === newPrefab;
+  const listed = new Set(rootIds);
+  const byEntry: RebuildTarget[] = [];
   let refreshed = 0;
   for (const oldRootId of rootIds) {
     // ⚠️ A root can be DEAD by the time the loop reaches it, and `rebuildInstance` does not
@@ -1140,6 +1472,7 @@ export function refreshInstances(
     // ⚠️ Checked by GUID, not id — an id-only check is worse than none here. See
     // `isLiveInstanceRoot`.
     if (!isLiveInstanceRoot(oldRootId, guidOf.get(oldRootId) ?? '')) continue;
+    const entryRouted = isOutermostEntry(oldRootId) || (cachedIsNew && !!readableEntryOf(oldRootId));
     // Capture this instance's per-field overrides AND structural diffs against
     // the OLD prefab, then tear down + re-instantiate from the NEW prefab and
     // re-apply them. Structure must be captured before the teardown inside
@@ -1152,24 +1485,30 @@ export function refreshInstances(
     // also clears the record the refusal reads). Left alone, it stays refused until a reload's
     // `rebaseStaleInstances` rebuilds that nested frame by itself, from its own record (#1493).
     // Judged against the CACHE, because that is what the nested capture reads (`captureNestedRef`). A P
-    // instance the author dropped inside another P instance is current by now: the loop runs deepest first.
-    if (framesBuiltFromOtherRows(oldRootId, { nestedOnly: true }).length) {
+    // instance the author dropped inside another P instance is current by now: the loop runs deepest first —
+    // and an entry-routed one is rebuilt by the same load as the frame holding it, so it is not judged at all.
+    if (framesBuiltFromOtherRows(oldRootId, { nestedOnly: true, ...(entryRouted ? { except: listed } : {}) }).length) {
       console.warn(`[Prefab] not refreshing an instance of "${source}": a prefab nested in it has changed since it was built — reload its scene to update it`);
       continue;
     }
     refreshed++;
+    const liveGuid = durableGuid(guidOf.get(oldRootId));
+    const from = (Array.isArray(appliedFrom) ? appliedFrom : appliedFrom ? [appliedFrom] : [])
+      .find((a) => (a.rootGuid ? a.rootGuid === liveGuid : a.rootId === oldRootId));
+    // Every applied field leaves the source (#1469, U15): U13 reverted the enclosing overrides that could shadow one.
+    if (entryRouted) {
+      byEntry.push({ root: oldRootId, ...(from ? { edit: { overrides: (o) => subtractFieldOverrides(o, from.fields) } } : {}) });
+      continue;
+    }
     const handle = findEntity(oldRootId);
     const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
     const baseline = rec && rec.source === source ? rec.doc as PrefabFile : oldPrefab;
     let captured = captureInstanceOverrides(oldRootId, baseline);
-    const from = (Array.isArray(appliedFrom) ? appliedFrom : appliedFrom ? [appliedFrom] : []).find((a) => a.rootId === oldRootId);
-    if (from) {
-      // Every applied field leaves the source (#1469, U15): U13 reverted the enclosing overrides that could shadow one.
-      captured = subtractFieldOverrides(captured, from.fields);
-    }
+    if (from) captured = subtractFieldOverrides(captured, from.fields);
     const capturedStructure = captureStructureForRespawn(oldRootId, baseline);
     rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, baseline, remap);
   }
+  if (byEntry.length) rebuildTargetsByEntry(byEntry, remap, undefined, { source, from: oldPrefab, to: newPrefab });
 
   // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
   // under another root's teardown, so this line is the only place that case becomes visible.
@@ -1199,7 +1538,8 @@ export async function rebaseStaleInstances(
   const stale = staleFrames(opts);
   for (const s of stale) {
     await preloadNestedPrefabs(s.to);
-    await preloadNestedPrefabsForSubtree(s.root);
+    // …and the entry it rebuilds through (#1880 F6-U): that load reads every frame in it.
+    await preloadNestedPrefabsForSubtree(outermostEntryOf(s.root) || s.root);
   }
   if (getCurrentWorld() !== world) return 0;
   return rebuildStaleFrames(stale);
@@ -1224,7 +1564,7 @@ export function rebaseStaleInstancesSoon(opts: { sources?: ReadonlySet<string> }
   const pi = getTraitByName('PrefabInstance')!;
   const subtreeCached = (root: number) => collectTree(root, getAllEntities())
     .every((e) => !e.traits.includes('PrefabInstance') || cached(readTraitData(e.id, pi)?.source as string));
-  if (stale.every((s) => docCached(s.to) && subtreeCached(s.root))) { rebuildStaleFrames(stale); return true; }
+  if (stale.every((s) => docCached(s.to) && subtreeCached(outermostEntryOf(s.root) || s.root))) { rebuildStaleFrames(stale); return true; }
   const release = beginWorldBoundOperation();
   void rebaseStaleInstances(opts)
     .catch((e) => console.error('[Prefab] rebasing a re-linked instance onto its current prefab failed:', e))
@@ -1248,7 +1588,7 @@ export function rebuildStaleFrames(stale: StaleFrame[]): number {
   // #1493 review 2.) ⚠️ TRACED, NOT DRIVEN: the order above never lets a rebuild destroy an entry still pending, so
   // no fixture reaches this, and deleting it leaves every test green. It stays because the order is the only other
   // thing standing between a damaged tree and a frame rebuilt as the wrong prefab, and it costs one lookup.
-  const pending = [...stale];
+  let pending = [...stale];
   const liveRoot = (s: (typeof pending)[number]): number => {
     const e = findEntity(s.root);
     if (!e) return 0;
@@ -1256,6 +1596,22 @@ export function rebuildStaleFrames(stale: StaleFrame[]): number {
     return d?.source === s.source && d.rootInstanceId === e.id() && frameRootDoc(world, e)?.doc === s.from ? e.id() : 0;
   };
   let rebuilt = 0;
+  // A frame inside a scene entry is rebuilt as the LOAD of that entry (#1880 F6-U): every stale frame in one entry by the
+  // same load, which states each against its own record (`from`) and expands each from the cache (`to`) — so the order
+  // below is not needed for them. Counted by frame. The rest (an entry whose load reads a prefab not cached,
+  // `readableEntryOf`) keep the order.
+  const byEntry = pending.filter((s) => liveRoot(s) && readableEntryOf(s.root));
+  if (byEntry.length) {
+    const listed = new Set(byEntry.map((s) => s.root));
+    const targets = byEntry.filter((s) => {
+      // What `refreshInstances` refuses: a stale frame inside this one that this rebase does not rebuild with it.
+      if (!framesBuiltFromOtherRows(s.root, { nestedOnly: true, except: listed }).length) return true;
+      console.warn(`[Prefab] not refreshing an instance of "${s.source}": a prefab nested in it has changed since it was built — reload its scene to update it`);
+      return false;
+    });
+    rebuilt += rebuildTargetsByEntry(targets.map((s) => ({ root: s.root }))).size;
+    pending = pending.filter((s) => !listed.has(s.root));
+  }
   while (pending.length) {
     const roots = pending.map(liveRoot);
     for (let i = pending.length - 1; i >= 0; i--) if (!roots[i]) { pending.splice(i, 1); roots.splice(i, 1); }

@@ -143,3 +143,31 @@ export function translateLocalIds(
 export function placedAnchor(doc: MemberDoc, parentLocalId: number): number {
   return (doc.entities ?? []).some((e) => e.localId === parentLocalId) ? parentLocalId : (doc.rootLocalId ?? 1);
 }
+
+/** {@link translateLocalIds}' `lid` applied to everything a frame's statement carries by localId: its overrides, and the
+ *  `removed` / `removedTraits` / `moved` keys and each added node's anchor. What `lid` drops is dropped. Shared by the
+ *  rebuild's carry and the capture of a reference node stated against its own record (#1880 F6e). */
+export function translateCarried<S extends { added?: ReadonlyArray<{ parentLocalId: number }>; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> }>(
+  lid: (n: number) => number,
+  overrides: Record<number, Record<string, Record<string, unknown>>>,
+  structure: S,
+): { overrides: typeof overrides; structure: S } {
+  const keys = <V,>(m: Record<number, V> | undefined): Record<number, V> | undefined => {
+    if (!m) return m;
+    const out: Record<number, V> = {};
+    for (const [k, v] of Object.entries(m)) { const n = lid(Number(k)); if (n) out[n] = v; }
+    return out;
+  };
+  return {
+    overrides: keys(overrides)!,
+    structure: {
+      ...structure,
+      removed: structure.removed?.map(lid).filter((n) => n > 0),
+      removedTraits: keys(structure.removedTraits),
+      // An anchor the template dropped reads as 0 — "merely absent", which `applyStructureCore`
+      // re-anchors to the root with a warning, rather than an anchor some other member now holds.
+      added: structure.added?.map((n) => ({ ...n, parentLocalId: lid(n.parentLocalId) })),
+      ...(structure.moved ? { moved: keys(structure.moved) } : {}),
+    } as S,
+  };
+}

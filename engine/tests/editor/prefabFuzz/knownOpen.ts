@@ -39,6 +39,9 @@ export interface KnownOpen {
 // undo) is NOT shown fixed — only this route to it is gone (confirmed: with R1's branch switched off, the repro reproduced). A re-found pin is a new failure again, and re-enters here
 // with a repro that reaches it without the reload.
 
+// Retired by #1880 F6d (drift, not a fix): #1891's seed 1233 list diverges at its 15th pick once the entry rebuild
+// renumbers ids, and no longer reaches the case. The case is stated id-free, from the run's own documents, in
+// prefabWholeListRebuild.test.ts (passing since F6e).
 export const KNOWN_OPEN: KnownOpen[] = [
   {
     issue: 1822,
@@ -54,6 +57,46 @@ export const KNOWN_OPEN: KnownOpen[] = [
         const r = ops.findIndex((o) => o.kind === 'removeComponent');
         return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'addComponent') && !ops.slice(r + 1).some((o) => o.kind === 'undo');
       })(),
+  },
+  {
+    issue: 1893,
+    what: "#1880 F6 precondition hunt seed 1294, SEEN by T4 but NOT a rebuild defect: addComponent, Create Prefab, an outside edit of the new prefab, and an undo the edit refuses. Every step's world AND the save→reload mark QR's Rotate3D (HR's row QR states it: the spawner marks what a row applies); the end-of-run undo/redo WALK leaves QR unmarked, and T4's no-op rebuild then puts back what a load gives (/marks/0 undefined vs \"Rotate3D.axis\"). Probed read-only 2026-09-30. Red on c879a0338 too; hidden in the first hunt behind seed 1233's signature. F6 cannot close it: the walk's mark restore needs its own fix (#1893)",
+    repro: [
+      { kind: 'addComponent', u: [0.9362869369797409, 0.44597287848591805, 0.2419073861092329, 0.062128879595547915, 0.2224271954037249, 0.8683678451925516, 0.7178896840196103, 0.7713594404049218] },
+      { kind: 'createPrefab', u: [0.4144869849551469, 0.4089658232405782, 0.20890062884427607, 0.9231097148731351, 0.3927326067350805, 0.41872269148007035, 0.3743586875498295, 0.5361575500573963] },
+      { kind: 'outsideEdit', u: [0.31801428459584713, 0.24425062886439264, 0.08957791281864047, 0.5608493906911463, 0.010221707867458463, 0.9444657859858125, 0.38045233697630465, 0.8559809618163854], check: 'rebuild-reload' },
+      { kind: 'undo', u: [0.33416790375486016, 0.11875490262173116, 0.21718760346993804, 0.011441385140642524, 0.756048726150766, 0.6167072555981576, 0.6525275206658989, 0.4093857652042061] },
+    ],
+    reproduces: (f) => f.check === 'a no-op rebuild is not the identity' && /\/marks\/\d+: undefined vs /.test(f.detail),
+    stops: (f, ops) => f.check === 'a no-op rebuild is not the identity' && /\/marks\/\d+: undefined vs /.test(f.detail) && ops.some((o) => o.kind === 'outsideEdit') && ops.some((o) => o.kind === 'createPrefab'),
+  },
+  {
+    issue: 1895,
+    what: "#1880 F6 hunt seed 3129: a prefab instance whose prefab is TRASHED is kept live (#1862's keep) and saved as an ordinary prefab root entry, which writes no sortOrder for the root; on reload the Missing Prefab placeholder comes back at sortOrder 0, and save→reload→save reorders the file. Pre-existing (this list fails on the pre-F6 path too); F6's id order only let the full seed reach it",
+    repro: [
+      { kind: 'delete', u: [0.9129093873780221, 0.48112353729084134, 0.6681748542468995, 0.03234542463906109, 0.11518862145021558, 0.9136989440303296, 0.6377161764539778, 0.3317907089367509] },
+      { kind: 'addChild', u: [0.2458805199712515, 0.21558656124398112, 0.11938353115692735, 0.8148526235017926, 0.8918901064898819, 0.5355975485872477, 0.9143984671682119, 0.23446833714842796] },
+      { kind: 'createPrefab', u: [0.8380175959318876, 0.653672066051513, 0.47205331991426647, 0.8653421129565686, 0.5434760409407318, 0.10925909434445202, 0.8066154445987195, 0.009585820604115725] },
+      { kind: 'trashPrefab', u: [0.317435038741678, 0.30858678580261767, 0.5941915709991008, 0.2919786865822971, 0.29372866079211235, 0.6846848397981375, 0.6610678271390498, 0.7737833959981799] },
+    ],
+    reproduces: (f) => f.check === 'save→reload→save is not byte-identical' && /\/entities: order of/.test(f.detail),
+    stops: (f, ops) => f.check === 'save→reload→save is not byte-identical' && /\/entities: order of/.test(f.detail) && ops.some((o) => o.kind === 'trashPrefab') && ops.some((o) => o.kind === 'createPrefab'),
+  },
+  {
+    issue: 1896,
+    what: "#1880 F6 hunt seed 1286: the KEY ORDER of an instance root's Transform override flips on re-save (R's {rx, x, ry, rz} saves back as {rx, ry, rz, x}); the two files are equal as JSON. Pre-existing: this list fails the same way on c879a0338, before any F6 commit. Pinned on the formatting-only signature, so a real round-trip diff in the same seed still goes red",
+    repro: [
+      { kind: 'duplicate', u: [0.47179811680689454, 0.5361906290054321, 0.45847699232399464, 0.970015165861696, 0.9514494312461466, 0.6894133083987981, 0.9133780209813267, 0.9591480705421418] },
+      { kind: 'delete', u: [0.3955101245082915, 0.2073646194767207, 0.2521001184359193, 0.7691139227245003, 0.3056975929066539, 0.7484040216077119, 0.5129559764172882, 0.1141097224317491] },
+      { kind: 'instantiate', u: [0.29314925032667816, 0.8060806528665125, 0.2299345824867487, 0.600198240717873, 0.7820273176766932, 0.843088585184887, 0.8476436485070735, 0.18949251668527722] },
+      { kind: 'editField', u: [0.04541659774258733, 0.7074924686457962, 0.9998251996003091, 0.9558091170620173, 0.10606249864213169, 0.5112339758779854, 0.034641468431800604, 0.663360723759979] },
+      { kind: 'reparent', u: [0.04389688209630549, 0.9625714612193406, 0.7999080924782902, 0.1876900875940919, 0.21735200146213174, 0.2413864633999765, 0.9149042987264693, 0.5204655202105641] },
+      { kind: 'apply', u: [0.07125281449407339, 0.6572538097389042, 0.5309010487981141, 0.8569293210748583, 0.18330736574716866, 0.4384826102759689, 0.3433154025115073, 0.2811720366589725] },
+      { kind: 'instantiate', u: [0.8096777715254575, 0.10962936142459512, 0.9470734349451959, 0.5054131706710905, 0.26287622773088515, 0.024724331917241216, 0.9913043545093387, 0.9360132687725127] },
+      { kind: 'reparent', u: [0.8227990865707397, 0.014032450970262289, 0.24443837092258036, 0.22992625273764133, 0.27803528727963567, 0.3375412884633988, 0.2763173363637179, 0.06756221572868526] },
+    ],
+    reproduces: (f) => f.check === 'save→reload→save is not byte-identical' && f.detail === 'formatting or key order only',
+    stops: (f) => f.check === 'save→reload→save is not byte-identical' && f.detail === 'formatting or key order only',
   },
 ];
 
@@ -1163,7 +1206,7 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   },
   {
     issue: 1880,
-    what: "hunt seed 1127 (#1880 lane F's pinned case, fixed by F3a under hub ruling B′): a P instance the scene hung under Q's member M, and the Apply drops M from Q. The rebase used to RE-HOME it at the frame root while a load kept it in M's orphan row (T2: rebuild ≠ reload). Now it vanishes with M on both sides (R2, fork 2), kept in the row; the follow-up test brings it back once by an undo",
+    what: "(DRIFTED under #1880 F6: the outermost-entry rebuild renumbers ids and this list diverges at its 19th pick, so it no longer reaches the case; nestedRowFieldSave's \"hunt seed 1127's shape\" states it) hunt seed 1127 (#1880 lane F's pinned case, fixed by F3a under hub ruling B′): a P instance the scene hung under Q's member M, and the Apply drops M from Q. The rebase used to RE-HOME it at the frame root while a load kept it in M's orphan row (T2: rebuild ≠ reload). Now it vanishes with M on both sides (R2, fork 2), kept in the row; the follow-up test brings it back once by an undo",
     repro: [
       { kind: 'duplicate', u: [0.12547480361536145, 0.9172176993452013, 0.2996261084917933, 0.6559859698172659, 0.8270155822392553, 0.5202678602654487, 0.07430692110210657, 0.983024621848017] },
       { kind: 'addChild', u: [0.5005198577418923, 0.21395651367492974, 0.6162232181522995, 0.9086727485992014, 0.5342297083698213, 0.7085787456016988, 0.6206040042452514, 0.30395350023172796] },
@@ -1180,6 +1223,26 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'prefabEdit', u: [0.2569285349454731, 0.11394528183154762, 0.6899550722446293, 0.9042902726214379, 0.3446665012743324, 0.26979535445570946, 0.4735005246475339, 0.4410180188715458], inner: [] },
       { kind: 'delete', u: [0.9249458548147231, 0.13140208553522825, 0.1637770188972354, 0.18753996887244284, 0.4126576907001436, 0.41410851664841175, 0.9688789052888751, 0.26149918721057475] },
       { kind: 'apply', u: [0.9592203965876251, 0.17904004035517573, 0.402616735547781, 0.25171292666345835, 0.45266122836619616, 0.8701333501376212, 0.5479187725577503, 0.7636868208646774], check: "rebuild-reload" },
+    ],
+  },
+  {
+    issue: 1880,
+    what: "F6 precondition hunt seed 1171 (3090 is the same mechanism): a TEMPLATE-added node (O's row N adds Extra under P's member A) under a member an Apply drops from P. F3a's `withoutGoneMemberNodes` dropped it with the scene's own nodes, while a reload re-anchors it at N's frame root (\"anchor missing → root\"): rebuild ≠ reload. B′ covers only the scene's own nodes; one an enclosing layer adds (`layerAuthoredNodeGuids`) keeps the re-anchor",
+    repro: [
+      { kind: 'reparent', u: [0.03160661831498146, 0.6695412455592304, 0.913755728630349, 0.3830101368948817, 0.9675972813274711, 0.8822341142222285, 0.0629757174756378, 0.5305535295046866] },
+      { kind: 'prefabEdit', u: [0.13717939867638052, 0.7131396168842912, 0.18489172449335456, 0.6059518004767597, 0.20130644855089486, 0.16419226513244212, 0.33560820668935776, 0.010541375959292054], inner: [] },
+      { kind: 'delete', u: [0.25035141315311193, 0.7507564211264253, 0.9290105449035764, 0.8282686581369489, 0.5362858024891466, 0.8408432477153838, 0.30600635055452585, 0.9304315994959325] },
+      { kind: 'apply', u: [0.06982092093676329, 0.6507889749482274, 0.9688183201942593, 0.8480763635598123, 0.7799043250270188, 0.9346878521610051, 0.5688009855803102, 0.9248915063217282], check: 'rebuild-reload' },
+    ],
+  },
+  {
+    issue: 1891,
+    what: "#1880 F6 precondition hunt seed 3265 (T4; 3292 is the same mechanism): a reference node the scene hung in a NODE ROW's own (under template node Extra) lost its members' pinned guids on a no-op rebuild — the old rebuild's pin walk never reached node-row own. Fixed by #1880 F6c: the rebuild settles through the loader's own post-pass (`settleEntryRows`), whose reference-row walk covers every channel",
+    repro: [
+      { kind: 'duplicate', u: [0.14981729490682483, 0.5979397119954228, 0.5348868125583977, 0.5220310764852911, 0.096922472352162, 0.8983463814947754, 0.36227904772385955, 0.8295183572918177] },
+      { kind: 'addChild', u: [0.7338485296349972, 0.24986214167438447, 0.14688554708845913, 0.4074539050925523, 0.10735217505134642, 0.005733222933486104, 0.9680708202067763, 0.22049151291139424] },
+      { kind: 'reparent', u: [0.1585476107429713, 0.7742696758359671, 0.48420550394803286, 0.8099868271965533, 0.9923207000829279, 0.9547602660022676, 0.5826827390119433, 0.8156926503870636] },
+      { kind: 'createPrefab', u: [0.3763056464958936, 0.30700652580708265, 0.8074927234556526, 0.7040917878039181, 0.6436235592700541, 0.44129140488803387, 0.17668788298033178, 0.4260172820650041] },
     ],
   },
 ];
