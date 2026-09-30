@@ -1676,6 +1676,14 @@ edit, so Vite keeps watching it. There, a folder with subfolders still cannot be
 dev editor runs. The packaged editor has no Vite and is fixed there too. Moving those `.ts` files out
 of the asset root would close it.
 
+⚠️ **A test that waits on a report must allow for the report's delay, and a readiness loop must
+accept ANY probe it wrote.** A report reaches `onSceneChanged` only after `COALESCE_MS` in
+`assetTreeWatcher.ts` plus the consumer's own debounce (150 ms in `assetBackend.ts`). A single
+write measured 228 ms on this box. `electronBackendSelfWrite.test.ts` (#1744) wrote a new probe
+every 200 ms and looked only for the latest one, so each probe was reported just after its window
+closed: every Windows run went red at setup, with the watcher working (#1875). The chokidar test
+had already been fixed the same way after a delayed-event mutation (#1742): count any reported probe.
+
 Tests: `assetTreeIndex.test.ts` + `assetTreeWatcher.test.ts` (every platform) and
 `assetTreeWatcherLive.test.ts` (win32: the real watcher, a real Vite server and the real
 `moveToTrash`, each with a control built the old way that must fail to recycle).

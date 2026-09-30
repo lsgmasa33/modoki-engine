@@ -20,10 +20,13 @@ import { registerTestRun, testRunNeed, unregisterVerifyRun } from './scripts/ver
  */
 export function registerThisPool({
   argv = process.argv,
+  platform = process.platform,
   registry = {},
   onExit = (release: () => void) => { process.on('exit', release) },
 }: {
   argv?: string[]
+  /** `testRunNeed`'s platform — for the test, which must reach both sides (#1875: win32 registers no need). */
+  platform?: NodeJS.Platform
   /** `registerTestRun`'s seams (`env`, `dir`, `alive`, `pid`) — for the test, which must not touch the real registry. */
   registry?: Omit<NonNullable<Parameters<typeof registerTestRun>[0]>, 'need'>
   onExit?: (release: () => void) => void
@@ -32,7 +35,7 @@ export function registerThisPool({
   // is not held to an equal share this pool leaves idle. Reserve-only: `perfCoreWorkers()` below
   // still sizes this pool exactly as before, because vitest's filters are substring matches and the
   // count can be low (see `testRunNeed`).
-  const budget = registerTestRun({ ...registry, need: testRunNeed(argv) })
+  const budget = registerTestRun({ ...registry, need: testRunNeed(argv, { platform }) })
   if (!budget) return // already registered by an ancestor — not ours to release.
   // `exit` only: a pool killed by an uncaught signal is reaped by the registry's pid + TTL checks
   // anyway, and adding signal handlers here would change how a vitest run responds to Ctrl-C.

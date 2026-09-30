@@ -127,15 +127,21 @@ describe('perfCoreWorkers', () => {
 
   it('registers a named-file run with its NEED — the production seam the budget reads (#1871)', () => {
     // Every registry test injects `need` by hand; this is the one that drives the line production
-    // runs, so dropping the argv from the registration (`registerTestRun()`) goes red here.
+    // runs, so dropping the argv from the registration (`registerTestRun()`) goes red here. The platform is
+    // injected, both sides asserted: darwin registers the need, win32 registers none (the equal split; #1871 scoped win32 out).
+    // This once asserted darwin's figure on the real platform, so it was red on every Windows box (#1875).
     const dir = makeScratchDir('modoki-testworkers-')
     const alive = () => true
     const releases: Array<() => void> = []
     const argv = ['node', '/x/vitest.mjs', 'run', 'tests/editor/prefabFuzz.test.ts', '-t', 'replay']
-    registerThisPool({ argv, registry: { env: { VITEST: 'true' }, dir, alive, pid: 4242 }, onExit: (r) => releases.push(r) })
+    registerThisPool({ argv, platform: 'darwin', registry: { env: { VITEST: 'true' }, dir, alive, pid: 4242 }, onExit: (r) => releases.push(r) })
     expect(readRuns({ dir, alive }).map((r) => [r.pid, r.need])).toEqual([[4242, 1]])
+    // The same named-file run on win32 registers no need.
+    const winDir = makeScratchDir('modoki-testworkers-win-')
+    registerThisPool({ argv, platform: 'win32', registry: { env: { VITEST: 'true' }, dir: winDir, alive, pid: 4545 }, onExit: () => {} })
+    expect(readRuns({ dir: winDir, alive }).map((r) => [r.pid, r.need])).toEqual([[4545, undefined]])
     // A whole-suite run registers no need: a full share.
-    registerThisPool({ argv: ['node', '/x/vitest.mjs', 'run'], registry: { env: { VITEST: 'true' }, dir, alive, pid: 4343 }, onExit: (r) => releases.push(r) })
+    registerThisPool({ argv: ['node', '/x/vitest.mjs', 'run'], platform: 'darwin', registry: { env: { VITEST: 'true' }, dir, alive, pid: 4343 }, onExit: (r) => releases.push(r) })
     expect(readRuns({ dir, alive }).find((r) => r.pid === 4343)?.need).toBeUndefined()
     // Its exit releases exactly its own entry, in the registry it registered in.
     releases[0]()

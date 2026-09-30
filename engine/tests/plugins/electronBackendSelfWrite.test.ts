@@ -67,11 +67,21 @@ async function until(changed: string[], urlPath: string, ms = 10_000): Promise<b
   return false;
 }
 
-/** Ready is OBSERVED: write a fresh probe scene until one is dispatched, so the initial scan is over. */
+/** Ready is OBSERVED: write a fresh probe scene until one is dispatched, so the initial scan is over.
+ *
+ *  ANY probe counts, not just the one written last. A report trails its write by the watcher's coalescing plus the
+ *  backend's 150 ms debounce — measured 220–230 ms on Windows — so looking only for the latest probe, 200 ms at a time,
+ *  gave up on each one just before it arrived and never saw a probe at all (#1875: red on every Windows run). A probe
+ *  reported after the clear below is harmless: every assertion is about `a` and `b`. */
 async function ready(changed: string[]): Promise<void> {
+  const isProbe = (urlPath: string) => /^\/assets\/scenes\/probe-\d+\.scene\.json$/.test(urlPath);
   for (let i = 0; i < 100; i++) {
     put(`probe-${i}.scene.json`, scene(`p${i}`));
-    if (await until(changed, `/assets/scenes/probe-${i}.scene.json`, 200)) { changed.length = 0; return; }
+    const end = Date.now() + 200;
+    while (Date.now() < end) {
+      if (changed.some(isProbe)) { changed.length = 0; return; }
+      await sleep(10);
+    }
   }
   throw new Error('the watcher never reported a probe');
 }
