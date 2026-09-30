@@ -16,7 +16,9 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import os from 'node:os';
-import { perfCoreWorkers } from '../../testWorkers';
+import { perfCoreWorkers, registerThisPool } from '../../testWorkers';
+import { readRuns } from '../../scripts/verifyLoad.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const realPlatform = process.platform;
 const realOverride = process.env.MODOKI_TEST_MAX_WORKERS;
@@ -100,6 +102,44 @@ describe('perfCoreWorkers', () => {
       const { maxWorkers } = perfCoreWorkers();
       expect(maxWorkers, `${n} CPUs`).toBeLessThan(n);
     }
+  });
+
+  it("a run over ONE named file keeps its own pool as it was: its need is reserved, never used to size it (#1871)", () => {
+    // `testRunNeed()` can undercount — vitest's filters are substring matches, so `a.test.ts` also
+    // runs `xa.test.ts` — so the figure only changes what this run RESERVES in the registry. Sized
+    // from it, an undercount would starve this run; reserved, it costs the others a little
+    // oversubscription. Linux pins the fall-through; darwin pins the perf-core cap (on this Mac 12,
+    // on a non-Apple-Silicon runner `{}` both ways).
+    delete process.env.MODOKI_TEST_MAX_WORKERS;
+    const realArgv = process.argv;
+    try {
+      for (const platform of ['linux', 'darwin']) {
+        setPlatform(platform);
+        process.argv = ['node', '/x/vitest.mjs', 'run'];
+        const wholeSuite = perfCoreWorkers();
+        process.argv = ['node', '/x/vitest.mjs', 'run', 'tests/editor/prefabFuzz.test.ts', '-t', 'replay'];
+        expect(perfCoreWorkers(), platform).toEqual(wholeSuite);
+      }
+    } finally {
+      process.argv = realArgv;
+    }
+  });
+
+  it('registers a named-file run with its NEED — the production seam the budget reads (#1871)', () => {
+    // Every registry test injects `need` by hand; this is the one that drives the line production
+    // runs, so dropping the argv from the registration (`registerTestRun()`) goes red here.
+    const dir = makeScratchDir('modoki-testworkers-')
+    const alive = () => true
+    const releases: Array<() => void> = []
+    const argv = ['node', '/x/vitest.mjs', 'run', 'tests/editor/prefabFuzz.test.ts', '-t', 'replay']
+    registerThisPool({ argv, registry: { env: { VITEST: 'true' }, dir, alive, pid: 4242 }, onExit: (r) => releases.push(r) })
+    expect(readRuns({ dir, alive }).map((r) => [r.pid, r.need])).toEqual([[4242, 1]])
+    // A whole-suite run registers no need: a full share.
+    registerThisPool({ argv: ['node', '/x/vitest.mjs', 'run'], registry: { env: { VITEST: 'true' }, dir, alive, pid: 4343 }, onExit: (r) => releases.push(r) })
+    expect(readRuns({ dir, alive }).find((r) => r.pid === 4343)?.need).toBeUndefined()
+    // Its exit releases exactly its own entry, in the registry it registered in.
+    releases[0]()
+    expect(readRuns({ dir, alive }).map((r) => r.pid)).toEqual([4343])
   });
 
   it('caps below availableParallelism when it caps at all', () => {

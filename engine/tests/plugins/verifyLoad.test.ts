@@ -21,6 +21,7 @@ import {
   parseVitestAggregates, registryPath, MIN_WORKERS, VERIFY_TTL_MS,
   groupOf, countGroups, isTestRun, registerTestRun, VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
   verifyRegistryDir, engineLaneWorkers, LEGACY_ENGINE_LANE_WORKERS, verifyPoolSize, appLaneWorkers,
+  groupNeeds, testRunNeed, VITEST_VALUE_FLAGS, VITEST_BOOLEAN_FLAGS,
 } from '../../scripts/verifyLoad.mjs';
 
 let dir: string;
@@ -494,5 +495,174 @@ describe('the Windows gate runs two thirds of the pool, for memory (#1846)', () 
     // The context line names the BOX's cores and the counts the lanes RUN with (review: it printed the
     // cut pool as "3 perf core(s)", and `budget.appWorkers` rather than the app lane's cap).
     expect(code).toMatch(/benchLine\(\{[^}]*total:\s*perfCores\(\),\s*appWorkers:\s*appLaneShown\(\)/);
+  });
+});
+
+describe('a run over named files holds only what it can use (#1871)', () => {
+  // The owner saw the box at ~60% with two gates and two one-file runs live: each run counted as a
+  // whole peer, so every gate took floor(12/4) = 3 app workers while each one-file run used about one.
+
+  it('water-fills: the small needs are granted first and the rest is split among the full-share runs', () => {
+    expect(budgetFor(12, 4, [1, 1])).toBe(5);
+    expect(budgetFor(12, 2, [1])).toBe(11);
+    expect(budgetFor(12, 3, [2, 1])).toBe(9);
+  });
+
+  it('never hands out more than the pool: what the runs hold still sums to it (the #1285 protection)', () => {
+    // Two gates at 5 plus two runs at 1 is 12 on 12 cores — the same total as the equal split.
+    const gate = budgetFor(12, 4, [1, 1]);
+    expect(2 * gate + 1 + 1).toBeLessThanOrEqual(12);
+    for (const reserved of [[1], [1, 1], [1, 2, 3], [3, 3], [2, 2, 2, 2]]) {
+      const runners = reserved.length + 2;
+      const share = budgetFor(12, runners, reserved);
+      const held = reserved.map((r) => Math.min(r, share)).reduce((a, b) => a + b, 0);
+      expect(held + 2 * share, JSON.stringify(reserved)).toBeLessThanOrEqual(12);
+    }
+  });
+
+  it('treats a need at or above the equal share as a full share, not a reservation', () => {
+    // 12 over 3 runs is 4 each; a run that can use 5 gets its 4 like everyone else.
+    expect(budgetFor(12, 3, [5])).toBe(4);
+    expect(budgetFor(12, 3, [4])).toBe(4);
+    // A solo run and no reservations: exactly the old answer.
+    expect(budgetFor(12, 1)).toBe(12);
+    expect(budgetFor(12, 1, [])).toBe(12);
+  });
+
+  it('two gates and two one-file runs: each gate gets app=5 engine=2, not app=3', () => {
+    registerVerifyRun({ pid: 1, clone: '/ai3', dir, alive, total: 12, env: {}, need: 1 });
+    registerVerifyRun({ pid: 2, clone: '/ai', dir, alive, total: 12, env: {}, need: 1 });
+    registerVerifyRun({ pid: 3, clone: '/ai2', dir, alive, total: 12, env: {} });
+    const gate = registerVerifyRun({ pid: 4, clone: '/qa', dir, alive, total: 12, env: {} });
+    expect(gate.peers).toBe(4);
+    expect(gate.appWorkers).toBe(5);
+    expect(gate.engineWorkers).toBe(2);
+    expect(gate.sized).toEqual({ runs: 2, workers: 2 });
+    // It is what the lane is capped to, since the box is shared.
+    expect(appLaneWorkers(gate, { env: {}, platform: 'darwin' })).toBe(5);
+  });
+
+  it('a run with no need — a gate, a whole suite, an older clone — still takes a full share', () => {
+    registerVerifyRun({ pid: 1, clone: '/old', dir, alive, total: 12, env: {} });
+    const gate = registerVerifyRun({ pid: 2, clone: '/qa', dir, alive, total: 12, env: {} });
+    expect(gate.appWorkers).toBe(6);
+    expect(gate.sized).toEqual({ runs: 0, workers: 0 });
+  });
+
+  it("a group takes a full share if ANY of its entries has no need, and the largest need otherwise", () => {
+    const needs = groupNeeds([
+      { pid: 1, clone: '/a', startedAt: 0, group: 'g', need: 1 },
+      { pid: 2, clone: '/a', startedAt: 0, group: 'g' },
+      { pid: 3, clone: '/b', startedAt: 0, group: 'h', need: 1 },
+      { pid: 4, clone: '/b', startedAt: 0, group: 'h', need: 3 },
+    ]);
+    expect(needs.get('g')).toBe(Infinity);
+    expect(needs.get('h')).toBe(3);
+  });
+
+  it('records the need in the registry, and a gate beside that run takes everything else', () => {
+    const env: NodeJS.ProcessEnv = { VITEST: 'true' };
+    registerTestRun({ pid: 700, clone: '/ai', dir, alive, total: 12, env, need: 1 });
+    expect(readRuns({ dir, alive }).find((r) => r.pid === 700)?.need).toBe(1);
+    const gate = registerVerifyRun({ pid: 701, clone: '/qa', dir, alive, total: 12, env: {} });
+    expect(gate.appWorkers).toBe(11);
+  });
+
+  it('prints what the sized runs hold on the context line, and nothing extra when there are none', () => {
+    const base = { peers: 4, total: 12, appWorkers: 5, engineWorkers: 2, load: [9, 9, 9], platform: 'darwin' };
+    expect(benchLine({ ...base, sized: { runs: 2, workers: 2 } }))
+      .toContain('4 verify run(s) on 12 perf core(s) (2 sized, holding 2) · workers app=5 engine=2');
+    expect(benchLine({ ...base, sized: { runs: 0, workers: 0 } })).not.toContain('sized');
+    expect(benchLine(base)).toContain('on 12 perf core(s) · workers');
+  });
+});
+
+describe('testRunNeed — a run\'s need, read off the vitest command line (#1871)', () => {
+  const v = (...args: string[]) => testRunNeed(['node', '/x/node_modules/vitest/vitest.mjs', ...args], { platform: 'darwin', tty: false });
+
+  it('counts the named test files: one worker per file', () => {
+    expect(v('run', 'tests/editor/prefabFuzz.test.ts')).toBe(1);
+    expect(v('run', 'tests/a.test.ts', 'tests/b.spec.tsx')).toBe(2);
+    expect(v('tests/a.test.ts')).toBe(1); // no subcommand, no terminal: vitest runs once
+  });
+
+  it('skips the value of a flag that takes one — `-t repl…` is not a filter', () => {
+    expect(v('run', '--config', 'engine/vite.config.ts', 'tests/editor/prefabFuzz.test.ts', '-t', 'replay')).toBe(1);
+    expect(v('run', '--config=engine/vite.config.ts', 'tests/a.test.ts', '--reporter', 'dot')).toBe(1);
+    expect(v('run', '--config', 'vite.config.ts', '--reporter=dot', '--no-isolate', 'tests/a.test.ts')).toBe(1);
+  });
+
+  it('is a FULL share for anything that is not a bounded set of files', () => {
+    expect(v('run')).toBeUndefined(); // a whole suite
+    expect(v()).toBeUndefined();
+    expect(v('run', 'tests/editor')).toBeUndefined(); // a directory
+    expect(v('run', 'prefabFuzz')).toBeUndefined(); // a bare substring
+    expect(v('run', 'tests/a.test.ts', 'tests/editor')).toBeUndefined(); // one filter is not a file
+    expect(v('run', 'tests/a.test.ts', '--unknownFlag', 'value')).toBeUndefined(); // errs toward a full share
+    expect(v('watch', 'tests/a.test.ts')).toBeUndefined();
+    expect(v('related', 'src/a.ts')).toBeUndefined();
+  });
+
+  it('is a FULL share when a flag can SWALLOW the file, or after `--` — vitest then runs the whole suite (close-out review)', () => {
+    // Per vitest's own parser each of these runs with NO filter (`-u` takes the file as its optional
+    // value, everything after `--` is ignored) or is rejected (`--silent <file>`). Read as booleans they registered
+    // `need: 1` while the run took all 12 workers, and a gate beside one took 11 more.
+    for (const flag of ['-u', '--update', '--browser', '--coverage.all', '--silent', '--changed', '--bail', '--']) {
+      expect(v('run', flag, 'tests/a.test.ts'), flag).toBeUndefined();
+    }
+    expect(v('run', '--coverage=false', 'tests/a.test.ts')).toBeUndefined(); // a boolean with a value: not read
+  });
+
+  it('is a FULL share for a watch run: pressing `a` reruns everything', () => {
+    expect(v('run', '--watch', 'tests/a.test.ts')).toBeUndefined();
+    expect(v('-w', 'tests/a.test.ts')).toBeUndefined();
+    // A bare `vitest <file>` in a terminal watches; without one (a Claude session, a script) it runs once.
+    const argv = ['node', 'vitest.mjs', 'tests/a.test.ts'];
+    expect(testRunNeed(argv, { platform: 'darwin', tty: true })).toBeUndefined();
+    expect(testRunNeed(argv, { platform: 'darwin', tty: false })).toBe(1);
+    expect(testRunNeed(['node', 'vitest.mjs', 'run', 'tests/a.test.ts'], { platform: 'darwin', tty: true })).toBe(1);
+  });
+
+  it("never claims fewer files than vitest's OWN parser filters on — checked shape by shape against parseCLI", async () => {
+    // The dangerous direction is a small need for a run vitest executes wide. A hand parser can only
+    // drift toward that, so every shape that yields a number is checked against vitest's `parseCLI`:
+    // the same filters, all of them test files, and not a watch, update, related or changed run.
+    const { parseCLI } = await import('vitest/node');
+    const files = ['tests/a.test.ts', 'tests/b.spec.tsx'];
+    // Every entry of both allowlists, not a sample: a listed flag that swallows the file (a wrong entry,
+    // or a vitest minor that gives it an optional value) must go red here (re-review: a hand-picked
+    // corpus let `--merge-reports` join the boolean list with the file green).
+    const flags = [
+      ...[...VITEST_BOOLEAN_FLAGS].map((f) => [f]),
+      ...[...VITEST_VALUE_FLAGS].map((f) => [f, 'X']),
+      [], ['-t', 'replay'], ['--config', 'vite.config.ts'], ['--config=vite.config.ts'], ['--reporter', 'dot'],
+      ['-u'], ['--update'], ['--browser'], ['--coverage.all'], ['--coverage'], ['--no-isolate'], ['--bail', '1'],
+      ['--changed'], ['--'], ['--watch'], ['-w'], ['--run'], ['--project', 'app'], ['--shard', '1/2'],
+      ['--inspect'], ['--api'], ['--passWithNoTests'], ['--unknownFlag', 'value'],
+    ];
+    let checked = 0;
+    for (const sub of [['run'], [], ['watch'], ['related']]) {
+      for (const f of flags) {
+        for (const shape of [[...f, files[0]], [files[0], ...f], [...f, ...files], [files[0], ...f, files[1]]]) {
+          const args = [...sub, ...shape];
+          const need = testRunNeed(['node', 'vitest.mjs', ...args], { platform: 'darwin', tty: false });
+          if (need === undefined) continue;
+          let parsed: ReturnType<typeof parseCLI>;
+          try { parsed = parseCLI(['vitest', ...args]); } catch { throw new Error(`need ${need} for a shape vitest REJECTS: ${args.join(' ')}`); }
+          const o = parsed.options as Record<string, unknown>;
+          expect(parsed.filter, args.join(' ')).toHaveLength(need);
+          expect(parsed.filter.every((x) => /\.(test|spec)\./.test(String(x))), args.join(' ')).toBe(true);
+          // Falsy, not absent: `--no-watch` sets `watch: false`, which is a run that ends.
+          expect([o.watch, o.update, o.related, o.changed].map(Boolean), args.join(' ')).toEqual([false, false, false, false]);
+          checked++;
+        }
+      }
+    }
+    // Each listed flag must have reached the parser on the accept side at least once.
+    expect(checked, 'the corpus must reach the accept side too').toBeGreaterThan(VITEST_BOOLEAN_FLAGS.size + VITEST_VALUE_FLAGS.size);
+  });
+
+  it('is undefined on Windows, so the win box keeps the equal split (#1871 scope)', () => {
+    expect(testRunNeed(['node', 'vitest.mjs', 'run', 'tests/a.test.ts'], { platform: 'win32' })).toBeUndefined();
   });
 });

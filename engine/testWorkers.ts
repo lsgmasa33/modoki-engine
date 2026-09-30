@@ -1,7 +1,7 @@
 import os from 'node:os'
 import { execFileSync } from 'node:child_process'
 
-import { registerTestRun, unregisterVerifyRun } from './scripts/verifyLoad.mjs'
+import { registerTestRun, testRunNeed, unregisterVerifyRun } from './scripts/verifyLoad.mjs'
 
 /**
  * Put THIS vitest pool in the machine-wide registry (#1285).
@@ -18,12 +18,25 @@ import { registerTestRun, unregisterVerifyRun } from './scripts/verifyLoad.mjs'
  * 2.5x cost on a box at load 39.5). This only makes the count TRUE; `verify.mjs` remains the only
  * thing that acts on it.
  */
-function registerThisPool(): void {
-  const budget = registerTestRun()
+export function registerThisPool({
+  argv = process.argv,
+  registry = {},
+  onExit = (release: () => void) => { process.on('exit', release) },
+}: {
+  argv?: string[]
+  /** `registerTestRun`'s seams (`env`, `dir`, `alive`, `pid`) — for the test, which must not touch the real registry. */
+  registry?: Omit<NonNullable<Parameters<typeof registerTestRun>[0]>, 'need'>
+  onExit?: (release: () => void) => void
+} = {}): void {
+  // #1871: a run over named test files RESERVES only a worker per file, so a gate running beside it
+  // is not held to an equal share this pool leaves idle. Reserve-only: `perfCoreWorkers()` below
+  // still sizes this pool exactly as before, because vitest's filters are substring matches and the
+  // count can be low (see `testRunNeed`).
+  const budget = registerTestRun({ ...registry, need: testRunNeed(argv) })
   if (!budget) return // already registered by an ancestor — not ours to release.
   // `exit` only: a pool killed by an uncaught signal is reaped by the registry's pid + TTL checks
   // anyway, and adding signal handlers here would change how a vitest run responds to Ctrl-C.
-  process.on('exit', () => unregisterVerifyRun())
+  onExit(() => unregisterVerifyRun({ pid: registry.pid, dir: registry.dir, alive: registry.alive }))
 }
 
 /**

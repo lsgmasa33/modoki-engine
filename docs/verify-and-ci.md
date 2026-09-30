@@ -465,6 +465,24 @@ both vitest configs call, so a scoped `npx vitest run`, a bare `npm test` and a 
 all counted. `peers` counts DISTINCT GROUPS, not processes — `verify.mjs` stamps a group id into
 both lanes' env, so one gate with two vitest lanes still counts once.
 
+**A run over named test files holds only what it can use (#1871).** It registers a `need` — one
+worker per named file (`testRunNeed()`, read off the vitest argv) — and `budgetFor` water-fills:
+the small needs are granted while each is below the equal share of what is left, and the rest is
+split among the runs that can use it. Before, a one-file run counted as a whole peer and left its
+share idle: two gates beside two one-file runs took `app=3` each on 12 cores, now `app=5`. At
+each registration the shares sum to the pool, so #1285's protection holds; the budget still never
+renegotiates, so a gate that started beside a one-file run keeps its larger share after that run
+exits (the existing caveat in `verifyLoad.mjs`'s header). Anything that is not a bounded set of
+files (no filter, a directory, a substring, `--`, a watch run, any flag outside its allowlist —
+vitest gives many flags an OPTIONAL value that swallows a following file) takes a full share, as
+does an entry from an older clone, and Windows records no need at all. ⚠️ **The count can be LOW**
+— vitest's filters are substring matches, so `a.test.ts` also runs `xa.test.ts` — which is why
+`need` only changes what a run RESERVES: `perfCoreWorkers()` sizes the run's own pool exactly as
+before, and an undercount costs the others a little oversubscription, never this run's workers.
+The `context:` line names them: `5 verify run(s) on 12 perf core(s) (2 sized, holding 2)`. The
+efficiency cores are still never budgeted; whether 2 of them should be is an open measurement on
+#1871.
+
 ⚠️ **The registry deliberately does NOT use `claimsDir()`, and the first version of this did.**
 `claimsDir()` redirects to `modoki-claims-vitest-<pid>/` whenever `VITEST` is set, so every pool
 registered into a temp dir named after its own pid — visible to nobody, and it re-created the

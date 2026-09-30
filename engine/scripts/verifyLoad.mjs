@@ -32,6 +32,10 @@
 // it gets today (peers=1 -> the full pool), so nothing changes for the common case — this only
 // bites when the box is genuinely shared, which is the case it exists for.
 //
+// A run over a few NAMED test files registers a `need` (one worker per file, `testRunNeed()`), and
+// the division gives it only that, splitting the rest among the runs that can use it (`budgetFor`,
+// #1871). Before, a one-file run held a whole share it left idle.
+//
 // Deliberately NOT a mutex. Serializing would make a clone wait minutes on another clone's gate,
 // and the point is to stop the thrash, not to stop the work.
 //
@@ -239,10 +243,135 @@ function writeRuns(runs, dir = verifyRegistryDir()) {
   fs.renameSync(tmp, file);
 }
 
-/** Workers this run may use, given `runners` live runs sharing `total` performance cores. */
-export function budgetFor(total, runners) {
-  const n = Math.max(1, runners);
-  return Math.max(MIN_WORKERS, Math.floor(total / n));
+/**
+ * Workers this run may use, given `runners` live runs sharing `total` performance cores.
+ *
+ * `reserved` is the `need` of every OTHER run that registered one (#1871): a run over a few named
+ * files can use at most one worker per file, so it holds only that and the rest of the pool is
+ * divided among the runs that can use it. Max-min fair (water-filling): the smallest needs are
+ * granted first, each only while it is below the equal share of what is left; a need at or above
+ * that share is just another full-share run. Before this, a one-file run counted as a whole peer and
+ * its share sat idle — two gates and two one-file runs took 3 app workers each on 12 cores, and the
+ * owner saw the box at ~60%.
+ *
+ * ⚠️ **The overload protection (#1285) is unchanged**: at each registration what the runs hold sums
+ * to at most `total`, because a reserved need is subtracted before dividing, never added on top. The
+ * budget never renegotiates (header), so a gate that registered beside a one-file run keeps its
+ * larger share after that run exits.
+ */
+export function budgetFor(total, runners, reserved = []) {
+  return waterFill(total, runners, reserved).share;
+}
+
+/** `budgetFor`'s arithmetic, plus which reserved needs it GRANTED (the rest count as full shares). */
+function waterFill(total, runners, reserved) {
+  let n = Math.max(1, runners);
+  let left = total;
+  const granted = [];
+  for (const need of [...reserved].sort((a, b) => a - b)) {
+    if (n <= 1 || !(need < Math.floor(left / n))) break;
+    granted.push(need);
+    left -= need;
+    n -= 1;
+  }
+  return { share: Math.max(MIN_WORKERS, Math.floor(left / n)), granted };
+}
+
+/** Each group's `need` — the most workers it can use — or `Infinity` for a full share.
+ *
+ *  A group with ANY entry lacking a need (a gate, a whole-suite run, an entry from a clone that
+ *  predates #1871) takes a full share, so a mixed fleet mid-upgrade degrades to the old equal split. */
+export function groupNeeds(runs) {
+  const needs = new Map();
+  for (const r of runs) {
+    const g = groupOf(r);
+    const n = Number.isInteger(r?.need) && r.need > 0 ? r.need : Infinity;
+    needs.set(g, Math.max(needs.get(g) ?? 0, n));
+  }
+  return needs;
+}
+
+/** Vitest flags that take exactly ONE value, always — each checked against vitest 4.1's own `parseCLI`
+ *  (`run <flag> <value> a.test.ts` keeps `a.test.ts` as the filter). The value is skipped. */
+export const VITEST_VALUE_FLAGS = new Set([
+  '-c', '--config', '-r', '--root', '--dir', '-t', '--testNamePattern', '--project', '--reporter',
+  '--outputFile', '--pool', '--environment', '--maxWorkers', '--minWorkers', '--shard', '--exclude',
+  '--mode', '--testTimeout', '--hookTimeout', '--retry', '--maxConcurrency', '--sequence.seed',
+  '--coverage.provider', '--coverage.reporter',
+]);
+
+/** Vitest flags that take NO value — each checked against `parseCLI` not to swallow a following file,
+ *  and none of them turning the run into a watch or an unbounded one. */
+export const VITEST_BOOLEAN_FLAGS = new Set([
+  '--run', '--globals', '--no-globals', '--passWithNoTests', '--allowOnly', '--isolate', '--no-isolate',
+  '--logHeapUsage', '--hideSkippedTests', '--color', '--no-color', '--clearScreen', '--no-clearScreen',
+  '--fileParallelism', '--no-file-parallelism', '--typecheck', '--dom', '--expandSnapshotDiff',
+  '--coverage', '--no-coverage', '--printConsoleTrace', '--includeTaskLocation', '--no-watch',
+  '--sequence.shuffle', '--sequence.concurrent', '--disableConsoleIntercept', '--detectAsyncLeaks',
+]);
+
+const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$/;
+
+/**
+ * How many workers a vitest run can use, read off its command line — or `undefined` for "a full
+ * share" (#1871).
+ *
+ * A run whose every filter names a test file (`vitest run tests/a.test.ts -t foo`) runs at most one
+ * worker per file, so its `need` is the file count. Anything it cannot read for certain is
+ * `undefined`, the equal share every run got before: no filter (a whole suite), a directory, a bare
+ * substring, a subcommand other than `run`, a watch run, `--`, and ANY flag outside the two lists above.
+ *
+ * ⚠️ **Only an ALLOWLIST is safe, and the first version was a denylist.** Vitest gives many flags an
+ * OPTIONAL value (`-u`, `--browser`, `--coverage.all`, `--bail`, `--changed`), so a file right after
+ * one is swallowed as its value (and `--silent <file>` is rejected outright), and everything after `--` is ignored: `run -u a.test.ts`
+ * runs the WHOLE suite at full width. Read as a boolean flag, it registered `need: 1`, and a gate
+ * beside it took 11 app workers — 28 on 12 cores (close-out review). So an unknown flag now means a
+ * full share. `verifyLoad.test.ts` drives EVERY entry of both lists, and every shape that returns a
+ * number, through vitest's own `parseCLI` — so a vitest bump that makes a listed flag take a value
+ * goes red there.
+ *
+ * ⚠️ **A bare `vitest <file>` in a terminal is WATCH mode** (vitest watches when stdin is a TTY and
+ * `CI` is unset), where pressing `a` reruns everything; so it is a full share there. A Claude session
+ * or a script has no TTY, and there the bare form runs once.
+ *
+ * ⚠️ **It can UNDERCOUNT, and that is why `need` only changes what a run RESERVES.** Vitest's filters
+ * are substring matches, so `foo.test.ts` also runs `barfoo.test.ts`; resolving them against the
+ * files vitest will collect is not possible when the config is evaluated. So `testWorkers.ts` registers
+ * this figure and still sizes its OWN pool exactly as before: an undercount lets the other runs take a
+ * worker or two too many (a little oversubscription), and never starves this run.
+ *
+ * `undefined` on Windows, so the `win` box keeps the equal split unchanged (#1871 scope; #1846 sized
+ * that pool by hand).
+ */
+export function testRunNeed(argv = process.argv, {
+  platform = process.platform,
+  tty = Boolean(process.stdin?.isTTY) && !process.env.CI,
+} = {}) {
+  if (platform === 'win32') return undefined;
+  const args = argv.slice(2);
+  let files = 0;
+  let subcommand;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('-')) {
+      const flag = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
+      if (VITEST_VALUE_FLAGS.has(flag)) {
+        if (!a.includes('=')) i++;
+        continue;
+      }
+      if (VITEST_BOOLEAN_FLAGS.has(a)) continue;
+      return undefined; // `--`, a watch flag, an optional-value flag, or one this does not know
+    }
+    if (subcommand === undefined && files === 0 && /^[a-z]+$/.test(a)) {
+      subcommand = a;
+      if (a !== 'run') return undefined; // watch/dev/related/bench/list: not a bounded set of files
+      continue;
+    }
+    if (!TEST_FILE.test(a)) return undefined;
+    files++;
+  }
+  if (subcommand === undefined && tty) return undefined; // a bare run in a terminal watches
+  return files > 0 ? files : undefined;
 }
 
 /**
@@ -260,6 +389,7 @@ export function registerVerifyRun({
   total = perfCores(),
   env = process.env,
   group = env[VERIFY_GROUP_ENV] || String(pid),
+  need,
 } = {}) {
   // ⚠️ **Deliberately does NOT write the group back into `process.env`.** An earlier draft did, so
   // that children would inherit it — and that made the function silently non-idempotent: the SECOND
@@ -268,7 +398,9 @@ export function registerVerifyRun({
   // case reporting `peers` of 1. Publication is now explicit and belongs to the caller that spawns
   // children (`verify.mjs` via `laneGroupEnv()`, `registerTestRun` for its own process).
   const others = readRuns({ dir, now, alive }).filter((r) => r.pid !== pid);
-  const runs = [...others, { pid, clone, startedAt: now, group: String(group) }];
+  const self = { pid, clone, startedAt: now, group: String(group) };
+  if (Number.isInteger(need) && need > 0) self.need = need;
+  const runs = [...others, self];
   try {
     writeRuns(runs, dir);
   } catch {
@@ -276,12 +408,18 @@ export function registerVerifyRun({
     // cannot register simply behaves as it did before this module existed.
   }
   const peers = countGroups(runs);
-  const appWorkers = budgetFor(total, peers);
+  // The OTHER groups' finite needs (#1871). This run's own share is computed as a full one: for a
+  // gate that is what it is, and a sized run does not size its own pool from this (reserve-only).
+  const needs = groupNeeds(runs);
+  needs.delete(String(group));
+  const { share: appWorkers, granted } = waterFill(total, peers, [...needs.values()].filter(Number.isFinite));
   return {
     peers,
     total,
     /** This run's group id — the caller publishes it to children it spawns. */
     group: String(group),
+    /** The peers held to what they can use, and what they hold — for the `context:` line. */
+    sized: { runs: granted.length, workers: granted.reduce((a, b) => a + b, 0) },
     appWorkers,
     // The engine lane has always taken about half the app lane's pool (12 vs a pinned 6) and runs
     // entirely INSIDE it, so it keeps that ratio rather than getting an equal share.
@@ -415,7 +553,7 @@ export function engineLaneWorkers(budget, env = process.env) {
  *  with no record of the contention it ran under cannot be compared against another one, and four
  *  months of the header's table were quoted as current long after the box stopped being quiet. */
 export function benchLine({
-  peers, total, appWorkers, engineWorkers, load = os.loadavg(), platform = process.platform,
+  peers, total, appWorkers, engineWorkers, sized, load = os.loadavg(), platform = process.platform,
 }) {
   // ⚠️ **`os.loadavg()` returns `[0,0,0]` on Windows — always, by Node's contract.** Printed raw
   // that reads as a perfectly idle box, which is strictly worse than printing nothing: the line
@@ -423,7 +561,10 @@ export function benchLine({
   // measures going RED rather than merely slow under oversubscription — the platform this line
   // exists to explain. `peers` and the worker split are still real there, so the line stays.
   const l = platform === 'win32' ? 'n/a (os.loadavg is 0 on Windows)' : `${load[0].toFixed(1)}/${load[1].toFixed(1)}`;
-  return `  context: load ${l} · ${peers} verify run(s) on ${total} perf core(s)`
+  // #1871: the runs held to what they can use, so a share bigger than `total / peers` reads as the
+  // reason it is, not as a miscount. Absent when there are none, so a solo line reads as before.
+  const held = sized?.runs ? ` (${sized.runs} sized, holding ${sized.workers})` : '';
+  return `  context: load ${l} · ${peers} verify run(s) on ${total} perf core(s)${held}`
     + ` · workers app=${appWorkers} engine=${engineWorkers}`;
 }
 

@@ -14,6 +14,9 @@ export interface VerifyRun {
   /** The id shared by every process of ONE gate — `peers` counts distinct groups, not entries.
    *  Optional: an entry written by a pre-#1285 clone has none and falls back to its own pid. */
   group?: string;
+  /** The most workers this run can use — one per named test file (#1871, `testRunNeed`). Absent for
+   *  a gate, a whole-suite run, or an entry from an older clone: those take a full share. */
+  need?: number;
 }
 
 /** This run's share of the box. `peers` COUNTS THIS RUN, so a solo gate reports 1. */
@@ -26,6 +29,8 @@ export interface VerifyBudget {
   group: string;
   /** Performance cores being divided (`perfCores()` unless injected). */
   total: number;
+  /** The OTHER runs held to their `need` (#1871), and the workers they hold. */
+  sized: { runs: number; workers: number };
   appWorkers: number;
   engineWorkers: number;
 }
@@ -59,6 +64,7 @@ export function registerTestRun(
     total?: number;
     group?: string;
     env?: NodeJS.ProcessEnv;
+    need?: number;
   },
 ): VerifyBudget | null;
 
@@ -71,7 +77,18 @@ export function registryPath(dir?: string): string;
 export function perfCores(opts?: { platform?: NodeJS.Platform | string }): number;
 export function isLiveRun(run: VerifyRun | null | undefined, opts?: RunsOpts): boolean;
 export function readRuns(opts?: RunsOpts): VerifyRun[];
-export function budgetFor(total: number, runners: number): number;
+/** Max-min fair: `reserved` holds the OTHER runs' needs; each is granted while below the equal share
+ *  of what is left, and the rest is divided among the remaining runs (#1871). */
+export function budgetFor(total: number, runners: number, reserved?: number[]): number;
+/** Each group's need, `Infinity` for a full share (any entry of the group without one). */
+export function groupNeeds(runs: Array<Partial<VerifyRun>>): Map<string, number>;
+/** A vitest run's worker need from its argv: the number of named test files, or `undefined` for a
+ *  full share (no filter, a directory, a substring, an unknown flag, Windows). May UNDERCOUNT —
+ *  filters are substring matches — so it only changes what a run reserves. */
+/** The flags `testRunNeed` reads: exactly-one-value, and no-value. Anything else is a full share. */
+export const VITEST_VALUE_FLAGS: ReadonlySet<string>;
+export const VITEST_BOOLEAN_FLAGS: ReadonlySet<string>;
+export function testRunNeed(argv?: string[], opts?: { platform?: NodeJS.Platform | string; tty?: boolean }): number | undefined;
 export function registerVerifyRun(
   opts?: RunsOpts & {
     pid?: number;
@@ -79,6 +96,7 @@ export function registerVerifyRun(
     total?: number;
     group?: string;
     env?: NodeJS.ProcessEnv;
+    need?: number;
   },
 ): VerifyBudget;
 export function unregisterVerifyRun(opts?: RunsOpts & { pid?: number }): void;
@@ -102,7 +120,7 @@ export function appLaneWorkers(
  *  line reports context and has no business requiring a group id it never renders. */
 export function benchLine(
   b: Pick<VerifyBudget, 'peers' | 'total' | 'appWorkers' | 'engineWorkers'>
-    & { load?: number[]; platform?: NodeJS.Platform | string },
+    & { sized?: VerifyBudget['sized']; load?: number[]; platform?: NodeJS.Platform | string },
 ): string;
 
 /** vitest's cross-worker aggregate breakdown, in SECONDS (a `17ms` value becomes `0.017`).
