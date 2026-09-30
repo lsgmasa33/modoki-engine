@@ -18,8 +18,7 @@ import { resolveDirectorRootForTimeline } from './openAssetInEditor';
 import { fireDirtyListeners, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { Director } from '../../runtime/traits/Director';
 import { newGuid, registerAsset, getAllAssets } from '../../runtime/loaders/assetManifest';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
-import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { classifyAssetDocFetchFailure, readAssetDocFresh } from './assetDocLoad';
 import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
@@ -294,8 +293,7 @@ export default function TimelineEditor() {
       setParkAdopted(true);
       return;
     }
-    fetch(asset.path)
-      .then((r) => parseAssetJson(r, asset.path))
+    readAssetDocFresh(asset.path)
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeTimeline(json as Partial<TimelineDef>);

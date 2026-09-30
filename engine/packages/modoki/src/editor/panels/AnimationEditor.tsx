@@ -18,8 +18,7 @@ import { useHmrEpoch } from '../input/hmrEpoch';
 import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid, registerAsset, getGuidForPath } from '../../runtime/loaders/assetManifest';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
-import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { classifyAssetDocFetchFailure, readAssetDocFresh } from './assetDocLoad';
 import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import {
@@ -375,8 +374,7 @@ export default function AnimationEditor() {
       setParkAdopted(true);
       return;
     }
-    fetch(asset.path)
-      .then((r) => parseAssetJson(r, asset.path))
+    readAssetDocFresh(asset.path)
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeAnimationClip(json as Partial<AnimationClipDef>);

@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused, sceneFileLoadBegins, sceneFileLoaded } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused, outsideFileReadBegins, outsideFileReadLanded } from '../debug/agentBridge';
 import { startCountdown } from '../debug/countdownBanner';
 import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
@@ -77,7 +77,7 @@ detachPrefabInstanceWithUndo, detachRefusal,
   type PrefabFile,
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
-  editorStateCurrent, captureAdoption, recordSceneFileChanged, setSceneFileLoadObserver, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
+  editorStateCurrent, captureAdoption, recordSceneFileChanged, setFreshFileReadObserver, beginFreshFileRead, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
 UndoRefusedError, isUndoStepInFlight, isSnapshotOperationInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
 import { recordsUndo, stepRunningRefusal, applyRunningRefusal } from './agentOpUndoClass';
@@ -1427,8 +1427,8 @@ export function registerEditorAgentOps(): void {
   onWorldHoldsSettled(() => { void replaySuppressedSceneReloads(); });
   onAdoptionsSettled(() => { void replaySuppressedSceneReloads(); });
   setSceneAdoptionHooks({ capture: captureAdoption, settled: () => adoptionsSettled() === null, sceneFileChanged: recordSceneFileChanged });
-  // A scene load reads its file, so it applies that file's held outside change (#1899): the hold drops it.
-  setSceneFileLoadObserver({ begins: sceneFileLoadBegins, loaded: sceneFileLoaded });
+  // Every fresh read of a file applies its held outside change (#1899 scene loads, #1902 the rest): the hold drops it.
+  setFreshFileReadObserver({ begins: outsideFileReadBegins, loaded: outsideFileReadLanded });
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);
@@ -2990,13 +2990,18 @@ export function registerEditorAgentOps(): void {
    *  (#1164) and dropped both. Deferred while the world may not be rebuilt (Play, a preview, a landing switch), and replayed
    *  as a re-import once it may. In prefab edit the world is the template, so only the caches take the file (the adopt landing, `rebase: false`). */
   const reimportDiscardedPrefabs = async (paths: string[]): Promise<PrefabReimportReport & { deferred?: string }> => {
-    if (useEditorStore.getState().editingPrefab) return reimportPrefabsInPlace(paths, { rebase: false });
-    const suppressed = sceneReloadSuppressedReason();
+    const editing = !!useEditorStore.getState().editingPrefab;
+    const suppressed = editing ? null : sceneReloadSuppressedReason();
     if (suppressed) {
       deferPrefabReimport(paths, suppressed);
       return { reimported: [], failed: [], deleted: [], unused: [], notRebased: [], placeholders: [], deferred: suppressed };
     }
-    return reimportPrefabsInPlace(paths);
+    // The re-import reads each file fresh (#1902): it applies the outside change the hold lists for it, so the hold drops
+    // it — a path it read, that is. One that failed to read keeps its change held, and the release tries again.
+    const reads = new Map(paths.map((path) => [path, beginFreshFileRead(path)]));
+    const report = await reimportPrefabsInPlace(paths, editing ? { rebase: false } : {});
+    for (const path of [...report.reimported, ...report.unused, ...report.deleted]) reads.get(path)?.landed();
+    return report;
   };
 
   /** Drop parked asset writes, the agent's way: an asset document's applied def stays LIVE (the op's documented scope),
@@ -4103,10 +4108,14 @@ export function registerEditorAgentOps(): void {
       // and the fetch is only a cache-miss fallback — the panel opening this clip, or a concurrent
       // agent op for the same path landing mid-flight, can populate the live cache with content
       // that is NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      // A fresh read, so it applies the clip's held outside change when its bytes are the ones edited (#1902): left held,
+      // the park below started conflicted and the release discarded it — this op's edit, made on the new bytes.
+      const read = beginFreshFileRead(p.clipPath);
       const res = await fetch(assetUrl(p.clipPath), { cache: 'no-store' }).catch(() => null);
       const live = getAnimationClip(p.clipPath) as AnimationClipDef | null;
       if (!res?.ok && !live) throw new Error(`cannot load clip ${p.clipPath}`);
-      clip = live ?? normalizeAnimationClip(await res!.json());
+      if (live) clip = live;
+      else { clip = normalizeAnimationClip(await res!.json()); read.landed(); }
     }
     // Deep-copy tracks/keys so we don't mutate the cached clip in place.
     const next: AnimationClipDef = { ...clip, tracks: clip.tracks.map((t) => ({ ...t, keys: [...t.keys] })) };
@@ -4164,10 +4173,13 @@ export function registerEditorAgentOps(): void {
       // fetch is only a cache-miss fallback — the panel opening this timeline, or a concurrent agent
       // op for the same path landing mid-flight, can populate the live cache with content that is
       // NEWER than (or simply present despite) whatever this fetch did or didn't get. #521.
+      // A fresh read applies the timeline's held outside change when its bytes are the ones edited (#1902, as above).
+      const read = beginFreshFileRead(p.timelinePath);
       const res = await fetch(assetUrl(p.timelinePath), { cache: 'no-store' }).catch(() => null);
       const live = getTimeline(p.timelinePath) as TimelineDef | null;
       if (!res?.ok && !live) throw new Error(`cannot load timeline ${p.timelinePath}`);
-      def = live ?? normalizeTimeline(await res!.json());
+      if (live) def = live;
+      else { def = normalizeTimeline(await res!.json()); read.landed(); }
     }
     const target = p.target ?? '';
     const clone = JSON.parse(JSON.stringify(def)) as TimelineDef;
@@ -4608,7 +4620,7 @@ export function registerEditorAgentOps(): void {
    *
    *  The obvious list — the four modules in `editor/scene/` — is missing the most commonly edited
    *  thing in the editor. `sceneDirty.ts` tracks BASE scenes only (its own header says so); the
-   *  PRIMARY scene's unsaved live-world state is `getEditVersion() !== _savedAtEditVersion`, a bare
+   *  PRIMARY scene's unsaved live-world state is `worldStateToken() !== _savedWorldState`, a bare
    *  pathless boolean in `serialize.ts`. A probe built by enumerating registry modules is VACUOUS
    *  for the open scene, and nothing goes red. The name collision is what hides it: the CAUSE
    *  called `sceneDirty` is the primary, while the MODULE called `sceneDirty.ts` supplies

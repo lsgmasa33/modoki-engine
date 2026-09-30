@@ -24,7 +24,7 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
-import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled } from '../undo/undoManager';
+import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled, worldStateToken, beginFreshWorldState, captureSavePoint, captureSceneSavePoint, settleSavePoint, settleSceneSavePoint, restoreWorldStateToken, type SavePoint } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
 import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
@@ -39,7 +39,8 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
-import { clearSceneDirty, clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
+import { clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty, captureSceneTokens, restoreSceneTokens, forgetSceneSavedStates, type SceneTokens } from './sceneDirty';
+import { beginFreshFileRead } from './freshFileRead';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -766,18 +767,6 @@ let _currentBaseScene: string | undefined;
 export function getCurrentBaseScene() { return _currentBaseScene; }
 export function setCurrentBaseScene(baseScene: string | undefined) { _currentBaseScene = baseScene; }
 
-/** Told when a scene load starts reading its file and when its world is adopted (#1899): the app's outside-change hold
- *  (`agentBridge.ts`'s `sceneFileLoadBegins` / `sceneFileLoaded`, installed by `agentEditorOps.ts`) drops the held changes
- *  to the file that the load read. `begins` names the holds its read covers, handed back to `loaded`; any at all makes
- *  the adopt start the scene's history fresh. Null in a host with no hold. */
-export interface SceneFileLoadObserver {
-  begins(path: string): readonly number[];
-  loaded(path: string, covered: readonly number[]): void;
-}
-let _sceneFileLoadObserver: SceneFileLoadObserver | null = null;
-export function setSceneFileLoadObserver(observer: SceneFileLoadObserver | null): void {
-  _sceneFileLoadObserver = observer;
-}
 
 export function getCurrentScenePath() { return _currentScenePath; }
 const scenePathListeners = new Set<() => void>();
@@ -823,13 +812,21 @@ export function setCurrentScenePath(scenePath: string | null) {
  *  that was never written. That is the worst possible lie here: every "create live, then edit
  *  the file" flow depends on save_all, so a fake success reproduced the exact bug save_all
  *  exists to fix, with the fix itself confirming it had worked. */
-// The edit-version at the last successful save / load / new. Anything past it is work that
-// exists ONLY in the live world. (C7)
+// The edit-version at the last successful save / load / new — what the baseline logic below compares ("a save since the
+// capture"). (C7)
 let _savedAtEditVersion = 0;
+// The world-state token the file holds (#1904): the world is unsaved exactly while it is at another state. An undo back
+// to the state a save wrote lands on this token again, so it reads clean (Unity issue 6559); the edit version cannot
+// say that — it counts the undo as one more change.
+let _savedWorldState = 0; // the boot world's (`BOOT_WORLD_STATE`), inlined: this runs at import, where a mocked undo manager may not export it
+/** Is the primary world at a state its file does not hold? */
+function primaryWorldEdited(): boolean {
+  return worldStateToken() !== _savedWorldState;
+}
 /** Mark the live world as matching disk (a successful save, or a fresh load/new).
  *
- *  `atEditVersion` is the version the written CONTENT was serialized at, and an async caller MUST
- *  pass it. Defaulting to `getEditVersion()` is only correct when the world became the disk state
+ *  `at` is what the written CONTENT was serialized at (`captureSavePoint()`), and an async caller MUST
+ *  pass it. Defaulting to now is only correct when the world became the disk state
  *  synchronously — a load, a new scene, a prefab-edit exit — because then "now" and "what was
  *  written" are the same moment. `saveScene` is not that: it serializes, then awaits a disk write
  *  (and on the Save-As path, a NATIVE MODAL a human can leave open indefinitely). Reading the
@@ -837,12 +834,20 @@ let _savedAtEditVersion = 0;
  *  which is a silent data-loss bug — `hasUnsavedChanges()` then answers false, and per its own
  *  doc comment below that is the flag the game-code-reload gate reads before force-reloading the
  *  editor and discarding the live world. See docs/async-lifetime.md. */
-export function markSceneSaved(atEditVersion?: number): void {
-  _savedAtEditVersion = atEditVersion ?? getEditVersion();
+export function markSceneSaved(at?: SavePoint): void {
+  if (at) {
+    _savedAtEditVersion = at.version;
+    _savedWorldState = at.state;
+    return;
+  }
+  // The world just BECAME the file (a load, a new scene, a restore): a fresh token, so no entry recorded before it — a
+  // parked stack coming back, or one kept across a reload of a changed file — can land on "saved".
+  _savedAtEditVersion = getEditVersion();
+  _savedWorldState = beginFreshWorldState();
 }
 
 /** The WORLD-shaped dirty state (the two world causes of `worldHasUnsavedEdits`) as a baseline a revert can put back. */
-export interface WorldDirtyBaseline { readonly primaryClean: boolean; readonly scenes: ReadonlySet<string>; readonly savedAt: number; readonly editVersion: number }
+export interface WorldDirtyBaseline { readonly worldState: number; readonly scenes: SceneTokens; readonly savedAt: number; readonly editVersion: number }
 
 /** Taken at the Play press, with Play's undo barrier (`playMode.ts`). */
 /** `snapshotVersion`: the edit version when the snapshot this baseline goes with STARTED. An edit landing during the
@@ -850,11 +855,11 @@ export interface WorldDirtyBaseline { readonly primaryClean: boolean; readonly s
  *  baseline then records no version a save can match (#1816 close-out, fourth review). */
 export function captureWorldDirtyBaseline(snapshotVersion?: number): WorldDirtyBaseline {
   const v = getEditVersion();
-  // Both answers are about what the SNAPSHOT holds: an edit during its awaits may be missing from it, so neither "clean at
-  // the press" nor "a save of this version holds it" can be claimed then (fifth review: a save of that edit landing
-  // before the capture read `primaryClean`, and Stop marked a world without the edit clean against a disk with it).
+  // Both answers are about what the SNAPSHOT holds: an edit during its awaits may be missing from it, so neither "the
+  // world is at this state" nor "a save of this version holds it" can be claimed then (fifth review: a save of that edit
+  // landing before the capture read clean, and Stop marked a world without the edit clean against a disk with it).
   const snapshotComplete = snapshotVersion === undefined || snapshotVersion === v;
-  return { primaryClean: snapshotComplete && v === _savedAtEditVersion, scenes: dirtySceneGuidsSnapshot(), savedAt: _savedAtEditVersion, editVersion: snapshotComplete ? v : -1 };
+  return { worldState: worldStateToken(), scenes: captureSceneTokens(), savedAt: _savedAtEditVersion, editVersion: snapshotComplete ? v : -1 };
 }
 
 /** Put the world's dirty state back to `baseline`, once Stop has reverted the world and cut the undo stack to Play's
@@ -871,9 +876,24 @@ export function restoreWorldDirtyBaseline(baseline: WorldDirtyBaseline): void {
   // …unless that save wrote exactly the capture's version: a save serialized before the press whose disk write landed
   // after it holds the snapshot itself (#1816 close-out, third review).
   const diskHoldsSnapshot = _savedAtEditVersion === baseline.editVersion;
-  if (_savedAtEditVersion !== baseline.savedAt && !diskHoldsSnapshot) return;
-  if (baseline.primaryClean || diskHoldsSnapshot) markSceneSaved();
-  clearSceneDirtyExcept(baseline.scenes);
+  if (_savedAtEditVersion !== baseline.savedAt && !diskHoldsSnapshot) {
+    // The tokens say otherwise: that save recorded the Play-startup world's token, which is still the live one, so
+    // leaving them read clean over a reverted world lacking an edit the save wrote (#1904 close-out, fourth review).
+    beginFreshWorldState();
+    forgetSceneSavedStates();
+    return;
+  }
+  // The same stack goes on, cut to Play's barrier, so the world goes back to the token it had at the press (#1904): its
+  // pre-Play entries still name that state, and an undo or redo onto the saved one reads clean after Stop. Dirty at the
+  // press stays dirty, because the token then differed from the saved one. A snapshot that may lack an edit is at no
+  // known state, so it reads unsaved until the next save.
+  const complete = baseline.editVersion !== -1;
+  if (!complete) beginFreshWorldState();
+  // Not `_savedWorldState = baseline.worldState` for a save of the capture's version: that save recorded its own state,
+  // which is the press's whenever the premise holds, and a version can match with the token moved (a push dropped
+  // during a file-direct step moves it with no version bump) — forcing it read clean over that edit (fourth review).
+  else restoreWorldStateToken(baseline.worldState);
+  restoreSceneTokens(baseline.scenes, { unknownState: !complete });
 }
 /** Is there live-world work not on disk? Used to stop load_scene/new_scene silently
  *  DESTROYING it — that reported {ok:true} while the entity you just created was gone from
@@ -1025,8 +1045,8 @@ const CAUSE_SPECS = {
   // (docs/mcp-persistence.md). ⚠️ Name collision worth knowing: this cause is `sceneDirty`, while
   // the MODULE `sceneDirty.ts` supplies `dirtyScenes` below.
   sceneDirty: {
-    has: () => getEditVersion() !== _savedAtEditVersion,
-    read: () => getEditVersion() !== _savedAtEditVersion,
+    has: primaryWorldEdited,
+    read: primaryWorldEdited,
     keying: 'none',
     writtenBy: 'scene-write',
     label: { bool: 'unsaved scene changes' },
@@ -1212,7 +1232,7 @@ export interface SaveResult {
  *  makes after the primary anyway); if any fails, nothing is copied and nothing is reopened.
  *
  *  The original file is never written. */
-async function saveSceneAs(target: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+async function saveSceneAs(target: string, content: string, sceneId: string, entityCount: number, savedAt: SavePoint): Promise<SaveResult> {
   const from = _currentScenePath!;
   const others = await saveOtherLoadedScenes();
   const othersReport = {
@@ -1226,7 +1246,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
     // the classifier compares strings, the disk does not. A plain save, to `from` as captured: a
     // scene load landing during the awaits above would otherwise take this write over ITS file.
     if (_currentScenePath !== from) return { saved: false, path: from, reason: 'superseded', ...othersReport };
-    return { ...(await writePrimaryScene(from, content, sceneId, entityCount, savedAtEditVersion)), ...othersReport };
+    return { ...(await writePrimaryScene(from, content, sceneId, entityCount, savedAt)), ...othersReport };
   }
   if (written === 'target-loaded') return { saved: false, path: target, reason: 'target-loaded', ...othersReport };
   if ('refused' in written) {
@@ -1244,8 +1264,11 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note }, ...othersReport });
   // An edit that landed during the writes is in the live world but not in the copy — reopening
   // would discard it. Stay on the original, still dirty, and say so (#573's window, one level up).
-  if (getEditVersion() !== savedAtEditVersion) {
-    return stay(`an edit landed while the copy was being written, so it is NOT in the copy; the editor stays on ${from} with that edit unsaved`);
+  // …or the world is not at the state the copy was serialized at: a step or an edit during the serialize (the settled
+  // point is unreachable), or a push dropped during a file-direct step since, which moves the token with no version
+  // bump (#1904 close-out, fifth review, reproduced: the reopen discarded that edit).
+  if (getEditVersion() !== savedAt.version || worldStateToken() !== savedAt.state) {
+    return stay(`an edit landed (or an undo step ran) while the copy was being serialized or written, so the copy may not hold it; the editor stays on ${from} with that change unsaved`);
   }
   // The reopen swaps the world, and `SceneManager` clears the #124 records on a load — so warn now,
   // or the copy is the one save that bakes a system-rewritten field in silently.
@@ -1264,7 +1287,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
 
 /** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */
 async function writePrimaryScene(
-  path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number,
+  path: string, content: string, sceneId: string, entityCount: number, savedAt: SavePoint,
   /** The world `content` was serialized from — see `saveScene`. Defaults to the one live now, for a caller that did
    *  not serialize across an await of its own. */
   worldSerialized = getCurrentWorld(),
@@ -1289,7 +1312,7 @@ async function writePrimaryScene(
   if (path !== _currentScenePath) setCurrentScenePath(path);
   // An untitled world's first file (#1712): its undo stacks move to the file's key, which a hot reload of it adopts.
   if (openBefore === null) rekeyUntitledHistory(path);
-  markSceneSaved(savedAtEditVersion);
+  markSceneSaved(savedAt);
   return { saved: true, path, reason: 'ok' };
 }
 
@@ -1357,15 +1380,18 @@ export async function saveScene(opts: {
   // save binds its file only to this world (#1712 close-out reviews — read after, a Create Scene landing inside the
   // serialize was taken for the world the bytes came from).
   const worldSerialized = getCurrentWorld();
+  // The state `content` represents, captured in the same run as `serializeScene`'s synchronous read of the entity list:
+  // its awaits (prefab sources, nested preloads) and the disk write are where an edit can land, and one landing there
+  // may be missing from the bytes — captured after them, it read as saved (#1904 close-out review F3). The guids
+  // `assignGuids` mints are raw writes that move neither the version nor the state token, so they cannot make this
+  // stale. Every `markSceneSaved` below is handed this rather than re-reading on the other side of an await; see
+  // markSceneSaved's doc comment.
+  let savedAt = captureSavePoint();
   // Saving is the authored write that persists identity — commit minted guids
   // to the live world so subsequent refs resolve and the next save is stable.
   const scene = await serializeScene({ assignGuids: true });
+  savedAt = settleSavePoint(savedAt); // the bytes are fixed: did anything move the world during the serialize's awaits?
   const content = jsonFileBody(scene);
-  // The version `content` actually represents. Captured HERE — after serializeScene, which mints
-  // guids into the live world and so moves the version itself, and before the disk write, which is
-  // the deferral an edit can land inside. Every `markSceneSaved` below is handed this rather than
-  // re-reading the version on the other side of an await; see markSceneSaved's doc comment.
-  const savedAtEditVersion = getEditVersion();
 
   const kind = explicitPath ? classifyExplicitSceneSave(explicitPath, {
     currentPath: _currentScenePath,
@@ -1374,13 +1400,13 @@ export async function saveScene(opts: {
     loadedPaths: [...sceneManager.getLoadedScenes().values()].map((e) => e.path),
   }) : null;
   if (kind === 'target-loaded') return { saved: false, path: explicitPath!, reason: 'target-loaded' };
-  if (kind === 'save-as') return saveSceneAs(explicitPath!, content, scene.id, scene.entities.length, savedAtEditVersion);
+  if (kind === 'save-as') return saveSceneAs(explicitPath!, content, scene.id, scene.entities.length, savedAt);
 
   // The open scene's own file is written under the spelling it was opened with (#1273) — a
   // case-variant `path` names the same file, and adopting it would give the manifest a second key.
   const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
   // scene.id is always populated by serializeScene (required field).
-  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion, worldSerialized);
+  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAt, worldSerialized);
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.
@@ -1426,7 +1452,7 @@ export async function saveScene(opts: {
     rekeyUntitledHistory(saved); // its undo stacks now belong to the file (#1712 close-out review) — see writePrimaryScene
     editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
-    markSceneSaved(savedAtEditVersion);
+    markSceneSaved(savedAt);
     return { saved: true, path: saved, reason: 'ok' };
   }
   const error = written.outcome === 'failed' ? written.error : undefined;
@@ -1768,8 +1794,8 @@ async function loadSceneRequest(
     // One pending adoption from here to the adopt (#1698): the owner reads the outgoing world's dirt now, before the
     // await (#1409) — the outgoing world stays live and editable while the new one loads.
     return await withAdoption('scene-load', async (adoption) => {
-      // Before the read (#1899): only an outside change held by now is one this load's bytes can include.
-      const covered = _sceneFileLoadObserver?.begins(scenePath);
+      // Before the read (#1899, `freshFileRead.ts`): only an outside change held by now is one this load's bytes can include.
+      const read = beginFreshFileRead(scenePath);
       const { world, keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
         ...(gameId !== undefined ? { gameId } : {}),
         // Resources acquire in parallel; each completion (on a cold cache, a finished
@@ -1789,11 +1815,11 @@ async function loadSceneRequest(
       const adopted = adoption.offer({
         world, path: scenePath, baseScene: 'loaded', journal: { path: scenePath },
         // An outside change this read applies (#1899): the stack under this key was recorded over the old bytes (#1744).
-        history: { key: scenePath, keptBaseGuids, ...(covered?.length ? { freshIncoming: true } : {}) },
+        history: { key: scenePath, keptBaseGuids, ...(read.coversHeldChange ? { freshIncoming: true } : {}) },
       });
       if (!adopted) return 'superseded';
       onAdopted(world);
-      if (covered) _sceneFileLoadObserver?.loaded(scenePath, covered);
+      read.landed();
       // Reported for the scene the editor adopted, even when a newer request began (#1425 — close-out review of #1698):
       // that request installed nothing, so these managers are the ones running on screen.
       _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
@@ -2081,12 +2107,23 @@ async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; gu
   const loadedScenes = [...sceneManager.getLoadedScenes().values()];
   for (const entry of loadedScenes) {
     if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
+    // Asked per base, not once by the caller: each write before this one awaited, and Play (or a pose preview) can start
+    // there — this base would then serialize the RUNTIME world into its file (#1904 close-out, fifth review).
+    const notAuthored = whyWorldNotAuthored();
+    if (notAuthored) {
+      console.error(`[Editor] Refused to save "${entry.path}": the live world is not authored (${notAuthored}).`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: `the live world is not authored: ${notAuthored}` });
+      continue;
+    }
     // Catch per-scene so one scene that fails to serialize can't block every OTHER
     // dirty scene in the same Save All, and so its dirty flag stays SET (not
     // silently cleared) until it can actually be written. This used to be load-
     // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
     // prefab instance; that guard is gone (both bugs fixed), but the per-scene
     // isolation is worth keeping on its own merits for any future throw.
+    // The state these bytes are, read before any await (#1904): an edit landing during the serialize or the write moves
+    // the scene past it, and so still reads dirty once the write lands — clearing the flag outright recorded it as written.
+    const savedAt = captureSceneSavePoint(entry.guid);
     let sceneFile;
     try {
       sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
@@ -2095,6 +2132,7 @@ async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; gu
       failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
       continue;
     }
+    const savedAtToken = settleSceneSavePoint(entry.guid, savedAt);
     const wrote = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
     if (!wrote.ok) {
       console.error(`[Editor] Failed to save scene to ${entry.path}: ${wrote.error}`);
@@ -2102,7 +2140,7 @@ async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; gu
       continue;
     }
     registerAsset(entry.guid, entry.path, 'scene');
-    clearSceneDirty(entry.guid);
+    clearSceneDirty(entry.guid, savedAtToken);
     editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
     extraSaved.push({ path: entry.path, guid: entry.guid });

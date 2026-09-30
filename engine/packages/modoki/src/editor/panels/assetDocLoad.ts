@@ -50,7 +50,8 @@
  *  plain `.ts` so the decision is unit-testable without mounting the component (CLAUDE.md §
  *  Panels) — this module keeps that property for all five remaining sites. */
 
-import { assetIsAbsent } from '../../runtime/loaders/assetFetch';
+import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
+import { beginFreshFileRead } from '../scene/freshFileRead';
 
 /** What to do when an asset document's fetch/parse threw.
  *
@@ -90,4 +91,19 @@ export type AssetDocFetchFailure =
 export function classifyAssetDocFetchFailure(e: unknown): AssetDocFetchFailure {
   if (assetIsAbsent(e)) return { kind: 'missing' };
   return { kind: 'refused', message: e instanceof Error ? e.message : String(e) };
+}
+
+/** An asset-document panel's read of its FILE — on open, and on Retry after "Discard & reload" (#1902). The one read
+ *  every panel that parks edits on the document makes when nothing is parked for the path — the five editors (Particle,
+ *  Animation, Timeline, SpriteAnim, Skin) and the Inspector's Material, Shader, AnimSet and multi-material views; the
+ *  parked branch (`pendingAssetDoc`) is not a disk read. What it read is the outside change the #1879 hold lists for the file,
+ *  so a parse that succeeds APPLIES it (`freshFileRead.ts`), as Unity shows the imported asset: the hold drops it, the
+ *  runtime cache follows the file, and the file's `heldOutside` note ends. Left held, a park made on these bytes started
+ *  conflicted, Save asked Overwrite/Cancel over a change the user was looking at, and the release DISCARDED the park as
+ *  stale. A failed read applies nothing, so its change stays held. */
+export async function readAssetDocFresh(path: string, init: { signal?: AbortSignal } = {}): Promise<unknown> {
+  const read = beginFreshFileRead(path);
+  const json = await parseAssetJson(await fetch(path, { ...init, ...ASSET_FETCH_INIT }), path);
+  read.landed();
+  return json;
 }

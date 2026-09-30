@@ -55,6 +55,8 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
   swapHistory: (path: string) => { h.swapHistoryCalls.push(path); },
   activeHistoryKey: () => '', // the adopt's prefab-edit drop reads the outgoing key (#1704): no edit world here
   getEditVersion: () => 0,
+  worldStateToken: () => 0, // the dirty check and a load's fresh baseline (#1904)
+  beginFreshWorldState: () => 0,
   beginWorldSwitch: () => ({ idle: null, release: () => {} }),
   worldSwitchesSettled: () => null,
 }));

@@ -5,6 +5,7 @@
  *  frame without a reload. Editing applies live to any SkeletalAnimator whose
  *  `clip` leaves the matching field at its trait default (= inherit). */
 
+import { readAssetDocFresh } from '../assetDocLoad';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { pushAction } from '../../undo/undoManager';
 import { assetDocAction } from '../../undo/assetDocUndo';
@@ -12,7 +13,7 @@ import type { AnimSetClipDef } from '../../../runtime/loaders/animSetCache';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateAnimSetFile } from './persist';
 import { pendingAssetDoc } from '../pendingAssetDoc';
-import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
+import { isMissingAsset } from '../../../runtime/loaders/assetFetch';
 
 export function AnimSetAssetView({ path }: { path: string }) {
   const [data, setData] = useState<{ source?: string; clips?: AnimSetClipDef[] } | null>(null);
@@ -29,8 +30,7 @@ export function AnimSetAssetView({ path }: { path: string }) {
     const parked = pendingAssetDoc(path, 'animset');
     if (parked) { setData(parked as { source?: string; clips?: AnimSetClipDef[] }); return; }
     const ac = new AbortController();
-    fetch(path, { signal: ac.signal })
-      .then(r => parseAssetJson(r, path))
+    readAssetDocFresh(path, { signal: ac.signal })
       .catch(e => { if (isMissingAsset(e)) return null; throw e; })
       .then((data) => setData(data as { source?: string; clips?: AnimSetClipDef[] } | null))
       .catch(e => { if (e.name !== 'AbortError') setData(null); });

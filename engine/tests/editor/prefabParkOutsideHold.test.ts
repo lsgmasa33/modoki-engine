@@ -49,7 +49,7 @@ import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManag
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import {
-  holdOutsideChange, releaseOutsideChanges, enableOutsideChangeHold, _resetOutsideChangesForTests, heldOutsideChanges,
+  holdOutsideChange, releaseOutsideChanges, enableOutsideChangeHold, _resetOutsideChangesForTests, heldOutsideChanges, runAgentOp,
 } from '../../app/debug/agentBridge';
 import { resetPrefabMarkRecord, parkPrefabChanges, commitPrefabWrites, commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -355,6 +355,35 @@ describe('a write step REFUSED part-way supersedes nothing: its rollback puts th
     expect(diskRow('XA').z, 'precondition: X holds the outside change again').toBe(7);
     await release();
     expect(cachedXAz(), 'the release adopts the outside change the rollback put back').toBe(7);
+  });
+});
+
+describe("discarding a parked prefab re-imports its file, which applies the held change (#1902)", () => {
+  // The re-import reads X fresh and rebases the instances onto it — the release's whole apply. Left held, the release
+  // re-imported it a second time and `pendingOutsideChanges` named a file the editor already showed.
+  // Mutation: drop the `landed()` loop in `reimportDiscardedPrefabs` — the change stays held.
+  it('the discard drops the hold, and the instances already show the file', async () => {
+    const d1 = await applyXB4();
+    await restore(diskDoc(), d1); // undo the Apply: D0 parked
+    outsideWrite();
+    await watcherSees('held');
+    const r = await quietly(() => runAgentOp('discard-asset-edits', { paths: [X_PATH] })) as { ok?: boolean };
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+    expect(tf(I1, 'XA').z, 'the re-import took the file').toBe(7);
+    expect(heldOutsideChanges()).toEqual([]);
+  });
+
+  // The accept side: a re-import that could NOT read the file applied nothing, so its change stays held for the
+  // release. Mutation: land every path the discard named, not only the ones the report says it read — it drops here.
+  it('a re-import that fails to read the file leaves the change held', async () => {
+    const d1 = await applyXB4();
+    await restore(diskDoc(), d1);
+    outsideWrite();
+    await watcherSees('held');
+    route.disk.set(X_PATH, '{ not json');
+    await quietly(() => runAgentOp('discard-asset-edits', { paths: [X_PATH] }));
+    expect(heldOutsideChanges()).toEqual([X_PATH]);
   });
 });
 

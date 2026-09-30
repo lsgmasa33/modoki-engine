@@ -192,7 +192,6 @@ export { placedPrefabPath, placedPrefabRefusal } from './scene/prefabPlace';
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export {
   hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked, adoptWorldReloadedFromDisk,
-  setSceneFileLoadObserver,
   type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
   type FlushPhase, type ParkedFlushResults,
 } from './scene/serialize';
@@ -225,3 +224,5 @@ export { isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath, PREFAB_
 // the route asks for one measured verdict rather than re-deriving the policy in main.
 export { probeKeyReach, chordFromElectronKey, DOM_KEY_ALIAS, type KeyReach } from './input/keyReach';
 export { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './scene/authoringScope';
+// One entry point for "this operation read file X fresh" (#1902) — the outside-change hold drops what the read covered.
+export { beginFreshFileRead, setFreshFileReadObserver, type FreshFileRead, type FreshFileReadObserver } from './scene/freshFileRead';

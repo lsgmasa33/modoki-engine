@@ -4,19 +4,20 @@
  *  a renderer). A load that reads an outside change the hold still lists applies it, so the scene's undo stack — recorded
  *  over the OLD bytes — must end with that load (#1744: undoing a delete then made a second entity with the same guid).
  *
- *  The first cut raised the file's debt from `sceneFileLoadBegins`, inside the load's already-registered route, so its
+ *  The first cut raised the file's debt from `outsideFileReadBegins`, inside the load's already-registered route, so its
  *  own adopt could not pay it (`paySceneFileDebt` pays only debts raised before the route registered): the stale stack
  *  survived the load, and the NEXT adopt of the scene dropped whatever was recorded over the new bytes. Measured by the
  *  reviewer with this seam; pinned here.
  *
  *  Mutations, each measured red here and restored: `freshIncoming` not passed for a covered change → "ends the stack";
- *  the debt raised again from `sceneFileLoadBegins` → "leaves no debt" (both cases); `sceneFileLoaded` dropping every
+ *  the debt raised again from `outsideFileReadBegins` → "leaves no debt" (both cases); `outsideFileReadLanded` dropping every
  *  entry of the file rather than the covered holds → "only in its local batch". */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, getCurrentWorld, sceneManager } from '@modoki/engine/runtime';
 import { pushAction, canUndo, undoLabel, markSceneSaved } from '@modoki/engine/editor';
 import { swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
-import { loadScene, setSceneFileLoadObserver, setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
+import { loadScene, setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
+import { setFreshFileReadObserver } from '../../packages/modoki/src/editor/scene/freshFileRead';
 import { isWorldReplacementInFlight } from '../../packages/modoki/src/editor/scene/authoringSettle';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -38,7 +39,7 @@ beforeEach(() => {
   _resetHistoryContexts();
   bridge.enableOutsideChangeHold(true);
   bridge.setSceneAdoptionHooks({ capture: captureAdoption, settled: () => adoptionsSettled() === null, sceneFileChanged: recordSceneFileChanged });
-  setSceneFileLoadObserver({ begins: bridge.sceneFileLoadBegins, loaded: bridge.sceneFileLoaded });
+  setFreshFileReadObserver({ begins: bridge.outsideFileReadBegins, loaded: bridge.outsideFileReadLanded });
   setCurrentScenePath(SCENE);
   swapHistory(SCENE);
   pushAction({ label: 'Delete Entity', undo: noop, redo: noop });
@@ -46,7 +47,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setSceneFileLoadObserver(null);
+  setFreshFileReadObserver(null);
   bridge.setSceneAdoptionHooks(null);
   bridge.setSceneReloadSuppressor(null);
   bridge.setSceneConflictResolver(null);
@@ -106,9 +107,9 @@ describe('a load that applies a held scene change ends the stack recorded over t
     let begun!: () => void;
     const begunP = new Promise<void>((r) => { begun = r; });
     const covered: (readonly number[])[] = [];
-    setSceneFileLoadObserver({
-      begins: (p) => { const c = bridge.sceneFileLoadBegins(p); covered.push(c); begun(); return c; },
-      loaded: bridge.sceneFileLoaded,
+    setFreshFileReadObserver({
+      begins: (p) => { const c = bridge.outsideFileReadBegins(p); covered.push(c); begun(); return c; },
+      loaded: bridge.outsideFileReadLanded,
     });
     let loadP: Promise<unknown> | undefined;
     // Stands in for any await while the release handles the earlier change (a clean reload's fetch, a parked write's drop).

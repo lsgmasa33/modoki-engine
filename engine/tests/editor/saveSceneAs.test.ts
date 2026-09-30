@@ -15,7 +15,8 @@ import {
 } from '@modoki/engine/editor';
 import { classifyExplicitSceneSave } from '../../packages/modoki/src/editor/scene/sceneFileName';
 import { markSceneDirty, clearAllSceneDirty, isSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
-import { swapHistory, forgetHistory, undoDepth, pushAction } from '../../packages/modoki/src/editor/undo/undoManager';
+import { swapHistory, forgetHistory, undoDepth, pushAction, undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
+import { setRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import { sceneManager, type LoadedSceneEntry } from '@modoki/engine/runtime';
 import { noteAuthoredWriteWhileStopped, clearAuthoredWritesWhileStopped } from '../../packages/modoki/src/runtime/core/ecs/authoredWrites';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -181,6 +182,21 @@ describe('saveScene — Save As, the review findings (#1414 close-out)', () => {
     expect(r.savedAs?.note).toMatch(/edit landed/);
   });
 
+  // #1904 close-out, fifth review (reproduced): a push dropped during a file-direct step moves the world with NO version
+  // bump, so the version check alone let the reopen discard that edit. Mutation: drop `worldStateToken() !==
+  // savedAt.state` from the stay check — the copy is reopened.
+  it('a push dropped during a file-direct step in the copy write keeps the editor on the original', async () => {
+    pushAction({ label: 'asset edit', undo: () => { pushAction({ label: 'scene edit, dropped', undo: () => {}, redo: () => {} }); }, redo: () => {}, _isFileDirect: true });
+    let step: Promise<unknown> = Promise.resolve();
+    duringSaveAs = () => { step = undoStep('undo'); };
+    const answer = saveAsAnswer;
+    saveAsAnswer = () => ({ ok: true, status: 200, json: async () => { await step; return answer().json(); } }) as unknown as Response;
+    const r = await saveScene({ path: COPY_PATH, allowDialog: false });
+    expect(hasUnsavedChanges(), 'precondition: the dropped edit is unsaved').toBe(true);
+    expect(reopenFetches()).toHaveLength(0);
+    expect(r.savedAs).toMatchObject({ reopened: false });
+  });
+
   describe('with a dirty BASE loaded under the open scene', () => {
     const BASE_PATH = '/assets/scenes/Base.scene.json';
     const BASE_ID = '00000034-0000-4000-8000-000000000034';
@@ -221,6 +237,19 @@ describe('saveScene — Save As, the review findings (#1414 close-out)', () => {
       const r = await saveAll({ path: COPY_PATH, allowDialog: false });
       expect(calls.filter((c) => c.url.includes('/api/write-file') && c.body.path === BASE_PATH)).toHaveLength(2);
       expect(r.extraSaved).toEqual([{ path: BASE_PATH, guid: BASE_ID }]);
+    });
+
+    // #1904 close-out, fifth review: Play can start during the primary's write, and the base loop then serialized the
+    // RUNTIME world into the base file. Mutation: drop the per-base `whyWorldNotAuthored()` check — the base is written.
+    it('Play starting during the primary write: the base is refused, not written, and stays dirty', async () => {
+      writeFileOk = (pth) => { if (pth === OPEN_PATH) setRunMode('playing'); return true; };
+      try {
+        const r = await saveAll({ allowDialog: false });
+        expect(calls.filter((c) => c.url.includes('/api/write-file') && c.body.path === OPEN_PATH), 'precondition: the primary was written').toHaveLength(1);
+        expect(calls.filter((c) => c.url.includes('/api/write-file') && c.body.path === BASE_PATH)).toHaveLength(0);
+        expect(r.failed?.[0]?.path).toBe(BASE_PATH);
+        expect(isSceneDirty(BASE_ID)).toBe(true);
+      } finally { setRunMode('stopped'); }
     });
 
     it('a base that fails to write means NO copy, and the failure is reported', async () => {

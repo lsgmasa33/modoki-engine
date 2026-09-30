@@ -2641,7 +2641,7 @@ Every editor route shares ONE adopt rule, the adoption owner's history write (`s
   edit, and the unsaved-work guard stopped asking. The edit stayed on screen, flagged clean.
 - **The stack drops when work was discarded**: a world edit since the last save, or a dirty base
   that was NOT kept. (It also drops on leaving prefab edit, U27, and when a scene file changed
-  on disk, #1744: both below.) ⚠️ The edit version is one global counter and a base edit bumps it too, so
+  on disk, #1744: both below.) ⚠️ The primary's state token is one global token and a base edit moves it too, so
   it cannot tell a primary edit from a base edit. In the common case a kept base's edit still
   drops the stack: the edit stays saveable, not undoable. That is the lesser loss next to a stack
   replaying discarded primary work, and filtering one mixed stack by scene would need per-entry
@@ -2765,9 +2765,60 @@ Where it applies:
   then read as unsaved. (It also dropped the prefab world's stack on leave, which since #1704 happens
   anyway.)
 
-"Dirty" over-reports, deliberately: undo and redo bump the edit version, so a scene undone back to
-its saved state still reads dirty and its history is dropped rather than parked. That loses
-history, never correctness. Not covered: a scene FILE that changes on disk while its CLEAN stack is
+"Dirty" means **not at the saved state** (#1904), compared by world-state token, not by the edit
+version. Each undo entry records the token the world was at before it and the one it leaves
+(`undo/stateToken.ts`, `undoManager.ts` `recordForward`); a whole undo or redo puts that token back
+(`landOn`), and a save records the token it serialized (`markSceneSaved(captureSavePoint())`). So a
+scene undone back to what its file holds reads clean and its history parks, as Unity clears the dirty
+mark (issue tracker 6559); undoing past a save partway down the stack, or redoing past it, reads
+dirty. Base scenes use the same tokens per guid (`sceneDirty.ts`), and Save All records each base's
+token before its awaits, so an edit landing during the write stays unsaved.
+- **A step that did not apply whole invalidates the chain.** One that threw partway (#310) or
+  reported a shortfall (#1823) leaves the world at a state no token names, and a REFUSED one drops
+  its entry with its edit still applied; either way every token on the live stacks is re-minted
+  (`forgetRecordedStates`), so nothing can land on "saved" until the next save or load. So does a
+  forward scene edit pushed and DROPPED during a step's await (#1833: applied, no entry) — at the
+  drop itself, for the world and the push's scenes, whatever kind the step is — and the step window
+  counts it, so the step in flight does not land "saved" over it either.
+- **A load, a new scene or a restore mints a fresh token** (`markSceneSaved()` with no point;
+  `clearSceneDirtyExcept` starts a new per-scene epoch). A stack that comes back with the world —
+  parked, or kept across a reload of a changed file — therefore never reads clean against the
+  reloaded file; it can over-report there, never under-report. A KEPT base (#1417) is not reloaded
+  but is re-minted too — clean stays clean, dirty stays dirty until saved — because its old tokens
+  belong to stacks that are parked now, and another scene sharing the base may have moved it: a
+  returning stack once undid/redid such a base onto "saved" over the other scene's unwritten edit,
+  and Save All skipped it (close-out review, reproduced). Not at Stop: its restore keeps the same
+  stack (cut to Play's barrier), so it puts the world's token and every scene's tokens back as they
+  were at the press (`captureWorldDirtyBaseline` → `restoreSceneTokens`), and an undo or redo onto
+  the saved state still reads clean after Stop, for a scene clean at the press as much as a dirty
+  one. A snapshot that may lack an edit made during its own awaits restores to no known state:
+  unsaved until the next save.
+- **A save during an undo/redo step records a state nothing reaches** (`captureSavePoint`,
+  `captureSceneSavePoint`): the step's closure has changed the world but its token moves only when
+  the step lands, so the bytes match no token. Stays unsaved until the next save (close-out third
+  review: a save during an Apply undo's rebase, then a redo, read clean over a file without the
+  change). The capture sees only a step already RUNNING, so once the serialize's last await is
+  behind it the save settles its point (`settleSavePoint`, `settleSceneSavePoint`): an edit, a step
+  that started, or a dropped push landing in the prefab fetches may be in the bytes, and the point
+  then names no state either (fourth review, reproduced through `saveScene`).
+- **Stop never forces "saved".** A save since the press (Play's startup window allows one) wrote a
+  world Stop then reverts, so that branch mints a fresh world token and forgets every scene's saved
+  state; a save of exactly the press's version keeps the state it recorded itself, because a push
+  dropped during a file-direct step moves the token with no version bump (fourth review). Play's
+  press also ends the coalescing chain (`markPlayBarrier`): a Play-time edit with the same key
+  merged into the pre-Play top entry, which survives Stop's cut carrying the Play value. A scene
+  whose saved token CHANGED since the press was saved in the startup window — Save All's base loop
+  writes after the primary, so a base can be saved there even when the primary was not — and reads
+  unsaved after Stop (`restoreSceneTokens`; fifth review, reproduced). The same review moved two
+  neighbours: Save As stays on the original when the world TOKEN moved since the copy was
+  serialized, not only the version, and the base loop re-asks `whyWorldNotAuthored` before each
+  base, because Play can start during the previous awaited write.
+- **`getEditVersion()` still counts every change**, undo and redo included. Its other readers ask
+  "did anything happen since" — a drop's witness, Play's snapshot completeness, the Apply dialog's
+  re-plan key, the timeline preview's authored-edit check — and edit-then-undo is something
+  happening.
+
+Not covered: a scene FILE that changes on disk while its CLEAN stack is
 parked under a scene that is not open (a git checkout, an agent `write_asset`). The OPEN scene's
 file is covered: its hot reload drops the stack (#1744).
 

@@ -17,8 +17,7 @@ import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../
 import { spriteThumbStyle } from './SpritePicker';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
-import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { classifyAssetDocFetchFailure, readAssetDocFresh } from './assetDocLoad';
 import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
@@ -136,8 +135,7 @@ export default function SpriteAnimEditor() {
       setParkAdopted(true);
       return;
     }
-    fetch(asset.path)
-      .then((r) => parseAssetJson(r, asset.path))
+    readAssetDocFresh(asset.path)
       .then((json) => {
         if (cancelled) return;
         const loaded = normalizeSpriteAnim(json as Parameters<typeof normalizeSpriteAnim>[0]);

@@ -6,6 +6,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { pushAction, clearHistory, hasUnsavedChanges } from '@modoki/engine/editor';
 import { captureWorldDirtyBaseline, restoreWorldDirtyBaseline, markSceneSaved } from '../../packages/modoki/src/editor/scene/serialize';
+import { captureSavePoint } from '../../packages/modoki/src/editor/undo/undoManager';
 import { markSceneDirty, isSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -19,7 +20,7 @@ const edit = () => pushAction({ label: 'edit', undo: () => {}, redo: () => {} })
 beforeEach(() => { clearHistory(); markSceneSaved(); clearAllSceneDirty(); });
 
 describe('restoreWorldDirtyBaseline', () => {
-  // Mutation: drop `clearSceneDirtyExcept(baseline.scenes)` — the base marked during Play stays dirty.
+  // Mutation: drop `restoreSceneTokens(baseline.scenes, …)` — the base marked during Play stays dirty.
   it('a base scene dirtied during Play is clean again; one dirty at the press stays dirty', () => {
     markSceneDirty(BEFORE);
     const baseline = captureWorldDirtyBaseline();
@@ -61,7 +62,7 @@ describe('restoreWorldDirtyBaseline', () => {
   it('a save of exactly the capture\'s version, landing after the press, still clears', () => {
     edit();                                            // unsaved at the press
     const baseline = captureWorldDirtyBaseline();
-    markSceneSaved(baseline.editVersion);              // its write lands now, stamped with the version it serialized
+    markSceneSaved(captureSavePoint());                // its write lands now, stamped with what it serialized at the press
     edit();                                            // a Play-time edit
     restoreWorldDirtyBaseline(baseline);
     expect(hasUnsavedChanges()).toBe(false);
@@ -73,16 +74,17 @@ describe('restoreWorldDirtyBaseline', () => {
   it('an edit during the snapshot\'s awaits: a save of the capture\'s version clears nothing', () => {
     const atSnapshotStart = (captureWorldDirtyBaseline()).editVersion;
     edit();                                            // lands while the snapshot is being taken
+    const afterEdit = captureSavePoint();
     const baseline = captureWorldDirtyBaseline(atSnapshotStart);
-    markSceneSaved(atSnapshotStart + 1);              // a save of the capture's version (the one after the edit)
+    markSceneSaved(afterEdit);                         // a save of the capture's version (the one after the edit)
     edit();
     restoreWorldDirtyBaseline(baseline);
     expect(hasUnsavedChanges()).toBe(true);
   });
 
   // The same holds for "clean at the press": an edit during the snapshot's awaits, saved before the capture, makes the
-  // primary read clean at capture — but the snapshot may lack the edit disk holds. Mutation: compute primaryClean
-  // without `snapshotComplete` — Stop marks the reverted world clean.
+  // primary read clean at capture — but the snapshot may lack the edit disk holds. Mutation: restore the press's token
+  // for an incomplete snapshot too (drop the `beginFreshWorldState()` branch) — Stop marks the reverted world clean.
   it('an edit and its save during the snapshot\'s awaits: the restore leaves the scene unsaved', () => {
     const atSnapshotStart = captureWorldDirtyBaseline().editVersion;
     edit();                                            // lands during the snapshot's awaits

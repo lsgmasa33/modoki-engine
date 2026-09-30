@@ -59,12 +59,25 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   tool's earlier call saw instead of reading as "nothing pending". A
   file-direct route notes its own path at once (`notePendingOutsideWrite`), so its OWN answer lists it before the
   watcher's debounce raises it; a note the renderer never confirms expires after 3 s. There is NO implicit flush on any
-  other call: a reload is always a deliberate act. The one thing that clears an entry without a release is a load that
-  READ the file (next bullet).
-- **A scene load applies its own file's held change (#1899).** `load_scene`, the menu or the Assets panel re-reads the
-  scene from disk, so it shows the outside change a hold, a deferral or an open *Reload / Keep mine* question still
-  lists. `serialize.ts`'s load tells the bridge before its read (`sceneFileLoadBegins`, which names the holds listed
-  for the file at that instant by their `heldSeq`) and after its adopt (`sceneFileLoaded`), which drops exactly those.
+  other call: a reload is always a deliberate act. The one thing that clears an entry without a release is an operation
+  that READ the file fresh (next bullet).
+- **A fresh read of a file applies its held change (#1899 for scene loads, #1902 for the rest).** `load_scene`, the menu
+  or the Assets panel re-reads the scene from disk, so it shows the outside change a hold, a deferral or an open
+  *Reload / Keep mine* question still lists. Every such reader takes ONE entry point, `beginFreshFileRead(path)`
+  (`editor/scene/freshFileRead.ts`), before its read, and calls the ticket's `landed()` once the read is applied; the
+  app installs the bridge behind it (`outsideFileReadBegins`, which names the holds listed for the file at that instant
+  by their `heldSeq`, and `outsideFileReadLanded`, which drops exactly those). The readers: a scene load (after its
+  adopt); **prefab edit-open** (once the session opens — not at the cache seed, since an open cancelled after it leaves
+  the scene world, whose instances only the release rebases; a parked prefab opens from its park and takes no ticket);
+  the **re-import after a parked prefab is discarded** (`discard-asset-edits`, `resolve-unsaved {dirtyAsset}` — landed
+  per path the re-import actually read, so one it could not read stays held); and the **asset editors' open and Retry**
+  (Particle, Animation, Timeline, SpriteAnim, Skin, all through `panels/assetDocLoad.ts` `readAssetDocFresh`; a failed
+  parse applies nothing). For an asset document the bridge also runs the release's other half — drops the runtime
+  cache and wakes every surface — but never `dropParkedWriteFor`, and the ticket ends the file's `heldOutside` note.
+  That is the case that lost work: the panel opened on the NEW bytes while the change was held, a park made there
+  started conflicted (Save asked Overwrite/Cancel over the change the user was looking at), and the release then
+  DISCARDED the park as stale. The open applying the change is Unity's answer too (an asset editor shows the imported
+  asset); honouring the hold instead was never possible, since the file already holds the new bytes.
   Not every hold of the file: one held while the load was in flight may postdate the bytes it read, and one a release
   has taken into its local batch is in no list when the load begins — both replay and reload as usual. (A sequence-mark
   bound dropped the second too, although the load had not started its history fresh for it, and the stale stack
@@ -76,8 +89,9 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   mine would have kept — a scene file has no supersede tracking on either path. ⚠️ Not as the owner's debt (`recordSceneFileChanged`): raised inside the load's route,
   which registered first, its own adopt could not pay it, and the NEXT adopt of the scene dropped a stack recorded
   over the new bytes (close-out review F1, measured at the real seam). A load of the scene does NOT apply a held
-  PREFAB or asset change it uses — it takes those from caches — and prefab edit-open and the asset editors, which do
-  read their file fresh, still leave the entry listed: #1902.
+  PREFAB or asset change it uses — it takes those from caches, which only their own refresh brings up to date. Nor does
+  a plain cache fill (`getPrefabSource` on a miss): it rebases no live instance, so dropping the hold there would leave
+  the scene's instances on the old document.
 - **A scene with unsaved edits is ASKED about** (owner ruling 2026-09-30, amends #1164 for the dirty case): see the
   scene-reload paragraph below and [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
 

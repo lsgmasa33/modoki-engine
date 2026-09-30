@@ -33,7 +33,7 @@
  *  - the watcher installed with the plain refresh (`setPrefabSourceRefresher(refreshPrefabSourceForPath)`) → the wiring case;
  *  - the agent `edit-open` keyed by the typed spelling → its case-variant case. */
 
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
 
@@ -119,7 +119,7 @@ import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBac
 import { undo, redo, canUndo, canRedo, undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { runAgentOp } from '../../app/debug/agentBridge';
+import { runAgentOp, holdOutsideChange, heldOutsideChanges, enableOutsideChangeHold, _resetOutsideChangesForTests } from '../../app/debug/agentBridge';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 
 registerAllTraits();
@@ -508,5 +508,33 @@ describe('an Instantiate\'s redo after an Assets Rename or delete (#1868)', () =
     expect(r.refused ?? r.failed?.error ?? '').toMatch(/holds another prefab now|was deleted/);
     expect(named('OR')).toHaveLength(0);
     expect(named('XR')).toHaveLength(0);
+  });
+});
+
+describe("prefab edit-open reads the file, which applies its held outside change (#1902)", () => {
+  afterEach(() => { _resetOutsideChangesForTests(); useEditorStore.setState({ editingPrefab: null } as never); });
+
+  // Left held, `pendingOutsideChanges` named a prefab the edit world already shows, and the release re-imported it.
+  // Mutation: drop `fileRead?.landed()` in `openPrefabForEditingSwitching` — the change stays held.
+  it('an open that lands drops the hold', async () => {
+    enableOutsideChangeHold(true);
+    holdOutsideChange({ urlPath: W_PATH, kind: 'prefab' });
+    expect(heldOutsideChanges(), 'precondition: held').toEqual([W_PATH]);
+    const res = await quietly(() => openPrefabForEditing({ path: W_PATH, name: 'W' }));
+    expect(res).toBeUndefined();
+    expect(useEditorStore.getState().editingPrefab, 'precondition: the session opened').toBeTruthy();
+    expect(heldOutsideChanges()).toEqual([]);
+  });
+
+  // The accept side: an open that never landed left the scene world, whose instances only the release rebases.
+  // Mutation: call `landed()` right after the fetch — the superseded open drops the hold.
+  it('an open superseded after its read leaves the change held', async () => {
+    enableOutsideChangeHold(true);
+    holdOutsideChange({ urlPath: W_PATH, kind: 'prefab' });
+    const { pending } = await holdReadOf(W_PATH, () => quietly(() => openPrefabForEditing({ path: W_PATH, name: 'W' })));
+    beginWorldRequest(); // a newer scene request, made while this one read
+    heldRead!.release();
+    expect(await pending).toBeUndefined();
+    expect(heldOutsideChanges()).toEqual([W_PATH]);
   });
 });

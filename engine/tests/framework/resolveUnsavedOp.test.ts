@@ -53,7 +53,8 @@ import {
 import {
   setCurrentScenePath, markSceneSaved, unsavedChangeCauses,
 } from '../../packages/modoki/src/editor/scene/serialize';
-import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { getEditVersion, captureSavePoint } from '../../packages/modoki/src/editor/undo/undoManager';
+import { UNREACHABLE_STATE } from '../../packages/modoki/src/editor/undo/stateToken';
 
 /** Park the way a PANEL does — on a document THIS path's own read handed back (#890/#891).
  *
@@ -107,7 +108,7 @@ const reset = () => {
   // The sixth thing to reset: the primary-scene term is MODULE state in serialize.ts, not a
   // registry with a clear function. Left dirty it leaks into every later case as a `liveScene` row
   // nobody set — which reads as the very false-positive these cases exist to distinguish from.
-  setCurrentScenePath(null); markSceneSaved(getEditVersion());
+  setCurrentScenePath(null); markSceneSaved(captureSavePoint());
 };
 beforeEach(reset);
 afterEach(reset);
@@ -134,7 +135,7 @@ describe('resolve-unsaved — the probe', () => {
     markBaseSceneEdit('/lvl.scene.json', '/base.scene.json');                // pendingBaseScene
     markSceneDirty('scene-guid-1');                                          // liveScene (a BASE)
     setCurrentScenePath(OPEN_SCENE);                                         // liveScene (PRIMARY)
-    markSceneSaved(getEditVersion() - 1);
+    markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
 
     const r = await resolve({});   // global mode — no `paths`
 
@@ -163,7 +164,7 @@ describe('resolve-unsaved — the probe', () => {
   describe('a dirty live world with no scene path', () => {
     it('CONTROL — with a path, the primary scene is reported', async () => {
       setCurrentScenePath(OPEN_SCENE);
-      markSceneSaved(getEditVersion() - 1);
+      markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
       expect(unsavedChangeCauses().sceneDirty, 'the tracker is dirty').toBe(true);
 
       const r = await resolve({});
@@ -172,7 +173,7 @@ describe('resolve-unsaved — the probe', () => {
 
     it('reports the world under a MARKER rather than reporting nothing', async () => {
       setCurrentScenePath(null);
-      markSceneSaved(getEditVersion() - 1);
+      markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
       expect(unsavedChangeCauses().sceneDirty, 'same dirty tracker, no path').toBe(true);
 
       const r = await resolve({});
@@ -189,7 +190,7 @@ describe('resolve-unsaved — the probe', () => {
       // The accept side. A fix that emitted the marker whenever the path was missing would pass
       // the case above and report unsaved work on every headless call for the rest of time.
       setCurrentScenePath(null);
-      markSceneSaved(getEditVersion());
+      markSceneSaved(captureSavePoint());
       expect(unsavedChangeCauses().sceneDirty).toBe(false);
 
       expect(pathsIn(await resolve({}), 'liveScene')).toEqual([]);
@@ -198,7 +199,7 @@ describe('resolve-unsaved — the probe', () => {
     it('a path-scoped ask does NOT match the marker', async () => {
       // A marker is not a file, so a route asking about its own path must not be refused by it.
       setCurrentScenePath(null);
-      markSceneSaved(getEditVersion() - 1);
+      markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
 
       expect(pathsIn(await resolve({ paths: [OPEN_SCENE] }), 'liveScene')).toEqual([]);
     });

@@ -99,12 +99,17 @@ describe('editor asset-document loads are parsed through parseAssetJson, not res
     // matching" — and the regex is a lookbehind-plus-alternation that one edit could silently narrow.
     // Measured 2026-09-12: 18 sites in 15 files, 17 of them routed through parseAssetJson, 0
     // offending. Floored well under both, so only a broken matcher trips it, never ordinary churn.
+    // #1902 then folded every asset-document panel's read into ONE (`panels/assetDocLoad.ts` `readAssetDocFresh`: the
+    // five editors, then the Inspector's Material/Shader/AnimSet/multi-material views), which took nine routed sites out
+    // of the corpus by design — about 9 sites, 4 routed after it (the helper's own read is a site, not "routed": its
+    // `parseAssetJson` wraps the fetch rather than following it). The floors moved down with it rather than a panel read
+    // being kept inline to feed them.
     const { sites, routed } = scan();
     expect(sites, 'FETCH_PATH_CALL matches nothing — the rule below is green over zero inputs')
-      .toBeGreaterThanOrEqual(10);
+      .toBeGreaterThanOrEqual(6);
     expect(routed, 'no site routes through parseAssetJson — the LOOKAHEAD window or the helper name '
       + 'has changed, so every site would read as an offender or as unmatched')
-      .toBeGreaterThanOrEqual(8);
+      .toBeGreaterThanOrEqual(3);
   });
 
   /** ⚠️ **The corpus floors above cannot see `LOOKAHEAD` being WIDENED, and that direction disarms

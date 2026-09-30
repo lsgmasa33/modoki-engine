@@ -1789,7 +1789,9 @@ enter-play / revert-on-stop:
   `restoreWorldDirtyBaseline` puts the dirty state back as it was at the press: an undoable edit made in Play (the
   Inspector, an agent's `setTrait` or `set-traits`) dirtied the scene, and that mark used to survive Stop, so the
   editor read "unsaved" with nothing to undo or save (#1816 close-out review; Unity does not dirty a scene for Play
-  changes). It only clears — work unsaved at the press stays unsaved — and asset-shaped causes are untouched. A save
+  changes). It puts back the state tokens of the press (#1904; scene-loading.md § "Per-scene undo history"), so
+  work unsaved at the press stays unsaved and an undo onto the saved state still reads clean; asset-shaped causes are
+  untouched. A save
   made after the press (Play's startup awaits allow one) wrote a world the snapshot does not hold, so then it clears
   nothing: the restored world differs from disk, and dirty is the safe answer — unless that save wrote exactly the
   capture's edit version (serialized before the press, landed after it), which holds the snapshot itself — and only

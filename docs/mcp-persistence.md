@@ -1128,7 +1128,7 @@ The obvious list is the four modules under `editor/scene/` — `dirtyAssets`, `p
 
 `sceneDirty.ts` tracks **base scenes only** (its own header says so, and explains why: `saveAll`
 always attempts the primary anyway). The **primary** scene's unsaved live-world state is
-`getEditVersion() !== _savedAtEditVersion` — a bare, pathless boolean in `serialize.ts`, in no
+`worldStateToken() !== _savedWorldState` (#1904; it was an edit-version compare) — a bare, pathless boolean in `serialize.ts`, in no
 registry module at all.
 
 ⚠️ **A name collision is what hides it.** The *cause* called `sceneDirty` is the PRIMARY scene; the

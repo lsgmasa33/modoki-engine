@@ -4,6 +4,7 @@
  *  "Mixed"; a change writes to EVERY selected material as ONE coalesced undo entry
  *  (materials persist undoably, unlike textures/models). */
 
+import { readAssetDocFresh } from '../assetDocLoad';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { pushAction } from '../../undo/undoManager';
 import { captureAssetDocBaseline, runAssetDocStep, type AssetDocSide } from '../../undo/assetDocUndo';
@@ -14,7 +15,6 @@ import { persistAssetEdit, invalidateMaterialFile, useAssetViewRefreshers } from
 import { pendingAssetDoc } from '../pendingAssetDoc';
 import { ParamField } from './MaterialAssetView';
 import { mergeRecords } from '../assetMerge';
-import { parseAssetJson } from '../../../runtime/loaders/assetFetch';
 import { loadMaterialBatch, planBatchWrite, type MatMap, type UnreadableMaterial } from './materialBatchLoad';
 import { AssetLoadRefusedBanner, ParkAdoptedBanner } from '../AssetLoadRefusedBanner';
 
@@ -53,10 +53,11 @@ export function MaterialBatchView({ paths }: { paths: string[] }) {
       // path-change only — a live edit while mounted arrives through the per-path refresher below,
       // not through a re-run of this loop, so there is no mid-loop re-read to get wrong (#843).
       parked: (p) => pendingAssetDoc(p, 'material'),
-      // ⚠️ `parseAssetJson`, never a raw `r.json()` (#886). Vite answers an unknown path with
+      // ⚠️ Parsed by `parseAssetJson` (inside `readAssetDocFresh`), never a raw `r.json()` (#886). Vite answers an unknown path with
       // `200 index.html`, so a deleted/renamed material used to arrive as a `SyntaxError` on HTML
       // — indistinguishable from a corrupt file, and (before this) swallowed into `{}` either way.
-      fetchDoc: (p) => fetch(p).then((r) => parseAssetJson(r, p)),
+      // A fresh read of the file applies its held outside change (#1902): the batch parks edits on these bytes.
+      fetchDoc: (p) => readAssetDocFresh(p),
     });
     if (epoch !== loadEpoch.current) return; // a newer load won while this one was in flight
     setMats(next);

@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState } from '@modoki/engine/runtime';
 import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty } from '@modoki/engine/editor';
 import { getEditVersion, pushAction, undo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { UNREACHABLE_STATE } from '../../packages/modoki/src/editor/undo/stateToken';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -44,7 +45,7 @@ afterEach(() => {
 });
 
 /** An unsaved edit in the (prefab-edit) world: the edit version moves past its saved baseline. */
-const dirtyTheWorld = () => markSceneSaved(getEditVersion() - 1);
+const dirtyTheWorld = () => markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
 
 describe('prefab edit-exit and unsaved prefab-world edits (#1424)', () => {
   it('refuses with REQUIRES_SAVE and does NOT leave prefab-edit mode', async () => {

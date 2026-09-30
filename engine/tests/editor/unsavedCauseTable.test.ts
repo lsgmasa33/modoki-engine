@@ -23,6 +23,7 @@ import {
   type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
 } from '../../packages/modoki/src/editor/scene/serialize';
 import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { UNREACHABLE_STATE } from '../../packages/modoki/src/editor/undo/stateToken';
 import { markAssetDirty, clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { markSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markBaseSceneEdit, clearPendingBaseScenes } from '../../packages/modoki/src/editor/scene/pendingBaseScene';
@@ -40,7 +41,7 @@ const DRIVERS: Record<keyof UnsavedCauses, () => void> = {
   // The PRIMARY live world is dirty when the edit version has moved past its saved baseline.
   // Re-baselining one BEHIND the current version is the public-API way to say that, with no
   // world and no undo stack — `notifyEdited()` is module-private.
-  sceneDirty: () => markSceneSaved(getEditVersion() - 1),
+  sceneDirty: () => markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE }),
   dirtyAssetPaths: () => markAssetDirty('/assets/x.mat.json', 'material', { a: 1 }),
   dirtyScenes: () => markSceneDirty('guid-of-a-loaded-base'),
   pendingBaseScenes: () => markBaseSceneEdit('/assets/scenes/child.scene.json', 'base-guid'),

@@ -6,6 +6,7 @@
  *  the sibling `.wgsl`/`.glsl` files, not here (shown as a note). Edits persist to the file
  *  + undo via persistAssetEdit; they apply on the next scene load / material rebuild. */
 
+import { readAssetDocFresh } from '../assetDocLoad';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { pushAction } from '../../undo/undoManager';
 import { assetDocAction } from '../../undo/assetDocUndo';
@@ -14,7 +15,7 @@ import { BufferedTextInput, inputStyle } from '../fields';
 import { NumberField } from './widgets';
 import { persistAssetEdit, useAssetViewRefresher, invalidateShaderFile } from './persist';
 import { pendingAssetDoc } from '../pendingAssetDoc';
-import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
+import { isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { ParamField } from './MaterialAssetView';
 import { ShaderPreview } from '../ShaderPreview';
 
@@ -40,8 +41,7 @@ export function ShaderAssetView({ path }: { path: string }) {
     const parked = pendingAssetDoc(path, 'shader');
     if (parked) { setData(parked as Record<string, unknown>); return; }
     const ac = new AbortController();
-    fetch(path, { signal: ac.signal })
-      .then((r) => parseAssetJson(r, path))
+    readAssetDocFresh(path, { signal: ac.signal })
       .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
       .then((data) => setData(data as Record<string, unknown> | null))
       .catch((e) => { if (e.name !== 'AbortError') setData(null); });

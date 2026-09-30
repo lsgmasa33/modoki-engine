@@ -19,8 +19,7 @@ import { writeNewAssetDocument, newAssetRefusalText } from '../scene/createAsset
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
-import { classifyAssetDocFetchFailure } from './assetDocLoad';
+import { classifyAssetDocFetchFailure, readAssetDocFresh } from './assetDocLoad';
 import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { type Rig2DFile } from '../../runtime/loaders/rig2dCache';
 import { coerceRigBones, defaultRig2DFile } from '../../runtime/skinning/rig2dTypes';
@@ -342,8 +341,7 @@ export default function SkinEditor() {
       setParkAdopted(true);
       return;
     }
-    fetch(asset.path)
-      .then((r) => parseAssetJson(r, asset.path))
+    readAssetDocFresh(asset.path)
       .then((json) => {
         if (cancelled) return;
         const doc = json as Rig2DFile;

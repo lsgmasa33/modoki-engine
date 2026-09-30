@@ -27,6 +27,10 @@ export interface StepWindow {
   readonly direction: UndoDirection;
   readonly label: string;
   readonly shortfalls: StepShortfall[];
+  /** Forward scene edits whose push was DROPPED while this window was open (`pushAction`, #1833): applied to the world
+   *  with no undo entry. The step then cannot claim the world is at the state its entry recorded (#1904 close-out
+   *  review F2) — `runStep` treats it as a step that did not apply whole. */
+  droppedEdits: number;
 }
 
 let _open: StepWindow | null = null;
@@ -34,7 +38,7 @@ let _open: StepWindow | null = null;
 /** Open the window for a step. Steps never nest (`serialize`), so a window already open is a bug in the caller. */
 export function openStepWindow(direction: UndoDirection, label: string): StepWindow {
   if (_open) console.error(`[undo] a step window opened for "${label}" while "${_open.label}"'s was still open`);
-  _open = { direction, label, shortfalls: [] };
+  _open = { direction, label, shortfalls: [], droppedEdits: 0 };
   return _open;
 }
 

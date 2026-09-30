@@ -1,7 +1,8 @@
 /** Undo/Redo manager — command stack for all editor actions. */
 
 import { editorEmit, type EditorJournalType } from '../editorJournal';
-import { markSceneDirty } from '../scene/sceneDirty';
+import { sceneStateToken, setSceneStateToken } from '../scene/sceneDirty';
+import { mintStateToken, UNREACHABLE_STATE } from './stateToken';
 import { reportStepShortfall, reportUndoThrew, UndoRefusedError } from './undoFailure';
 import { _resetStepWindow, closeStepWindow, currentStepWindow, openStepWindow } from './stepWindow';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -102,10 +103,11 @@ export interface UndoAction {
    *  Phase 12, M2) — resolved by the CALLER before the mutation runs (a delete/reparent
    *  can destroy the entity or is otherwise unsafe to re-resolve after the fact, so the
    *  caller captures this once and both directions share it: undo and redo touch the
-   *  SAME entities, so the same scenes are dirtied either way). Marks every listed scene
-   *  dirty on push AND on undo/redo (mirrors `notifyEdited()`'s own unconditional bump on
-   *  all three) — skipped when `_isFileDirect` (that action's write is already on disk,
-   *  nothing pending). Omit for actions with no live-world entity effect (selection). */
+   *  SAME entities, so the same scenes move either way). Moves every listed scene's state
+   *  token on push AND on undo/redo (#1904: an undo puts the scene back at its token from
+   *  before, so undoing to the saved state reads clean) — skipped when `_isFileDirect` (that
+   *  action's write is already on disk, nothing pending). Omit for actions with no
+   *  live-world entity effect (selection). */
   affectedScenes?: string[];
   /** Consecutive actions sharing a non-null `coalesceKey`, pushed within
    *  COALESCE_MS of each other, merge into the existing top entry: its `redo`
@@ -449,10 +451,129 @@ export { subscribeUndoRedoStep } from './undoRedoStep';
 // unsaved live work — the case that used to report {ok:true, entityCount:12} while the
 // entity you just made was gone from the world, the file, AND the undo stack.
 //
-// Conservative by design: undo/redo bump it too, so undoing back to the on-disk state still
-// reads as dirty. A spurious "save or pass force" is a nuisance; the reverse is data loss.
+// It counts CHANGES: undo/redo bump it too, since its other readers ask "did anything happen since" (a drop's witness,
+// Play's snapshot completeness, the Apply dialog's re-plan key). Whether the world is back at its SAVED state is the
+// state token's question below (#1904) — this counter used to answer that too, and so an undo back to the on-disk
+// state still read dirty.
 let _editVersion = 0;
 function notifyEdited() { _editVersion++; }
+
+// ── Where the world is: state tokens (#1904) ──────────────────────────────────
+// Each edit mints a token for the state it leaves, recorded on its entry beside the token it started from; an undo
+// puts the `before` back and a redo the `after`, for the primary world and for every base scene the entry touched
+// (`scene/sceneDirty.ts`). A save records the token it wrote (`serialize.ts markSceneSaved`), so "dirty" is "not at
+// that token", and undoing every edit since the save reads clean — Unity clears a scene's dirty mark the same way
+// (issue tracker 6559). A save partway down the stack is handled by the same compare: undoing past it lands on a
+// token the save did not write.
+// ⚠️ A token is a CLAIM that the world is in that state. Only an entry whose step ran whole may move to its own
+// before/after; a step that threw partway (#310) or reported a shortfall (#1823) leaves the world somewhere no token
+// names, and `forgetRecordedStates` makes every recorded state unreachable — dirty until the next save or load.
+interface EntryStates {
+  before: number;
+  after: number;
+  /** Per base scene the entry touched: its token before the entry's FIRST push (a coalesced chain keeps the first). */
+  readonly scenesBefore: Map<string, number>;
+}
+const _entryStates = new WeakMap<UndoAction, EntryStates>();
+/** 0 is the boot world, which no minted token equals — and a constant, so `serialize.ts` can start from it without
+ *  calling in here at import (several suites mock this module with an explicit export list). */
+export const BOOT_WORLD_STATE = 0;
+let _worldState = BOOT_WORLD_STATE;
+/** The state token the primary world is at now. A save reads it together with the edit version it serializes. */
+export function worldStateToken(): number { return _worldState; }
+/** What a save wrote, read in ONE synchronous moment before its await: the edit version (for "did an edit land during
+ *  the write") and the state token (for "is the world at what the file holds"). */
+export interface SavePoint { readonly version: number; readonly state: number }
+/** ⚠️ An undo/redo step in flight has changed (or is about to change) the world with its token still the one before it
+ *  — `landOn` moves the token only once the step resolves. A save in that window serialized a state no token names, so
+ *  it records one nothing reaches: the scene stays unsaved until the next save (#1904 close-out, third review: a save
+ *  during an Apply undo's rebase paired the pre-step token with the post-step bytes, and a redo then read clean over a
+ *  file without it). */
+export function captureSavePoint(): SavePoint {
+  return { version: _editVersion, state: _stepsPending > 0 ? UNREACHABLE_STATE : _worldState };
+}
+/** The same for base scene `guid`, whose bytes Save All writes after the primary's. */
+export function captureSceneSavePoint(guid: string): SavePoint {
+  return { version: _editVersion, state: _stepsPending > 0 ? UNREACHABLE_STATE : sceneStateToken(guid) };
+}
+/** Call once the serialize's LAST await is behind it — the bytes are fixed then. The capture sees only a step already
+ *  running: an edit, a step that STARTED after it, or a dropped push landing in the serialize's awaits (prefab sources,
+ *  nested preloads) may or may not be in the bytes, so the point then names no reachable state (#1904 close-out, fourth
+ *  review: an undo during a prefab fetch wrote the undone bytes under the pre-undo token, and the redo read clean). */
+export function settleSavePoint(at: SavePoint): SavePoint {
+  return worldMovedSince(at, _worldState) ? { version: at.version, state: UNREACHABLE_STATE } : at;
+}
+/** The same for base scene `guid`: the token Save All clears it at. */
+export function settleSceneSavePoint(guid: string, at: SavePoint): number {
+  return worldMovedSince(at, sceneStateToken(guid)) ? UNREACHABLE_STATE : at.state;
+}
+function worldMovedSince(at: SavePoint, stateNow: number): boolean {
+  return _stepsPending > 0 || _editVersion !== at.version || stateNow !== at.state;
+}
+/** Play's undo barrier: the depth Stop cuts back to. It also ends the coalescing chain, or a Play-time edit with the
+ *  same key merged into the pre-Play top entry, which survives the cut carrying the Play value — a later redo then wrote
+ *  it into the authored world (#1904 close-out, fourth review). */
+export function markPlayBarrier(): number {
+  _coalesce = null;
+  return undoStack.length;
+}
+/** Stop's restore: the reverted world is back at the state it was in at the Play press, token and all (#1904). */
+export function restoreWorldStateToken(token: number): void { _worldState = token; }
+/** The world was just replaced wholesale (a load, a new scene, a restore): it is at a state no entry recorded. */
+export function beginFreshWorldState(): number {
+  _worldState = mintStateToken();
+  return _worldState;
+}
+/** A forward edit: `entry` (just pushed, or the top a coalesced edit merged into) now leaves a new state. */
+function recordForward(entry: UndoAction, scenes: readonly string[]) {
+  const after = mintStateToken();
+  let states = _entryStates.get(entry);
+  if (!states) {
+    states = { before: _worldState, after, scenesBefore: new Map() };
+    _entryStates.set(entry, states);
+  }
+  states.after = after;
+  _worldState = after;
+  for (const guid of scenes) {
+    if (!guid) continue;
+    if (!states.scenesBefore.has(guid)) states.scenesBefore.set(guid, sceneStateToken(guid));
+    setSceneStateToken(guid, after);
+  }
+}
+/** A whole undo or redo of `entry`: the world and its scenes are back at the state the entry recorded. */
+function landOn(entry: UndoAction, direction: 'Undo' | 'Redo'): boolean {
+  const states = _entryStates.get(entry);
+  if (!states) return false;
+  _worldState = direction === 'Undo' ? states.before : states.after;
+  for (const [guid, before] of states.scenesBefore) setSceneStateToken(guid, direction === 'Undo' ? before : states.after);
+  return true;
+}
+/** The live stacks no longer describe the world: every token recorded on them is re-minted, so no later undo or redo
+ *  can land on one a save recorded. `moved`: the step also changed the world partway (a throw, a shortfall), so the
+ *  world and the step's scenes move to fresh tokens too. A REFUSED step moved nothing, but its entry is dropped with its
+ *  edit still applied, so the entries beneath it would otherwise land on states that no longer have that edit. Parked
+ *  stacks keep theirs: they belong to worlds this step never touched — a return to one reloads the primary and the
+ *  bases it does not keep from disk, and re-mints the bases it keeps (`sceneDirty.ts` `clearSceneDirtyExcept`). */
+function forgetRecordedStates(entry: UndoAction, moved: boolean) {
+  const fresh = new Map<number, number>();
+  const remap = (t: number) => {
+    let n = fresh.get(t);
+    if (n === undefined) { n = mintStateToken(); fresh.set(t, n); }
+    return n;
+  };
+  for (const a of [...undoStack, ...redoStack]) {
+    const states = _entryStates.get(a);
+    if (!states) continue;
+    states.before = remap(states.before);
+    states.after = remap(states.after);
+    for (const [guid, t] of states.scenesBefore) states.scenesBefore.set(guid, remap(t));
+  }
+  if (!moved) return;
+  _worldState = mintStateToken();
+  const scenes = new Set(entry.affectedScenes ?? []);
+  for (const guid of _entryStates.get(entry)?.scenesBefore.keys() ?? []) scenes.add(guid);
+  for (const guid of scenes) setSceneStateToken(guid, mintStateToken());
+}
 /** An entry that leaves the SCENE FILE as it was (#1857, #1858): a selection, or any file-direct edit — a rebase of the
  *  live frames onto a changed prefab included, since the scene file holds the instance and its overrides, not the
  *  prefab's rows. What the edit version and the scene dirty marks ask. */
@@ -464,13 +585,6 @@ function leavesSceneFile(action: UndoAction): boolean {
  *  landed on. */
 function worldFree(action: UndoAction): boolean {
   return !!action._isSelection || (!!action._isFileDirect && !action._rebasesLiveFrames);
-}
-/** Mark every scene an action's entities belong to as dirty (Phase 12, M2) — the same
- *  skip condition as `notifyEdited()` (a selection or file-direct action has no
- *  live-world edit to attribute to a scene). */
-function markAffectedScenesDirty(action: UndoAction) {
-  if (leavesSceneFile(action)) return;
-  for (const guid of action.affectedScenes ?? []) markSceneDirty(guid);
 }
 /** Monotonic count of non-selection edits. Compare against a snapshot to detect unsaved work. */
 export function getEditVersion(): number { return _editVersion; }
@@ -594,14 +708,23 @@ export function endActionCapture(frame: UndoAction[]): UndoAction[] {
 export function pushAction(action: UndoAction) {
   // Dropped inside a step's window (a closure's own push must not clear the redo stack it is about to land on). ⚠️ The
   // window is time, so a HUMAN forward edit made while a step awaits is dropped too (#1833); an AGENT one is refused
-  // before it applies (#1832, `agentStepGate` in agentEditorOps.ts).
-  if (currentStepWindow()) return;
+  // before it applies (#1832, `agentStepGate` in agentEditorOps.ts). When it edits the scene, the world now holds an edit
+  // no token names and no undo can take back: every recorded state is forgotten HERE — the world and the push's scenes
+  // move to fresh tokens — so no later step, whatever kind (file-direct, refused) or whichever scenes it touches, lands
+  // on "saved" over it; and the window counts it, so the step in flight does not land either (#1904 close-out reviews
+  // F2 and re-review 2). Before #1904 every step bumped the dirty counter, and this edit read unsaved by accident. A
+  // closure's own push would count too — none in production does (re-review Q1) — costing only a clean-on-undo.
+  const openWindow = currentStepWindow();
+  if (openWindow) {
+    if (!leavesSceneFile(action)) { openWindow.droppedEdits += 1; forgetRecordedStates(action, true); }
+    return;
+  }
   // Divert into the innermost open capture frame (see the block comment above).
   // BEFORE notifyEdited/coalesce/emit: a captured sub-action is not yet a committed
   // edit — the composite that wraps it does all three exactly once, for the batch.
   if (_captureStack.length > 0) { _captureStack[_captureStack.length - 1].push(action); return; }
-  if (!leavesSceneFile(action)) notifyEdited(); // a real edit → the world now differs from disk
-  markAffectedScenesDirty(action);
+  const edits = !leavesSceneFile(action);
+  if (edits) notifyEdited(); // a real edit → the world has changed
   // Coalesce consecutive same-key edits (opt-in via coalesceKey) into the top
   // entry instead of stacking one per keystroke.
   if (action.coalesceKey != null) {
@@ -615,6 +738,7 @@ export function pushAction(action: UndoAction) {
         && now - _coalesce.at <= COALESCE_MS) {
       top.redo = action.redo;     // advance to the latest value…
       top.label = action.label;   // …keep the ORIGINAL undo (pre-chain state)
+      if (edits) recordForward(top, action.affectedScenes ?? []); // …and a new state, leaving the chain's `before`
       // NOTE: we deliberately do NOT advance `top.detail` here. The `!edit` journal
       // event was already emitted (with a frozen snapshot) on the first push of this
       // chain, so it reports the value at FIRST commit. Mutating a shared detail to
@@ -636,6 +760,7 @@ export function pushAction(action: UndoAction) {
   }
   const preview = currentPreview();
   if (preview !== null) _pushedInPreview.set(action, preview);
+  if (edits) recordForward(action, action.affectedScenes ?? []);
   undoStack.push(action);
   redoStack.length = 0;
   if (undoStack.length > MAX_STACK_SIZE) {
@@ -732,8 +857,13 @@ async function runStep(
   // world read as unsaved over a change that never happened (an agent's load then refuses on "unsaved work"). A step
   // that threw any other way may have moved the world partway, so it keeps the conservative marks (#310).
   const refused = !ok && error instanceof UndoRefusedError;
-  if (!worldGone && !refused && !leavesSceneFile(action)) notifyEdited(); // the world moved relative to disk
-  if (!worldGone && !refused) markAffectedScenesDirty(action);
+  if (!worldGone && !refused && !leavesSceneFile(action)) {
+    notifyEdited(); // the world moved
+    // Whole → back at the state the entry recorded (#1904), which is how an undo reaches the saved state. Partway →
+    // nowhere any token names (#310, #1823).
+    if (!(ok && !shortfall && window.droppedEdits === 0 && landOn(action, direction))) forgetRecordedStates(action, true);
+  }
+  if (!worldGone && refused && !leavesSceneFile(action)) forgetRecordedStates(action, false);
   notifyUndoChanged();
   notifyUndoRedoStep(); // after the step's data moved: a field ending its edit reads the undone value (#1905)
   const payload = buildEditorPayload(action);

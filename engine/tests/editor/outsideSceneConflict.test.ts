@@ -42,19 +42,22 @@ import { boot, bridge, memoryStorage, flushWatcher, startRun, settle, piOf, type
 import { getAllEntities, getTraitByName, readTraitData, setRunMode } from '@modoki/engine/runtime';
 import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
-import { getCachedPrefabSync, preloadNestedPrefabsForSubtree } from '../../packages/modoki/src/editor/scene/prefabCache';
+import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { undoStep, beginWorldBoundOperation } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undoStep, beginWorldBoundOperation, pushAction, undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { saveAll, saveScene, loadSceneReporting, unsavedChangeCauses, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';
 import { owedSceneFileChanges } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { markAssetDirty, peekDirtyAsset, flushDirtyAssets, discardDirtyAssets, overwriteParkedAsset, CHANGED_OUTSIDE_BASELINE } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import {
   setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, pendingOutsideChanges, _setEditorFocusedForTests,
-  _resetOutsideChangesForTests, deferredOutsideChanges, onPendingOutsideChanges,
+  _resetOutsideChangesForTests, deferredOutsideChanges, onPendingOutsideChanges, runAgentOp,
 } from '../../app/debug/agentBridge';
 import { makeSceneConflictResolver } from '../../app/editor/outsideRefresh';
+import { readAssetDocFresh } from '../../packages/modoki/src/editor/panels/assetDocLoad';
+import { addDirtyListener } from '../../packages/modoki/src/runtime/core/renderDirty';
+import { setParticleEffect, getParticleEffect, normalizeParticleDef } from '../../packages/modoki/src/runtime/loaders/particleCache';
 
 const be = makeFuzzBackend();
 /** Called with every URL fetched, before it is served: a test can act in the middle of a release. */
@@ -406,6 +409,137 @@ describe('a parked asset under a held outside write (review F1)', () => {
     expect((peekDirtyAsset(path)?.data as { maxParticles: number } | undefined)?.maxParticles, 'the edit made after the save').toBe(7);
     expect(pendingOutsideChanges()).toEqual([]);
     discardDirtyAssets([path]);
+  });
+});
+
+describe('a save records the state it serialized, not the one after its awaits (#1904 close-out review F3)', () => {
+  // `serializeScene` reads the entity list, then awaits a prefab source that missed the cache; an entity created there is
+  // not in the bytes. Captured after the await, the save point included it and the scene read saved with the entity only
+  // in memory. Mutation: move `captureSavePoint()` back below `await serializeScene(...)` in `saveScene`.
+  it('an entity created during the serialize\'s prefab fetch keeps the scene unsaved', async () => {
+    const f = await startRun(be, async () => {}, 'f3-save-point');
+    for (const k of ['Q', 'P', 'O', 'H'] as const) { setPrefabCache(f.prefabs[k].guid, null); setPrefabCache(f.prefabs[k].path, null); }
+    let created = false;
+    onFetch.fn = (url) => {
+      if (created || !url.includes('.prefab.json')) return;
+      created = true;
+      const { specs } = emptySpecs(0);
+      createEntityWithUndo('Add', 0, specs.map((sp) => (sp.name === 'EntityAttributes' ? { ...sp, data: { ...sp.data, name: 'MidSave' } } : sp)), () => {});
+    };
+    try {
+      expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    } finally { onFetch.fn = null; }
+    expect(created, 'precondition: the serialize fetched a prefab source').toBe(true);
+    expect(JSON.stringify(JSON.parse(be.read(f.scenePath)!)).includes('MidSave'), 'precondition: the entity missed the bytes').toBe(false);
+    expect(hasUnsavedChanges()).toBe(true);
+  });
+});
+
+describe('a save settles its point once the serialize is done (#1904 close-out, fourth review, finding 2)', () => {
+  // An edit landing in the prefab fetch moves the world after the capture, and may be in the bytes: undoing it must not
+  // read saved against a file that might hold it. Mutation: drop the `settleSavePoint(savedAt)` line in `saveScene`.
+  it("an edit during the serialize's prefab fetch: undoing it still reads unsaved", async () => {
+    const f = await startRun(be, async () => {}, 'settle-save-point');
+    for (const k of ['Q', 'P', 'O', 'H'] as const) { setPrefabCache(f.prefabs[k].guid, null); setPrefabCache(f.prefabs[k].path, null); }
+    let pushed = false;
+    onFetch.fn = (url) => {
+      if (pushed || !url.includes('.prefab.json')) return;
+      pushed = true;
+      pushAction({ label: 'mid-save edit', undo: () => {}, redo: () => {} });
+    };
+    try {
+      expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    } finally { onFetch.fn = null; }
+    expect(pushed, 'precondition: the serialize fetched a prefab source').toBe(true);
+    await undo();
+    expect(hasUnsavedChanges()).toBe(true);
+  });
+});
+
+describe("an asset editor's read of the file applies its held change (#1902)", () => {
+  const particle = (maxParticles: number) => ({ id: 'eeeeeeee-0000-4000-8000-000000001902', version: 1, maxParticles });
+  const heldParticle = async (key: string) => {
+    const f = await startRun(be, async () => {}, key);
+    const path = `${f.root}/fx/r.particle.json`;
+    be.write(path, `${JSON.stringify(particle(1), null, 2)}\n`);
+    return { f, path };
+  };
+  // The edit-loss case: the panel opens on the NEW bytes while the change is still held, the user edits, and the release
+  // then discarded that edit as "stale". Mutation: drop `read.landed()` in `readAssetDocFresh` — still pending, the park
+  // starts conflicted, and the release discards it.
+  it('the open drops the hold: a park made on what it showed is ordinary, and the release leaves it alone', async () => {
+    const { path } = await heldParticle('c-read-applies');
+    be.write(path, `${JSON.stringify(particle(99), null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    await settle();
+    expect(pendingOutsideChanges(), 'precondition: held').toEqual([path]);
+    expect((await readAssetDocFresh(path) as { maxParticles: number }).maxParticles, 'the panel shows the file').toBe(99);
+    expect(pendingOutsideChanges()).toEqual([]);
+    markAssetDirty(path, 'particle', particle(5), 'panel'); // the user edits what the panel showed
+    expect(peekDirtyAsset(path)?.ifMatch, 'no conflict: the edit was made on the file').toBeUndefined();
+    await releaseOutsideChanges(); // the focus gain
+    await settle();
+    expect((peekDirtyAsset(path)?.data as { maxParticles: number } | undefined)?.maxParticles, 'the edit survives').toBe(5);
+    expect((await flushDirtyAssets()).saved).toEqual([path]);
+    expect(JSON.parse(be.read(path)!).maxParticles).toBe(5);
+  });
+
+  // Mutation: end no notes in `beginFreshFileRead`'s `landed` (the bridge still drops) — the park starts conflicted.
+  it("the note ends with the hold: Save does not ask Overwrite/Cancel over the change the user was looking at", async () => {
+    const { path } = await heldParticle('c-read-note');
+    be.write(path, `${JSON.stringify(particle(99), null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    await settle();
+    await readAssetDocFresh(path);
+    markAssetDirty(path, 'particle', particle(5), 'panel');
+    expect((await flushDirtyAssets()).failed).toEqual([]);
+  });
+
+  // The runtime half of the apply: what is playing the effect follows the file the panel shows. Mutation: skip the
+  // invalidator in `outsideFileReadLanded` — nothing wakes, and the cached def stays the pre-change one.
+  it('the runtime cache is dropped and every surface woken, as the release would', async () => {
+    const { path } = await heldParticle('c-read-cache');
+    be.write(path, `${JSON.stringify(particle(99), null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    await settle();
+    setParticleEffect(path, normalizeParticleDef(particle(1))); // what an entity playing it cached before the change
+    expect(getParticleEffect(path, { load: false }), 'precondition: cached').not.toBeNull();
+    const woke = vi.fn();
+    const off = addDirtyListener(woke);
+    try { await readAssetDocFresh(path); } finally { off(); }
+    expect(getParticleEffect(path, { load: false }), 'the stale def is gone: the next use reads the file').toBeNull();
+    expect(woke).toHaveBeenCalled();
+  });
+
+  // A sibling of the panel read (#1902 close-out sweep): an agent keying a clip nothing has loaded reads the file on a
+  // cache miss and parks its edit on those bytes. Mutation: drop `read.landed()` in `anim-add-key`'s cache-miss branch —
+  // still pending, and the park starts conflicted.
+  it("an agent op's cache-miss read applies the held change too, so its park is ordinary", async () => {
+    const f = await startRun(be, async () => {}, 'c-read-anim');
+    const path = `${f.root}/anim/k.anim.json`;
+    const clip = { id: 'eeeeeeee-0000-4000-8000-000000001907', version: 1, name: 'k', duration: 1, tracks: [] };
+    be.write(path, `${JSON.stringify(clip, null, 2)}\n`);
+    be.write(path, `${JSON.stringify({ ...clip, duration: 2 }, null, 2)}\n`); // the outside change
+    bridge.emit('scene-changed', { urlPath: path, kind: 'animation' });
+    await settle();
+    expect(pendingOutsideChanges(), 'precondition: held').toEqual([path]);
+    const r = await runAgentOp('anim-add-key', { clipPath: path, trait: 'Transform', field: 'x', time: 0, value: 1 }) as { ok?: boolean };
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(pendingOutsideChanges()).toEqual([]);
+    expect(peekDirtyAsset(path)?.ifMatch, 'the edit was made on the file').toBeUndefined();
+    expect((peekDirtyAsset(path)?.data as { duration: number }).duration, 'on the NEW bytes').toBe(2);
+    discardDirtyAssets([path]);
+  });
+
+  // The accept side: a read that failed applied nothing. Mutation: call `landed()` before the parse — the hold drops
+  // a change the panel never showed.
+  it('a read that fails to parse leaves the change held', async () => {
+    const { path } = await heldParticle('c-read-fails');
+    be.write(path, '{ not json');
+    bridge.emit('scene-changed', { urlPath: path, kind: 'particle' });
+    await settle();
+    await expect(readAssetDocFresh(path)).rejects.toThrow();
+    expect(pendingOutsideChanges()).toEqual([path]);
   });
 });
 

@@ -21,7 +21,9 @@ import { serializePrefab } from './prefabSerialize';
 import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
-import { getEditVersion } from '../undo/undoManager';
+import { peekDirtyAsset } from './dirtyAssets';
+import { beginFreshFileRead } from './freshFileRead';
+import { captureSavePoint } from '../undo/undoManager';
 import { sceneManager, type SceneLoadResult } from '../../runtime/scene/SceneManager';
 import { withAdoption, adoptionCount, endPrefabEditInPlace, beginWorldRequest, editorStateCurrent, SCENE_SWITCH_LANDING } from './sceneAdoption';
 import { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } from './prefabEditWorld';
@@ -461,6 +463,9 @@ async function openPrefabForEditingSwitching(
   // will write, and the one every instance shows): the shape check every prefab read asks where it enters a cache (#1813 —
   // this one seeds both caches below and builds the edit world from `entities`) and the zIndex migration, which must
   // run BEFORE that seed or the un-migrated object poisons every later read of this guid for the session.
+  // A read of the FILE applies the outside change the hold lists for it (#1902) — once this session opens on it, below.
+  // A parked prefab is read from its park, not the file: its held change stands, and the park's conflict owns it.
+  const fileRead = peekDirtyAsset(asset.path) ? null : beginFreshFileRead(asset.path);
   const prefab = await fetchPrefabSource(asset.path);
   if (!prefab) {
     console.error(`[PrefabEdit] ${asset.path} is not a prefab document it could read — not opened`);
@@ -578,6 +583,9 @@ async function openPrefabForEditingSwitching(
     // cancel this open and the swap can fail or be replaced — and the session still open (another prefab's) would be left
     // with no baseline, refusing every save, including the gate's own Save of it.
     editBaseline = { guid, doc: opened };
+    // The caches hold the file and the world edits it: what the release would do in prefab edit (caches only) is done.
+    // Not at the seed: an open cancelled after it leaves the scene world, whose instances the release must still rebase.
+    fileRead?.landed();
     console.log(`[PrefabEdit] editing "${prefab.name}"`);
   });
 }
@@ -840,12 +848,12 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
     return { saved: false, warnings: [serialized.error] };
   }
   const { prefab, runtimeExcluded, rows } = serialized;
-  // The version `prefab` represents, captured BEFORE the write. `commitPrefabWrite` is a real fetch
+  // The state `prefab` represents (its edit version and world-state token), captured BEFORE the write. `commitPrefabWrite` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
   // saved baseline without it ever being written; see markSceneSaved's doc comment for why that is
   // data loss and not a cosmetic flag (#573).
-  const savedAtEditVersion = getEditVersion();
+  const savedAt = captureSavePoint();
   // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
   // the call sits here and not in commitPrefabWrite.
   const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid, getCachedPrefabSync);
@@ -883,8 +891,8 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   // …and where it put each member added this session, so the next save keeps that row and its identity (#1662).
   noteSessionRows(editingPrefab.guid, rows, prefab);
   // ⚠️ Re-baseline the dirty tracker. Without this the prefab-edit world stayed "unsaved" FOREVER
-  // after a successful save: `hasUnsavedChanges()` compares the live edit version against
-  // `_savedAtEditVersion`, and every other write path (`saveScene`, `loadScene`, `newScene`) moves
+  // after a successful save: `hasUnsavedChanges()` compares the live world-state token against
+  // the one the last save recorded, and every other write path (`saveScene`, `loadScene`, `newScene`) moves
   // that baseline while this one did not.
   //
   // Not cosmetic. `edit-open` and `load_scene` both REFUSE on unsaved changes, so a single prefab
@@ -893,7 +901,7 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   // was stale when it was byte-identical to the live world. Reported by the owner — "I think I
   // saved it before you said it's stale, maybe we have a bug" — and confirmed by diffing the file
   // against the world rather than by trusting the flag, which is the only way to see it.
-  markSceneSaved(savedAtEditVersion);
+  markSceneSaved(savedAt);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return { saved: true, warnings };
 }

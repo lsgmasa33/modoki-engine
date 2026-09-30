@@ -49,7 +49,8 @@ import { PREFAB_EDIT_SCENE_PREFIX } from '../../packages/modoki/src/editor/scene
 import {
   setCurrentScenePath, markSceneSaved, unsavedChangeCauses,
 } from '../../packages/modoki/src/editor/scene/serialize';
-import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { getEditVersion, captureSavePoint } from '../../packages/modoki/src/editor/undo/undoManager';
+import { UNREACHABLE_STATE } from '../../packages/modoki/src/editor/undo/stateToken';
 import { clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { clearPendingMeta, clearMetaBaselines } from '../../packages/modoki/src/editor/scene/pendingMeta';
 import { clearPendingBaseScenes } from '../../packages/modoki/src/editor/scene/pendingBaseScene';
@@ -77,13 +78,13 @@ const enterPrefabEdit = (prefab = PREFAB) => {
   useEditorStore.setState({ editingPrefab: prefab, prefabReturnScenePath: '/assets/scenes/main.scene.json' });
   setCurrentScenePath(null);
 };
-const dirtyTheWorld = () => markSceneSaved(getEditVersion() - 1);
+const dirtyTheWorld = () => markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE });
 
 const reset = () => {
   currentScene = null;
   useEditorStore.setState({ editingPrefab: null, prefabReturnScenePath: null });
   setCurrentScenePath(null);
-  markSceneSaved(getEditVersion());
+  markSceneSaved(captureSavePoint());
   clearPendingMeta(); clearMetaBaselines();
   clearDirtyAssets(); clearPendingBaseScenes(); clearAllSceneDirty();
 };

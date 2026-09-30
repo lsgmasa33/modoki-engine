@@ -38,7 +38,7 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   sceneLoadGeneration: () => loadGeneration,
   isSceneLoadInFlight: () => false,
   bootSceneWalkPending: () => null,
-  captureWorldDirtyBaseline: () => ({ primaryClean: false, scenes: new Set(), savedAt: 0, editVersion: 0 }),
+  captureWorldDirtyBaseline: () => ({ worldState: 0, scenes: { current: new Map(), saved: new Map(), epoch: 0 }, savedAt: 0, editVersion: 0 }),
   restoreWorldDirtyBaseline: () => {},
 }));
 vi.mock('../../src/editor/scene/timelinePreview', () => ({
@@ -54,7 +54,7 @@ vi.mock('../../src/editor/panels/aiSettingsModel', () => ({
   fetchAiSettings: async () => ({}),
   getCachedAiSettings: () => ({}),
 }));
-vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, getEditVersion: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {}, beginWorldSwitch: () => ({ idle: null, release: () => {} }), worldSwitchesSettled: () => null }));
+vi.mock('../../src/editor/undo/undoManager', () => ({ undoDepth: () => 0, markPlayBarrier: () => 0, getEditVersion: () => 0, truncateUndoTo: vi.fn(), registerUndoRestoreBarrier: () => {}, beginWorldSwitch: () => ({ idle: null, release: () => {} }), worldSwitchesSettled: () => null }));
 vi.mock('../../src/editor/editorJournal', () => ({ editorEmit: vi.fn() }));
 
 const { enterPlay, stopPlay } = await import('../../src/editor/scene/playMode');

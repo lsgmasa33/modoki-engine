@@ -106,7 +106,7 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
 }));
 
 // sceneDirty.ts is real (light, no SceneManager import) — track its marks directly.
-import { dirtySceneGuidsSnapshot, clearAllSceneDirty } from '../../src/editor/scene/sceneDirty';
+import { clearAllSceneDirty } from '../../src/editor/scene/sceneDirty';
 
 beforeEach(() => {
   testWorld = createWorld();
@@ -248,11 +248,12 @@ describe('moveEntityToScene — promote (level → base)', () => {
     warnSpy.mockRestore();
   });
 
-  it('marks BOTH the base and (implicitly) the primary dirty, and does not set _isFileDirect', async () => {
+  // The base is marked dirty by the PUSH, through `affectedScenes` (#1904: the undo manager moves the scene's state
+  // token, so an undo back to saved clears it) — this suite stubs `pushAction`, so it asserts the entry carries it.
+  it('names the base in affectedScenes (which dirties it on push), and does not set _isFileDirect', async () => {
     const { moveEntityToScene } = await getModule();
     const e = spawn('E');
     moveEntityToScene(e.id(), BASE);
-    expect(dirtySceneGuidsSnapshot().has(BASE)).toBe(true);
     expect((pushedActions[0] as any)._isFileDirect).toBeUndefined();
     expect(pushedActions[0].affectedScenes).toContain(BASE);
   });

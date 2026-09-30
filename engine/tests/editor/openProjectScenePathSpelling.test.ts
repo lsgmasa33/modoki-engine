@@ -16,7 +16,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, getCurrentWorld, sceneManager } from '@modoki/engine/runtime';
-import { setCurrentScenePath, getCurrentScenePath, loadScene, setSceneFileLoadObserver } from '../../packages/modoki/src/editor/scene/serialize';
+import { setCurrentScenePath, getCurrentScenePath, loadScene } from '../../packages/modoki/src/editor/scene/serialize';
+import { setFreshFileReadObserver } from '../../packages/modoki/src/editor/scene/freshFileRead';
 import { setOpenProjectRoots, toOpenProjectScenePath } from '../../packages/modoki/src/editor/scene/openProjectScenePath';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -33,7 +34,7 @@ beforeEach(() => {
   setPlayState('stopped');
 });
 afterEach(() => {
-  setSceneFileLoadObserver(null);
+  setFreshFileReadObserver(null);
   setOpenProjectRoots([]);
   setCurrentScenePath(null);
   game?.dispose();
@@ -95,7 +96,7 @@ describe('the editor stores one spelling', () => {
 describe('a scene load reports the file it read (#1899)', () => {
   it('begins before its read, and reports the adopt with the same mark', async () => {
     const order: string[] = [];
-    setSceneFileLoadObserver({
+    setFreshFileReadObserver({
       begins: (p) => { order.push(`begins ${p}`); return [7]; },
       loaded: (p, covered) => { order.push(`loaded ${p} ${covered.join()}`); },
     });
@@ -109,7 +110,7 @@ describe('a scene load reports the file it read (#1899)', () => {
 
   it('a load that fails reports no adopt — its bytes applied nothing', async () => {
     const loaded = vi.fn();
-    setSceneFileLoadObserver({ begins: () => [], loaded });
+    setFreshFileReadObserver({ begins: () => [7], loaded }); // a held change it would cover — so only the failure keeps `loaded` silent
     vi.spyOn(sceneManager, 'loadScene').mockRejectedValueOnce(new Error('404'));
     expect(await loadScene('/assets/scenes/missing.scene.json', undefined, { probing: true })).toBe('failed');
     expect(loaded).not.toHaveBeenCalled();

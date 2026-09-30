@@ -10,6 +10,7 @@ import {
   unsavedChangeCauses, markSceneSaved, causeSpecs, type UnsavedCauses,
 } from '../../packages/modoki/src/editor/scene/serialize';
 import { getEditVersion } from '../../packages/modoki/src/editor/undo/undoManager';
+import { UNREACHABLE_STATE } from '../../packages/modoki/src/editor/undo/stateToken';
 import { markAssetDirty, clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import { markSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markBaseSceneEdit, clearPendingBaseScenes } from '../../packages/modoki/src/editor/scene/pendingBaseScene';
@@ -31,7 +32,7 @@ vi.mock('../../packages/modoki/src/editor/components/choiceModal', () => modal);
  *  derives the split from `writtenBy`, so a list derived the same way would test the derivation
  *  against itself. The completeness test below makes a sixth cause fail here. */
 const DRIVERS: Record<keyof UnsavedCauses, { drive: () => void; lostOnWorldSwap: boolean }> = {
-  sceneDirty: { drive: () => markSceneSaved(getEditVersion() - 1), lostOnWorldSwap: true },
+  sceneDirty: { drive: () => markSceneSaved({ version: getEditVersion() - 1, state: UNREACHABLE_STATE }), lostOnWorldSwap: true },
   dirtyScenes: { drive: () => markSceneDirty('guid-of-a-loaded-base'), lostOnWorldSwap: true },
   // Parked, path-keyed module state: it SURVIVES a scene swap (guardUnsaved's consequence clause).
   dirtyAssetPaths: { drive: () => markAssetDirty('/assets/x.mat.json', 'material', { a: 1 }), lostOnWorldSwap: false },

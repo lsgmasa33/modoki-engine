@@ -2,6 +2,7 @@
  *  Extracted from Inspector.tsx (editor-inspector.md F2). Undo/redo persists
  *  against the file+cache via persistAssetEdit (F10), not panel-local state. */
 
+import { readAssetDocFresh } from '../assetDocLoad';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { pushAction } from '../../undo/undoManager';
 import { assetDocAction } from '../../undo/assetDocUndo';
@@ -12,7 +13,7 @@ import { AssetRefField } from '../AssetRefField';
 import { ColorField, NumberField, DropdownField, DEFAULT_COLOR } from './widgets';
 import { clampNum, persistAssetEdit, useAssetViewRefresher, invalidateMaterialFile } from './persist';
 import { pendingAssetDoc } from '../pendingAssetDoc';
-import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
+import { isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { MaterialPreview } from '../MaterialPreview';
 
 /** One inspector widget for a shader param, dispatched by its schema type. When
@@ -88,8 +89,7 @@ export function MaterialAssetView({ path }: { path: string }) {
     const parked = pendingAssetDoc(path, 'material');
     if (parked) { setData(parked as Record<string, unknown>); return; }
     const ac = new AbortController();
-    fetch(path, { signal: ac.signal })
-      .then(r => parseAssetJson(r, path))
+    readAssetDocFresh(path, { signal: ac.signal })
       .catch(e => { if (isMissingAsset(e)) return null; throw e; })
       .then((data) => setData(data as Record<string, unknown> | null))
       .catch(e => { if (e.name !== 'AbortError') setData(null); });

@@ -35,7 +35,7 @@ import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
 import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
 import { nestedDeclaredKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
-import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
+import { resolveAffectedScenes, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
@@ -1936,8 +1936,8 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
 
   markStructureDirty();
   markUIDirty();
-  if (fromScene) markSceneDirty(fromScene);
-  if (targetScene) markSceneDirty(targetScene);
+  // No direct scene marks here or in the closures: `affectedScenes` below moves both scenes' state tokens on the push
+  // and on each undo/redo, and a direct `markSceneDirty` would pin them dirty past an undo back to saved (#1904).
 
   const targetLabel = targetScene ? 'base' : 'primary';
   // NOT resolveAffectedScenes (that reads the CURRENT stamp — post-mutation both
@@ -1953,15 +1953,11 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
       undoRekeys();
       undoStamps(target);
       markStructureDirty(); markUIDirty();
-      if (fromScene) markSceneDirty(fromScene);
-      if (targetScene) markSceneDirty(targetScene);
     },
     redo: () => {
       applyStamps();
       applyRekeys();
       markStructureDirty(); markUIDirty();
-      if (fromScene) markSceneDirty(fromScene);
-      if (targetScene) markSceneDirty(targetScene);
     },
     kind: '!sceneMove',
     journalPayload: {

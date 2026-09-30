@@ -7,6 +7,7 @@
  *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
+import { readAssetDocFresh } from './assetDocLoad';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { jsonFileBody } from '../backend/editorBackend';
@@ -24,7 +25,6 @@ import { particleBackend } from '../../runtime/particles/particleBackend';
 import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape, COLLIDER_SHAPES, COLLISION_MODES } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
-import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
 import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
@@ -343,8 +343,7 @@ export default function ParticleEditor() {
       setParkAdopted(true);
       return;
     }
-    fetch(asset.path)
-      .then((r) => parseAssetJson(r, asset.path))
+    readAssetDocFresh(asset.path)
       .then((json) => {
         if (cancelled) return;
         // REFUSE a too-new / unreadable format version (docs/format-versioning.md § 2b-bis)

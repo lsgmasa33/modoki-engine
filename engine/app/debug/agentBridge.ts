@@ -3360,43 +3360,59 @@ export async function answerSceneConflict(urlPath: string, answer: 'reload' | 'k
   if (answer === 'reload') await handleSceneChanged({ ...msg, reload: true });
 }
 
-/** A scene load is about to READ `urlPath` from disk (#1899) — `serialize.ts`'s load, every route (an agent's
- *  `load_scene`, the menu, the Assets panel), installed by `agentEditorOps.ts`. What it reads IS the outside change a hold,
- *  a deferral or an open "Reload / Keep mine" question lists for that file right now, so {@link sceneFileLoaded} drops
- *  exactly those entries once the load's world is adopted: left listed, `pendingOutsideChanges` named a file the editor
- *  already shows, and the next focus gain or refresh reloaded it a second time — over any edit made since.
- *  Returns the holds it covers (their `heldSeq`s), handed back to {@link sceneFileLoaded}. Only those: one held while the
- *  load was in flight may postdate the bytes read, and one a release has taken into its local batch at this instant is
- *  in none of the lists — it is not covered, so it replays and reloads as usual (a reload too many at worst). A mark
- *  bound instead dropped that one too, although the load had not started its history fresh for it (close-out re-review,
- *  measured). By `heldSeq`, not by object: a release copies each change it defers.
- *  A covered change means the scene's undo stack was recorded over bytes the file no longer has, so the load adopts with
- *  a fresh history (`freshIncoming`), as the release's reload would have (#1744). NOT raised as the owner's debt
+/** An editor operation is about to READ `urlPath` fresh from disk (#1899, generalised by #1902) — the one entry point
+ *  every fresh reader takes (`freshFileRead.ts` `beginFreshFileRead`, installed by `agentEditorOps.ts`): a scene load
+ *  (every route), prefab edit-open, the re-import after a parked prefab is discarded, and the asset editors' open and
+ *  Retry. What it reads IS the outside change a hold, a deferral or an open "Reload / Keep mine" question lists for that
+ *  file right now, so {@link outsideFileReadLanded} drops exactly those entries once the read is applied: left listed,
+ *  `pendingOutsideChanges` named a file the editor already shows, and the next focus gain or refresh applied it a second
+ *  time — reloading a scene over any edit made since, re-importing a prefab, or DISCARDING an asset park made on the
+ *  very bytes the release was "applying" (#1902).
+ *  Returns the holds it covers (their `heldSeq`s), handed back to {@link outsideFileReadLanded}. Only those: one held
+ *  while the read was in flight may postdate the bytes read, and one a release has taken into its local batch at this
+ *  instant is in none of the lists — it is not covered, so it replays as usual: for a scene or a prefab an apply too many
+ *  at worst; for an asset document it is any held change's rule — a park made meanwhile starts conflicted and the
+ *  release discards it (#1902 close-out review F4: a write in the few ms of the read, whose bytes it may or may not
+ *  hold, so disk winning is the only answer that does not guess). A mark
+ *  bound instead dropped that one too, although the load had not started its history fresh for it (close-out
+ *  re-review, measured). By `heldSeq`, not by object: a release copies each change it defers.
+ *  For a scene, a covered change means its undo stack was recorded over bytes the file no longer has, so the load adopts
+ *  with a fresh history (`freshIncoming`), as the release's reload would have (#1744). NOT raised as the owner's debt
  *  (`sceneFileChanged`): the load's route registered before it, so its adopt could not pay it, and the NEXT adopt of
  *  that scene dropped a stack recorded over the new bytes (close-out review F1); a load that then failed left it owed
  *  too (F2). */
-export function sceneFileLoadBegins(urlPath: string): number[] {
-  return outsideSceneChangesFor(urlPath).map((m) => m.heldSeq!);
+export function outsideFileReadBegins(urlPath: string): number[] {
+  return outsideChangesFor(urlPath).map((m) => m.heldSeq!);
 }
 
-/** The load {@link sceneFileLoadBegins} announced was adopted: the held, deferred or asked-about changes it covered are
- *  applied. An open question's dialog stays on screen until answered; its answer then finds nothing to apply. */
-export function sceneFileLoaded(urlPath: string, covered: readonly number[]): void {
-  if (!covered.length) return;
+/** The read {@link outsideFileReadBegins} announced was applied: the held, deferred or asked-about changes it covered are
+ *  dropped. An open question's dialog stays on screen until answered; its answer then finds nothing to apply.
+ *  An ASSET document's read was the panel's own, so the release's other half runs here: its runtime cache is dropped
+ *  (entities playing the clip, the material on screen, pick up the file the panel now shows) and every surface is woken.
+ *  Its park is NOT touched — the reader read because there was none, and one made since was made on these bytes.
+ *  Returns what it dropped, so the caller ends each file's `heldOutside` note (`freshFileRead.ts`). */
+export function outsideFileReadLanded(urlPath: string, covered: readonly number[]): { path: string; seq: number }[] {
+  if (!covered.length) return [];
   const seqs = new Set(covered);
   const read = (m: SceneChangedMsg) => m.heldSeq !== undefined && seqs.has(m.heldSeq);
-  const dropped = _outsideHold.drop(read).length;
-  let more = 0;
-  for (const [k, m] of [..._suppressedReloads]) if (read(m)) { _suppressedReloads.delete(k); more++; }
-  for (const [k, m] of [..._awaitingDecision]) if (read(m)) { _awaitingDecision.delete(k); more++; }
-  if (!dropped && !more) return;
-  console.log(`[agentBridge] a load of ${urlPath} read the file — its held outside change is applied`);
+  const dropped = _outsideHold.drop(read);
+  for (const [k, m] of [..._suppressedReloads]) if (read(m)) { _suppressedReloads.delete(k); dropped.push(m); }
+  for (const [k, m] of [..._awaitingDecision]) if (read(m)) { _awaitingDecision.delete(k); dropped.push(m); }
+  if (!dropped.length) return [];
+  let woke = false;
+  for (const m of dropped) {
+    const invalidate = hasDocKey(ASSET_CACHE_INVALIDATORS, m.kind) ? ASSET_CACHE_INVALIDATORS[m.kind] : undefined;
+    if (invalidate) { invalidate(m.urlPath); woke = true; }
+  }
+  if (woke) fireDirtyListeners();
+  console.log(`[agentBridge] ${urlPath} was read fresh — its held outside change is applied`);
   notifyPending();
+  return dropped.map((m) => ({ path: m.urlPath, seq: m.heldSeq! }));
 }
 
-/** The held, deferred and asked-about changes to the scene FILE `urlPath` — by path, so never a prefab or asset the scene
- *  uses (a load takes those from its caches, which only their own refresh brings up to date). */
-function outsideSceneChangesFor(urlPath: string): SceneChangedMsg[] {
+/** The held, deferred and asked-about changes to the FILE `urlPath` — by path, so a scene read never covers a prefab or
+ *  asset the scene uses (a load takes those from its caches, which only their own refresh brings up to date). */
+function outsideChangesFor(urlPath: string): SceneChangedMsg[] {
   const want = normScenePath(urlPath);
   return [..._outsideHold.peek(), ..._suppressedReloads.values(), ..._awaitingDecision.values()]
     .filter((m) => m.heldSeq !== undefined && normScenePath(m.urlPath) === want);
