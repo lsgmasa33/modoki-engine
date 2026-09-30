@@ -29,6 +29,8 @@ import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
 import { placeholderWriteRefusal, placeholderWriteRefusalAny, isMissingPrefabPlaceholder, isUnderPrefabInstance, placeholderRefusalWords, entityNameOf } from './placeholderGate';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { sortOrderAsNode } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
 import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
@@ -1473,13 +1475,14 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   const oldFolder = ((findEntity(entityId)?.get(attrMeta.trait as never) as { editorFolder?: string } | undefined)?.editorFolder) || '';
 
   const parentChanged = oldParentId !== newParentId;
-  // A Missing Prefab placeholder that lands inside an instance is saved as an added node, which keeps no `sortOrder`
-  // (#1818, `PLACEHOLDER_ENTRY_ONLY_FIELDS`), and the load spawns a node placeholder at 0 (`spawnUnresolvedReference`
-  // sets none). So the move puts it at 0, where the reload will, rather than at the dropped position or its old entry
-  // order, and a reorder alone is refused, named.
+  // A Missing Prefab placeholder that lands inside an instance is saved as an added node, which keeps no USER `sortOrder`
+  // (#1818, `PLACEHOLDER_ENTRY_ONLY_FIELDS`); the load spawns it at what its node record states (the template's value,
+  // #1897), else 0 (`sortOrderAsNode`). So the move puts it there, where the reload will, rather than at the dropped
+  // position or its old entry order, and a reorder alone is refused, named.
   if (isMissingPrefabPlaceholder(entityId) && isUnderPrefabInstance(newParentId, entityId)) {
     if (!parentChanged) { reportWriteRefusal(placeholderRefusalWords(entityNameOf(entityId))); return false; }
-    newSortOrder = 0;
+    const ref = unresolvedRefOf(findEntity(entityId));
+    newSortOrder = ref ? sortOrderAsNode(ref.kind, ref.record) : 0;
   }
   const orderChanged = newSortOrder !== undefined && newSortOrder !== oldSortOrder;
   if (!parentChanged && !orderChanged) return false;

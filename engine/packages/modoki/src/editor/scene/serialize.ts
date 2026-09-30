@@ -34,7 +34,7 @@ import { levelDoc } from './prefabBase';
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
-import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { asSceneEntry, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
@@ -338,9 +338,11 @@ async function serializeSceneScoped(opts?: {
   // how they used to leak out and orphan on reload).
   // Each root's ENTRY — the one writer the rebuild respawns from too (`captureInstanceEntry`, #1880 F6).
   const entries = new Map<number, InstanceEntry>();
+  const unresolvedRoots = new Set<number>();
   for (const [rootId, { source }] of prefabRootInfo) {
     // A prefab that stopped resolving mid-session is written from the document the instance was expanded from (#1738).
-    const current = (await getPrefabSource(source)) ?? levelDoc(rootId, source).doc;
+    const resolved = await getPrefabSource(source);
+    const current = resolved ?? levelDoc(rootId, source).doc;
     if (!current) continue;
     // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
     const prefab = savedFrameDoc(rootId, source, current);
@@ -348,6 +350,7 @@ async function serializeSceneScoped(opts?: {
     // (#1355), and a deleted instance's source is not among the live ones preloaded above.
     await preloadNestedPrefabs(prefab);
     const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guidForId(rootId));
+    if (!resolved) unresolvedRoots.add(rootId);
     for (const ecsId of consumedEcsIds) prefabChildIds.add(ecsId);
     entries.set(rootId, entry);
   }
@@ -441,7 +444,11 @@ async function serializeSceneScoped(opts?: {
         // level on the next load. A folder-tagged instance can sit at the SCENE ROOT
         // (empty parentGuid), so emit EA whenever EITHER field is present.
         const parentGuid = guidForId(info.parentId);
-        const minimalEa: Record<string, unknown> = {};
+        // A root whose prefab no longer resolves also states its sibling position and active flag (#1895): its next load
+        // has no template to restore them from (`placementForMissing` says why here and not as an override).
+        const minimalEa: Record<string, unknown> = unresolvedRoots.has(info.id) && eaMeta
+          ? placementForMissing(entry.overrides as Parameters<typeof placementForMissing>[0], rootInfo.localId, findEntity(info.id)?.get(eaMeta.trait) as Record<string, unknown> | undefined)
+          : {};
         if (parentGuid) minimalEa.parentId = parentGuid;
         if (info.editorFolder) minimalEa.editorFolder = info.editorFolder;
         if (Object.keys(minimalEa).length) entry.traits.EntityAttributes = minimalEa;

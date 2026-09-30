@@ -206,6 +206,27 @@ export function foldMarkedEqual(
   }
 }
 
+/** `diffs` in the ONE key order a save writes (#1896): traits in the order {@link collectComparableTraits} reads them
+ *  (the registry's), each trait's fields in the order it read them (the schema's — `writtenTraitKeys`' order for a
+ *  plain entity; an AoS trait's live order). The two passes above build the object in HISTORY order: the value diff in
+ *  schema order, then `foldMarkedEqual` appending in mark-set insertion order. That order is what the session happened
+ *  to mark first, and a reload re-seeds marks in file order with a rotation mark pulling in its whole group
+ *  (`markOverride`), so a save → reload → save rewrote `{rx,x,ry,rz}` as `{rx,ry,rz,x}` with no value changed. */
+function inCanonicalOrder(
+  diffs: Record<string, Record<string, unknown>>,
+  currentTraits: Record<string, Record<string, unknown>>,
+): Record<string, Record<string, unknown>> {
+  const ordered = <T>(o: Record<string, T>, order: Record<string, unknown> | undefined): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (const k of Object.keys(order ?? {})) if (k in o) out[k] = o[k]!;
+    for (const k of Object.keys(o)) if (!(k in out)) out[k] = o[k]!; // nothing today: every key comes from `order`
+    return out;
+  };
+  const byTrait = ordered(diffs, currentTraits);
+  for (const t of Object.keys(byTrait)) byTrait[t] = ordered(byTrait[t]!, currentTraits[t]);
+  return byTrait;
+}
+
 export function captureInstanceOverrides(
   rootInstanceId: number,
   prefab: PrefabFile,
@@ -252,7 +273,7 @@ export function captureInstanceOverrides(
     foldMarkedEqual(diffs, markSet, currentTraits);
 
     if (Object.keys(diffs).length > 0) {
-      result[localId] = diffs;
+      result[localId] = inCanonicalOrder(diffs, currentTraits);
     }
   });
 

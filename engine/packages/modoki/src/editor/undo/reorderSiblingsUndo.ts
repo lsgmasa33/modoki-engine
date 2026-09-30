@@ -52,7 +52,7 @@ export interface RenumberSibling { id: number; sortOrder: number; fixed?: boolea
 /** Renumber `siblings` (already in display order) to distinct, increasing `sortOrder`s `step` apart, leaving each
  *  `fixed` sibling's value where it is and numbering the rest around it. A Missing Prefab placeholder inside an
  *  instance is fixed: its save cannot keep a `sortOrder` (#1818, `placeholderWriteRefusal`), so writing one would show a
- *  reorder the reload undoes. Where two fixed siblings share a value (a node placeholder loads at 0) with others between
+ *  reorder the reload undoes. Where two fixed siblings share a value (a node placeholder loads at 0 unless its record carries its template's, #1897) with others between
  *  them, those keep the value too: only a drop INTO that span is refused (`planCollidingDrop`), not every drop in the
  *  group. */
 export function renumberAround(siblings: readonly RenumberSibling[], step = 10): SiblingSortChange[] {

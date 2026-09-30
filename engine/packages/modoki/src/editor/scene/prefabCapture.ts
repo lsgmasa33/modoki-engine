@@ -23,7 +23,7 @@ import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
+import { asAddedNode, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap } from '../../runtime/loaders/prefabOverrides';
@@ -815,8 +815,20 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       const t = translateCarried(lid, moved.channels.overrides ?? {}, { added: moved.channels.added, removed: moved.channels.removed, removedTraits: moved.channels.removedTraits });
       return { ...moved.channels, overrides: t.overrides, added: t.structure.added, removed: t.structure.removed, removedTraits: t.structure.removedTraits };
     })() : moved.channels;
+    // A node whose prefab no longer resolves (trashed mid-session, its frame kept, #1862) states its root's LIVE sibling
+    // position and active flag in its own traits (#1897, owner ruling A): its next load has no template to take them from,
+    // and spawns a placeholder, which seats them (`spawnUnresolvedReference`). The template's value, or a root override
+    // made while the prefab was live — stated here even so, since a node placeholder reads only its traits (it has no
+    // `PrefabInstance.localId` to find a root override by), while a resolving node ignores them, so the override still
+    // applies once the prefab returns. Not a user edit on a placeholder: the gate still refuses those on a node (I21).
+    // Every live source is fetched before the save captures, so an empty cache here is a prefab that does not resolve.
+    const placement = getCachedPrefabSync(source) ? {} : placementForMissing(
+      undefined, pi?.localId as number,
+      readTraitData(ecsId, getTraitByName('EntityAttributes')!) as Record<string, unknown> | undefined,
+    );
     return {
       ...node,
+      ...(Object.keys(placement).length ? { traits: { EntityAttributes: placement } } : {}),
       ...(lid && node.moved ? { moved: translateCarried(lid, {}, { moved: node.moved }).structure.moved } : {}),
       overrides: nonEmpty(ch.overrides), added: nonEmpty(ch.added),
       removed: nonEmpty(ch.removed), removedTraits: nonEmpty(ch.removedTraits),
