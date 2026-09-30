@@ -75,7 +75,10 @@ export function markUnstated(doc: { version?: unknown; nextLocalId?: unknown } |
  *  The ONE rule for "the same document" (#1892). There were two copies: `prefabCommit`'s (is a file still the document a
  *  step recorded?) got #1774's exemption, and the frame-staleness one (`staleFrames`: was this frame expanded from another
  *  document than the cache holds?) did not, so an Apply's undo made every frame expanded before the Apply read as stale
- *  and rebased it — and Create Prefab's redo, told its undo had rebased the tree, refused in a clean segment. */
+ *  and rebased it — and Create Prefab's redo, told its undo had rebased the tree, refused in a clean segment.
+ *  ⚠️ The prefab fuzz harness states this rule on its own (`markFree` in `tests/editor/prefabFuzz/checks.ts`, #1913), so
+ *  its checks do not inherit a defect here: change it there too. A NARROWER rule here that is not made there too goes
+ *  unnoticed, since the harness would keep exempting what the product no longer does. */
 export function documentContentKey(doc: object): string {
   // Through JSON first, as a write would put it: an undefined field is no field.
   const d = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;

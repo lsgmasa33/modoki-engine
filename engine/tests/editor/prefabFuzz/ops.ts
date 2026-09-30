@@ -41,7 +41,9 @@ import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/pre
 import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, getCurrentWorld, type Fixture } from './harness';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
+import { canonicalJson } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import type { FuzzBackend } from './backend';
+import { markFree } from './checks';
 
 export type OpKind =
   | 'createPrefab' | 'instantiate' | 'detach' | 'duplicate' | 'copy' | 'cut' | 'paste' | 'delete'
@@ -151,6 +153,11 @@ export interface RunState {
 
 const liveGuids = () => new Set(authored().map((e) => e.guid).filter((g): g is string => !!g));
 
+/** A prefab document's content under #1892's one "same document" rule ({@link markFree}), keys sorted: a frame expanded
+ *  before an Apply that was then undone is current, as the undo keeps the mark it raised on the same rows (#1913, hunt
+ *  seed 3066). */
+const docContent = (doc: object): string => canonicalJson(markFree(doc));
+
 /** #1820: when a Paste RETURNS — before anything is awaited — every frame it made is on the cached copy of its prefab,
  *  whenever every prefab in the pasted tree is cached: the rebase is synchronous then, and an async one would be a
  *  window a world switch can land in (#1833). The settle after the op cannot tell the two apart; this can. */
@@ -163,7 +170,7 @@ function requirePastedFramesCurrent(pre: ReadonlySet<string>): void {
     const pi = piOf(e.id);
     if (!pi?.source || pi.rootInstanceId !== e.id) continue;
     const rec = frameRootDoc(world, findEntity(e.id)!);
-    if (rec && JSON.stringify(rec.doc) !== JSON.stringify(getCachedPrefabSync(pi.source))) {
+    if (rec && docContent(rec.doc) !== docContent(getCachedPrefabSync(pi.source)!)) {
       throw new Error(`harness: pasted frame "${e.name}" is still expanded from an older ${pi.source} when the paste returns (#1820)`);
     }
   }

@@ -236,6 +236,20 @@ export function checkScene(scene: unknown): Failure[] {
 
 const NODE_LISTS = new Set(['added', 'children', 'own']);
 
+/** A prefab document with the #1774 mark (`nextLocalId`) and the format `version` set aside: #1892's one "same document"
+ *  rule, stated once for the harness (the paste check, the hand-edit and park matching, I15's carry, a restored file's
+ *  diff). A restore may raise both on the rows it gives back (an Apply's undo), and nothing that expands a frame reads
+ *  either. Stated here, not imported from `documentContentKey`, so the checks do not share a defect in which fields it
+ *  sets aside (#1913); the paste check does share the product's key sort (`canonicalJson`). Only the exemption is one
+ *  statement: each caller's equality after it is its own (sorted keys, the formatted text, `firstDiff`). A copy through
+ *  JSON, as a write would put it: an undefined field is no field. */
+export function markFree(doc: object): Record<string, unknown> {
+  const d = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+  delete d.nextLocalId;
+  delete d.version;
+  return d;
+}
+
 /** The first place two JSON-like values differ, as a path, or null. */
 export function firstDiff(a: unknown, b: unknown, path = ''): string | null {
   if (a === b) return null;

@@ -1051,7 +1051,14 @@ problem with random fileIDs instead; the owner kept sequential numbers, which ar
     and each rebase caller respawned it for nothing. Create Prefab's undo also took the rebase as "the template
     changed since the create", and its redo refused in a clean segment (hunt seed 3097). The mark and the
     version change no row, and nothing that expands a frame reads either one, so a frame that differs in
-    them alone is current.
+    them alone is current. ⚠️ The fuzz harness had a THIRD copy that #1892 missed: its #1820 paste check
+    (`requirePastedFramesCurrent`, `prefabFuzz/ops.ts`) still compared raw JSON. A paste of a copy taken
+    before an Apply that was then undone passed the product's check and failed the harness's (hunt seed
+    3066, #1913). The harness now states the rule ONCE, in `markFree` (`prefabFuzz/checks.ts`), which the
+    paste check, the hand-edit matching, I15's carry and `diffFiles` all use. It does not import
+    `documentContentKey`, so a defect in which fields that sets aside is not inherited (the paste check
+    does share the product's key sort, `canonicalJson`). When the rule changes, change it there too:
+    `documentContentKey`'s docblock says so, since a rule narrowed only in the product goes unnoticed.
   - **The route's refusal counts as a conflict.** `prefab-mark-lowered` from the route means the file's
     mark rose past what the write was raised to (a later undo already kept it). The commit then re-reads
     the file and raises from it, like any other precondition miss. Without this, undoing two minting Applies

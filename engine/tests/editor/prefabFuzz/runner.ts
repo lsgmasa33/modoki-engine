@@ -7,7 +7,7 @@ import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/s
 import { getAllEntities, getCurrentWorld, findEntity } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
 import { execute, describe as describeOp, deletedPrefabs, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, nodeMoved, signature, alignEqualOrientations, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
+import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -121,7 +121,7 @@ const prefabBytes = (be: FuzzBackend) => {
 /** {@link RunState.lastPrefabs}, brought up to date: each prefab the editor holds now, by document id. */
 /** A prefab file's contents as a DOCUMENT, with the localId mark and the version set aside (what a restore may raise,
  *  #1774/#1797) and the formatting normalized (a park is the editor's own serialization of what it read). */
-const docForm = (t: string): string => { try { const d = JSON.parse(t) as Record<string, unknown>; delete d.nextLocalId; delete d.version; return JSON.stringify(d); } catch { return t; } };
+const docForm = (t: string): string => { try { return JSON.stringify(markFree(JSON.parse(t) as object)); } catch { return t; } };
 
 /** Which held paths a hand edit wrote (#1880 T1): `handEdited`, by its bytes or as the same DOCUMENT (a park is the
  *  editor's re-serialization of what it read), is held to nothing by the file checks; `handBytes`, by its own bytes only,
@@ -309,7 +309,6 @@ export function rebaseForFileOp(prefabs: Map<string, string>, op: { from: string
  *  mark"), so an undo cannot give back the exact bytes by design. Those two fields are set aside as long as they only
  *  went UP; everything else, formatting included, must match. */
 export function diffFiles(a: Map<string, string>, b: Map<string, string>, created?: readonly string[]): string | null {
-  const markFree = (t: string) => { const d = JSON.parse(t) as Record<string, unknown>; delete d.nextLocalId; delete d.version; return d; };
   for (const p of new Set([...a.keys(), ...b.keys()])) {
     if (a.get(p) === b.get(p)) continue;
     // A file a Create Prefab made, still there at the segment's start: its undo LEAVES the file (#1795, hub ruling (i),
@@ -320,7 +319,7 @@ export function diffFiles(a: Map<string, string>, b: Map<string, string>, create
     if (a.get(p) === undefined && created?.some((made) => prefabTextIsDocument(b.get(p)!, JSON.parse(made) as PrefabFile))) continue;
     if (a.get(p) === undefined || b.get(p) === undefined) return `${p}: ${a.has(p) ? 'present' : 'absent'} vs ${b.has(p) ? 'present' : 'absent'}`;
     const [da, db] = [JSON.parse(a.get(p)!) as CountedDoc & { version?: number }, JSON.parse(b.get(p)!) as CountedDoc & { version?: number }];
-    const d = firstDiff(markFree(a.get(p)!), markFree(b.get(p)!));
+    const d = firstDiff(markFree(JSON.parse(a.get(p)!) as object), markFree(JSON.parse(b.get(p)!) as object));
     if (d) return `${p}: ${d}`;
     // Set aside, but only in the direction a restore may move them (#1880 T1): an undo or a redo that gives back a LOWER
     // mark than the side it returns to frees a number a row took, which is the whole of I4 (#1877 3b S1), and deleting

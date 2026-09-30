@@ -51,6 +51,19 @@ export const KNOWN_OPEN: KnownOpen[] = [
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
+    issue: 1913,
+    what: "hunt seed 3066: a Paste of a copy taken before an Apply, after that Apply was undone. The undo keeps the #1774 mark it raised (version 8, nextLocalId) on the same rows, so the pasted frame is current under #1892's one \"same document\" rule and nothing rebases it. The #1820 paste check compared raw JSON and read it as stale; it now compares content without the mark and the version",
+    repro: [
+      { kind: 'copy', u: [0.09484180947765708, 0.42850814457051456, 0.9910836778581142, 0.44680791860446334, 0.6759011175017804, 0.2814236788544804, 0.601917487801984, 0.4636768940836191] },
+      { kind: 'instantiate', u: [0.1374225493054837, 0.5400660415180027, 0.3437578836455941, 0.1232674173079431, 0.7499900374095887, 0.9724785936996341, 0.6178272974211723, 0.32715358678251505] },
+      { kind: 'prefabEdit', u: [0.28322699200361967, 0.8333327248692513, 0.0684905571397394, 0.6176799486856908, 0.7738619239535183, 0.44571892032399774, 0.6433682369533926, 0.9507702726405114], inner: [] },
+      { kind: 'reparent', u: [0.5185867443215102, 0.9025393356569111, 0.7728170431219041, 0.45462952414527535, 0.05682112672366202, 0.6795169685501605, 0.7645600726827979, 0.3142650849185884] },
+      { kind: 'apply', u: [0.23766510700806975, 0.03287525731138885, 0.19914947147481143, 0.004267196403816342, 0.04567374777980149, 0.7845990906935185, 0.47620489448308945, 0.5257858119439334] },
+      { kind: 'undo', u: [0.8857593168504536, 0.23443350242450833, 0.622052836464718, 0.5814989935606718, 0.5170310474932194, 0.1567833845037967, 0.4998121790122241, 0.05712961032986641] },
+      { kind: 'paste', u: [0.364863223163411, 0.5309305356349796, 0.06996219558641315, 0.03358817892149091, 0.023151569068431854, 0.17860745289362967, 0.9888399969786406, 0.22902356274425983] },
+    ],
+  },
+  {
     issue: 1908,
     what: "#1880 F7d close-out reviewer's hunt seed 7035: Create Prefab of Plain swallowed the Leaf instance, a prefab-edit save then added N368 under Leaf's nested Q row (a template-keyed node, derived through the new prefab's frame), and the walk undid the create. The undo reversed only the renames its stamp recorded, so N368 kept a guid of the removed frame, and T4's no-op rebuild derived it from Leaf. The undo now re-derives what the rename did not put back (`rederiveUntaggedTree`)",
     repro: [
