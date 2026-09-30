@@ -882,7 +882,16 @@ variance is machine-readable while it lasts.
   half-and-half shape that applied the valid ops, wrote the junk field to disk, and *then* answered
   `ok:false`: a caller who reads `ok:false` reasonably assumes nothing happened, so a partial apply
   behind a failure verdict is worse than either honest outcome. An entity-not-found, by contrast,
-  can only be learned while applying, so it stays a per-op error alongside whatever succeeded.
+  can only be learned while applying, so it stays a per-op error alongside whatever succeeded —
+  and a call where something applied AND something failed answers **`PARTIAL`**, naming
+  `appliedOps`/`failedOps` by index, never the failing op's own code (#1910). It answered
+  `NOT_FOUND` once, with the applied op already written to disk, so a caller who fixed the ref and
+  resent the whole list would apply the first op twice (an `addEntity` duplicates; inferred, not run).
+  On the file path the remedy names the reply's receipts, NOT a live read — `get_scene_state` sees
+  a file write to the open scene only after `modoki_refresh`, and one to another scene only once it
+  is loaded, so "checking" there shows nothing and invites the resend. The verdict is
+  `partialApplyVerdict` in `sceneMutate.ts`, shared by the live and file paths; the tool
+  description says ops are per-op and to resend only the failed ones.
 - **A write refuses what it would silently replace or orphan, and never changes an identity the
   caller did not name** (#1215). A create over an existing file is refused rather than replaced
   (`create_registered_asset` via `/api/write-file`'s `ifNoneMatch:'*'`, beside the 409s

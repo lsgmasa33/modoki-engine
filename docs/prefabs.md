@@ -1984,7 +1984,10 @@ Apply never does, and the undo dirties the scene as every undo does. Before, a p
 undo and redo then saved it over the other half's bytes, which needed #1695's precondition to stay safe.
 
 **Every prefab the Apply wrote** (an enclosing prefab's row too, #1693/U13) is restored as one step, and the refusal
-names the prefab whose document changed, not the Apply's primary (#1732).
+names the prefab whose document changed, not the Apply's primary (#1732). On the FORWARD side, a multi-file Apply that
+fails part-way is refused, but when its rollback could not put a written file back, or the world was replaced while it
+wrote (#1667), part of it is on disk anyway: `ApplyResult.landed` marks that, and the agent op answers `PARTIAL`
+(`prefabApplyRefusal`), never a plain refusal that reads as "nothing happened" (#1910's family).
 
 **The snapshot is reloaded under the key of the world the undo belongs to when it RUNS**
 (`currentSceneKey()`, the key Stop's restore uses), not under a path captured at the Apply (#1575):

@@ -2,7 +2,7 @@
  *  scene shape. Deterministic GUID minting injected. Pure, no world. */
 
 import { describe, it, expect } from 'vitest';
-import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, ALSO_DELETED_CAP, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
+import { applyOps, partialApplyVerdict, assignSyntheticEntityIds, stripBackfilledEntityIds, ALSO_DELETED_CAP, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
 import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 import { worldTrsOf } from '../../src/runtime/scene/transformSpace';
@@ -769,6 +769,9 @@ describe('applyOps — runtime guids never reach the file (#1210)', () => {
     ], mint);
     expect(res.changed).toBe(0); // the route writes only when changed > 0
     expect(res.errors.join('\n')).toMatch(/RUNTIME guid/);
+    // …and names no op as applied, or the reply would list a write that never happened (#1910).
+    // Mutation: drop `appliedOps.length = 0` from the tripwire.
+    expect(res.appliedOps).toEqual([]);
   });
 
   // #1223 P4 review: the tripwire cleared `changed` and `created` but not `addedTraits`, so a refused write
@@ -1162,5 +1165,28 @@ describe('applyOps — setTrait parentId keeps the world pose (#1847)', () => {
     );
     expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-k' }, trait: 'EntityAttributes', fields: { parentId: 'g-g' } }], mint).errors).toEqual([]);
     expect(byName(s, 'K').traits.Transform).toEqual({ x: 1, sy: -1, rz: 3.5 });
+  });
+});
+
+describe('applyOps — which ops applied and which failed (#1910)', () => {
+  // The route's PARTIAL reply names these, so a caller can resend ONLY the failed ops.
+  // Mutation: drop either push in the loop's `finally` — its list comes back empty.
+  it('names each op by index, including a refusal that leaves its op with `continue`', () => {
+    const res = applyOps(freshScene(), [
+      { op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 5 } },
+      { op: 'setTrait', entity: { guid: 'no-such-guid' }, trait: 'Transform', fields: { x: 1 } },
+      { op: 'addEntity', name: 'New', traits: {} },
+      { op: 'setTrait', entity: { name: 'Child' }, trait: '' } as MutateOp, // missing 'trait', refused after the ref resolved
+    ], mint);
+    expect(res.appliedOps).toEqual([0, 2]);
+    expect(res.failedOps).toEqual([1, 3]);
+  });
+
+  // The verdict fires only on a MIXED call: all-failed changed nothing a retry could repeat, so it keeps its own code.
+  // Mutation: decide on `errors.length` alone — the all-failed case answers PARTIAL.
+  it('partialApplyVerdict: PARTIAL only when something changed AND something failed', () => {
+    expect(partialApplyVerdict({ changed: 1, errors: [], appliedOps: [0], failedOps: [] }, 'file')).toBeNull();
+    expect(partialApplyVerdict({ changed: 0, errors: ['x'], appliedOps: [], failedOps: [0] }, 'file')).toBeNull();
+    expect(partialApplyVerdict({ changed: 1, errors: ['x'], appliedOps: [0], failedOps: [1] }, 'file')?.code).toBe('PARTIAL');
   });
 });

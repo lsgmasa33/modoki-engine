@@ -4,6 +4,8 @@
  *  a fake route that honours if-match as the real one does. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { prefabApplyRefusal } from '../../app/editor/agentEditorOps';
+import { OpRefusal } from '../../app/debug/opRefusal';
 import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
 
@@ -304,6 +306,11 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
     expect(res.refused).toContain(`the prefab ${O} file could not be written (the disk is full)`);
     expect(res.refused).toContain(`${P} was written and could not be put back`);
     expect(res.refused).not.toMatch(/nothing was applied/);
+    // …and the agent op answers PARTIAL for it, not an uncoded refusal (#1910's family).
+    // Mutation: drop `...landed` from the write-failure return — `landed` is unset and the op throws a plain Error.
+    //   And: make `prefabApplyRefusal` ignore `landed` — the code is not PARTIAL.
+    expect(res.landed).toBe(true);
+    expect((prefabApplyRefusal(res.refused!, res.landed) as OpRefusal).code).toBe('PARTIAL');
   });
 
   it('O fails with P put back: "nothing was applied" still holds, and names O', async () => {
@@ -312,6 +319,9 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
     const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
     expect(fs.disk.get(P)).toBe(jsonFileBody(pDoc()));
     expect(res.refused).toBe(`the prefab ${O} file could not be written (the disk is full), so nothing was applied.`);
+    // Nothing landed, so a plain refusal — the accept side of the PARTIAL above. Mutation: set `landed` unconditionally.
+    expect(res.landed).toBeUndefined();
+    expect(prefabApplyRefusal(res.refused!, res.landed)).not.toBeInstanceOf(OpRefusal);
   });
 
   it('an undo refused because O changed outside names O, the document that changed — not P', async () => {

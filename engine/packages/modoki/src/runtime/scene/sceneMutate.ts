@@ -106,6 +106,65 @@ export interface ApplyResult {
    *  `EntityResolveCode`. A single-op call is the common case, so the first failure is the
    *  one that actually blocked the op the caller cares about. */
   code?: EntityResolveCode;
+  /** The ops, by index, that CHANGED something, and the ops that FAILED (#1910) — see {@link partialApplyVerdict}.
+   *  Cleared with `changed` when the runtime-guid tripwire refuses the whole write, since nothing is then written. */
+  appliedOps: number[];
+  failedOps: number[];
+}
+
+/** The verdict for an op list whose ops apply ONE BY ONE (#1910) — both `/api/scene-mutate` paths, file and live.
+ *
+ *  Per-op is the contract, not an accident: what can only be learned while applying (an entity-not-found, a refused
+ *  write) fails ITS op and the ops around it still apply (docs/mcp-tool-conventions.md § "Mutation semantics",
+ *  the "proven wrong BEFORE starting" rule). The defect was the VERDICT. A mixed call answered `ok:false` with the failing op's own code
+ *  (`NOT_FOUND`), and a caller reading that reasonably assumes nothing happened — and fixing the ref and resending the
+ *  whole list would apply the ops that already landed a second time (an `addEntity` makes a duplicate). On the file
+ *  path those ops were already on disk.
+ *
+ *  So a call where something changed AND something failed is `PARTIAL`, with the applied and failed ops named and a
+ *  remedy that says not to resend the list. Decided on `changed`/`errors` alone, so a renderer too old to send the
+ *  op lists still gets the right code; the lists are the detail. `null` when the call was not mixed — all-applied is
+ *  `ok:true`, all-failed keeps its own code, and neither changed anything that a retry could repeat. */
+export function partialApplyVerdict(
+  r: { changed: number; errors: readonly string[]; appliedOps?: readonly number[]; failedOps?: readonly number[]; code?: string },
+  appliedTo: 'live' | 'file',
+): { code: 'PARTIAL'; error: string; options: string[]; appliedOps?: number[]; failedOps?: number[]; failedCode?: string } | null {
+  if (r.changed <= 0 || r.errors.length === 0) return null;
+  const list = (ops: readonly number[]) => ops.map((i) => `op[${i}]`).join(', ');
+  // Counts only for a renderer too old to send the lists.
+  const applied = r.appliedOps?.length ? list(r.appliedOps) : `${r.changed} op(s)`;
+  const failed = r.failedOps?.length ? list(r.failedOps) : 'the ops named in `errors`';
+  // ⚠️ The FILE path's ops are invisible to a live read: modoki_get_scene_state reads the open world, which is another
+  // scene, or this one with the write held until a refresh (#1879). Sending the agent there to "check" shows it
+  // nothing, and it resends the list — the double-apply this verdict exists to stop (close-out review).
+  const where = appliedTo === 'live'
+    ? 'They are in the LIVE world, as ONE undo step with the rest of this call, and not yet on disk.'
+    : 'They are already WRITTEN to the scene file, and modoki_get_scene_state will NOT show them: it reads the open '
+      + 'live world, if an editor is open at all — another scene (which shows them only once loaded), or this one with '
+      + 'the write held until modoki_refresh.';
+  return {
+    code: 'PARTIAL',
+    error: `PARTIALLY APPLIED — ${applied} applied and ${failed} failed. Ops apply one by one, and a failing op does `
+      + `NOT undo the ones that applied: ${where} Do NOT resend the whole list — that applies ${applied} AGAIN `
+      + '(an addEntity makes a duplicate). Fix and resend ONLY the failed ops.',
+    options: [
+      `resend only the failed ops (${failed}), fixed — never the whole list`,
+      ...(appliedTo === 'live'
+        ? [
+          'modoki_get_scene_state — re-read what the applied ops did before retrying',
+          'modoki_history {action:"undo"} — reverts the WHOLE call (it is one undo step), then resend all of it fixed',
+        ]
+        : [
+          'trust this reply\'s receipts (`appliedOps`, `created`, `alsoDeleted`) for what landed — the file already holds them',
+          'modoki_refresh — if this is the open scene, loads the held write, after which modoki_get_scene_state shows it',
+        ]),
+    ],
+    ...(r.appliedOps ? { appliedOps: [...r.appliedOps] } : {}),
+    ...(r.failedOps ? { failedOps: [...r.failedOps] } : {}),
+    // The FIRST coded failure's code (NOT_FOUND / AMBIGUOUS), which PARTIAL replaces — not per op: an uncoded refusal (a
+    // missing 'trait', a refused field) sets none, so with several failed ops it need not be `failedOps[0]`'s.
+    ...(r.code ? { failedCode: r.code } : {}),
+  };
 }
 
 /** How many cascaded descendants a delete reply names before it only counts them. */
@@ -170,14 +229,18 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   let changed = 0;
   // FIRST resolveEntity failure's code, if any op hit one — see `ApplyResult.code`.
   const codeOut: { code?: EntityResolveCode } = {};
+  const appliedOps: number[] = [];
+  const failedOps: number[] = [];
 
   if (!scene || !Array.isArray(scene.entities)) {
-    return { scene, changed: 0, errors: ['scene.entities is missing or not an array'], warnings, unresolved };
+    return { scene, changed: 0, errors: ['scene.entities is missing or not an array'], warnings, unresolved, appliedOps, failedOps };
   }
 
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     const where = `op[${i}] (${op?.op ?? 'unknown'})`;
+    const errorsBefore = errors.length;
+    const changedBefore = changed;
     try {
       if (op.op === 'setTrait') {
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
@@ -361,6 +424,10 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
       }
     } catch (e) {
       errors.push(`${where}: ${String(e)}`);
+    } finally {
+      // `finally`, because every refusal above leaves its op with `continue` (#1910).
+      if (changed > changedBefore) appliedOps.push(i);
+      if (errors.length > errorsBefore) failedOps.push(i);
     }
   }
 
@@ -381,9 +448,10 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     created.length = 0; // nothing is written, so nothing was created
     addedTraits.length = 0; // …and no trait was added to anything
     alsoDeleted = alsoDeletedTally(); // …or removed from the file
+    appliedOps.length = 0; // …so no op is named as applied (`changed = 0` is what keeps the verdict from PARTIAL)
   }
 
-  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(codeOut.code ? { code: codeOut.code } : {}) };
+  return { scene, changed, errors, warnings, unresolved, appliedOps, failedOps, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(codeOut.code ? { code: codeOut.code } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.

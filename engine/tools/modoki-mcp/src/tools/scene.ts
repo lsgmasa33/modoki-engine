@@ -117,6 +117,14 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'subtree, and `alsoDeleted` lists the descendants the call took with the entities it named (as modoki_delete_entities does; ' +
       'on the file-direct path, only entities authored in the file — never a prefab instance\'s members). After ' +
       'mutating, verify with modoki_get_scene_state, which reads the running engine. ' +
+      'OPS APPLY ONE BY ONE, NOT ALL-OR-NOTHING: an op that fails (an entity not found, a refused write) is ' +
+      'skipped and does NOT undo the ops that applied. A call where some applied and some failed answers ' +
+      '`PARTIAL` with `appliedOps`/`failedOps` (op indices) and `failedCode` (the first coded failure) — resend ONLY ' +
+      'the failed ops, never the whole list (that applies the rest again; an addEntity makes a duplicate). On the FILE ' +
+      'path the applied ops are already on disk and modoki_get_scene_state does not show them — the open scene only ' +
+      'after modoki_refresh, another scene only once it is loaded — so trust the receipts. ' +
+      '(Refused whole, BEFORE anything applies: an unknown field on a known trait, once the editor has sent its trait ' +
+      'schema; and on the file path, a runtime guid anywhere in the result.) ' +
       'PERSISTENCE (mcp-persistence.md): when the editor has this exact scene open, the ' +
       'whole call applies to the LIVE world as ONE undoable step (a human can Cmd-Z it) and stays ' +
       'live-only until modoki_save_all — persistence is MANUAL-only, so `saved:false` is the normal ' +

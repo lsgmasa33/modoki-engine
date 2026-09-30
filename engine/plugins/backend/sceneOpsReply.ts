@@ -51,6 +51,10 @@ export type SceneOpsLiveReply = {
   options?: string[];
   /** Why the first failure's runtime guid missed — `'despawned'` | `'world-swapped'` (#1223 D4). */
   stale?: string;
+  /** The ops that changed something / failed, by index (#1910). Lenient: an older renderer omits them, and the route
+   *  still answers PARTIAL from `changed`/`errors` — only the op names are lost. */
+  appliedOps?: number[];
+  failedOps?: number[];
 };
 
 export type SceneOpsOutcome =
@@ -60,6 +64,9 @@ export type SceneOpsOutcome =
 
 function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((s) => typeof s === 'string');
+}
+function isIndexArray(v: unknown): v is number[] {
+  return Array.isArray(v) && v.every((n) => Number.isInteger(n) && n >= 0);
 }
 
 export function decodeSceneOpsReply(raw: unknown): SceneOpsOutcome {
@@ -99,6 +106,8 @@ export function decodeSceneOpsReply(raw: unknown): SceneOpsOutcome {
       ...(typeof o.code === 'string' ? { code: o.code as ErrorCode } : {}),
       ...(isStringArray(o.options) ? { options: o.options } : {}),
       ...(typeof o.stale === 'string' ? { stale: o.stale } : {}),
+      ...(isIndexArray(o.appliedOps) ? { appliedOps: o.appliedOps } : {}),
+      ...(isIndexArray(o.failedOps) ? { failedOps: o.failedOps } : {}),
     },
   };
 }

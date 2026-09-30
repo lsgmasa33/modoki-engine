@@ -19,6 +19,16 @@ import { notePendingHeader } from './pendingStamp.js';
 import { PENDING_OUTSIDE_HEADER } from '../../shared/pendingOutside.js';
 import { buildLogLines, buildLogTail, writeBuildLog } from './buildLog.js';
 
+/** `why` for a 200 failure: a PARTIAL body's own `error` leads (#1910 close-out review). `failureDetail` prefers
+ *  `errors[]`, which for a mixed op list is just the failing op's text — word for word the old NOT_FOUND — so the
+ *  sentence saying the other ops ALREADY applied, and not to resend them, reached the agent only inside `got`. */
+function partialWhy(body: unknown, detail: string): string {
+  const b = body as { code?: unknown; error?: unknown } | null;
+  return b && b.code === 'PARTIAL' && typeof b.error === 'string' && b.error && !detail.startsWith(b.error)
+    ? `${b.error} — ${detail}`
+    : detail;
+}
+
 export type ToolContext = {
   /** Backend base URL, trailing slash stripped. Interpolated into error messages. */
   backend: string;
@@ -390,7 +400,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
             // uncoded `{ok:false, …}` may carry options too — so both paths relay them.
             ...(optionsFromBody(body) ? { options: optionsFromBody(body)! } : {}),
             what: label,
-            why: failure.split('\n\nfull response:')[0],
+            why: partialWhy(body, failure.split('\n\nfull response:')[0]),
             got: body,
             ...(opts?.gotBudget ? { gotBudget: opts.gotBudget } : {}),
           })

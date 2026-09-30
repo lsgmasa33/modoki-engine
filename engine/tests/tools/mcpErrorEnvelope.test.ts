@@ -111,6 +111,30 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(JSON.stringify(e.got)).toContain('changed');
   });
 
+  // #1910 close-out review: `failureDetail` prefers `errors[]`, which for a mixed op list is only the failing op's text,
+  // so the sentence saying the rest ALREADY applied reached the agent only inside `got`. Mutation: make `partialWhy`
+  // return `detail` — `why` is the bare NOT_FOUND text again.
+  it('a 200 PARTIAL leads `why` with its own `error`, then the per-op errors', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scene-mutate'
+        ? { body: { ok: false, changed: 1, code: 'PARTIAL', errors: ['op[1] (setTrait): no entity matching'], error: 'PARTIALLY APPLIED — do not resend' } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_mutate_scene', { path: '/assets/scenes/main.scene.json', ops: [{ op: 'setTrait', entity: { name: 'A' }, trait: 'Transform', fields: { x: 1 } }] }));
+    expect(e.code).toBe('PARTIAL');
+    expect(e.why).toBe('PARTIALLY APPLIED — do not resend — op[1] (setTrait): no entity matching');
+  });
+
+  // The accept side: a PARTIAL body with `error` and NO `errors[]` (the unreadable apply-scene-ops branch, player-prefs)
+  // already has `error` as its detail, so it passes through once. Mutation: drop the `startsWith` guard — "X — X".
+  it('a 200 PARTIAL whose detail already IS its `error` is not doubled', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path === '/api/scene-mutate'
+        ? { body: { ok: false, code: 'PARTIAL', error: 'apply-scene-ops answered a shape this build cannot read' } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_mutate_scene', { path: '/assets/scenes/main.scene.json', ops: [{ op: 'setTrait', entity: { name: 'A' }, trait: 'Transform', fields: { x: 1 } }] }));
+    expect(e.why).toBe('apply-scene-ops answered a shape this build cannot read');
+  });
+
   // QA-TOOL-0003 — `codeFromBody` (context.ts): a backend that names a SPECIFIC code wins over
   // the generic status-derived one, at both `isFailureBody` refusal sites (getJson's
   // checkFailure branch, and the POST branch here). MEASURED live: with two entities named

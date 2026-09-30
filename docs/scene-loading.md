@@ -3216,8 +3216,10 @@ stability on disk" above) — they never round-trip to disk as-is.
   Inspector field does not call it directly — it parks, and the flush is the caller.
 
 `errors` are **hard** (entity not found, malformed op) — those ops are skipped;
-the caller decides whether to still write (the `/api/scene-mutate` endpoint only
-persists when `changed > 0`, so a typo leaves the file untouched). `warnings` are
+the caller decides whether to still write (the `/api/scene-mutate` endpoint
+persists when `changed > 0`: a call whose EVERY op failed leaves the file untouched, and a mixed
+call writes the ops that applied and answers `PARTIAL` with `appliedOps`/`failedOps` — #1910,
+[mcp-tool-conventions.md](./mcp-tool-conventions.md) § "Mutation semantics"). `warnings` are
 **soft** — the op applied but the result is suspect: `addEntity` under a
 non-existent parent (orphan), or a surviving `UIAction.target` left dangling by a
 `removeEntity`. Neither blocks the write; the agent reads them to self-correct.

@@ -113,6 +113,10 @@ export interface ApplyResult {
    *  A refusal is the opposite shape: nothing landed, and there was no move. Sharing the channel
    *  produced "1 move was not applied: prefab format 6 is newer than 5", which is wrong twice over. */
   refused?: string;
+  /** Set WITH `refused` when part of the Apply is on disk anyway: a file written that the rollback could not put back
+   *  (#1732), or a prefab written while the world it began in was replaced (#1667). "Refused" alone reads as "nothing
+   *  happened", which is false there, so the agent op answers PARTIAL rather than a plain refusal (#1910's family). */
+  landed?: true;
 }
 
 /** Shared no-op result so every early return is consistent. */
@@ -1325,14 +1329,15 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     const stranded = committed.stranded?.length
       ? ` ${committed.stranded.join(' and ')} ${committed.stranded.length === 1 ? 'was' : 'were'} written and could not be put back, so it holds the Apply on disk while the editor still shows it as it was: reopen the scene to pick that up before applying again.`
       : '';
+    const landed = stranded ? { landed: true as const } : {};
     return committed.conflict
-      ? { ...NOOP_APPLY, refused: `${which} changed on disk since the editor read it (a save elsewhere, an outside edit or a \`git pull\`), so it was left as it is.${stranded || ' Reopen the scene to pick up the change, then apply again.'}` }
-      : { ...NOOP_APPLY, refused: `${which} file could not be written${committed.error ? ` (${committed.error})` : ''}, so ${stranded ? 'the Apply did not land.' + stranded : 'nothing was applied.'}` };
+      ? { ...NOOP_APPLY, ...landed, refused: `${which} changed on disk since the editor read it (a save elsewhere, an outside edit or a \`git pull\`), so it was left as it is.${stranded || ' Reopen the scene to pick up the change, then apply again.'}` }
+      : { ...NOOP_APPLY, ...landed, refused: `${which} file could not be written${committed.error ? ` (${committed.error})` : ''}, so ${stranded ? 'the Apply did not land.' + stranded : 'nothing was applied.'}` };
   }
   // The world the Apply began in was replaced while it wrote: the file holds the Apply, the new world was built from
   // it, and nothing here can be undone against that world. Said, not hidden (#1667).
   if (committed.worldLeft) {
-    return { ...NOOP_APPLY, refused: 'the scene changed while the Apply wrote the prefab: the prefab was written, but the instances and the undo history of the scene it began in were not updated.' };
+    return { ...NOOP_APPLY, landed: true, refused: 'the scene changed while the Apply wrote the prefab: the prefab was written, but the instances and the undo history of the scene it began in were not updated.' };
   }
 
   // Those promoted additions are now prefab members in the live world, but the scene file on disk still lists them as

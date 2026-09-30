@@ -290,7 +290,7 @@ import {
 } from '../../project-config';
 import { validateSceneData, validatePrefabData, fieldValueWarning, jsonBankWarnings, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
+import { applyOps, partialApplyVerdict, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
 import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../tools/shared/waitForTiming';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
@@ -3157,6 +3157,8 @@ async function describeUnresolvedAgainstLiveWorld(
             });
           }
           const live = decoded.reply;
+          // A mixed call (something applied, something failed) is PARTIAL, not the failing op's own code (#1910).
+          const partial = partialApplyVerdict(live, 'live');
           // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
           // every live call now, and the hint says how to persist — the field is kept (rather
           // than dropped) because callers already branch on it and `false` is meaningful.
@@ -3191,6 +3193,8 @@ async function describeUnresolvedAgainstLiveWorld(
             // dropped both, so a stale runtime guid reached the agent as a bare NOT_FOUND.
             ...(live.options ? { options: live.options } : {}),
             ...(live.stale ? { stale: live.stale } : {}),
+            // Last, so PARTIAL replaces the failing op's code; that op's own options still follow the partial ones.
+            ...(partial ? { ...partial, options: [...partial.options, ...(live.options ?? [])] } : {}),
           });
         } catch (e) {
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
@@ -3330,7 +3334,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // The schema carries each trait's category, which a file does not: the parent rule's resource half needs it (#1825).
       const schema = ctx.getSchema();
       const resourceTraits = schema ? new Set(Object.entries(schema.traits).filter(([, t]) => t.category === 'resource').map(([name]) => name)) : undefined;
-      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code: applyCode } = applyOps(scene, ops, undefined, { resourceTraits, syntheticIds: backfilledIds });
+      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code: applyCode, appliedOps, failedOps } = applyOps(scene, ops, undefined, { resourceTraits, syntheticIds: backfilledIds });
       // Surface BOTH the op-level warnings (dangling refs / re-rooted parents)
       // and the post-apply schema validation warnings.
       const { warnings: schemaWarnings } = validateSceneData(scene, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
@@ -3361,8 +3365,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // (The unknown-field guard that used to live here now runs PRE-FLIGHT, above the live/file
       // branch — see `detectFieldTypos`. Down here it was unreachable from the live path.)
       const allErrors = errors;
-      // Only persist when at least one op succeeded — a structural-op error
-      // (entity-not-found) leaves the file untouched so a typo is a no-op.
+      // Persist when ANY op changed something. A call whose every op failed leaves the file untouched, so a typo is a
+      // no-op — but a MIXED call writes the ops that applied, and answers PARTIAL below (#1910). This comment used to
+      // say an entity-not-found "leaves the file untouched", which held only when every op failed.
       // Written HERE, immediately after applyOps and with no `await` in between since the
       // read above — the liveHint lookup below is async (a round-trip to the browser) and
       // used to sit BEFORE this write, leaving a window where a concurrent writer to the
@@ -3384,6 +3389,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // applyOps is pure (file-only) and CANNOT know; this route can ASK the renderer, so
       // the explanation belongs here. One probe, only when something failed to resolve.
       const liveHint = unresolved.length ? await describeUnresolvedAgainstLiveWorld(ctx, unresolved) : null;
+      const partial = partialApplyVerdict({ changed, errors: allErrors, appliedOps, failedOps, code: applyCode }, 'file');
       // Do NOT echo the scene by default. A `setTrait` always changes something, so this
       // fired on EVERY edit — ~10k tokens of agent context per call, on the hottest write
       // path, and nobody read it. It is also the wrong data: this is the pre-expansion
@@ -3396,6 +3402,8 @@ async function describeUnresolvedAgainstLiveWorld(
         // has to infer it from `changed`/`ok`. Phase 2 gives mutate_scene a live-world
         // path where `saved` can be false in 'manual' mode — until then it mirrors `changed > 0`.
         saved: changed > 0,
+        // The tool description promises `mode` on every reply; this branch used to omit it (#1910).
+        mode: PERSISTENCE_MODE,
         // What each addEntity CREATED — {op, id, guid, name} (S3.12). The agent must not have to
         // re-find its own new entity by name (which this surface refuses when ambiguous).
         ...(created?.length ? { created } : {}),
@@ -3406,6 +3414,8 @@ async function describeUnresolvedAgainstLiveWorld(
         ...(liveHint || changed > 0 ? { hint: [liveHint, changed > 0 ? REFRESH_HINT : null].filter(Boolean).join(' ') } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
         ...(applyCode ? { code: applyCode } : {}),
+        // Last, so PARTIAL replaces the failing op's code — the live branch's shape (#1910).
+        ...(partial ?? {}),
       });
     } catch (e) {
       return json({ error: e instanceof Error ? e.message : String(e) }, 500);

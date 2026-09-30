@@ -648,6 +648,15 @@ function throwAddressRefusal(r: { code?: ErrorCode; error: string; options?: str
   throw new Error(r.error);
 }
 
+/** A refused prefab Apply, as the op throws it. When part of it LANDED on disk anyway (`ApplyResult.landed` — a file the
+ *  rollback could not put back, or the world replaced mid-write) it is PARTIAL, not an uncoded refusal: "refused" reads
+ *  as "nothing happened", and an agent repeats an Apply it believes did nothing (#1910's family). */
+export function prefabApplyRefusal(refused: string, landed?: boolean): Error {
+  return landed
+    ? new OpRefusal('PARTIAL', `prefab apply refused, but part of it is ON DISK: ${refused} Do NOT repeat the apply as though nothing happened — the refusal above says what was written and what to reload before applying again.`)
+    : new Error(`prefab apply refused: ${refused}`);
+}
+
 /** A SET member (`set-selection`/`delete-entities`): its live id, or null when it matched nothing, so
  *  the op can skip it and say so. Any OTHER refusal throws, and refuses the whole call: an `{id}` naming
  *  an entity that has a guid (#1223 D2), or a guid given beside an id (D1), is a wrong address, and
@@ -1087,6 +1096,8 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   created: Array<{ op: number; id: number; guid: string; name: string }>;
   addedTraits?: Array<{ op: number; id: number; guid: string; trait: string }>;
   code?: ErrorCode; options?: string[]; stale?: string;
+  /** #1910 — the file path's twin (`ApplyResult.appliedOps`/`failedOps`); the route turns a mixed call into PARTIAL. */
+  appliedOps: number[]; failedOps: number[];
 } & AlsoDeletedFields> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -1107,12 +1118,16 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   let code: ErrorCode | undefined;
   // …and that failure's `options`/`stale`, which travel with the code (#1223 D4).
   let first: { options?: string[]; stale?: string } | undefined;
+  const appliedOps: number[] = [];
+  const failedOps: number[] = [];
   const allTraitsList = getAllTraits();
 
   await runAsCompositeAction({ label: `Mutate Scene (${ops.length} op${ops.length === 1 ? '' : 's'})`, kind: '!mutate' }, () => {
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       const where = `op[${i}] (${op?.op ?? 'unknown'})`;
+      const errorsBefore = errors.length;
+      const changedBefore = changed;
       try {
         if (op.op === 'setTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
@@ -1241,11 +1256,15 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
         }
       } catch (e) {
         errors.push(`${where}: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        // `finally`, because every refusal above leaves its op with `continue` — the file path's shape (#1910).
+        if (changed > changedBefore) appliedOps.push(i);
+        if (errors.length > errorsBefore) failedOps.push(i);
       }
     }
   });
 
-  return { changed, errors, warnings, unresolved, created, ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(code ? { code } : {}),
+  return { changed, errors, warnings, unresolved, created, appliedOps, failedOps, ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(code ? { code } : {}),
     ...(code && first?.options?.length ? { options: first.options } : {}), ...(code && first?.stale ? { stale: first.stale } : {}) };
 }
 
@@ -3284,8 +3303,8 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code, options, stale } = await applySceneOpsLive(p.ops);
-    return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
+    const { changed, errors, warnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code, options, stale, appliedOps, failedOps } = await applySceneOpsLive(p.ops);
+    return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false, appliedOps, failedOps,
       ...(created.length ? { created } : {}), ...(addedTraits ? { addedTraits } : {}),
       ...(alsoDeleted ? { alsoDeleted } : {}), ...(alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds } : {}), ...(alsoDeletedTotal ? { alsoDeletedTotal } : {}),
       ...(code ? { code } : {}), ...(options ? { options } : {}), ...(stale ? { stale } : {}) };
@@ -3654,7 +3673,7 @@ export function registerEditorAgentOps(): void {
           // A REFUSAL states its own cause; leading with the "may have stopped being a prefab
           // instance" guess before appending the real reason sends the reader down the wrong path
           // (#1468 close-out review F4). That guess is right only when nothing else explains it.
-          if (result.refused) throw new Error(`prefab apply refused: ${result.refused}`);
+          if (result.refused) throw prefabApplyRefusal(result.refused, result.landed);
           // Keys not applied WITH a reason (a move the prefab cannot express, a key into a frame whose prefab is missing,
           // #1831) are the cause: lead with them, and keep the guess for when nothing explains it.
           if (notWritten.length) throw new Error(`prefab apply: nothing was written. Not applied: ${notWritten.map((x) => `${x.key} (${x.reason})`).join('; ')}.`);

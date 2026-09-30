@@ -166,6 +166,23 @@ describe('apply-scene-ops: one call, one undo entry, regardless of op count', ()
     expect(r.errors[0]).toMatch(/no LIVE entity/);
   });
 
+  // #1910: the route turns a mixed call into PARTIAL and names the ops — it can only name what this op reports.
+  // Mutation: drop either push in the loop's `finally` — its list comes back empty.
+  it('reports WHICH ops applied and which failed, by index (a refusal that `continue`s still counts)', async () => {
+    const a = await createBox();
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [
+        { op: 'setTrait', entity: { guid: a.guid }, trait: 'Transform', fields: { x: 3 } },
+        { op: 'setTrait', entity: { guid: 'no-such-guid' }, trait: 'Transform', fields: { x: 1 } },
+        { op: 'setTrait', entity: { guid: a.guid }, trait: 'Transform', fields: { x: 5 } },
+        { op: 'setTrait', entity: { guid: a.guid }, trait: 'NoSuchTrait', fields: { v: 1 } },
+      ],
+    }) as { changed: number; appliedOps: number[]; failedOps: number[] };
+    expect(r.changed).toBe(2);
+    expect(r.appliedOps).toEqual([0, 2]);
+    expect(r.failedOps).toEqual([1, 3]);
+  });
+
   // The router (editorBackendRouter.ts) never actually routes a setBaseScene-bearing call
   // here — it keeps the whole call file-direct instead. This locks the op's OWN defense in
   // depth for any other caller.
