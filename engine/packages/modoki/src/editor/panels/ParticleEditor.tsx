@@ -7,7 +7,7 @@
  *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
-import { useEffect, useRef, useState, useCallback, useContext } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
 import { jsonFileBody } from '../backend/editorBackend';
 import { writeNewAssetDocument, newAssetRefusalText } from '../scene/createAssetDocument';
@@ -28,8 +28,7 @@ import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
 import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
-import { applyWheelStep, useWheelStep, BufferedFieldScope } from './fields';
-import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from './bufferedEcho';
+import { applyWheelStep, useWheelStep, useBufferedValue, BufferedFieldScope } from './fields';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
@@ -843,10 +842,10 @@ function Hint({ text }: { text: string }) {
   );
 }
 
-/** The value {@link NumInput}'s `handle` would push upstream for this text, or `null` when it
- *  pushes nothing (mid-typing: '', '-', '.'). **One definition, because the re-sync effect has to
- *  ask the same question** — a second copy of the clamp would drift, and the two disagreeing is
- *  exactly a buffer that re-syncs when it should not. */
+/** The value {@link NumInput} would push upstream for this text, or `null` when it pushes nothing
+ *  (mid-typing: '', '-', '.'). **One definition, because the re-sync has to ask the same question as
+ *  the commit** — `NumInput` builds both its `validate` and its `parse` for `useBufferedValue` from
+ *  it, and a second copy of the clamp would drift into a buffer that re-syncs when it should not. */
 function committedValueOf(raw: string, min?: number, max?: number): number | null {
   const n = parseFloat(raw);
   if (!Number.isFinite(n)) return null;
@@ -863,65 +862,37 @@ function committedValueOf(raw: string, min?: number, max?: number): number | nul
  *  (preserving in-progress `-`, `.`, `-.5`, …) and only push a value upstream when the
  *  text parses to a finite number; on blur we resync to the committed value. */
 function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, width }: { uiId?: string; uiLabel?: string; value: number; on: (v: number) => void; title?: string; min?: number; max?: number; step?: number; disabled?: boolean; width: number }) {
-  const [local, setLocal] = useState(String(value));
-  const focused = useRef(false);
+  // ⭐ The buffer is `useBufferedValue`'s — the Inspector's, not a copy (#1905: this field carried its
+  // own copy of the focus hold, and an undo had to be fixed twice). It brings the echo guard that
+  // makes it safe in an unfocused window (#242: typing `-3.5` into a field clamped at 0 used to
+  // commit 0.5 there, because the echo of the clamped `-3` rewrote the buffer; #1411: a late echo
+  // dropping a keystroke) and the undo that ends an edit even while focused (#1905).
+  // `committedValueOf` returning null (mid-typing: '', '-', '.') is the hook's `validate`: keep the
+  // text, push nothing. So `parse` only ever sees text that commits.
+  // `NaN`, not a fallback value: `resyncBuffered` also asks whether the text already MEANS the store's
+  // value, and a mid-typing `-` means none — a genuine external change must replace it, as before.
+  const parse = useCallback((raw: string) => committedValueOf(raw, min, max) ?? NaN, [min, max]);
+  const commits = useCallback((raw: string) => committedValueOf(raw, min, max) !== null, [min, max]);
+  const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, on, parse, false, commits);
   const ref = useRef<HTMLInputElement>(null);
   const valueRef = useRef(value);
   valueRef.current = value;
-  // ⚠️ **`focused` ALONE CANNOT GUARD THIS — Chromium dispatches `focus`/`blur` only while
-  // `document.hasFocus()` (#242, and #233's rule: nothing in the editor may depend on a focus event
-  // firing).** With the window behind another one no focus event lands, so this effect ran mid-edit
-  // and the field's OWN commit was what clobbered it. Concretely, on one of the clamped fields here
-  // (25 of the 38 carry a `min`/`max`): typing `-3.5` into a field showing 0.4 pushes nothing for
-  // `-`, clamps `-3` to 0, and the echo of that 0 rewrote the buffer to '0' — so the rest of the
-  // keystrokes landed on it and the field committed **0.5**. Focused, the same typing commits 0.
-  // Focus decided the result, which is the bug. Measured on demos/particle-demo's comet effect.
-  //
-  // ⭐ So the guard is the ECHO: when the text on screen would commit exactly the value already in
-  // the store, re-syncing can only reformat it, which is the destruction itself and never new
-  // information. A real external change (a preset load, an undo, retargeting the panel) does not
-  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`, through the same
-  // `resyncBuffered` — which also skips a LATE echo of an earlier keystroke (#1411: the echo of
-  // `…3` arriving after `…35` was typed would otherwise rewrite it and drop the `5`).
-  const localRef = useRef(local);
-  localRef.current = local;
-  const pendingRef = useRef<PendingCommit<number | null>[]>([]);
-  const scope = useContext(BufferedFieldScope);
-  const scopeRef = useRef(scope);
-  useEffect(() => {
-    if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
-    if (focused.current) return;
-    const r = resyncBuffered<number | null>(localRef.current, value, pendingRef.current, (raw) => committedValueOf(raw, min, max), performance.now());
-    pendingRef.current = r.pending;
-    if (r.text !== null) setLocal(r.text);
-  }, [value, min, max, scope]);
-  const handle = (raw: string) => {
-    setLocal(raw);
-    localRef.current = raw;
-    const c = committedValueOf(raw, min, max);
-    if (c === null) return; // mid-typing ("", "-", ".") — keep the text, push nothing
-    on(c);
-    const now = performance.now(); // after the write — see useBufferedValue
-    pendingRef.current = [...pendingRef.current.filter((p) => now - p.at <= ECHO_WINDOW_MS), { value: c, at: now }];
-  };
   // Mouse-wheel adjust (focused only); Shift = ×10. Steps from the shown value, falling
-  // back to the committed value mid-typing. Writes local + upstream directly (the wheel
-  // only fires while focused, so the value→local resync effect won't clobber it).
+  // back to the committed value mid-typing. Commits through `handleChange`, so the step is recorded
+  // as this field's own commit and its echo cannot rewrite the text.
   const onStep = useCallback((dir: 1 | -1, mult: number) => {
     const cur = parseFloat(ref.current?.value ?? '');
-    const next = applyWheelStep(Number.isFinite(cur) ? cur : valueRef.current, dir, step ?? 0.1, mult, min, max);
-    setLocal(String(next));
-    on(next);
-  }, [on, step, min, max]);
+    handleChange(String(applyWheelStep(Number.isFinite(cur) ? cur : valueRef.current, dir, step ?? 0.1, mult, min, max)));
+  }, [handleChange, step, min, max]);
   useWheelStep(ref, onStep, !disabled);
   return (
     <input
       ref={ref}
       data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel}
-      type="text" inputMode="decimal" title={title} value={local} disabled={disabled}
-      onFocus={() => { focused.current = true; }}
-      onBlur={() => { focused.current = false; pendingRef.current = []; setLocal(String(value)); }}
-      onChange={(e) => handle(e.target.value)}
+      type="text" inputMode="decimal" title={title} value={localValue} disabled={disabled}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      onChange={(e) => handleChange(e.target.value)}
       style={{ ...input, width }}
     />
   );

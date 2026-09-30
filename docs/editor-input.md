@@ -415,6 +415,10 @@ Two consequences that are easy to get wrong, both of which cost a real bug in #2
 The same applies to `onFocus`: any state it gates is dead in an unfocused window. Drive
 "is the user mid-edit?" from `onChange`, which fires regardless.
 
+That "mid-edit" flag has to END on an undo, too — see § "An undo ENDS the edit" below (#1905). The
+Animation panel's `NumBox` did not, and the blur after a Cmd+Z committed the typed text on top of the
+undo.
+
 ### A per-keystroke commit needs a THIRD pattern: guard on the ECHO, not on focus (#242)
 
 The two rules above fit a field that commits on a terminal signal. A field that commits on **every
@@ -433,7 +437,7 @@ and still re-syncs.
 
 ```tsx
 useEffect(() => {
-  if (focusedRef.current) return;
+  if (holdsBufferedText(editRef.current)) return;   // focused and mid-edit; an undo ends it (#1905)
   setLocalValue((cur) => (Object.is(parse(cur), externalValue) ? cur : String(externalValue)));
 }, [externalValue]);
 ```
@@ -473,8 +477,8 @@ was gone — about one character lost per run, at a random position. A focused w
 because `focusedRef` skips the whole re-sync.
 
 **The fix: the field remembers what it committed.** `resyncBuffered`
-(`editor/panels/bufferedEcho.ts`) is the whole decision, shared by `useBufferedValue` and
-`ParticleEditor`'s `NumInput`:
+(`editor/panels/bufferedEcho.ts`) is the whole decision, inside `useBufferedValue` — which
+`ParticleEditor`'s `NumInput` also uses since #1905, rather than its own copy:
 
 - A store value that equals the text on screen → keep the text (the #242 rule).
 - A store value found in the field's pending commits → a late echo: keep the text, and drop that
@@ -494,8 +498,9 @@ The memory is cleared three ways, and each one closes a stale-memory failure the
 
 **One ambiguity is deliberate, and cannot be closed without an identity on the echo.** Echoes are
 coalesced, so `1`, `12`, then a backspace to `1` in one frame is answered by ONE echo of `1`. That
-consumes the first `1`, and `12` lingers for up to a second. An undo to `12` inside that second is
-skipped and the field shows `1`. Clearing on a match with the LATEST entry would fix this and bring
+consumes the first `1`, and `12` lingers for up to a second. A gizmo drag or another panel setting
+`12` inside that second is skipped and the field shows `1`. (An UNDO to `12` no longer is: an undo
+clears the record, #1905.) Clearing on a match with the LATEST entry would fix this and bring
 #1411 back whenever echoes are not coalesced, which is the worse trade. As with the clamp above:
 in an agent-driven session, read the value back from the store, never off the field.
 
@@ -568,6 +573,44 @@ really does reformat a fractional input, so a refusal is true.
 Tests: `bufferedEcho.test.ts` § "at a display precision", `fields.test.tsx` § #1407 and
 `colorFieldHex.test.tsx` § #1407. Seven
 mutations were checked, each caught by its own test only.
+
+### An undo ENDS the edit — even while the field is focused (#1905)
+
+Every rule above protects a buffer FROM the store. One external change must go the other way.
+**Observed:** Cmd+Z with the Particle Editor's Max Particles field still focused undid the def to
+`400` while the field kept showing `777` until blur. A wheel tick then committed `777 ± 50` on top of
+the undo. The same happened on the Inspector's `Transform.x`. The focus hold ran first, so the undo
+never reached `resyncBuffered`, even though that function's own doc named an undo as a change that
+re-syncs.
+
+**Unity's rule, which this copies:** on `UndoRedoPerformed`, the active text field calls
+`EndEditing()` and replaces its text with the undone value (`EditorGUI.cs`; the citations are on
+#1905). The field stays focused.
+
+- **The signal is `subscribeUndoRedoStep`** (`editor/undo/undoRedoStep.ts`). `undoManager`'s
+  `runStep` notifies it once per undo or redo, after the step's data moved. `subscribeUndo` cannot
+  serve here: it also fires on every `pushAction`, and a field's own keystrokes push. It is a leaf
+  module so that `fields.tsx` stays free of the store.
+- **The hold is a state machine**, `nextBufferedEdit` / `holdsBufferedText` in `bufferedEcho.ts`.
+  Focus arms it. A keystroke or wheel step re-arms it. An undo/redo ends it without blurring. Blur
+  releases it. "Ended" rather than "re-sync once" matters because the Inspector reads ECS a render
+  after the step, so the undone value can land after the notification. With the hold off, the normal
+  re-sync path takes it.
+- **On a step, `useBufferedValue` also drops its pending record** and shows the store's value.
+  Otherwise an undo back to a value typed a moment ago reads as a late echo (#1411) and is skipped.
+- **`useUndoRedoStep` (`fields.tsx`) is the one hook** for any field that holds typed text against
+  the store. `useBufferedValue` (the Inspector, `NumberField`/`ColorField`, and now `NumInput`) and
+  the Animation panel's `NumBox` use it. For `NumBox`, which commits on blur, ending the edit also
+  **discards the uncommitted text**, as Unity does. Otherwise the blur committed it on top of the undo
+  (confirmed by a revert-run).
+- Blur still re-syncs and never re-commits.
+
+Not the same mechanism, and left alone: `SpriteEditor`'s fields (its own undo stack; its ⌘Z yields to
+native text undo while a field is focused), and the uncontrolled `defaultValue` inputs (the
+Skin Editor's part/bone names, the rename boxes), which never re-sync at all.
+
+Tests: `bufferedEcho.test.ts` § `nextBufferedEdit`, `undoRedoStepSignal.test.ts` (fires on steps
+only, after the data moved), and `fields.test.tsx` § #1905 (the hook, through the real undo stack).
 
 ### And the mirror-image trap: Escape, in a window that IS focused
 

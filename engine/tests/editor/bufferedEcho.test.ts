@@ -5,7 +5,7 @@
  *  Each case replays a sequence the live editor produced; the #1411 one is the measured
  *  `…qr`-over-`…qrs` clobber. */
 import { describe, it, expect } from 'vitest';
-import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
+import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEditEvent, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
 import { parseNumber, parseString } from '../../packages/modoki/src/editor/panels/fields';
 
 const commits = <T,>(...values: T[]): PendingCommit<T>[] => values.map((value) => ({ value, at: 0 }));
@@ -100,5 +100,43 @@ describe('resyncBuffered', () => {
       expect(at2.same(-0.001, 0)).toBe(true);
       expect(at2.format(-0.001)).toBe('0');
     });
+  });
+});
+
+/** #1905: the hold a focused field keeps against the store, and the undo that ends it. Replays the
+ *  observed sequence: focus the field, type, Cmd+Z with it still focused. */
+describe('nextBufferedEdit / holdsBufferedText', () => {
+  const run = (...events: BufferedEditEvent[]) => events.reduce(nextBufferedEdit, IDLE_EDIT);
+
+  it('holds the typed text while focused, so a store change cannot clobber an edit in flight', () => {
+    expect(holdsBufferedText(run('focus'))).toBe(true);
+    expect(holdsBufferedText(run('focus', 'input', 'input'))).toBe(true);
+  });
+
+  it('#1905: an undo or redo while focused ends the hold, and the field stays focused', () => {
+    const s = run('focus', 'input', 'undoRedo');
+    expect(holdsBufferedText(s)).toBe(false);
+    expect(s.focused).toBe(true);
+    // A second step (redo after the undo) keeps it ended.
+    expect(holdsBufferedText(nextBufferedEdit(s, 'undoRedo'))).toBe(false);
+  });
+
+  it('#1905: the next keystroke or wheel step after the undo starts a new edit, which holds again', () => {
+    expect(holdsBufferedText(run('focus', 'input', 'undoRedo', 'input'))).toBe(true);
+  });
+
+  it('#1905: a focus after the undo starts a new edit too', () => {
+    // An undo in an unfocused window (no blur ever fired), then a click into the field: no blur
+    // separates the two, so the focus itself must clear the ended edit.
+    expect(holdsBufferedText(run('undoRedo', 'focus'))).toBe(true);
+  });
+
+  it('blur releases the hold', () => {
+    expect(holdsBufferedText(run('focus', 'input', 'blur'))).toBe(false);
+  });
+
+  it('#242: with no focus event (unfocused window) typing never arms the hold; the echo checks carry it', () => {
+    expect(holdsBufferedText(run('input', 'input'))).toBe(false);
+    expect(holdsBufferedText(run('input', 'undoRedo', 'input'))).toBe(false);
   });
 });

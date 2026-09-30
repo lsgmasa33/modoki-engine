@@ -5,6 +5,7 @@ import { markSceneDirty } from '../scene/sceneDirty';
 import { reportStepShortfall, reportUndoThrew, UndoRefusedError } from './undoFailure';
 import { _resetStepWindow, closeStepWindow, currentStepWindow, openStepWindow } from './stepWindow';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
+import { notifyUndoRedoStep } from './undoRedoStep';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
@@ -438,6 +439,9 @@ export function subscribeUndo(listener: () => void): () => void {
 /** Stable version snapshot — bumps on every stack mutation. */
 export function getUndoVersion(): number { return _version; }
 
+// Re-exported so the undo API stays in one place; the signal itself lives in a leaf module (#1905).
+export { subscribeUndoRedoStep } from './undoRedoStep';
+
 // ── "has the WORLD been edited since save?" (C7) ──────────────────────────────
 // Distinct from _version, which also bumps on SELECTION (selection deliberately pushes undo
 // entries — see CLAUDE.md), so _version would read as "unsaved work" after a mere click.
@@ -731,6 +735,7 @@ async function runStep(
   if (!worldGone && !refused && !leavesSceneFile(action)) notifyEdited(); // the world moved relative to disk
   if (!worldGone && !refused) markAffectedScenesDirty(action);
   notifyUndoChanged();
+  notifyUndoRedoStep(); // after the step's data moved: a field ending its edit reads the undone value (#1905)
   const payload = buildEditorPayload(action);
   if (!ok) payload.failed = true;
   if (worldGone) payload.dropped = true; // it ran, and it is on neither stack

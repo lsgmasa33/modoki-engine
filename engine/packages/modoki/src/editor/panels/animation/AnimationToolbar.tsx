@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { timeToFrame } from './timelineMath';
-import { Tooltip } from '../fields';
+import { Tooltip, useUndoRedoStep } from '../fields';
 import { saveStatusLabel } from '../useParkedAssetDoc';
 
 /** A toolbar button with a custom hover tooltip. Native HTML `title` tooltips do
@@ -197,6 +197,17 @@ export function NumBox({ value, onSet, min, step, width, title }: { value: numbe
     lastCommittedRef.current = null;
     if (!editingRef.current) setLocal(String(value));
   }, [value]);
+  // An undo or redo ENDS the edit and drops the uncommitted text (#1905, Unity's
+  // `UndoRedoPerformed`). Otherwise the field went on showing the typed text over the undone value,
+  // and the blur that follows COMMITTED it on top of the undo.
+  // `value` may still be the pre-step one; `editingRef` is off, so the effect above re-syncs when
+  // the step's value lands.
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  useUndoRedoStep(() => {
+    editingRef.current = false;
+    setLocal(String(valueRef.current));
+  });
   const commit = () => {
     editingRef.current = false;
     const n = parseFloat(local);

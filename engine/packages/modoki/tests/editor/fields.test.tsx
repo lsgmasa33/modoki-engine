@@ -3,10 +3,12 @@
  *  with no editor/three/store transitive deps. Covers the pure wheel-step math and
  *  the useBufferedValue mixed-mode commit guard (F7 regression). */
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act, render, fireEvent } from '@testing-library/react';
 import { useState, createElement, type ReactNode } from 'react';
 import { applyWheelStep, useBufferedValue, parseNumber, parseString, clampRange, BufferedNumberInput, BufferedFieldScope } from '../../src/editor/panels/fields';
+import { pushAction, undo, redo, clearHistory } from '../../src/editor/undo/undoManager';
+import { setRunMode } from '../../src/runtime/core/playState';
 
 describe('applyWheelStep', () => {
   it('steps up/down by step × multiplier', () => {
@@ -348,3 +350,123 @@ describe('BufferedNumberInput — its own echo at the displayed precision is not
   });
 });
 
+
+describe('an undo or redo ENDS the edit, even while the field is focused (#1905)', () => {
+  // Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+  beforeEach(() => { setRunMode('stopped'); clearHistory(); });
+
+  /** The Inspector's shape, with the store's setter reachable so an undo entry can move it. */
+  let setStore!: (v: number) => void;
+  function StoreField({ initial }: { initial: number }) {
+    const [v, setV] = useState(initial);
+    setStore = setV;
+    return (
+      <>
+        <BufferedNumberInput value={v} onChange={setV} />
+        <output data-testid="committed">{String(v)}</output>
+      </>
+    );
+  }
+  const later = () => new Promise((r) => setTimeout(r, 5));
+
+  it('⭐ the observed repro: focus, type 777, Cmd+Z — the FOCUSED field shows the undone 400', async () => {
+    const { container } = render(<StoreField initial={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    pushAction({ label: 'maxParticles', undo: () => setStore(400), redo: () => setStore(777) });
+
+    await act(async () => { await undo(); });
+    expect(input.value).toBe('400');
+    expect(document.activeElement).toBe(input); // ended the edit, did not blur
+
+    await act(async () => { await redo(); });
+    expect(input.value).toBe('777');
+  });
+
+  it('⭐ the wheel step after the undo steps from the undone value, not the stale text', async () => {
+    const { container, getByTestId } = render(<StoreField initial={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    pushAction({ label: 'maxParticles', undo: () => setStore(400), redo: () => setStore(777) });
+    await act(async () => { await undo(); });
+
+    fireEvent.wheel(input, { deltaY: -100 });
+    expect(getByTestId('committed').textContent).toBe('401'); // 400 + step 1, not 778
+  });
+
+  it('the undone value landing a render AFTER the step still reaches the focused field', async () => {
+    // The Inspector reads ECS a render after the step, so the notification can see the old value.
+    // Ending the hold, rather than re-syncing once at the notification, is what lets it through.
+    const { container } = render(<StoreField initial={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    pushAction({ label: 'maxParticles', undo: () => { setTimeout(() => setStore(400), 0); }, redo: () => {} });
+
+    await act(async () => { await undo(); await later(); });
+    expect(input.value).toBe('400');
+  });
+
+  it('a keystroke after the undo starts a new edit, which holds against the store again', async () => {
+    const { container } = render(<StoreField initial={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    pushAction({ label: 'maxParticles', undo: () => setStore(400), redo: () => {} });
+    await act(async () => { await undo(); });
+
+    fireEvent.change(input, { target: { value: '5' } });
+    act(() => setStore(9)); // not an undo: a gizmo drag mid-edit
+    expect(input.value).toBe('5');
+  });
+
+  it('blur after the undo re-syncs and commits nothing', async () => {
+    const onChange = vi.fn();
+    function Field() {
+      const [v, setV] = useState(400);
+      setStore = setV;
+      return <BufferedNumberInput value={v} onChange={(n) => { onChange(n); setV(n); }} />;
+    }
+    const { container } = render(<Field />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    pushAction({ label: 'maxParticles', undo: () => setStore(400), redo: () => {} });
+    await act(async () => { await undo(); });
+    onChange.mockClear();
+
+    fireEvent.blur(input);
+    expect(input.value).toBe('400');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('an undo back to a value typed a moment ago is not skipped as a late echo (#1411 record cleared)', async () => {
+    // Unfocused window: no focus event, so only the echo record stands between the undo and the
+    // text. `1`, `12`, `1` answered by one coalesced echo of `1` leaves `12` in the record; an undo
+    // to 12 must still show, which needs the step to forget the record.
+    const { result, rerender } = renderHook(({ v }) => useBufferedValue(v, vi.fn(), parseNumber), { initialProps: { v: 0 } });
+    act(() => result.current.handleChange('1'));
+    act(() => result.current.handleChange('12'));
+    act(() => result.current.handleChange('1'));
+    rerender({ v: 1 }); // the coalesced echo
+    pushAction({ label: 'x', undo: () => { setTimeout(() => rerender({ v: 12 }), 0); }, redo: () => {} });
+
+    await act(async () => { await undo(); await later(); });
+    expect(result.current.localValue).toBe('12');
+  });
+
+  it('a MIXED field shows the placeholder again after an undo, not a broadcastable value', async () => {
+    const { result } = renderHook(() => useBufferedValue(5, vi.fn(), parseNumber, /* mixed */ true));
+    act(() => result.current.handleChange('7'));
+    pushAction({ label: 'x', undo: () => {}, redo: () => {} });
+    await act(async () => { await undo(); });
+    expect(result.current.localValue).toBe('');
+  });
+});

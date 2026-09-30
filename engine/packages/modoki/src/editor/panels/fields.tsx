@@ -5,7 +5,8 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from 'react';
 import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
-import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, type PendingCommit, type EchoMatch } from './bufferedEcho';
+import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEdit, type PendingCommit, type EchoMatch } from './bufferedEcho';
+import { subscribeUndoRedoStep } from '../undo/undoRedoStep';
 
 /** Shared monospace input style for Inspector-style field inputs. */
 export const inputStyle: React.CSSProperties = {
@@ -103,8 +104,17 @@ export { MIXED_PLACEHOLDER };
  *  `null` (no provider) never changes, which keeps every other caller on the old behaviour. */
 export const BufferedFieldScope = createContext<unknown>(null);
 
+/** Run `onStep` after every undo or redo step (#1905) — how a field that buffers typed text ENDS
+ *  its edit, as Unity's `UndoRedoPerformed` does. The latest `onStep` is called; subscribing once. */
+export function useUndoRedoStep(onStep: () => void): void {
+  const ref = useRef(onStep);
+  ref.current = onStep;
+  useEffect(() => subscribeUndoRedoStep(() => ref.current()), []);
+}
+
 /** Local-state input hook: buffers keystrokes while focused so ECS re-renders
- *  don't overwrite in-flight typing. Syncs the ECS value back when not focused.
+ *  don't overwrite in-flight typing. Syncs the ECS value back when not focused,
+ *  and on an undo or redo even while focused (#1905 — see `nextBufferedEdit`).
  *  When `mixed` is true (multi-select with differing values), the input shows
  *  empty (so the MIXED_PLACEHOLDER placeholder is visible) until the user types;
  *  whatever they commit then broadcasts to every selected entity. */
@@ -114,7 +124,8 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   const matchRef = useRef(match);
   matchRef.current = match;
   const [localValue, setLocalValue] = useState<string>(mixed ? '' : (match?.format ?? String)(externalValue));
-  const focusedRef = useRef(false);
+  // Holding the text against the store (focused, and no undo since the last keystroke) — #1905.
+  const editRef = useRef<BufferedEdit>(IDLE_EDIT);
   // `parse` is an inline arrow at most call sites, so its identity changes every render and it
   // CANNOT be an effect dep — the re-sync would then run on every render and overwrite the buffer
   // any time the displayed text has not yet round-tripped through the store (an edit the `validate`
@@ -132,12 +143,12 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   // Sync from ECS when the value changed for a reason other than this field's own typing.
   useEffect(() => {
     if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
-    if (focusedRef.current) return;
+    if (holdsBufferedText(editRef.current)) return;
     if (mixed) { pendingRef.current = []; setLocalValue(''); return; }
-    // ⚠️ `focusedRef` IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).
+    // ⚠️ THE FOCUS HOLD IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).
     // Chromium dispatches `focus`/`blur` only while `document.hasFocus()`, so with the editor
     // window not OS-focused — the permanent state of an agent-driven MCP session, and an ordinary
-    // one for a human with another window on top — `focusedRef` is never true and this effect
+    // one for a human with another window on top — the hold never arms and this effect
     // would clobber the buffer mid-edit with this field's OWN commits coming back: the echo of the
     // latest keystroke (#242: clearing commits 0, the echo rewrites '' to '0', `-3.5` lands as
     // '0-3.5') and the LATE echo of an earlier one (#1411: `…qr` written over `…qrs`, a character
@@ -148,13 +159,30 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
     pendingRef.current = r.pending;
     if (r.text !== null) setLocalValue(r.text);
   }, [externalValue, mixed, scope]);
-  const onFocus = useCallback(() => { focusedRef.current = true; }, []);
+  // An undo or redo ends the edit and shows the store's value, focused or not (#1905, Unity's
+  // `UndoRedoPerformed`). The pending record goes too: a step back to a value typed a moment ago
+  // would otherwise read as this field's late echo and be skipped. `externalValue` may still be the
+  // pre-step one (the Inspector reads ECS a render later); the hold is off, so the effect above
+  // re-syncs when it lands.
+  const externalRef = useRef(externalValue);
+  externalRef.current = externalValue;
+  const mixedRef = useRef(mixed);
+  mixedRef.current = mixed;
+  useUndoRedoStep(() => {
+    editRef.current = nextBufferedEdit(editRef.current, 'undoRedo');
+    pendingRef.current = [];
+    const text = mixedRef.current ? '' : (matchRef.current?.format ?? String)(externalRef.current);
+    localRef.current = text;
+    setLocalValue(text);
+  });
+  const onFocus = useCallback(() => { editRef.current = nextBufferedEdit(editRef.current, 'focus'); }, []);
   const onBlur = useCallback(() => {
-    focusedRef.current = false;
+    editRef.current = nextBufferedEdit(editRef.current, 'blur');
     pendingRef.current = [];
     setLocalValue(mixed ? '' : (matchRef.current?.format ?? String)(externalValue)); // reconcile with ECS — reverts an unaccepted edit
   }, [externalValue, mixed]);
   const handleChange = useCallback((raw: string) => {
+    editRef.current = nextBufferedEdit(editRef.current, 'input');
     setLocalValue(raw);
     localRef.current = raw;
     // Mixed-mode (multi-select with differing values): a transient empty string

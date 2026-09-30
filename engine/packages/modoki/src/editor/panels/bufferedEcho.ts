@@ -84,3 +84,33 @@ export function resyncBuffered<T>(
   if (hit >= 0) return { text: null, pending: live.slice(hit + 1) };
   return { text: (match.format ?? String)(external), pending: [] };
 }
+
+/** Whether a buffered field is HOLDING its text against the store right now, and what moves that
+ *  (#1905). While it holds, a store change does not touch the text: the user is mid-edit, and the
+ *  echo checks above are not needed. `focused` comes from focus events, so in an unfocused window it
+ *  never arms (#242) and those checks carry the whole load.
+ *
+ *  ⚠️ **An undo or redo ENDS the edit, focused or not — Unity's rule.** On `UndoRedoPerformed`
+ *  Unity's active text field calls `EndEditing()` and replaces its text with the undone value
+ *  (`EditorGUI.cs`, cited on #1905). Before this, the focus hold ran first and swallowed the undo:
+ *  Cmd+Z undid the data, the field kept showing the undone text until blur, and a wheel step then
+ *  committed FROM that text. The field stays focused but stops holding, so a store change that lands
+ *  after the step (the Inspector reads ECS a render later) still reaches it; the next keystroke,
+ *  wheel step or focus starts a new edit. */
+export interface BufferedEdit { focused: boolean; ended: boolean }
+export type BufferedEditEvent = 'focus' | 'blur' | 'input' | 'undoRedo';
+
+export const IDLE_EDIT: BufferedEdit = { focused: false, ended: false };
+
+export function nextBufferedEdit(s: BufferedEdit, event: BufferedEditEvent): BufferedEdit {
+  switch (event) {
+    case 'focus': return { focused: true, ended: false };
+    case 'blur': return { focused: false, ended: false };
+    case 'input': return { focused: s.focused, ended: false };
+    case 'undoRedo': return { focused: s.focused, ended: true };
+  }
+}
+
+export function holdsBufferedText(s: BufferedEdit): boolean {
+  return s.focused && !s.ended;
+}
