@@ -60,6 +60,13 @@
  * registering a chokidar/`.watcher.on` handler that also classifies via `classifySceneChange`)
  * rather than a hand-typed two-file list, so a third such watcher is swept in automatically instead
  * of silently passing outside the list.
+ *
+ * #1911 then had to change both twins' whole onChange/flush (a change chokidar drops is re-asked at the
+ * flush), and folded them into ONE `createSceneChangeBatch`. So the gate now lives in one handler, the
+ * batch's `onChange`, and the sweep asserts the stronger property: every watcher file BUILDS the batch
+ * and classifies, remaps or extension-tests nothing outside it. Mutations checked red: a host that
+ * re-grows an inline classify, one that stops building the batch, and a batch `onChange` testing the
+ * extension itself.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -350,12 +357,13 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
 describe('live-reload watchers share ONE extension gate, not two (#857)', () => {
   /** A file that registers a watcher — `chokidar.watch(…)` (the Electron backend) or the Vite dev server's
    *  `….watcher.on(…)` — AND classifies via `classifySceneChange`: a call to it, or any read of a binding
-   *  imported AS it (an alias, or handed on by reference). From the parser, so a file (like this one) that only
-   *  discusses either in prose or a string cannot satisfy it. */
+   *  imported AS it (an alias, or handed on by reference), or a call to `createSceneChangeBatch`. From the parser, so
+   *  a file (like this one) that only discusses either in prose or a string cannot satisfy it. */
   function isWatcherClassifier(sf: ts.SourceFile): boolean {
     const aliases = findNodes(sf, ts.isImportSpecifier)
       .filter((sp) => (sp.propertyName ?? sp.name).text === 'classifySceneChange').map((sp) => sp.name);
-    const classifies = callsTo(sf, 'classifySceneChange').length > 0 || aliases.some((id) => readsOf(id).length > 0);
+    // …or builds the shared change batch, which classifies for it (#1911: both hosts since).
+    const classifies = callsTo(sf, 'classifySceneChange', 'createSceneChangeBatch').length > 0 || aliases.some((id) => readsOf(id).length > 0);
     // `createAssetTreeWatcher(…)` is how both producers register since #1708 (the shared module itself only watches;
     // it never classifies, so it is not swept in as a third).
     const registers = callsToPath(sf, 'chokidar.watch').length > 0 || callsToPath(sf, 'watcher.on').length > 0
@@ -375,7 +383,7 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
       // Cheap RAW pre-filter first — narrows the whole repo down to a handful of candidates before
       // paying for a parse of each. It only ever ADDS candidates relative to the authoritative check
       // next: every call the parser can find spells both names somewhere in the raw text.
-      if (!raw.includes('classifySceneChange') || !/\bwatch\b|\bwatcher\b|\bcreateAssetTreeWatcher\b/.test(raw)) continue;
+      if (!/classifySceneChange|createSceneChangeBatch/.test(raw) || !/\bwatch\b|\bwatcher\b|\bcreateAssetTreeWatcher\b/.test(raw)) continue;
       if (isWatcherClassifier(parseSource(readScannedSource(abs).code, rel))) out.push(abs);
     }
     return out;
@@ -396,14 +404,17 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     return (stringValueOf(n.right) === '.json' && isExtname(n.left)) || (stringValueOf(n.left) === '.json' && isExtname(n.right));
   }
 
-  /** The one `onChange` handler in `sf`: its extension gates (as flat text), and how many times it calls the
-   *  shared `pathToClassifyForChange`. */
-  function onChangeGate(sf: ts.SourceFile): { gates: string[]; callsShared: number } {
-    const fn = oneFunction(sf, 'onChange');
+  /** An `onChange` handler's extension gates (as flat text), and how many times it calls the shared
+   *  `pathToClassifyForChange`. */
+  function onChangeGate(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): { gates: string[]; callsShared: number } {
     return { gates: findNodes(fn.body, isExtensionGate).map(flatText), callsShared: callsTo(fn.body, 'pathToClassifyForChange').length };
   }
 
   const watcherFiles = findWatcherClassifierFiles();
+  // #1911: the two hosts' hand-kept onChange/flush twins became ONE `createSceneChangeBatch`, so the extension gate
+  // lives in exactly one handler — the batch's `onChange` — and every watcher host must BUILD the batch rather than
+  // grow its own copy back.
+  const batch = oneFunction(producerSf, 'createSceneChangeBatch');
 
   it('found watcher implementations to check (sanity: the enumeration works, so a pass means something)', () => {
     // At least the two known today (vite-asset-scanner.ts, assetBackend.ts) — `toBeGreaterThan`
@@ -411,33 +422,35 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     expect(watcherFiles.length).toBeGreaterThan(1);
   });
 
-  it("no watcher's onChange re-implements the .json extension gate — all call pathToClassifyForChange", () => {
+  it("the batch's onChange does not re-implement the .json extension gate — it calls pathToClassifyForChange", () => {
+    const handlers = functionsNamed(batch.body, 'onChange');
+    expect(handlers, 'createSceneChangeBatch has no onChange handler to check').toHaveLength(1);
+    const { gates, callsShared } = onChangeGate(handlers[0]!);
+    // The exact duplicated line #857 exposed: a shader BODY (.glsl/.wgsl) never satisfies a raw .json test.
+    expect(gates, "onChange tests extname(...) === '.json' itself instead of going through pathToClassifyForChange").toEqual([]);
+    expect(callsShared, 'onChange does not resolve the path to classify through pathToClassifyForChange').toBeGreaterThan(0);
+  });
+
+  it('every watcher builds the ONE change batch, and classifies nothing outside it (#857, #1911)', () => {
     const violators: string[] = [];
     for (const abs of watcherFiles) {
       const rel = path.relative(REPO, abs).split(path.sep).join('/');
-      const { gates, callsShared } = onChangeGate(parseSource(readScannedSource(abs).code, rel));
-      if (gates.length > 0) {
-        violators.push(
-          `${rel}: onChange still tests extname(...) === '.json' directly instead of going through ` +
-          'pathToClassifyForChange — this is the exact duplicated line #857 exposed: a shader BODY ' +
-          '(.glsl/.wgsl) never satisfies a raw .json test, so this watcher can never broadcast a ' +
-          'shader-body edit no matter what pathToClassifyForChange itself does.',
-        );
-      }
-      if (callsShared === 0) {
-        violators.push(
-          `${rel}: onChange does not call pathToClassifyForChange — every watcher must resolve the ` +
-          'path to classify through the one shared helper, not its own logic, so the two watchers ' +
-          'cannot drift apart the way they did in #857.',
-        );
-      }
+      const sf = parseSource(readScannedSource(abs).code, rel);
+      if (callsTo(sf, 'createSceneChangeBatch').length === 0) violators.push(`${rel}: registers a watcher and classifies its changes without createSceneChangeBatch`);
+      // Exempt only the batch itself and the shared helper, in the ONE file that defines them: anywhere else a classify,
+      // remap or extension gate is a re-grown copy — also inside a host's own function that borrowed the name.
+      const producer = rel === 'engine/plugins/vite-asset-scanner.ts';
+      const within = (n: ts.Node, name: string) => producer && functionsNamed(sf, name).some((f) => n.pos >= f.pos && n.end <= f.end);
+      const outside = [...callsTo(sf, 'classifySceneChange', 'pathToClassifyForChange', 'isSiblingRaisedChange'), ...findNodes(sf, isExtensionGate)]
+        .filter((n) => !within(n, 'createSceneChangeBatch') && !within(n, 'pathToClassifyForChange'));
+      for (const n of outside) violators.push(`${rel}: ${flatText(n)} outside createSceneChangeBatch — a re-grown copy of the batch`);
     }
     expect(violators, violators.join('\n')).toEqual([]);
   });
 
   it('isExtensionGate flags both historical spellings of the duplicated gate, and not the shared helper', () => {
     // Its half of the check above greens on zero matches, and a clean corpus has none (#1105).
-    const gates = (src: string) => onChangeGate(parseSource(`const onChange = (file: string) => {\n${src}\n};`, 'probe.ts')).gates;
+    const gates = (src: string) => onChangeGate(oneFunction(parseSource(`const onChange = (file: string) => {\n${src}\n};`, 'probe.ts'), 'onChange')).gates;
     expect(gates("if (path.extname(file) === '.json') {}")).toEqual(["path.extname(file) === '.json'"]);
     expect(gates('if (extname(file).toLowerCase() === ".json") {}')).toEqual(['extname(file).toLowerCase() === ".json"']);
     expect(gates("if ('.json' !== extname(\n  file,\n)) return;")).toEqual(["'.json' !== extname( file, )"]);
@@ -481,5 +494,7 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d);", 'g.ts'))).toBe(false);
     expect(isWatcherClassifier(parseSource('createAssetTreeWatcher({ roots, onEvent: (_k, f) => classifySceneChange(f) });', 'h.ts'))).toBe(true);
     expect(isWatcherClassifier(parseSource("const doc = 'createAssetTreeWatcher('; classifySceneChange(x);", 'i.ts'))).toBe(false);
+    // #1911: a host that builds the shared batch is a watcher file too, so the sweep checks it.
+    expect(isWatcherClassifier(parseSource('createAssetTreeWatcher({ roots, onEvent }); createSceneChangeBatch({ guard });', 'j.ts'))).toBe(true);
   });
 });

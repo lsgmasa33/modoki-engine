@@ -580,6 +580,59 @@ describe('createEditorWriteGuard (self-write TTL)', () => {
     expect(isWrite('E:\\Projects\\game\\scenes\\main.json')).toBe(true); // chokidar: uppercase drive
     expect(isWrite('E:/Projects/game/scenes/main.json')).toBe(true);     // forward slashes too
   });
+
+  // #1911: chokidar drops a `change` inside 50 ms of the previous one, so a `git checkout` right after a save raised no
+  // event at all. `missedChanges` re-asks, at the flush, every path an event was vouched for. The end-to-end case, with
+  // the batch that calls it: sceneChangeBatchMissed.test.ts.
+  it('#1911: missedChanges returns a vouched path whose bytes moved with no event, once, and evicts it', () => {
+    const { mark, isWrite, missedChanges } = createEditorWriteGuard(1500, () => 0);
+    mark('/p/a.json', 'hashA');
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(true); // the save's own event
+    expect(missedChanges(() => 'hashB')).toEqual(['/p/a.json']); // the checkout's event never came
+    expect(missedChanges(() => 'hashB')).toEqual([]);          // asked once: the list is emptied
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(false);   // evicted, as a late event would have been
+  });
+  it('#1911: missedChanges returns nothing for a path whose bytes still match, one never vouched, or a TTL-only mark', () => {
+    let t = 0;
+    const { mark, isWrite, missedChanges } = createEditorWriteGuard(1500, () => t);
+    mark('/p/same.json', 'hashA');
+    expect(isWrite('/p/same.json', () => 'hashA')).toBe(true);
+    mark('/p/quiet.json', 'hashQ'); // marked, no event yet
+    mark('/p/moved-from.json', null);
+    expect(isWrite('/p/moved-from.json', () => 'x')).toBe(true); // the TTL answers
+    t = 1600; // a busy batch can push the flush past the TTL: a TTL-only mark then has nothing to say
+    expect(missedChanges((p) => (p === '/p/same.json' ? 'hashA' : 'moved'))).toEqual([]);
+    expect(isWrite('/p/same.json', () => 'hashA')).toBe(true); // still guarded: nothing was evicted
+  });
+  // A drop needs a DELIVERED change of the same path within 50 ms before it, and that event vouches again; so the re-ask
+  // covers the flush window it was vouched in, not every file the editor ever saved, re-hashed on every flush forever.
+  it('#1911: missedChanges re-asks a path for the flush it was vouched in only', () => {
+    const { mark, isWrite, missedChanges } = createEditorWriteGuard(1500, () => 0);
+    mark('/p/a.json', 'hashA');
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(true);
+    expect(missedChanges(() => 'hashA')).toEqual([]); // this flush: unchanged
+    expect(missedChanges(() => 'hashB')).toEqual([]); // the next one: no event since, so not this mechanism's to find
+  });
+  // Close-out review: the answer is the CURRENT mark. A later save whose own event was dropped still matches it; an
+  // outside write putting back exactly the bytes vouched for earlier does not — comparing against those let it through.
+  // (A route's failed write leaves no stale mark to compare against: every route marks AFTER its write lands.)
+  it('#1911: a later save whose own event dropped is ours; the earlier bytes put back from outside are not', () => {
+    const { mark, isWrite, missedChanges } = createEditorWriteGuard(1500, () => 0);
+    mark('/p/saved.json', 'hashA');
+    expect(isWrite('/p/saved.json', () => 'hashA')).toBe(true);
+    mark('/p/saved.json', 'hashB'); // saved again; its event is the one chokidar threw away
+    mark('/p/restored.json', 'hashA');
+    expect(isWrite('/p/restored.json', () => 'hashA')).toBe(true);
+    mark('/p/restored.json', 'hashB'); // saved again, then `git checkout` put A back: both events dropped
+    expect(missedChanges((p) => (p === '/p/saved.json' ? 'hashB' : 'hashA'))).toEqual(['/p/restored.json']);
+  });
+  it('#1911: missedChanges does not report again what an event already reported', () => {
+    const { mark, isWrite, missedChanges } = createEditorWriteGuard(1500, () => 0);
+    mark('/p/a.json', 'hashA');
+    expect(isWrite('/p/a.json', () => 'hashA')).toBe(true);
+    expect(isWrite('/p/a.json', () => 'hashB')).toBe(false); // the checkout's event DID come, and was reported
+    expect(missedChanges(() => 'hashB')).toEqual([]);
+  });
 });
 
 describe('normalizeWriteGuardKey (Windows path canonicalization)', () => {
@@ -1732,27 +1785,28 @@ describe('classifySceneChange — animation (C7)', () => {
 });
 
 /**
- * BOTH watchers must classify through ONE function.
+ * BOTH watchers must classify through ONE function — since #1911, through ONE change batch.
  *
  * The C7 clip-cache fix taught `classifySceneChange` about '.anim.json' — and was DEAD in the
  * Electron editor (dev AND packaged, i.e. every surface the modoki MCP targets), because
  * engine/electron/assetBackend.ts had DUPLICATED the classification inline ("same logic as
  * the Vite plugin") instead of calling it. It worked in a browser and silently did nothing
- * where it mattered. Duplicated logic rots; one function cannot.
+ * where it mattered. Duplicated logic rots; one function cannot. #1911's flush-time recheck then
+ * had to change both hosts' copies of the whole onChange/flush, so both now build
+ * `createSceneChangeBatch` and neither classifies anything itself.
  */
-describe('the Electron watcher must not re-implement classifySceneChange', () => {
-  const src = readScannedSource(
+describe('the Electron watcher must not re-implement the change batch', () => {
+  const code = readScannedSource(
     pathMod.join(__dirname, '..', '..', 'electron', 'assetBackend.ts'),
   ).code;
-  // Already stripped at the read (#816) — this line filter matched nothing.
-  const code = src;
 
-  it('calls the shared classifier', () => {
-    expect(code).toMatch(/classifySceneChange\(/);
+  it('builds the shared change batch', () => {
+    expect(code).toMatch(/createSceneChangeBatch\(/);
   });
 
-  it('does NOT hand-roll the scene/prefab/animation decision', () => {
-    // The duplicated form was: detectType(rel,'.json') then `if (type === 'prefab') …`.
+  it('does NOT classify, remap or collect a change itself', () => {
+    expect(code).not.toMatch(/classifySceneChange\(|pathToClassifyForChange\(|isSiblingRaisedChange\(/);
+    // The duplicated form before C7: detectType(rel,'.json') then `if (type === 'prefab') …`.
     expect(code).not.toMatch(/type === 'prefab'/);
     expect(code).not.toMatch(/rel\.includes\('\/scenes\/'\)/);
   });

@@ -1059,7 +1059,12 @@ function importIdentity(ctx: BackendContext, destUrl: string, bytes: Buffer, cla
 
 /** Mark a file this route just WROTE as the editor's own, fingerprinted by the bytes now on disk (#1702). Called right
  *  after a SYNCHRONOUS write, with no await between: the watcher runs on this same event loop, so its event for the
- *  write cannot be handled before the mark. */
+ *  write cannot be handled before the mark.
+ *
+ *  ⚠️ AFTER, never before — every route that marks its exact bytes follows this too (#1911). A mark made first, by a
+ *  write that then throws (a Windows EPERM on the rename), is a mark the disk never got: the watcher's flush re-asks
+ *  what it vouched for against the CURRENT mark (`missedChanges`), and reported the editor's own earlier save as an
+ *  outside change, which discards the unsaved world at the next refresh (#1702's class). */
 function markWrittenFile(ctx: BackendContext, abs: string): void {
   const hash = fingerprintFile(abs); // null → TTL-only
   ctx.markEditorWrite(abs, hash);
@@ -4079,11 +4084,11 @@ async function describeUnresolvedAgainstLiveWorld(
           return json({ error: 'destination escapes the project' }, 403);
         }
         fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-        ctx.markEditorWrite(destAbs, fingerprintBytes(bytes));
         const tmpPath = `${destAbs}.tmp`;
         try {
           fs.writeFileSync(tmpPath, bytes);
           fs.renameSync(tmpPath, destAbs);
+          ctx.markEditorWrite(destAbs, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
         } catch (writeErr) {
           // Leave no half-written `.tmp` behind for the asset scanner to find: the write already
           // failed, and a stray sibling of the file you dropped is a worse outcome than the error.
@@ -4716,12 +4721,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // gone. A file-direct write_asset must NOT set this: there the cached def really is stale,
       // which is the whole reason the invalidation exists.
       // (`selfWrite` is read once, above the gate — see its comment there.)
-      if (selfWrite) {
-        const bytes = assetJsonBytes(out);
-        ctx.markEditorWrite(abs, fingerprintBytes(bytes));
-      }
       const outBytes = assetJsonBytes(out);
       writeJsonAtomic(abs, outBytes);
+      if (selfWrite) ctx.markEditorWrite(abs, fingerprintBytes(outBytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
       // A file-direct write is an outside change (docs/editor-hmr.md): held until a refresh (#1879), pending from now.
       // Not an atlas: no watcher broadcast ever raises one (`NOT_LIVE_RELOADABLE` in liveReloadKinds.test.ts), so
       // nothing would hold it and a refresh could not apply it — noted, it read as pending for the note's TTL (review U1).
@@ -4814,8 +4816,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // and silently restores the bug.
       // Unlike a file-direct `write_asset`, suppressing this event is safe: the file is brand new,
       // so there is no stale cached def the invalidation needs to clear.
-      ctx.markEditorWrite(abs, fingerprintBytes(assetJsonBytes(data)));
       writeJsonAtomic(abs, assetJsonBytes(data));
+      ctx.markEditorWrite(abs, fingerprintBytes(assetJsonBytes(data))); // after the write lands — `markWrittenFile`'s rule (#1911)
       ctx.rebuildManifest(); // register the new asset's GUID
       return json({ ok: true, saved: true, path: assetPath, id });
     } catch (e) {
@@ -4893,7 +4895,6 @@ async function describeUnresolvedAgainstLiveWorld(
       const bytes = encoding === 'base64'
         ? Buffer.from(content as string, 'base64')
         : Buffer.from(typeof content === 'string' ? content : JSON.stringify(content, null, 2));
-      ctx.markEditorWrite(absPath, fingerprintBytes(bytes));
       const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       // Atomic write (tmp + rename), not a direct writeFileSync: this endpoint is
@@ -4903,13 +4904,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // `readAssetGuid` (vite-asset-scanner.ts) swallows that parse failure
       // silently and just omits the asset's guid from the manifest, which can
       // transiently break base-scene chain resolution (SceneManager.loadScene's
-      // resolveGuidToPath lookup) right after a Save All. The write-guard above
-      // already anticipates a rename landing after the initial write (see its
-      // "write+rename" burst handling), so this doesn't change hot-reload
-      // suppression behavior — same pattern as writeJsonAtomic in this file.
+      // resolveGuidToPath lookup) right after a Save All. The write-guard mark below
+      // covers every event of the tmp + rename burst (see its "write+rename"
+      // handling), so this doesn't change hot-reload suppression behavior — same
+      // pattern as writeJsonAtomic in this file.
       const tmpPath = `${absPath}.tmp`;
       fs.writeFileSync(tmpPath, bytes);
       fs.renameSync(tmpPath, absPath);
+      ctx.markEditorWrite(absPath, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
       // `path`: the url of the file just written, spelled the way the DISK does (#1273 close-out review).
       // A create at `/assets/SCENES/new.json` lands in an existing `scenes/` folder on APFS/NTFS, and the
       // scanner keys it `/assets/scenes/new.json` — a caller registering the spelling it asked for would
@@ -4967,10 +4969,10 @@ async function describeUnresolvedAgainstLiveWorld(
       const guid = crypto.randomUUID();
       const copy = remintSceneEntityGuids({ ...scene, id: guid }, () => crypto.randomUUID(), makePrefabResolver(ctx));
       const bytes = assetJsonBytes(copy);
-      ctx.markEditorWrite(absPath, fingerprintBytes(bytes));
       const dir = path.dirname(absPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       writeJsonAtomic(absPath, bytes);
+      ctx.markEditorWrite(absPath, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
       // The manifest must hear about the fresh id now: an overwritten scene's OLD id leaves it here.
       const manifestRebuilt = rebuildManifestInline(ctx);
       return json({ ok: true, guid, path: ctx.absToAssetUrl(absPath, { onDisk: true }) ?? filePath, manifestRebuilt });

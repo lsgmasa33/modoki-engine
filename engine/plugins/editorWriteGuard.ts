@@ -142,8 +142,7 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
   // dialog. Every route marks the exact bytes it writes, synchronously and with no await before the watcher can run
   // (`markWrittenFile`'s comment), so the editor's own burst still matches. Only a mark with nothing to compare
   // (a move's source, a folder move's children, a failed read-back) is left to the TTL alone.
-  const isWrite = (absPathRaw: string, currentHash?: () => string | null) => {
-    const absPath = normalizeWriteGuardKey(absPathRaw, platform);
+  const check = (absPath: string, currentHash?: () => string | null) => {
     const e = recent.get(absPath);
     if (!e) return false;
     const inBurst = e.exp > now();
@@ -159,5 +158,45 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
     recent.delete(absPath); // diverged → a genuine external edit; stop guarding it
     return false;
   };
-  return { mark, isWrite };
+  // (#1911) Every path an event was vouched for BY ITS BYTES since the last `missedChanges`, as the watcher spelled it.
+  const vouched = new Map<string, string>();
+  const isWrite = (absPathRaw: string, currentHash?: () => string | null) => {
+    const absPath = normalizeWriteGuardKey(absPathRaw, platform);
+    const ours = check(absPath, currentHash);
+    if (ours && currentHash && recent.get(absPath)?.hash != null) vouched.set(absPath, absPathRaw);
+    return ours;
+  };
+  /** (#1911) The paths vouched for as the editor's own since the last call whose bytes have MOVED since, with no event to
+   *  say so: each is an outside change the watcher dropped, and is reported now, evicted as a late event would be. The
+   *  watchers call this when they flush their debounced batch (`createSceneChangeBatch`), and it empties the list.
+   *
+   *  "Moved" means the bytes match the CURRENT mark no longer — a later save whose own event was the dropped one still
+   *  matches it. That rests on every mark being made AFTER its write lands (`markWrittenFile`'s rule): a route that
+   *  marked first and then failed its write (a Windows EPERM on the rename) left a mark the disk never got, and this
+   *  reported the editor's own earlier save (close-out review). Comparing against the bytes that were vouched for
+   *  instead only moved the hole: a save of B whose event dropped, then an outside write putting back exactly A, then
+   *  read as nothing.
+   *
+   *  chokidar drops a `change` inside 50 ms of the path's previous `change`, with no trailing emit
+   *  (`node_modules/chokidar/index.js` `_emit`, `this._throttle(EV.CHANGE, path, 50)`), and its per-file watch callback
+   *  inside 5 ms of the previous one. A `git checkout` a few ms after `save_all` is exactly that: the save's event is
+   *  delivered and vouched for, the checkout's is thrown away, and the file's next event may never come. MEASURED
+   *  (repro through this guard and the real watcher): an unlink + create 0 ms after a save was lost 12 times in 15, at
+   *  10 ms 3 in 15, at 20 ms and later none — only because a redundant FSEvents callback landed after the window.
+   *  Asked at the flush, which runs 150 ms after the LAST delivered event, so after every change `_emit`'s throttle drops:
+   *  that drop needs a delivered `change` for the same path within 50 ms before it. The 5 ms per-file callback throttle
+   *  can be opened by a callback that emits nothing; a change it drops is not this recheck's to find, and relies on its
+   *  own later callback (not measured).
+   *
+   *  Only a fingerprinted mark is re-asked: a TTL-only mark has no bytes to compare, and a flush a busy batch pushed past
+   *  its TTL would report the editor's own move. */
+  const missedChanges = (currentHash: (absPathRaw: string) => string | null): string[] => {
+    const missed: string[] = [];
+    for (const [absPath, raw] of vouched) {
+      if (recent.get(absPath)?.hash != null && !check(absPath, () => currentHash(raw))) missed.push(raw);
+    }
+    vouched.clear();
+    return missed;
+  };
+  return { mark, isWrite, missedChanges };
 }

@@ -213,6 +213,37 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
      process holds open (an antivirus scan of the fresh write) can fail to read. That premise is
      INFERRED, not observed. The residual it leaves on Windows: an outside DELETE within 1.5 s of
      a save is still swallowed.
+   - **A change the watcher DROPPED is found at the flush (#1911).** chokidar discards a `change`
+     inside 50 ms of the same path's previous `change`, with no trailing emit (`_emit`'s
+     `_throttle(EV.CHANGE, path, 50)`; its per-file watch callback has a 5 ms twin). So a
+     `git checkout` a few ms after `save_all` delivered ONLY the save's own event, which the guard
+     rightly vouched for. Nothing was held, `modoki_refresh` applied `[]`, and the undo stack stayed
+     live over bytes the editor never saw, which is #1744's precondition reached another way.
+     Measured through the real Electron backend: a `git checkout` 0 ms after the route's save was
+     lost 19 times in 45. The checkouts 137–297 ms after a save that did reload lost their first
+     `change` too; they passed only because a redundant FSEvents callback landed after the window.
+     So the guard remembers what it vouched for by the bytes, and the flush re-asks those
+     (`missedChanges`). The flush runs 150 ms after the last DELIVERED event, and a change `_emit`'s
+     throttle drops needs a delivered `change` of that path within 50 ms before it, so the re-ask
+     comes after that dropped write. (The 5 ms per-file throttle can be opened by a callback that
+     emits nothing. A change it drops is left to the change's own later callback, which is not measured.)
+     A path counts as moved when its bytes no longer match the CURRENT mark, so a later save whose
+     own event was the dropped one still reads as ours. That makes the rule two bullets up
+     load-bearing for EVERY route that marks its exact bytes, not only for deletes. Five routes
+     (`/api/write-file`, `scene-save-as`, `create-asset`, `/api/import-file`, `/api/asset-write`'s
+     self-write) marked BEFORE writing. A write that then threw (a Windows EPERM on the rename) left a
+     mark the disk never got, and the recheck reported the editor's own earlier save as outside. All
+     five now mark after (the close-out review's finding). Left as is: `/api/move-file` marks its
+     source and landings BEFORE `moveAssetFile`, because the landings need the source marked first. So a
+     move that throws onto a path the editor trashed in the same flush window reports that path
+     (contrived; review probe only). Comparing against the bytes that were
+     vouched for instead would only move the hole: a second save whose event dropped, then a checkout
+     putting back exactly the first save's bytes, would read as nothing. Only a fingerprinted mark
+     is re-asked (a TTL-only one has nothing to compare), and only for the flush it was vouched in.
+     After the fix: 0 in 45. The onChange/flush that does this
+     is `createSceneChangeBatch` (`vite-asset-scanner.ts`), ONE function both watchers run. The
+     Electron main process kept a hand-copied twin of it, which drifted twice before this fix had to
+     change both.
    - **One key function, `normalizeWriteGuardKey`, spells both sides.** It folds separators and the
      drive letter, applies Unicode NFC, strips a trailing separator, and folds letter case on
      macOS/Windows (not on Linux). ⚠️ It over-folds on a case-SENSITIVE volume on those platforms.

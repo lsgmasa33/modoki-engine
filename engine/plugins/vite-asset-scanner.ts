@@ -543,9 +543,8 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
  *  NOT a manifest asset itself (`assetTypeClassifier.ts`), but the file `ShaderAssetView.tsx`
  *  tells authors to edit — its sibling `.shader.json` descriptor, PROVIDED that descriptor
  *  exists on disk (a body with no descriptor is not a shader change). Returns null for a
- *  body with no descriptor, or for a change to anything else — `onChange`'s
- *  `scheduleRebuild()` still runs unconditionally in that case; only the classify + broadcast
- *  are gated on this. (#857)
+ *  body with no descriptor, or for a change to anything else — `createSceneChangeBatch` still
+ *  rebuilds the manifest in that case; only the classify + broadcast are gated on this. (#857)
  *
  *  Pure aside from the fs check, so — per this file's own module doc — it's exported and
  *  tested directly rather than through a mocked Vite server. */
@@ -580,6 +579,68 @@ export function isSiblingRaisedChange(
   prev: boolean | undefined,
 ): boolean {
   return classifiedTarget !== changedFile && (prev ?? true);
+}
+
+/** The watcher's change batch — ONE implementation, both watchers (#1911): the Vite plugin's and
+ *  `engine/electron/assetBackend.ts`'s. Each watcher event goes to `onChange`; a scene/prefab/asset-def change the
+ *  self-write guard does not recognise as the editor's own is collected, and 150 ms after the LAST event `flush`
+ *  rebuilds the manifest and then broadcasts each collected change (after, so guid→path changes are live on the client
+ *  before it reloads). add/unlink/change all reach `rebuildManifest`, since `.id` and sidecar files affect it; the
+ *  debounce makes a bulk write (an importer) one update.
+ *
+ *  The flush first re-asks the guard about every event it vouched for (`missedChanges`): chokidar throws away a change
+ *  inside 50 ms of the previous one, so a `git checkout` right after `save_all` raised nothing at all, and the editor
+ *  kept a world and an undo stack over bytes it never saw — the precondition for #1744's duplicate guid.
+ *
+ *  It was a hand-copied twin in each host until this fix had to change both, the fifth rule that would have. */
+export function createSceneChangeBatch(opts: {
+  assetRoots: () => AssetRoot[];
+  guard: {
+    isWrite(file: string, currentHash: () => string | null): boolean;
+    missedChanges(currentHash: (file: string) => string | null): string[];
+  };
+  rebuildManifest: () => void;
+  broadcast: (urlPath: string, kind: LiveReloadKind, viaSibling: boolean) => void;
+}) {
+  let timer: NodeJS.Timeout | null = null;
+  // Scene/prefab files changed since the last flush, by urlPath. `viaSibling`: see `isSiblingRaisedChange`.
+  const pending = new Map<string, { kind: LiveReloadKind; viaSibling: boolean }>();
+  // `file` is the file that CHANGED — for a shader body, the body, never the descriptor it classifies as: the guard is a
+  // content-hash check, and hashing the wrong file would defeat it.
+  const collect = (file: string, target: string) => {
+    // Every 'scene' is positively identified (suffix or legacy /scenes/ dir, #54); 'prefab' always broadcasts.
+    const kind = classifySceneChange(target.split(path.sep).join('/'));
+    const urlPath = kind ? absToAssetUrl(target, opts.assetRoots()) : null;
+    // Editing both `foo.glsl` and `foo.wgsl` in one window remaps both to `foo.shader.json`: ONE broadcast, intended.
+    if (kind && urlPath) pending.set(urlPath, { kind, viaSibling: isSiblingRaisedChange(file, target, pending.get(urlPath)?.viaSibling) });
+  };
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    for (const file of opts.guard.missedChanges(fingerprintFile)) {
+      const target = pathToClassifyForChange(file);
+      if (target) collect(file, target);
+    }
+    opts.rebuildManifest();
+    const changes = [...pending];
+    pending.clear();
+    for (const [urlPath, { kind, viaSibling }] of changes) opts.broadcast(urlPath, kind, viaSibling);
+  };
+  return {
+    onChange(file: string) {
+      // The scanner's containment helper, never a bare `startsWith(absDir)`: no separator boundary matches a sibling
+      // root sharing the prefix (`<root>-evil`, `…/assets-extra`).
+      if (!isUnderAssetRoot(file, opts.assetRoots())) return;
+      // A shader BODY is remapped to its `.shader.json` descriptor before classifying (#857); null for anything that is
+      // not a scene/prefab/asset-def change, which still rebuilds the manifest below.
+      const target = pathToClassifyForChange(file);
+      if (target && !opts.guard.isWrite(file, () => fingerprintFile(file))) collect(file, target);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(flush, 150);
+    },
+    flush,
+    cancel() { if (timer) clearTimeout(timer); timer = null; },
+  };
 }
 
 /** True if `url` targets one of the SSE routes (which own their own streaming
@@ -1796,7 +1857,8 @@ export function assetScannerPlugin(): Plugin {
   // Only a mark with no hash falls back to the TTL alone. The TTL behavior,
   // fingerprint fallback, and self-cleaning timer all live in createEditorWriteGuard
   // (above), factored out so they're unit-testable with an injectable clock.
-  const { mark: markEditorWrite, isWrite: isEditorWrite } = createEditorWriteGuard();
+  const editorWriteGuard = createEditorWriteGuard();
+  const markEditorWrite = editorWriteGuard.mark;
 
   /** Relay an op to the browser over the HMR socket and await its reply. Rejects
    *  on timeout (no app open / no agent bridge connected). */
@@ -2016,68 +2078,20 @@ export function assetScannerPlugin(): Plugin {
 
       // Watch asset roots for changes — with the scanner's OWN watcher, not Vite's (#1708): Vite's opens a handle per
       // directory, which on Windows stops a folder with subfolders from being recycled, so the `config` hook above
-      // keeps Vite's off the project asset roots entirely. add/unlink/change all trigger a rebuild,
-      // since changes to .id or sidecar files affect the manifest. Debounce
-      // with a short timer so a bulk write (e.g. importer) only fires one update.
-      let pendingRebuild: NodeJS.Timeout | null = null;
-      // Scene/prefab files edited since the last flush → broadcast to the browser
-      // so it hot-reloads the active scene (app/debug/agentBridge.ts).
-      // `viaSibling` = this urlPath's OWN file did not change; a SIBLING did (today: a
-      // `.glsl`/`.wgsl` body remapped to its `.shader.json` descriptor, #857). The consumer needs
-      // it because `dropParkedWriteFor` discards an unsaved parked edit on the grounds that "the
-      // file on disk is now authoritative" — true when the descriptor itself was rewritten, FALSE
-      // when only its body sibling was, and discarding then throws away exactly the Inspector edit
-      // the author was iterating on. Collapsing several changes in one debounce window ANDs the
-      // flag, so a direct write to the descriptor in the same window wins and the drop still happens.
-      const pendingSceneChanges = new Map<string, { kind: LiveReloadKind; viaSibling: boolean }>();
-      const flushPending = () => {
-        pendingRebuild = null;
-        rebuildManifest();
-        // Broadcast after the manifest rebuild so guid→path changes are already
-        // live on the client before it re-loads the scene.
-        if (pendingSceneChanges.size && viteServer) {
-          for (const [urlPath, { kind, viaSibling }] of pendingSceneChanges) {
-            try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind, viaSibling } }); }
-            catch { /* ws not ready */ }
-          }
-          pendingSceneChanges.clear();
-        }
-      };
-      const scheduleRebuild = () => {
-        if (pendingRebuild) clearTimeout(pendingRebuild);
-        pendingRebuild = setTimeout(flushPending, 150);
-      };
-      const onChange = (file: string) => {
-        if (!isUnderAssetRoot(file, assetRoots)) return;
-        // Classify via the same detector the scanner uses — new scenes are
-        // `.scene.json`; a plain `.json` under a `scenes/` dir is the legacy fallback (#54).
-        // A shader BODY (.glsl/.wgsl) is the file an author actually edits, so it remaps to
-        // its sibling `.shader.json` descriptor before classifying (#857) — `target` is that
-        // descriptor for a body (when it exists on disk), the file itself for `.json`, or
-        // null for anything else (a body with no descriptor is not a shader change).
-        const target = pathToClassifyForChange(file);
-        // isEditorWrite is checked against `file` (the BODY actually written), never
-        // `target` (the remapped descriptor) — it's a content-hash guard, and hashing the
-        // wrong file would defeat it.
-        if (target && !isEditorWrite(file, () => fingerprintFile(file))) {
-          const rel = target.split(path.sep).join('/');
-          // classifySceneChange just forwards detectType's verdict for 'scene' now that
-          // the catch-all is gone (#54) — every 'scene' is positively identified (suffix
-          // or legacy /scenes/ dir), so no further gating is needed. 'prefab' always broadcasts.
-          const kind = classifySceneChange(rel);
-          if (kind) {
-            const urlPath = absToAssetUrl(target, assetRoots);
-            // Editing both `foo.glsl` and `foo.wgsl` inside one debounce window both remap to
-            // the SAME descriptor path, so `pendingSceneChanges` (keyed by urlPath) collapses
-            // them into ONE broadcast for `foo.shader.json` — intended.
-            if (urlPath) {
-              const viaSibling = isSiblingRaisedChange(file, target, pendingSceneChanges.get(urlPath)?.viaSibling);
-              pendingSceneChanges.set(urlPath, { kind, viaSibling });
-            }
-          }
-        }
-        scheduleRebuild();
-      };
+      // keeps Vite's off the project asset roots entirely. What an event does is `createSceneChangeBatch`'s, shared with
+      // the Electron backend's watcher; its changes broadcast to the browser, which hot-reloads the active scene
+      // (app/debug/agentBridge.ts).
+      const changeBatch = createSceneChangeBatch({
+        assetRoots: () => assetRoots,
+        guard: editorWriteGuard,
+        rebuildManifest: () => { rebuildManifest(); },
+        broadcast: (urlPath, kind, viaSibling) => {
+          if (!viteServer) return;
+          try { viteServer.ws.send({ type: 'custom', event: 'modoki:scene-changed', data: { urlPath, kind, viaSibling } }); }
+          catch { /* ws not ready */ }
+        },
+      });
+      const onChange = changeBatch.onChange;
       // `watch: null` turns Vite's watcher off (vitest does, in a run); the scanner's follows it, as it did while it
       // rode on Vite's.
       if (server.config.server.watch !== null) {
