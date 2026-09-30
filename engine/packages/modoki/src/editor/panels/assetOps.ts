@@ -27,7 +27,7 @@ import {
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
-import { snapshotUnkeyed } from '../scene/capturedKeys';
+import { snapshotUnkeyed, dropOnThrow, type UnkeyedSnapshot } from '../scene/capturedKeys';
 import { isResourceEntity } from '../../runtime/core/ecs/hierarchy';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason, parkPrefabChanges } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
@@ -636,7 +636,16 @@ function notAuthoredRefusal(reason: string): CreatePrefabRefusal {
   return { refused: `Create Prefab refused — ${reason}.${exit ? ` ${sentence(exit)}.` : ''}`, notAuthored: reason };
 }
 
-export async function createPrefabFromEntity(
+/** Create Prefab's door. An exception after its capture takes the capture's keys off, as its refusals and failed writes
+ *  do (`dropOnThrow`, #1884 close-out): a throw skipped every `drop()` below and left keys on a tree nothing links. */
+export function createPrefabFromEntity(...args: CreatePrefabArgs): ReturnType<typeof createPrefab> {
+  return dropOnThrow((hold) => createPrefab(hold, ...args));
+}
+type CreatePrefabArgs = Parameters<typeof createPrefab> extends [unknown, ...infer R] ? R : never;
+
+async function createPrefab(
+  /** Takes the capture's snapshot, for `dropOnThrow`. */
+  hold: (s: UnkeyedSnapshot) => UnkeyedSnapshot,
   entityId: number,
   /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
    *  spelling (#1273), which is what the result's `savePath` reports. */
@@ -734,7 +743,7 @@ export async function createPrefabFromEntity(
   // The tree's nodes with no template key, before the serialize keys some of them (#1884): the tag's undo takes exactly
   // those keys off again. Each with its identity check, as `sameRoot`: a node the commit's rebuild re-minted is not it.
   // …and a create that writes nothing takes them off at once (`unkeyed.drop()`): nothing links the tree to a document.
-  const unkeyed = snapshotUnkeyed(entityId);
+  const unkeyed = hold(snapshotUnkeyed(entityId));
   const draft = serializePrefab(entityId, keptId, {
     bakeKeptState: true,
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
@@ -783,7 +792,9 @@ export async function createPrefabFromEntity(
       const id = ref.resolve();
       if (id == null) return;
       // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-      ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab, { unkeyed: unkeyed.ids() }));
+      // Kept the moment the tag has linked the tree, from inside `tagTree` (reviews): the rest of the tag (the guid stamp,
+      // the settles, the marks) can still throw, and the keys are the file's by then — not a create that landed nothing.
+      ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab, { unkeyed: unkeyed.ids(), onLinked: unkeyed.keep }));
     },
   });
   // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only

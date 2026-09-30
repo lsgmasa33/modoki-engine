@@ -102,8 +102,9 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefabApply.ts', in: 'commitApplyPlan', warned: true }, // Apply's writing half (#1693)
       { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
-      // The agent `prefab create` IS createPrefabFromEntity since #1873 C1 (the row below): it writes nothing itself.
-      { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefabFromEntity', warned: true }, // Save-as-Prefab
+      // The agent `prefab create` IS createPrefabFromEntity since #1873 C1 (the row below): it writes nothing itself. Its body
+      // is `createPrefab` since the #1884 close-out (the export wraps it in `dropOnThrow`).
+      { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefab', warned: true }, // Save-as-Prefab
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
     // unwarned write inside a pardoned function is an offender too, and a restore that starts warning (or goes away)
@@ -185,11 +186,11 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // Every write is one `commitPrefabWrite` since #1692: the forward one is the authoring write and warns; a CREATE's
     // REDO writes a deleted file back and must stay quiet for the reason above. A Replace's undo and redo write nothing
     // since #1868 — they restore in memory.
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'commitPrefabWrite').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
-      { in: 'createPrefabFromEntity', warned: true },
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefab', 'commitPrefabWrite').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
+      { in: 'createPrefab', warned: true },
       { in: 'redo', warned: false },
     ]);
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile'), 'no unguarded write is left in the action').toEqual([]);
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefab', 'writeAssetFile'), 'no unguarded write is left in the action').toEqual([]);
   });
 
   // The agent create op's answer (#1251 close-out: the agent never reads the renderer console) is behaviour-tested since

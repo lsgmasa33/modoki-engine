@@ -12,7 +12,7 @@
  *    every case below that asserts Extra except the Replace's: its undo's rebuild respawns O's Extra with its key, so it
  *    cannot see that mutation, and pins only Z.
  *  - a Replace over another prefab runs the same undo. Mutation: drop `undoKeys()` from `undoKept` — red, as the first.
- *  - a redo that REFUSES takes its seat back off. Mutation: drop `stripCreatedKeys(unkeyed)()` in the refused branch — red,
+ *  - a redo that REFUSES takes its seat back off. Mutation: drop `stripKeysNow(unkeyed)` in the refused branch — red,
  *    and only this.
  *  - a Create that writes nothing after its serialize keyed the tree takes the keys off at once, and Extra keeps k-extra:
  *    the write conflicts or fails (`!committed.ok`), or the serialize refuses a cycle part-way (`!draft`: the plan had
@@ -27,6 +27,18 @@
  *    keeps the key that create's document declares: its tag re-derived Z's guid, so this one's snapshot no longer names Z
  *    (mutation: the handle-only snapshot above — red here too).
  *
+ *  - an EXCEPTION after the serialize keyed the tree (a throw right after it, before the write) takes the keys off like a
+ *    refusal, and Extra keeps k-extra (`dropOnThrow`, the #1884 close-out's un-killed candidate (a)); the ACCEPT side, a
+ *    throw after the tag linked the tree (in the commit's rebase), leaves Z the key the written file declares, live and
+ *    reloaded (`keep()`) — with Z guid-less, the one node the snapshot still names after the tag (by identity; a guid is
+ *    renamed by the tag's derivation); and so does a throw INSIDE the tag once it linked (its guid stamp, its settle),
+ *    which is why `keep()` runs from `tagTree`'s tag loop (`onLinked`), not after the tag. Mutations: drop `held?.drop()`
+ *    in `dropOnThrow` — the first red; drop the `onLinked` call — all three accept cases red; call it after `tagTree`
+ *    returns — the stamp case red; after `tagCreatedPrefab` returns — the stamp and settle cases red.
+ *  - the strip of a Create that lands nothing writes no identity: a Z with NO durable guid keeps none (candidate (b):
+ *    the strip addressed nodes by `entityRef`, which mints one). Mutation: strip through `stripCreatedKeys(ids())()` in
+ *    `drop()` again — red.
+ *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches and the undo stack. */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -40,6 +52,45 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
+// A throw at two seams of the door, armed per test: right after the serialize (its inert-size warning), and after the tag
+// (the commit's rebase of the other instances).
+const thrown = vi.hoisted(() => ({ at: '' as '' | 'serialize' | 'rebase' | 'settle' | 'stamp' }));
+// …and inside the tag once it linked the tree: its guid stamp (inside `tagTree`, after its tag loop) and its kept-state
+// settle (after `tagTree`).
+vi.mock('../../packages/modoki/src/runtime/core/ecs/memberHome', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/runtime/core/ecs/memberHome')>();
+  return { ...m, stampDerivedMemberGuids: (...a: Parameters<typeof m.stampDerivedMemberGuids>) => {
+    const out = m.stampDerivedMemberGuids(...a);
+    if (thrown.at === 'stamp') throw new Error('threw inside the tag (armed)');
+    return out;
+  } };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefabTokens', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/editor/scene/prefabTokens')>();
+  return {
+    ...m,
+    // A live binding, not the spread's frozen copy: the serialize reads it inside `withKeptStateBake`.
+    get bakingKeptState() { return m.bakingKeptState; },
+    settleSwallowedKeptState: (...a: Parameters<typeof m.settleSwallowedKeptState>) => {
+      if (thrown.at === 'settle') throw new Error('threw inside the tag (armed)');
+      return m.settleSwallowedKeptState(...a);
+    },
+  };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefab', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
+  return { ...m, warnInertPrefabSizes: (...a: Parameters<typeof m.warnInertPrefabSizes>) => {
+    if (thrown.at === 'serialize') throw new Error('threw after the serialize (armed)');
+    return m.warnInertPrefabSizes(...a);
+  } };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/editor/scene/prefabRebuild')>();
+  return { ...m, rebaseStaleInstances: (...a: Parameters<typeof m.rebaseStaleInstances>) => {
+    if (thrown.at === 'rebase') throw new Error('threw after the tag (armed)');
+    return m.rebaseStaleInstances(...a);
+  } };
+});
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, authored, type Fixture } from './prefabFuzz/harness';
 import { pushAction } from '@modoki/engine/editor';
@@ -50,7 +101,8 @@ import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreate
 import { createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { tagCreatedPrefab } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
-import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { findEntity, readTraitData, writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { withAdoption } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -303,5 +355,75 @@ describe("Create Prefab's undo takes off the keys the create put on (#1884)", ()
     const key = keyOf('Z');
     expect(key, 'Z keeps its key').toBeTruthy();
     expect(JSON.stringify(s.prefab), "the second create's document declares it").toContain(key!);
+  });
+
+  it("a Create that THROWS after its serialize takes the capture's keys off, as a save + reload leaves Z, and Extra keeps k-extra", async () => {
+    const f = await startRun(be, async () => {}, 'createKeys-throw');
+    const plain = await holder(f);
+    thrown.at = 'serialize';
+    try {
+      await expect(createPrefabFromEntity(plain, `${f.root}/prefabs/NewPlain.prefab.json`, 'Save prefab "Plain"', async () => false))
+        .rejects.toThrow(/after the serialize/);
+    } finally {
+      thrown.at = '';
+    }
+    await settle();
+    expect(be.read(`${f.root}/prefabs/NewPlain.prefab.json`), 'premise: nothing was written').toBeFalsy();
+    expect(keyOf('Z')).toBeUndefined();
+    expect(extraKeys()).toEqual(['k-extra']);
+    await saveScene({ allowDialog: false });
+    await loadSceneReporting(f.scenePath);
+    await settle();
+    expect(keyOf('Z'), 'the reload agrees').toBeUndefined();
+  });
+
+  // Z with no durable guid: the snapshot then names it by its identity, which the tag keeps (a node with a guid is renamed
+  // by the tag's derivation, so a drop after it would not find that node anyway).
+  for (const at of ['rebase', 'settle', 'stamp'] as const) it(`a Create that throws AFTER its tag linked the tree (${at === 'rebase' ? 'in the commit\'s rebase' : `inside the tag, its ${at}`}) keeps the keys: they are the written file's (accept side)`, async () => {
+    const f = await startRun(be, async () => {}, `createKeys-throwLanded-${at}`);
+    const plain = await holder(f);
+    writeTraitField(byName('Z').id, getTraitByName('EntityAttributes')!, 'guid', '');
+    const path = `${f.root}/prefabs/NewPlain.prefab.json`;
+    thrown.at = at;
+    try {
+      await expect(createPrefabFromEntity(plain, path, 'Save prefab "Plain"', async () => false)).rejects.toThrow(at === 'rebase' ? /after the tag/ : /inside the tag/);
+    } finally {
+      thrown.at = '';
+    }
+    await settle();
+    const key = keyOf('Z');
+    expect(key, 'Z keeps the key its landing wrote').toBeTruthy();
+    expect(be.read(path), 'premise: the file landed, and declares that key').toContain(key!);
+    expect(extraKeys()).toEqual(['k-extra']);
+    await saveScene({ allowDialog: false });
+    await loadSceneReporting(f.scenePath);
+    await settle();
+    expect(keyOf('Z'), 'the reload agrees').toBe(key);
+  });
+
+  it('the strip of a Create that lands nothing writes no identity: a Z with no durable guid still has none', async () => {
+    const f = await startRun(be, async () => {}, 'createKeys-guidless');
+    const plain = await holder(f);
+    const ea = getTraitByName('EntityAttributes')!;
+    const guidOf = (id: number) => (readTraitData(id, ea) as { guid?: string } | null)?.guid;
+    writeTraitField(byName('Z').id, ea, 'guid', '');
+    expect(guidOf(byName('Z').id), 'premise: Z has no guid').toBe('');
+    const through = be.fetch;
+    vi.stubGlobal('fetch', async (url: string, init?: Parameters<typeof through>[1]) => {
+      if (String(url).includes('/api/write-file') && String(init?.body ?? '').includes('NewPlain.prefab.json')) {
+        return new Response(JSON.stringify({ error: 'disk full (armed)' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      return through(url, init);
+    });
+    let r: Awaited<ReturnType<typeof createPrefabFromEntity>>;
+    try {
+      r = await createPrefabFromEntity(plain, `${f.root}/prefabs/NewPlain.prefab.json`, 'Save prefab "Plain"', async () => false);
+    } finally {
+      vi.stubGlobal('fetch', through);
+    }
+    await settle();
+    expect(r && r !== 'declined' && 'refused' in r ? r.refused : r, 'premise: the write failed').toMatch(/was not written/);
+    expect(keyOf('Z'), 'premise: the strip ran').toBeUndefined();
+    expect(guidOf(byName('Z').id)).toBe('');
   });
 });

@@ -1841,7 +1841,11 @@ nodes before its capture and drops what got keyed (`snapshotUnkeyed`, `editor/sc
 landing that tagged nothing — whose redo then links the tree to the file, so Create Prefab records the keys right after
 its serialize and that redo seats them again (without them its plan minted keys the file does not declare). The snapshot names its nodes by durable guid, so a rebuild in place during the write (a
 nested prefab rebased meanwhile) does not hide one, and another create that linked the tree meanwhile re-derived their
-guids, so its keys stay. Two doors
+guids, so its keys stay. **An exception is an exit too**: a throw after the capture and before the landing took the tree
+drops the keys as a refusal does (`dropOnThrow`), and one after it leaves them — Create marks the moment its tag links the
+tree (`keep()`, from inside the tag: the rest of the tag can still throw); Apply's
+rebuild respawns every node its promotion keyed under a guid the snapshot does not name. **The drop writes no identity**:
+it un-keys by id (`stripKeysNow`), where an `entityRef` would mint a guid on a node that has none (#1884 close-out). Two doors
 capture a live scene tree: **Create Prefab** (its serialize; the refused serialize, the failed write and the undo,
 below) and **Apply** (its writing plan's promotion; a failed write or a refusal after the plan. Its undo reloads the
 scene from before it). The rest capture nothing before their step, or capture a tree that is not the scene's: a model

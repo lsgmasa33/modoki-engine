@@ -9,7 +9,7 @@ import { toLocalIdKeys, memberRef, splitNestedKey, nestedKeyRef } from './overri
 import { memberPathRecords, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
-import { snapshotUnkeyed } from './capturedKeys';
+import { snapshotUnkeyed, dropOnThrow } from './capturedKeys';
 import { newGuid, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { memberPathSteps, addedKeyStep } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
@@ -217,16 +217,21 @@ export async function applyToPrefabSelective(
   // nothing takes those keys back off, and the Apply's undo reloads the scene from before it. Unity: a failed Apply leaves
   // the object as it was. (The one other non-applied answer, the world left mid-write, rebuilt nothing either: in a world
   // that switched the snapshot resolves nothing, and in one an adoption only held, the keys come off like a failed write's.)
-  const unkeyed = snapshotUnkeyed(rootInstanceId);
-  const plan = await planApply(rootInstanceId, selectedKeys, targets);
-  if ('result' in plan) { unkeyed.drop(); return plan.result; }
-  if (plan.conflicts.length) {
-    unkeyed.drop();
-    return { ...NOOP_APPLY, refused: conflictRefusal(plan.conflicts), effects: plan.effects, conflicts: plan.conflicts };
-  }
-  const result = await commitApplyPlan(plan);
-  if (!result.applied) unkeyed.drop();
-  return result;
+  // …and so does an exception after it, which skipped every `drop()` here (`dropOnThrow`, #1884 close-out). One after the
+  // rebuild began finds nothing to drop: the rebuild deletes every node the promotion keyed and respawns it under a guid
+  // its template derives, which the snapshot does not name (so Apply needs no `keep()`, unlike Create).
+  return dropOnThrow(async (hold) => {
+    const unkeyed = hold(snapshotUnkeyed(rootInstanceId));
+    const plan = await planApply(rootInstanceId, selectedKeys, targets);
+    if ('result' in plan) { unkeyed.drop(); return plan.result; }
+    if (plan.conflicts.length) {
+      unkeyed.drop();
+      return { ...NOOP_APPLY, refused: conflictRefusal(plan.conflicts), effects: plan.effects, conflicts: plan.conflicts };
+    }
+    const result = await commitApplyPlan(plan);
+    if (!result.applied) unkeyed.drop();
+    return result;
+  });
 }
 
 /** The computing half of Apply: reads the instance and the prefab, and returns the documents to write — or, for a

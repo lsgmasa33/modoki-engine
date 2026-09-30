@@ -19,7 +19,7 @@ import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
 import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
-import { unkeyedNodes, stripCreatedKeys } from './capturedKeys';
+import { unkeyedNodes, stripCreatedKeys, stripKeysNow } from './capturedKeys';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -70,7 +70,9 @@ type TagWrites = Map<number, 'link' | 'stamp'>;
 /** {@link tagEntityTreeAsInstance}, reporting what it wrote. `refuseQuietly`: a plan that no longer matches the file is
  *  returned as `refused` for the caller to refuse its step with, instead of logged. */
 function tagTree(
-  rootEcsId: number, source: string, writtenPrefab?: PrefabFile, opts?: { refuseQuietly?: boolean },
+  rootEcsId: number, source: string, writtenPrefab?: PrefabFile,
+  /** `onLinked`: called once every row is tagged, before the rest (the frame note, the guid stamp) can throw. */
+  opts?: { refuseQuietly?: boolean; onLinked?: () => void },
 ): { guidRemap: Map<string, string>; writes: TagWrites; refused?: string } {
   const writes: TagWrites = new Map();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
@@ -146,6 +148,7 @@ function tagTree(
     applyTag(info.id, localId);
     writes.set(info.id, 'link');
   }
+  opts?.onLinked?.();
   // What these members' localIds now MEAN — the document just written — so every identity walk reads their
   // template parents from it before any reload has expanded it (`identityParents.ts`, #1468 Phase 6).
   if (writtenPrefab) noteFrameDoc(getCurrentWorld(), ref, writtenPrefab, findEntity(rootEcsId) ?? undefined);
@@ -496,7 +499,13 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
  *  its seat back off the same way. Unity: undoing Create Prefab leaves an object with no prefab identity on it. */
 export function tagCreatedPrefab(
   rootEcsId: number, source: string, writtenPrefab: PrefabFile,
-  opts?: { keys?: ReadonlyMap<string, string>; unkeyed?: ReadonlySet<number> },
+  opts?: {
+    keys?: ReadonlyMap<string, string>; unkeyed?: ReadonlySet<number>;
+    /** Called the moment `tagTree` has linked the tree — after its tag loop, before its guid stamp (#1884 close-out
+     *  reviews): from here the keys are the file's, so a throw in the rest of the tag is not a create that landed nothing
+     *  (Create's `keep()`). Not called when the tag refuses or the tree no longer plans to the file. */
+    onLinked?: () => void;
+  },
 ): { guidRemap: Map<string, string>; undoKept: () => void; priorLinks: DetachSnapshot; keys: Map<string, string>; refused?: string } {
   const redo = opts?.keys;
   const unkeyed = opts?.unkeyed ?? unkeyedNodes(rootEcsId);
@@ -505,9 +514,9 @@ export function tagCreatedPrefab(
   const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
   // Taken without stripping (#1278), before the tag, then kept to what the tag wrote (`writes`).
   const snapshot = detachPrefabInstance(rootEcsId, { strip: false });
-  const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo });
+  const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo, onLinked: opts?.onLinked });
   if (refused) {
-    stripCreatedKeys(unkeyed)();
+    stripKeysNow(unkeyed);
     return { guidRemap, undoKept: () => {}, priorLinks: { links: [], orphans: [] }, keys: new Map(), refused };
   }
   const priorLinks: DetachSnapshot = {

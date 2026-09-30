@@ -23,9 +23,20 @@ export function unkeyedNodes(rootEcsId: number): Set<number> {
   return out;
 }
 
-/** The undo of the keys a capture put on: of `unkeyed`, the nodes that carry one now. Addressed by the guid each holds
- *  NOW — after Create's tag has stamped the member guids, the one each holds when its `undoKept` runs (before the rename
- *  is reversed), as `clearLinkedMarks`. */
+/** Take the template key off each of these nodes, now. Addressed by id and nothing else: an exit that lands nothing
+ *  writes no identity either, and `entityRef` would MINT a durable guid on a node that has none (#1884 close-out). */
+export function stripKeysNow(ids: Iterable<number>): void {
+  for (const id of ids) {
+    const e = findEntity(id);
+    if (e?.has(TemplateAddedKey)) e.remove(TemplateAddedKey);
+  }
+}
+
+/** The undo of the keys a landed capture put on: of `unkeyed`, the nodes that carry one now. Addressed by the guid each
+ *  holds NOW — after Create's tag has stamped the member guids, the one each holds when its `undoKept` runs (before the
+ *  rename is reversed), as `clearLinkedMarks`. Taken by a step that LANDED, which may write identity: the ref must find
+ *  its node after a world rebuild (Play→Stop), so a node with no guid gets one (`entityRef`). An exit that lands
+ *  nothing strips at once instead (`stripKeysNow`). */
 export function stripCreatedKeys(unkeyed: ReadonlySet<number>): () => void {
   const refs = [...unkeyed].filter((id) => templateKeyOf(findEntity(id))).map((id) => entityRef(id));
   return () => {
@@ -44,9 +55,12 @@ export function stripCreatedKeys(unkeyed: ReadonlySet<number>): () => void {
  *    it and left the key (the #1884 rider review). A node with no durable guid is found only while it is the same entity.
  *    A step that LINKED the tree meanwhile (another Create Prefab of it, landed during this one's write) re-derived the
  *    members' guids with its tag, so the snapshot no longer names them and leaves the keys that document declares.
- *  - `drop()`: take off the keys the capture put on them, for an exit that lands nothing.
+ *  - `drop()`: take off the keys the capture put on them, for an exit that lands nothing. A no-op once `keep()` ran.
+ *  - `keep()`: the landing took the tree (Create's tag), so its keys are the file's from here on: an exception after it
+ *    is not a door that landed nothing, and `dropOnThrow` leaves them. Load-bearing for a node with no durable guid,
+ *    which the snapshot names by identity and the tag keeps (a guid is renamed by the tag's derivation, and not found).
  *  - `keyed()`: the keys they carry now, by guid. */
-export function snapshotUnkeyed(rootEcsId: number): { ids: () => Set<number>; drop: () => void; keyed: () => Map<string, string> } {
+export function snapshotUnkeyed(rootEcsId: number): UnkeyedSnapshot {
   const world = getCurrentWorld();
   const eaMeta = getTraitByName('EntityAttributes');
   const guidOf = (id: number) => (eaMeta ? durableGuid((readTraitData(id, eaMeta) as { guid?: string } | null)?.guid) : '');
@@ -71,6 +85,28 @@ export function snapshotUnkeyed(rootEcsId: number): { ids: () => Set<number>; dr
     }
     return out;
   };
-  return { ids, drop: () => stripCreatedKeys(ids())(), keyed };
+  let kept = false;
+  return { ids, drop: () => { if (!kept) stripKeysNow(ids()); }, keep: () => { kept = true; }, keyed };
+}
+
+export interface UnkeyedSnapshot {
+  ids: () => Set<number>;
+  drop: () => void;
+  keep: () => void;
+  keyed: () => Map<string, string>;
+}
+
+/** Run a door whose capture keys the live tree, and take those keys back off when it THROWS before its landing took the
+ *  tree (#1884 close-out): an exception between the capture and the landing (a throw in the serialize, the plan, the
+ *  commit) is an exit that lands nothing like a refusal or a failed write, and skipped the door's own `drop()`. The door
+ *  hands its snapshot to `hold` as it takes it; a throw before that has no capture to undo. */
+export async function dropOnThrow<T>(run: (hold: (s: UnkeyedSnapshot) => UnkeyedSnapshot) => Promise<T>): Promise<T> {
+  let held: UnkeyedSnapshot | undefined;
+  try {
+    return await run((s) => (held = s));
+  } catch (e) {
+    held?.drop();
+    throw e;
+  }
 }
 

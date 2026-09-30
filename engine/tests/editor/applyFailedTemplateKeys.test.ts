@@ -12,6 +12,12 @@
  *  - the ACCEPT side, in the same Apply: a placed O under the same root, whose Extra O's template keys `k-extra`, keeps it.
  *    Mutation: widen `unkeyedNodes` to every node of the tree — both red on Extra.
  *
+ *  - an EXCEPTION after the writing plan's promotion keyed Z (a throw in the commit, before the write) takes the keys off
+ *    like a failed write (`dropOnThrow`, the #1884 close-out's candidate (a)); the ACCEPT side, a throw after the rebuild
+ *    took the tree (in the commit's rebase), leaves Z the key the written H declares: the rebuild respawned Z under a
+ *    derived guid the snapshot does not name, so Apply needs no `keep()`. Mutations: drop `held?.drop()` in
+ *    `dropOnThrow` — the first red; strip every key of the tree in `drop()`, ignoring the snapshot — the second red.
+ *
  *  Not driven: the writing plan's own refusal and its conflicts (the same `drop()`), which need the world to change between
  *  the dry plan and the writing one.
  *
@@ -28,6 +34,23 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
+// A throw at two seams of the commit, armed per test: before the write (its inert-size warning), and after the rebuild
+// (the rebase of the other instances).
+const thrown = vi.hoisted(() => ({ at: '' as '' | 'plan' | 'rebase' }));
+vi.mock('../../packages/modoki/src/editor/scene/prefab', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/editor/scene/prefab')>();
+  return { ...m, warnInertPrefabSizes: (...a: Parameters<typeof m.warnInertPrefabSizes>) => {
+    if (thrown.at === 'plan') throw new Error('threw after the plan (armed)');
+    return m.warnInertPrefabSizes(...a);
+  } };
+});
+vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (orig) => {
+  const m = await orig<typeof import('../../packages/modoki/src/editor/scene/prefabRebuild')>();
+  return { ...m, rebaseStaleInstances: (...a: Parameters<typeof m.rebaseStaleInstances>) => {
+    if (thrown.at === 'rebase') throw new Error('threw after the rebuild (armed)');
+    return m.rebaseStaleInstances(...a);
+  } };
+});
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, authored, type Fixture } from './prefabFuzz/harness';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
@@ -116,4 +139,42 @@ describe("an Apply that lands nothing takes its promotion's keys off (#1884 ride
       expect(keyOf('Z'), 'the reload agrees').toBeUndefined();
     });
   }
+
+  it('an Apply that THROWS after its plan promoted Z: Z is unkeyed, as a save + reload leaves it, and Extra keeps k-extra', async () => {
+    const f = await startRun(be, async () => {}, 'applyKeys-throw');
+    const h1 = await setup(f);
+    const before = be.read(f.prefabs.H.path);
+    thrown.at = 'plan';
+    try {
+      await expect(applyAll(h1, f)).rejects.toThrow(/after the plan/);
+    } finally {
+      thrown.at = '';
+    }
+    await settle();
+    expect(be.read(f.prefabs.H.path), 'premise: H was not written').toBe(before);
+    expect(keyOf('Z')).toBeUndefined();
+    expect(placedExtraKey(h1)).toEqual(['k-extra']);
+    await saveScene({ allowDialog: false });
+    await loadSceneReporting(f.scenePath);
+    await settle();
+    expect(keyOf('Z'), 'the reload agrees').toBeUndefined();
+  });
+
+  // The claim Apply's door rests on instead of a `keep()`: a throw after the rebuild began leaves the landed keys, because the
+  // rebuild respawned Z under a guid its template derives, which the snapshot does not name.
+  it('an Apply that throws AFTER its rebuild took the tree keeps the keys: they are the written file\'s (accept side)', async () => {
+    const f = await startRun(be, async () => {}, 'applyKeys-throwLanded');
+    const h1 = await setup(f);
+    thrown.at = 'rebase';
+    try {
+      await expect(applyAll(h1, f)).rejects.toThrow(/after the rebuild/);
+    } finally {
+      thrown.at = '';
+    }
+    await settle();
+    const key = keyOf('Z');
+    expect(key, 'Z keeps the key its landing wrote').toBeTruthy();
+    expect(be.read(f.prefabs.H.path), 'premise: H landed, and declares that key').toContain(key!);
+    expect(placedExtraKey(h1)).toEqual(['k-extra']);
+  });
 });
