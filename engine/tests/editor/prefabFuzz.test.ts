@@ -75,7 +75,7 @@ import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
 import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
-import { KNOWN_OPEN, REGRESSIONS } from './prefabFuzz/knownOpen';
+import { KNOWN_OPEN, REGRESSIONS, type KnownOpen } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { setRunMode } from '@modoki/engine/runtime';
@@ -203,9 +203,13 @@ const VERIFY_LEN = 25;
 
 const OPTS = { expectedError };
 
-/** The KNOWN_OPEN entry whose `stops` predicate claims this failure, if any. A predicate sees only the ops that ran up to
- *  the failing step: judged on the whole list, an op AFTER the failure satisfied an op-shape clause (review). */
-const knownStop = (f: StepFailure, ops: readonly Op[]) => KNOWN_OPEN.find((k) => k.stops?.(f, ops.slice(0, f.step + 1)));
+/** Every KNOWN_OPEN entry whose `stops` predicate claims this failure; an entry without one claims nothing. A predicate
+ *  sees only the ops that ran up to the failing step: judged on the whole list, an op AFTER the failure satisfied an
+ *  op-shape clause (review). `list` is the harness self-tests' seam: they plant fixture entries, so the matcher is checked
+ *  while KNOWN_OPEN is empty — iterating an empty list, they passed checking nothing. */
+const claimsOf = (f: StepFailure, ops: readonly Op[], list: readonly KnownOpen[] = KNOWN_OPEN) => list.filter((k) => k.stops?.(f, ops.slice(0, f.step + 1)));
+/** The first entry that claims this failure, if any: what verify, the hunt and a replay stop at. */
+const knownStop = (f: StepFailure, ops: readonly Op[], list: readonly KnownOpen[] = KNOWN_OPEN): KnownOpen | undefined => claimsOf(f, ops, list)[0];
 
 /** Every tally the hunt prints: taints and the checks they skipped (#1845), op outcomes, backend routes. */
 const tallies = (): Map<string, number>[] => [taintCounts, skippedChecks, opOutcomes, be.routeCounts, checksRun];
@@ -347,7 +351,7 @@ describe('#1789 prefab fuzz', () => {
       if (k.stops) expect(knownStop(r.failure!, k.repro)?.issue, `#${k.issue}'s stop predicate does not claim its own repro`).toBe(k.issue);
       // The reject side: no OTHER issue's entry claims this failure — each predicate is one mechanism's, not a family's
       // (a second route of one issue is its own entry, with its own repro).
-      const others = KNOWN_OPEN.filter((o) => o.issue !== k.issue && o.stops?.(r.failure!, k.repro.slice(0, r.failure!.step + 1))).map((o) => o.issue);
+      const others = claimsOf(r.failure!, k.repro).filter((o) => o.issue !== k.issue).map((o) => o.issue);
       expect(others, `#${k.issue}'s repro is also claimed by ${others.join(', ')}`).toEqual([]);
     }, 60_000);
   }
@@ -550,7 +554,23 @@ describe('#1789 prefab fuzz', () => {
       { check: 'undo to the start does not restore the scene', detail: `/entities/${R}: {"traits":{"EntityAttributes":{"guid":"${R}"}}} vs undefined`, step: ops.length, op: 'undo/redo to the ends', touched, console: [untag] },
       { check: 'redo to the end does not restore the scene', detail: `/entities/${R}: {"traits":{"EntityAttributes":{"guid":"${R}"}}} vs undefined`, step: ops.length, op: 'undo/redo to the ends', touched, console: [untag] },
     ];
-    const claims = shapes.flatMap((ops) => planted(ops).flatMap((f) => KNOWN_OPEN.filter((k) => k.stops?.(f, ops)).map((k) => `#${k.issue} claims ${f.check} after ${ops.map((o) => o.kind).join(',')}`)));
+    // A fixture stop planted beside the real entries, so the matcher is exercised while KNOWN_OPEN is empty: one
+    // mechanism under the same op shape (a Create Prefab's undo loses a MEMBER's row of the entity it created), keyed on
+    // the check, the path, the entity the create touched and the ops — as a real entry is.
+    const fixture: KnownOpen = {
+      issue: -1841, what: 'fixture: a Create Prefab undo loses a member row', repro: [], reproduces: () => false,
+      stops: (f, ops) => f.check === 'undo to the start does not restore the scene' && ops.some((o) => o.kind === 'createPrefab') && ops.some((o) => o.kind === 'undo')
+        && (f.touched?.create ?? []).some((g) => f.detail.startsWith(`/entities/${g}/members/`)),
+    };
+    const list = [...KNOWN_OPEN, fixture];
+    // Accept side: under every shape, the fixture claims its own failure. Only the planted claims are compared: a real entry
+    // for this mechanism, should one reopen, rightly claims it too (review).
+    for (const ops of shapes) {
+      const own: StepFailure = { check: 'undo to the start does not restore the scene', detail: `/entities/${R}/members//aaaaaaaa-0000-4000-8000-000000001841/traits: {"Transform":{"x":1}} vs undefined`, step: ops.length, op: 'undo/redo to the ends', touched };
+      expect(claimsOf(own, ops, list).filter((k) => k.issue < 0).map((k) => k.issue), ops.map((o) => o.kind).join(',')).toEqual([fixture.issue]);
+    }
+    // Refuse side: no stop, real or planted, claims a root loss.
+    const claims = shapes.flatMap((ops) => planted(ops).flatMap((f) => claimsOf(f, ops, list).map((k) => `#${k.issue} claims ${f.check} after ${ops.map((o) => o.kind).join(',')}`)));
     expect(claims).toEqual([]);
   });
 
@@ -763,11 +783,41 @@ describe('#1789 prefab fuzz', () => {
         f('undo to the start does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
       ];
     };
+    // Fixture stops planted beside the real entries, so the matcher is exercised while KNOWN_OPEN is empty: #1777's shape
+    // (a paste that duplicates its own node inside one frame, keyed on the check, the pasted entity and the op, as a real
+    // entry is), #1792's (a duplicate after a detach, keyed on the detail and the op alone, so only the op-window cut keeps
+    // it off a later detach), and an entry without a `stops` (it must claim nothing).
+    const pasteDup: KnownOpen = {
+      issue: -1777, what: 'fixture: a paste duplicates its own node inside one frame', repro: [], reproduces: () => false,
+      stops: (f, ops) => f.check === 'I7 duplicate guid' && /rows of one frame\)$/.test(f.detail) && !/not rows/.test(f.detail)
+        && ops.some((o) => o.kind === 'paste') && (f.touched?.paste ?? []).some((g) => f.detail.startsWith(`${g} held by`)),
+    };
+    const afterDetach: KnownOpen = {
+      issue: -1792, what: 'fixture: a duplicate after a detach', repro: [], reproduces: () => false,
+      stops: (f, ops) => f.check === 'I7 duplicate guid' && /not rows of one frame/.test(f.detail) && ops.some((o) => o.kind === 'detach'),
+    };
+    const noStop: KnownOpen = { issue: -1, what: 'fixture: an entry with no stop', repro: [], reproduces: () => true };
+    const list = [...KNOWN_OPEN, pasteDup, afterDetach, noStop];
+    const at = (kind: Op['kind']) => ({ kind, u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] });
+    const pasted = 'bbbbbbbb-0000-4000-8000-000000000002';
+    // Accept side: each fixture claims its own failure, and no other fixture does. Only the planted claims are compared: a
+    // real entry for one of these mechanisms, should one reopen, rightly claims the fixture's failure too (review).
+    const plantedClaims = (ks: KnownOpen[]) => ks.filter((k) => k.issue < 0).map((k) => k.issue);
+    const ownDup = (step: number): StepFailure => ({ check: 'I7 duplicate guid', detail: `${pasted} held by M, M (under one top-level root; rows of one frame)`, op: 'paste(0.500)', step, touched: { drop: [], paste: [pasted], detach: [], create: [] } });
+    for (const ops of lists) expect(plantedClaims(claimsOf(ownDup(ops.length - 1), ops, list)), ops.map((o) => o.kind).slice(-3).join(', ')).toEqual([pasteDup.issue]);
+    const early = [at('detach'), at('revert')];
+    const detachDup: StepFailure = { check: 'I7 duplicate guid', detail: 'G held by R, R (under one top-level root; not rows of one frame)', op: 'revert(0.500)', step: 1 };
+    expect(plantedClaims(claimsOf(detachDup, early, list))).toEqual([afterDetach.issue]);
+    // Every claimant, not the first: the per-entry reject side reads the rest ("also claimed by"), so a matcher that
+    // stopped at the first would leave it blind to a later entry claiming the same repro (review).
+    const twin: KnownOpen = { ...afterDetach, issue: -17920, what: 'fixture: a second entry claiming the same duplicate' };
+    expect(plantedClaims(claimsOf(detachDup, early, [...list, twin]))).toEqual([afterDetach.issue, twin.issue]);
+    // Refuse side: no stop, real or planted, claims a generic failure.
     for (const ops of lists) for (const g of generic(ops)) {
-      expect(knownStop(g, ops)?.issue, `${g.check}: ${g.detail} after ${ops.map((o) => o.kind).slice(-3).join(', ')}`).toBeUndefined();
+      expect(knownStop(g, ops, list)?.issue, `${g.check}: ${g.detail} after ${ops.map((o) => o.kind).slice(-3).join(', ')}`).toBeUndefined();
     }
     // And only the ops BEFORE the failure count: a #1792-shaped duplicate at step 0 whose detach runs later is unclaimed.
-    const late = [{ kind: 'revert' as const, u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] }, { kind: 'detach' as const, u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] }];
-    expect(knownStop({ check: 'I7 duplicate guid', detail: 'G held by R, R (under one top-level root; not rows of one frame)', op: 'revert(0.500)', step: 0 }, late)).toBeUndefined();
+    const late = [at('revert'), at('detach')];
+    expect(knownStop({ check: 'I7 duplicate guid', detail: 'G held by R, R (under one top-level root; not rows of one frame)', op: 'revert(0.500)', step: 0 }, late, list)).toBeUndefined();
   });
 });

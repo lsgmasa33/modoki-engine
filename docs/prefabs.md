@@ -726,8 +726,8 @@ trashed, then Apply All) skips that node and keeps the frame live (`missingNeste
 
 **KNOWN_OPEN** (`prefabFuzz/knownOpen.ts`) is how verify stays green while a found bug is open.
 - Each entry names its issue.
-- It either stops a seed at that bug, with a predicate on the check AND the op shape that reaches it, or tolerates it with a
-  named normalization.
+- It stops a seed at that bug, with a predicate on the check AND the op shape that reaches it. (A second kind, a
+  normalization verify applied while its issue was open, had one user, #1796's node-list order, and went with its fix.)
 - It carries a repro that a self-test must still see fail. Fixing the bug turns that self-test red, which removes the entry.
 - A predicate sees only the ops before the failure, and keys on what the failure SHOWS (the I7 detail says whether the
   holders are rows of one frame; an identity failure says whether an entity was lost or changed guid), not on the op
@@ -754,6 +754,14 @@ trashed, then Apply All) skips that node and keeps the frame live (`missingNeste
   untouched entities must go unclaimed after lists that end in each op a stop keys "last" on, and after lists that
   leave out each op a stop keys "no …" on. Those failures are #1777's shape, values and marks, a lost, gained or
   placeholder'd entity of a live prefab, the reviews' planted regressions, and a re-tag refusal for another tree.
+  - Over KNOWN_OPEN alone these self-tests check nothing while it is empty, and it is empty whenever every found bug is
+    fixed. So each one also plants fixture stops beside the real entries and runs them through the same matcher
+    (`claimsOf`, which verify, the hunt and a replay all stop through). The accept side: each fixture claims its own
+    failure, no other fixture does, and two entries claiming one failure are both returned (the per-entry reject side
+    reads the rest). A real entry is not held to "nothing else claims it": one for the same mechanism, reopened,
+    rightly would. The refuse side covers three things: the generic failures above, an op after the
+    failure (the op window), and an entry with no stop, which claims nothing. Breaking the matcher in each of those ways
+    turns them red with KNOWN_OPEN empty.
 - Hunt mode, not verify, reports a seed as a known route, not a finding, when a stop claims both its shrunk list's
   failure (same signature) and the seed's own failure judged against the shrunk op order. A 40-op list often hides
   the op order a route's stop keys on. The content keys stay the seed's own, and the replay is printed.
