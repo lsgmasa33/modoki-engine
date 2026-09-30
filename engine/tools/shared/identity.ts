@@ -2,7 +2,7 @@
  *
  *  SHARED by BOTH MCP servers (`docs/mcp-tool-conventions.md` §9 — a rule implemented twice
  *  diverges, and this one had not been implemented twice at all: the DEVICE server had no identity
- *  guard whatsoever. `.mcp.json` defaults MODOKI_BACKEND to 5179 for every clone, so a `device_*`
+ *  guard whatsoever. `.mcp.json` defaulted MODOKI_BACKEND to 5179 for every clone (until #1894), so a `device_*`
  *  call from the work-ai2 clone drove the MAIN clone's editor — and its device lease — with every
  *  call reporting success.
  *

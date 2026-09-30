@@ -46,7 +46,9 @@ import {
 } from './result.js';
 import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseNativeLogsReply, deviceListDecoder, describeClaim, SYNTHETIC_MECHANISM, decodeLeaseStatus, decodeDeviceRequestReply, decodeIdentity, decodeToolchain, type Decoder, type DeviceRequestReply, type LeaseStatus, type DeviceListClaim } from './reply.js';
 
-const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
+import { BACKEND_RESOLUTION } from './backend.js';
+
+const BACKEND = BACKEND_RESOLUTION.url;
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals + the line that renders them live in `reply.ts` (with `describeLease`, the other
@@ -255,8 +257,8 @@ function deviceEvalApiGuidance(): {
 }
 
 // ── WHICH editor is this pointed at? (S2.39) ─────────────────────────────────
-// `.mcp.json` defaults MODOKI_BACKEND to 5179 for EVERY clone, and this server had no identity
-// check whatsoever — so a `device_*` call from the work-ai2 clone drove the MAIN clone's editor,
+// `.mcp.json` used to default MODOKI_BACKEND to 5179 for EVERY clone (#1894 replaced that with a
+// per-clone derivation, `./backend.ts`), and this server had no identity check whatsoever — so a `device_*` call from the work-ai2 clone drove the MAIN clone's editor,
 // and therefore the MAIN clone's device lease, with every call reporting success. The editor MCP
 // has warned about this since C6; the device MCP is the surface where it matters MORE, because a
 // tap or a dispatch lands on a physical phone somebody else is using.

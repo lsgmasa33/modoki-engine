@@ -183,7 +183,8 @@ export default function AIPanel(): React.ReactElement {
                 know why their port stops auto-following the editor. */}
             {status.mcpTracked && (
               <div style={{ color: '#8a8a9a', fontSize: 10, marginTop: 3 }}>
-                tracked by git — not rewritten automatically; Reconnect edits it explicitly
+                {/* A tracked config that DEFERS its backend offers no Reconnect at all (#1894). */}
+                tracked by git — not rewritten automatically{summary.action === 'Reconnect' ? '; Reconnect edits it explicitly' : ''}
               </div>
             )}
           </div>

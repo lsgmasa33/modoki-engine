@@ -3,11 +3,20 @@
 // quick end-to-end check that the server speaks MCP and reaches the backend.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fileURLToPath } from 'node:url';
+import { CLONE_BACKEND_PORTS, backendUrlForClone } from '../../scripts/cloneBackendPorts.mjs';
+
+// MODOKI_BACKEND, else THIS clone's pinned port, else the hub's — the resolution the server it
+// spawns makes (#1894, `engine/tools/shared/backendUrl.ts`). Plain node cannot import that .ts, so
+// this reads the same table directly; the repo root is three levels up from this file.
+const SMOKE_BACKEND = process.env.MODOKI_BACKEND
+  || backendUrlForClone(fileURLToPath(new URL('../../..', import.meta.url)))
+  || `http://127.0.0.1:${CLONE_BACKEND_PORTS['modoki']}`;
 
 const transport = new StdioClientTransport({
   command: 'npx',
   args: ['tsx', 'src/index.ts'],
-  env: { ...process.env, MODOKI_BACKEND: process.env.MODOKI_BACKEND || 'http://localhost:5173' },
+  env: { ...process.env, MODOKI_BACKEND: SMOKE_BACKEND },
 });
 const client = new Client({ name: 'smoke', version: '1.0.0' });
 await client.connect(transport);
@@ -1674,7 +1683,7 @@ if (canUC3) {
   // path resolution the save used, so no guess about the project's asset-root layout is needed
   // (3d-test's is `runtime/assets`). Read before and after to prove the save-as never touched it.
   const readSceneBytes = async (p) => {
-    const res = await fetch(new URL(p, process.env.MODOKI_BACKEND || 'http://localhost:5173'), { cache: 'no-store' });
+    const res = await fetch(new URL(p, SMOKE_BACKEND), { cache: 'no-store' });
     return res.ok ? res.text() : null;
   };
   const originalBytes = SCENE ? await readSceneBytes(SCENE).catch(() => null) : null;

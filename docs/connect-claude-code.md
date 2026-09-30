@@ -74,9 +74,9 @@ path everywhere).
 | `REPO_ROOT = app.isPackaged ? <resourcesPath>/app.asar.unpacked : <repo>` | `main.ts` | Main can compute the **absolute** path to the MCP entry + the template on *this* machine |
 | Backend port is `backendHandle.port` (default 5179, ephemeral fallback on clash) | `main.ts` | Main knows the exact `MODOKI_BACKEND` URL to bake; the user never could |
 | Open project root is `state.root` | `main.ts` | Main knows where to write `.mcp.json` |
-| MCP reads `MODOKI_BACKEND` (default `http://localhost:5173`) + logs a start banner | `modoki-mcp/src/index.ts`'s `main()` | The written env var is the only wiring the MCP needs |
+| MCP reads `MODOKI_BACKEND` (unset: its own clone's pinned port, else `http://127.0.0.1:5179` — #1894) + logs a start banner naming which | `modoki-mcp/src/index.ts`, `tools/shared/backendUrl.ts` | The written env var is the only wiring the MCP needs; outside a clone (the packaged app) the derivation finds nothing, so the written value is what it uses |
 | Dev CDP is an electron CLI arg (`--remote-debugging-port`) the launcher sets; Chromium binds it 127.0.0.1-only. **On by default** in dev too now: an explicit `MODOKI_CDP_PORT` wins, else the launcher derives a per-clone-safe default `9222 + (backend − 5179)` (5179→9222, 5180→9223, 5181→9224) whenever the backend port is pinned; only an AUTO backend port (MULTI mode) leaves it off | `launch-editor.sh` | The packaged app (OS double-click, no CLI arg) `appendSwitch`es the port itself — also **on by default** (opt-out), so a plain launch opens it unless the user disabled it |
-| The repo `.mcp.json` already runs three servers (`modoki`, `game-debug`, `chrome-devtools --browser-url`) | repo `.mcp.json` | Multi-server merge is the proven shape; `chrome-devtools` attaches to a renderer over CDP by URL |
+| The repo `.mcp.json` already runs three servers (`modoki`, `game-debug`, `chrome-devtools` — through `engine/scripts/chrome-devtools-mcp.mjs`, which supplies `--browser-url` at spawn since #1894) | repo `.mcp.json` | Multi-server merge is the proven shape; `chrome-devtools` attaches to a renderer over CDP by URL |
 | Menus merge renderer items via `rendererMenuSpec` + `modoki:bridge-menu-action`; main↔renderer over the preload bridge | `projects.ts`, `preload.ts`, `main.ts` | A new menu item + a dockable panel slot into existing patterns |
 | Editor already writes project files (`project.config.json`, `.modoki/layouts/`) | `projects.ts` | Writing `.mcp.json` is an established capability, not a new trust boundary |
 | Starter template ships a project `CLAUDE.md`, copied recursively by BOTH scaffold paths | `templates/starter/CLAUDE.md`, `scaffold-project.mjs`'s `fs.cpSync(TEMPLATE_DIR, targetDir, { recursive: true })`, `newProject.ts`'s `scaffoldProject`, `main.ts`'s `onNewProject` | New projects are already primed — the CLAUDE.md is in the DMG/exe; only its *content* needs upgrading |
@@ -833,14 +833,29 @@ verified over a NARROWER surface than the code enforces*:
   5179/5180/5181 per clone and the file merges via `origin`, each clone would rewrite it to
   its own port **forever**. Now `healMcpPort` refuses a tracked target (`reason:'tracked'`);
   an explicit **Connect** may still write it (the user asked; git shows the diff) but warns.
+  **One exception (#1894): Connect/Reconnect refuses a tracked config whose modoki server DEFERS
+  its backend** (no `MODOKI_BACKEND`, or a `${...}` one — `connectRefusal`; a git check that did not
+  answer counts as tracked, as it does for the heal), and the panel offers no button there — main
+  sends it `connectRefusal`'s own verdict (`mcpWriteRefused`), which every branch that would offer
+  Reconnect reads (the deferred one, and the foreign-token one before it). Such a file is generic on purpose — every clone or teammate supplies its own
+  port — so baking this editor's port into it commits a machine-specific value for everyone who
+  pulls it; for THIS repo it would also restore the per-machine drift #1894 removed. A tracked
+  config that already names a literal port still writes (the user's own committed game config).
 - **`Connect` would have destroyed this repo's own config.** The committed `.mcp.json` is
-  deliberately generic — `"MODOKI_BACKEND": "${MODOKI_BACKEND:-http://127.0.0.1:5179}"` plus
-  relative paths — so ONE tracked file serves every clone. But `mcpOurs` answered "is this
+  deliberately generic — then `"MODOKI_BACKEND": "${MODOKI_BACKEND:-http://127.0.0.1:5179}"`, since
+  #1894 no `MODOKI_BACKEND` at all (the expansion made Claude Code start every server twice) — plus
+  relative paths, so ONE tracked file serves every clone. But `mcpOurs` answered "is this
   ours?" with `mcpBackendPort() != null`, and `new URL('${MODOKI_BACKEND:-…}')` throws ⇒ the
   panel called a working config *"not a usable Modoki config"* and pushed the user to
   overwrite the very mechanism it provides. `mcpOurs` is now the modoki server's PRESENCE;
   a deferred backend gets its own honest state ("Claude will reach whatever your shell
-  resolves — not necessarily this editor").
+  resolves — not necessarily this editor"). #1894 widened "deferred" to a modoki server with NO
+  `MODOKI_BACKEND` (`mcpBackendDeferred`), and gave chrome-devtools the same state
+  (`mcpChromeDeferred`): an entry that takes its port from the environment at spawn — the repo's
+  `chrome-devtools-mcp.mjs` wrapper, or a `${...}` `--browser-url=` — is not "stale" on the CDP
+  axis, or the panel would push Reconnect at the committed file. Deliberately NOT "any entry with
+  no literal `--browser-url=`": that first version also swallowed `--browserUrl=`, a separated
+  `--browser-url <url>`, `-u <url>` and no URL, and read a foreign renderer as "Connected.".
 - **`isGitTracked` failed OPEN.** It returned `r.status === 0`, mapping THREE outcomes onto
   two: `spawnSync` reports a missing `git` as `status: null` **without throwing**, so
   "couldn't run" silently became "untracked" — on the one surface dev can't test (a

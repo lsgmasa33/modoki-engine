@@ -94,7 +94,7 @@ describe('the device surface keeps the editor surface\'s param rules (#1559)', (
 
 describe('S2.39 — the device server knows WHICH editor it is driving', () => {
   it('banners a wrong-clone backend on the result itself', async () => {
-    // `.mcp.json` defaults MODOKI_BACKEND to 5179 for every clone and this server had no identity
+    // `.mcp.json` defaulted MODOKI_BACKEND to 5179 for every clone (until #1894) and this server had no identity
     // check at all, so a device_* call from one clone drove another clone's editor — and its
     // physical device — with every call reporting success.
     const s = (surface = await loadDeviceSurface((req) =>

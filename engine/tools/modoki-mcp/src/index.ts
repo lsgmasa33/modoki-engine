@@ -4,8 +4,11 @@
  * server or the Electron main process). The user's own Claude Code connects to this over stdio
  * and edits the project's scenes/assets through validated tools, then verifies its own work.
  *
- * Backend base: MODOKI_BACKEND env (e.g. http://127.0.0.1:<port> for the Electron editor) —
- * defaults to the Vite dev server at http://localhost:5173.
+ * Backend base: MODOKI_BACKEND env (e.g. http://127.0.0.1:<port> for the Electron editor); unset,
+ * THIS clone's pinned port (`../../shared/backendUrl.ts`, #1894); otherwise the hub/default editor
+ * port, 5179 — the value `.mcp.json` supplied to every server before #1894, and where an editor in
+ * an unlisted clone settles (docs/clones-and-ports.md). It was `http://localhost:5173` (Vite) in
+ * code, which `.mcp.json` always overrode; keeping it would have split the two servers apart.
  *
  * THIS FILE IS THE EXECUTABLE ENTRY, and deliberately nothing else. It is the ONE module that
  * reads the environment and starts a transport; everything testable lives beside it:
@@ -27,8 +30,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createToolContext } from './context.js';
 import { registerAllTools } from './registerAll.js';
 import { createGameToolSync } from './gameTools.js';
+import { resolveBackend, describeBackend } from '../../shared/backendUrl.js';
 
-const BACKEND = (process.env.MODOKI_BACKEND || 'http://localhost:5173').replace(/\/$/, '');
+// `import.meta.url` of THIS file: `src/index.ts` under tsx and `dist/index.js` in the bundle sit at
+// the same depth, which is what `resolveBackend` counts on to find the clone.
+const RESOLVED = resolveBackend({ env: process.env.MODOKI_BACKEND, entryModuleUrl: import.meta.url });
+const BACKEND = RESOLVED.url;
 
 const server = new McpServer({ name: 'modoki', version: '1.0.0' });
 const ctx = createToolContext({ backend: BACKEND, token: process.env.MODOKI_TOKEN });
@@ -41,7 +48,7 @@ ctx.refreshGameTools = async () => { await gameTools.refresh(); };
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write(`[modoki-mcp] started — backend ${BACKEND}\n`);
+  process.stderr.write(`[modoki-mcp] started — backend ${describeBackend(RESOLVED)}\n`);
   gameTools.start();
 }
 

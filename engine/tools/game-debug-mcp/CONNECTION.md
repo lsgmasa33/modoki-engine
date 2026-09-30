@@ -144,11 +144,12 @@ any WiFi lease) captures natively through the lease.
 ```json
 "game-debug": {
   "command": "npx",
-  "args": ["tsx", "engine/tools/game-debug-mcp/src/index.ts"],
-  "env": { "MODOKI_BACKEND": "${MODOKI_BACKEND:-http://127.0.0.1:5179}" }
+  "args": ["tsx", "engine/tools/game-debug-mcp/src/index.ts"]
 }
 ```
-Point a session at its clone with `MODOKI_BACKEND=http://127.0.0.1:<port>`. Ports: **9095** is the
+No `MODOKI_BACKEND` and no `${...}` in it, on purpose (#1894): unset, the server derives its own
+clone's pinned port (`../shared/backendUrl.ts`), and a `${...}` default made Claude Code start it
+twice. `MODOKI_BACKEND=http://127.0.0.1:<port>` in the environment still wins. Ports: **9095** is the
 device's TCP server (owned by the backend, not this MCP); the HOST end of the adb tunnel is derived
 per clone from the backend port, 9095/9096/9097/9098 (#158).
 

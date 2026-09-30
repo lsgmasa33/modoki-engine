@@ -45,6 +45,13 @@ export interface ConnectStatus {
    *  literal URL — Claude Code resolves those at spawn time from the user's shell, so we
    *  genuinely cannot know which editor it lands on. */
   mcpBackendRaw?: string | null;
+  /** The config leaves MODOKI_BACKEND to the environment: a `${...}` expansion, OR no
+   *  MODOKI_BACKEND at all (this repo's committed config since #1894). Absent on an older main
+   *  process → the panel falls back to judging `mcpBackendRaw` alone. */
+  mcpBackendDeferred?: boolean;
+  /** Connect/Reconnect would refuse to write this config (#1894 `connectRefusal`: tracked, or
+   *  possibly tracked, AND deferred). Absent on an older main process → `mcpTracked` decides. */
+  mcpWriteRefused?: boolean;
   /** The effective config is version-controlled ⇒ the unattended heal refuses to touch it. */
   mcpTracked?: boolean;
   /** The CDP port the project's .mcp.json itself names (independent of our own state). */
@@ -179,20 +186,44 @@ export function connectionSummary(s: ConnectStatus | null): ConnectionSummary {
   // The config names a different editor (C6), so this one is 403ing every call it makes.
   // Checked before `mcpStale` — which also fires here, but reports it as a changed port.
   if (s.mcpTokenForeign) {
+    // …unless Connect would refuse the rewrite (#1894 — a tracked config that defers its backend):
+    // then say where the fix is instead of offering a button that only produces the refusal.
+    if (s.mcpWriteRefused) {
+      return {
+        level: 'error',
+        message: 'This project’s .mcp.json was written for a DIFFERENT editor — this one refuses its requests rather than silently applying them. It is committed and leaves MODOKI_BACKEND to the environment, so it is not rewritten here: remove its MODOKI_TOKEN by hand, then restart `claude`.',
+        action: null,
+      };
+    }
     return {
       level: 'error',
       message: 'This project’s .mcp.json was written for a DIFFERENT editor — this one refuses its requests rather than silently applying them. Click Reconnect, then restart `claude`.',
       action: 'Reconnect',
     };
   }
-  // The config defers MODOKI_BACKEND to the shell (`${VAR}` / `${VAR:-default}`, which
-  // Claude Code expands at spawn time). We CANNOT know what it resolves to — so neither a
-  // green "Connected" nor a red "stale" is honest. Say exactly what's true and give both
-  // fixes. (This repo's own committed .mcp.json is deliberately written this way.)
-  if (isBackendDeferred(s.mcpBackendRaw)) {
+  // The config defers MODOKI_BACKEND to the environment (`${VAR}` / `${VAR:-default}`, which
+  // Claude Code expands at spawn time, or no MODOKI_BACKEND at all, which the server reads from
+  // its environment or derives from its clone — #1894). We CANNOT know what it resolves to — so
+  // neither a green "Connected" nor a red "stale" is honest. Say exactly what's true and give
+  // the fixes. (This repo's own committed .mcp.json is deliberately written this way.)
+  if (s.mcpBackendDeferred ?? isBackendDeferred(s.mcpBackendRaw)) {
+    const port = s.backendPort ?? '?';
+    const how = isBackendDeferred(s.mcpBackendRaw)
+      ? `leaves MODOKI_BACKEND to your shell (\`${s.mcpBackendRaw}\`)`
+      : 'sets no MODOKI_BACKEND, so the server takes it from the environment `claude` runs in — or, inside a Modoki clone, that clone\'s own port —';
+    // A TRACKED generic config is the one file Reconnect refuses to write (#1894,
+    // `connectRefusal`): offering the button would only produce that refusal. Main sends the
+    // refusal verdict itself, which also covers a git check that did not answer.
+    if (s.mcpWriteRefused ?? s.mcpTracked) {
+      return {
+        level: 'action',
+        message: `This ${s.mcpTracked ? 'committed' : 'possibly committed (git did not answer)'} config ${how} and Claude will reach whatever that resolves to — not necessarily this editor (port ${port}). To aim it here, set MODOKI_BACKEND=http://127.0.0.1:${port} where \`claude\` runs (a clone's .claude/settings.local.json "env"); it is shared through git, so it is not rewritten.`,
+        action: null,
+      };
+    }
     return {
       level: 'action',
-      message: `This config leaves MODOKI_BACKEND to your shell (\`${s.mcpBackendRaw}\`), so Claude will reach whatever that resolves to — not necessarily this editor (port ${s.backendPort ?? '?'}). Either export MODOKI_BACKEND=http://127.0.0.1:${s.backendPort ?? '?'} before running \`claude\`, or Reconnect to bake this editor's port in.`,
+      message: `This config ${how} and Claude will reach whatever that resolves to — not necessarily this editor (port ${port}). Either export MODOKI_BACKEND=http://127.0.0.1:${port} before running \`claude\`, or Reconnect to bake this editor's port in.`,
       action: 'Reconnect',
     };
   }

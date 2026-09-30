@@ -267,7 +267,7 @@ import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentPro
 import { scaffoldProject } from './newProject';
 import { resolveCdpConfig, readCdpEnabled, writeCdpEnabled, probeCdp, newCdpNonce, buildRendererUrl, readCdpPortMemo, writeCdpPortMemo, cdpMemoVerdict, type CdpProbe } from './cdp';
 import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from './backendPort';
-import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
+import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, mcpBackendDeferred, connectRefusal, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
 import { composeDepsInstallError, projectDepsMissing } from './projectDeps';
@@ -2187,6 +2187,7 @@ app.whenReady().then(async () => {
     const target = resolveMcpTarget(state.root);
     const mcpPath = target.mcpPath;
     const mcpText = target.exists ? fs.readFileSync(mcpPath, 'utf8') : null;
+    const trackedState = gitTrackedState(mcpPath); // one git call, read by two fields below
     // OBSERVED, not intended: the pref alone once painted CDP green while the port
     // belonged to a sibling clone's editor.
     const cdp = await cdpStatus();
@@ -2220,16 +2221,25 @@ app.whenReady().then(async () => {
       // ours. Without this the panel reported "Connected" for a .mcp.json Claude can't
       // even parse. `mcpOurs` = it actually carries our modoki server.
       //
-      // Judged on the server's PRESENCE, not on a parseable port: Claude Code expands
-      // `${VAR:-default}` in .mcp.json, and this repo's own committed config uses it, so a
-      // port-based test called a working config "not usable" (C9b).
+      // Judged on the server's PRESENCE, not on a parseable port: a config may leave the
+      // backend to the environment (`${VAR:-default}`, or no MODOKI_BACKEND at all — this
+      // repo's own committed config since #1894), so a port-based test called a working
+      // config "not usable" (C9b).
       mcpOurs: mcpHasModoki(mcpText),
       // The RAW backend string, so the panel can distinguish "baked to a literal port"
       // from "defers to your shell's MODOKI_BACKEND" — states with different fixes.
       mcpBackendRaw: mcpBackendRaw(mcpText),
+      // …and the verdict itself, which also covers a modoki server with NO MODOKI_BACKEND
+      // (null raw), the shape #1894 committed. (The chrome half, `mcpChromeDeferred`, is folded
+      // into `mcpStale` by `isMcpStale` — the panel needs no field of its own for it.)
+      mcpBackendDeferred: mcpBackendDeferred(mcpText),
       // Version-controlled ⇒ the unattended heal refuses it, and Connect warns before
       // dirtying the user's tree.
-      mcpTracked: gitTrackedState(mcpPath) === 'tracked',
+      mcpTracked: trackedState === 'tracked',
+      // The exact verdict Connect/Reconnect will reach (#1894) — the panel hides its button on
+      // THIS, not on `mcpTracked`, which reads an unanswered git check ('unknown') as untracked
+      // while `connectRefusal` fails closed on it.
+      mcpWriteRefused: connectRefusal(mcpText, trackedState) != null,
       // The config's OWN chrome-devtools port, read unconditionally. A `.mcp.json` written
       // before the CDP verification existed (or while another editor held the port) can
       // still aim Claude at a FOREIGN renderer — the original bug, displaced from the
@@ -2265,6 +2275,10 @@ app.whenReady().then(async () => {
       const mcpPath = target.mcpPath;
       const existing = target.exists ? fs.readFileSync(mcpPath, 'utf8') : null;
       const trackedBefore = gitTrackedState(mcpPath); // read BEFORE the write, for the warning
+      // The one config an explicit click may NOT write (#1894): tracked AND generic. See
+      // `connectRefusal` — a tracked config with a literal port still writes, below.
+      const refusal = connectRefusal(existing, trackedBefore);
+      if (refusal) return { ok: false, error: refusal, mcpPath };
       // mergeMcpConfig THROWS on a corrupt existing file rather than clobbering it.
       // Bake the token that names THIS editor+project, so a config that later reaches a
       // recycled port held by another editor is refused rather than silently obeyed (C6).
@@ -2288,7 +2302,8 @@ app.whenReady().then(async () => {
         mcpShadowing: target.shadowing,
         // An explicit click MAY write a tracked file — it's the user's own repo and git
         // shows them the diff (unlike the unattended heal, which refuses outright). But
-        // say so: we just baked a machine-local port into a committed, shared file.
+        // say so: we just baked a machine-local port into a committed, shared file. (The
+        // exception, a tracked config that DEFERS its backend, was refused above — #1894.)
         mcpTrackedWarning: trackedBefore === 'tracked'
           ? `${mcpPath} is tracked by git — this wrote machine-specific ports into a committed file. Review the diff before committing it (other clones/teammates use different ports).`
           : undefined,

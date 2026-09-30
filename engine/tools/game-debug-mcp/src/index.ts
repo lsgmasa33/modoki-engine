@@ -10,6 +10,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { registerTools } from './mcp-tools.js';
+import { BACKEND_RESOLUTION } from './backend.js';
+import { describeBackend } from '../../shared/backendUrl.js';
 
 async function main() {
   const server = new McpServer({ name: 'modoki-device', version: '2.0.0' });
@@ -18,8 +20,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  const backend = process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179';
-  process.stderr.write(`[device-mcp] MCP server started (backend: ${backend})\n`);
+  process.stderr.write(`[device-mcp] MCP server started (backend: ${describeBackend(BACKEND_RESOLUTION)})\n`);
 }
 
 main().catch((err) => {

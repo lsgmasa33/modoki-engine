@@ -45,9 +45,12 @@ const skip = !hasPrivateTooling();
 const MCP_CONFIGS = ['.mcp.json'];
 
 /** The per-clone lanes from root CLAUDE.md § Clones. A literal occurrence of any of these in a
- *  shared config is the bug — UNLESS it is the default of a `${VAR:-…}` expansion, which is the
- *  sanctioned escape: the shared file then carries a sensible default and each clone overrides it
- *  through its own gitignored `.claude/settings.local.json`.
+ *  shared config is the bug, and so is one inside a `${VAR:-…}` default — that USED to be the
+ *  sanctioned escape, and it is what made Claude Code start every server twice (#1894: the
+ *  expansion is evaluated before and after settings `env` applies, and differing answers spawn
+ *  both). The config now names no port at all; each server derives its clone's
+ *  (`engine/tools/shared/backendUrl.ts`) and a clone's gitignored `.claude/settings.local.json`
+ *  overrides it.
  *
  *  DERIVED, not hand-listed (#349). This list used to stop at three clones — 5179/5180/5181,
  *  5173-5175, 9222-9224 — while five existed, so `modoki-ai3`'s and `modoki-qa`'s lanes were
@@ -60,22 +63,18 @@ const CLONE_PORTS = Object.values(CLONE_BACKEND_PORTS).flatMap((backend) => [
   cdpPortForBackend(backend),
 ]);
 
-/** Strip every `${VAR:-default}` expansion, so what remains is only the genuinely hardcoded text. */
-function stripEnvExpansions(src: string): string {
-  return src.replace(/\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}/g, '${…}');
-}
-
 describe.skipIf(skip)('committed MCP configs do not hardcode a per-clone port (#68 sibling)', () => {
   for (const rel of MCP_CONFIGS) {
-    it(`${rel} names a clone port only as an env-expansion default`, () => {
-      const bare = stripEnvExpansions(read(rel));
+    it(`${rel} names no clone port, not even as an env-expansion default`, () => {
+      const bare = read(rel);
       const offenders = CLONE_PORTS.filter((p) => new RegExp(`127\\.0\\.0\\.1:${p}\\b`).test(bare));
       expect(
         offenders,
         `${rel} hardcodes 127.0.0.1:${offenders.join('/')} — that is one clone's lane baked into a file `
-        + 'every clone reads, so the other clones silently drive the wrong target. Use '
-        + '`${VAR:-http://127.0.0.1:<hub-default>}` and put the per-clone value in that clone\'s '
-        + 'gitignored .claude/settings.local.json (see root CLAUDE.md § Clones).',
+        + 'every clone reads, so the other clones silently drive the wrong target. Name NO port: the '
+        + 'servers derive their clone\'s (engine/tools/shared/backendUrl.ts), and a per-clone override '
+        + 'goes in that clone\'s gitignored .claude/settings.local.json. Not a `${VAR:-…}` default '
+        + 'either — Claude Code then starts the server twice (#1894).',
       ).toEqual([]);
     });
   }

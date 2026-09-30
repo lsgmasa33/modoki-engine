@@ -31,13 +31,20 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { CONTRACTS } from './src/contracts.js';
+import { resolveBackend } from '../shared/backendUrl.js';
 // The buckets live in `src/` so a CI-safe vitest guard can assert the split is TOTAL — see
 // `src/liveCoverage.ts` for why that separation matters.
 import { COVERED_BY_SMOKE as SMOKE_LIST, LIVE_UNCOVERED } from './src/liveCoverage.js';
 
 const COVERED_BY_SMOKE = new Set<string>(SMOKE_LIST);
 
-const BACKEND = process.env.MODOKI_BACKEND || 'http://127.0.0.1:5179';
+// The same resolution the server it spawns makes (#1894), handed down explicitly so the two
+// cannot disagree: MODOKI_BACKEND, else THIS clone's pinned port, else the hub's. This harness used
+// to default straight to 5179, so a bare run from a worker clone swept the HUB's editor.
+const BACKEND = resolveBackend({
+  env: process.env.MODOKI_BACKEND,
+  entryModuleUrl: new URL('./src/index.ts', import.meta.url).href,
+}).url;
 
 const transport = new StdioClientTransport({
   command: 'npx', args: ['tsx', 'src/index.ts'], env: { ...process.env, MODOKI_BACKEND: BACKEND },

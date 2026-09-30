@@ -19,6 +19,7 @@ import { checkToken } from './instanceToken';
 import { loginShellCommandPath, spawnTimedOut, type LoginShellAnswer } from '../plugins/backend/loginShellProbe';
 // The ONE 'same directory?' comparison (#869) — this file donated its body.
 import { samePath } from '../scripts/pathIdentity.mjs';
+import { CLONE_BACKEND_PORTS } from '../scripts/cloneBackendPorts.mjs';
 // A leading UTF-8 BOM is stripped by the ONE helper (#1799): Windows editors (Notepad, PowerShell `Out-File`) write
 // one, and JSON.parse rejects it — so a perfectly valid .mcp.json would be misread as corrupt.
 import { parseJsonText, stripBom } from '../scripts/jsonFile.mjs';
@@ -170,12 +171,12 @@ export function mcpBackendPort(mcpText: string | null): number | null {
  * MODOKI_BACKEND is a literal URL?
  *
  * Distinct from `mcpBackendPort() != null`, which the panel used to answer "is this ours"
- * with. That conflated "not our config" with "our config, port not a literal" — and
- * Claude Code expands `${VAR}` / `${VAR:-default}` in `.mcp.json`, which THIS REPO's own
- * committed config uses (`"MODOKI_BACKEND": "${MODOKI_BACKEND:-http://127.0.0.1:5179}"`,
- * deliberately generic so one tracked file serves every clone). So the panel called a
- * perfectly working config "not a usable Modoki config" and pushed the user to overwrite
- * the very mechanism it exists to provide.
+ * with. That conflated "not our config" with "our config, port not a literal" — a config can
+ * leave MODOKI_BACKEND to the environment (a `${VAR:-default}` expansion, or no MODOKI_BACKEND
+ * at all, which is how THIS REPO's committed config does it since #1894 — deliberately generic
+ * so one tracked file serves every clone). So the panel called a perfectly working config "not
+ * a usable Modoki config" and pushed the user to overwrite the very mechanism it exists to
+ * provide.
  */
 export function mcpHasModoki(mcpText: string | null): boolean {
   const servers = parseMcp(mcpText)?.mcpServers;
@@ -210,6 +211,64 @@ export function mcpChromePort(mcpText: string | null): number | null {
 }
 
 /**
+ * Does this config's modoki server leave its backend to the ENVIRONMENT rather than naming a
+ * literal port? True for a `${VAR}` / `${VAR:-default}` MODOKI_BACKEND (Claude Code expands it at
+ * spawn) and for a modoki server that sets NO MODOKI_BACKEND at all — the server then reads the
+ * one it inherits, or derives its clone's pinned port (`engine/tools/shared/backendUrl.ts`). That
+ * second shape is this repo's committed config since #1894, whose `${...}` default made Claude
+ * Code spawn every server twice. Either way this editor cannot know which backend the config
+ * reaches, so it is neither "connected" nor "stale" — the panel says so instead (C9b).
+ */
+export function mcpBackendDeferred(mcpText: string | null): boolean {
+  if (!mcpHasModoki(mcpText)) return false;
+  const raw = mcpBackendRaw(mcpText);
+  return raw == null || raw.includes('${');
+}
+
+/**
+ * The chrome-devtools half of `mcpBackendDeferred`: the config's chrome-devtools server takes its
+ * port from the ENVIRONMENT at spawn — exactly two shapes: a `--browser-url=` that expands one
+ * (`${MODOKI_CDP_PORT:-9222}`), or this repo's wrapper, `engine/scripts/chrome-devtools-mcp.mjs`
+ * (#1894), which reads MODOKI_CDP_PORT itself.
+ *
+ * ⚠️ NOT "has no literal `--browser-url=` port" — that is far wider, and it silenced real stale
+ * configs (#1894 close-out review): `--browserUrl=…`, a separated `--browser-url <url>`, `-u <url>`
+ * and no URL at all (the server launches its own Chrome) all lack a parseable `--browser-url=`, so
+ * they read as STALE — "out of date — Reconnect", which rewrites them to the canonical form, as
+ * before #1894. Calling them deferred instead turned that into a green "Connected." while Claude
+ * drove another renderer. Nor is an ABSENT entry deferred: that is Connect not having written it yet.
+ */
+export function mcpChromeDeferred(mcpText: string | null): boolean {
+  const chrome = parseMcp(mcpText)?.mcpServers?.['chrome-devtools'];
+  if (!chrome || typeof chrome !== 'object' || Array.isArray(chrome)) return false;
+  const rawArgs = (chrome as { args?: unknown }).args;
+  const args = Array.isArray(rawArgs) ? rawArgs.filter((a): a is string => typeof a === 'string') : [];
+  if (args.some((a) => /(?:^|[\\/])chrome-devtools-mcp\.mjs$/.test(a))) return true;
+  return args.some((a) => a.startsWith('--browser-url=') && a.includes('${'));
+}
+
+/**
+ * Why Connect/Reconnect must NOT write this file, or null when it may (#1894). The ONE refusal:
+ * a git-TRACKED config whose modoki server defers its backend (`mcpBackendDeferred`). "Tracked"
+ * includes `'unknown'` (git missing, or `ls-files` timed out) — the same fail-closed reading
+ * `healMcpPort` makes: a committed generic file is exactly what an unanswered git check may be. Such a file
+ * is generic on purpose — a committed config shared by every clone or teammate, each supplying its
+ * own port — and baking this editor's literal port into it is exactly the per-machine drift it
+ * exists to avoid (and, for this repo, would undo #1894 for everyone who pulls it). Every other
+ * case still writes, including a TRACKED config that already carries a literal port: an explicit
+ * click may edit the user's own committed file, git shows them the diff (C9).
+ */
+export function connectRefusal(existingText: string | null, tracked: TrackedState): string | null {
+  if (tracked === 'untracked' || !mcpBackendDeferred(existingText)) return null;
+  return (tracked === 'tracked' ? 'This .mcp.json is tracked by git' : 'This .mcp.json may be tracked by git (the check did not answer)')
+    + ' and leaves MODOKI_BACKEND to the environment, so every '
+    + 'clone and teammate supplies its own port — writing this editor\'s port into it would commit a '
+    + 'machine-specific value. Set MODOKI_BACKEND where `claude` runs instead (a clone\'s '
+    + '.claude/settings.local.json "env"), or leave it unset inside a Modoki clone to use that '
+    + `clone's pinned port (${CLONE_BACKEND_PORTS['modoki']} for a clone not in the port table).`;
+}
+
+/**
  * Is the project's `.mcp.json` STALE relative to the live editor — i.e. would running
  * `claude` against it hit the wrong (or a missing) endpoint, so the panel should offer
  * Reconnect? True when:
@@ -233,7 +292,9 @@ export function isMcpStale(opts: {
   if (opts.mcpText == null) return false; // not written yet → "not stale", just "not connected"
   const baked = mcpBackendPort(opts.mcpText);
   if (baked != null && opts.backendPort != null && baked !== opts.backendPort) return true;
-  if (opts.cdpEnabled && opts.cdpPort != null && mcpChromePort(opts.mcpText) !== opts.cdpPort) return true;
+  // A chrome-devtools entry that reads its port at spawn (#1894) cannot be compared — like a
+  // deferred backend it is not stale, it is unknowable. An ABSENT entry still is (not written yet).
+  if (opts.cdpEnabled && opts.cdpPort != null && !mcpChromeDeferred(opts.mcpText) && mcpChromePort(opts.mcpText) !== opts.cdpPort) return true;
   return isMcpTokenForeign(opts.mcpText, opts.token ?? null);
 }
 
@@ -616,8 +677,8 @@ export function healMcpPort(opts: {
   //   - dirty the working tree with no user action, and
   //   - thrash across clones: CLAUDE.md pins 5179/5180/5181 per clone and the file is
   //     merged via origin, so each editor would rewrite it to its own port forever.
-  // This repo's committed config is also deliberately GENERIC — `${MODOKI_BACKEND:-…}` plus
-  // relative paths, so one file serves every clone. Baking a literal port into it destroys
+  // This repo's committed config is also deliberately GENERIC — no MODOKI_BACKEND at all (#1894;
+  // it was a `${MODOKI_BACKEND:-…}` before) plus relative paths, so one file serves every clone. Baking a literal port into it destroys
   // the mechanism it exists to provide.
   //
   // The doctrine (§11.1): a surprise write is worse than a clear error. So we refuse, the

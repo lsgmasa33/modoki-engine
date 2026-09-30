@@ -21,9 +21,14 @@ import {
   gitTrackedState,
   mcpHasModoki,
   mcpBackendRaw,
+  mcpBackendDeferred,
+  mcpChromeDeferred,
+  connectRefusal,
   _resetClaudeMemo,
 } from '../../electron/connectClaude';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { readScannedSource } from '@modoki/engine/testing';
+import { hasPrivateTooling } from '../helpers/repoLayout';
 
 /**
  * C2 unit gate — the "Connect Claude Code" .mcp.json writer.
@@ -922,8 +927,8 @@ describe('gitTrackedState', () => {
 });
 
 describe('mcpHasModoki / mcpBackendRaw — the ${VAR:-default} config (C9b)', () => {
-  // THIS REPO's committed .mcp.json is exactly this shape: deliberately generic so one
-  // tracked file serves every clone. Judging "is this ours" by a parseable port called it
+  // THIS REPO's committed .mcp.json WAS this shape until #1894 (it now sets no MODOKI_BACKEND at
+  // all — see the #1894 block below): deliberately generic so one tracked file serves every clone. Judging "is this ours" by a parseable port called it
   // "not a usable Modoki config" and pushed the user to overwrite the very mechanism.
   const deferred = JSON.stringify({
     mcpServers: { modoki: { command: 'npx', args: ['tsx', 'x.ts'], env: { MODOKI_BACKEND: '${MODOKI_BACKEND:-http://127.0.0.1:5179}' } } },
@@ -1048,5 +1053,111 @@ describe('ensureProjectClaudeMd', () => {
     const r = ensureProjectClaudeMd({ projectRoot: game, templatePath: template, projectName: 'My Game' });
     expect(r.path).toBe(path.join(game, 'CLAUDE.md')); // primer is the game's own
     expect(path.dirname(target.mcpPath)).not.toBe(game); // …and they genuinely differ
+  });
+});
+
+describe('a config that leaves its ports to the environment (#1894)', () => {
+  const cfg = (servers: Record<string, unknown>) => JSON.stringify({ mcpServers: servers });
+  const modokiNoEnv = { command: 'npx', args: ['tsx', 'x.ts'] };
+  const modokiLiteral = { command: 'npx', args: ['tsx', 'x.ts'], env: { MODOKI_BACKEND: 'http://127.0.0.1:5180' } };
+  const modokiExpanded = { command: 'npx', args: ['tsx', 'x.ts'], env: { MODOKI_BACKEND: '${MODOKI_BACKEND:-http://127.0.0.1:5179}' } };
+  const chromeWrapper = { command: 'node', args: ['engine/scripts/chrome-devtools-mcp.mjs'] };
+  const chromeLiteral = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', '--browser-url=http://127.0.0.1:9325'] };
+  const chromeExpanded = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', '--browser-url=http://127.0.0.1:${MODOKI_CDP_PORT:-9222}'] };
+  const chromeArgs = (...args: string[]) => ({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', ...args] });
+
+  it('mcpBackendDeferred: no MODOKI_BACKEND and a ${...} one both defer; a literal does not', () => {
+    expect(mcpBackendDeferred(cfg({ modoki: modokiNoEnv }))).toBe(true);
+    expect(mcpBackendDeferred(cfg({ modoki: modokiExpanded }))).toBe(true);
+    expect(mcpBackendDeferred(cfg({ modoki: modokiLiteral }))).toBe(false);
+    // Not ours at all is not "deferred" — that is the panel's Connect case, not this one.
+    expect(mcpBackendDeferred(cfg({ weather: { command: 'w' } }))).toBe(false);
+    expect(mcpBackendDeferred(null)).toBe(false);
+  });
+
+  it('mcpChromeDeferred: the wrapper or a ${...} --browser-url defers; a literal port or an ABSENT entry does not', () => {
+    expect(mcpChromeDeferred(cfg({ 'chrome-devtools': chromeWrapper }))).toBe(true);
+    expect(mcpChromeDeferred(cfg({ 'chrome-devtools': { command: 'node', args: ['C:\\m\\engine\\scripts\\chrome-devtools-mcp.mjs'] } }))).toBe(true);
+    expect(mcpChromeDeferred(cfg({ 'chrome-devtools': chromeExpanded }))).toBe(true);
+    expect(mcpChromeDeferred(cfg({ 'chrome-devtools': chromeLiteral }))).toBe(false);
+    expect(mcpChromeDeferred(cfg({ modoki: modokiLiteral }))).toBe(false);
+  });
+
+  it('mcpChromeDeferred is NOT "no parseable --browser-url=" — other spellings, and no URL, are not deferred (close-out review)', () => {
+    // Each of these names a renderer this editor can see is not its own, or attaches to none:
+    // calling them deferred turned "out of date" into a green "Connected." on a foreign renderer.
+    for (const c of [
+      chromeArgs('--browserUrl=http://127.0.0.1:9222'),
+      chromeArgs('--browser-url', 'http://127.0.0.1:9222'),
+      chromeArgs('-u', 'http://127.0.0.1:9222'),
+      chromeArgs(),
+      { command: 'node', args: ['some-other-chrome-devtools-mcp.mjs.bak'] },
+      { command: 'node', args: ['/x/not-chrome-devtools-mcp.mjs'] }, // the path boundary, not a suffix match
+    ]) {
+      expect(mcpChromeDeferred(cfg({ 'chrome-devtools': c })), JSON.stringify(c.args)).toBe(false);
+      expect(isMcpStale({ mcpText: cfg({ modoki: modokiLiteral, 'chrome-devtools': c }), backendPort: 5180, cdpEnabled: true, cdpPort: 9325 }), JSON.stringify(c.args)).toBe(true);
+    }
+  });
+
+  it('isMcpStale: CDP on + a chrome entry that reads its port at spawn is NOT stale — the chrome half alone', () => {
+    const opts = { backendPort: 5180, cdpEnabled: true, cdpPort: 9325 };
+    // A literal, MATCHING backend, so only the chrome axis can fire.
+    expect(isMcpStale({ ...opts, mcpText: cfg({ modoki: modokiLiteral, 'chrome-devtools': chromeWrapper }) })).toBe(false);
+    expect(isMcpStale({ ...opts, mcpText: cfg({ modoki: modokiLiteral, 'chrome-devtools': chromeExpanded }) })).toBe(false);
+    // Both halves deferred — the committed shape, built inline so the public snapshot runs it too.
+    expect(isMcpStale({ ...opts, backendPort: 5182, mcpText: cfg({ modoki: modokiNoEnv, 'chrome-devtools': chromeWrapper }) })).toBe(false);
+  });
+
+  it('isMcpStale still fires on the CDP axis for an ABSENT chrome entry or a literal wrong port (accept side)', () => {
+    const opts = { backendPort: 5180, cdpEnabled: true, cdpPort: 9325 };
+    expect(isMcpStale({ ...opts, mcpText: cfg({ modoki: modokiLiteral }) })).toBe(true);
+    expect(isMcpStale({ ...opts, mcpText: cfg({ modoki: modokiLiteral, 'chrome-devtools': chromeArgs('--browser-url=http://127.0.0.1:9222') }) })).toBe(true);
+    // …and never with a matching literal one.
+    expect(isMcpStale({ ...opts, mcpText: cfg({ modoki: modokiLiteral, 'chrome-devtools': chromeLiteral }) })).toBe(false);
+  });
+
+  it('connectRefusal refuses a TRACKED — or possibly-tracked (git did not answer) — config whose backend defers', () => {
+    expect(connectRefusal(cfg({ modoki: modokiNoEnv }), 'tracked')).toMatch(/tracked by git/);
+    expect(connectRefusal(cfg({ modoki: modokiExpanded }), 'tracked')).toMatch(/tracked by git/);
+    // 'unknown' fails CLOSED, as healMcpPort does: an unanswered git check may be hiding a commit.
+    expect(connectRefusal(cfg({ modoki: modokiNoEnv }), 'unknown')).toMatch(/may be tracked/);
+  });
+
+  it('connectRefusal lets every other case write — a tracked LITERAL config (C9) and an untracked deferred one', () => {
+    expect(connectRefusal(cfg({ modoki: modokiLiteral }), 'tracked')).toBeNull();
+    expect(connectRefusal(cfg({ modoki: modokiLiteral }), 'unknown')).toBeNull();
+    expect(connectRefusal(cfg({ modoki: modokiNoEnv }), 'untracked')).toBeNull();
+    expect(connectRefusal(null, 'untracked')).toBeNull(); // first Connect: no file yet
+  });
+});
+
+// THIS REPO's committed .mcp.json, read from disk: the shape #1894 committed is what the predicates
+// above must recognise. `.mcp.json` is PRIVATE — the public snapshot does not ship it while this
+// file does — so the block skips there, and reads lazily so a missing file cannot fail collection
+// and take every other test in this file down with it (#1894 close-out review).
+describe.skipIf(!hasPrivateTooling())('this repo\'s committed .mcp.json (#1894)', () => {
+  const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+  const committed = () => readScannedSource(path.join(REPO_ROOT, '.mcp.json'), {
+    comments: 'include', reason: 'JSON has no comments — the assertion is about every byte Claude Code will expand',
+  }).raw;
+
+  it('has no ${...} anywhere — Claude Code would evaluate it twice and spawn twice', () => {
+    const text = committed();
+    expect(text).not.toContain('${');
+    // …and every server is still there, with a literal command.
+    const servers = JSON.parse(text).mcpServers as Record<string, { command: unknown; args: unknown }>;
+    expect(Object.keys(servers).sort()).toEqual(['chrome-devtools', 'game-debug', 'modoki']);
+    for (const s of Object.values(servers)) {
+      expect(typeof s.command).toBe('string');
+      expect((s.args as unknown[]).every((a) => typeof a === 'string')).toBe(true);
+    }
+  });
+
+  it('reads as deferred on both halves, is not stale with CDP on, and refuses a write while tracked', () => {
+    const text = committed();
+    expect(mcpBackendDeferred(text)).toBe(true);
+    expect(mcpChromeDeferred(text)).toBe(true);
+    expect(isMcpStale({ mcpText: text, backendPort: 5182, cdpEnabled: true, cdpPort: 9325 })).toBe(false);
+    expect(connectRefusal(text, 'tracked')).toMatch(/settings\.local\.json/);
   });
 });

@@ -15,15 +15,17 @@ Add to the project's `.mcp.json` (already wired in this repo):
   "mcpServers": {
     "modoki": {
       "command": "npx",
-      "args": ["tsx", "engine/tools/modoki-mcp/src/index.ts"],
-      "env": { "MODOKI_BACKEND": "${MODOKI_BACKEND:-http://127.0.0.1:5179}" }
+      "args": ["tsx", "engine/tools/modoki-mcp/src/index.ts"]
     }
   }
 }
 ```
 
-`MODOKI_BACKEND` points at the running editor backend — the Vite dev server
-(`http://localhost:5173`) or the Electron editor's port. The editor must be open.
+`MODOKI_BACKEND` points at the running editor backend — the Vite dev server or the Electron
+editor's port. Unset, the server uses its own clone's pinned port (`../shared/backendUrl.ts`), and
+outside a known clone `http://127.0.0.1:5179`; the start banner says which. Keep it OUT of `.mcp.json`
+(no literal, no `${...}`): the file is committed, and a `${...}` default made Claude Code start
+every server twice (#1894). The editor must be open.
 
 ## Tools
 

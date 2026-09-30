@@ -320,7 +320,7 @@ Why the GUID is **Modoki-generated, server-side, and persisted per clone** (`.mo
 the long-lived editor owns the token (not the ephemeral app), so relaunching the *game* doesn't
 invalidate it and auto-reconnect swallows every relaunch — **click Connect once per editor session**.
 The token never leaves the backend; the device trusts exactly one socket. Reuses the per-clone
-`MODOKI_BACKEND` convention (5179/5180/5181), so `modoki_identity`'s "which clone am I driving" guard
+`MODOKI_BACKEND` convention (each clone's pinned port — [clones-and-ports.md](clones-and-ports.md) § RULE 2), so `modoki_identity`'s "which clone am I driving" guard
 now covers device ops too, and manual IP deletes discovery entirely — nothing auto-connects, no race.
 
 | Event | Behavior |
@@ -971,8 +971,8 @@ clone lands on 9095 and only the ownership check stands between them.
 
 **The editor is shipped as the Electron desktop app, so debug it there by default.** Use the
 `modoki` MCP server (`engine/tools/modoki-mcp/`), which drives the running Electron editor over
-its backend (`MODOKI_BACKEND=http://127.0.0.1:<backend-port>` — 5179 main / 5180 work-ai / 5181
-work-ai2 clone; see the Two Clones section of `CLAUDE.md`). This is the host you actually ship, so
+its backend (`MODOKI_BACKEND=http://127.0.0.1:<backend-port>`; unset, the server derives its own
+clone's pinned port — [clones-and-ports.md](clones-and-ports.md) § RULE 2, #1894). This is the host you actually ship, so
 it's the only place the Electron-only surfaces exist at all (main-process logs, IPC, native file
 dialogs, `autoUpdate`, asar/packaging, the heal-on-open native flow) — none of which a browser tab
 can see.

@@ -381,15 +381,6 @@ const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; count?: nu
       + "clone instead. Every one is the other clone's port on purpose; none is this runner's lane",
   },
   {
-    file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
-    port: 5179,
-    count: 5,
-    reason: 'quotes the committed `${MODOKI_BACKEND:-http://127.0.0.1:5179}` default verbatim — '
-      + 'three times (the context, the precondition, the pass criterion) — and names 5179 as the '
-      + "HUB twice around it, because the case's subject is the default resolving to the hub's "
-      + 'lane. It is the failure being tested for, never a port the runner uses',
-  },
-  {
     file: 'qa/cases/packaged/clean-install-renders.md',
     port: 5179,
     reason:

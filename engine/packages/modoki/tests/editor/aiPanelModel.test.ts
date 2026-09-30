@@ -164,7 +164,7 @@ describe('connectionSummary — C9 config location + expansion', () => {
   });
 
   it('a ${VAR:-default} config is NOT green — we cannot know which editor it resolves to', () => {
-    // THIS REPO's committed .mcp.json is exactly this. Claude expands it at spawn time from
+    // THIS REPO's committed .mcp.json was exactly this until #1894. Claude expands it at spawn time from
     // the user's shell, which the editor can't see. Green would be a guess; "stale" would
     // be wrong too (nothing drifted). Say what's true, and give both fixes.
     // Distinct ports on purpose: the config defaults to 5179 while THIS editor is on 5180,
@@ -174,6 +174,52 @@ describe('connectionSummary — C9 config location + expansion', () => {
     expect(s.action).toBe('Reconnect');
     expect(s.message).toContain('${MODOKI_BACKEND:-http://127.0.0.1:5179}'); // what it'd reach
     expect(s.message).toContain('5180'); // …and this editor's port
+  });
+
+  it('a config with NO MODOKI_BACKEND (#1894) is deferred too — not green, not "out of date"', () => {
+    // THIS REPO's committed .mcp.json since #1894: raw is null, so judging raw alone would fall
+    // through to the stale/green branches. mcpStale true here is the CDP-on + wrapper case
+    // reaching the panel from an older main process — deferral must still decide first.
+    const s = connectionSummary({ ...base, backendPort: 5182, mcpBackendRaw: null, mcpBackendDeferred: true, mcpStale: true });
+    expect(s.level).toBe('action');
+    expect(s.message).toContain('sets no MODOKI_BACKEND');
+    expect(s.message).toContain('5182');
+    expect(s.message).not.toContain('out of date');
+    expect(s.action).toBe('Reconnect'); // untracked → Reconnect may bake a port in
+  });
+
+  it('a TRACKED deferred config offers no Reconnect — that write is refused (#1894) — and says where to set the port', () => {
+    for (const raw of [null, '${MODOKI_BACKEND:-http://127.0.0.1:5179}']) {
+      const s = connectionSummary({ ...base, backendPort: 5182, mcpBackendRaw: raw, mcpBackendDeferred: true, mcpTracked: true });
+      expect(s.action).toBeNull();
+      expect(s.message).toContain('settings.local.json');
+      expect(s.message).toContain('MODOKI_BACKEND=http://127.0.0.1:5182');
+    }
+  });
+
+  it('the button follows main\'s refusal verdict, not mcpTracked — a git check that did not answer (#1894 re-review)', () => {
+    // 'unknown' reads as mcpTracked:false, yet connectRefusal fails closed on it: a Reconnect
+    // button here would only produce the refusal.
+    const refused = connectionSummary({ ...base, mcpBackendRaw: null, mcpBackendDeferred: true, mcpTracked: false, mcpWriteRefused: true });
+    expect(refused.action).toBeNull();
+    expect(refused.message).toContain('possibly committed');
+    // …and a deferred config main would let Connect write keeps its button.
+    const allowed = connectionSummary({ ...base, mcpBackendRaw: null, mcpBackendDeferred: true, mcpTracked: false, mcpWriteRefused: false });
+    expect(allowed.action).toBe('Reconnect');
+  });
+
+  it('a foreign-token config Connect would refuse to rewrite offers no Reconnect either (#1894 final review)', () => {
+    const refused = connectionSummary({ ...base, mcpTokenForeign: true, mcpWriteRefused: true, mcpTracked: true });
+    expect(refused.level).toBe('error');
+    expect(refused.action).toBeNull();
+    expect(refused.message).toContain('MODOKI_TOKEN');
+    // Accept side: a foreign token on a config Connect may write keeps its Reconnect.
+    expect(connectionSummary({ ...base, mcpTokenForeign: true, mcpWriteRefused: false }).action).toBe('Reconnect');
+  });
+
+  it('a tracked config with a LITERAL port keeps its Reconnect (C9 — the refusal is deferred-only)', () => {
+    const s = connectionSummary({ ...base, mcpBackendRaw: 'http://127.0.0.1:5180', mcpBackendDeferred: false, mcpTracked: true, mcpStale: true });
+    expect(s.action).toBe('Reconnect');
   });
 
   it('a rival modoki config on the path → warn, because the cwd decides which editor wins', () => {
