@@ -620,8 +620,6 @@ describe('#1789 prefab fuzz', () => {
         // value, not the thing that moved (review: keyed on any guid named, #1793 claimed both).
         f('redo to the end does not restore the scene', `/entities/${other(1)}/added: [{"parentLocalId":1,"guid":"aaaaaaaa-0000-4000-8000-000000000006"}] vs undefined`, walk),
         f('redo to the end does not restore the scene', `/entities/aaaaaaaa-0000-4000-8000-000000000007/traits/EntityAttributes/parentId: "${other(1)}" vs "aaaaaaaa-0000-4000-8000-000000000008"`, walk),
-        // A pasted node moved inside a created tree's member row (#1830 keys on the created row, not any node in it).
-        f('redo to the end does not restore the scene', `/entities/${other(5)}/members//${other(4)}/added: [{"parentLocalId":1,"guid":"${other(2)}"}] vs undefined`, walk),
         // A lost top-level entity no drop touched.
         f('redo to the end does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
         f('undo to the start does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),

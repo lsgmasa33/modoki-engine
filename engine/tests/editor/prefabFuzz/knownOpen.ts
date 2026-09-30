@@ -21,32 +21,9 @@ export interface KnownOpen {
   stops?: (f: StepFailure, ops: readonly Op[]) => boolean;
 }
 
-/** The ONE node or entry a scene diff is about — not every guid in it (review: a path now carries its top-level entry's
- *  guid, so "any guid named" claimed a diff inside a dropped entry whichever node moved). A top-level entry gone, new
- *  or re-parented names itself in the path; a node gone from or new to a list names itself first in its value. */
-/** The member-path node keys (`members//<nodeGuid>`) in a diff's path: which frame row of a tree the diff is inside. */
-const memberKeys = (f: StepFailure) => [...f.detail.split(': ')[0].matchAll(/members\/\/([0-9a-f]{8}-[0-9a-f-]{27})/g)].map((m) => m[1]);
-
-function diffSubject(f: StepFailure): string | undefined {
-  const top = /^\/entities\/([0-9a-f]{8}-[0-9a-f-]{27})(: |\/traits\/EntityAttributes\/parentId: )/.exec(f.detail);
-  if (top) return top[1];
-  const m = /: (.*) vs (.*)$/.exec(f.detail);
-  if (!m) return undefined;
-  const side = m[2] === 'undefined' ? m[1] : m[1] === 'undefined' ? m[2] : '';
-  return /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,12}/.exec(side)?.[0];
-}
-/** Whether op `kind` of this run introduced (a drop, a paste) or covered (a detach) that guid: keys a stop on the
- *  entity its mechanism's op touched, not on the op merely having run somewhere in the list (review: a planted redo
- *  regression that misplaced some other node was claimed by #1793 on the op list alone). */
-const touchedBy = (f: StepFailure, kind: 'drop' | 'paste' | 'detach' | 'create', g: string | undefined) =>
-  !!g && g.length >= 20 && !!f.touched?.[kind].some((t) => t.startsWith(g) || g.startsWith(t));
-
 /** The op before the failure, reloads aside: for a route that shows at the next save→reload after the op that exposes it,
  *  keying on that op being LAST is what keeps a stop from claiming any later failure in a list that merely holds it. */
 const lastOp = (ops: readonly Op[]) => ops.filter((o) => o.kind !== 'saveReload').at(-1)?.kind;
-
-/** A node in a node list (or a template-added key's record, or a slot) that differs across the redo walk. */
-const NODE_LIST_DIFF = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(parentLocalId|own)":.* vs undefined$|undefined vs \[?\{"(parentLocalId|own)":)|\/(own|added|children)(\/\d+)+\/guid: "[^"]+" vs "[^"]+"$/;
 
 
 // Retired by #1869, whose refusals (a supplied object is not moved, reordered, detached out of its instance or saved as
@@ -54,8 +31,8 @@ const NODE_LIST_DIFF = /\/((own|added|children)(\/\d+)*|a\+k-[^/:]+): (\[?\{"(pa
 // and a sweep of legal variants did not re-find: #1792 (every route refused; closed), #1808, #1826, #1829, #1851, and one
 // route each of #1796 (two: Create Prefab on a member), #1809 (Create Prefab on a member, then the directed Apply) and
 // #1820 (Create Prefab's undo, on a member). Also a route #1796's fix unmasked (outsideEdit → reparent → createPrefab: its
-// redo tagged, then a template-added node row read removed; kept under #1830, mechanism unconfirmed): with #1869 merged one
-// of its draws lands on a refused gesture and it no longer reproduces.
+// redo tagged, then a template-added node row read removed): with #1869 merged one of its draws lands on a refused gesture
+// and it no longer reproduces.
 /** The last three ops (reloads aside) are a delete, a SAVED prefab edit (`u[1] < 0.65` saves) and an undo: Delete's undo
  *  respawning a snapshot older than the template the edit saved. Adjacent, so a list that merely holds the three somewhere
  *  is not claimed (the planted-regression guard). */
@@ -107,27 +84,117 @@ export const KNOWN_OPEN: KnownOpen[] = [
         return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'addComponent') && !ops.slice(r + 1).some((o) => o.kind === 'undo');
       })(),
   },
-  {
-    issue: 1830,
-    what: "Create Prefab's redo mints a fresh TemplateAddedKey for a marker-less added node instead of the file's key",
-    repro: [
-      { kind: 'duplicate', u: [0.97, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'createPrefab', u: [0.14, 0.5, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'redo to the end does not restore the scene' && NODE_LIST_DIFF.test(f.detail),
-    // A node of a tree Create Prefab tagged (touched.create) moved in a node list across the redo, and not a drop's node
-    // (#1793).
-    stops: (f, ops) => f.check === 'redo to the end does not restore the scene' && f.op === 'undo/redo to the ends'
-      && NODE_LIST_DIFF.test(f.detail)
-      && (touchedBy(f, 'create', diffSubject(f)) || memberKeys(f).some((k) => touchedBy(f, 'create', k)))
-      && !(['drop', 'paste', 'detach'] as const).some((k) => touchedBy(f, k, diffSubject(f)))
-      && ops.some((o) => o.kind === 'createPrefab'),
-  },
 ];
 
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1830,
+    what: "Create Prefab's redo minted a fresh TemplateAddedKey for a node an undone Duplicate had respawned without its marker, instead of the key the file holds (#1830's own repro; the redo now puts the written keys back)",
+    repro: [
+      { kind: 'duplicate', u: [0.97, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'createPrefab', u: [0.14, 0.5, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Windows hunt seed 5881's two-op list (Duplicate, Create Prefab): the same minted key, showing as #1854's signature, a template-added key's {removed:true} record lost across the redo",
+    repro: [
+      { kind: 'duplicate', u: [0.5963568142615259, 0.8849396670702845, 0.6458703870885074, 0.6016285156365484, 0.4876746661029756, 0.15752911334857345, 0.3674554496537894, 0.12655106629244983] },
+      { kind: 'createPrefab', u: [0.03326389635913074, 0.6116315200924873, 0.12370068859308958, 0.26712705474346876, 0.04323147865943611, 0.9797979812137783, 0.9593758592382073, 0.6386072726454586] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "#1831 hunt seed 7233 (Duplicate, Create Prefab, a field edit): the minted key re-derived the node's guid, so the field edit's redo refused \"M is no longer in the scene\"",
+    repro: [
+      { kind: 'duplicate', u: [0.977625418221578, 0.10981691116467118, 0.8696209718473256, 0.07155231852084398, 0.5348184262402356, 0.0396548924036324, 0.3063154264818877, 0.43074198695831] },
+      { kind: 'createPrefab', u: [0.32201413507573307, 0.8158542171586305, 0.5061640609055758, 0.6455502198077738, 0.46572459978051484, 0.30121782794594765, 0.7006634974386543, 0.9674662773031741] },
+      { kind: 'editField', u: [0.966237222077325, 0.6521248209755868, 0.8099878376815468, 0.8283290637191385, 0.46284840046428144, 0.4721653030719608, 0.40968819498084486, 0.44078236212953925] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Windows hunt seed 5244 (Instantiate, Create Prefab, Add Child): the minted key, as \"Extra is no longer in the scene\" on the Add Child's redo",
+    repro: [
+      { kind: 'instantiate', u: [0.26984861749224365, 0.857217205921188, 0.5417404866311699, 0.6520530749112368, 0.27365411608479917, 0.06802519364282489, 0.2010678865481168, 0.10494927037507296] },
+      { kind: 'createPrefab', u: [0.031088791321963072, 0.8898211200721562, 0.4956407188437879, 0.5259370838757604, 0.3480511426459998, 0.6040984797291458, 0.5115663693286479, 0.821438854560256] },
+      { kind: 'addChild', u: [0.5326266644988209, 0.9753338638693094, 0.751311041880399, 0.2873122403398156, 0.9126396756619215, 0.15535532915964723, 0.675605678698048, 0.07076598913408816] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Create Prefab on O's root, then a saved prefab edit adding a child to the nested P, then Cmd+Z: the undo put the nested frame's create-time record back over the frame the save had rebased, and its rebase respawned the child beside itself (I7). The undo now restores only what the tag overwrote",
+    repro: [
+      { kind: 'createPrefab', u: [0, 0.9, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.61, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'addChild', u: [0.5, 0.45, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "#1831 hunt seed 7137 (Create Prefab, a saved prefab edit deleting a member of a nested frame): the undo was asked to relink the deleted member, which the tag never wrote, and reported a lost link",
+    repro: [
+      { kind: 'createPrefab', u: [0.047634169925004244, 0.610289781820029, 0.11021222011186182, 0.7074943124316633, 0.40937073971144855, 0.21729625179432333, 0.002168258186429739, 0.5071092371363193] },
+      { kind: 'prefabEdit', u: [0.9690003884024918, 0.06597855570726097, 0.6092434453312308, 0.6823969944380224, 0.6381569232326001, 0.6950476826168597, 0.9112842523027211, 0.9077273816801608], inner: [{ kind: 'delete', u: [0.28125073038972914, 0.5679815823677927, 0.9654117312747985, 0.1948673736769706, 0.08424057275988162, 0.278156612534076, 0.8821839834563434, 0.003483220236375928] }] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Windows hunt seed 5354: I7 on the undo walk, from the same create-time nested frame records",
+    repro: [
+      { kind: 'duplicate', u: [0.6963883680291474, 0.9425665645394474, 0.8681900694500655, 0.9644319310318679, 0.8393072879407555, 0.9496176526881754, 0.5431543777231127, 0.6081813441123813] },
+      { kind: 'detach', u: [0.7872956683859229, 0.40090060187503695, 0.7127918475307524, 0.9570385066326708, 0.0032037843484431505, 0.6652133502066135, 0.6525406290311366, 0.7110467322636396] },
+      { kind: 'createPrefab', u: [0.02270437264814973, 0.3694461004342884, 0.6758084241300821, 0.9498452744446695, 0.9478365711402148, 0.8077748452778906, 0.08220607950352132, 0.16558049619197845] },
+      { kind: 'createPrefab', u: [0.4561503136064857, 0.40720081282779574, 0.13428969937376678, 0.8261703141033649, 0.04716356145218015, 0.42683183890767395, 0.04437782894819975, 0.8018280963879079] },
+      { kind: 'prefabEdit', u: [0.8095252434723079, 0.16822834499180317, 0.5719397112261504, 0.6995144600514323, 0.3714845951180905, 0.7725116177462041, 0.04039384517818689, 0.7935558205936104], inner: [{ kind: 'instantiate', u: [0.11733893770724535, 0.8894950586836785, 0.12409552745521069, 0.38069786550477147, 0.7777354796417058, 0.02062457730062306, 0.5780926090665162, 0.292934522498399] }] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "#1831 hunt seed 6376 (Detach, Create Prefab, a prefab edit, an outside edit): Create Prefab's redo re-planned a tree the Detach's undo had rebased onto the edited template, logged \"6 rows now vs 5 written\", left it unlinked and reported success. It now refuses",
+    repro: [
+      { kind: 'detach', u: [0.131138457916677, 0.03025388065725565, 0.16239675809629261, 0.02427092124707997, 0.23535011988133192, 0.6762105983216316, 0.331267784582451, 0.491535049630329] },
+      { kind: 'createPrefab', u: [0.07974131079390645, 0.61921744979918, 0.8827914723660797, 0.814963303739205, 0.11848264816217124, 0.7384613386821002, 0.6724770395085216, 0.9046368224080652] },
+      { kind: 'prefabEdit', u: [0.6151660135947168, 0.08909262414090335, 0.6475611277855933, 0.15453396714292467, 0.6684619230218232, 0.04004926327615976, 0.07897007511928678, 0.5703308735974133] },
+      { kind: 'outsideEdit', u: [0.4955225696321577, 0.5475801357533783, 0.4016699972562492, 0.7284062763210386, 0.17238674825057387, 0.9416410464327782, 0.7055809462908655, 0.4237301112152636] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "#1831 hunt seed 7062: a Detach left override marks on the plain tree, and Create Prefab's redo linked them as overrides equal to the template's values. The tag now clears the marks of what it links, and its undo restores them",
+    repro: [
+      { kind: 'addChild', u: [0.3149684425443411, 0.5195810534060001, 0.23953052354045212, 0.9728077817708254, 0.11790635576471686, 0.12733556679449975, 0.990328834624961, 0.7928611556999385] },
+      { kind: 'apply', u: [0.6018423652276397, 0.3286145585589111, 0.889105669921264, 0.1708408643025905, 0.9766480689868331, 0.9332218661438674, 0.21935313660651445, 0.27238739375025034] },
+      { kind: 'reparent', u: [0.9503660832997411, 0.2899808743968606, 0.6874415180645883, 0.6880770085845143, 0.011967694852501154, 0.9092594424728304, 0.3530650103930384, 0.4704747630748898] },
+      { kind: 'detach', u: [0.8597701750695705, 0.0603654021397233, 0.34584561991505325, 0.6911473139189184, 0.7360344079788774, 0.4908128157258034, 0.23907885188236833, 0.021343653090298176] },
+      { kind: 'saveReload', u: [0.8564406603109092, 0.701155444374308, 0.3244916482362896, 0.9722273021470755, 0.44977816264145076, 0.3314992734231055, 0.31690627872012556, 0.5629932114388794] },
+      { kind: 'detach', u: [0.681957570835948, 0.8124798578210175, 0.12105117668397725, 0.0973592484369874, 0.4919206916820258, 0.814731955062598, 0.749281405704096, 0.6496201597619802] },
+      { kind: 'saveReload', u: [0.7401411707978696, 0.27528235455974936, 0.19733069115318358, 0.3697264895308763, 0.9189415869768709, 0.07987727038562298, 0.7075915231835097, 0.08189732511527836] },
+      { kind: 'apply', u: [0.053308817790821195, 0.5723371666390449, 0.8925435731653124, 0.17998747318051755, 0.6573338292073458, 0.9314077515155077, 0.8248182635288686, 0.6315945165697485] },
+      { kind: 'createPrefab', u: [0.4934964864514768, 0.6956504574045539, 0.8385598394088447, 0.3917850435245782, 0.24555502086877823, 0.2637817175127566, 0.19915034319274127, 0.07720904238522053] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Windows hunt seed 6874 (Create Prefab, a field edit, Create Prefab replacing it): the Replace's undo restored the first document in memory only (#1868), and the first create's redo read the file, still holding the Replace's bytes, and refused as \"changed on disk\". It reads the parked document first",
+    repro: [
+      { kind: 'createPrefab', u: [0.35482500214129686, 0.7939310185611248, 0.9346682026516646, 0.7842025875579566, 0.6883090001065284, 0.48073346936143935, 0.26965042925439775, 0.026049146428704262] },
+      { kind: 'editField', u: [0.17994162859395146, 0.1491128816269338, 0.6467705767136067, 0.8391306621488184, 0.10253269993700087, 0.7723070946522057, 0.24937461921945214, 0.48834813036955893] },
+      { kind: 'createPrefab', u: [0.13982705818489194, 0.3522340760100633, 0.623425422469154, 0.3912985196802765, 0.13050302886404097, 0.10667726094834507, 0.8669430015143007, 0.061126263346523046] },
+    ],
+  },
+  {
+    issue: 1830,
+    what: "Windows hunt seed 6409 (Create Prefab, Instantiate x2, Apply): the same, through an Apply's in-memory undo",
+    repro: [
+      { kind: 'createPrefab', u: [0.5980798900127411, 0.5542913048993796, 0.8380707998294383, 0.7950446989852935, 0.3749640053138137, 0.3903450327925384, 0.1789306893479079, 0.5110339599195868] },
+      { kind: 'instantiate', u: [0.2975576678290963, 0.973259056918323, 0.17457714094780385, 0.5449914857745171, 0.17879209714010358, 0.6274365580175072, 0.6519286704715341, 0.8233920186758041] },
+      { kind: 'instantiate', u: [0.5373392198234797, 0.7409823008347303, 0.12965819146484137, 0.5993281197734177, 0.43376305885612965, 0.12345235841348767, 0.6472075902856886, 0.2611759507562965] },
+      { kind: 'apply', u: [0.29788372991606593, 0.8901947310660034, 0.8465813612565398, 0.9081029477529228, 0.4242454443592578, 0.1325376844033599, 0.22037539444863796, 0.17715892824344337] },
+    ],
+  },
   {
     issue: 1796,
     what: "#1831 hunt seed 1069 (revert, duplicate x2, Create Prefab): the redo walk's member rows differed while Create Prefab's tree was written in ECS query order \u2014 fixed by #1796 (658df5534, sibling order), bisected",

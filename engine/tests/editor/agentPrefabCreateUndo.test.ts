@@ -210,6 +210,36 @@ describe('agent prefab create — undo restores the links the tree already had (
     expect(r.has(PrefabInstance)).toBe(false);
   });
 
+  // #1830 close-out review: a frame the undo RELINKED rebuilt from another document since (a saved prefab edit) — the
+  // redo refuses, as the human redo does (`relinkedFramesCheck`). Linked anyway, the new values sat on rows written with
+  // the old ones and a reload reverted them. Mutation: the agent redo's check ignored — Hull is linked to Made.
+  it('redo refuses once a frame the undo relinked was rebuilt from a changed prefab, and re-links while it was not', async () => {
+    const spawnHull = (tag: string) => {
+      const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', guid: `g-${tag}-hull` }));
+      const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: `g-${tag}-bolt` }));
+      hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
+      bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+      noteFrameRootDoc(getCurrentWorld(), hull, { source: CHILD_GUID, doc: childPrefab as never });
+      return hull;
+    };
+    const sourceOf = (e: ReturnType<typeof spawnHull>) => (e.get(PrefabInstance) as { source: string }).source;
+    // Accept side: nothing rebuilt since the undo — the redo re-links Hull to the prefab it made.
+    const kept = spawnHull('rl-ok');
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rl-ok-hull', path: NEW_PATH });
+    const made = sourceOf(kept);
+    expect(made, 'premise: the create relinked Hull').not.toBe(CHILD_GUID);
+    await undo();
+    expect(sourceOf(kept)).toBe(CHILD_GUID);
+    await redo();
+    expect(sourceOf(kept)).toBe(made);
+    await undo();
+    // Hull's frame rebuilt from a changed Child, as a saved prefab edit does.
+    const changed = { ...childPrefab, entities: childPrefab.entities.map((e) => (e.localId === 2 ? { ...e, traits: { ...e.traits, Transform: { x: 5 } } } : e)) };
+    noteFrameRootDoc(getCurrentWorld(), kept, { source: CHILD_GUID, doc: changed as never });
+    await redo();
+    expect(sourceOf(kept)).toBe(CHILD_GUID);
+  });
+
   // I9, as the human redo (close-out review 2): the redo re-seats a key an eviction left cold. Mutation: drop the agent
   // redo's `primeEditorPrefabCache` — the key stays cold.
   it('redo re-seats an editor cache evicted since the undo', async () => {

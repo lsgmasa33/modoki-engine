@@ -50,11 +50,11 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, relinkedFramesCheck, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
-  detachPrefabInstance, reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
+  classifyExistingPrefabId, parkedPrefabRead, jsonFileBody, untagEntityTreeAsInstance, unstampMemberGuids,
+  reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
   restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, partOfInstanceRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
@@ -3341,7 +3341,7 @@ export function registerEditorAgentOps(): void {
       // ONE step (#1692): written only over what was at `path` when it was read above — nothing, or those bytes (I10) —
       // then both caches, the tag of this tree, and a rebuild of every OTHER live instance of the prefab this overwrites
       // (#1685's sibling: it used to seat the runtime cache alone, so the editor cache kept the old document under the guid).
-      type TaggedTree = { ref: ReturnType<typeof entityRef>; priorLinks: ReturnType<typeof detachPrefabInstance> } & ReturnType<typeof tagCreatedPrefab>;
+      type TaggedTree = { ref: ReturnType<typeof entityRef> } & ReturnType<typeof tagCreatedPrefab>;
       // Set inside the commit's rebuild; `as` so the closure's assignment is not narrowed away.
       let tagged = null as TaggedTree | null;
       const committed = await commitPrefabWrite(path, prefab, {
@@ -3350,24 +3350,20 @@ export function registerEditorAgentOps(): void {
           // The tree was rebuilt in place during the write (fourth close-out review): the id names another entity now, so
           // nothing is tagged, and the reply says the file landed unlinked.
           if (!sameRoot()) return;
-          // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
-          // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
-          // below strips the WHOLE tree — without this the agent path's undo left that instance
-          // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
+          // The tag reports the links it overwrote, for the undo to put back (#1278, #1830): only those, as the human flow.
           // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
           // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
           // from and leaves the create window open. (Its other job — resolving the subtree across a world
           // rebuild — is unchanged.) Inside the commit, BEFORE its rebase: the tagged tree is recorded as
           // expanded from the new document, so the rebase leaves it alone and rebuilds only the others.
           const ref = entityRef(entityId);
-          const priorLinks = detachPrefabInstance(entityId, { strip: false });
           // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
           // By the path the file LANDED on (#1753 F4), as Create Prefab tags (`assetOps.ts`): a Replace asked as
           // `enemy.prefab.json` over `Enemy.prefab.json` lands on the existing file, and the manifest knows only that
           // spelling — tagged with the request's, the tag resolved no guid and stamped the raw path as the source, which
           // the next load rejects (GUID-only), losing the instance. Through Create Prefab's tag (#1790), which also settles
           // the kept state the new instance swallowed.
-          tagged = { ref, priorLinks, ...tagCreatedPrefab(entityId, landed.path, prefab) };
+          tagged = { ref, ...tagCreatedPrefab(entityId, landed.path, prefab) };
         },
       });
       if (!committed.ok && committed.conflict) {
@@ -3386,8 +3382,10 @@ export function registerEditorAgentOps(): void {
       if (committed.worldLeft) warnings.push('the scene changed while the prefab was written: the file landed, but the entity was not linked to it');
       else if (ok && !tagged) warnings.push('the entity was rebuilt in place while the prefab was written: the file landed, but the entity was not linked to it');
       if (tagged) {
-        const { ref, priorLinks } = tagged;
+        const { ref, keys, priorLinks } = tagged;
         let { guidRemap, undoKept } = tagged;
+        // Asked by the redo: whether a frame the undo relinked was rebuilt since (#1830 close-out review).
+        let relinkedChanged: () => string | null = () => null;
         // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
         // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
@@ -3414,15 +3412,21 @@ export function registerEditorAgentOps(): void {
             untagEntityTreeAsInstance(id, landedPath, prefab); // by the document's guid, not the manifest (#1807)
             const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
             if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${unresolved} prior prefab link(s) could not be put back — no longer addressable` });
+            relinkedChanged = relinkedFramesCheck(priorLinks);
           },
           redo: async () => {
             ref.require(); // I19: a target that is gone refuses, rather than reading as done
+            const changed = relinkedChanged();
+            if (changed) throw new UndoRefusedError(`"${prefab.name ?? landedPath}" no longer describes the tree it was made from: ${changed}. Nothing was linked.`, `The tree changed since it was saved as ${landedPath.split('/').pop()} — nothing was redone`);
             // The file must still hold the document it re-links to, as the human redo asks (#1795 review): after a
             // prefab-edit save or an outside edit, the tag would plan the tree against rows the file no longer holds
             // (I10), and after a delete it would link a file that is not there. Read where its guid lives now (a Rename
             // moves it). This op writes no file on undo or redo, so an absent file refuses too.
             const at = (prefab.id ? resolveRef(prefab.id) : undefined) ?? landedPath;
-            const onDisk = await readPriorDocument(at);
+            // The document the EDITOR holds first (#1868): a later Replace's or Apply's undo restores this one in memory only,
+            // and the file keeps the bytes it overwrote until a Save — read from disk, it refused over the stack's own step.
+            const parked = parkedPrefabRead(at);
+            const onDisk = parked ? jsonFileBody(parked) : await readPriorDocument(at);
             if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });
             if (onDisk === undefined || !prefabTextIsDocument(onDisk, prefab)) throw fileChangedRefusal([at]);
             // I9, as the human redo: the key an eviction since the undo left cold is seated with the document the file holds.
@@ -3432,8 +3436,10 @@ export function registerEditorAgentOps(): void {
             // the file written warm, and the redo tags nothing at all.
             await preloadNestedPrefabsForSubtree(ref.require()); // asked again: the read above can span a world swap
             const after = ref.require(); // …and the await above too
-            ({ guidRemap, undoKept } = tagCreatedPrefab(after, at, prefab)); // undo reverses THIS run's rename
-
+            // The keys the file holds go back on first (#1830), and a tree that no longer plans to its rows refuses.
+            const t = tagCreatedPrefab(after, at, prefab, { keys }); // undo reverses THIS run's rename
+            if (t.refused) throw new UndoRefusedError(`"${prefab.name ?? at}" no longer describes the tree it was made from: ${t.refused}. Nothing was linked.`, `The tree changed since it was saved as ${at.split('/').pop()} — nothing was redone`);
+            ({ guidRemap, undoKept } = t);
           },
         });
       }

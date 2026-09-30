@@ -103,7 +103,11 @@ vi.mock('../../src/editor/scene/prefabApplyStructure', () => ({}));
 vi.mock('../../src/editor/scene/prefabApply', () => ({}));
 vi.mock('../../src/editor/scene/prefabLink', () => ({
   tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return new Map([['g-old', 'g-derived']]); },
-  tagCreatedPrefab: (...a: unknown[]) => { calls.push('tag'); tagSpy(...a); return { guidRemap: new Map([['g-old', 'g-derived']]), undoKept: () => {} }; },
+  // The links the tag reports it OVERWROTE are what the undo restores (#1830): the tag takes that snapshot itself.
+  tagCreatedPrefab: (...a: unknown[]) => {
+    calls.push('tag'); tagSpy(...a);
+    return { guidRemap: new Map([['g-old', 'g-derived']]), undoKept: () => {}, priorLinks: (detachSpy as () => unknown)(), keys: new Map() };
+  },
   // #1461: the tag stamps the members with the guid the reload derives, and undo reverses it. Recorded
   // here because this file is the only place the undo's call ORDER is asserted — see the sequences below.
   unstampMemberGuids: (...a: unknown[]) => { calls.push('unstamp'); return unstampSpy(...a); },
@@ -419,10 +423,6 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     // the file that actually landed (#1278 close-out §2d) — the two are computed either side of
     // the write's await, which on a Replace includes the confirmReplace dialog.
     expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK, expect.objectContaining({ id: OLD_ID }));
-    // The snapshot is taken WITHOUT stripping (#1278): tagging overwrites the rows it owns, and
-    // must leave a held nested instance's members carrying their own link rather than relying on
-    // a strip-then-retag that no longer retags them.
-    expect(detachSpy).toHaveBeenCalledWith(7, { strip: false });
     written = [];
     await res.action.undo();
     // #1868: restored in memory by the prefab's guid — which the manifest maps to the file really there — and nothing
@@ -477,9 +477,12 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
   // Tagging overwrites every PrefabInstance in the subtree. Create Prefab on an instance of the prefab
   // it replaces (same name → same path), or on a tree holding nested instances, used to come back from
   // undo with NO link at all — and the next save wrote plain entities.
-  it('snapshots the prior links BEFORE tagging', async () => {
+  // The snapshot is the TAG's (#1830): taken without stripping (#1278), before it tags, and kept to what it wrote
+  // (`tagCreatedPrefab.test.ts` covers that half). The caller takes none of its own — a record of the whole tree put
+  // create-time frame records back over nested frames rebased since (I7).
+  it('takes no snapshot of its own: the links are the ones the tag reports', async () => {
     await makeAction();
-    expect(calls.slice(0, 2)).toEqual(['detach', 'tag']);
+    expect(calls).toEqual(['tag']);
   });
 
   it('undo of a CREATE untags, then restores the prior links', async () => {
@@ -513,15 +516,19 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     await res.action.undo();
     calls.length = 0;
     await res.action.redo();
-    expect(calls).toEqual(['detach', 'tag']);
+    expect(calls).toEqual(['tag']);
   });
 
-  it('redo re-snapshots before tagging again, so a second undo restores what redo overwrote', async () => {
+  it('redo tags again, and a second undo restores what THAT tag reports it overwrote', async () => {
     const action = await makeAction();
     await action.undo();
+    const REDO_LINKS = { links: [{ id: 7, data: { source: 'g-redo', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }], orphans: [] };
+    detachSpy.mockReturnValueOnce(REDO_LINKS);
     calls.length = 0;
     await action.redo();
-    expect(calls).toEqual(['detach', 'tag']);
+    expect(calls).toEqual(['tag']);
+    await action.undo();
+    expect(reattachSpy).toHaveBeenLastCalledWith(REDO_LINKS, { rootEcsId: 7 });
   });
 });
 

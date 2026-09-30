@@ -121,28 +121,32 @@ export function planMatchesFile(
   written: PrefabFile,
   source: string,
 ): boolean {
-  const mismatch = (why: string) => {
-    console.error(`[Prefab] not tagging "${source}" — the live tree no longer matches the prefab just written (${why}). The entities were left untagged rather than pointed at rows that may not exist.`);
-    return false;
-  };
+  const why = planMismatch(plan, written);
+  if (why) console.error(`[Prefab] not tagging "${source}" — the live tree no longer matches the prefab just written (${why}). The entities were left untagged rather than pointed at rows that may not exist.`);
+  return !why;
+}
+
+/** Why a freshly-computed plan no longer describes the prefab that was written, or null ({@link planMatchesFile}'s
+ *  question, unlogged: for a caller that refuses with the reason itself). */
+export function planMismatch(plan: { flatTree: EntityInfo[]; nestedRefs: Map<number, unknown> }, written: PrefabFile): string | null {
   if (plan.flatTree.length !== written.entities.length) {
-    return mismatch(`${plan.flatTree.length} rows now vs ${written.entities.length} written`);
+    return `${plan.flatTree.length} rows now vs ${written.entities.length} written`;
   }
   const record = writtenRows.get(written.entities);
   for (let i = 0; i < plan.flatTree.length; i++) {
     const e = plan.flatTree[i]!;
     const row = written.entities[i]!;
     if (plan.nestedRefs.has(e.id) !== !!row.prefab) {
-      return mismatch(`row ${i + 1} changed between a nested reference and a plain member`);
+      return `row ${i + 1} changed between a nested reference and a plain member`;
     }
     // The tag reads each entity's localId from the row at its position (#1759), so a tree that changed under the write
     // (a delete and an add keep the count) hands one entity another's row. The recorded plan says which entity each row
     // was written from. Not the NAME (close-out review F5): a rename during the write reorders nothing, and refusing it
     // left a correctly numbered tree unlinked.
     const was = e.guid ? record?.get(e.guid) : undefined;
-    if (was !== undefined && was !== row.localId) return mismatch(`"${e.name ?? ''}" was written at localId ${was}, but sits where row ${row.localId} was written`);
+    if (was !== undefined && was !== row.localId) return `"${e.name ?? ''}" was written at localId ${was}, but sits where row ${row.localId} was written`;
   }
-  return true;
+  return null;
 }
 
 /** The node guid every written row keeps (#1468) — CARRIED where a genuine correspondence to the

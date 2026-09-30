@@ -3,6 +3,8 @@
 
 import { keptStateOf, restoreKeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
+import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { endFrames, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { identitySubtree, noteFrameDoc, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -10,11 +12,12 @@ import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '.
 import { getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
+import { clearOverrideMarks, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from '../undo/overrideMarkWrites';
 import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
 import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
-import { planMatchesFile, planPrefabRows } from './prefabSerialize';
+import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -53,8 +56,23 @@ function instanceSourceRef(source: string, doc?: Pick<PrefabFile, 'id'> | null):
  *  mismatch REFUSES to tag: an untagged entity round-trips as an `added` node, which is the
  *  degradation that loses nothing. */
 export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
+  return tagTree(rootEcsId, source, writtenPrefab).guidRemap;
+}
+
+/** What a tag wrote, per ecs id: `link` — the entity's link replaced by a row of the new prefab (and, on a frame root,
+ *  its frame's record with it); `stamp` — a nested row's root, which keeps its own link and record and had only its
+ *  owning-row fields written. An entity absent here was not written at all. Create Prefab's undo restores exactly
+ *  these ({@link tagCreatedPrefab}). */
+type TagWrites = Map<number, 'link' | 'stamp'>;
+
+/** {@link tagEntityTreeAsInstance}, reporting what it wrote. `refuseQuietly`: a plan that no longer matches the file is
+ *  returned as `refused` for the caller to refuse its step with, instead of logged. */
+function tagTree(
+  rootEcsId: number, source: string, writtenPrefab?: PrefabFile, opts?: { refuseQuietly?: boolean },
+): { guidRemap: Map<string, string>; writes: TagWrites; refused?: string } {
+  const writes: TagWrites = new Map();
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return new Map();
+  if (!PrefabInstanceMeta) return { guidRemap: new Map(), writes };
 
   // PrefabInstance.source is GUID-only — a raw path bakes a literal into the scene JSON on save and trips resolveRef's
   // hard rejection on load. The written file's own id first (#1807), then the manifest (`instanceSourceRef`).
@@ -97,7 +115,10 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   // checked against the file before anything is written. (`planPrefabRows` only returns null for
   // a cycle, which needs `existingId`; this call passes none, so that cannot fire here.)
   const plan = planPrefabRows(tree, rootEcsId)!;
-  if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return new Map();
+  if (writtenPrefab && opts?.refuseQuietly) {
+    const refused = planMismatch(plan, writtenPrefab);
+    if (refused) return { guidRemap: new Map(), writes, refused };
+  } else if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return { guidRemap: new Map(), writes };
   // The numbering is the FILE's, row for row (#1759): a Replace keeps the replaced document's localIds, which the
   // positional plan above cannot reproduce. Without the file there is only the positional plan, which is right only
   // for a first create — said out loud, since a Replace tagged that way addresses rows the file numbered otherwise.
@@ -116,10 +137,12 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
           ...(entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>),
           parentLocalId: localId, parentNodeGuid: nodeGuidAt(localId), ownerGuid: '', // at its row: nothing to link
         });
+        writes.set(info.id, 'stamp');
       }
       continue;
     }
     applyTag(info.id, localId);
+    writes.set(info.id, 'link');
   }
   // What these members' localIds now MEAN — the document just written — so every identity walk reads their
   // template parents from it before any reload has expanded it (`identityParents.ts`, #1468 Phase 6).
@@ -132,7 +155,7 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   // which is what gives this an anchor to derive from.
   const guidRemap = stampDerivedMemberGuids(rootEcsId);
   markStructureDirty();
-  return guidRemap;
+  return { guidRemap, writes };
 }
 
 /** Undo of the member rename {@link tagEntityTreeAsInstance} returned (#1461): the map reversed and
@@ -384,14 +407,91 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
 }
 
 /** Create Prefab's tag (#1790, owner ruling D), for both callers: `tagEntityTreeAsInstance`, then the scene half of the
- *  bake. Returns the tag's rename and the undo of the settle, which runs BEFORE the rename is reversed. */
-export function tagCreatedPrefab(rootEcsId: number, source: string, writtenPrefab: PrefabFile): { guidRemap: Map<string, string>; undoKept: () => void } {
+ *  bake. Returns the tag's rename and the undo of everything else it did to the scene (run BEFORE the rename is reversed),
+ *  plus what the step's undo and redo read — each taken from what the tag WROTE and the document it wrote, never from a
+ *  record of the tree or a re-plan of it (#1830):
+ *
+ *  - `priorLinks`: the links the tag OVERWROTE, for the undo to put back — nothing else. A nested row's root had only
+ *    its owning-row fields written, so its link goes back without its frame's record: that frame keeps whatever it was
+ *    expanded from since. Put back, the create-time record claimed a nested frame a prefab-edit save had since rebased
+ *    was still on the old document, and the undo's rebase respawned the new child beside itself (I7). A frame the tag
+ *    RELINKED gets its record back, which is what a Replace's root needs (#1665 re-review). A nested frame's members are
+ *    not written at all, so they are not in it: asked to relink a member a later save deleted, the undo reported a loss.
+ *  - `keys`: the template key of each template-added node, by the guid it had before the stamp, for the keys the written
+ *    document declares. A redo passes them back (`redo.keys`), and they are put on the tree before it is planned again:
+ *    a node whose marker a respawn dropped (an undone Duplicate, redone) was minted a fresh key by that plan, so its
+ *    derived guid no longer matched the file and everything naming it missed.
+ *  - `refused`, on a redo only: the tree no longer plans to the written rows (a Detach's undo rebased it onto a newer
+ *    template, say). The caller refuses the step; nothing was written. Without it the tag logged, left the tree unlinked,
+ *    and the step reported success.
+ *
+ *  It also clears the override marks on every entity it links, and its undo puts them back: the tree is written as it
+ *  stands, so nothing in it overrides the document just written from it (Unity: a prefab made from an unpacked object
+ *  has no overrides). A Detach leaves its marks on the plain tree until a reload, and linked with them they were saved
+ *  as overrides equal to the template's values, which pinned them against every later edit of the prefab. */
+export function tagCreatedPrefab(
+  rootEcsId: number, source: string, writtenPrefab: PrefabFile,
+  redo?: { keys: ReadonlyMap<string, string> },
+): { guidRemap: Map<string, string>; undoKept: () => void; priorLinks: DetachSnapshot; keys: Map<string, string>; refused?: string } {
+  if (redo) seatTemplateKeys(rootEcsId, redo.keys);
   const piMeta = getTraitByName('PrefabInstance');
   const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
-  const guidRemap = tagEntityTreeAsInstance(rootEcsId, source, writtenPrefab);
+  // Taken without stripping (#1278), before the tag, then kept to what the tag wrote (`writes`).
+  const snapshot = detachPrefabInstance(rootEcsId, { strip: false });
+  const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo });
+  if (refused) return { guidRemap, undoKept: () => {}, priorLinks: { links: [], orphans: [] }, keys: new Map(), refused };
+  const priorLinks: DetachSnapshot = {
+    links: snapshot.links.filter((l) => writes.has(l.id)).map(({ frame, ...l }) => (writes.get(l.id) === 'link' && frame ? { ...l, frame } : l)),
+    orphans: snapshot.orphans,
+  };
+  const undoMarks = clearLinkedMarks(writes);
   const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
   const undoSettle = settleSwallowedKeptState(rootEcsId);
-  return { guidRemap, undoKept: () => { undoSettle(); undoUnpack(); } };
+  return {
+    guidRemap, undoKept: () => { undoSettle(); undoUnpack(); undoMarks(); }, priorLinks,
+    keys: writtenKeys(rootEcsId, guidRemap, writtenPrefab),
+  };
+}
+
+/** Clear the override marks of every entity the tag linked, and return their undo. Addressed by the guid each holds AFTER
+ *  the stamp, which is the one it holds when the undo runs: `undoKept` runs before the rename is reversed. The marks
+ *  alone, not `restoreMarks`: that one also brings the unmarked fields onto the template (#1800), and neither half of
+ *  the tag changes a value. */
+function clearLinkedMarks(writes: TagWrites): () => void {
+  const held = [...writes].filter(([, w]) => w === 'link').map(([id]) => ({ id, marks: captureMarks(id).keys }))
+    .filter((h) => h.marks.length).map(({ id, marks }) => ({ ref: entityRef(id), marks }));
+  const handle = (ref: EntityRef) => { const id = ref.resolve(); return id == null ? null : findEntity(id); };
+  for (const h of held) { const e = handle(h.ref); if (e) clearOverrideMarks(e); }
+  return () => { for (const h of held) { const e = handle(h.ref); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, h.marks); } } };
+}
+
+/** The template key on each node of the tagged tree that the written document declares, by the node's guid BEFORE the
+ *  stamp — the guid it holds again once the undo reverses the rename, and so the one a redo finds it by. */
+function writtenKeys(rootEcsId: number, guidRemap: ReadonlyMap<string, string>, written: PrefabFile): Map<string, string> {
+  const declared = new Set(templateKeysOf(written));
+  const eaMeta = getTraitByName('EntityAttributes');
+  const out = new Map<string, string>();
+  if (!eaMeta || !declared.size) return out;
+  const was = new Map([...guidRemap].map(([from, to]) => [to, from]));
+  for (const info of collectTree(rootEcsId, getAllEntities())) {
+    const key = templateKeyOf(findEntity(info.id));
+    if (!key || !declared.has(key)) continue;
+    const guid = durableGuid((readTraitData(info.id, eaMeta) as { guid?: string } | null)?.guid);
+    if (guid) out.set(was.get(guid) ?? guid, key);
+  }
+  return out;
+}
+
+/** Put recorded template keys back on the nodes of the tree that hold those guids (a redo, before its plan reads them).
+ *  Only inside the tree: a node that left it since is no row of the document, and a key on a scene-authored node makes
+ *  the derive pass treat it as template-added (#1538). A redo that then refuses leaves them: each is the key the file
+ *  holds for that node, which the create's undo leaves on it too. */
+function seatTemplateKeys(rootEcsId: number, keys: ReadonlyMap<string, string>): void {
+  for (const info of collectTree(rootEcsId, getAllEntities())) {
+    const key = info.guid ? keys.get(info.guid) : undefined;
+    const e = key ? findEntity(info.id) : undefined;
+    if (e && templateKeyOf(e) !== key) setTemplateKey(e, key!);
+  }
 }
 
 /** Create Prefab from an instance ROOT unpacks it (#1814, hub ruling under "prefab behaviour copies Unity"): the root was an

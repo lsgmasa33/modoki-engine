@@ -81,7 +81,7 @@ export { PREFAB_FORMAT_VERSION, warnInertPrefabSizes, resolveInstanceContext, ty
 export {
   setPrefabSource, primeEditorPrefabCache, isEditorPrefabCached, getPrefabSource, setPrefabCache,
   refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange, preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
-  classifyExistingPrefabId,
+  classifyExistingPrefabId, parkedPrefabRead,
 } from './scene/prefabCache';
 export {
   getOverrides, getOverrideValues, captureInstanceOverrides, applyOverridesByRootInstance,
@@ -206,7 +206,7 @@ export {
 // #889 — the Clean Up dialog's staleness DECISION, exported for its unit test. The dialog itself
 // is .tsx; the decision is a plain module so it is assertable without a jsdom mount
 // (docs/editor.md § Panels).
-export { readUnusedStaleness, readPriorDocument, createdFrameRebuiltRefusal, type UnusedStaleness } from './panels/assetOps';
+export { readUnusedStaleness, readPriorDocument, createdFrameRebuiltRefusal, relinkedFramesCheck, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

@@ -24,12 +24,12 @@ import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { serializePrefab, parsedPrefabRows } from '../scene/prefabSerialize';
 import {
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance,
-  tagCreatedPrefab,
+  tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal } from '../scene/restructureRefusal';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
-import { entityRef, isInstanceRootCheck } from '../undo/entityRef';
+import { entityRef, isInstanceRootCheck, type EntityRef } from '../undo/entityRef';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { resolveRef } from '../../runtime/loaders/assetManifest';
@@ -715,6 +715,8 @@ export async function createPrefabFromEntity(
   let guidRemap: ReturnType<typeof tagEntityTreeAsInstance> = new Map();
   // The undo of the tag's kept-state settle (#1790), run before the rename is reversed.
   let undoKept = () => {};
+  // The template keys the tag wrote (#1830), which every redo puts back before it re-tags.
+  let keys: ReadonlyMap<string, string> = new Map();
   // ONE step (#1692): the write only over what the path held when it was read — nothing, or `previousContent` — then
   // both caches (by GUID too: PrefabInstance.source is GUID-only, and the sync nested lookup keys on it), the tag of
   // THIS tree, and a rebuild of every OTHER live instance of a replaced prefab (#1685: they stayed expanded from the
@@ -722,22 +724,16 @@ export async function createPrefabFromEntity(
   const committed = await commitPrefabWrite(savePath, prefab, {
     expected: replaced ? previousContent : null,
     rebuild: (landed) => {
-      // ⚠️ Snapshot the links the tree ALREADY has before tagging over them, so undo can put them back
-      // (#1264 close-out). Tagging overwrites every PrefabInstance in the subtree: re-running Create
-      // Prefab on an instance of the very prefab it replaces, or on a tree holding nested instances,
-      // used to come back from undo with those links gone and the next save writing plain entities.
-      // ⚠️ Snapshot WITHOUT stripping (#1278). Tagging below overwrites every row it owns, so the
-      // strip was never needed here — and it was actively wrong: a held nested instance's members
-      // are deliberately NOT retagged (a reload leaves them linked to their own prefab), so
-      // stripping first left them plain until the next scene load.
+      // ⚠️ The tag reports the links it OVERWROTE, so undo can put them back (#1264 close-out) — and only those (#1830):
+      // it snapshots the tree itself, without stripping (#1278), and keeps what it wrote. A snapshot of the whole tree put
+      // create-time records back over nested frames a later save had rebased.
       // Inside the commit and BEFORE its rebase: the tag records this tree as expanded from the new document, so the
       // rebase rebuilds only the other instances — never this one from what it was before.
       // Not the raw id: the write and the warm awaited, and a freed id can be handed straight to another entity.
       const id = ref.resolve();
       if (id == null) return;
-      priorLinks = detachPrefabInstance(id, { strip: false });
       // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-      ({ guidRemap, undoKept } = tagCreatedPrefab(id, landed.path, prefab));
+      ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab));
     },
   });
   // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only
@@ -761,6 +757,8 @@ export async function createPrefabFromEntity(
    *  create (a saved prefab edit, an outside edit) — so the tree is no longer the one the create's rows describe, in
    *  shape or in value, and the redo refuses rather than re-link it to them. */
   let rebasedByUndo = false;
+  /** Asked by the redo: whether a frame its undo relinked was rebuilt since (#1830 close-out review). */
+  let relinkedChanged: () => string | null = () => null;
   // Not this step's OWN document: a Replace's undo restores its old bytes itself, and a rebase onto that is the step
   // undoing, not a template change it cannot redo over.
   const priorSources = () => new Set((priorLinks?.links ?? []).map((l) => l.data.source as string).filter((src) => !!src && src !== guid));
@@ -774,6 +772,10 @@ export async function createPrefabFromEntity(
    *  a refused file write leaves the tree
    *  tagged, and must leave the stamp with it. */
   const unstamp = () => { undoKept(); undoKept = () => {}; unstampMemberGuids(guidRemap); };
+  const treeChangedRefusal = (why: string) => new UndoRefusedError(
+    `"${prefab.name ?? savePath}" no longer describes the tree it was made from: ${why}. Nothing was written or linked.`,
+    `The tree changed since it was saved as ${savePath.split('/').pop()} — nothing was redone`,
+  );
   const action: UndoAction = {
     label,
     // Both directions are ALL-OR-NOTHING: a file write is gated, and the
@@ -813,6 +815,7 @@ export async function createPrefabFromEntity(
           reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id }), label);
           // The links name the template the tree was built from, which can have changed since (#1820): onto the current one.
           rebasedByUndo = rebaseStaleInstancesSoon({ sources: priorSources() });
+          relinkedChanged = relinkedFramesCheck(priorLinks);
         }
         tagged = false;
         return;
@@ -835,6 +838,7 @@ export async function createPrefabFromEntity(
           if (priorLinks) {
             reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
             rebasedByUndo = rebaseStaleInstancesSoon({ sources: priorSources() }); // as the create's undo above (#1820)
+            relinkedChanged = relinkedFramesCheck(priorLinks); // as the create's undo above (#1830 close-out review)
           }
           tagged = false;
         },
@@ -856,12 +860,11 @@ export async function createPrefabFromEntity(
       // current document when that template had changed since the create, so the tree differs from those rows — in shape
       // (the tag then refused inside while the step reported success) or only in value (re-linked, the reload reverted
       // it). Refused before anything is written, the undone state stands, and it is current.
-      if (rebasedByUndo) {
-        throw new UndoRefusedError(
-          `"${prefab.name ?? savePath}" no longer describes the tree it was made from: the prefab the tree held changed since, and the undo brought the tree onto that change. Nothing was written or linked.`,
-          `The tree changed since it was saved as ${savePath.split('/').pop()} — nothing was redone`,
-        );
-      }
+      if (rebasedByUndo) throw treeChangedRefusal('the prefab the tree held changed since, and the undo brought the tree onto that change');
+      // …and a frame the undo RELINKED rebuilt since (#1830 close-out review) — a Replace's too: its in-memory precondition
+      // asks only after the document it replaced, not after the template the tree was put back on.
+      const changed = relinkedChanged();
+      if (changed) throw treeChangedRefusal(changed);
       if (!replaced) {
         // A create's undo left the file (#1795, ruling (i)), so the redo RE-LINKS to it and writes nothing when it still
         // holds this document (its bytes, or the same document under a raised #1774 mark). A file somebody changed since
@@ -872,7 +875,10 @@ export async function createPrefabFromEntity(
         // path this step wrote can hold another prefab by then — a later Create Prefab of the same name reuses the path
         // the rename freed, and the redo read THAT file and refused (hunt seed 6029).
         const at = resolveRef(guid) ?? savePath;
-        const onDisk = await readPriorDocument(at);
+        // The document the EDITOR holds first (#1868): a later Replace's or Apply's undo restores this one in memory only,
+        // and the file keeps the bytes it overwrote until a Save — read from disk, it refused over the stack's own step.
+        const parked = parkedPrefabRead(at);
+        const onDisk = parked ? jsonFileBody(parked) : await readPriorDocument(at);
         // Unreadable (a failed fetch, a 5xx): said and left as it is, not refused as "changed" — a refusal drops the entry
         // for good over what may be a moment's failure (#1795 review).
         if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });
@@ -886,10 +892,13 @@ export async function createPrefabFromEntity(
           // The editor cache must hold the document every sync reader and the tag read (I9) — the file does, but an
           // eviction since the undo (a delete and its restore) can have left the key cold.
           if (!getCachedPrefabSync(guid)) primeEditorPrefabCache(guid, prefab);
-          if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
           // The same cold-cache flatten as the commit's rebuild below (#1284), and the same re-resolve after it.
           await preloadNestedPrefabsForSubtree(id);
-          ({ guidRemap, undoKept } = tagCreatedPrefab(ref.require(), at, prefab)); // undo reverses THIS run's rename
+          // The keys the file holds go back on first (#1830), and a tree that no longer plans to its rows refuses.
+          const t = tagCreatedPrefab(ref.require(), at, prefab, { keys }); // undo reverses THIS run's rename
+          if (t.refused) throw treeChangedRefusal(t.refused);
+          ({ guidRemap, undoKept } = t);
+          if (!tagged) priorLinks = t.priorLinks;
           tagged = true;
           return;
         }
@@ -900,7 +909,6 @@ export async function createPrefabFromEntity(
         const id = ref.resolve();
         // The prefab is back; the entity it links is gone, so nothing was linked — said into the step (#1823).
         if (id == null) return reportUndoFailure({ direction: 'Redo', label, detail: `${savePath} was restored, but the entity it links no longer exists, so nothing was linked` });
-        if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
         // tagEntityTreeAsInstance re-runs planPrefabRows, whose nested-instance lookup is the
         // same sync cache read as the original create (#1284). Cold, the plan drops the nested
         // row, planMatchesFile then disagrees with the file that was written WARM, and the redo
@@ -911,7 +919,10 @@ export async function createPrefabFromEntity(
         // watcher reload). Tagging the pre-await id could hit a different entity, or none.
         const tagId = ref.resolve();
         if (tagId == null) return reportUndoFailure({ direction: 'Redo', label, detail: `${savePath} was restored, but the entity it links no longer exists, so nothing was linked` });
-        ({ guidRemap, undoKept } = tagCreatedPrefab(tagId, savePath, prefab)); // re-stamped, so undo reverses THIS run's rename
+        const t = tagCreatedPrefab(tagId, savePath, prefab, { keys }); // re-stamped, so undo reverses THIS run's rename
+        if (t.refused) return reportUndoFailure({ direction: 'Redo', label, detail: `${savePath} was restored, but the tree no longer matches it (${t.refused}), so nothing was linked` });
+        ({ guidRemap, undoKept } = t);
+        if (!tagged) priorLinks = t.priorLinks;
         tagged = true;
       };
       if (replaced) {
@@ -942,6 +953,30 @@ export function createdFrameRebuiltRefusal(id: number, doc: PrefabFile, path: st
   const rec = handle ? frameRootDoc(getCurrentWorld(), handle) : undefined;
   if (!rec || rec.doc === (doc as unknown) || prefabTextIsDocument(jsonFileBody(rec.doc as unknown as PrefabFile), doc)) return null;
   return `was rebuilt from a changed ${path} since, so unlinking it would keep that change in the scene`;
+}
+
+/** Taken when Create Prefab's undo (a create's or a Replace's) has put the tree's old links back: the record of each frame it RELINKED (#1830 close-out
+ *  review). The check it returns, asked by the redo before anything changes, answers why the tree no longer matches the
+ *  rows the redo would link it to, or null: a relinked frame rebuilt from another document since the undo (a saved
+ *  prefab edit, an outside edit). Linked anyway, its new values sat on rows written with the old ones and a Save + reload
+ *  reverted them — the value half of the redo's refusal, which `rebasedByUndo` caught only when the undo's own rebase did
+ *  it. A reload re-expanding the same document is not a change. */
+export function relinkedFramesCheck(priorLinks: DetachSnapshot | null): () => string | null {
+  const recordOf = (ref: EntityRef) => {
+    const id = ref.resolve();
+    const handle = id == null ? undefined : findEntity(id);
+    return handle ? frameRootDoc(getCurrentWorld(), handle)?.doc as unknown as PrefabFile | undefined : undefined;
+  };
+  const held = (priorLinks?.links ?? []).filter((l) => l.frame).map((l) => ({ ref: l.ref, doc: recordOf(l.ref) }));
+  return () => {
+    for (const h of held) {
+      if (!h.doc) continue;
+      const now = recordOf(h.ref);
+      if (now === h.doc || (now && prefabTextIsDocument(jsonFileBody(now), h.doc))) continue;
+      return 'a prefab the tree held changed since the undo, and the tree was rebuilt onto that change';
+    }
+    return null;
+  };
 }
 
 /** Whether instance root `id` is an instance of the prefab with document guid `guid` (or, where the manifest could not

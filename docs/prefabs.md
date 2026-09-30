@@ -697,9 +697,9 @@ trashed, then Apply All) skips that node and keeps the frame live (`missingNeste
 - A predicate sees only the ops before the failure, and keys on what the failure SHOWS (the I7 detail says whether the
   holders are rows of one frame; an identity failure says whether an entity was lost or changed guid), not on the op
   list alone. Op-list predicates claimed a fixed bug's regression in every verify seed. Two later reviews each planted
-  an undo/redo regression that such a predicate swallowed with the whole file green. So the routes that key on an
-  entity (#1793, #1794, #1796's re-tag, #1820's paste, #1826, #1830) also ask whether it is the one their mechanism's op
-  touched. The runner records the guids each drop, paste, detach and Create Prefab introduced or covered, and hands
+  an undo/redo regression that such a predicate swallowed with the whole file green. So the routes that keyed on an
+  entity (#1793, #1794, #1796's re-tag, #1820's paste, #1826, #1830, all fixed and retired since) also asked whether it
+  was the one their mechanism's op touched, and a new stop of that kind should too. The runner records the guids each drop, paste, detach and Create Prefab introduced or covered, and hands
   them to the stop with the failure (`touched`). The stop asks it about the ONE node the diff is about: the entry named
   in `/entities/<guid>`, or the first guid of a node gone or new. It does not ask about every guid the detail names,
   because a diff inside a dropped entry names the drop in its path whichever node moved.
@@ -1893,6 +1893,40 @@ member's row: false overrides, and Apply wrote one member's value into another's
   create's rows describe, in shape or only in value, so its **redo refuses** before anything is written. Re-linked
   anyway, it tagged nothing while reporting success (a shape change) or its reload reverted the new value (a value
   change) — both OBSERVED by the close-out reviews.
+- **Create Prefab's undo and redo take the tree's state from what the TAG WROTE and the document it wrote** (#1830),
+  never from a record of the whole tree or a re-plan of it. `tagCreatedPrefab` (both routes) reports each write — a
+  `link` (the entity's link replaced by a row of the new prefab) or a `stamp` (a nested row's root: only its
+  owning-row fields) — and hands back exactly what the step's two halves need:
+  - **The undo puts back only what the tag overwrote.** A relinked frame gets its record back with its links (below,
+    #1665). A nested frame keeps the record it has NOW: a saved prefab edit since may have rebased it, and the
+    create-time record put back over it made the undo's rebase respawn the edit's new child beside itself (I7,
+    OBSERVED from O → Create Prefab → edit the nested P, add a child, save → Cmd+Z). A nested frame's members were
+    never written, so they are not relinked either (a member a later save deleted read as a lost link).
+  - **The redo puts the file's template keys back before it re-plans.** A node an undone Duplicate respawned without
+    its `TemplateAddedKey` marker was minted a fresh key by the plan (`addedNodeIdentity`), so its derived guid no
+    longer matched the file: a later redo refused "X is no longer in the scene", or a `{removed:true}` record keyed
+    on the old key was lost (#1854's signature). The tag records each key the written document declares by the node's
+    pre-stamp guid; not row-for-row as #1759 does for localIds, because those nodes sit inside a nested row's lists
+    and the plan's capture carries no entity to pair them with.
+  - **The redo refuses when the tree no longer plans to the written rows** (`planMismatch`, the unlogged half of
+    `planMatchesFile`), before anything is linked. A Detach's undo can rebase the tree onto a newer template between
+    the two halves. The tag used to log `not tagging … (N rows now vs M written)`, leave the tree unlinked and let the
+    step report success.
+    **…and when a frame the undo RELINKED was rebuilt from another document since** (`relinkedFramesCheck`, both
+    routes, a create's redo and a Replace's; the value half, from the close-out reviews). A Replace's in-memory
+    precondition asks only after the document it replaced, not after the template the undo put the tree back on. A saved prefab edit of the template the undo put back changes
+    the tree's values without changing its shape; linked anyway, those values sat on rows written with the old ones,
+    and a Save + reload reverted them. `rebasedByUndo` caught this only when the undo's own rebase did it. A reload
+    re-expanding the same document is not a change.
+  - **The tag clears the override marks of what it links, and its undo puts them back.** The tree is written as it
+    stands, so nothing in it overrides the document just written from it (Unity: a prefab made from an unpacked object
+    has no overrides). A Detach keeps its marks on the plain tree until a reload, and Create Prefab linked them as
+    overrides equal to the template's values, which pinned them against every later edit of the prefab.
+  - **The redo reads the document the EDITOR holds first** (`parkedPrefabRead`, #1868's rule). A later Replace's or
+    Apply's undo restores this prefab in memory only, and the file keeps the bytes it overwrote until a Save; read
+    from disk, the redo refused "changed on disk" over the stack's own step.
+  Tests: one fuzzer REGRESSION per symptom (`prefabFuzz/knownOpen.ts`, issue 1830), and
+  `createPrefabTagWrites.test.ts` for a relinked root's record and the marks.
   **A deleted ROW of a frame that SURVIVES the delete** (a member, or an owned nested root, whose frame root was not
   deleted) is the case the rebase alone cannot see. It rebuilds frames whose OWN record is stale, and leaving prefab
   edit has already rebased the surviving frame onto the saved document. Before this fix, the respawned row followed the
@@ -1975,7 +2009,8 @@ member's row: false overrides, and Apply wrote one member's value into another's
   the detach snapshot carries each frame root's record and the reattach puts it back; without it the
   rebase skipped the frame (close-out review). Always, not only where the world has none: the restored
   localIds index the snapshot's document, and Create Prefab's Replace undo otherwise kept the SAME
-  prefab's newer record over them, so the instance read as stale (re-review). Detach's redo keeps
+  prefab's newer record over them, so the instance read as stale (re-review). Create Prefab puts back only the
+  records of frames its tag RELINKED (#1830): a nested frame's current record stands. Detach's redo keeps
   the snapshot of the detach it just made (`detachPrefabInstanceWithUndo`): the undo's rebase can bring
   members in, and replaying the FIRST snapshot on the next undo left one of them plain. ⚠️ Not `rebuildInstance(…, cache, …, baseline = the Revert's document)`: `baseline` is two
   things there — the numbering of what is carried, and the document the LIVE tree was expanded from,
