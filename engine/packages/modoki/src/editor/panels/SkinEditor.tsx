@@ -42,7 +42,7 @@ import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, 
 import { pushAction } from '../undo/undoManager';
 import { skinDocAction } from './skinDocAction';
 import { runUndoCommand } from '../undo/undoCommand';
-import { BufferedNumberInput, inputStyle } from './fields';
+import { BufferedNumberInput, BufferedFieldScope, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
 import { captureSkinOpBasis, isSkinOpBasisCurrent, skinOpStaleMessage, type SkinOpBasis } from './skinOpBasis';
@@ -809,6 +809,9 @@ export default function SkinEditor() {
             <button data-ui-id="skin.inspector.pose.reset" data-ui-kind="button" data-ui-label="reset test pose" onClick={() => setTestPose(() => ({}))} title="Reset the test pose to bind" style={{ background: '#2a2a40', color: '#bbb', border: '1px solid #444', borderRadius: 3, padding: '1px 6px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10 }}>reset</button>
           </div>
         )}
+        {/* The x/y/rot fields are not keyed by bone, so the scope tells them the target changed
+            (#1907): another bone, or bind pose vs test pose, ends a focused edit. */}
+        <BufferedFieldScope.Provider value={`${def?.id ?? asset?.path}:${paintMode ? 'pose' : 'bind'}:${selBone}`}>
         <div style={{ ...inspectorBox, border: `1px solid ${paintMode ? '#3a5a2a' : '#2a2a3a'}` }}>
           <div style={inspectorTitle}><span>Transform</span>
             <InfoDot tip="The selected bone's transform. In Rig mode this edits the bind pose (undoable); in Weights mode it's a transient TEST pose to preview the deform (not saved)." /></div>
@@ -818,6 +821,7 @@ export default function SkinEditor() {
           <div style={{ ...trowStyle, marginBottom: 0 }}><span style={{ ...lbl, width: 26 }}>rot°</span>
             <BufferedNumberInput dataUiId="skin.inspector.bone.rot" dataUiLabel="bone rotation" dataUiKind="field" value={posed.rot * 180 / Math.PI} precision={2} step={1} onChange={(v) => setBoneField('rot', v * Math.PI / 180)} style={{ ...inputStyle, width: 50 }} /></div>
         </div>
+        </BufferedFieldScope.Provider>
       </>
     );
   };
@@ -1127,6 +1131,8 @@ export default function SkinEditor() {
                 </div>
                 {/* Transform (needs a mesh) */}
                 {hasMesh ? (
+                  // Not keyed by part, so the scope tells these fields the target changed (#1907).
+                  <BufferedFieldScope.Provider value={`${def?.id ?? asset?.path}:part:${activePart}`}>
                   <div style={inspectorBox}>
                     <div style={inspectorTitle}><span>Transform</span>
                       <InfoDot tip="The active part's placement — baked into the mesh verts (a part has no transform node). Position = mesh center; Rotation + Size read from the UV→vertex map. Edit here or with the canvas Parts gizmo. Size is width/height in px." /></div>
@@ -1141,6 +1147,7 @@ export default function SkinEditor() {
                       <button data-ui-id="skin.part.sizeLock" data-ui-kind="toggle" data-ui-label="aspect ratio lock" onClick={() => setSizeLocked((l) => !l)} title={sizeLocked ? 'Aspect ratio locked — w/h scale together. Click to unlock.' : 'Aspect ratio unlocked — w/h scale independently. Click to lock.'}
                         style={{ ...eyeBtn, color: sizeLocked ? '#4a9eff' : '#777', fontSize: 12 }}>{sizeLocked ? '🔒' : '🔓'}</button></div>
                   </div>
+                  </BufferedFieldScope.Provider>
                 ) : (
                   <div style={inspectorEmpty}>Pick a sprite above — it builds the mesh.</div>
                 )}

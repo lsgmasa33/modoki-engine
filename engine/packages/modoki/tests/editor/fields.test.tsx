@@ -470,3 +470,172 @@ describe('an undo or redo ENDS the edit, even while the field is focused (#1905)
     expect(result.current.localValue).toBe('');
   });
 });
+
+/** #1907: a field that stops being MIXED, or gets a new owner, shows the new value. Observed live on
+ *  timeline-demo: select Prop + Main Camera (x differs, `----`), then Cutscene (x 0). `x` went BLANK
+ *  with no placeholder, because the blank left by mixed "already meant" 0 to the #242 check. */
+describe('leaving MIXED, or a new owner, shows the new value (#1907)', () => {
+  beforeEach(() => { setRunMode('stopped'); clearHistory(); });
+  const later = () => new Promise((r) => setTimeout(r, 5));
+  const scoped = { s: 'A' };
+  const wrapper = ({ children }: { children: ReactNode }) => createElement(BufferedFieldScope.Provider, { value: scoped.s }, children);
+
+  it('⭐ the observed repro: mixed, then one entity whose value is 0 — shows 0, not a blank', () => {
+    scoped.s = 'Prop,Camera';
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true }, wrapper });
+    expect(result.current.localValue).toBe('');
+    scoped.s = 'Cutscene';
+    rerender({ v: 0, m: false });
+    expect(result.current.localValue).toBe('0');
+  });
+
+  it('the same exit with NO scope change (an edit that makes every selected value 0)', () => {
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    rerender({ v: 0, m: false });
+    expect(result.current.localValue).toBe('0');
+  });
+
+  it('a clamped field exits mixed at its min (parse(\'\') is the min there, not 0)', () => {
+    function Field({ v, m }: { v: number; m: boolean }) { return <BufferedNumberInput value={v} onChange={() => {}} mixed={m} min={1} max={10} />; }
+    const { container, rerender } = render(<Field v={4} m={true} />);
+    rerender(<Field v={1} m={false} />);
+    expect(container.querySelector('input')!.value).toBe('1');
+  });
+
+  it('an undo that un-mixes to 0, landing a render after the step, shows 0', async () => {
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    pushAction({ label: 'x', undo: () => { setTimeout(() => rerender({ v: 0, m: false }), 0); }, redo: () => {} });
+    await act(async () => { await undo(); await later(); });
+    expect(result.current.localValue).toBe('0');
+  });
+
+  it('a blur while mixed, then the un-mix at 0, shows 0', () => {
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    act(() => result.current.onFocus());
+    act(() => result.current.onBlur());
+    rerender({ v: 0, m: false });
+    expect(result.current.localValue).toBe('0');
+  });
+
+  it('text typed while mixed is the user\'s: its own un-mixing echo keeps it (#242 still holds)', () => {
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    act(() => result.current.handleChange('5.'));
+    rerender({ v: 5, m: false }); // the broadcast of 5 comes back, and the field is no longer mixed
+    expect(result.current.localValue).toBe('5.');
+  });
+
+  it('a blank the USER made while mixed is theirs: type 5, backspace, then the un-mixing echo keeps it (review F1)', () => {
+    // In mixed the backspace to '' commits nothing, so the 5 coming back is a late echo (#1411).
+    // Re-syncing it would put the next keystroke on '5': typing 7 would commit 57.
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    act(() => result.current.handleChange('5'));
+    act(() => result.current.handleChange(''));
+    rerender({ v: 5, m: false });
+    expect(result.current.localValue).toBe('');
+  });
+
+  it('a wheel notch on that user-made blank steps from the STORED value, not 0 (review 2, note 1)', () => {
+    const onChange = vi.fn();
+    function Field({ v, m }: { v: number; m: boolean }) { return <BufferedNumberInput value={v} onChange={onChange} mixed={m} step={1} />; }
+    const { container, rerender } = render(<Field v={1.6} m={true} />);
+    const input = container.querySelector('input')!;
+    fireEvent.change(input, { target: { value: '5' } });
+    fireEvent.change(input, { target: { value: '' } });
+    rerender(<Field v={5} m={false} />);
+    expect(input.value).toBe('');
+    input.focus(); // the wheel acts only on the focused field; no focus event, so no hold (#242)
+    fireEvent.wheel(input, { deltaY: -100 });
+    expect(onChange).toHaveBeenLastCalledWith(6);
+  });
+
+  it('a mixed exit re-syncs a FOCUSED field too — the placeholder is not held (review F2)', () => {
+    // Held, it showed a blank with no placeholder, and a wheel notch stepped every entity from 0.
+    const onChange = vi.fn();
+    function Field({ m }: { m: boolean }) { return <BufferedNumberInput value={3} onChange={onChange} mixed={m} step={1} />; }
+    const { container, rerender } = render(<Field m={true} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    rerender(<Field m={false} />); // an agent write, or a Play-mode system, un-mixes it under the caret
+    expect(input.value).toBe('3');
+    fireEvent.wheel(input, { deltaY: -100 });
+    expect(onChange).toHaveBeenLastCalledWith(4);
+  });
+
+  it('a FOCUSED field typed into while mixed keeps the text through the exit, and a later clear keeps its blank', () => {
+    // Only the untouched placeholder bypasses the hold: `5.` is the user's. After a blur, a clear
+    // commits 0 and its echo must keep the '' (#242), not read as another mixed exit.
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 1.6, m: true } });
+    act(() => result.current.onFocus());
+    act(() => result.current.handleChange('5.'));
+    rerender({ v: 5, m: false });
+    expect(result.current.localValue).toBe('5.');
+    act(() => result.current.onBlur());
+    act(() => result.current.handleChange(''));
+    rerender({ v: 0, m: false });
+    expect(result.current.localValue).toBe('');
+  });
+
+  it('a new owner re-syncs even when the text already "means" its value', () => {
+    // Typed `1.50` for A; B's value is 1.5. The text was A's, so B's value shows as B's.
+    scoped.s = 'A';
+    const { result, rerender } = renderHook(({ v }) => useBufferedValue(v, vi.fn(), parseNumber),
+      { initialProps: { v: 0 }, wrapper });
+    act(() => result.current.handleChange('1.50'));
+    rerender({ v: 1.5 });
+    expect(result.current.localValue).toBe('1.50');
+    scoped.s = 'B';
+    rerender({ v: 1.5 });
+    expect(result.current.localValue).toBe('1.5');
+  });
+
+  it('⭐ a selection change while the field is FOCUSED ends the edit and shows the new owner\'s value', () => {
+    function Field({ scope, v }: { scope: string; v: number }) {
+      return <BufferedFieldScope.Provider value={scope}><BufferedNumberInput value={v} onChange={() => {}} /></BufferedFieldScope.Provider>;
+    }
+    const { container, rerender } = render(<Field scope="A" v={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    rerender(<Field scope="B" v={3} />); // a selection change that leaves DOM focus in the field
+    expect(input.value).toBe('3');
+    expect(document.activeElement).toBe(input);
+
+    fireEvent.change(input, { target: { value: '8' } }); // a new edit, on B, holds again
+    rerender(<Field scope="B" v={9} />);
+    expect(input.value).toBe('8');
+  });
+
+  it('a focused rescope stays ENDED: the new owner\'s value landing a render late still reaches the field', () => {
+    // The Inspector can render the new scope before it has read the new owner's value. The first run
+    // re-syncs to what it has; only an ended edit lets the real value through on the next.
+    function Field({ scope, v }: { scope: string; v: number }) {
+      return <BufferedFieldScope.Provider value={scope}><BufferedNumberInput value={v} onChange={() => {}} /></BufferedFieldScope.Provider>;
+    }
+    const { container, rerender } = render(<Field scope="A" v={400} />);
+    const input = container.querySelector('input')!;
+    input.focus();
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: '777' } });
+    rerender(<Field scope="B" v={777} />); // the new scope, with the previous owner's value still in hand
+    rerender(<Field scope="B" v={3} />);   // B's own value, a render later
+    expect(input.value).toBe('3');
+  });
+
+  it('a selection change INTO mixed still shows the placeholder blank', () => {
+    scoped.s = 'A';
+    const { result, rerender } = renderHook(({ v, m }) => useBufferedValue(v, vi.fn(), parseNumber, m),
+      { initialProps: { v: 3, m: false }, wrapper });
+    scoped.s = 'A,B';
+    rerender({ v: 3, m: true });
+    expect(result.current.localValue).toBe('');
+  });
+});

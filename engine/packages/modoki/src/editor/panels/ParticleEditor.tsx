@@ -509,9 +509,12 @@ export default function ParticleEditor() {
   savedMarkRef.current = markSaved; // let the load effect seed the saved reference
 
   return (
-    // NumInput instances survive a retarget (Sections are not re-keyed by asset), so the scope tells
-    // them the owner changed and their pending commits are the previous effect's (#1411).
-    <BufferedFieldScope.Provider value={asset?.path ?? null}>
+    // Opening another effect (or a reload) nulls `def`, so the Sections below unmount and nothing
+    // carries over. The scope covers a def swapped IN PLACE. When its owner changes, the fields drop
+    // their pending commits (#1411) and a focused edit ends (#1907). The owner is the in-file guid,
+    // not the path: a move or rename re-points the path but it is the same effect, and ending an
+    // edit there would drop typed text.
+    <BufferedFieldScope.Provider value={def?.id ?? null}>
     <div style={{ display: 'flex', width: '100%', height: '100%', background: '#1a1a2e', fontFamily: 'monospace', fontSize: 12, color: '#ccc' }}>
       {/* Viewport */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>

@@ -30,7 +30,7 @@ import { useEditorStore } from '../store/editorStore';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
 import { assetDocAction } from '../undo/assetDocUndo';
 import { runUndoCommand } from '../undo/undoCommand';
-import { BufferedNumberInput, inputStyle } from './fields';
+import { BufferedNumberInput, BufferedFieldScope, inputStyle } from './fields';
 import { FrameThumb, TrackNameField, iconBtn, labelStyle } from './SpriteAnimatorSection';
 
 const COALESCE_MS = 500;
@@ -324,7 +324,8 @@ export default function SpriteAnimEditor() {
           {!activeName ? (
             <div style={{ color: '#777', fontSize: 11, padding: '4px 2px' }}>No clips yet — add one to start a sprite animation.</div>
           ) : (
-            <>
+            // The clip fields are not keyed by clip, so the scope tells them the target changed (#1907).
+            <BufferedFieldScope.Provider value={`${def?.id ?? asset?.path}:${activeName}`}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                 <span style={labelStyle}>name</span>
                 <TrackNameField name={activeName} onRename={renameTrack} />
@@ -367,7 +368,7 @@ export default function SpriteAnimEditor() {
                 <AssetRefField label="+ add" value="" onChange={addFrame} accept={['sprite']} placeholder="pick (▦) or drop a sprite"
                   dataUiId="spriteAnim.frames.add" dataUiLabel="add frame" />
               </div>
-            </>
+            </BufferedFieldScope.Provider>
           )}
         </div>
       )}

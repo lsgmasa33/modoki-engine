@@ -5,7 +5,7 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from 'react';
 import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
-import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEdit, type PendingCommit, type EchoMatch } from './bufferedEcho';
+import { resyncBuffered, shownTextIsStale, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEdit, type PendingCommit, type EchoMatch } from './bufferedEcho';
 import { subscribeUndoRedoStep } from '../undo/undoRedoStep';
 
 /** Shared monospace input style for Inspector-style field inputs. */
@@ -98,10 +98,12 @@ export function Info({ text }: { text: string }) {
 export { MIXED_PLACEHOLDER };
 
 /** Who owns the value the buffered fields below are editing — the Inspector provides its selection.
- *  A field instance is reused across owners (the Inspector keys fields by field name), so when this
- *  changes the field forgets its pending commits: they were the PREVIOUS owner's, and one that
- *  happens to equal the new owner's value would otherwise be skipped as a late echo (#1411).
- *  `null` (no provider) never changes, which keeps every other caller on the old behaviour. */
+ *  A field instance is reused across owners (the Inspector keys fields by field name). When this
+ *  changes, the field ENDS its edit, even while focused, and shows the new owner's value (#1907,
+ *  Unity's rule: see `nextBufferedEdit`). It also forgets its pending commits. They were the
+ *  PREVIOUS owner's, and one that happened to equal the new owner's value would otherwise be skipped
+ *  as a late echo (#1411). `null` (no provider) never changes, which keeps every other caller on the
+ *  old behaviour. */
 export const BufferedFieldScope = createContext<unknown>(null);
 
 /** Run `onStep` after every undo or redo step (#1905) — how a field that buffers typed text ENDS
@@ -136,15 +138,34 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   // decision also consumes `pendingRef`, and an updater may run twice).
   const localRef = useRef(localValue);
   localRef.current = localValue;
+  // Whether the text on screen is the blank MIXED put there, untouched since (#1907). Every write of
+  // the text goes through `show`, so this cannot drift from what the field shows.
+  const placeholderRef = useRef(mixed);
+  const show = useCallback((text: string, placeholder: boolean) => {
+    placeholderRef.current = placeholder;
+    localRef.current = text;
+    setLocalValue(text);
+  }, []);
   // What this field itself committed and has not yet seen echo back — see bufferedEcho.ts (#1411).
   const pendingRef = useRef<PendingCommit<T>[]>([]);
   const scope = useContext(BufferedFieldScope);
   const scopeRef = useRef(scope);
+  // Whether the last run of the effect below saw MIXED, so it can tell a run that LEAVES mixed (#1907).
+  const wasMixedRef = useRef(mixed);
   // Sync from ECS when the value changed for a reason other than this field's own typing.
   useEffect(() => {
-    if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
-    if (holdsBufferedText(editRef.current)) return;
-    if (mixed) { pendingRef.current = []; setLocalValue(''); return; }
+    const rescoped = scopeRef.current !== scope;
+    if (rescoped) { scopeRef.current = scope; pendingRef.current = []; editRef.current = nextBufferedEdit(editRef.current, 'rescope'); }
+    // Read and updated BEFORE the hold returns: it describes this transition only, and must not stay
+    // armed until some later run.
+    const leftMixed = wasMixedRef.current && !mixed;
+    wasMixedRef.current = mixed;
+    // Text that is not the user's is not held either: nothing was typed, so there is nothing to
+    // protect. Without this, a FOCUSED field left mixed showed a blank with no placeholder, and a
+    // wheel notch stepped every entity from 0 (#1170's mass overwrite, reached another way).
+    const stale = shownTextIsStale(rescoped, leftMixed, placeholderRef.current);
+    if (holdsBufferedText(editRef.current) && !stale) return;
+    if (mixed) { pendingRef.current = []; show('', true); return; }
     // ⚠️ THE FOCUS HOLD IS NOT ENOUGH, BECAUSE A FOCUS EVENT IS NOT GUARANTEED TO FIRE (#242).
     // Chromium dispatches `focus`/`blur` only while `document.hasFocus()`, so with the editor
     // window not OS-focused — the permanent state of an agent-driven MCP session, and an ordinary
@@ -155,10 +176,10 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
     // lost per run). `resyncBuffered` tells those apart from a real external change (a gizmo drag,
     // an undo, a selection change), which still re-syncs. Same shape as #233 (`qa/knowledge.md` §5:
     // nothing in the editor may depend on a focus event firing).
-    const r = resyncBuffered(localRef.current, externalValue, pendingRef.current, parseRef.current, performance.now(), matchRef.current);
+    const r = resyncBuffered(localRef.current, externalValue, pendingRef.current, parseRef.current, performance.now(), matchRef.current, stale);
     pendingRef.current = r.pending;
-    if (r.text !== null) setLocalValue(r.text);
-  }, [externalValue, mixed, scope]);
+    if (r.text !== null) show(r.text, false);
+  }, [externalValue, mixed, scope, show]);
   // An undo or redo ends the edit and shows the store's value, focused or not (#1905, Unity's
   // `UndoRedoPerformed`). The pending record goes too: a step back to a value typed a moment ago
   // would otherwise read as this field's late echo and be skipped. `externalValue` may still be the
@@ -171,20 +192,17 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   useUndoRedoStep(() => {
     editRef.current = nextBufferedEdit(editRef.current, 'undoRedo');
     pendingRef.current = [];
-    const text = mixedRef.current ? '' : (matchRef.current?.format ?? String)(externalRef.current);
-    localRef.current = text;
-    setLocalValue(text);
+    show(mixedRef.current ? '' : (matchRef.current?.format ?? String)(externalRef.current), mixedRef.current);
   });
   const onFocus = useCallback(() => { editRef.current = nextBufferedEdit(editRef.current, 'focus'); }, []);
   const onBlur = useCallback(() => {
     editRef.current = nextBufferedEdit(editRef.current, 'blur');
     pendingRef.current = [];
-    setLocalValue(mixed ? '' : (matchRef.current?.format ?? String)(externalValue)); // reconcile with ECS — reverts an unaccepted edit
-  }, [externalValue, mixed]);
+    show(mixed ? '' : (matchRef.current?.format ?? String)(externalValue), mixed); // reconcile with ECS — reverts an unaccepted edit
+  }, [externalValue, mixed, show]);
   const handleChange = useCallback((raw: string) => {
     editRef.current = nextBufferedEdit(editRef.current, 'input');
-    setLocalValue(raw);
-    localRef.current = raw;
+    show(raw, false);
     // Mixed-mode (multi-select with differing values): a transient empty string
     // mid-edit (type, then backspace to empty) must NOT broadcast the parse
     // fallback (0 / '') to every selected entity — that's an accidental mass
@@ -308,8 +326,11 @@ export function BufferedNumberInput({ value, onChange, step, style, readOnly, mi
     // `handleChange` already refuses for a typed '' (F7); the wheel just bypassed it.
     const shown = ref.current?.value ?? '';
     if (mixed && shown === '') return;
-    handleChange(String(applyWheelStep(parseNumber(shown || '0'), dir, step ?? 1, mult, min, max)));
-  }, [handleChange, step, min, max, mixed]);
+    // An empty box steps from the STORED value, not 0. For one entity those agree, since clearing
+    // committed 0 (or the clamp). A blank the user made while mixed does not: it commits nothing,
+    // survives the un-mix (#1907), and stepping it from 0 jumped every entity from 5 to 1.
+    handleChange(String(applyWheelStep(shown === '' ? value : parseNumber(shown), dir, step ?? 1, mult, min, max)));
+  }, [handleChange, step, min, max, mixed, value]);
   useWheelStep(ref, onStep, !readOnly);
   // `type="text"` (not `type="number"`): a number input reports `value === ''` for an
   // incomplete entry like a lone `-`, wiping the minus sign before a digit can follow

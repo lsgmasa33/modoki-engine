@@ -457,7 +457,8 @@ itself out of the deps, which matters for the same reason.
   did, so the fix aligns the two rather than inventing a behaviour; but with no blur in an
   agent-driven session, **read the value back with `modoki_get_scene_state`, never off the field.**
   And in mixed (multi-select) mode the guard is skipped entirely, so entering mixed mode still clears
-  the buffer and shows the `----` placeholder.
+  the buffer and shows the `----` placeholder. Leaving mixed must not ask the guard either. See
+  § "A new owner ENDS the edit, and leaving MIXED re-syncs" (#1907).
 - **`ParticleEditor`'s `NumInput` had the same defect and auto-saved**, so the corrupted value reached
   disk with no Save at all (it wrote on a trailing timer, by design — until #259 made the panel park
   its document for Cmd+S like every other surface). Typing `-3.5`
@@ -612,6 +613,54 @@ Skin Editor's part/bone names, the rename boxes), which never re-sync at all.
 Tests: `bufferedEcho.test.ts` § `nextBufferedEdit`, `undoRedoStepSignal.test.ts` (fires on steps
 only, after the data moved), and `fields.test.tsx` § #1905 (the hook, through the real undo stack).
 
+### A new owner ENDS the edit, and leaving MIXED re-syncs (#1907)
+
+The echo checks above protect text the USER typed. Two kinds of text on screen are not the user's,
+and the checks kept both. `shownTextIsStale` in `bufferedEcho.ts` names them. When it answers yes,
+`resyncBuffered` writes the store's value without asking the checks.
+
+- **The blank that MIXED left behind.** While mixed, the buffer is `''` so `----` shows. `parseNumber('')`
+  is 0, so on leaving mixed at a shared 0 the #242 check read the blank as "already means 0". The field
+  stayed **blank with no placeholder**. Observed live on timeline-demo: select Prop + Main Camera,
+  then Cutscene. A clamped field did the same at its `min`, because `parse('')` is the min there.
+  This applies only while the blank is UNTOUCHED, which the hook tracks as `placeholderRef`. Every
+  text write goes through its `show`. The TEXT cannot answer this: type `5` into a mixed field (it
+  broadcasts), then backspace (which in mixed commits nothing), and the blank is the user's. The 5
+  coming back is its late echo. The review of the first version, which tested `current === ''`,
+  caught that re-syncing there put the next keystroke on `5`.
+  Stale text is not HELD either: nothing was typed, so the focus hold has nothing to protect. Held,
+  a focused field left mixed showed the placeholder-less blank, and a wheel notch stepped every
+  entity from 0 (#1170's mass overwrite, reached another way).
+- **A new owner** (`BufferedFieldScope` changed, meaning the selection changed). The text was typed
+  for, or shows, the previous owner.
+
+**A new owner also ENDS a focused edit — Unity's rule, like the undo above.** In Unity a selection
+change ends the Inspector's text edit and shows the new target's value, on two paths. A Hierarchy
+click moves window focus, and `HostView.OnLostFocus` calls `EditorGUI.EndEditingActiveTextField()`.
+Any selection change also makes `InspectorWindow.OnSelectionChanged` call `RebuildContentsContainers()`;
+when the focused container detaches, `OnFocusOutContainer` calls `CommitActiveDelayedTextField()`
+(UnityCsReference @ 88ce7b6). Here, a Hierarchy click already blurs the input: focus goes to `<body>`,
+measured on #1907. What the hold still swallowed was a selection change that leaves DOM focus in the
+field, such as an agent's `modoki_set_selection`. The previous owner's text stayed, and the next
+keystroke edited the new owner from it. `nextBufferedEdit` takes a `'rescope'` event, which ends the
+hold exactly as `'undoRedo'` does: the field stays focused, and the next keystroke starts a new edit
+on the new owner. This gives a field the target-swap signal that § "Remount a field when its TARGET
+changes" says a component cannot see. `BufferedFieldScope` is that signal, for the fields under a
+provider.
+
+**Siblings, and the owner's identity.** Some fields change their target without a React key.
+Those are the Skin Editor's bone and part transforms, and the Sprite Anim clip's fps and cycles.
+They now sit under a `BufferedFieldScope` naming the target, so they get the same rule. The
+Particle Editor's scope is the document's in-file guid (`def.id`), not its path. A move or rename
+re-points the path, but it is the same effect, so it must not end an edit.
+
+Not changed: text the user TYPED is still held against an external change until blur. That is
+the hold's job, and Unity likewise keeps an active edit's text against a data change.
+
+Tests: `bufferedEcho.test.ts` § `shownTextIsStale` and § "a new owner ends the edit", and
+`fields.test.tsx` § #1907 (the observed repro, a clamped field, an undo landing late, a blur while
+mixed, typed text kept, a blank the user made, a focused mixed exit, and a focused rescope).
+
 ### And the mirror-image trap: Escape, in a window that IS focused
 
 The rule above is about a blur that never fires. The opposite state has its own bug, and the #233
@@ -724,7 +773,8 @@ A field that tracks "is the user mid-edit?" in a ref must be keyed on what it ed
 cleared by a commit, so a target swap that never blurs the input — an agent changing selection over
 MCP — leaves the previous target's typed text in place, and the next commit applies it to the NEW
 target. The component cannot tell a target swap from an ordinary external value change, so the fix is
-a React `key`, not more logic inside it.
+a React `key`, not more logic inside it. (`useBufferedValue` is the exception: under a
+`BufferedFieldScope` it is told, and ends the edit itself — #1907, above.)
 
 Measured behaviour, the diagnosis, and how to reproduce it live: **[qa/knowledge.md](../qa/knowledge.md) §5**.
 

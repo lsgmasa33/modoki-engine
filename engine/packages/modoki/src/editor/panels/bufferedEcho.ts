@@ -73,7 +73,11 @@ export function resyncBuffered<T>(
   parse: (raw: string) => T,
   now: number,
   match: EchoMatch<T> = {},
+  /** The text on screen is not the user's — see {@link shownTextIsStale}. */
+  stale = false,
 ): { text: string | null; pending: PendingCommit<T>[] } {
+  // Both checks below protect the USER'S text. Text that is not theirs has nothing to protect (#1907).
+  if (stale) return { text: (match.format ?? String)(external), pending: [] };
   const same = match.same ?? Object.is;
   const live = pending.filter((p) => now - p.at <= ECHO_WINDOW_MS);
   const hit = live.findIndex((p) => same(p.value, external));
@@ -83,6 +87,25 @@ export function resyncBuffered<T>(
   // A late echo of this field's own earlier commit (#1411).
   if (hit >= 0) return { text: null, pending: live.slice(hit + 1) };
   return { text: (match.format ?? String)(external), pending: [] };
+}
+
+/** Whether the text a field shows is NOT the user's, so the echo checks in {@link resyncBuffered}
+ *  must not keep it (#1907), and neither may the focus hold. Both exist to protect what the user
+ *  typed. Two cases where the text on screen is something else:
+ *  - **A new owner** (`rescoped`: the selection changed). The text was typed for, or shows, the
+ *    PREVIOUS owner. When it happened to "mean" the new owner's value it stayed, and so did the
+ *    previous owner's pending commits.
+ *  - **The blank that MIXED left behind** (`leftMixed`, text still `''`). While mixed, the buffer is
+ *    `''` so the placeholder shows. That is not text, but `parseNumber('')` is 0. So on leaving mixed
+ *    at a shared value of 0, the #242 check read the blank as "already means 0", and the field
+ *    stayed BLANK with no placeholder. Observed live: select two entities whose `x` differ, then one
+ *    whose `x` is 0. This applies only while the blank is UNTOUCHED (`placeholder`), which is a fact
+ *    about the field's history that its text cannot tell. A blank the user typed looks the same:
+ *    type `5` (broadcast to every entity), then backspace, which in mixed commits nothing. Their
+ *    `''` is kept, and 5 is a late echo (#1411). Re-syncing it would put the next keystroke on `5`.
+ *    That was a review finding against an earlier `current === ''` version of this check. */
+export function shownTextIsStale(rescoped: boolean, leftMixed: boolean, placeholder: boolean): boolean {
+  return rescoped || (leftMixed && placeholder);
 }
 
 /** Whether a buffered field is HOLDING its text against the store right now, and what moves that
@@ -96,9 +119,23 @@ export function resyncBuffered<T>(
  *  Cmd+Z undid the data, the field kept showing the undone text until blur, and a wheel step then
  *  committed FROM that text. The field stays focused but stops holding, so a store change that lands
  *  after the step (the Inspector reads ECS a render later) still reaches it; the next keystroke,
- *  wheel step or focus starts a new edit. */
+ *  wheel step or focus starts a new edit.
+ *
+ *  ⚠️ **A new owner ENDS the edit too — also Unity's rule (#1907).** A selection change in Unity
+ *  ends the Inspector's text edit and shows the new target's value, on both paths:
+ *  - A Hierarchy click moves window focus, and `HostView.OnLostFocus` calls
+ *    `EditorGUI.EndEditingActiveTextField()`.
+ *  - Any selection change makes `InspectorWindow.OnSelectionChanged` call
+ *    `RebuildContentsContainers()`, which tears down the old editors. When the focused container
+ *    detaches, `IMGUIContainer` calls `OnFocusOutContainer`, which calls
+ *    `EditorGUI.CommitActiveDelayedTextField()`.
+ *
+ *  Source: UnityCsReference @ 88ce7b6. Here, a Hierarchy click already blurs the field (focus goes to
+ *  `<body>`, measured on #1907), so blur covered that path. A selection change that leaves DOM focus
+ *  in the field did not: the hold kept the previous owner's text on screen, and the next keystroke
+ *  edited the new owner from it. An agent's `modoki_set_selection` is one such change. */
 export interface BufferedEdit { focused: boolean; ended: boolean }
-export type BufferedEditEvent = 'focus' | 'blur' | 'input' | 'undoRedo';
+export type BufferedEditEvent = 'focus' | 'blur' | 'input' | 'undoRedo' | 'rescope';
 
 export const IDLE_EDIT: BufferedEdit = { focused: false, ended: false };
 
@@ -107,7 +144,8 @@ export function nextBufferedEdit(s: BufferedEdit, event: BufferedEditEvent): Buf
     case 'focus': return { focused: true, ended: false };
     case 'blur': return { focused: false, ended: false };
     case 'input': return { focused: s.focused, ended: false };
-    case 'undoRedo': return { focused: s.focused, ended: true };
+    case 'undoRedo':
+    case 'rescope': return { focused: s.focused, ended: true };
   }
 }
 

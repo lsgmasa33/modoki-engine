@@ -5,7 +5,7 @@
  *  Each case replays a sequence the live editor produced; the #1411 one is the measured
  *  `…qr`-over-`…qrs` clobber. */
 import { describe, it, expect } from 'vitest';
-import { resyncBuffered, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEditEvent, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
+import { resyncBuffered, shownTextIsStale, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEditEvent, type PendingCommit } from '../../packages/modoki/src/editor/panels/bufferedEcho';
 import { parseNumber, parseString } from '../../packages/modoki/src/editor/panels/fields';
 
 const commits = <T,>(...values: T[]): PendingCommit<T>[] => values.map((value) => ({ value, at: 0 }));
@@ -138,5 +138,54 @@ describe('nextBufferedEdit / holdsBufferedText', () => {
   it('#242: with no focus event (unfocused window) typing never arms the hold; the echo checks carry it', () => {
     expect(holdsBufferedText(run('input', 'input'))).toBe(false);
     expect(holdsBufferedText(run('input', 'undoRedo', 'input'))).toBe(false);
+  });
+});
+
+/** #1907: text on screen that is not the user's, which the echo checks must not keep. Observed live:
+ *  select two entities whose `x` differ (the field shows `----`), then one whose `x` is 0. The field
+ *  went BLANK with no placeholder. */
+describe('shownTextIsStale / resyncBuffered(stale)', () => {
+  it('the observed mechanism: without it, the blank MIXED left behind already "means" 0', () => {
+    expect(resyncBuffered('', 0, [], parseNumber, 10).text).toBeNull();
+  });
+
+  it('leaving MIXED with the blank untouched is stale, and re-syncs to the shared value', () => {
+    expect(shownTextIsStale(false, true, /* placeholder */ true)).toBe(true);
+    expect(resyncBuffered('', 0, [], parseNumber, 10, {}, true).text).toBe('0');
+  });
+
+  it('leaving MIXED with anything the user typed is NOT stale — even a blank: the echo checks still protect it', () => {
+    // `5.` broadcast 5 and un-mixed the field; or `5` then backspace, a blank the user made.
+    expect(shownTextIsStale(false, true, /* placeholder */ false)).toBe(false);
+  });
+
+  it('without a mixed exit or a new owner nothing is stale (#242: a cleared box keeps its own echo)', () => {
+    expect(shownTextIsStale(false, false, false)).toBe(false);
+    expect(shownTextIsStale(false, false, true)).toBe(false);
+  });
+
+  it('a new owner is stale whatever the text is', () => {
+    expect(shownTextIsStale(true, false, false)).toBe(true);
+    expect(shownTextIsStale(true, true, true)).toBe(true);
+  });
+
+  it('a stale re-sync writes through the field\'s format and forgets the pending record', () => {
+    const r = resyncBuffered('1.50', 1.5, commits(1.5), parseNumber, 10, roundedTo(2), true);
+    expect(r.text).toBe('1.5');
+    expect(r.pending).toEqual([]);
+  });
+});
+
+describe('nextBufferedEdit — a new owner ends the edit (#1907, Unity)', () => {
+  const run = (...events: BufferedEditEvent[]) => events.reduce(nextBufferedEdit, IDLE_EDIT);
+
+  it('a selection change while focused ends the hold, and the field stays focused', () => {
+    const s = run('focus', 'input', 'rescope');
+    expect(holdsBufferedText(s)).toBe(false);
+    expect(s.focused).toBe(true);
+  });
+
+  it('the next keystroke after it starts a new edit on the new owner, which holds again', () => {
+    expect(holdsBufferedText(run('focus', 'input', 'rescope', 'input'))).toBe(true);
   });
 });
