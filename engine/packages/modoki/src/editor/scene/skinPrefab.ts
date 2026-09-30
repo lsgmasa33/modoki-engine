@@ -13,12 +13,11 @@ import { coerceRigBones } from '../../runtime/skinning/rig2dTypes';
 import { spawnEntitySubtree, type SubtreeSpec } from '../undo/entityActions';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { type PrefabFile } from './prefab';
-import { classifyExistingPrefabId, parkedPrefabRead } from './prefabCache';
+import { classifyExistingPrefabId } from './prefabCache';
 import { serializeRebuildOver } from './prefabSerialize';
 import { restorePrefabsInMemory } from './prefabMemoryRestore';
 import { commitPrefabWrite, parsePrefabBytes } from './prefabCommit';
 import { readPriorDocument } from '../panels/assetOps';
-import { jsonFileBody } from '../backend/editorBackend';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 
 /** Build the SkinnedSprite2D + Bone2D subtree spec for a rig. The root sits at its
@@ -78,15 +77,14 @@ export async function makeRigPrefabAsset(
   // Snapshot the current on-disk content so undo RESTORES the prior prefab (an update
   // must not delete a prefab that predated it). Absent ⇒ this was a fresh create.
   //
-  // ⚠️ Read from the FILE (`readPriorDocument`), and an unreadable one is not a create (#1679 close-out review): it
+  // ⚠️ Read through `readPriorDocument` (the file, or the park below), and an unreadable one is not a create (#1679 close-out review): it
   // used to fall through to "create", so the undo TRASHED the prefab this update had replaced — #1264's shape. It is
   // not a free overwrite either (#1692, I10): the update is conditional on what it read, so an unreadable prefab
   // REFUSES the update and is left as it is. A manifest id whose file is gone (a 404, or the SPA fallback's HTML) is a
   // create.
-  // A parked prefab is updated over the PARK (#1868 D-i), as Create Prefab's Replace does: it is what the editor shows and
-  // Save would write, so the update is conditional on it and its undo restores it.
-  const parked = parkedPrefabRead(savePath);
-  const prior = parked ? jsonFileBody(parked) : await readPriorDocument(savePath);
+  // A parked prefab is updated over the PARK (#1868 D-i, `readPriorDocument` takes it first), as Create Prefab's Replace
+  // is: it is what the editor shows and Save would write, so the update is conditional on it and its undo restores it.
+  const prior = await readPriorDocument(savePath);
   if (prior === null) { console.error(`[skinPrefab] not updating ${savePath} — it could not be read, so it would be overwritten blind`); return null; }
   const prevContent: string | null = prior ?? null;
 

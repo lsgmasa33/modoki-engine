@@ -50,10 +50,10 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, relinkedFramesCheck, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabConflictReason, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, relinkedFramesCheck, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  classifyExistingPrefabId, parkedPrefabRead, jsonFileBody, untagEntityTreeAsInstance, unstampMemberGuids,
+  classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
   reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
   restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, partOfInstanceRefusal,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
@@ -3293,7 +3293,8 @@ export function registerEditorAgentOps(): void {
       // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
-      // What is at `path` now, read ONCE (#1692): the bytes the write below is conditional on (I10), and — over an existing
+      // What is at `path` now, read ONCE (#1692) — the PARK over a parked prefab, as the human path reads it (#1868 D-i,
+      // `readPriorDocument`; before #1872 this read took the file): the bytes the write below is conditional on (I10), and — over an existing
       // prefab, a Replace — the rows it overwrites, which a node with no live identity is matched against by name, the
       // same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`). One read, so the rows matched are the rows the
       // write replaces.
@@ -3367,7 +3368,10 @@ export function registerEditorAgentOps(): void {
         },
       });
       if (!committed.ok && committed.conflict) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${path} changed on disk while this create was writing it, so it was left as it is. Retry to write over the new content.`);
+        // Which conflict (#1872 close-out review): over a prefab parked across an outside change, a retry meets it again.
+        const why = prefabConflictReason(path);
+        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${why.reason}.${why.parked ? '' : ' Retry to write over the new content.'}`,
+          why.parked ? { options: ['modoki_save_all, which reports the conflict with the outside change', 'modoki_discard_asset_edits for this prefab, then retry'] } : undefined);
       }
       // Any other failed write refuses WITH the commit's reason (#1776) — it answered a bare ok:false. The one channel a
       // write's refusal travels in is `committed.error`, whoever produced it.
@@ -3423,10 +3427,9 @@ export function registerEditorAgentOps(): void {
             // (I10), and after a delete it would link a file that is not there. Read where its guid lives now (a Rename
             // moves it). This op writes no file on undo or redo, so an absent file refuses too.
             const at = (prefab.id ? resolveRef(prefab.id) : undefined) ?? landedPath;
-            // The document the EDITOR holds first (#1868): a later Replace's or Apply's undo restores this one in memory only,
-            // and the file keeps the bytes it overwrote until a Save — read from disk, it refused over the stack's own step.
-            const parked = parkedPrefabRead(at);
-            const onDisk = parked ? jsonFileBody(parked) : await readPriorDocument(at);
+            // The document the EDITOR holds (#1868, `readPriorDocument` takes the park first): a later Replace's or Apply's
+            // undo restores this one in memory only, and the file keeps the bytes it overwrote until a Save.
+            const onDisk = await readPriorDocument(at);
             if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });
             if (onDisk === undefined || !prefabTextIsDocument(onDisk, prefab)) throw fileChangedRefusal([at]);
             // I9, as the human redo: the key an eviction since the undo left cold is seated with the document the file holds.

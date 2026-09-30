@@ -110,6 +110,30 @@ describe('foldMemberRowChannels — v17 channels', () => {
     expect(f.added!.map((n) => n.key ?? n.guid)).toEqual([G2]);
   });
 
+  it('a whole list replaces only the nodes the TEMPLATE anchors at its member — one re-anchored there stays (#1872)', () => {
+    // k1's anchor, localId 3, is gone from the document, so the load re-anchors it to the root; a whole list the scene
+    // pinned at the root BEFORE the anchor went never held it, and replacing it lost the node (the close-out review's
+    // pin-first order). A list pinned over it says so with a node row on its key (`diffFrameAdded`, below). Mutation:
+    // filter on `placedAnchor(doc, n.parentLocalId)` — k1 is dropped.
+    const f = foldMemberRowChannels(doc, { [`/${G1}`]: { added: [node(undefined, 3, { guid: G2 })] } },
+      { added: [node('k1', 1, { parentLocalId: 3 }), node('k2', 1)] });
+    expect(f.added!.map((n) => n.key ?? n.guid)).toEqual(['k1', G2]);
+  });
+
+  it('in TEMPLATE form a whole list that names a re-anchored node by key replaces it; one that does not, keeps it (#1872 re-review)', () => {
+    // A prefab's own rows carry the node's key in the list, and a removed row on that key removed the list's copy too.
+    // The key is the statement there. Mutation: drop the key-named clause — k1 comes twice.
+    const f = foldMemberRowChannels(doc, { [`/${G1}`]: { added: [node('k1', 7)] } }, { added: [node('k1', 1, { parentLocalId: 3 }), node('k2', 1)] });
+    expect(f.added!.map((n) => `${n.key}:${(n.traits.Transform as { x: number }).x}`)).toEqual(['k1:7']);
+    // A list that does not name it (pinned before the anchor went) leaves the template's node to the load's re-anchor.
+    const g = foldMemberRowChannels(doc, { [`/${G1}`]: { added: [node('k9', 7)] } }, { added: [node('k1', 1, { parentLocalId: 3 })] });
+    expect(g.added!.map((n) => n.key)).toEqual(['k1', 'k9']);
+    // A key the lower list uses twice names neither copy (third review): the root copy goes as the list's own anchor,
+    // the re-anchored one stays. Mutation: drop the once-only test — both go.
+    const h = foldMemberRowChannels(doc, { [`/${G1}`]: { added: [node('kd', 7)] } }, { added: [node('kd', 1), node('kd', 2, { parentLocalId: 3 })] });
+    expect(h.added!.map((n) => `${n.key}:${(n.traits.Transform as { x: number }).x}`)).toEqual(['kd:2', 'kd:7']);
+  });
+
   it('own and traitRemovals on a NESTED row\'s member row are forwarded to that frame', () => {
     // Mutation: drop `row.own || row.traitRemovals` from the nested forward test — nothing is forwarded.
     const nestedDoc = { rootLocalId: 1, entities: [{ localId: 1, nodeGuid: G1 }, { localId: 2, nodeGuid: G2, prefab: 'p' }] };
@@ -137,7 +161,7 @@ describe('diffFrameAdded', () => {
     // Mutation: read a field one side omits as undefined (drop `defaultOf`) — y reads as an edit.
     const chain = [node('k1', 1, { traits: { EntityAttributes: { name: 'k1', parentId: 0, guid: '' }, Transform: { x: 1, y: 0 } } }), node('k2', 1)];
     const d = diffFrameAdded([live('k1', 1, { traits: { EntityAttributes: { name: 'k1' }, Transform: { x: 1 } } }), live('k2', 1)], chain, deps);
-    expect(d).toEqual({ nodeRows: new Map(), own: new Map(), whole: new Set() });
+    expect(d).toEqual({ nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() });
   });
 
   it('an edit to ONE node is that node\'s field, and its sibling states nothing (#1516)', () => {
@@ -180,6 +204,27 @@ describe('diffFrameAdded', () => {
     const chain = [node('k1', 1, { children: [node('k1c', 2)] })];
     const d = diffFrameAdded([live('k1', 1, { children: [live('k1c', 4)] })], chain, deps);
     expect([...d.nodeRows]).toEqual([['k1c', { traits: { Transform: { x: 4 } } }]]);
+  });
+
+  it('a whole list over a node the load RE-ANCHORED reports it pinned over; a list stated node by node does not (#1872)', () => {
+    // k1's template anchor is gone, so the load placed it at the root beside a key-less node, whose list goes whole: the
+    // list holds the live k1, and the fold (which replaces only the template's own anchor) would spawn the template's k1
+    // beside it. Reported, not written as a row: the writer states it per form. Mutation: drop `pinOver()` — empty.
+    const whole = diffFrameAdded([live('k1', 1), live(undefined, 1)], [node('k1', 1), node(undefined, 1)], deps, new Set(['k1']));
+    expect([...whole.whole]).toEqual([1]);
+    expect([...whole.pinnedOver]).toEqual(['k1']);
+    expect(whole.nodeRows.has('k1')).toBe(false);
+    // Node by node, k1 is matched on its key already.
+    const rows = diffFrameAdded([live('k1', 1)], [node('k1', 1)], deps, new Set(['k1']));
+    expect(rows.whole.size).toBe(0);
+    expect(rows.pinnedOver.size).toBe(0);
+  });
+
+  it('a key used twice elsewhere in the frame does not stop a re-anchored node\'s own unique key from being reported (#1872 re-review)', () => {
+    // The duplicate-key branch returned before the rule, so the save wrote no row while the rebuild's own copy of the
+    // condition fired: two copies on load. Mutation: drop `pinOver()` from the duplicate branch — k1 is not reported.
+    const d = diffFrameAdded([live('k1', 1)], [node('k1', 1), node('kd', 1), node('kd', 1)], deps, new Set(['k1', 'kd']));
+    expect([...d.pinnedOver]).toEqual(['k1']); // kd is used twice: no row could name one of them
   });
 
   it('falls back to the whole list for a key-less chain node, and for a duplicate key', () => {

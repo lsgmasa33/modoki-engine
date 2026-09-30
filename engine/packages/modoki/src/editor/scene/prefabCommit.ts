@@ -81,6 +81,18 @@ export interface PrefabCommitOptions {
   rebase?: boolean;
 }
 
+/** Why a commit over `path` met a conflict, worded for the caller to say (#1872 close-out review). Two causes, and they
+ *  need opposite advice:
+ *  - `parked`: the prefab is PARKED over an outside change of its file (#1868: the watcher kept the park). The writer read
+ *    the park (`readPriorDocument`), whose baseline the file no longer holds, so a retry meets the same conflict until
+ *    the park is saved (Save asks whether to overwrite the outside change) or discarded.
+ *  - otherwise the file changed between the writer's read and its write, and a retry reads the new content. */
+export function prefabConflictReason(path: string): { parked: boolean; reason: string } {
+  return parkedPrefabEntry(path)?.fileChanged
+    ? { parked: true, reason: `${path} has unsaved changes in the editor and its file was changed outside the editor since, so it was left as it is — save it first (Save asks whether to overwrite the outside change) or discard the editor's changes, then try again` }
+    : { parked: false, reason: `${path} changed on disk while it was being written, so it was left as it is` };
+}
+
 /** The file a prefab ref names: a GUID through the manifest; a path (a not-yet-normalized instance, a new file) as is. */
 export function prefabPathOf(source: string): string {
   return isGuid(source) ? (resolveRef(source) || source) : source;
@@ -341,18 +353,22 @@ function contentFor(doc: PrefabFile, bytes: string | undefined, ...priors: Array
   // out and were refused for good, close-out re-review).
   const written = bytes === undefined ? doc : parsedOrNull(bytes) ?? doc;
   if (need <= localIdCounter(written) && !markUnstated(written)) return bytes ?? jsonFileBody(doc);
+  const claims = !(written.version >= LOCAL_ID_MARK_VERSION);
+  stateRaisedMark(doc, need);
+  if (bytes === undefined) return jsonFileBody(doc);
+  return withTopLevelNumbers(bytes, { nextLocalId: doc.nextLocalId!, ...(claims ? { version: doc.version } : {}) }) ?? jsonFileBody(doc);
+}
+
+/** Raise `doc`'s localId mark to at least `need` and state it as a write does (#1774): the field, placed after the root
+ *  when it was absent, and the version the field arrived in. A raised mark is v8 data, so the document claims v8 (an
+ *  older build then refuses to save over it and drop the mark) — v8, not today's format: a later bump must not be
+ *  claimed by a document that carries nothing of it (close-out review of #1797). The commit's writes and an in-memory
+ *  restore's park both state it here (#1872 close-out review), so Save writes a park as the commit would have. */
+export function stateRaisedMark(doc: PrefabFile, need: number): void {
   const had = doc.nextLocalId !== undefined;
   advanceLocalIdCounter(doc, need);
-  // A raised mark is v8 data, so what is written claims v8 (an older build then refuses to save over it and drop the
-  // mark). The version the FIELD arrived in, not today's format: a later bump must not be claimed by bytes that carry
-  // nothing of it (close-out review of #1797).
-  const claims = !(written.version >= LOCAL_ID_MARK_VERSION);
   if (!(doc.version >= LOCAL_ID_MARK_VERSION)) doc.version = LOCAL_ID_MARK_VERSION;
-  if (bytes === undefined) {
-    if (!had) placeMarkAfterRoot(doc);
-    return jsonFileBody(doc);
-  }
-  return withTopLevelNumbers(bytes, { nextLocalId: doc.nextLocalId!, ...(claims ? { version: doc.version } : {}) }) ?? jsonFileBody(doc);
+  if (!had) placeMarkAfterRoot(doc);
 }
 
 /** `bytes` with each of `fields` set as a top-level number and every other byte kept — formatting, key order, a BOM —

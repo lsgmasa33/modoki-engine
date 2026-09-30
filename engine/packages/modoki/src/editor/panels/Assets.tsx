@@ -15,7 +15,7 @@ import { getDirtyAssetPaths } from '../scene/dirtyAssets';
 import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { placePrefabFromPath } from '../scene/prefabPlace';
-import { commitPrefabWrite } from '../scene/prefabCommit';
+import { commitPrefabWrite, prefabConflictReason } from '../scene/prefabCommit';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 // Backend-IO wrappers + create-prefab flow shared with the Hierarchy panel
 // (editor-panels F6/F7) — single source of truth for the /api/* calls and the
@@ -204,8 +204,9 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       return;
     }
     // A RE-import replaces the prefab already there, so its undo must put those bytes back rather than trash the file
-    // (#1264's shape, found by #1679's sweep). Read now, before anything is written, and decided by the FILE: a
-    // manifest-`known` id can outlive it, and a `no-id` file is there all the same (`readPriorDocument`).
+    // (#1264's shape, found by #1679's sweep). Read now, before anything is written, and decided by the FILE, not the
+    // manifest: a `known` id can outlive it, and a `no-id` file is there all the same — or by the PARK over a parked
+    // prefab, the document the editor shows (#1868, #1872; both are `readPriorDocument`).
     const previousContent = await readPriorDocument(prefabPath);
     // …and the write is conditional on it (#1692, I10), so a prefab that is there and cannot be read is not overwritten
     // blind. Refused before anything is spawned or written.
@@ -254,14 +255,20 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
     deleteEntity(rootId);
 
+    let prefabFailed = false;
     if (prefab) {
       // ONE step (#1692): only over what was read at the path, then both caches — so the instances placed from a
       // re-imported prefab are rebuilt from it now, not at the next reload.
       const committed = await commitPrefabWrite(prefabPath, prefab, { expected: previousContent ?? null });
       const wrote = committed.ok;
       if (!wrote) {
-        // The commit's own reason when it has one (#1750: "a scene is still loading" refuses a write, and says so).
-        console.error(`[Assets] Failed to create prefab ${prefabPath}${committed.error ? ` — ${committed.error}` : ''}`);
+        // The commit's own reason when it has one (#1750: "a scene is still loading" refuses a write, and says so), and a
+        // conflict's cause (#1872 close-out review: over a prefab parked across an outside change, a retry cannot land).
+        // Shown as the import's error, not only logged: the import otherwise finished as a success.
+        const why = committed.conflict ? prefabConflictReason(prefabPath).reason : committed.error;
+        console.error(`[Assets] Failed to create prefab ${prefabPath}${why ? ` — ${why}` : ''}`);
+        setImportError(`Import of "${assetName}" did not write its prefab${why ? ` — ${why}` : ''}.`);
+        prefabFailed = true;
       } else {
         // No undo entry (#1868, D2): an import is a file operation, and its prefab is a new asset saved on creation.
         console.log(`[Assets] Created prefab: ${prefabPath}`);
@@ -270,7 +277,8 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 
     refreshAssets();
     onDone?.();
-    setImportStatus(false);
+    // Not over a failed prefab write: `setImportStatus` clears the modal's failed state, which is what shows it.
+    if (!prefabFailed) setImportStatus(false);
   } catch (e) {
     // Surface conversion/import failures (e.g. unsupported FBX) as a dismissible
     // modal instead of an unhandled rejection — this runs from a fire-and-forget

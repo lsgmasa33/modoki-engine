@@ -9,6 +9,8 @@ import { makeFakeAssetRoute, sha256, type FakeAssetRoute } from './fakeAssetRout
 import { readPriorDocument } from '../../src/editor/panels/assetOps';
 import { writeAssetFileGuarded } from '../../src/editor/backend/editorBackend';
 import { sha256OfWritten } from '../../src/editor/utils/contentHash';
+import { parkPrefab, clearDirtyAssets } from '../../src/editor/scene/dirtyAssets';
+import { jsonFileBody } from '../../src/editor/backend/editorBackend';
 
 let route: FakeAssetRoute;
 let spies: Array<{ mockRestore: () => void }> = [];
@@ -31,6 +33,20 @@ describe('the prior-bytes read and the hash', () => {
     expect(await readPriorDocument('/assets/corrupt.prefab.json')).toBeNull(); // corrupt is there, never "absent"
     route.fail.add('/assets/p.prefab.json');
     expect(await readPriorDocument('/assets/p.prefab.json')).toBeNull();
+  });
+
+  it('readPriorDocument: a PARKED prefab reads as the park, not the file (#1868, #1872)', async () => {
+    // Every prefab writer replaces what the editor shows: the agent's `prefab create`, the model re-import and the rigged
+    // regenerate read the file here and wrote over it without the parked edits. Mutation: drop the park read from
+    // `readPriorDocument` — red.
+    const onDisk = { id: 'p', name: 'P', rootLocalId: 1, entities: [] };
+    const park = { ...onDisk, entities: [{ localId: 1, name: 'Parked', traits: {} }] };
+    route.put('/assets/p.prefab.json', `${JSON.stringify(onDisk)}\n`);
+    parkPrefab('/assets/p.prefab.json', park, onDisk);
+    try {
+      expect(await readPriorDocument('/assets/p.prefab.json')).toBe(jsonFileBody(park as never));
+      expect(await readPriorDocument('/assets/other.prefab.json'), 'an unparked path still reads the file').toBeUndefined();
+    } finally { clearDirtyAssets(); }
   });
 
   it('a file that starts with a UTF-8 BOM hashes the way the route does', async () => {

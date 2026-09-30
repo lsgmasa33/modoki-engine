@@ -1128,6 +1128,42 @@ all, and every untouched sibling was pinned: a later template change to it never
   save read the loader's re-anchor as a re-parent and unlinked the node; without the second, a member
   below a deleted one read as live-but-changed, and the frame fell back to the pinning whole slot
   (close-out review F3/F4).
+  **A whole list pinned over a RE-ANCHORED node says it covers that node (#1872).** Where a node is placed is one
+  rule, `placedAnchor(doc, parentLocalId)` (`runtime/loaders/memberTranslation.ts`): the anchor while the frame's
+  document has that row, else the root. `chainNodesAsPlaced` states nodes there, and `reanchoredKeys` names the nodes
+  it moved. The load's fold (`foldMemberRowChannels`) replaces a whole `added` list against the TEMPLATE's own anchor,
+  the nodes the list was captured over. So when the diff (`diffFrameAdded`, the save's and the rebuild's) pins a whole
+  list at an anchor holding a node the load re-anchored there, it reports that node's key (`pinnedOver`), and each
+  consumer states it in its own form. Only the SAVE knows which list covers which node, so it says so:
+  - **Scene form** (a scene's rows): the list's copy carries a guid and no key, so the writer adds a node row
+    `a+<key>: { removed: true }`. A node row applies by key wherever the template anchors the node.
+  - **Template form** (a prefab's own rows, e.g. H nesting O): the list's copy carries the node's KEY, and a removed
+    row on it removed the list's copy too, in every instance of H (the re-review's finding). The key is the statement
+    there: the fold also replaces a lower node the list names by key where that node is PLACED at the list's anchor,
+    when the lower list uses that key ONCE (a key used twice names neither copy: a list pinned while the anchor existed
+    held only the one anchored there). A node the edit DELETED is in no list, so its removal is still a removed row
+    (the third review: without it, H's delete came back).
+  - **The rebuild** (`captureNestedInstanceOverrides`) does not subtract a pinned-over node as the template's: it
+    respawns it from the capture, edited or not, and a removed row (applied after) deletes the fresh template copy.
+    Subtracted, an unedited one was left to that copy and the row deleted it. It reads the diff's own `pinnedOver`: a
+    copy of the condition there drifted from the diff's in the duplicate-key branch.
+  - **A key the chain uses twice** sends every anchor of the frame whole; the rule is still asked there for each
+    re-anchored node whose OWN key is used once (the re-review: skipping it left two copies). A key used twice is never
+    reported, since no row can name one of the two.
+
+  The orders it has to hold in (`prefabReanchoredWholeList.test.ts`):
+  - **6053's order** (win's hunt seed): the anchor goes, then the scene edits inside a re-anchored template REFERENCE
+    node, which falls back to the whole list above. Without the statement, the pinned copy and the template's (still
+    anchored to the deleted row) both spawned on one guid, the template's showing what the scene deleted inside it.
+  - **The reversed order** (the close-out review's): the scene pins the root's list while the anchor still exists,
+    then a prefab edit deletes the anchor, with no save between. The first fix made the FOLD replace every node PLACED
+    at the root, and so dropped a node that list never held: gone at the next load, and for good at the next save.
+  - **The anchor comes back** (an undo of the prefab-edit save that deleted it, or an outside edit restoring the row):
+    the statement still names the template's node, so no second copy spawns.
+  - **A rebuild in place**, a template-form save, and a key used twice elsewhere in the frame.
+
+  The spawn sites (`loadSceneFile`'s, `applyStructureCore`) keep their own re-anchor: they also ask whether the
+  anchor is LIVE, which is a question about the frame, not the document.
 - **The template drops a node the scene edited (fork 2, owner):** the node vanishes with it. Its row is
   an orphan, warned and KEPT across saves by R2 exactly as a member row is, judged against the keys the
   template adds in THAT frame (`templateFrameKeys` — per frame, because a prefab-editor re-parent keeps a

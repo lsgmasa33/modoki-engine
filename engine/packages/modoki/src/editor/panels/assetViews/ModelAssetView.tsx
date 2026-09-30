@@ -13,9 +13,8 @@ import { importModel } from '../../scene/modelImport';
 import { glbDeclaresSkin } from '../../scene/rigBones';
 import { needsGLBConversion } from '../../scene/convertToGLB';
 import { classifyExistingPrefabId } from '../../scene/prefabCache';
-import { serializePrefab, mergeRiggedPrefab } from '../../scene/prefabSerialize';
-import { commitPrefabWrite, parsePrefabBytes } from '../../scene/prefabCommit';
-import { readPriorDocument } from '../assetOps';
+import { serializePrefab } from '../../scene/prefabSerialize';
+import { writeModelPrefab } from './modelPrefabWrite';
 import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings, type ModelCacheInfo, type LodCount, type ModelEncoder } from '../../../runtime/loaders/modelSettings';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
 import { loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
@@ -293,28 +292,12 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
               // as "first-time import" and minted a FRESH file guid over it, orphaning every scene
               // that referenced the old one (#1468, #896's class).
               const existingId = existingPrefab?.kind === 'known' ? existingPrefab.id : undefined;
-              let prefab = serializePrefab(rootId, existingId);
-              // What is at the path now, read fresh: the rigged merge's base AND what the write is conditional on
-              // (#1692, I10) — a prefab changed on disk since (a save in prefab edit, an outside edit) is left as it is.
-              const prior = prefab && prefabExists ? await readPriorDocument(prefabPath) : undefined;
-              // P7b-2b: a rigged re-import refreshes the skeleton from source, but the
-              // user's prefab edits (a child hung on a bone, an added Animator) must
-              // survive. Merge the fresh skeleton over the existing on-disk prefab,
-              // matching bones by NAME so their localIds stay stable and the child
-              // stays attached. Read the file fresh (no-store) — the cache may be stale.
-              if (prefab && typeof prior === 'string' && isRigged) {
-                const existing = parsePrefabBytes(prior);
-                if (existing && Array.isArray(existing.entities)) prefab = mergeRiggedPrefab(prefab, existing);
-              }
-              if (prefab && prior === null) {
+              const prefab = serializePrefab(rootId, existingId);
+              // The read, the rigged merge and the conditional write (`writeModelPrefab`, #1692, #1872).
+              const committed = prefab ? await writeModelPrefab(prefabPath, prefab, { exists: prefabExists, rigged: isRigged }) : null;
+              if (committed?.unreadable) {
                 console.error(`[Inspector] Could not read prefab ${prefabPath}, so it was not overwritten`);
-              } else if (prefab) {
-                // ONE step (#1692): the write, both caches (by the stable GUID too, so both resolve it), and a rebuild
-                // of every placed instance — a rigged regenerate's added bones used to reach them only at the next
-                // reload, while the next save captured them against the old rows. ⚠️ Nothing is cached unless the
-                // write landed: a scene load short-circuits on a runtime cache hit, so seating bytes that never
-                // reached disk would keep serving them for as long as a scene owns the prefab.
-                const committed = await commitPrefabWrite(prefabPath, prefab, { expected: prior ?? null });
+              } else if (committed) {
                 const wrote = committed.ok;
                 if (wrote) {
                   const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';

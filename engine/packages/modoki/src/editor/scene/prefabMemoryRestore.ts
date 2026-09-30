@@ -9,7 +9,7 @@
  *  is dropped, when it is what the file already holds (a redo back to what the forward write put there). Nothing is
  *  written and no scene is saved. */
 
-import { seatCaches, prefabPathOf, prefabTextIsDocument } from './prefabCommit';
+import { seatCaches, prefabPathOf, prefabTextIsDocument, stateRaisedMark } from './prefabCommit';
 import { type PrefabFile } from './prefab';
 import { preloadNestedPrefabs, getCachedPrefabSync } from './prefabCache';
 import { rebaseStaleInstances } from './prefabRebuild';
@@ -17,6 +17,7 @@ import { parkPrefab, parkedPrefab, parkedPrefabEntry, discardDirtyAssets, assetW
 import { jsonFileBody } from '../backend/editorBackend';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { isGuid } from '../../runtime/loaders/assetManifest';
+import { localIdCounter, type CountedDoc } from '../../runtime/core/localIdCounter';
 
 export interface PrefabRestore {
   /** The prefab's guid — resolved to wherever the file is NOW, so a Rename since the step does not strand it (#1868 hub
@@ -74,6 +75,14 @@ export async function restorePrefabsInMemory(
     // else the side the step left, which the refusal above has just matched against the editor.
     const park = parkedPrefabEntry(path);
     const onDisk = park?.onDisk ?? r.from;
+    // The localId mark never goes down (I4, #1774): the restored document is OLDER than the one the step left, and a
+    // row the step added took a number at or above the old mark. Every reader of the park mints from it (Create
+    // Prefab's Replace, the model re-import, the rigged regenerate, the agent's create, prefab edit), and with the old
+    // mark a new row reused the undone row's number (#1872 close-out review). Raised to what the file holds and what the
+    // step left — `sameDocument` ignores the mark, so the restore's own comparisons are unchanged. Stated only when it
+    // is higher than the document's own counter: a step that added no row leaves the document exactly as it was.
+    const mark = Math.max(localIdCounter(onDisk as CountedDoc), localIdCounter(r.from));
+    if (mark > localIdCounter(doc)) stateRaisedMark(doc, mark);
     seatCaches(path, r.source, doc.id, doc);
     // Not dropped when the file changed under the park (the watcher kept it): `onDisk` no longer says what the file holds,
     // so the park stays for Save, whose precondition meets the change and asks (close-out review F2).

@@ -129,3 +129,17 @@ export function translateLocalIds(
   if ([...map].every(([a, b]) => a === b)) return null;
   return (lid) => map.get(lid) ?? lid;
 }
+
+/** Where a template-added node sits in the frame that expands `doc` NOW: under its anchor row while `doc` still has
+ *  it, else at the frame root, where the load and a rebuild re-anchor a node whose anchor the prefab deleted
+ *  (`applyStructureCore`, `loadSceneFile`'s spawn) rather than dropping it (#1872). The one answer for every reader
+ *  that matches a node by its anchor: the save's diff (`chainNodesAsPlaced`, which states a node where it is placed)
+ *  and the load's fold (`foldMemberRowChannels`, where a member row's whole `added` list replaces the nodes at its
+ *  anchor). The two disagreed once: the save pinned a re-anchored node in the root's whole list, the fold replaced
+ *  only the nodes whose OWN anchor was the root, and the template's copy spawned beside the pinned one on one guid.
+ *
+ *  Answers about the document, not the live frame: whether the anchor is LIVE (the scene removed that member) is the
+ *  spawn's own question, asked where it spawns. */
+export function placedAnchor(doc: MemberDoc, parentLocalId: number): number {
+  return (doc.entities ?? []).some((e) => e.localId === parentLocalId) ? parentLocalId : (doc.rootLocalId ?? 1);
+}

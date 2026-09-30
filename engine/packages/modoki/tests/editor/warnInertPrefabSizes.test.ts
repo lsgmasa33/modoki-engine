@@ -123,7 +123,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
         { item: 'packages/modoki/src/editor/panels/assetOps.ts::redo',
           reason: 'a redo putting back the document the create wrote: a warning there blames someone for the value they are restoring' },
         // The generated prefabs: a model or rig, not an authored UI — the serializer census holds the same three.
-        ...GENERATED_PREFAB_WRITERS,
+        ...GENERATED_PREFAB_WRITES,
       ],
       scanned: census.length,
       // 11 since #1868 took the five undo/redo restores out and added Save's flush of a parked prefab.
@@ -389,6 +389,14 @@ const GENERATED_PREFAB_WRITERS = [
   { item: 'packages/modoki/src/editor/panels/Assets.tsx::importModelWithMeta', reason: 'model import: the prefab is serialized from the GLB it just spawned — mesh/bone entities, no UIElement' },
   { item: 'packages/modoki/src/editor/panels/assetViews/ModelAssetView.tsx::ModelAssetView', reason: 'model re-import regenerates the model prefab from the GLB — mesh/bone entities, no UIElement' },
   { item: 'packages/modoki/src/editor/scene/skinPrefab.ts::makeRigPrefabAsset', reason: 'a 2D skin rig prefab built from bone definitions — Bone/skin entities, no UIElement' },
+];
+
+/** Where each generated prefab is WRITTEN, for the write census: the same three, except that the Model inspector's
+ *  re-import serializes in the panel and writes through `writeModelPrefab` (its read, rigged merge and commit, moved to
+ *  a plain module to be testable, #1872). */
+const GENERATED_PREFAB_WRITES = [
+  ...GENERATED_PREFAB_WRITERS.filter((w) => !w.item.endsWith('ModelAssetView.tsx::ModelAssetView')),
+  { item: 'packages/modoki/src/editor/panels/assetViews/modelPrefabWrite.ts::writeModelPrefab', reason: 'the model re-import\'s write of the prefab it regenerated from the GLB (serialized in ModelAssetView) — mesh/bone entities, no UIElement' },
 ];
 
 /** Functions that serialize a prefab for a CALLER and write nothing themselves: whether it is written, and so warned,

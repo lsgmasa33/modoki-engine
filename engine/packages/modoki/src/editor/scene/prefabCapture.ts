@@ -3,6 +3,7 @@
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
+import { placedAnchor } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { memberRowKeysIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
@@ -1315,6 +1316,15 @@ export function moveChannelsOntoRows(
         const k = `${f.key}/${nodeRowComponent(nodeKey)}`;
         out[k] = nr.own ? { ...nr, own: writerForm(nr.own) } : nr;
       }
+      // A re-anchored template node a whole list pins (#1872): in SCENE form the list's copy carries a guid and no key, so
+      // the template's copy is removed on its key by a node row. In TEMPLATE form the list's copy carries the key itself,
+      // and a row naming it would remove that copy too (the #1872 re-review): the load's fold replaces a node the list
+      // names by key there (`foldMemberRowChannels`). But only a node the list HOLDS is named by it: one this edit
+      // deleted is in no list, so its removal is stated by the row in either form (third review).
+      const listed = opts.template ? new Set((live.added ?? []).map((n) => n.key).filter((k): k is string => !!k)) : new Set<string>();
+      for (const nodeKey of nodes.pinnedOver) {
+        if (!listed.has(nodeKey)) out[`${f.key}/${nodeRowComponent(nodeKey)}`] = { removed: true };
+      }
     }
     legacy.nestedStructure = Object.keys(keep).length ? keep : undefined;
   }
@@ -1813,10 +1823,11 @@ export function liveTemplateKeys(nodes: readonly AddedEntity[], deep = false, in
 function frameAddedDiff(
   frameRoot: number, doc: PrefabFile, chainAdded: AddedEntity[] | undefined, liveAdded: AddedEntity[] | undefined, liveLids: ReadonlySet<number>,
 ): FrameAddedDiff {
-  const chain = chainNodesAsPlaced(resolveAddedNodeTokens(baseTokenResolver(frameRoot), chainAdded) ?? [], doc, liveLids);
-  if (!chain.length && !liveAdded?.length) return { nodeRows: new Map(), own: new Map(), whole: new Set() };
+  const resolved = resolveAddedNodeTokens(baseTokenResolver(frameRoot), chainAdded) ?? [];
+  const chain = chainNodesAsPlaced(resolved, doc, liveLids);
+  if (!chain.length && !liveAdded?.length) return { nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() };
   const full = captureInstanceStructure(frameRoot, doc);
-  return diffFrameAdded(full.added, chain, nodeDiffDeps(liveTemplateKeys(full.added, true)));
+  return diffFrameAdded(full.added, chain, nodeDiffDeps(liveTemplateKeys(full.added, true)), reanchoredKeys(resolved, doc));
 }
 
 /** The live-world answers `diffFrameAdded` asks for, shared by the save (`frameAddedDiff`) and the rebuild
@@ -1838,13 +1849,22 @@ export function nodeDiffDeps(keys: ReadonlyMap<string, string>): NodeDiffDeps {
  *  anchor row the document no longer has is re-anchored to the root, as `applyStructureCore` re-anchors it — else
  *  the diff looks for it under the missing anchor and reads the loader's re-anchor as the scene's re-parent — and a
  *  node whose anchor is not live (the scene deleted that member, or one above it) is left out: it went with its
- *  member, and needs no statement. */
+ *  member, and needs no statement. Placed by `placedAnchor` (#1872); a whole list pinned over a re-anchored node states
+ *  that it covers it ({@link reanchoredKeys}, `diffFrameAdded`'s `pinnedOver`), since the load's fold replaces only what
+ *  the template anchors there. */
 export function chainNodesAsPlaced(chain: readonly AddedEntity[], doc: PrefabFile, liveLids: ReadonlySet<number>): AddedEntity[] {
-  const rows = new Set(doc.entities.map((e) => e.localId));
-  const root = doc.rootLocalId ?? 1;
   return chain
-    .map((n) => (rows.has(n.parentLocalId) ? n : { ...n, parentLocalId: root }))
+    .map((n) => { const at = placedAnchor(doc, n.parentLocalId); return at === n.parentLocalId ? n : { ...n, parentLocalId: at }; })
     .filter((n) => liveLids.has(n.parentLocalId));
+}
+
+/** The keys of the chain's nodes the load RE-ANCHORS in frame document `doc` — their anchor row is gone, so
+ *  `placedAnchor` puts them at the root. `diffFrameAdded` reports such a node as `pinnedOver` when a whole list pins it,
+ *  since the load's fold replaces only the nodes the template anchors at the list's own member (#1872). */
+export function reanchoredKeys(chain: readonly AddedEntity[], doc: PrefabFile): Set<string> {
+  const out = new Set<string>();
+  for (const n of chain) if (n.key && placedAnchor(doc, n.parentLocalId) !== n.parentLocalId) out.add(n.key);
+  return out;
 }
 
 /** v17 per-trait removal statements (#1516): `true` for a trait the scene removes that the chain does not, `false`

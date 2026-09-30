@@ -27,7 +27,7 @@ import {
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal } from '../scene/restructureRefusal';
-import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument } from '../scene/prefabCommit';
+import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef, isInstanceRootCheck, type EntityRef } from '../undo/entityRef';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -438,8 +438,20 @@ export async function deleteAssetFiles(
  *
  *  The bytes KEEP a leading UTF-8 BOM (#1684's note on #1692): an undo writes them back verbatim, and `Response.text()`
  *  strips it, so a restore silently re-encoded the file. Parse them with `parsePrefabBytes` (prefabCommit.ts), which
- *  drops it the way every reader does; the route's `ifMatch` hash strips it too (`sha256OfBytes`). */
+ *  drops it the way every reader does; the route's `ifMatch` hash strips it too (`sha256OfBytes`).
+ *
+ *  ⚠️ **A PARKED prefab reads as the park, not the file (#1868 D-i, #1872).** The park is the document the editor shows
+ *  and Save would write, so a step that replaces the path replaces THAT: its rows are matched against it, a rigged
+ *  regenerate merges over it, and its undo restores it. A step that read the file instead dropped every parked edit
+ *  from what it wrote, and its undo put back bytes the editor never showed. Every caller is a prefab writer: the
+ *  forward ones hand this read to `commitPrefabWrite` as `expected`, which checks an expectation equal to the park
+ *  against the FILE's own baseline (`prefabCommit.ts`), and the two Create Prefab redos only ask whether it still holds
+ *  their document (`prefabTextIsDocument`). So no caller holds these bytes as the disk's, and none may: a conflict
+ *  check against the disk reads the disk itself. Here once, because four callers spelled the rule inline and three
+ *  (the agent's `prefab create`, the model re-import, the rigged regenerate) did not. */
 export async function readPriorDocument(path: string): Promise<string | null | undefined> {
+  const parked = parkedPrefabRead(path);
+  if (parked) return jsonFileBody(parked);
   try {
     const res = await fetch(path, { cache: 'no-store' });
     if (res.status === 404) return undefined;
@@ -649,11 +661,9 @@ export async function createPrefabFromEntity(
     // confirmed replacing the file's content, not re-identifying it, and every instance of it would unlink.
     const existing = await classifyExistingDocumentId(at);
     if (existing.kind === 'refuse') return { refused: `Create Prefab refused — ${at} was not replaced: ${existing.reason}.` };
-    // A parked prefab is replaced as the PARK (#1868 D-i): it is the document the editor shows and Save would write, so
-    // the Replace is conditional on it (the commit checks the file's own baseline instead, and retires the park), and
-    // its undo restores it — not the bytes an older Save left in the file.
-    const parked = parkedPrefabRead(at);
-    const prior = parked ? jsonFileBody(parked) : await readPriorDocument(at);
+    // A parked prefab is replaced as the PARK (#1868 D-i, `readPriorDocument`): the Replace is conditional on it (the
+    // commit checks the file's own baseline instead, and retires the park), and its undo restores it.
+    const prior = await readPriorDocument(at);
     if (prior === null) return { refused: `Create Prefab refused — ${at} could not be read, so it was not overwritten blind.` };
     savePath = at;
     if (prior !== undefined) {
@@ -740,7 +750,7 @@ export async function createPrefabFromEntity(
   // logged, so a Create Prefab that wrote nothing looked like one that did nothing.
   if (!committed.ok) {
     return { refused: committed.conflict
-      ? `Create Prefab refused — ${savePath} changed on disk while it was being written, so it was left as it is.`
+      ? `Create Prefab refused — ${prefabConflictReason(savePath).reason}.`
       : `Create Prefab failed — ${savePath} was not written: ${committed.error ?? 'the write failed'}.` };
   }
   // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
@@ -875,10 +885,10 @@ export async function createPrefabFromEntity(
         // path this step wrote can hold another prefab by then — a later Create Prefab of the same name reuses the path
         // the rename freed, and the redo read THAT file and refused (hunt seed 6029).
         const at = resolveRef(guid) ?? savePath;
-        // The document the EDITOR holds first (#1868): a later Replace's or Apply's undo restores this one in memory only,
-        // and the file keeps the bytes it overwrote until a Save — read from disk, it refused over the stack's own step.
-        const parked = parkedPrefabRead(at);
-        const onDisk = parked ? jsonFileBody(parked) : await readPriorDocument(at);
+        // The document the EDITOR holds (#1868, `readPriorDocument` takes the park first): a later Replace's or Apply's
+        // undo restores this one in memory only, and the file keeps the bytes it overwrote until a Save — read from disk,
+        // it refused over the stack's own step.
+        const onDisk = await readPriorDocument(at);
         // Unreadable (a failed fetch, a 5xx): said and left as it is, not refused as "changed" — a refusal drops the entry
         // for good over what may be a moment's failure (#1795 review).
         if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });

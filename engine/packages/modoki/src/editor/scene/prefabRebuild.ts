@@ -32,7 +32,7 @@ import {
   captureInstanceMembers, enclosingFrames, frameMovesOf, liveRowLocalIds, memberTransforms, restoreInstanceMembers,
 } from './prefabMembers';
 import {
-  captureInstanceStructure, captureNestedChannels, chainNodesAsPlaced, type InstanceStructure, keepsTemplateRows,
+  captureInstanceStructure, captureNestedChannels, chainNodesAsPlaced, reanchoredKeys, type InstanceStructure, keepsTemplateRows,
   type KeptNodeReplace, liveTemplateKeys, moveChannelsOntoRows, nodeDiffDeps, resolveAddedNodeTokens,
   subtractChainOverrides, subtractChainStructure,
 } from './prefabCapture';
@@ -179,14 +179,21 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
         // The template's nodes node by node (v17, #1516), as the save states them; a member whose list cannot be
         // stated that way keeps the #1386 whole-node replace below. Placed as the loader places them, without the
         // ones under a member that is not live (`chainNodesAsPlaced`).
-        const chainAdded = chainNodesAsPlaced(resolveAddedNodeTokens(resolve, chainStructure.added) ?? [], childPrefab, liveRowLocalIds(id, childPrefab));
+        const resolvedAdded = resolveAddedNodeTokens(resolve, chainStructure.added) ?? [];
+        const chainAdded = chainNodesAsPlaced(resolvedAdded, childPrefab, liveRowLocalIds(id, childPrefab));
         const keys = chainAdded.length ? liveTemplateKeys(full.added, true) : new Map<string, string>();
-        const nodes = diffFrameAdded(full.added, chainAdded, nodeDiffDeps(keys));
+        const nodes = diffFrameAdded(full.added, chainAdded, nodeDiffDeps(keys), reanchoredKeys(resolvedAdded, childPrefab));
         // A kept ORPHAN row (fork 2) is not merged in here: `settleKeptOrphans` replays every kept row the new template
         // backs again, in whatever frame, after this re-apply (#1535).
         const inWhole = (n: AddedEntity) => nodes.whole.has(n.parentLocalId);
+        // A re-anchored template node in a whole list is the LIST's now, as the save writes it (#1872, the diff's
+        // `pinnedOver` — asked there once, not re-derived here: a copy of its condition drifted from it in the
+        // duplicate-key branch). So the live node is not subtracted as the template's — it is respawned from the capture,
+        // edited or not — and a removed row (applied after, below) deletes the fresh template copy. Subtracted, an
+        // unedited one was left to that copy and the row deleted it: the node was lost.
+        const pinnedOver = (n: AddedEntity) => !!n.key && nodes.pinnedOver.has(n.key);
         const { structure, replace } = subtractChainStructure(
-          { ...full, added: full.added.filter(inWhole) }, { ...chainStructure, added: chainAdded.filter(inWhole) }, keys);
+          { ...full, added: full.added.filter(inWhole) }, { ...chainStructure, added: chainAdded.filter((n) => inWhole(n) && !pinnedOver(n)) }, keys);
         const own = [...nodes.own].flatMap(([lid, list]) => list.map((n) => ({ ...n, parentLocalId: lid })));
         captures.push({
           chain,
@@ -197,7 +204,8 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
             captureInstanceOverrides(id, childPrefab), resolve(chainLayerHere.overrides) as Record<number, Record<string, Record<string, unknown>>>, childPrefab, memberTransforms(id)),
           structure: { ...structure, added: [...structure.added, ...own] },
           replace,
-          ...(nodes.nodeRows.size ? { nodeRows: nodes.nodeRows } : {}),
+          ...(nodes.nodeRows.size || nodes.pinnedOver.size
+            ? { nodeRows: new Map([...nodes.nodeRows, ...[...nodes.pinnedOver].map((k) => [k, { removed: true }] as const)]) } : {}),
         });
       }
     }

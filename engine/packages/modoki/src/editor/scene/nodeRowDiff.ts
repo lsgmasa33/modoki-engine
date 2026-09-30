@@ -48,6 +48,11 @@ export interface FrameAddedDiff {
   own: Map<number, AddedEntity[]>;
   /** Anchors whose whole live list must be written as v16 `added` instead. */
   whole: Set<number>;
+  /** Template keys of the chain nodes the load RE-ANCHORED into a whole-list anchor (#1872): the pinned list holds each
+   *  one, and the load's fold replaces only what the template anchors at the list's member, so its template copy must
+   *  go some other way — a `removed` node row in scene form, the list's own key in template form (the writer's call),
+   *  and the rebuild respawns it from its capture. Only a key the chain uses ONCE: a row cannot name one used twice. */
+  pinnedOver: Set<string>;
 }
 
 /** Not a field edit: identity the load re-derives (`guid`) and the live ecs parent (`parentId`). */
@@ -57,26 +62,36 @@ export function diffFrameAdded(
   live: readonly AddedEntity[] | undefined,
   chain: readonly AddedEntity[] | undefined,
   deps: NodeDiffDeps,
+  reanchored: ReadonlySet<string> = new Set(),
 ): FrameAddedDiff {
-  const out: FrameAddedDiff = { nodeRows: new Map(), own: new Map(), whole: new Set() };
+  const out: FrameAddedDiff = { nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() };
   const liveNodes = live ?? [];
   const chainNodes = chain ?? [];
   const anchors = new Set([...liveNodes, ...chainNodes].map((n) => n.parentLocalId));
 
   // A key used twice anywhere in the frame's chain could not say which node a row is about.
   const seen = new Set<string>();
-  let duplicate = false;
+  const twice = new Set<string>();
   const scan = (nodes: readonly AddedEntity[]) => {
     for (const n of nodes) {
-      if (n.key) { if (seen.has(n.key)) duplicate = true; seen.add(n.key); }
+      if (n.key) { if (seen.has(n.key)) twice.add(n.key); seen.add(n.key); }
       scan(n.children ?? []);
     }
   };
   scan(chainNodes);
-  if (duplicate) {
+  // A whole list holds every node live at its anchor, a template node the load RE-ANCHORED there from a lost anchor
+  // included (#1872, win's seed 6053) — asked in both branches below, since a key used twice elsewhere in the frame does
+  // not stop THIS node's key from naming it.
+  const pinOver = () => {
+    for (const c of chainNodes) {
+      if (c.key && !twice.has(c.key) && reanchored.has(c.key) && out.whole.has(c.parentLocalId)) out.pinnedOver.add(c.key);
+    }
+  };
+  if (twice.size) {
     for (const a of anchors) if (chainNodes.some((n) => n.parentLocalId === a)) out.whole.add(a);
     for (const a of anchors) if (!out.whole.has(a)) out.own.set(a, ownForm(liveNodes.filter((n) => n.parentLocalId === a)));
     for (const [a, nodes] of out.own) if (!nodes.length) out.own.delete(a);
+    pinOver();
     return out;
   }
 
@@ -91,6 +106,7 @@ export function diffFrameAdded(
     for (const [k, r] of rows) out.nodeRows.set(k, r);
     if (matched.own.length) out.own.set(anchor, ownForm(matched.own));
   }
+  pinOver();
   return out;
 }
 

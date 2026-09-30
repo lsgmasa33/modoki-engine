@@ -19,7 +19,7 @@
  *  (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged. */
 import { emptyDocMap } from '../core/docKeys';
 import { nodeRowKey } from '../core/assetRefRules';
-import { docRows } from './memberTranslation';
+import { docRows, placedAnchor } from './memberTranslation';
 
 /** localId → trait name → field → value. */
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
@@ -312,7 +312,28 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
       removedTraits = next;
     }
     if (Array.isArray(row.added)) {
-      added = [...(added ?? []).filter((n) => n.parentLocalId !== lid), ...row.added.map((n) => ({ ...n, parentLocalId: lid }))];
+      // The whole list replaces the nodes the TEMPLATE anchors at `lid`, the ones the list was captured over. A node the
+      // load re-anchors here from a lost anchor is the list's only when the save says so: a list pinned before the
+      // anchor was lost never held it (#1872). In scene form it says so with a `removed` node row (applied below); in
+      // template form the list's copy carries the node's key, which is the statement.
+      // A key the lower list uses twice names neither node (the diff never reports one, `diffFrameAdded`'s `twice`): a
+      // list pinned while the anchor existed held only the copy anchored at `lid` (third review).
+      const named = new Set(row.added.map((n) => (n as { key?: string }).key).filter((k): k is string => !!k));
+      const lowerKeys = new Map<string, number>();
+      const countKeys = (nodes: readonly A[] | undefined) => {
+        for (const n of nodes ?? []) {
+          const k = (n as { key?: string }).key;
+          if (k) lowerKeys.set(k, (lowerKeys.get(k) ?? 0) + 1);
+          countKeys((n as { children?: A[] }).children);
+        }
+      };
+      countKeys(added);
+      const replaced = (n: A) => {
+        if (n.parentLocalId === lid) return true;
+        const k = (n as { key?: string }).key;
+        return !!k && named.has(k) && lowerKeys.get(k) === 1 && placedAnchor(doc, n.parentLocalId) === lid;
+      };
+      added = [...(added ?? []).filter((n) => !replaced(n)), ...row.added.map((n) => ({ ...n, parentLocalId: lid }))];
     }
     if (Array.isArray(row.own) && row.own.length) {
       added = [...(added ?? []), ...row.own.map((n) => ({ ...n, parentLocalId: lid }))];
