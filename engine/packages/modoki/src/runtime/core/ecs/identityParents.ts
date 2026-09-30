@@ -447,7 +447,10 @@ export function identitySubtree(world: World, roots: Iterable<number>, parents: 
  *  not the scope alone decides. ⚠️ Residual, measured harmless in close-out review 2: a few writers change a
  *  resolver input without bumping the version (a promotion's `PrefabInstance` write, the loader's raw
  *  `parentId` set). Only a user action landing in one of the save's awaits could interleave one, and the
- *  sources are fetched before the loop, so those awaits resolve from the cache. */
+ *  sources are fetched before the loop, so those awaits resolve from the cache. A template key is an input too (a keyed
+ *  node derives from its frame root, #1809), stamped without a bump by a TEMPLATE capture (`addedNodeIdentity`) — which
+ *  the save itself never runs (it captures in scene form; a probe across the editor suite, 2026-09-30, found zero stamps
+ *  inside an open scope), so it is in the same residual: an Apply landing in one of the save's awaits. */
 let scopeDepth = 0;
 let scoped: { world: World; version: number; parents: IdentityParents } | null = null;
 export function openIdentityScope(): void { scopeDepth++; }

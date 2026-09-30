@@ -12,7 +12,7 @@ import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRo
 import { sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
 import { hasDocKey } from '../../runtime/core/docKeys';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, readTraitData, findEntity, markStructureDirty, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
@@ -532,10 +532,6 @@ function addedNodeIdentity(ecsId: number, template: boolean | undefined, readOnl
   if (!key) {
     key = recoverTemplateKey(ecsId) || newGuid();
     setTemplateKey(entity, key);
-    // A key is an input of the identity resolver (a keyed node derives from its frame root, #1809), and a save's scope
-    // reuses one resolver while the structure version stands still: bump it, or the rest of this save asks a resolver
-    // that never saw this key (close-out review).
-    markStructureDirty();
   }
   return { guid: '', key };
 }

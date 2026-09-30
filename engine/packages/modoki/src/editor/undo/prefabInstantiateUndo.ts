@@ -24,7 +24,8 @@ import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { durableGuid } from '../../runtime/core/assetRefRules';
+import { durableGuid, entityStep, type MemberPi } from '../../runtime/core/assetRefRules';
+import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import { findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 
 /** Structural address of one entity within an instantiated subtree, e.g.
@@ -35,8 +36,8 @@ import { findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world'
 type SubtreePath = string;
 
 /** Walk `rootId`'s subtree depth-first in a canonical order (siblings by sortOrder, then
- *  name, then id), returning each entity's id and structural path. Both instantiations of
- *  one prefab produce the same paths.
+ *  name, then TEMPLATE identity — a member's step or a keyed node's key — then id), returning each entity's id and
+ *  structural path. Both instantiations of one prefab produce the same paths.
  *
  *  ⚠️ This is DELIBERATELY not `compareSiblings` (the Hierarchy/serializer rule, which
  *  tiebreaks on the GUID) — it used to claim it matched the Hierarchy, and #500 made that
@@ -56,8 +57,23 @@ function subtreePaths(rootId: number, flat: EntityInfo[]): { id: number; path: S
       arr.push(e);
     }
   }
+  // Two siblings with one sortOrder and one name are told apart by their TEMPLATE identity — the step every identity walk
+  // gives them (`entityStep`: a keyed node's key FIRST, then a member's localId or a nested root's parentLocalId) —
+  // before the ecs id. The ecs id is not structural: a respawn hands ids out in another order, and the redo then stamped
+  // each captured guid on the OTHER sibling, so every ref to either silently swapped (#1831 hunt seed 5785; Unity:
+  // undo/redo restores the same objects, same identities). Key first because two keyed reference roots of one prefab
+  // share a member step (close-out review). ⚠️ Residual: siblings from DIFFERENT frames (a moved member beside an outer
+  // member with the same localId) can still share a step, and fall back to the ecs id as before.
+  const piMeta = getTraitByName('PrefabInstance');
+  const rankOf = (e: EntityInfo): string => {
+    const pi = piMeta ? (readTraitData(e.id, piMeta) as MemberPi) : null;
+    const key = templateKeyOf(findEntity(e.id));
+    if (!pi && !key) return '2:';
+    const step = entityStep(pi, key);
+    return typeof step === 'number' ? `0:${String(step).padStart(12, '0')}` : `1:${step}`;
+  };
   for (const arr of childrenByParent.values()) {
-    arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || a.id - b.id);
+    arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || rankOf(a).localeCompare(rankOf(b)) || a.id - b.id);
   }
   const out: { id: number; path: SubtreePath }[] = [];
   // ⚠️ A parent cycle REFUSES, naming the entity, instead of recursing until the stack overflows (#1793 defence in
