@@ -1,13 +1,12 @@
 /** Member rows and moves: which rows an instance owns, where each member hangs, the prefab's own moves, and
- *  capturing/restoring an instance's member rows.
+ *  capturing an instance's member rows.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
-import { getCurrentWorld, indexEntityGuid } from '../../runtime/core/ecs/world';
-import { applyGuidRemap } from '../../runtime/core/ecs/memberHome';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { memberRowKeysIn, memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
+import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
 import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -19,7 +18,7 @@ import { type PrefabFile } from './prefab';
 
 // ── Instance-keyed scan cost (review F11 — measured, no index threaded) ──────
 //  The instance-keyed helpers below (capture/apply overrides + structure,
-//  collectInstanceRoots, localToEcsGuid, findChildNestedRoot, resolveInstance
+//  collectInstanceRoots, localToEcsGuid, resolveInstance
 //  context, setPrefabSource) each `getCurrentWorld().query(PrefabInstance)
 //  .updateEach(...)` and filter to one `rootInstanceId`.
 //
@@ -28,9 +27,7 @@ import { type PrefabFile } from './prefab';
 //  is ARCHETYPE-based — it iterates only entities that CARRY `PrefabInstance`, NOT
 //  the whole world. So each scan is O(live prefab-instance members), not
 //  O(worldEntities) as the finding's wording implied; a 10k-entity scene with a
-//  handful of small instances scans only those few dozen tagged members. The one
-//  nested case (`findChildNestedRoot` inside `reapplyNestedInstanceOverrides`) is
-//  O(nestingDepth × members), still bounded by tagged members. A full Apply/Refresh
+//  handful of small instances scans only those few dozen tagged members. A full Apply/Refresh
 //  chains ~5-8 such scans; at realistic instance-member counts that is sub-millisecond
 //  and dwarfed by the teardown/respawn + render it triggers.
 //  Verdict: the constant-factor win does not justify threading a mutable index
@@ -150,69 +147,6 @@ export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (
   };
 }
 
-/** This instance's MEMBER ROWS as the scene stores them (v16, #1468): each live member's minted
- *  identity → the guid it currently carries. The point of the whole plan — a member's guid stops
- *  being re-derived from where it happens to sit and becomes something the file states.
- *
- *  `memberRowKeysIn` decides which members are keyed and under what, in ONE spelling shared with the
- *  loader that reads the rows back; its docblock carries the four exclusions and why each one is not
- *  a row. This function only turns those keys into rows.
- *
- *  Emitted in KEY order, not tree order. A key is stable across everything this plan exists to
- *  survive, so the block does not churn when a template row moves or is renumbered; tree order would
- *  reorder the whole map on any of those. Unreadable to a human either way — that is what `name` is
- *  for.
- *
- *  ⚠️ A member with no DURABLE guid gets no row. `durableGuid` excludes a runtime guid (#1210),
- *  which is a per-session handle and not an identity to write down; and an unaddressable member
- *  (no anchored ancestor) has '' and nothing to store. Both keep deriving — the same answer they give
- *  today. */
-/** Put the member identity an instance HAD back onto the tree a REBUILD has just re-expanded
- *  (Refresh, Revert, and every other `rebuildInstance` caller — v16, #1468).
- *
- *  A rebuild destroys the members and expands fresh ones, which then take DERIVED guids: the
- *  loader's stored rows live in the scene file, not in the live world, so without this a Refresh
- *  silently replaces every pinned identity with a derived one and the next save writes the
- *  derived values over the rows. That is precisely the failure the #1468 design record's root cause describes — an artist re-imports, members
- *  renumber, and identity is lost — arriving through the gesture meant to pick the change up.
- *
- *  The rows come from `captureInstanceMembers` on the LIVE tree before the teardown, because the live
- *  guids ARE the pinned values (the load put them there). So this is a carry, not a re-read of the
- *  file, and it works the same whether the instance was loaded from disk or created this session.
- *
- *  `applyGuidRemap` rather than a hand-rolled write, because it is the SAME primitive the two
- *  sibling mechanisms use (`stampDerivedMemberGuids`, `promoteOwnedRoots`) and it is less code than
- *  writing, re-indexing and remapping refs by hand.
- *
- *  ⚠️ **Not falsifiable by the suite, and stated rather than implied.** Mutating it to a bare write
- *  leaves every test green, twice over: `findEntityByGuid` SELF-HEALS on a miss (one rescan, then
- *  retry), so the missing re-index costs speed and not correctness; and nothing this rebuild does
- *  holds a reference to the transient derived guid for the ref-remap to repair. What a bare write
- *  would really cost is `peekEntityByGuid`, which never rescans by design — a guid written without
- *  indexing is invisible to a caller running inside a structure change. No such caller is on this
- *  path today, which is exactly why this note exists instead of a test that cannot fail. */
-export function restoreInstanceMembers(rootEcsId: number, rows: Record<string, SceneMemberRow>, pinned?: Set<number>): void {
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!eaMeta || !Object.keys(rows).length) return;
-  const remap = new Map<string, string>();
-  for (const [ecsId, key] of memberRowKeysIn(rootEcsId)) {
-    const want = durableGuid(rows[key]?.guid);
-    if (!want) continue;
-    const had = durableGuid((readTraitData(ecsId, eaMeta) as { guid?: string } | null)?.guid);
-    if (had === want) continue;
-    // A member with no guid at all is written directly — `applyGuidRemap` keys on the OLD value, and
-    // '' would match every guid-less entity in the world — and INDEXED here, because
-    // `writeTraitField` does not and the lookups later in this rebuild would not find it.
-    if (!had) {
-      writeTraitField(ecsId, eaMeta, 'guid', want);
-      const e = findEntity(ecsId);
-      if (e) indexEntityGuid(e);
-    } else remap.set(had, want);
-    pinned?.add(ecsId); // the derive after it drops a pin that collides with a derivation (#1777)
-  }
-  applyGuidRemap(remap);
-}
-
 /** Where each member of `rootInstanceId`'s instance tree sits when that is NOT where its own frame's
  *  TEMPLATE puts it — the guid that goes into `SceneMemberRow.parent` (Phase 3, #1468). Members that
  *  sit where their template says are absent, so the common case writes nothing.
@@ -320,6 +254,23 @@ export function memberRowParents(
   return out;
 }
 
+/** This instance's MEMBER ROWS as the scene stores them (v16, #1468): each live member's minted
+ *  identity → the guid it currently carries. The point of the whole plan — a member's guid stops
+ *  being re-derived from where it happens to sit and becomes something the file states.
+ *
+ *  `memberRowKeysIn` decides which members are keyed and under what, in ONE spelling shared with the
+ *  loader that reads the rows back; its docblock carries the four exclusions and why each one is not
+ *  a row. This function only turns those keys into rows.
+ *
+ *  Emitted in KEY order, not tree order. A key is stable across everything this plan exists to
+ *  survive, so the block does not churn when a template row moves or is renumbered; tree order would
+ *  reorder the whole map on any of those. Unreadable to a human either way — that is what `name` is
+ *  for.
+ *
+ *  ⚠️ A member with no DURABLE guid gets no row. `durableGuid` excludes a runtime guid (#1210),
+ *  which is a per-session handle and not an identity to write down; and an unaddressable member
+ *  (no anchored ancestor) has '' and nothing to store. Both keep deriving — the same answer they give
+ *  today. */
 export function captureInstanceMembers(rootInstanceId: number, prefab?: PrefabFile): Record<string, SceneMemberRow> {
   const eaMeta = getTraitByName('EntityAttributes');
   const out: Record<string, SceneMemberRow> = {};
@@ -328,9 +279,8 @@ export function captureInstanceMembers(rootInstanceId: number, prefab?: PrefabFi
   // stampers skip a member on the strength of a row existing for it, so "a row exists" has exactly
   // one spelling and this is a consumer of it rather than a second copy of the durability rule.
   const keyed = [...memberRowsToWrite(rootInstanceId)].sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
-  // ⚠️ Without the template there is no `parent`, and that is a CARRY, not a save: `rebuildInstance`
-  // reads the rows off the live tree purely to put them back on the re-expanded one, and the moves
-  // it must survive ride in the structure it re-applies. A save always has the document.
+  // ⚠️ Without the template there is no `parent`: nothing to measure a member's place against. A save
+  // always has the document (the old per-frame rebuild called this without one, as a carry, #1880 F7d).
   const parents = prefab ? memberRowParents(rootInstanceId, prefab) : new Map<number, string>();
   for (const [ecsId, key] of keyed) {
     const ea = readTraitData(ecsId, eaMeta) as { guid?: string; name?: string } | null;

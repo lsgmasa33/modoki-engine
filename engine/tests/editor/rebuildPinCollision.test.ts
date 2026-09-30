@@ -18,9 +18,7 @@ import {
 import { setActionCallback, pushAction, clearHistory } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
-import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
-import { rebuildInstance, refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -105,7 +103,7 @@ describe('a rebuild never lets a new derivation take a restored pin (#1777, #188
     install(after());
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      rebuildInstance(getAllEntities().find((e) => e.guid === INST)!.id, P, after() as unknown as PrefabFile, {}, {}, before() as unknown as PrefabFile);
+      refreshInstances(P, [getAllEntities().find((e) => e.guid === INST)!.id], before() as unknown as PrefabFile, after() as unknown as PrefabFile);
       expect(warn.mock.calls.some((c) => String(c[0]).includes(`derives guid ${collide}, which "M" already holds`))).toBe(true);
     } finally { warn.mockRestore(); }
 
@@ -143,7 +141,7 @@ describe('a rebuild lands every pin it restores before the derive, so a new deri
     install(next);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      rebuildInstance(root, P, next as unknown as PrefabFile, captureInstanceOverrides(root, old), captureInstanceStructure(root, old), old);
+      refreshInstances(P, [root], old, next as unknown as PrefabFile);
       return warn.mock.calls.map((c) => String(c[0]));
     } finally { warn.mockRestore(); }
   };

@@ -241,13 +241,13 @@ describe('serializePrefab (Create Prefab) — #1306', () => {
   });
 });
 
-describe('rebuildInstance — #1301', () => {
+describe('a rebuild — #1301', () => {
   it('carries Transient across the teardown + respawn', async () => {
     const { m, root } = await setup();
     const { Transient } = await import('../../src/runtime/core/traits/Transient');
     index.get(root).add(Transient);
-    const emptyStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set<number>() };
-    const newRoot = m.rebuildInstance(root, SRC, shipPrefab as never, {}, emptyStructure);
+    expect(m.refreshInstances(SRC, [root], shipPrefab as never, shipPrefab as never)).toBe(1);
+    const newRoot = currentRoot();
     // Transience belongs to the IDENTITY, like the durable guid the rebuild already carries. Before
     // the fix this read false, which is what made a preview artifact serializable.
     expect(index.get(newRoot).has(Transient)).toBe(true);
@@ -256,8 +256,8 @@ describe('rebuildInstance — #1301', () => {
   it('does not invent Transient for an authored instance', async () => {
     const { m, root } = await setup();
     const { Transient } = await import('../../src/runtime/core/traits/Transient');
-    const emptyStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set<number>() };
-    const newRoot = m.rebuildInstance(root, SRC, shipPrefab as never, {}, emptyStructure);
+    expect(m.refreshInstances(SRC, [root], shipPrefab as never, shipPrefab as never)).toBe(1);
+    const newRoot = currentRoot();
     expect(index.get(newRoot).has(Transient)).toBe(false);
   });
 });

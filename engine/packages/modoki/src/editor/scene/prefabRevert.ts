@@ -10,18 +10,18 @@ import { isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { resolveAffectedScenes } from './sceneDirty';
 import { type PrefabFile, resolveInstanceContext } from './prefab';
 import {
-  getCachedPrefabSync, getPrefabSource, preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
+  getCachedPrefabSync, getPrefabSource, preloadNestedPrefabs,
 } from './prefabCache';
 import { baseTokenResolver } from './prefabTokens';
 import { captureInstanceOverrides } from './prefabInstanceOverrides';
-import { type InstanceStructure, resolveAddedNodeTokens } from './prefabCapture';
+import { captureInstanceStructure, type InstanceStructure, resolveAddedNodeTokens } from './prefabCapture';
 import {
   enclosingLayer, enclosingRowOverrides, layerAuthoredStructureKeys, nestedFrameMoves, subtractFieldOverrides,
 } from './prefabChain';
 import {
   framesBuiltFromOtherRows, missingSourceRefusal, staleFramesRefusal, staleInstanceRefusal,
 } from './prefabFrames';
-import { captureStructureForRespawn, rebuildInstance, isOutermostEntry, captureEntrySide, rebuildEntrySide, type EntrySide } from './prefabRebuild';
+import { isOutermostEntry, captureEntrySide, rebuildEntrySide, preloadRebuildEntry, keptEnclosingSource, type EntrySide } from './prefabRebuild';
 import { getAllEntities, readTraitData } from '../../runtime/core/ecs/entityUtils';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
@@ -35,8 +35,19 @@ export async function revertRefusal(rootInstanceId: number): Promise<string | nu
   const stale = staleInstanceRefusal(rootInstanceId);
   if (stale) return stale;
   const ctx = resolveInstanceContext(rootInstanceId);
-  if (!ctx || await getPrefabSource(ctx.source)) return null;
-  return missingSourceRefusal(ctx.rootInstanceId, ctx.source, 'revert');
+  if (!ctx) return null;
+  if (!await getPrefabSource(ctx.source)) return missingSourceRefusal(ctx.rootInstanceId, ctx.source, 'revert');
+  await preloadRebuildEntry(rootInstanceId); // warmed, so a merely cold prefab is not read as a trashed one
+  return keptFrameRefusal(rootInstanceId);
+}
+
+/** The refusal a Revert of `rootInstanceId` gives when it lies inside a frame its entry's rebuild keeps live
+ *  ({@link keptEnclosingSource}: that frame's prefab trashed, with no one record to expand it from), or null. The rebuild
+ *  would leave the instance as it is, so the Revert would change nothing while reporting that it did (#1880 F7d close-out
+ *  review 1). */
+function keptFrameRefusal(rootInstanceId: number): string | null {
+  const source = keptEnclosingSource(rootInstanceId);
+  return source ? `Revert refused: this instance lies inside an instance of "${source}", whose prefab cannot be read — restore that prefab, or reload the scene, and Revert again` : null;
 }
 
 /** What the layers enclosing instance `rootInstanceId` state about the members a Revert of `-removed.<lid>` brings back
@@ -167,10 +178,10 @@ export interface RevertResult {
   reducedOverrides: Record<number, Record<string, Record<string, unknown>>>;
   reducedStructure: InstanceStructure;
   /** Both sides as the instance's outermost entry states them (#1880 F6d, F6-U — `captureEntrySide`): the Revert, its undo
-   *  and its redo rebuild that entry by loading these, and the four fields above go unread. Absent where the frame keeps
-   *  its own rebuild (the prefab-edit world). */
-  fullSide?: EntrySide;
-  reducedSide?: EntrySide;
+   *  and its redo rebuild that entry by loading these. The four fields above are what the Revert takes out of the frame's
+   *  own statement to get the reduced side; nothing rebuilds from them. */
+  fullSide: EntrySide;
+  reducedSide: EntrySide;
   /** The BASE scene(s) that own the instance — pass as the undo action's `affectedScenes`. A base's
    *  file is written by Save All only when it is dirty, and nothing else marks it: without this a
    *  revert on a base's instance reads saved and is lost on reload (#1431). [] for a primary one. */
@@ -212,9 +223,9 @@ export async function revertOverridesSelective(
   }
   // Nested children must be cached for the synchronous re-instantiation.
   await preloadNestedPrefabs(prefab);
-  // The file walk above misses a USER-ADDED nested instance (not a row of `prefab`),
-  // whose per-copy overrides rebuildInstance captures from the cache (#1284).
-  await preloadNestedPrefabsForSubtree(rootInstanceId);
+  // The file walk above misses a USER-ADDED nested instance (not a row of `prefab`) (#1284), and the rebuild loads the
+  // whole scene entry the instance sits in, every frame of it (#1880 F7a).
+  await preloadRebuildEntry(rootInstanceId);
   // The keys in their localId form against this document (#1468 Phase 4) — see the same step in
   // `applyToPrefabSelective`. A key naming a member the document no longer has reverts nothing.
   selectedKeys = toLocalIdKeys(selectedKeys, prefab, getCachedPrefabSync).keys;
@@ -227,7 +238,7 @@ export async function revertOverridesSelective(
   // Capture the instance's current state against the prefab, then subtract the
   // reverted keys to get the state to re-apply after the rebuild.
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
-  let fullStructure = captureStructureForRespawn(rootInstanceId, prefab); // the rebuild and its undo respawn from it (#1826)
+  let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
   // Reverted, an outer row's removal came back and its added node was DELETED — neither is what the instance shows
   // with no override of its own (#1492's ruling, #1506 close-out review).
   for (const key of layerAuthoredStructureKeys(rootInstanceId, prefab, fullStructure)) {
@@ -289,6 +300,8 @@ export async function revertOverridesSelective(
   // frame's fields are its DELTA over the layers enclosing it (`captureNestedChannels`), so taking a key out of it puts
   // back what those layers state (#1492), and a reverted removal comes back as they state it (#1730) — the load applies
   // them, as a reload does.
+  const kept = keptFrameRefusal(rootInstanceId);
+  if (kept) { console.warn(`[Prefab] ${kept}`); return null; }
   const fullSide = captureEntrySide(rootInstanceId);
   if (fullSide) {
     const piMeta = getTraitByName('PrefabInstance');
@@ -322,7 +335,7 @@ export async function revertOverridesSelective(
       affectedScenes: resolveAffectedScenes([newRootId]),
     };
   }
-  const newRootId = rebuildInstance(rootInstanceId, source, prefab, reducedOverrides, reducedStructure);
-
-  return { newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, affectedScenes: resolveAffectedScenes([newRootId]) };
+  // No scene entry to state it by (`captureEntrySide`: no document to load it from), so nothing to rebuild it as.
+  console.warn(`[Prefab] Revert of an instance of "${source}" not done: no scene entry holding it could be read — reload its scene`);
+  return null;
 }

@@ -3680,7 +3680,7 @@ export function registerEditorAgentOps(): void {
       }
 
       // which === 'revert' — the dialog's own wrapper (`revertOverridesWithUndo`): revert itself pushes NO undo
-      // entry (rebuildInstance is a raw teardown+rebuild), so the wrapper records one, whose undo/redo rebuild
+      // entry (the rebuild is a raw teardown+respawn), so the wrapper records one, whose undo/redo rebuild
       // onto the prefab as it is THEN (#1665).
       // A refusal states its own cause (#1483) — Revert's bare null would be reported below as a lost instance.
       const refusal = await revertRefusal(ctx.rootInstanceId);

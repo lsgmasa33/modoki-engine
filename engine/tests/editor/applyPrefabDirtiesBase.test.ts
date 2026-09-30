@@ -74,7 +74,7 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOrigi
       const pi = getTraitByName('PrefabInstance')!;
       const roots = getAllEntities().filter((e) => (readTraitData(e.id, pi)?.rootInstanceId as number) === e.id && readTraitData(e.id, pi)?.source === KIT).map((e) => e.id);
       for (const id of roots) {
-        rebuildInstance(id, KIT, kitAfter as never, captureInstanceOverrides(id, kitDoc as never), captureInstanceStructure(id, kitDoc as never), kitDoc as never);
+        refreshInstances(KIT, [id], kitDoc as never, kitAfter as never);
       }
       return { applied: true, source: KIT, prefabBefore: kitDoc, prefabAfter: kitAfter, promotedAdditions: 0 };
     },
@@ -86,9 +86,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearHistory, setActionCallback, pushAction, undo, redo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
-import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
-import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';

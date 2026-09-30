@@ -7,12 +7,8 @@
  *  rebase; the template change is the cache swap + rebase every route that moves the cache runs.
  *
  *  Mutations (each goes red here, nothing else does):
- *  - `rebuildInstanceFromCapture`: rebuild onto `capturedFrom` instead of the cached copy → the first two cases.
- *  - drop the carried state's translation into the live frame's document → the renumbered case.
- *  - drop the stale-nested-frame refusal, or throw a plain Error instead of `UndoRefusedError` → the refusal case.
- *  - `rebuildInstanceFromCapture` with `live = capturedFrom` (the shape the design rejects: the Revert's document as
- *    the baseline) → the nested-addition case, which spawns the row's node twice.
- *  - drop `translateNestedMoveKeys` → the nested-move case.
+ *  - `rebuildEntrySide`: load onto the side's `from` instead of the cached copy → the first two cases.
+ *  - put back #1493's stale-nested-frame refusal in `rebuildFrameFromSide` → the stale nested frame case.
  *  - `translateLocalIds` (`memberTranslation.ts`): map a keyed row to 0 when the other document holds its number unkeyed → the pre-v5 case.
  *  - `reattachDetachedInstance`: drop its rebase → both Detach cases; drop the reattach's frame-record put-back →
  *    the reload case, and keep a record of the same source → the Create Prefab Replace case; redo replays the first
@@ -42,8 +38,7 @@ import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/r
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
 import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefabChain';
-import { undo, redo, canRedo, swapHistory, _resetHistoryContexts, getEditVersion, undoDepth, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
-import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -153,7 +148,10 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
     expect(removedOnSave(SHIP)).toEqual([]);
   });
 
-  it('a stale NESTED frame refuses the undo before anything is rebuilt, and the entry is dropped', async () => {
+  // #1880 F7d: the undo loads the Revert-time statement of the whole scene entry, every frame in it against its own record,
+  // onto the current documents — so a nested frame built from rows the cache no longer holds comes back as a reload builds
+  // it, and is not refused (the refusal's reason, the old rebuild's nested capture reading the cache, is gone with it).
+  it('a stale NESTED frame does not refuse the undo: the Revert is put back and the frame is built on its current template', async () => {
     const midV1 = doc(MID, 'Mid', [row(1, G(11), 'MidRoot', 0), row(2, G(12), 'Box', 1)]);
     setPrefabCache(MID, midV1);
     setPrefabCache(SHIP, doc(SHIP, 'Ship', [row(1, G(1), 'Ship', 0), row(2, G(2), 'Flame', 1), row(3, G(4), 'Mid', 1, { prefab: MID })]));
@@ -162,27 +160,22 @@ describe('Revert undo/redo after the template changed (#1665)', () => {
     overrideX(root, 'Flame', 5);
     const flameKey = `${piOf(member(root, 'Flame'))!.localId}.Transform.x`;
     expect(await quietly(() => revertOverridesWithUndo(root, new Set([flameKey])))).not.toBeNull();
+    expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0);
     // MID gains a row and nothing rebuilds the nested frame yet: it is built from rows the cache no longer holds.
     setPrefabCache(MID, doc(MID, 'Mid', [row(1, G(11), 'MidRoot', 0), row(2, G(12), 'Box', 1), row(3, G(13), 'Lid', 1)]));
     expect(framesBuiltFromOtherRows(rootOf(SHIP), { nestedOnly: true })).toEqual([MID]); // precondition
+    const lids = () => getAllEntities().filter((e) => e.name === 'Lid').length;
+    expect(lids()).toBe(0);
 
-    const before = getAllEntities().map((e) => e.id).sort();
-    const edits = getEditVersion();
-    // The Revert's selection of the rebuilt root is an undo entry of its own when the selection changed — whether it did
-    // depended on the id an EARLIER test left selected (the editor store outlives a test). Counted, not assumed away.
-    expect(undoLabel()).toBe('Revert prefab overrides');
-    const depth = undoDepth();
-    const toast = vi.spyOn(useEditorStore.getState(), 'showToast');
     await quietly(() => undo());
-    // A REFUSAL, as Apply's undo refuses (#1664): nothing changed, so nothing is marked edited, and the toast says why.
-    expect(getEditVersion()).toBe(edits);
-    expect(toast).toHaveBeenCalledWith(expect.stringMatching(/refused: a prefab nested in this instance changed/), 'warn');
-    toast.mockRestore();
-    expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0); // not put back over the stale frame
-    expect(getAllEntities().map((e) => e.id).sort()).toEqual(before); // nothing rebuilt
-    expect(undoDepth()).toBe(depth - 1); // the entry was dropped, not moved to the redo stack
-    expect(undoLabel()).not.toBe('Revert prefab overrides');
-    expect(canRedo()).toBe(false);
+    expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(5); // put back
+    expect(lids()).toBe(1); // the nested frame is built from the rows the cache holds now
+    expect(framesBuiltFromOtherRows(rootOf(SHIP), { nestedOnly: true })).toEqual([]);
+    expect(removedOnSave(SHIP)).toEqual([]);
+    expect(canRedo()).toBe(true);
+    await quietly(() => redo());
+    expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0);
+    expect(lids()).toBe(1);
   });
 });
 

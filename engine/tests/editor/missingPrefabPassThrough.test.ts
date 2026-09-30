@@ -41,7 +41,7 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { withKeptStateBake, bakingKeptStateForTest } from '../../packages/modoki/src/editor/scene/prefabTokens';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { rebuildInstance, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
@@ -994,14 +994,21 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
   });
 
   it('a rebuild onto a document with no root leaves the live instance standing', async () => {
-    // Mutation: drop the `expandsToRoot` guard in `rebuildInstance` — the teardown destroys R and A, and nothing is
-    // spawned in their place.
+    // Mutation: drop the `expandsToRoot` check in `rebuildTargetsByEntry` — the refresh counts an instance it did not
+    // rebuild (and dropping `rebuildFromEntry`'s own guard as well tears R and A down with nothing spawned in their place).
     install(pDoc());
     await load(scene(P));
     const root = rootOf(INST);
-    expect(rebuildInstance(root, P, { ...pDoc(), rootLocalId: 9 } as never, {}, {})).toBe(root);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(refreshInstances(P, [root], pDoc() as never, { ...pDoc(), rootLocalId: 9 } as never)).toBe(0);
     expect(getAllEntities().find((e) => e.guid === INST)?.id).toBe(root);
     expect(x(inside(INST, 'A'))).toBe(0);
+    // Said once, with its reason — not a second time as "no scene entry could be loaded" (#1880 F7d close-out review 6).
+    // Mutation: the no-root skip does not add to `said` — the false warning comes back.
+    const said = warn.mock.calls.map((c) => String(c[0]));
+    expect(said.some((w) => w.includes('expands to no root'))).toBe(true);
+    expect(said.some((w) => w.includes('not refreshing'))).toBe(false);
+    warn.mockRestore();
   });
 
   it('a template ROW whose child loads but expands to no root keeps the frame\'s scene edits, as a missing child does (close-out F1)', async () => {

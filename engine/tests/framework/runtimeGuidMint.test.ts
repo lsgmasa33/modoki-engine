@@ -20,8 +20,9 @@ import {
   spawnEntity, destroyEntity, findEntityByGuid, getCurrentWorld, spawnPrefabInstance, Time, Input, getAllEntities,
 } from '@modoki/engine/runtime';
 import {
-  instantiatePrefabAsync, instantiatePrefab, setPrefabSource, serializeScene, captureInstanceStructure, rebuildInstance, type PrefabFile,
+  instantiatePrefabAsync, instantiatePrefab, setPrefabSource, serializeScene, captureInstanceStructure, type PrefabFile,
 } from '@modoki/engine/editor';
+import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
   isRuntimeGuid, parseRuntimeGuid, deriveGuid, isGuid, durableGuid,
@@ -326,13 +327,13 @@ describe('copies and string refs under a real mint (#1210)', () => {
     await expect(serializeScene()).rejects.toThrow(/runtime guid/);
   });
 
-  it('rebuildInstance does not copy the old root\'s runtime guid onto the new root', () => {
+  it('a rebuild does not copy the old root\'s runtime guid onto the new root', () => {
     tw = createTestWorld({});
     const rootId = instantiatePrefab(kit() as never);
     const oldGuid = guidOf([...tw.world.entities].find((e) => e.id() === rootId)!);
     expect(isRuntimeGuid(oldGuid)).toBe(true);
-    const newRootId = rebuildInstance(rootId, KIT, kit() as never, {}, {});
-    const newRoot = [...tw.world.entities].find((e) => e.id() === newRootId)!;
+    expect(refreshInstances(KIT, [rootId], kit() as never, kit() as never)).toBe(1);
+    const newRoot = [...tw.world.entities].find((e) => e.has(PrefabInstance) && e.get(PrefabInstance)!.rootInstanceId === e.id())!;
     expect(guidOf(newRoot)).not.toBe(oldGuid);
     expect(findEntityByGuid(guidOf(newRoot))).toBe(newRoot);
   });

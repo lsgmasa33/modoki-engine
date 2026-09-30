@@ -59,6 +59,10 @@ function deleteEntitiesImpl(ids: number[]) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  // #1880 F7c: a Revert names its scene entry's root by durable guid, minting one (`ensureGuid`) where the root has none,
+  // and finds it again by it after the rebuild. This mock is an explicit list, so each reachable export is named here.
+  indexEntityGuid: () => {},
+  findEntityByGuid: (guid: string) => [...index.values()].find((e: any) => e.has?.(EntityAttributes) && e.get(EntityAttributes).guid === guid),
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
@@ -178,8 +182,8 @@ describe('revertOverridesSelective', () => {
   // What this proves is the Revert's RESULT: the full and the reduced payloads each rebuild their own state. It does not
   // drive the undo entry (`revertOverridesWithUndo`), which this file's world mock cannot resolve a ref in — that wiring
   // is `engine/tests/editor/revertUndoCurrentPrefab.test.ts`'s (swapping the entry's undo and redo turns it red, and left
-  // this case green: #1877). Mutation for this case: `revertOverridesSelective` returns `fullOverrides` as the reduced
-  // payload (`prefabRevert.ts`).
+  // this case green: #1877). Mutation for this case: `revertOverridesSelective` returns `fullSide` as the reduced side
+  // (`prefabRevert.ts`).
   it('the Revert\'s result carries both states: a rebuild from the full payload restores the edit, from the reduced one reverts it', async () => {
     const { m, root } = await setup();
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
@@ -189,39 +193,36 @@ describe('revertOverridesSelective', () => {
 
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
     expect(result).not.toBeNull();
-    const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result!;
+    const { fullSide, reducedSide } = result!;
     expect(memberData(result!.newRootId, 2, 'EngineFlame')!.idleScale).toBe(0.1); // reverted
 
-    // The full (pre-revert) payload: idleScale back to 0.5.
-    let cur = m.rebuildInstance(result!.newRootId, source, prefab, fullOverrides, fullStructure);
+    // The full (pre-revert) side: idleScale back to 0.5.
+    let cur = m.rebuildFrameFromSide(result!.newRootId, fullSide)!;
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.5);
 
-    // The reduced payload: idleScale reverted again.
-    cur = m.rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
+    // The reduced side: idleScale reverted again.
+    cur = m.rebuildFrameFromSide(cur, reducedSide)!;
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.1);
     expect(currentRoot()).toBe(cur); // single live instance, no leaks
   });
 
-  it('rebuildInstance teardown sweeps live non-member descendants, not a frozen id set (F5)', async () => {
+  it('a rebuild\'s teardown sweeps live non-member descendants, not a frozen id set (F5)', async () => {
     const { m, root } = await setup();
     const countAntennas = () => getAllEntitiesImpl().filter((e: any) => e.name === 'Antenna').length;
 
-    // A live plain "Antenna" child hangs under the root member but is NOT listed in
-    // the structure we rebuild with, and the structure's consumedEcsIds is empty —
-    // exactly the stale-snapshot situation F5 describes (the frozen set captured at
-    // a PRIOR cycle no longer names the currently-live added entity). A clean
-    // rebuild that doesn't mention the Antenna must tear it down rather than leave it
-    // dangling under a destroyed root. The old code keyed teardown off the frozen
-    // consumedEcsIds (empty here) + members, so it leaked the Antenna; the fix walks
-    // the live subtree and removes every non-member descendant.
+    // A live plain "Antenna" child hangs under the root member, spawned after anything was captured — the stale-snapshot
+    // situation F5 describes. The old code keyed its teardown off a frozen id set, so it leaked the Antenna beside the
+    // respawn. Since #1880 F7d a rebuild is the load of the entry, whose statement names the Antenna (a scene-added
+    // node): the teardown walks the live subtree, and the load respawns it — once.
     const antenna = testWorld.spawn(EntityAttributes({ name: 'Antenna', parentId: root, guid: 'antenna-guid' }), Transform({ x: 1, y: 0, z: 0 }));
     index.set(antenna.id(), antenna);
     expect(countAntennas()).toBe(1);
 
-    const emptyStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set<number>() };
-    const newRoot = m.rebuildInstance(root, SRC, shipPrefab as any, {}, emptyStructure);
+    expect(m.refreshInstances(SRC, [root], shipPrefab as any, shipPrefab as any)).toBe(1);
+    const newRoot = currentRoot();
 
-    expect(countAntennas()).toBe(0);   // live descendant swept, not leaked
+    expect(newRoot).not.toBe(0);
+    expect(countAntennas()).toBe(1);   // live descendant swept and respawned once, not leaked beside it
     expect(currentRoot()).toBe(newRoot); // single clean instance, no orphans
   });
 

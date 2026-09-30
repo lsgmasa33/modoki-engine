@@ -126,7 +126,7 @@ function templateWithout(name: string): PrefabFile {
 beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphans(); });
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
-describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a changed template', () => {
+describe('gesture: REFRESH (refreshInstances) — the instance re-expands from a changed template', () => {
   it('keeps every member`s identity across the rebuild instead of re-deriving it', async () => {
     // The gesture #1468 exists for (#1468 design record, the root cause): an artist changes the prefab, the designer refreshes,
     // and the members must not be re-identified. A rebuild destroys them and expands fresh ones,
@@ -137,7 +137,7 @@ describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a 
     // Refresh identity-preserving for any v5 template, which is strictly more than the rows alone
     // buy. It also means there is no way to switch it off from the scene input: the control here is
     // the WRONG ANSWER, and the mechanism is pinned by mutation.
-    const { scene } = await placedInstance();
+    const { template, scene } = await placedInstance();
     await load(scene as unknown as SceneData);
     const badgeGuid = guidOf('Badge');
     const labelGuid = guidOf('Label');
@@ -146,8 +146,8 @@ describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a 
     // The template loses its first child, so Badge inherits Panel's localId — and a rebuild that
     // re-derived would hand Badge the guid PANEL used to answer to.
     const second = templateWithout('Panel');
-    const { rebuildInstance } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
-    rebuildInstance(idOf('Root'), PREFAB, second, {}, {});
+    const { refreshInstances } = await import('../../packages/modoki/src/editor/scene/prefabRebuild');
+    refreshInstances(PREFAB, [idOf('Root')], template, second);
 
     expect(guidOf('Badge')).toBe(badgeGuid);
     expect(guidOf('Badge')).not.toBe(panelsGuid);   // …and specifically not the repointed one
@@ -167,8 +167,8 @@ describe('gesture: REFRESH (rebuildInstance) — the instance re-expands from a 
     const badgeGuid = guidOf('Badge');
     const badgeNode = rowOf(template, 'Badge').nodeGuid!;
     const second = templateWithout('Panel');
-    const { rebuildInstance } = await Promise.all([import('../../packages/modoki/src/editor/scene/prefabLink'), import('../../packages/modoki/src/editor/scene/prefabRebuild'), import('../../packages/modoki/src/editor/scene/prefabSerialize')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
-    rebuildInstance(idOf('Root'), PREFAB, second, {}, {});
+    const { refreshInstances } = await import('../../packages/modoki/src/editor/scene/prefabRebuild');
+    refreshInstances(PREFAB, [idOf('Root')], template, second);
 
     const resaved = await serializeScene() as unknown as { entities: unknown[] };
     expect(instanceEntry(resaved).members![`/${badgeNode}`]?.guid).toBe(badgeGuid);

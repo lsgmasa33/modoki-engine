@@ -361,7 +361,7 @@ relies on.
 > **Since #1880 F6 a refresh LOADS its outermost scene entry** — [prefabs.md § A rebuild is the LOAD of its outermost
 > scene entry](prefabs.md#a-rebuild-is-the-load-of-its-outermost-scene-entry-1880-f6). What this document says of
 > `rebuildInstance` and its re-apply (`captureNestedInstanceOverrides`, the carried `nestedMoves`) describes the old
-> per-frame route, which is now only the fallback for an entry that cannot be loaded, and goes in #1880 F7.
+> per-frame route, deleted in #1880 F7d: it is kept here as the record of why each rule exists, not as current code.
 
 `refreshInstances` already does *capture(old) → destroy → re-instantiate(new) →
 re-apply*. Extend the captured blob to include `{ added, removed }` and have the
@@ -908,12 +908,11 @@ handed every edit to whichever member inherited the number, with nothing to say 
   a pre-v5 template's members (every prefab the released editor wrote), and a member with no durable
   guid. A nested frame's STRUCTURE moves all-or-nothing: the legacy slot is a replace statement, and
   half of it on rows would be one statement in two places.
-- **Rows are written in the scene FILE form** (`StructureCaptureOpts.rows`, set by `serializeScene`) — **and in
-  whatever a rebuild RESPAWNS** (#1826): a Revert, an undo's side, a refresh and a nested frame's re-apply (all three of
-  its channels, a node row's `own` included) take their reference nodes as rows (`captureStructureForRespawn` /
-  `inRespawnForm`, `prefabRebuild.ts`, through the save's own `writerFormOf`), scene-added and template-added alike, so
-  the respawn is the load of what the save writes. The split and why it must stay two forms:
-  [prefabs.md](./prefabs.md) § "A capture that is RESPAWNED takes its reference nodes as rows". Every capture that is READ keeps the
+- **Rows are written in the scene FILE form** (`StructureCaptureOpts.rows`, set by `serializeScene`) — **and so is
+  whatever a rebuild RESPAWNS** (#1826): since #1880 F6 a rebuild is the load of the entry the save's writer states, so
+  the respawn is the load of what the save writes by construction (the old route's hand-made respawn form,
+  `captureStructureForRespawn` / `inRespawnForm`, went with it in F7d). The split and why it must stay two forms:
+  [prefabs.md](./prefabs.md) § "What a rebuild respawns is what the save writes". Every capture that is READ keeps the
   localId channels. The legacy channels fold wrongly against a template MEMBER ROW (a v6 row's `members` stating a
   value) in the loader's one expansion: a `nestedStructure` slot OWNS its frame, so the fold skips the inner layers'
   rows, member values included (a pasted O copy's M lost O's `y = 8` live and got it back on reload — seed 6068); and

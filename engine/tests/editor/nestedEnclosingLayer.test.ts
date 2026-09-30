@@ -1212,8 +1212,9 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     });
 
     it('#1780: a Refresh whose template GAINS that frame gives it the scene\'s value, and the save keeps it', async () => {
-      // Mutations: skip the kept channels in `rebuildInstance`'s expansion — L comes in at Q's bare 0, and the save drops
-      // it; skip `settleKeptLegacy` — the save states L twice, on its member row AND in the legacy channel.
+      // Mutations (the entry route, #1880 F7d; each measured red): the entry capture states no kept channel (drop
+      // `withKeptLegacy` in `captureInstanceEntry`) — L comes in at Q's bare 0; the load's settle keeps every kept channel
+      // (`keepUnreachedLegacy` stores them all, not the unreached) — the save states L twice.
       install(qDoc(), pDoc(), oWith({}));
       await load(legacyScene());
       install(pWithC());
@@ -1241,9 +1242,9 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     });
 
     it('#1780 close-out F2: a legacy nestedStructure removal into a frame the Refresh gains applies there too, as a load does', async () => {
-      // Mutations: forward no kept `nestedStructure` in `rebuildInstance` — L is live after the Refresh, where a load of
-      // the same scene removes it; settle no `nestedStructure` in `settleKeptLegacy` — the save states the removal twice
-      // over, the kept slot on top of what the capture now writes.
+      // Mutations (the entry route, #1880 F7d; each measured red): the entry capture states no kept channel (drop
+      // `withKeptLegacy` in `captureInstanceEntry`) — L is live after the Refresh, where a load of the same scene removes
+      // it; the load's settle keeps every kept channel (`keepUnreachedLegacy`) — the save states the removal twice over.
       const legacyRemoval = () => {
         const sc = scene(O, [ROOT1]);
         Object.assign((sc.entities as unknown as Array<Record<string, unknown>>)[1]!, { nestedStructure: { '4.3': { removed: [2] } } });

@@ -32,11 +32,9 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
   setPrefabCache, setPrefabSource, getCachedPrefabSync,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
-import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
 import { framesBuiltFromOtherRows } from '../../packages/modoki/src/editor/scene/prefabFrames';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { rebuildInstance, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { collectInstanceOverrideKeys, canonicalOverrideKey } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -284,9 +282,9 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
 });
 
 describe('a REBUILD across two versions of the template translates what it carries by identity (#1468 Phase 4)', () => {
-  // `rebuildInstance` accepts a `baseline` — the document the live tree was expanded from — other than
-  // the one it rebuilds from. What it carries was captured in the baseline's numbering. (No caller
-  // renumbers across it today: Apply is additive. This pins the function's own contract.)
+  // A refresh rebuilds from a document other than the one the live tree was expanded from (its record, else the
+  // refresh's `oldPrefab`). What it carries was captured in that document's numbering. (No caller renumbers across it
+  // today: Apply is additive. This pins the rebuild's own contract.)
   it('every channel lands on the member it was captured from, not on the one holding its old number', async () => {
     install(template());
     await load(scene(P));
@@ -298,7 +296,7 @@ describe('a REBUILD across two versions of the template translates what it carri
     const root = one('R').id;
     const next = renumbered() as unknown as PrefabFile;
     install(next as never);
-    rebuildInstance(root, P, next, captureInstanceOverrides(root, old), captureInstanceStructure(root, old), old);
+    refreshInstances(P, [root], old, next);
     expect(tf('A')?.x).toBe(5);
     expect(tf('B')?.x).toBe(0);
     expect(has('B', 'Renderable3DPrimitive')).toBe(false);
@@ -317,7 +315,7 @@ describe('a REBUILD across two versions of the template translates what it carri
     // C gone; A and B keep their identities, B now holding C's old number.
     const next = { id: P, version: 5, name: 'P', rootLocalId: 1, entities: [row(1, 'R', 0, gR), row(2, 'A', 1, gA), row(4, 'B', 1, gB)] } as unknown as PrefabFile;
     install(next as never);
-    rebuildInstance(root, P, next, captureInstanceOverrides(root, old), captureInstanceStructure(root, old), old);
+    refreshInstances(P, [root], old, next);
     expect(count('C')).toBe(0);
     expect(tf('B')?.x).toBe(0);
   });
@@ -333,7 +331,7 @@ describe('a REBUILD across two versions of the template translates what it carri
       row(1, 'OR', 0, gOR), row(3, 'Slot', 1, gSlot), row(2, 'N', 3, gN, { prefab: P }),
     ] } as unknown as PrefabFile;
     install(next as never);
-    rebuildInstance(root, O, next, captureInstanceOverrides(root, old), captureInstanceStructure(root, old), old);
+    refreshInstances(O, [root], old, next);
     expect(tf('A')?.x).toBe(5);
   });
 });
@@ -660,31 +658,60 @@ describe('a live frame built from another version of its template (#1483)', () =
     expect(framesBuiltFromOtherRows(orId())).toEqual([]);       // and the frame is current now
   });
 
-  it('an Apply fan-out SKIPS an instance whose stale frame is NESTED — its capture would read the wrong rows', async () => {
-    // Root1 = an O instance built before P renumbered (its nested P frame is stale); Root2 = an O instance
-    // made after. An Apply of O from Root2 refreshes every O instance; Root1's nested capture reads the
-    // cached P, so rebuilding it would move A's edit onto B. It is left alone, and stays refused.
+  // #1880 F7d: an Apply fan-out rebuilds an instance whose NESTED frame is stale, as a reload does. The old per-frame
+  // rebuild could not (its nested capture read the cached P, and would have moved A's edit onto B), so it refused it and
+  // left it stale (#1493). The entry route states the nested frame against its own record and expands it from the
+  // cache. (The refusal put back in `refreshInstances` leaves this case green: the Apply's commit rebases stale frames
+  // after its fan-out, #1877 — the next case drives the refresh alone.)
+  it('an Apply fan-out rebuilds an instance whose stale frame is NESTED — the nested edit stays on its member', async () => {
+    // Root1 = an O instance built before P renumbered (its nested P frame is stale); Root2 = an O instance made after.
+    // An Apply of O from Root2 refreshes every O instance.
     install(template(), outer());
     await load(scene(O));
-    const r1 = one('OR').id;
+    const r1Guid = one('OR').guid!;
+    const idOfGuid = (g: string) => getAllEntities().find((e) => e.guid === g)!.id;
     const nestedA = () => getAllEntities().filter((e) => e.name === 'A');
     writeTraitFieldWithUndo(nestedA()[0]!.id, meta('Transform'), 'x', 5);
     install(renumbered());
     const r2 = instantiatePrefab(getCachedPrefabSync(O)!, one('Holder').id);
     setPrefabSource(r2, { id: O });
     expect(framesBuiltFromOtherRows(r2)).toEqual([]);
+    expect(framesBuiltFromOtherRows(idOfGuid(r1Guid))).toEqual([P]); // precondition: Root1's nested P frame is stale
     const slot2 = getAllEntities().find((e) => e.name === 'Slot' && e.parentId === r2)!.id;
     writeTraitFieldWithUndo(slot2, meta('Transform'), 'x', 3);
     const result = await applyToPrefabSelective(r2, new Set([`${gSlot}.Transform.x`]));
     expect(result.applied).toBe(true);
+    const r1 = idOfGuid(r1Guid);
     const inR1 = (name: string) => {
       const all = getAllEntities();
       const inside = (id: number): boolean => { const e = all.find((x) => x.id === id); return !!e && (e.parentId === r1 || inside(e.parentId)); };
       return readTraitData(all.find((e) => e.name === name && inside(e.id))!.id, meta('Transform')) as { x: number };
     };
-    expect([inR1('A').x, inR1('B').x]).toEqual([5, 0]);        // not rebuilt against the wrong rows
-    expect(inR1('Slot').x).toBe(0);                             // …so not refreshed at all: that is the cost
-    expect(framesBuiltFromOtherRows(r1)).toEqual([P]);         // and it is still refused
+    expect([inR1('A').x, inR1('B').x]).toEqual([5, 0]);        // the nested edit on its own member, not moved onto B
+    expect(inR1('Slot').x).toBe(3);                             // refreshed
+    expect(framesBuiltFromOtherRows(r1)).toEqual([]);          // and current
+  });
+
+  // …and the refresh on its own. Mutation: put #1493's refusal back in `refreshInstances` (skip a target holding a stale
+  // nested frame) — nothing is refreshed, and Root1's P frame stays stale.
+  it('a refresh of an instance whose stale frame is NESTED rebuilds it, and counts it', async () => {
+    install(template(), outer());
+    await load(scene(O));
+    const r1Guid = one('OR').guid!;
+    const idOfGuid = (g: string) => getAllEntities().find((e) => e.guid === g)!.id;
+    writeTraitFieldWithUndo(getAllEntities().filter((e) => e.name === 'A')[0]!.id, meta('Transform'), 'x', 5);
+    install(renumbered());
+    expect(framesBuiltFromOtherRows(idOfGuid(r1Guid))).toEqual([P]); // precondition
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      expect(refreshInstances(O, [idOfGuid(r1Guid)], getCachedPrefabSync(O)!, getCachedPrefabSync(O)!)).toBe(1);
+    } finally { log.mockRestore(); }
+    const r1 = idOfGuid(r1Guid);
+    expect(framesBuiltFromOtherRows(r1)).toEqual([]);
+    const all = getAllEntities();
+    const inside = (id: number): boolean => { const e = all.find((x) => x.id === id); return !!e && (e.parentId === r1 || inside(e.parentId)); };
+    const xIn = (name: string) => (readTraitData(all.find((e) => e.name === name && inside(e.id))!.id, meta('Transform')) as { x: number }).x;
+    expect([xIn('A'), xIn('B')]).toEqual([5, 0]);
   });
 });
 
@@ -732,7 +759,7 @@ describe('a P instance dropped inside another P instance, through an Apply fan-o
     const gE = 'eeeeeeee-0000-4000-8000-000000000b0f';
     createEntityWithUndo('Create', inner, [{ name: 'EntityAttributes', data: { name: 'E', parentId: inner, guid: gE, sourceScene: BASE } }], () => {});
     const before = prefabs.get(P) as PrefabFile;
-    const side = captureSide(idOfGuid(ROOT2), ROOT2, P, before);
+    const side = captureSide(idOfGuid(ROOT2), ROOT2, P);
     const result = await applyToPrefabSelective(idOfGuid(ROOT2), new Set([`+added.${gE}`]));
     expect(getAllEntities().filter((e) => e.name === 'E')).toHaveLength(2);   // the premise: both expanded it
     stampAll();

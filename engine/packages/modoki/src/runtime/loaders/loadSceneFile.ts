@@ -1360,18 +1360,13 @@ export function keptLegacyChannels(rootGuid: string): { nestedOverrides?: Nested
   return keptLegacyOf(rootGuid) as { nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths } | undefined;
 }
 
-/** Replace them — a rebuild's settle, once the frames it made live took their channels. */
-export function setKeptLegacyChannels(rootGuid: string, channels: { nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths }): void {
-  setKeptLegacy(rootGuid, channels as KeptLegacy);
-}
-
 /** One user-added REFERENCE node's stored member rows: its root's guid, the rows, the prefab it expands — and the node,
  *  whose legacy channels the load keeps the same way (#1780). */
 export type ReferenceNodeRows = [rootGuid: string, members: Record<string, SceneMemberRow>, source: string, node?: AddedEntity];
 
 /** Every user-added REFERENCE node in an `added[]` tree, with its stored member rows (`{}` when it stores none) — the ONE spelling of
- *  "where can a reference node's rows be", read by the loader to pin them and by `rebuildInstance` to
- *  carry them across a respawn (#1482). A reference node is its own row-writing root (`memberRowsIn`
+ *  "where can a reference node's rows be", read by the loader to pin them, and so by the editor's rebuild —
+ *  the load of the entry (`rebuildFromEntry`, #1880 F7d) — across a respawn (#1482). A reference node is its own row-writing root (`memberRowsIn`
  *  stops at it), so a walk of the instance around it never reaches these rows; each has to be pinned
  *  from its own node, found by the guid the node stores.
  *
@@ -1887,7 +1882,7 @@ function settleDerivedGuids(world: World): void {
 /** What follows a PIN of stored member guids, in the one order it can run (#1761, #1777): derive every member still
  *  without a guid, drop a pin that collides with a derivation ({@link dropCollidingPins}, which re-derives the member),
  *  and only then settle tokens and moves against the final guids. The load pins the scene's rows (`applyStoredMemberRows`)
- *  and a rebuild the rows it carried across its teardown (`restoreInstanceMembers`); both call this, so the order has one
+ *  and the editor's rebuild, which is the load of one entry (`settleEntryRows`, #1880 F7d), the rows its entry states; both call this, so the order has one
  *  spelling. A rebuild used to derive and settle with no guard at all: a restored pin equal to a guid the NEW template's
  *  derivation hands another member left two entities on one guid, unreported, and a template's `@member` token could
  *  resolve to the wrong one (#1777). `pinned` is the set of entities the caller pinned; only those can be dropped. */

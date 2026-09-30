@@ -53,7 +53,7 @@ answer the same question for themselves. Each place in that column is a place th
 | # | Rule | Owner | Bypassed by |
 |---|---|---|---|
 | I1 | A frame's effective base is its template folded with every enclosing layer, from the outside in, the same way at every depth. A layer can carry every edit an instance can. | Runtime: the walk in `instantiatePrefabIntoWorld`, built from the shared folds. **Editor, comparison side: `frameBase` / `chainLayer` (`editor/scene/prefabBase.ts`, #1693)** — one fold (`foldPath`) with the same folds, in the editor expansion's order: a row's fields under the outer layer's forwarded ones, then every layer's member rows over both. **The step itself is shared since #1707** (`foldRowStep` / `foldPath`, `runtime/loaders/prefabOverrides.ts`): the validator and the UIEntries pool (`effectivePrefab*Traits`) compose each nested row with it too. It climbs by `ownerOf` and through a template reference node (#1506), and reads every level's document from its frame record (I3). | **One expansion since #1783:** the editor's `instantiatePrefab` calls `instantiatePrefabIntoWorld` with its own cache (`expand.read`, which holds a parked document, #1868) and, from a rebuild, the forward state (`expand.layers`, folded at nested rows only), and a reference node has one spawner (`spawnReferenceNode`). Until then the editor carried its own copy of the walk, and #1707 found it dropping both of a frame's moves at the nested-row apply: a slot's `moved` (a pre-v5 member moved inside a scene-added reference node went back to its row on every rebuild), and the member rows, so a member moved out from under a member the same frame removes was deleted with it. `engine/tests/editor/expansionTwinParity.test.ts` pinned the two against each other through the unification, and still compares the editor's callers of the walk with the load: the reference-node path through `applyStructureByRootInstance`, and the rebuild's forward state. **One step, one carrier, one lookup since #1880 lane F (2026-09-30):** the spawner's nested rows call `foldRowStep` too (F2; its inline twin is gone, and T3's oracle holds both readers); a layer's own `values`/`valuePaths` are the only carrier of legacy nested values (F1; the merged `nestedOverrides` handed down beside the layers is gone); "the nodes inside a node" is one channel set, `nodeChannels`/`mapNodeChannels` (F3b); and "the row at localId N" is `rowAt` (`runtime/core/prefabRowAt.ts`), the LAST row as the spawner keeps it, with a repeated template key naming neither node (F3c; `tests/architecture/rowLookupCensus.test.ts` refuses a raw lookup). `effectivePrefab*Traits` still model neither a structural `removed` of the member nor an `added` node. The pose base of an applied nested move (`docChainLayer`), and `referenceRootPose`, fold one level. |
-| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) and the rebuild (`captureNestedInstanceOverrides`), whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector pass the save's own mark gate (#1717): `gateOnMarks` (a diff with no mark is not an override; an added trait and a moved member's Transform are kept whatever the marks say) and `foldMarkedEqual` (a marked value equal to its base is one). The fold-in skips a field an enclosing row STATES, per field as the save's subtraction does, because the layer's value arrives marked too and would otherwise be listed as the nested instance's own; so a user's deliberate equal edit of a field the row states is not listed (the depth ≥ 2 case #1722 recorded). The moved-member question behind the Transform exemption is asked only for a Transform diff with no mark (`instanceMovedMembers` is lazy), since the Inspector recomputes on every dirty frame. |
+| I2 | Every "is this the instance's own edit?" question compares the live frame with its effective base. That covers the override list, the Inspector highlight, the save, the rebuild's capture, Apply's keys and write, and Revert. Every own edit found has one key, and the listing, Apply and Revert all handle it. | `frameBase`'s layer: through `instanceBase` / `enclosingRowOverrides` (fields) and `ownInstanceStructure` / `layerAuthoredStructureKeys` (structure) for the override list, the Inspector, Apply's structure refusal, and Revert; through `chainSlots` for Apply's targets and U13 (#1693); through `chainLayer` for the save (`captureNestedChannels`) — and so for the rebuild, which loads what the save states (#1880 F6) — whose removed-components pass also measures a member against the traits the layer adds (`layerAddedTraits`, #1676). | `instanceBase` folds the layer's fields but not its `removedTraits` or `added`. A layer's values arrive override-marked, so every bare-child diff has to subtract them by value. The listing and the Inspector pass the save's own mark gate (#1717): `gateOnMarks` (a diff with no mark is not an override; an added trait and a moved member's Transform are kept whatever the marks say) and `foldMarkedEqual` (a marked value equal to its base is one). The fold-in skips a field an enclosing row STATES, per field as the save's subtraction does, because the layer's value arrives marked too and would otherwise be listed as the nested instance's own; so a user's deliberate equal edit of a field the row states is not listed (the depth ≥ 2 case #1722 recorded). The moved-member question behind the Transform exemption is asked only for a Transform diff with no mark (`instanceMovedMembers` is lazy), since the Inspector recomputes on every dirty frame. |
 | I3 | A frame is compared against the document it was EXPANDED from. No capture runs on a frame whose recorded rows differ from the cached ones. | The frame record, read through `levelDoc` (`prefabBase.ts`) by every level of `frameBase` / `chainLayer`, the scene save's top-level capture (`savedFrameDoc`, #1685) and its nested captures, the rebuild's readers (`expandedDocOf`) and the settle's save capture (#1693 retired the scoped `expandedFrom` map and the settle's cache swap onto it). The record also lists the nested rows its expansion could NOT expand and no layer removed (`unexpanded`, #1812): the save's removal pass (`nestedRowPresent`) and Create Prefab's refusal (`unexpandedNestedRows`) ask it whether a row was expanded, never the cache. Runtime only; it answers for a capture document holding the SAME ROWS as the record's (`rowsMeanTheSame`, not object identity: the runtime and editor caches hold separate copies of one file after any editor write), and a record no expansion wrote answers nothing, so they fall back to the cache. `framesBuiltFromOtherRows` refuses a frame whose record holds other rows, and `rebaseStaleInstances` repairs it. `rebuildInstanceFromCapture` puts a capture taken against an older document back onto the current one (Revert's undo, #1665). | The two staleness tests differ: `rowsMeanTheSame` for the refusal, `sameDocument` for the rebase. A frame with no record falls back to the current cache (`setFrameDocFallback`), and the refusal cannot judge it; every expansion path writes one (`instantiatePrefab`, Create Prefab's tag, a reattach, the loader, a carry across a world swap, an undo respawn). |
 
 #### Identity
@@ -80,7 +80,7 @@ answer the same question for themselves. Each place in that column is a place th
 |---|---|---|
 | I12 | A runtime-generated (`Transient`) subtree is never authoring input. | `collectTransientSubtreeIds` / `filterAuthoringVisible` (`editor/scene/authoringScope.ts`); `authoringEntitiesFor` for Create Prefab. See § "Authoring scope — a runtime instance is not authoring input". |
 | I13 | Only an authored world (stopped, with nothing posed) is captured or written. | `whyWorldNotAuthored` (`editor/scene/authoredWorld.ts`). |
-| I14 | An entity is saved into exactly one scene file, the one its `sourceScene` names, and a rebuild keeps that. | `serializeScene`'s scene filter, `planReparent`, and both rebuild routes (`rebuildFromEntry`, `rebuildInstance`), which carry the stamp. |
+| I14 | An entity is saved into exactly one scene file, the one its `sourceScene` names, and a rebuild keeps that. | `serializeScene`'s scene filter, `planReparent`, and the rebuild (`rebuildFromEntry`), which carries the stamp. |
 | I15 | A template's `version` is the writer's constant, and a build never overwrites a file written in a newer format. | `PREFAB_FORMAT_VERSION`, `engine/plugins/prefabWriteGuard.ts`, `classifyExistingDocumentId`, which reads a prefab before answering `known` even when the manifest indexes it (#1678, `docs/format-versioning.md`). |
 | I16 | A template never contains itself. | The prefab-edit refusal at every gesture (`prefabEditRefusal.ts`, § Prefab edit mode); `wouldCreateCycle` / `expandedPrefabRefs` (member rows included) over the WHOLE document, when writing: in `serializePrefab`, and again at `commitPrefabWrites`, the one door every editor prefab write passes (Apply's plan included), reading the batch's own documents first, then the editor cache, then the document the live world last EXPANDED each prefab from (`prefabNestingReader`, #1866): a prefab trashed mid-session is in no cache (#1805, #1834), and read as nesting nothing, an Apply promoting a live instance of trashed P into Q (which P nests) wrote Q → P → Q, which surfaced as "P nests itself" once P was restored (hunt seed 6031; with the manifest pruned the plan's own check had caught it only through a stale guid key, the window I9 records as closed); the expansion's ancestor stack, carried through reference nodes, when loading (#1817). A file that already contains itself loads with its self-referencing node refused and named (`[loadSceneFile] cycle: prefab "…" contains itself …`), not a stack overflow (the loader's and the editor's callers both tested). The write check refuses to save such a document, so its repair is deleting the self-reference in prefab edit and saving. |
 | I17 | An editor write that changes an instance member's field leaves its override mark in the state the save needs, and its undo puts the mark back. | `editor/undo/overrideMarkWrites.ts`. See § "Editor writes and the override mark". |
@@ -188,7 +188,7 @@ In the Revert route, the undo that meets the placeholder is the SECOND one: the 
 | #1409 | S8: an undo replayed onto a world it does not describe, after a discard | OWNER (the history drop rule) |
 | #1579 | I11 / S9: a world swap inside a running step | OWNER (`beginWorldSwitch`) |
 | #1664 (and #1710 for asset documents) | The FILE side of this question: an undo replayed over a file changed since | OWNER: refused with `UndoRefusedError`, the precedent R follows |
-| #1665 | I3: Revert's undo rebuilt from the document the Revert read | OWNER: the undo is carried onto the CURRENT document (`rebuildInstanceFromCapture`), and it refuses only a stale nested frame. So one entity-side refusal already exists. |
+| #1665 | I3: Revert's undo rebuilt from the document the Revert read | OWNER: the undo is carried onto the CURRENT document (`rebuildInstanceFromCapture`, `rebuildFrameFromSide` since #1880 F7d), and it refused only a stale nested frame — a refusal F7d removed, since the side states that frame as built. |
 | #1353 | I20 at load: a reference, by raw id or by guid, resolved to the pass-1 placeholder instead of the instance root | LOCAL (pass 2 detaches and re-points each placeholder's references, `loadSceneFile.ts`, `SceneManager.ts`) |
 | #1272 | I19: Create Prefab's undo after Play→Stop missed a nested link whose member guids the reload re-derived | LOCAL |
 | #1575 | S8: an Apply undo reloaded under the wrong key, in an untitled scene | LOCAL |
@@ -499,7 +499,7 @@ whether #1801 shares the mechanism.
   document and writes `getGuidForPath(path) ?? path`: a RAW PATH whenever the lookup misses, for any reason. Its four
   callers all hold the document: `instantiatePrefabInstance` (the Hierarchy drop, the Assets and Inspector Instantiate
   buttons, their redos, the agent `instantiate`), `instantiatePrefab`'s nested rows, a template reference node's spawn, and
-  `rebuildInstance` (Revert, Refresh, and the Apply and Revert undo rebuilds). **Missing owner.**
+  `rebuildInstance` (Revert, Refresh, and the Apply and Revert undo rebuilds; `rebuildFromEntry` since #1880 F7d). **Missing owner.**
 - **M2 — the renderer's manifest follows a move before the renderer's own repair runs.** The owner is the route. The real
   `/api/move-file` and `/api/delete-asset` rebuild the manifest INLINE (`rebuildManifestInline` → the host's
   `rebuildManifest`, which pushes it: Vite's ws `asset-manifest-updated`, Electron's `modoki:bridge-manifest-updated`),
@@ -1407,7 +1407,7 @@ no value-import cycle runs through any of them):
 | `prefabFrames.ts` | Frame state: `rebuildTeardown`, `framesBuiltFromOtherRows`/`staleFrames`, the missing/stale/unexpanded refusals |
 | `prefabInstantiate.ts` | Editor instantiate: `instantiatePrefab`, `instantiatePrefabInstance`, `instantiatePrefabAsync`, `applyStructureByRootInstance` |
 | `prefabChain.ts` | An instance's own layer against its enclosing chain: `instanceBase`, `enclosingRowOverrides`, `ownInstanceStructure`, `memberOverrideKeys`, `nestedFrameMoves` |
-| `prefabRebuild.ts` | Rebuild, refresh and rebase: `rebuildFromEntry` (a rebuild is the load of the outermost scene entry, #1880 F6), `refreshInstances`, `rebaseStaleInstances`, and the old per-frame `rebuildInstance` kept as the fallback until #1880 F7 |
+| `prefabRebuild.ts` | Rebuild, refresh and rebase: `rebuildFromEntry` (a rebuild is the load of the outermost scene entry, #1880 F6; the old per-frame `rebuildInstance` was deleted in F7), `refreshInstances`, `rebaseStaleInstances`, `rebuildFrameFromSide` |
 | `prefabSerialize.ts` | `serializePrefab`, row planning and numbering, `mergeRiggedPrefab`, `serializeRebuildOver` |
 | `prefabApplyStructure.ts` | Apply's structural writes: `insertAddedSubtree`, promotion, the promoted-guid carry |
 | `prefabApply.ts` | Apply's orchestrators: `previewApply`, `applyToPrefabSelective`, `planApply`, `commitApplyPlan` |
@@ -1997,36 +1997,29 @@ prefabs), `untitledApplyUndo.test.ts` and `prefabEditApplyUndo.test.ts` (the wor
 `applyPrefabDirtiesBase.test.ts`, `prefabPark.test.ts` (the park across a world swap, the flush, Overwrite/Cancel), and
 `engine/packages/modoki/tests/editor/applyToPrefabUndo.test.ts` (no scene save).
 
-### A capture that is RESPAWNED takes its reference nodes as rows; a capture that is READ keeps them legacy (#1826)
+### What a rebuild respawns is what the save writes; a capture that is READ keeps reference nodes legacy (#1826)
 
 A live capture of an instance's structure has two kinds of consumer, and they need a reference node (an `added` node
-carrying `prefab`, scene-added or template-added) in two different forms. **Do not fold this back into one form:** each
-half is load-bearing, and each has a test that goes red without it.
+carrying `prefab`, scene-added or template-added) in two different forms.
 
-- **Respawned** (a rebuild re-spawns the node from the capture): Revert, Apply's undo side, `refreshInstances`, and the
-  nested-frame re-apply, in all three of its channels (the whole lists, the diff's `own`, and a node row's `own`, the
-  scene's nodes under a template node it matched). These go through `captureStructureForRespawn` / `inRespawnForm`
-  (`prefabRebuild.ts`), which map the nodes onto the same frame captured with `{ rows: true }` through the SAVE's own map
-  (`writerFormOf`, keeping their placement), so the save and the respawn cannot state a node two ways. A channel missed is
-  the bug again: the node row's `own` was, until the close-out re-review and the side-effect hunt (seed 6068 in full)
-  found it. The respawn runs the loader's
-  one spawner, and the LEGACY channels fold wrongly there against a template member row: a `nestedStructure` slot owns
-  its frame and drops the inner layers' member values, and a `nestedOverrides` value loses to them. The result was a
-  template value lost live until a reload, or a scene edit lost outright (live and saved). The invariant is **what is
-  respawned equals what is saved**. Mechanism and measurements:
+- **Respawned** (a rebuild re-spawns the node): since #1880 F6 a rebuild is the LOAD of its scene entry as the save's own
+  writer states it (next section), so it respawns the rows form by construction. Before that, the old per-frame rebuild
+  respawned from a capture of its own, which had to be mapped onto the save's rows form by hand
+  (`captureStructureForRespawn` / `inRespawnForm`, through `writerFormOf` keeping each node's placement); a channel the
+  map missed was the bug (#1826: the LEGACY channels fold wrongly in the loader's one spawner against a template member
+  row, so a template value was lost live until a reload, or a scene edit lost outright). Both were deleted with that
+  route (#1880 F7d). The invariant stands: **what is respawned equals what is saved**. Mechanism and measurements:
   [prefab-structural-overrides.md](./prefab-structural-overrides.md) § the member-row bullet "Rows are written in the scene
   FILE form".
 - **Read** (compared, listed, promoted): the comparisons against the chain's nodes (`diffFrameAdded`,
   `subtractChainStructure`, the save's nested-frame diff), the override listing, and Apply's promotion into a template
-  (`insertAddedSubtree`, `toTemplateNodes`). These take `captureInstanceStructure` itself, in the legacy form. In rows form,
-  a template reference node compared as edited and was restated on every save. And the promotion, which reads the localId
-  channels, dropped the members' edits of the node it promoted: the first #1826 fix did that by capturing rows at the
-  source (its close-out review's F1).
+  (`insertAddedSubtree`, `toTemplateNodes`). These take `captureInstanceStructure` itself, in the legacy form. **Do not
+  move them to rows:** in rows form a template reference node compared as edited and was restated on every save, and the
+  promotion, which reads the localId channels, dropped the members' edits of the node it promoted (the first #1826 fix
+  did that by capturing rows at the source — its close-out review's F1).
 
-Tests: `engine/tests/editor/prefabPastedReferenceRebuild.test.ts`, which also asserts each node is respawned WHERE it sat.
-With no swap at the respawn, the rebuild cases go red; with none on a node row's `own`, its two cases; with the placement
-dropped, the two nested-frame cases; with the swap moved to the source, the promotion case and the template-added node
-case.
+Tests: `engine/tests/editor/prefabPastedReferenceRebuild.test.ts` (each node is respawned once, WHERE it sat, with its
+values; with the capture moved to rows at the source, the promotion case and the template-added node case go red).
 
 ### A rebuild is the LOAD of its outermost scene entry (#1880 F6)
 
@@ -2046,15 +2039,46 @@ root's durable guid, `Transient`, the `sourceScene` stamp, and each torn-down no
 - **Every reference node is stated against its own RECORD** (`againstRecords`), not the cache: a stale nested frame is
   then stated as it was built, and the load expands it from the cache, as a reload of an older save does (I4). Its
   localId channels are translated into the cache's numbering (`translateCarried`).
-- **An entry is rebuilt this way only when every prefab its load reads is cached** (`readableEntryOf`); the rebase
-  preloads the entry's tree first.
+- **Every caller warms the entry before its synchronous rebuild** (`preloadRebuildEntry`, #1880 F7a): the load reads
+  every prefab in the entry, not only the frame's. An entry whose own prefab is gone (a trash, #1862) loads from its
+  record (`entryDocOf`). A frame INSIDE the entry whose prefab is gone is expanded from its own record too
+  (`withFrameRecords`, #1880 F7d), as a reload with the prefab restored expands it — kept whole instead, a stale frame
+  inside it was never re-expanded yet was counted (hunt seed 1042). Only where that changes nothing else the load
+  expands: the records come from the entry's own live subtree and must agree on one document, and a prefab the entry
+  holds as an UNEXPANDED row (ruling R, #1849) or a placeholder is not answered — a no-op rebuild must leave those as
+  they are — nor one with a NEW row: a row of it that no live frame of it expands and that its owner's frame was not
+  built with (a refreshed document's added row, which a reload leaves unexpanded, ruling D, #1790), matched by nodeGuid
+  (by number only for a pre-v5 row, since a renumber can put a new row on an old number). A row the instance removed is
+  one its frame was built with, so it blocks nothing. Otherwise the frame is KEPT by the teardown (`unexpandable`, asking
+  the same reader) — including an owned frame moved OUT of the entry (#1437), kept where it hangs, or parked and put back
+  by its parent's guid when it hangs under something the teardown takes — and a target inside a kept frame is not
+  counted: the rebuild says so ("left as they were"). A gesture that must rebuild such a frame to change it — a Revert,
+  an Apply, a Revert's or Apply's undo — is REFUSED before anything moves (`keptEnclosingSource`, which asks the frame
+  itself too: its own prefab can be trashed between a gesture and its undo): the rebuild would
+  leave it as it was while the gesture reported success. An entry with no document at all, or one whose document
+  expands to no root, is not rebuilt, and the caller says so, once, and does not count it.
+- **A Revert of a nested frame finds that frame again by a durable guid** (`captureEntrySide` mints the frame's as well
+  as the entry root's): on a runtime-guid instance (#1210) the rebuilt frame derived a new guid, and the Revert answered
+  the entry's root and its undo was refused (#1880 F7d close-out review).
+- **A refresh expands every frame of its prefab in the entry from the document it was handed** (the load's reader
+  answers `source` with `newPrefab`, #1880 F7d), so a nested frame is built from it even where the cache holds another
+  copy.
+- **A frame built from other rows than the cache's (#1493) is rebuilt, not refused** (#1880 F7d, close-out F2): its
+  record states it as built, and the load expands it from the cache, as a reload does. The old per-frame rebuild refused
+  it because its nested capture read the cache; that reason went with it. Refused while a sibling target in its entry was
+  accepted, it had been rebuilt by the sibling's load anyway, under a false "not refreshing" warning and count.
 - **Revert, its undo, and an Apply's undo sides keep the entry itself** (`EntrySide`: the entry root's guid, its source,
-  the document it was captured against, the entry), because ids do not survive the rebuilds in between.
+  the document it was captured against, the entry), because ids do not survive the rebuilds in between. An entry root
+  with no durable guid (never saved, or on a runtime guid, #1210) is given one when the side is captured, as `ensureGuid`
+  gives any entity an undo step names (#1880 F7c). The undo and redo load the side through `rebuildFrameFromSide`. A
+  Revert whose frame has no entry to state it by is refused, with a warning.
 - **In the prefab editor an entry is a ROW** of the edited prefab (F6f). It is rebuilt the same way; the rows the load
   keeps for it (R2) go back into the template through the edit save's row writer, which states a node by its key, so
   every member-row set in the entry is keyed while its nodes are live (`keyEntryRows` → `keySceneNodes`, gated by
-  `keepsTemplateRows`). A payload's refs stay live guids: a token would name a row added this session by a localId only
-  the next save assigns.
+  `keepsTemplateRows`), and every other node carries its live key marker (#1880 F7d): a node the rebuild brings back
+  that was not in its teardown — one a Revert took out, put back by its undo — had no marker to carry over, and the next
+  template save minted it a new key. A payload's refs stay live guids: a token would name a row added this session by a
+  localId only the next save assigns.
 - **What it changes, accepted by the hub:** more is re-expanded per rebuild. Measured on Court's daily-month (42 cell
   frames, machine under load, relative only): one cell's refresh 20–40 → 130–154 ms, all 42 cells 654–786 → 410–419 ms.
   No interactive path (a field edit, a gizmo drag, a scrub, Play) reaches a rebuild; a focus-gain release of outside
@@ -2062,15 +2086,22 @@ root's durable guid, `Transient`, the `sourceScene` stamp, and each torn-down no
   reach). The rebuild ends the undo coalescing chain (its respawn takes back the raw ids the chain is keyed by). koota
   handed a torn-down entry its ids back in allocation order in every case tried (four perturbations), so the ids of the
   entry's other entities did not drift there.
-- **What still takes the old per-frame `rebuildInstance`** (to be deleted in #1880 F7, § 3 of the design): an entry
-  whose load reads an uncached prefab (Apply preloads each instance's subtree, not its entry's), a refresh whose new
-  document is not the cache's by identity (`cachedIsNew`; in practice an equal or migrated copy), and a Revert or Apply
-  undo side whose entry root has no durable guid.
+- **The old per-frame `rebuildInstance` is gone** (#1880 F7, § 3 of the design), with its nested capture and re-apply,
+  its respawn form and `rebuildInstanceFromCapture`. The three classes that still reached it after F6 were closed first,
+  each measured to zero on the editor suite: an entry whose load read an uncached prefab (F7a, the preload and the record
+  fallback), a refresh whose new document was the cache's in content but not by identity (F7b; F7d's reader then
+  replaced the comparison), and a side whose entry root had no durable guid (F7c).
+- **Pre-v5 documents** (rows without `nodeGuid`): the save states a nested row's own `added` / `removed` /
+  `removedTraits` as the scene's, so a reload keeps the old template's there, and since F7d so does a refresh (it IS a
+  reload). Measured on `rebuildNestedReapply`'s fixtures at `version: 3` (four refresh cases red; all green on v6 rows).
+  Every source prefab with a nested row in the repo's corpus is v5+; only stale build copies are older.
 
 Tests: `prefabWholeListRebuild` (#1891's seed 1233, the class the unit closed), `nestedEnclosingLayer`'s three-level
 U14 case, `nestedRowFieldSave` (the kept `removed: false`, in a scene and in the prefab editor),
-`templateReferenceNodeRows` (the edit world's keys), and the fuzz's T2/T4 checks (rebuild ≡ reload, a no-op rebuild is
-the identity).
+`templateReferenceNodeRows` (the edit world's keys, and a Revert's undo through the real undo), `rebuildNestedReapply`
+(the old re-apply's cases, now driven through the refresh), `sceneMemberRowWriter` (a stale nested frame refreshed, not
+refused), `revertUndoCurrentPrefab` (the same for a Revert's undo), and the fuzz's T2/T4 checks (rebuild ≡ reload, a
+no-op rebuild is the identity).
 
 ### A capture reads the document the frame was EXPANDED from (#1483)
 
@@ -2185,14 +2216,13 @@ member's row: false overrides, and Apply wrote one member's value into another's
   only NEW rows are numbered in the new order. A committed file reorders once, on its next save.
 - **Every refresh captures a root against ITS document.** `refreshInstances` (Apply's fan-out, its
   undo/redo, the rebase) uses each root's own record as the capture baseline, and falls back to the
-  caller's `oldPrefab` only when there is no record. `rebuildInstance` translates from that baseline by
+  caller's `oldPrefab` only when there is no record; the load translates from that baseline by
   `nodeGuid` (`translateLocalIds`, `memberTranslation.ts`). Before the close-out review, an Apply on one instance rebuilt a
   stale nested frame in ANOTHER against the cached rows and moved its edits onto other members, for
-  good. A root whose stale frame is only NESTED is skipped, with a warning. The fan-out runs **deepest
-  first**: an instance the author dropped inside another instance of the same source is captured by
-  the outer rebuild through `captureNestedRef`, which reads the CACHED document. Outer first, it read
-  the not-yet-refreshed inner against the new rows, so a node the Apply had just promoted was saved as
-  removed. That predates #1483; the second close-out review found it.
+  good. (The per-frame rebuild then skipped a root whose stale frame was only NESTED, and ran the fan-out **deepest
+  first**, since its outer capture read an inner instance of the same source against the CACHED document. Since #1880
+  F6/F7d every frame in an entry is stated against its own record by one load, so neither the skip nor the order is
+  needed, and both are gone.)
 - **Apply's undo/redo rebuilds the applied base instance FIRST** (`rederiveBaseInstances`,
   `applyPrefabUndo.ts`), then re-derives the other base instances, then re-selects by guid. The
   applied instance can sit inside another base instance, whose refresh captures it through
@@ -2238,7 +2268,8 @@ member's row: false overrides, and Apply wrote one member's value into another's
   links naming the pre-detach document. When the template changed in between (a prefab-edit save, an
   Apply from another instance), both undid that change on this one instance, and the next save wrote a
   member the template had gained as REMOVED by it. Revert (`revertOverridesWithUndo`, the one wrapper
-  the dialog and the agent op share) rebuilds through `rebuildInstanceFromCapture`, and Detach's undo
+  the dialog and the agent op share) rebuilds through `rebuildFrameFromSide` (the entry as it stood, loaded onto the
+  current documents, #1880 F6d/F7d), and Detach's undo
   rebases after the reattach (`reattachDetachedInstance`). In production the template changes between
   a Detach and its undo only across a world reload, which leaves the tree plain with no frame record, so
   the detach snapshot carries each frame root's record and the reattach puts it back; without it the
@@ -2247,15 +2278,10 @@ member's row: false overrides, and Apply wrote one member's value into another's
   prefab's newer record over them, so the instance read as stale (re-review). Create Prefab puts back only the
   records of frames its tag RELINKED (#1830): a nested frame's current record stands. Detach's redo keeps
   the snapshot of the detach it just made (`detachPrefabInstanceWithUndo`): the undo's rebase can bring
-  members in, and replaying the FIRST snapshot on the next undo left one of them plain. ⚠️ Not `rebuildInstance(…, cache, …, baseline = the Revert's document)`: `baseline` is two
-  things there — the numbering of what is carried, and the document the LIVE tree was expanded from,
-  whose chain the nested capture subtracts (not mark-gated for structure). At undo time they differ, so
-  `rebuildInstanceFromCapture` translates the carried state into the frame's recorded document and
-  passes THAT as the baseline, which is the rule `refreshInstances` follows. It only picks the
-  document; the effective base is still computed in one place (`captureNestedInstanceOverrides` →
-  `chainLayer`). A stale NESTED frame refuses the step before anything
-  is rebuilt, with `UndoRefusedError` as Apply's undo refuses (#1664): `runStep` drops it (#310), marks
-  nothing edited, and toasts the reason.
+  members in, and replaying the FIRST snapshot on the next undo left one of them plain. (The per-frame route this
+  replaced translated the carried state into the frame's recorded document, and refused a step whose NESTED frame was
+  stale with `UndoRefusedError`. The entry states every frame as it stood, keyed by identity, so there is nothing to
+  translate by hand and nothing to refuse; the step is refused only when the entry's root is gone.)
 - **Apply and Revert refuse whatever is left** (`framesBuiltFromOtherRows`): any frame of the
   instance, nested ones included, whose recorded document does not hold the same rows as the cache:
   the same localIds, each naming the same `nodeGuid` where both carry one (`rowsMeanTheSame`). Both
@@ -2267,6 +2293,10 @@ member's row: false overrides, and Apply wrote one member's value into another's
   false removal, and the fixture now resets its cache. Only row identity is compared, not content: a
   template whose values changed is still captured on the right rows (the mark gate), and refusing on
   content would block Apply over any byte difference between two copies of one file.
+
+> **Superseded by #1880 F6/F7d.** A rebuild is now the load of the outermost scene entry, which states every frame in it
+> against its own record, so a stale nested frame is rebuilt WITH its entry and is no longer refused. The next two
+> sections record the per-frame design that replaced, and why it was shaped so.
 
 **A stale NESTED frame is rebuilt by ITSELF (#1493), never through its outer instance.** The nested
 captures (a rebuild's `captureNestedInstanceOverrides`, a save's `captureNestedChannels`) read each nested
@@ -2334,7 +2364,9 @@ Tests: `applyBaseTwoFileUndo.test.ts` (#1741); `nestedEnclosingLayer.test.ts` §
 kept rows the seeds broke, a Refresh from another version of the prefab, a forwarded member token, and a stored root's
 unchanged save.
 
-**A rebuild carries what its teardown reaches OUTSIDE its live subtree (#1499).** The teardown
+**A rebuild carries what its teardown reaches OUTSIDE its live subtree (#1499).** (The teardown, `rebuildTeardown`, is
+still the rebuild's own and runs in `rebuildFromEntry`; the nested capture and the rebase's order below went with the
+per-frame route, #1880 F7d.) The teardown
 (`rebuildTeardown`) reaches by identity, so it also destroys things outside the rebuilt root's live
 subtree: whatever the frame owns that was moved elsewhere in the instance (#1437), a member of a
 user-added reference node moved out of that node, and every frame under those. Before #1499 the capture
@@ -2440,7 +2472,7 @@ its folder, because those are what the Hierarchy can change. The name is the liv
 | An added reference node (on the entry, a member row, a plain node's children, another reference node) | `spawnUnresolvedReference`, under the node's parent. The one reference-node spawner (`spawnReferenceNode`, which the loader's and the editor's structure applies both run) calls it, so a rebuild (Apply, Revert, Refresh) respawns it — except over a node whose frame is still LIVE (its prefab went mid-session): the rebuild keeps that frame and skips the node's respawn (#1862, `withoutKeptNodes`), so its members survive and no placeholder stands beside it; a Revert of the node's own add removes it. The loader keeps no orphan rows for it: its record holds them, and kept ones outlived its re-expansion and overwrote a later edit. | `captureChild` writes the node (`asAddedNode`). |
 | A template's reference row inside a resolved instance | None: the frame is the template's. | The scene's edits to that frame ride member rows. `rowBackedTest` counts a row naming a reference row whose child cannot be read as unbacked, so the orphan store keeps it (the nested root's own row included, which it used to drop) and the save writes it back. Whether the ROW itself is saved as removed is asked of the frame record (`unexpanded`, #1812), not the cache: a frame built while the child was unreadable lists the row, so a cache holding the child later (restored or re-warmed mid-session, or left stale by an Assets delete, #1805) does not turn a row the frame never had into the scene's removal of it. A layer that removes the row takes it off the list (`noteRowsRemoved`, in `applyStructureCore`), so a scene's removal is stated again. |
 | A reference row in PREFAB EDIT | The row is a top-level entry of the edit world, so it takes the first path. | `serializePrefabEditWorld` writes the row from the baseline, because the edit world's entry went through `editWorldRefs`. |
-| A document that LOADS but expands to no root (#1768): its `rootLocalId` names no row, or a reference row whose prefab cannot be read, or one that nests itself | Where it is a scene entry or an added node: the same placeholder as a document that does not load. One predicate (`expandsToRoot`, `runtime/loaders/prefabRoot.ts`) gates the entry site before `onDeletePlaceholder`, the reference-node spawner (`spawnReferenceNode`), the expansion (which spawns NOTHING rather than a root-less scatter of rows) and `rebuildInstance` (the live instance stays). A template ROW whose child expands to no root has no placeholder, as a missing child has none: both expansions list the row on the frame record as unexpanded, as they do a missing child (`nestedRowPresent` reads that; the document tests read that child as unreadable for a frame with no such record, `rowBackedTest`'s reader and `templateNodeGuids`' unread set, `legacyPathReached`), so its row is not saved as removed, and the scene's edits to its frame are kept (close-out F1). | As the row it replaces; a template row's frame, as the row "A template's reference row inside a resolved instance" above. |
+| A document that LOADS but expands to no root (#1768): its `rootLocalId` names no row, or a reference row whose prefab cannot be read, or one that nests itself | Where it is a scene entry or an added node: the same placeholder as a document that does not load. One predicate (`expandsToRoot`, `runtime/loaders/prefabRoot.ts`) gates the entry site before `onDeletePlaceholder`, the reference-node spawner (`spawnReferenceNode`), the expansion (which spawns NOTHING rather than a root-less scatter of rows) and the rebuild (`rebuildTargetsByEntry`, `rebuildFromEntry`: the live instance stays, and a refresh does not count it). A template ROW whose child expands to no root has no placeholder, as a missing child has none: both expansions list the row on the frame record as unexpanded, as they do a missing child (`nestedRowPresent` reads that; the document tests read that child as unreadable for a frame with no such record, `rowBackedTest`'s reader and `templateNodeGuids`' unread set, `legacyPathReached`), so its row is not saved as removed, and the scene's edits to its frame are kept (close-out F1). | As the row it replaces; a template row's frame, as the row "A template's reference row inside a resolved instance" above. |
 | A LIVE frame whose document stops resolving mid-session (both caches evicted, no reload; #1738) | None: the frame is live. | The writers capture it against its frame record, the document it was expanded from (`captureDoc`, and `serializeScene`'s `levelDoc` fallback); the cache comes first, so a capture that works today writes the bytes it wrote. |
 | The same frame NESTED, when an in-place rebuild (Apply's fan-out, Revert, their undos, a rebase) re-expands the frame that owns it (#1862) | None: the frame is KEPT, a template row's (an owned root) and a scene-added reference node's (a stored root under one of ours) alike. The teardown parks every such root whose own prefab the respawn cannot expand (asked of the cache the respawn reads, so a merely cold key is kept too), and `seatKeptFrames` puts it back under its parent member by guid and takes its row off the owner's `unexpanded` list. A kept frame whose row the new document no longer leaves unexpanded (dropped, removed by a layer, or expanded after all) goes, as the teardown would have taken it. | As the row above: from its frame record. The save is byte-for-byte the one the same Apply writes with the prefab present (`missingNestedFrameKeep.test.ts`). A RELOAD while the prefab is still missing gives an unexpanded row (ruling D), not the entities; the prefab's return re-expands it in place (#1864). |
 
@@ -3026,8 +3058,9 @@ the file.**
     (it warns). `instantiatePrefabAsync` exists so UI entry points cannot get this wrong.
   - **serialize + capture** — `planPrefabRows` **flattens** a held nested instance into
     copies, `captureNestedRef` drops a user-added nested subtree from `added[]`, and
-    `captureNestedInstanceOverrides` / `reapplyNestedInstanceOverrides` lose a nested
-    instance's per-copy overrides across a rebuild *with no warning at all*.
+    the rebuild's load reads every prefab in the entry, and one it does not find is one it cannot expand (the frame is
+    kept as is) — so every rebuild caller warms the entry first (`preloadRebuildEntry`, #1880 F7a). Before, the old
+    rebuild's nested capture lost a nested instance's per-copy overrides here *with no warning at all*.
 
   ⚠️ **There are two warmers, and they answer different questions.**
   `preloadNestedPrefabs(prefabFile)` walks a prefab FILE's reference rows;
@@ -3210,8 +3243,8 @@ the file.**
 Two limits this list used to carry are gone. Structural edits inside an OWNED nested instance
 round-trip: as per-member rows (#1468, #1511), with `nestedStructure` (#1358) as the fallback for a frame
 whose members cannot be keyed. A per-copy override on a nested child survives an
-outer Apply's refresh, because the rebuild captures each nested instance and re-applies it
-(`captureNestedInstanceOverrides`).
+outer Apply's refresh, because a rebuild is the load of the scene entry, whose statement carries every nested frame's
+edits (#1880 F6).
 
 
 ## Authoring scope — a runtime instance is not authoring input
@@ -3236,7 +3269,7 @@ which is exactly why two hand-rolled copies were not enough. What each one did:
 - **`collectInstanceRoots`** handed a pooled/scrub instance to `refreshInstances` -> `rebuildInstance`,
   which carried the durable guid and `source` forward but **not the tag**. The rebuilt root was an
   ordinary serializable entity, so the next save wrote a preview artifact into the authored scene —
-  defeating the guarantee `spawnPrefabInstance` sets `Transient` for. `rebuildInstance` now carries
+  defeating the guarantee `spawnPrefabInstance` sets `Transient` for. The rebuild (`rebuildFromEntry` since #1880 F7d) now carries
   it over the respawn as well, on the same reasoning that already carries the guid: transience
   belongs to the identity, not to the id.
 - **`serializePrefab`** wrote them into the new `.prefab.json` as ordinary authored members. It now

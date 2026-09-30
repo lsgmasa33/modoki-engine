@@ -21,9 +21,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearHistory, setActionCallback, pushAction, undo, redo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
-import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
-import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
 import { isSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -96,7 +94,7 @@ const stampAll = (guid: string) => { for (const e of getAllEntities()) writeTrai
 /** What `refreshInstances` does per instance: capture against the old prefab, then rebuild. */
 function refresh(): void {
   const id = rootId();
-  rebuildInstance(id, KIT, kitDoc as never, captureInstanceOverrides(id, kitDoc as never), captureInstanceStructure(id, kitDoc as never), kitDoc as never);
+  refreshInstances(KIT, [id], kitDoc as never, kitDoc as never);
 }
 
 beforeEach(async () => {

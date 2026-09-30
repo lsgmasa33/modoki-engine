@@ -31,12 +31,9 @@ import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { serializeScene, isSceneLoadSwapping } from '../scene/serialize';
 import { withAdoption, adoptionsSettled, captureAdoption } from '../scene/sceneAdoption';
 import { guidForEntityId, entityIdForGuid, resolveInstanceContext, type PrefabFile } from '../scene/prefab';
-import { getPrefabSource, preloadNestedPrefabsForSubtree } from '../scene/prefabCache';
-import { captureInstanceOverrides } from '../scene/prefabInstanceOverrides';
-import { captureInstanceStructure } from '../scene/prefabCapture';
+import { getPrefabSource } from '../scene/prefabCache';
 import {
-  rebuildInstanceFromCapture, refreshBaseInstances, rebaseStaleInstances, captureNestedFrames, captureStructureForRespawn,
-  type NestedInstanceCapture, captureEntrySide, type EntrySide,
+  rebuildFrameFromSide, refreshBaseInstances, rebaseStaleInstances, captureEntrySide, type EntrySide, preloadRebuildEntry,
 } from '../scene/prefabRebuild';
 import { applyToPrefabSelective, type ApplyResult } from '../scene/prefabApply';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
@@ -150,27 +147,17 @@ export interface BaseInstanceSide {
   /** The frame's OWN prefab — not necessarily one the Apply wrote (#1724: "override in Prefab 'O'" writes only the
    *  enclosing one). */
   source: string;
-  prefab: PrefabFile;
-  overrides: ReturnType<typeof captureInstanceOverrides>;
-  structure: ReturnType<typeof captureInstanceStructure>;
-  /** Every frame NESTED in it, as it stood on this side (#1741). Captured here, not at the rebuild: the rebuild's own
-   *  capture reads the live frames, which by then show the other side — a U14 Apply from the outer root moved the frame's
-   *  own edit into a prefab (`took`), so its undo read nothing of it and re-derived the frame from the restored row. */
-  nested: NestedInstanceCapture[];
-  /** The side as its outermost entry states it (`captureEntrySide`, #1880 F6d, F6-U): the undo rebuilds that entry by
-   *  loading this, and the fields above go unread. */
-  entry?: EntrySide;
+  /** The side as its outermost scene entry states it (`captureEntrySide`, #1880 F6d, F6-U): every frame in it, the
+   *  nested ones included, as it stood on this side (#1741) — captured here, not at the rebuild, whose live frames by
+   *  then show the other side. The undo rebuilds that entry by loading this onto the current documents. */
+  entry: EntrySide;
 }
 
-export function captureSide(rootInstanceId: number, rootGuid: string, source: string, prefab: PrefabFile): BaseInstanceSide {
+/** The side instance `rootInstanceId` (durable guid `rootGuid`, of `source`) stands on now; null when it has no scene
+ *  entry to state it by (`captureEntrySide`). */
+export function captureSide(rootInstanceId: number, rootGuid: string, source: string): BaseInstanceSide | null {
   const entry = captureEntrySide(rootInstanceId);
-  return {
-    rootGuid, source, prefab,
-    overrides: captureInstanceOverrides(rootInstanceId, prefab),
-    structure: captureStructureForRespawn(rootInstanceId, prefab), // respawned by the undo's rebuild (#1826)
-    nested: captureNestedFrames(rootInstanceId, source, prefab),
-    ...(entry ? { entry } : {}),
-  };
+  return entry ? { rootGuid, source, entry } : null;
 }
 
 /** After `restoreSnapshot`: rebuild the carried base instance to `side`. Its root guid survives
@@ -179,18 +166,16 @@ async function restoreBaseInstance(side: BaseInstanceSide | null, direction: 'Un
   if (!side) return;
   const id = side.rootGuid ? entityIdForGuid(side.rootGuid) : 0;
   if (!id) return;
-  await preloadNestedPrefabsForSubtree(id);
+  await preloadRebuildEntry(id); // the rebuild loads the instance's whole scene entry (#1880 F7a)
   // Onto the CURRENT copy of its prefab, not the one captured (close-out review of #1724): when the Apply wrote only an
   // enclosing prefab, nothing restored the frame's own, and it may have changed since (a prefab-edit save, another
-  // scene's Apply, a pull). Rebuilt from the captured copy, a member it gained since vanished from this instance, and
-  // the frame read as stale, so Apply and Revert refused it. `null`: a frame nested in it is stale — the refresh's refusal.
-  if (rebuildInstanceFromCapture(id, side.source, side.prefab, side.overrides, side.structure, side.nested, side.entry) === null) {
-    // Reported, not thrown: the files and the world have already followed the step (#308). Reachable only with a frame
-    // the restore's rebase left stale, i.e. a damaged tree — but then the instance keeps the other side's edits, and a
-    // dirty base would save them.
+  // scene's Apply, a pull). `null`: the entry's root is gone.
+  if (rebuildFrameFromSide(id, side.entry) === null) {
+    // Reported, not thrown: the files and the world have already followed the step (#308). The instance keeps the other
+    // side's edits, and a dirty base would save them.
     reportUndoFailure({
       direction, label: 'Apply to Prefab',
-      detail: `the applied instance ${side.rootGuid} holds a nested frame built from other rows, so it was not rebuilt to this side of the Apply. Its own edits may be missing; check it before saving its scene.`,
+      detail: `the applied instance ${side.rootGuid} was not rebuilt to this side of the Apply: the scene entry holding it is gone, or it lies inside an instance of a prefab that cannot be read (trashed). Its own edits may be missing; check it before saving its scene.`,
     });
   }
 }
@@ -326,9 +311,9 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   // does: a cold cache drops a user-added nested instance from the capture (#1284).
   const ctx = affectedScenes.length ? resolveInstanceContext(rootInstanceId) : null;
   const rootGuid = ctx ? ensureGuid(rootInstanceId) : '';
-  if (ctx) await preloadNestedPrefabsForSubtree(rootInstanceId);
+  if (ctx) await preloadRebuildEntry(rootInstanceId); // `captureSide` states its whole scene entry (#1880 F7a)
   const prefabNow = ctx ? await getPrefabSource(ctx.source) : null;
-  const baseBefore = ctx && prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, ctx.source, prefabNow) : null;
+  const baseBefore = ctx && prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, ctx.source) : null;
   // The last await before the plan reads the instance by that id: a reload the wait above let land, or one landing in
   // `sceneBefore`'s serialize (it fetches a cold prefab) or the preloads, renumbered the world (#1750 H1, both windows).
   if (!adopted()) return { ...NOT_APPLIED, refused: 'the scene reloaded — open Apply again.' };
@@ -342,13 +327,11 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   const sceneAfter = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
   // Every file the Apply wrote, innermost first; the primary's only when the plural list is absent.
   const writes = result.writes ?? [{ source: result.source, before: result.prefabBefore, after: result.prefabAfter }];
-  // The base instance's sides are measured against the frame's OWN prefab — the one it is rebuilt as — on each side of
-  // the Apply: that file's two sides when the Apply wrote it, else the unchanged document on both. An Apply that wrote
-  // only ENCLOSING prefabs (#1693: "override in Prefab 'O'") still needs them (#1724): it moved the instance's own value
-  // into the enclosing row, and a re-derive from the row it restores cannot bring that value back.
-  const own = ctx ? writes.find((w) => w.source === ctx.source) : undefined;
+  // The base instance's side after the Apply, stated as its scene entry states it — every frame against its own record.
+  // An Apply that wrote only ENCLOSING prefabs (#1693: "override in Prefab 'O'") still needs it (#1724): it moved the
+  // instance's own value into the enclosing row, and a re-derive from the row it restores cannot bring that value back.
   const liveAfter = baseBefore && rootGuid ? entityIdForGuid(rootGuid) : 0;
-  const baseAfter = liveAfter && ctx && prefabNow ? captureSide(liveAfter, rootGuid, ctx.source, own?.after ?? prefabNow) : null;
+  const baseAfter = liveAfter && ctx ? captureSide(liveAfter, rootGuid, ctx.source) : null;
   pushAction(makeApplyPrefabAction({
     source: result.source,
     prefabBefore: result.prefabBefore,
@@ -357,7 +340,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     sceneAfter,
     selGuid,
     affectedScenes,
-    baseBefore: baseBefore && liveAfter ? { ...baseBefore, prefab: own?.before ?? baseBefore.prefab } : null,
+    baseBefore: liveAfter ? baseBefore : null,
     baseAfter,
     // Every file but the one `result.source` names (writes are innermost first, and a U14 Apply's frame file is not).
     others: writes.filter((w) => w.source !== result.source),

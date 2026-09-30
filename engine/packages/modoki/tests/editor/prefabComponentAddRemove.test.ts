@@ -63,6 +63,10 @@ function deleteEntitiesImpl(ids: number[]) {
 }
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
+  // #1880 F7c: a Revert names its scene entry's root by durable guid, minting one (`ensureGuid`) where the root has none,
+  // and finds it again by it after the rebuild. This mock is an explicit list, so each reachable export is named here.
+  indexEntityGuid: () => {},
+  findEntityByGuid: (guid: string) => [...index.values()].find((e: any) => e.has?.(EntityAttributes) && e.get(EntityAttributes).guid === guid),
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),

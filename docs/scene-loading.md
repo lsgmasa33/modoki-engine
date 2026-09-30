@@ -1208,7 +1208,7 @@ Two consumers:
 ⚠️ **Anything that RESPAWNS a base entity must carry the stamp, because a fresh spawn reads `''`,
 which means primary.** Losing it is silent data loss, not a cosmetic slip: the next Save All
 writes the entity into the primary and drops it from the base file, so it vanishes from every other
-level using that base. `rebuildInstance` (`editor/scene/prefabRebuild.ts`) is the case that shipped
+level using that base. A rebuild (`rebuildFromEntry`, `editor/scene/prefabRebuild.ts`; `rebuildInstance` before #1880 F7d) is the case that shipped
 (#1431). Refreshing after a prefab save, Revert, and Apply to Prefab all rebuild, and all three
 brought a base's instance back primary-owned. It now reads the old ROOT's stamp before the
 teardown and writes it onto the whole new subtree (members, nested expansions, restored `added`
@@ -1648,7 +1648,7 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     node's live, now per-instance guid. A scene restates a nested interior only where it differs
     from the chain (#1511). A ref into a template node the scene did not change therefore rests on
     the guid the node re-derives from its key on every load, not on a guid the scene stores.
-  - **Rebuilds derive.** `rebuildInstance` now ends with the derive pass. Before, a respawned keyed
+  - **Rebuilds derive.** A rebuild ends with the derive pass (the load's own since #1880 F6). Before, a respawned keyed
     node was left guid-less.
   - **Legacy.** A pre-key row node keeps loading exactly as before. A node with no guid loads
     guid-less. A node with a durable guid still gives every instance that one guid, until its OWN
@@ -1794,7 +1794,7 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   `reparentEntity` and `moveEntityToScene` mark the fields the compensation wrote and changed
   (`markCompensatedTransform`, [§ A reparent keeps the world pose](#a-reparent-keeps-the-world-pose-writing-only-what-the-move-changes-1848)), and undo puts the prior marks back. Unmarked, a linked root dropped
   under a moved parent reloaded at the prefab's value, offset by the parent (#1436 review).
-  `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
+  A rebuild carries an owned root's `parentLocalId` across the respawn (the entry states it; `rebuildInstance` did it by hand before #1880 F7d). Without it, a
   refresh left the root unstamped, which the save reads as a user-added instance.
 
 So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest

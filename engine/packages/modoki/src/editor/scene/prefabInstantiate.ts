@@ -206,15 +206,6 @@ export function applyStructureByRootInstance(
   applyStructureCore(editorStructureOps(), localToEcs, prefab, structure, ancestors);
 }
 
-/** Spawn scene-form `nodes` under the live entity `parentEcsId` — the editor spawn `applyStructureByRootInstance`
- *  uses, anchored at one entity instead of a member. For a v17 node row's `own` children (#1516), which hang under
- *  a template-added node rather than a member. */
-export function spawnAddedUnder(parentEcsId: number, nodes: readonly AddedEntity[], stack?: ReadonlySet<string>): void {
-  if (!nodes.length) return;
-  const ANCHOR = 1;
-  applyStructureCore(editorStructureOps(), new Map([[ANCHOR, parentEcsId]]), { entities: [], rootLocalId: ANCHOR } as never,
-    { added: nodes.map((n) => ({ ...n, parentLocalId: ANCHOR })) }, stack);
-}
 
 /** The editor-world ops `applyStructureCore` runs with. */
 function editorStructureOps(): Parameters<typeof applyStructureCore>[0] {

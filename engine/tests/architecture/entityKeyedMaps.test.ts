@@ -857,8 +857,6 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefabCapture.ts' },
   { item: 'engine/packages/modoki/src/editor/scene/prefabCapture.ts::InstanceReference.removedTraits',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefabCapture.ts' },
-  { item: 'engine/packages/modoki/src/editor/scene/prefabRebuild.ts::NestedInstanceCapture.overrides',
-    reason: 'not-entity: keyed by a nested prefab member\'s localId, addressed by the parentLocalId chain precisely because runtime ids churn across the rebuild; editor/scene/prefabRebuild.ts' },
   { item: 'engine/packages/modoki/src/editor/scene/prefabRevert.ts::RevertResult.fullOverrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefabRevert.ts' },
   { item: 'engine/packages/modoki/src/editor/scene/prefabRevert.ts::RevertResult.reducedOverrides',

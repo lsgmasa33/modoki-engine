@@ -12,20 +12,17 @@
  *  - a scene edit of that M (y = 3) rode `nestedOverrides`, which merge UNDER every layer's rows, so O's row beat it: 8
  *    live, and the next save wrote 8. The edit was lost.
  *  The same held for a reference node a TEMPLATE adds (H's row adds O under its P row's A): a scene edit inside it was
- *  lost by a partial Revert of H1, live and saved. Now what a rebuild RESPAWNS takes its reference nodes in the save's
- *  rows form (`captureStructureForRespawn`, `inRespawnForm` in prefabRebuild.ts); a capture that is READ keeps the legacy
- *  form — the comparisons against the chain's nodes, and Apply's promotion, whose case here is the close-out review's F1
- *  (capturing every scene-added node as rows at the source dropped the members' edits of a node Apply promoted).
+ *  lost by a partial Revert of H1, live and saved. The fix made what a rebuild RESPAWNED take its reference nodes in the
+ *  save's rows form, by hand; since #1880 F6 a rebuild is the load of the entry the save's own writer states, so it does
+ *  by construction, and F7d deleted the hand-made respawn form with the old route. A capture that is READ keeps the
+ *  legacy form — the comparisons against the chain's nodes, and Apply's promotion, whose case here is the close-out
+ *  review's F1 (capturing every scene-added node as rows at the source dropped the members' edits of a node Apply
+ *  promoted). Each node is asserted to come back WHERE it sat, not only with its values (`placedAt`).
  *
- *  The re-apply of a nested frame respawns through three channels, a node row's `own` among them (a copy pasted under a
- *  plain node a template adds); each is swapped, and each node is asserted to come back WHERE it sat, not only with its
- *  values (`placedAt`).
- *
- *  Mutations, each red on exactly its cases: no swap at the respawn — every rebuild case; none on a node row's `own` — its
- *  two cases; the placement dropped (`keepPlacement: false`) — the two nested-frame cases whose node sits under a member;
- *  the swap made at the source instead (the first fix) — the promotion and the template-added node. (The save's legacy
- *  comparison of a template reference node — in rows it restated the node on every save — is pinned by
- *  nestedRowFieldSave / templateReferenceNodeRows, not here.)
+ *  Mutations: the capture made in rows at the source (the first fix) reddens the promotion and the template-added node.
+ *  The old route's own mutations (no swap at its respawn, none on a node row's `own`, the placement dropped) went with
+ *  it. (The save's legacy comparison of a template reference node — in rows it restated the node on every save — is
+ *  pinned by nestedRowFieldSave / templateReferenceNodeRows, not here.)
  *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches, prefab edit, the undo
  *  stack and the simulated watcher. */

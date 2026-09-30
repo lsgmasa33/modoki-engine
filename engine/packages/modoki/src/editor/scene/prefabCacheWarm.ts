@@ -2,8 +2,8 @@
  *
  *  The editor keeps its own `Map` of parsed prefab files, separate from the runtime's
  *  refcounted one, and several editor readers consult it SYNCHRONOUSLY while walking the live
- *  tree — `planPrefabRows`, `captureInstanceStructure`/`captureNestedRef`,
- *  `captureNestedInstanceOverrides`. Every one of them treats a miss as "not a prefab" and
+ *  tree — `planPrefabRows`, `captureInstanceStructure`/`captureNestedRef`, and a rebuild's
+ *  load (`rebuildFromEntry`). Every one of them treats a miss as "not a prefab" and
  *  silently discards data (#1284: Create Prefab wrote copies instead of a reference, with only
  *  a console.warn).
  *

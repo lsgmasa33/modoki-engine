@@ -4,7 +4,7 @@
  *  `spawnNestedInstance`. Since #1783 both run the one `spawnReferenceNode`, so this pins the editor's rebuild reaching it.
  *
  *  It matters more here, not less: `captureNestedRef` reads the live guid onto the reference
- *  node precisely so a rebuild can put it back, and `rebuildInstance` already does exactly that
+ *  node precisely so a rebuild can put it back, and the rebuild (`rebuildFromEntry`) already does exactly that
  *  for the OUTER root ("refs into the instance survive the rebuild"). Dropping it on the nested
  *  root means Revert to Prefab / Apply / the undo of a prefab drop re-expands it with the
  *  TEMPLATE's guid — and prefab templates clear member guids, so it comes back as `''`: not

@@ -34,7 +34,9 @@ import {
 import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
 import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+/** Rebuild instance frame `root` (of `source`) onto `doc` unchanged: the load of its scene entry (#1880 F7d). */
+const rebuild = (root: number, source: string, doc: unknown): number => refreshInstances(source, [root], doc as never, doc as never);
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
@@ -447,7 +449,7 @@ describe('an owned nested instance that leaves its row stays gone after save + r
     const root = idAt('Holder/OuterRoot');
     const structure = captureInstanceStructure(root, outerDoc as never);
     expect(structure.removed).toEqual([4]);
-    rebuildInstance(root, OUTER, outerDoc as never, {}, structure);
+    rebuild(root, OUTER, outerDoc as never);
     expect([...treePaths().values()].filter((p) => p.includes('InnerRoot'))).toEqual([]);
     expect([...treePaths().values()]).toContain('Holder/OuterRoot/Panel/Button');
   });
@@ -895,7 +897,7 @@ describe('edits inside a USER-ADDED nested instance\'s own nested rows round-tri
     expect(paths()).not.toContain(LEAF);
   });
 
-  // The editor half. `rebuildInstance` (Apply, Revert, a prefab file changing) re-spawns the added
+  // The editor half. A rebuild (Apply, Revert, a prefab file changing) re-spawns the added
   // MID from the captured reference node through `spawnReferenceNode` (the loader's own spawner since #1783), which must
   // carry the node's nested channels. Mutation: in `spawnReferenceNode`, call `instantiatePrefabIntoWorld` without the
   // two channels.
@@ -903,15 +905,15 @@ describe('edits inside a USER-ADDED nested instance\'s own nested rows round-tri
     await load(withAddedMid());
     deleteEntitiesWithUndo([idAt(LEAF)]);
     const root = idAt('Holder/OuterRoot');
-    rebuildInstance(root, OUTER, outerDoc as never, captureInstanceOverrides(root, outerDoc as never), captureInstanceStructure(root, outerDoc as never));
+    rebuild(root, OUTER, outerDoc as never);
     expect(paths()).toContain('Holder/OuterRoot/Panel/Button/MidRoot/Slot/InnerRoot');
     expect(paths()).not.toContain(LEAF);
   });
 
-  // Found while designing the above, pre-existing: the rebuild's live re-apply
-  // (`captureNestedInstanceOverrides`) visited a USER-ADDED instance too (chain [0]) and re-applied its
-  // structure on top of the reference spawn that had already applied it, so every subtree it had added
-  // was spawned twice. Mutation: drop `!chain.includes(0)` from that capture.
+  // Found while designing the above, pre-existing: the old rebuild's live re-apply visited a USER-ADDED instance too
+  // and re-applied its structure on top of the reference spawn that had already applied it, so every subtree it had
+  // added was spawned twice. That re-apply is gone (#1880 F7d): a rebuild loads the entry, which states the added
+  // instance once, as the save does.
   it('a rebuild does not duplicate a subtree the added instance itself added', async () => {
     const BOLT = 'bbbbbbbb-0000-4000-8000-0000000000f9';
     const sc = scene([]) as unknown as { entities: Array<Record<string, any>> };
@@ -920,7 +922,7 @@ describe('edits inside a USER-ADDED nested instance\'s own nested rows round-tri
     await load(sc as unknown as SceneData);
     expect(getAllEntities().filter((e) => e.name === 'Bolt')).toHaveLength(1); // precondition
     const root = idAt('Holder/OuterRoot');
-    rebuildInstance(root, OUTER, outerDoc as never, captureInstanceOverrides(root, outerDoc as never), captureInstanceStructure(root, outerDoc as never));
+    rebuild(root, OUTER, outerDoc as never);
     expect(getAllEntities().filter((e) => e.name === 'Bolt')).toHaveLength(1);
   });
 
@@ -1044,8 +1046,7 @@ describe('Apply over a move from before #1869, and what the Apply dialog says (#
   // #1482: a rebuild of the OUTER instance (Refresh / Apply / Revert) respawns a user-added reference node
   // inside it, and must put back the member guids that node's rows store — the loader pins them, and a
   // rebuild that let them re-derive left anything naming them by guid dangling: here, an outer member's
-  // row `parent`. Mutation: drop the reference-node restore in rebuildInstance (Kid re-derives, InnerRoot
-  // falls back to its row).
+  // row `parent`. (The old rebuild's own restore is gone, #1880 F7d: a rebuild is the load, whose settle pins them.)
   describe('a rebuild keeps a reference node`s stored member guids (#1482)', () => {
     const REFP = 'aaaaaaaa-0000-4000-8000-0000000001b2';
     const KID = 'eeeeeeee-0000-4000-8000-000000000001';
@@ -1056,7 +1057,7 @@ describe('Apply over a move from before #1869, and what the Apply dialog says (#
     });
     const refresh = (path: string) => {
       const id = idAt(path);
-      return rebuildInstance(id, OUTER, outerDoc as never, captureInstanceOverrides(id, outerDoc as never), captureInstanceStructure(id, outerDoc as never));
+      return rebuild(id, OUTER, outerDoc as never);
     };
     beforeEach(() => { prefabs.set(REFP, refDoc); setPrefabCache(REFP, refDoc as never); });
     afterEach(() => { prefabs.delete(REFP); setPrefabCache(REFP, null); });
@@ -1072,7 +1073,7 @@ describe('Apply over a move from before #1869, and what the Apply dialog says (#
     });
 
     // The production seam (close-out review): Apply to Prefab rebuilds every instance of the source, and
-    // that rebuild is where the reference node's rows must be carried — not only a direct rebuildInstance.
+    // that rebuild is where the reference node's rows must be carried — not only a direct rebuild.
     it('Apply to Prefab on the outer instance keeps the reference node`s pinned guid, through a reload', async () => {
       const sc = JSON.parse(JSON.stringify(scene([]))) as { entities: Array<Record<string, unknown>> };
       (sc.entities[1]!.added as Array<Record<string, unknown>>)[0] = refNode({ parentLocalId: 3 });
@@ -1396,7 +1397,7 @@ describe('a nested row under a nested row (#1468 Phase 6 close-out)', () => {
       // A rebuild of O carries the edit too: its nested capture climbs Z's root to its OWNER, and the re-apply
       // finds the fresh Z root by owner — both read "the live parent is O's member" before, which it is not.
       const oDoc = docs[O6] as never;
-      rebuildInstance(idAt('ORoot'), O6, oDoc, captureInstanceOverrides(idAt('ORoot'), oDoc), captureInstanceStructure(idAt('ORoot'), oDoc));
+      rebuild(idAt('ORoot'), O6, oDoc);
       expect(zx()).toBe(7);
       const before = [...treePaths().values()].sort();
       await load(await serializeScene() as unknown as SceneData);
@@ -1470,8 +1471,9 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     for (const name of ['Plain', 'ZRoot', 'ZLeaf']) expect(getAllEntities().filter((e) => e.name === name)).toHaveLength(1);
   });
 
-  // #1484 (2): an Apply or Revert on source Q rebuilds the nested Q alone. Mutation: drop `foreignOwned` from the
-  // park predicate in `rebuildInstance` (Z is torn down with Q's subtree and nothing respawns it).
+  // #1484 (2): an Apply or Revert on source Q rebuilds the nested Q. It was rebuilt ALONE by the old per-frame rebuild,
+  // whose teardown parked O's row under it (`foreign` in `rebuildTeardown`'s park). Since #1880 F7d the rebuild is the
+  // load of O's whole entry, and dropping `foreign` from the park leaves this green (measured).
   it('rebuilding the inner instance keeps the outer frame\'s row under it, its guid and its edit', async () => {
     await loadO();
     const z = guidAt('ORoot/QRoot/ZRoot');
@@ -1479,7 +1481,7 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     writeTraitFieldWithUndo(idAt('ORoot/QRoot/ZRoot/ZLeaf'), getTraitByName('Transform')!, 'x', 7);
     const q = idAt('ORoot/QRoot');
     const qDoc = docs[Q7] as never;
-    rebuildInstance(q, Q7, qDoc, captureInstanceOverrides(q, qDoc), captureInstanceStructure(q, qDoc));
+    rebuild(q, Q7, qDoc);
     expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(1);
     expect(getAllEntities().filter((e) => e.name === 'Plain')).toHaveLength(1); // a plain row of O's under Q, too
     expect(guidAt('ORoot/QRoot/ZRoot')).toBe(z);
@@ -1489,20 +1491,21 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     expect(tfOf(idAt('ORoot/QRoot/ZRoot/ZLeaf')).x).toBe(7);
   });
   // …and a rebuild that tears the OWNER down too still destroys it, rather than parking a root whose frame is going.
-  // Mutation: return 0 from rebuildInstance's `frameOf` for an unmoved owned root (the pre-fix answer) — ZRoot is
-  // then parked through O's rebuild and survives beside its own respawn.
+  // (Returning 0 from `rebuildTeardown`'s `frameOf` for an unmoved owned root, the pre-fix answer, leaves this one green
+  // on the entry route — measured at #1880 F7d; the next case and "a rebuild of the outer instance keeps the deletion
+  // inside the added instance" go red.)
   it('rebuilding the outer instance respawns the row once', async () => {
     await loadO();
     const o = idAt('ORoot');
     const oDoc = docs[O7] as never;
-    rebuildInstance(o, O7, oDoc, captureInstanceOverrides(o, oDoc), captureInstanceStructure(o, oDoc));
+    rebuild(o, O7, oDoc);
     expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(1);
     expect(getAllEntities().filter((e) => e.name === 'ZLeaf')).toHaveLength(1);
   });
 
   // One level further out: P nests O, so O's QRoot is an owned root of ANOTHER frame hanging under a nested root of
   // P's — parked by P's rebuild, and destroyed with its owner O, which that rebuild respawns. Mutation: return 0 from
-  // rebuildInstance's `frameOf` for an unmoved owned root (the pre-fix answer): QRoot then stays parked through the
+  // `rebuildTeardown`'s `frameOf` for an unmoved owned root (the pre-fix answer): QRoot then stays parked through the
   // teardown of its own frame and survives beside its respawn.
   it('rebuilding an instance that nests the outer one respawns everything once', async () => {
     const P7 = 'aaaaaaaa-0000-4000-8000-0000000007b5';
@@ -1513,7 +1516,7 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
         { id: 1, prefab: P7, guid: ROOT, traits: { EntityAttributes: { name: 'PRoot', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
       ] } as unknown as SceneData);
       const p = idAt('PRoot');
-      rebuildInstance(p, P7, pDoc as never, captureInstanceOverrides(p, pDoc as never), captureInstanceStructure(p, pDoc as never));
+      rebuild(p, P7, pDoc as never);
       for (const name of ['ORoot', 'QRoot', 'QA', 'Plain', 'ZRoot', 'ZLeaf']) expect(getAllEntities().filter((e) => e.name === name)).toHaveLength(1);
     } finally { prefabs.delete(P7); setPrefabCache(P7, null); }
   });
@@ -1526,14 +1529,14 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     deleteEntitiesWithUndo([idAt('ORoot/QRoot/ZRoot')]);
     const o = idAt('ORoot');
     const oDoc = docs[O7] as never;
-    rebuildInstance(o, O7, oDoc, captureInstanceOverrides(o, oDoc), captureInstanceStructure(o, oDoc));
+    rebuild(o, O7, oDoc);
     expect(getAllEntities().filter((e) => e.name === 'ZRoot')).toHaveLength(0);
     expect((await oEntry()).removed).toEqual([3]);
   });
 
   // Review finding 3: in PREFAB-EDIT, O's own rows under Q's root are the edited document's, not Q's; a Revert on Q
   // rebuilt Q and tore them down, and the edit save then wrote O without them. Mutation: drop the `editRow` park in
-  // `rebuildInstance`.
+  // `rebuildTeardown`.
   it('prefab-edit: a Revert on the nested instance keeps the edited prefab\'s rows under it', async () => {
     await load(buildPrefabEditScene(docs[O7] as unknown as PrefabFile));
     writeTraitFieldWithUndo(idAt('ORoot/QRoot/QA'), getTraitByName('Transform')!, 'x', 3);

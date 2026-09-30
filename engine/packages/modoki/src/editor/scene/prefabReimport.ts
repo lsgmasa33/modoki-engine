@@ -18,9 +18,9 @@
 
 import { rowAt } from '../../runtime/core/prefabRowAt';
 import { commitPrefabChanges } from './prefabCommit';
-import { preloadNestedPrefabs, getCachedPrefabSync, preloadNestedPrefabsForSubtree } from './prefabCache';
+import { preloadNestedPrefabs, getCachedPrefabSync } from './prefabCache';
 import { staleFrames, type StaleFrame } from './prefabFrames';
-import { rebuildStaleFrames } from './prefabRebuild';
+import { rebuildStaleFrames, preloadRebuildEntry } from './prefabRebuild';
 import { placeholdersOf, resolvedRef } from './prefabUse';
 import { beginWorldBoundOperation } from '../undo/undoManager';
 import { getCurrentWorld, destroyEntity } from '../../runtime/core/ecs/world';
@@ -123,7 +123,7 @@ async function reexpandPlaceholders(sources: ReadonlySet<string>): Promise<void>
       const handle = findEntity(root);
       const rec = handle ? frameRootDoc(world, handle) : undefined;
       if (!rec) continue;
-      await preloadNestedPrefabsForSubtree(root);
+      await preloadRebuildEntry(root);
       frames.push({ root, source: rec.source, from: rec.doc as PrefabFile, to: rec.doc as PrefabFile });
     }
     if (getCurrentWorld() !== world) return;

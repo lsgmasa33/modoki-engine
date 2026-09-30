@@ -21,14 +21,17 @@ import { foreignRow, type RowDoc, rowsMeanTheSame, unexpandedRowsOf } from './pr
 
 /** A frame {@link rebuildTeardown} KEEPS because its prefab cannot be expanded (#1862): `owned` for a template row's frame,
  *  otherwise a scene-added reference node (a stored root). `parentGuid` is where it hung, already `remap`ped. */
-export type KeptFrame = { id: number; parentGuid: string; owned: boolean };
+/** `outside`: an owned frame moved OUT of the torn-down subtree (#1437) — it stays where it hangs, not re-seated. */
+export type KeptFrame = { id: number; parentGuid: string; owned: boolean; outside?: boolean };
 
-/** What {@link rebuildInstance} destroys for instance `rootInstanceId`, and which members of OTHER instances
+/** What a rebuild (`rebuildFromEntry`) destroys for instance `rootInstanceId`, and which members of OTHER instances
  *  hanging inside it it parks instead (to be put back by `parentGuid`, already `remap`ped). Its own function so
  *  the rebase can ask what a rebuild WOULD reach before running one (#1493, {@link rebaseStaleInstances}). */
 export function rebuildTeardown(
   rootInstanceId: number,
   remap: ReadonlyMap<string, string> = new Map(),
+  /** The documents the respawn expands from — the keep below asks the same ones (a rebuild's reader, #1880 F7d). */
+  read: typeof getCachedPrefabSync = getCachedPrefabSync,
 ): { toDestroy: Set<number>; parked: { id: number; parentGuid: string }[]; kept: KeptFrame[] } {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return { toDestroy: new Set(), parked: [], kept: [] };
@@ -69,17 +72,17 @@ export function rebuildTeardown(
   // so the respawn would record its row as unexpanded (#1790 ruling D) and spawn nothing in its place — the live members
   // would go with the teardown, and a gesture's own undo then refused on them. It is KEPT, as Unity keeps the objects of a
   // missing instance it merged before the asset went (`MergeStatus.NormalMerge` / `MergedAsMissingWithSceneBackup`), and
-  // re-seated by {@link seatKeptFrames}. Asked of the SAME cache the respawn reads, so a merely cold key is kept too.
+  // re-seated by {@link seatKeptFrames}. Asked of the SAME documents the respawn reads (`read`), so a merely cold key is kept too.
   // Both reference kinds: an OWNED root (a template row's frame), and a STORED root hanging under one of ours, a
-  // scene-added reference node, which the respawn would make a placeholder of from the structure (`rebuildInstance`
-  // then skips that respawn, and drops the kept frame when the structure no longer names it).
+  // scene-added reference node, which the respawn would make a placeholder of from the entry (`rebuildFromEntry`
+  // then leaves it out of the spawn, and `seatKeptFrames` drops it when the entry no longer names it).
   const kept: KeptFrame[] = [];
   const isKept = (id: number) => kept.some((k) => k.id === id);
   const unexpandable = (id: number, owned: boolean): boolean => {
     const pi = readTraitData(id, PrefabInstanceMeta) as (MemberPi & { source?: unknown }) | null;
     if (!pi || !(owned ? isOwnedRoot(pi, id) : isStoredRoot(pi, id)) || typeof pi.source !== 'string' || !pi.source) return false;
-    const doc = getCachedPrefabSync(pi.source);
-    return !doc || !expandsToRoot(doc, getCachedPrefabSync);
+    const doc = read(pi.source);
+    return !doc || !expandsToRoot(doc, read);
   };
   // Take `from` and everything under it — except what is not ours to destroy, which is PARKED where it hangs. The
   // one walk every part of the teardown takes: the unpark and reverse-case walks below took whole subtrees without
@@ -155,9 +158,26 @@ export function rebuildTeardown(
       const frame = frameOf(e.id);
       if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
       if (frame === e.id) continue; // a stored root is its own instance, and it is not ours
+      // …unless it is an owned frame whose prefab cannot be expanded: the respawn leaves its row unexpanded, so taken it
+      // went with nothing to respawn it (#1862's keep, flipped for a frame moved out — #1880 F7d close-out review 4).
+      // Kept where it hangs, as the keeps above keep one inside.
+      if (unexpandable(e.id, true)) { kept.push({ id: e.id, parentGuid: '', owned: true, outside: true }); grew = true; continue; }
       take([e.id]);
       grew = true;
     }
+  }
+  // An outside keep can still hang under something torn down here — another frame of ours moved out, which the reverse
+  // case reached after it (close-out re-review 1): left in place it went with that frame, and its raw id was reused by
+  // the respawn. It is kept as the ones inside are, then: parked, and re-seated under its parent by guid.
+  const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+  for (const k of kept) {
+    if (!k.outside) continue;
+    let under = false;
+    for (let p = parentOf.get(k.id) ?? 0, h = 0; p && h < 10_000; p = parentOf.get(p) ?? 0, h++) if (toDestroy.has(p)) { under = true; break; }
+    if (!under) continue;
+    const pg = guidById.get(parentOf.get(k.id) ?? 0) ?? '';
+    k.outside = false;
+    k.parentGuid = remap.get(pg) ?? pg;
   }
   return { toDestroy, parked, kept };
 }
@@ -348,8 +368,8 @@ export function collectInstanceRoots(source: string, excludeRootId?: number): nu
   const rootIds: number[] = [];
   // ⚠️ A Transient instance is a RUNTIME artifact — a UIEntries pooled row, a timeline scrub or
   // control-track spawn — and an authoring fan-out must not reach it (#1301). Rebuilding one is
-  // wrong twice over: `rebuildInstance` does not carry `Transient` forward, so the rebuilt root
-  // becomes serializable and the next save writes a preview artifact into the authored scene; and
+  // wrong twice over: the rebuild (then `rebuildInstance`) did not carry `Transient` forward, so the rebuilt root
+  // became serializable and the next save writes a preview artifact into the authored scene; and
   // the pool owns those rows, so tearing them down under it is not ours to do. A STOPPED editor
   // really does hold pooled instance roots that match this query's `source` + `rootInstanceId`
   // filter exactly — measured in docs/prefabs.md § Authoring scope.

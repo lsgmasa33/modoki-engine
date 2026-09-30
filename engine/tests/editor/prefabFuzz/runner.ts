@@ -17,7 +17,7 @@ import type { PrefabFile } from '../../../packages/modoki/src/editor/scene/prefa
 import { getDirtyAssetPaths, parkedPrefab } from '../../../packages/modoki/src/editor/scene/dirtyAssets';
 import { jsonFileBody } from '../../../packages/modoki/src/editor/backend/editorBackend';
 import { localIdCounter, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../../packages/modoki/src/runtime/core/localIdCounter';
-import { refreshInstances } from '../../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances, preloadRebuildEntry } from '../../../packages/modoki/src/editor/scene/prefabRebuild';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRefRules';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
@@ -216,6 +216,9 @@ async function respawnIdentity(): Promise<Failure | null> {
   }).map((e) => e.guid!);
   const world = getCurrentWorld();
   for (const guid of roots) {
+    // Warmed as every editor caller warms a rebuild: the load of the frame's whole scene entry (#1880 F7a).
+    const at = findEntityByGuid(guid)?.id();
+    if (at != null) await preloadRebuildEntry(at);
     const ent = findEntityByGuid(guid);
     const pi = ent ? piOf(ent.id()) : undefined;
     const doc = pi ? getCachedPrefabSync(pi.source) : null;

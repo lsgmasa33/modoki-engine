@@ -92,7 +92,6 @@ export {
   missingSourceRefusal,
 } from './scene/prefabFrames';
 export { instantiatePrefab, instantiatePrefabAsync, instantiatePrefabInstance } from './scene/prefabInstantiate';
-export { rebuildInstance, rebuildInstanceFromCapture } from './scene/prefabRebuild';
 export { serializePrefab, parsedPrefabRows } from './scene/prefabSerialize';
 export { applyToPrefabSelective, previewApply, type ApplyPreview } from './scene/prefabApply';
 export {

@@ -504,10 +504,9 @@ export interface StructureCaptureOpts {
    *  then spawn with. Default (scene form): the live durable guid, as a scene-authored node carries. */
   template?: boolean;
   /** SCENE FILE form (#1468 Phase 4): a reference node's edits go onto its member rows (`moveChannelsOntoRows`). Set by
-   *  the scene writer, and by what a rebuild RESPAWNS (`captureStructureForRespawn`, #1826): the respawn runs the loader's
-   *  one spawner (`spawnReferenceNode`, #1783), which folds the legacy channels differently from the rows the save writes.
-   *  Every other capture is read, not respawned, and its readers take the localId channels — the comparisons against the
-   *  chain's nodes (in rows a template reference node compared as edited) and Apply's promotion into a template. */
+   *  the scene writer (and so by a rebuild, which loads what it writes, #1880 F6). Every other capture is read, and its
+   *  readers take the localId channels — the comparisons against the chain's nodes (in rows a template reference node
+   *  compared as edited) and Apply's promotion into a template. */
   rows?: boolean;
   /** With `template`: a COMPARISON's capture, not a write (#1538) — a node's key is read off its marker or recovered,
    *  never minted and never stamped onto the live entity. A key stamped on a scene-authored node would make the
@@ -889,7 +888,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     }
   }
 
-  // Scene form: each captured node's key rides beside its guid, for a rebuild that respawns it (`rebuildInstance`).
+  // Scene form: each captured node's key rides beside its guid, for a rebuild that respawns it (`rebuildFromEntry`).
   const keyed = opts.template ? new Map<string, string>() : liveTemplateKeys(added, true, true);
   return {
     added, removed, removedTraits, moved, unrowed, consumedEcsIds, ownedNested: ownedByEcs,
@@ -1513,9 +1512,8 @@ export function toTemplateStructure(paths: NestedStructurePaths | undefined, dec
   return out;
 }
 
-/** Drop every captured field whose live value EQUALS what the prefab chain applies — the ONE subtraction both a
- *  save (`captureNestedSceneDelta`) and a rebuild (`captureNestedInstanceOverrides`) make of a nested
- *  instance, with the chain's member tokens already resolved to live guids. By value, not by key presence: a
+/** Drop every captured field whose live value EQUALS what the prefab chain applies — the ONE subtraction a save
+ *  (`captureNestedSceneDelta`) makes of a nested instance — and so a rebuild, which loads what the save states (#1880 F7d), with the chain's member tokens already resolved to live guids. By value, not by key presence: a
  *  scene that changed a row-set field keeps its change across the rebuild and the save (#1498).
  *
  *  - **A token the resolver cannot resolve** names nothing live, so the live side cannot equal it and the field is
@@ -1915,8 +1913,8 @@ function frameAddedDiff(
   return diffFrameAdded(full.added, chain, nodeDiffDeps(liveTemplateKeys(full.added, true)), reanchoredKeys(resolved, doc));
 }
 
-/** The live-world answers `diffFrameAdded` asks for, shared by the save (`frameAddedDiff`) and the rebuild
- *  (`captureNestedInstanceOverrides`) so the two cannot disagree about what counts as an edit. `keys` maps a
+/** The live-world answers `diffFrameAdded` asks for, shared by the save (`frameAddedDiff`) and the writers' node diff
+ *  so they cannot disagree about what counts as an edit (a rebuild loads what the save states, #1880 F7d). `keys` maps a
  *  captured node's guid to its template key ({@link liveTemplateKeys}, deep). */
 export function nodeDiffDeps(keys: ReadonlyMap<string, string>): NodeDiffDeps {
   return {
@@ -1965,16 +1963,14 @@ function traitRemovalStatements(live: string[] | undefined, chain: string[] | un
 
 /** Maps plain-capture nodes (what `frameAddedDiff` matched) to the WRITER's capture of the same entity, found by
  *  guid anywhere in `writer`'s trees — the form a scene row stores (a reference node carries its member rows there,
- *  which the plain capture does not). `parentLocalId` is written as 0: a row names the anchor — unless `keepPlacement`,
- *  for a rebuild's respawn, which spawns the nodes where the plain capture placed them (#1826,
- *  `prefabRebuild.ts`'s `inRespawnForm`: the save and the respawn state a node in ONE form, through this one map). */
-export function writerFormOf(writer: readonly AddedEntity[] | undefined, opts: { keepPlacement?: boolean } = {}): (nodes: readonly AddedEntity[]) => AddedEntity[] {
+ *  which the plain capture does not). `parentLocalId` is written as 0: a row names the anchor. */
+export function writerFormOf(writer: readonly AddedEntity[] | undefined): (nodes: readonly AddedEntity[]) => AddedEntity[] {
   const byGuid = new Map<string, AddedEntity>();
   const index = (list: readonly AddedEntity[] | undefined) => {
     for (const n of list ?? []) { if (n.guid) byGuid.set(n.guid, n); index(n.children); }
   };
   index(writer);
-  return (nodes) => nodes.map((n) => ({ ...(byGuid.get(n.guid) ?? n), parentLocalId: opts.keepPlacement ? n.parentLocalId : 0 }));
+  return (nodes) => nodes.map((n) => ({ ...(byGuid.get(n.guid) ?? n), parentLocalId: 0 }));
 }
 
 /** {@link writerFormOf} for a prefab ROW's rows (#1533): the TEMPLATE capture of the same entity, found by the template

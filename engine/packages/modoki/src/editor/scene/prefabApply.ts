@@ -43,7 +43,7 @@ import {
   collectInstanceRoots, framesBuiltFromOtherRows, missingNestedFrameKeys, missingPrefabInstance, missingSourceRefusal,
   staleFramesRefusal,
 } from './prefabFrames';
-import { refreshInstances } from './prefabRebuild';
+import { refreshInstances, preloadRebuildEntry, keptEnclosingSource } from './prefabRebuild';
 import {
   carryPromotedGuids, deletePromotedNodes, insertAddedSubtree, movedRowsOf, promoteReferenceMoves,
   rehangPromotionSurvivors, snapshotPromotedGuids,
@@ -303,6 +303,16 @@ async function planApply(
     // A frame kept live after its prefab was trashed (#1862), a nested one or #1738's top-level one: there is no document
     // to write into. Said, as Revert says it (`revertRefusal`), where this used to answer a bare `applied: false`.
     const why = missingSourceRefusal(ctx.rootInstanceId, source, 'apply');
+    if (!dryRun) console.warn(`[Prefab] cannot apply: ${why}`);
+    return { result: { ...NOOP_APPLY, refused: why } };
+  }
+  // Inside a frame its entry's rebuild keeps live (`keptEnclosingSource`): the Apply's refresh would leave this instance
+  // as it is, so the applied fields would stay on it as overrides of the template they were written into (#1880 F7d
+  // close-out review 1). Warmed first, so a merely cold prefab is not read as a trashed one.
+  await preloadRebuildEntry(ctx.rootInstanceId);
+  const keptIn = keptEnclosingSource(ctx.rootInstanceId);
+  if (keptIn) {
+    const why = `this instance lies inside an instance of "${keptIn}", whose prefab cannot be read — restore that prefab, or reload the scene, and Apply again`;
     if (!dryRun) console.warn(`[Prefab] cannot apply: ${why}`);
     return { result: { ...NOOP_APPLY, refused: why } };
   }
@@ -1271,7 +1281,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       for (const w of plan.writes) {
       if (w.role === 'outer') {
         const roots = collectInstanceRoots(w.source);
-        for (const rootId of roots) await preloadNestedPrefabsForSubtree(rootId);
+        for (const rootId of roots) await preloadRebuildEntry(rootId);
         refreshInstances(w.source, roots, w.expected, w.doc, new Map(), w.appliedFrom);
         continue;
       }
@@ -1283,11 +1293,10 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // refresh subtracts `appliedFields` from THIS instance's capture instead; other instances keep
       // their own overrides of the same field.
       const rootsToRefresh = collectInstanceRoots(source);
-      // refreshInstances re-instantiates synchronously, so warm the LIVE tree of each instance (the commit already
-      // warmed the new file's own reference rows). A user-added nested instance is not a row of newPrefab, so the file
-      // walk never reaches it, and captureNestedInstanceOverrides would then drop its per-copy overrides with no
-      // warning at all (#1284).
-      for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
+      // refreshInstances re-instantiates synchronously, so warm the LIVE tree of each instance's scene entry — the load
+      // it rebuilds through (#1880 F7a) — beside what the commit warmed (the new file's own reference rows). A user-added
+      // nested instance is not a row of newPrefab, so the file walk never reaches it (#1284).
+      for (const rootId of rootsToRefresh) await preloadRebuildEntry(rootId);
       refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields });
       for (const [from, to] of carryPromotedGuids(rootGuid, promotedGuids)) follow.set(from, to);
       rehangPromotionSurvivors(survivors, follow);

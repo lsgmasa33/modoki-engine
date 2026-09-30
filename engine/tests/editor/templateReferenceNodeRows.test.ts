@@ -36,10 +36,11 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { ownInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabChain';
 import { instantiatePrefab, instantiatePrefabAsync } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { rebaseStaleInstances, rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
 import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
-import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
+import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { buildPrefabEditScene, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { collectInstanceOverrideFields } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -839,7 +840,7 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
   const midKey = (p: PrefabFile) => (p.entities.find((e) => e.prefab === INNER)!.added ?? []).find((n) => n.prefab === MID)?.key;
 
   // A5: a reference node the user dropped has a random guid, so nothing can recover its key from it once a rebuild has
-  // respawned it without its marker. Mutation: skip the key carry in `rebuildInstance`.
+  // respawned it without its marker. Mutation: skip the key carry in `rebuildFromEntry` (`restoreTemplateKeys`).
   it('a dropped reference node keeps its key across a Refresh', async () => {
     install(midDoc());
     const root = await openInEditor(bare());
@@ -852,7 +853,7 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
   });
 
   // A2: the second Refresh's settle asks `keepsTemplateRows` of the respawned node; unkeyed, it keeps the rows without
-  // keys and every save mints a new one for the node inside. Mutation: skip the key carry in `rebuildInstance`.
+  // keys and every save mints a new one for the node inside. Mutation: skip the key carry in `rebuildFromEntry`.
   it('rows a second Refresh keeps for a dropped node write one key, save after save', async () => {
     const n1 = { parentLocalId: 2, guid: '', key: K1, name: 'N1', traits: { EntityAttributes: { name: 'N1' }, Transform: {} }, children: [] };
     install(midDoc({ added: [n1] }));
@@ -922,7 +923,9 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
 describe('#1543/#1567 close-out review', () => {
 
   // The undo of a Revert rebuilds from the capture taken before it, and the node it brings back was not in that
-  // teardown: its key has to travel with the capture. Mutation: in `rebuildInstance`, skip `structure.templateKeys`.
+  // teardown: its key has to travel with the capture. Driven through the real undo since #1880 F7d — the direct rebuild
+  // this called before was the old route, which carried the key, while the real undo (the entry route since F6d) did
+  // not. Mutation: in `keyEntryRows`, skip the live key on a node (`liveKey`) — this case goes red (the next stays green).
   it('Revert then its undo keeps a dropped reference node\'s key', async () => {
     const bare = { ...outer2(), entities: [
       row(1, G(21), 'OuterRoot', 0), row(2, G(22), 'Panel', 1), row(5, G(25), 'InnerRow', 2, { prefab: INNER }),
@@ -935,9 +938,9 @@ describe('#1543/#1567 close-out review', () => {
     setPrefabSource(r, { id: MID });
     const first = midKey(serializePrefab(root, OUTER2)!);
     expect(first).toBeTruthy();
-    const res = await revertOverridesSelective(innerRoot().id, new Set([`+added.${all().find((e) => e.name === 'MidRoot')!.guid}`]));
+    expect(await revertOverridesWithUndo(innerRoot().id, new Set([`+added.${all().find((e) => e.name === 'MidRoot')!.guid}`]))).not.toBeNull();
     expect(all().filter((e) => e.name === 'MidRoot')).toHaveLength(0); // precondition: reverted
-    rebuildInstance(res!.newRootId, res!.source, res!.prefab, res!.fullOverrides, res!.fullStructure);
+    await undo();
     expect(all().filter((e) => e.name === 'MidRoot')).toHaveLength(1); // precondition: undone
     expect(midKey(serializePrefab(root, OUTER2)!)).toBe(first);
   });
@@ -958,8 +961,8 @@ describe('#1543/#1567 close-out review', () => {
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'K', parentId: inMid('Slot')[0]!.id, guid: 'eeeeeeee-0000-4000-8000-00000000c567' }));
     const first = kKey(serializePrefab(root, OUTER2)!);
     expect(first).toBeTruthy();
-    const res = await revertOverridesSelective(innerRoot().id, new Set([`+added.${all().find((e) => e.name === 'MidRoot')!.guid}`]));
-    rebuildInstance(res!.newRootId, res!.source, res!.prefab, res!.fullOverrides, res!.fullStructure);
+    expect(await revertOverridesWithUndo(innerRoot().id, new Set([`+added.${all().find((e) => e.name === 'MidRoot')!.guid}`]))).not.toBeNull();
+    await undo();
     expect(inMid('K')).toHaveLength(1); // precondition: undone
     expect(kKey(serializePrefab(root, OUTER2)!)).toBe(first);
   });

@@ -268,8 +268,9 @@ export async function preloadNestedPrefabs(prefab: PrefabFile, seen = new Set<st
  *      no warm at all, so after an ordinary scene load EVERY live instance was cold —
  *      the scene loader fills the RUNTIME cache, not this one);
  *    - `captureNestedRef` drops a user-added nested subtree from `added[]` entirely;
- *    - `captureNestedInstanceOverrides` / `reapplyNestedInstanceOverrides` lose a
- *      nested instance's per-copy overrides across a rebuild, with no warning at all.
+ *    - the old per-frame rebuild's nested capture/reapply lost a nested instance's
+ *      per-copy overrides across a rebuild, with no warning at all (that route is gone, #1880 F7d;
+ *      a rebuild now warms its whole entry, `preloadRebuildEntry`).
  *
  *  ⚠️ **Calling this does not make those readers safe everywhere — only on the paths that
  *  call it.** Every async entry point that reaches one of them now does, INCLUDING the undo and
