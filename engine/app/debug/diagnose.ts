@@ -18,6 +18,10 @@ import {
 import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
 import { guidListFields } from './entityRef';
+import { capLogText, encodedSize, fitLogBudget, LOG_ENTRY_CHARS, LOG_ANSWER_CHARS } from '../../tools/shared/logAnswer';
+
+/** `consoleErrors`' share of the report: half a log answer's, since the rest of the report shares the cap. */
+const DIAGNOSE_ERRORS_CHARS = LOG_ANSWER_CHARS / 2;
 
 export interface DiagnoseConsoleEntry { level: string; ts: number; text: string }
 
@@ -112,6 +116,14 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   const windowed = windowing ? raw.filter((e) => e.ts >= cutoff) : raw;
   const older = windowing ? raw.filter((e) => e.ts < cutoff) : [];
   const consoleErrors = windowed.slice(-20);
+  // The errors as the answer SHOWS them (#1903): each text cut to a console entry's cap, and the newest fitted to a
+  // character budget, so one logged blob or deep stack cannot push the whole report past the 60k cap (a `TOO_LARGE`
+  // envelope in place of the diagnosis). The verdict and counts still read `consoleErrors`: an error left out of the
+  // answer for its size is still an error.
+  const shownErrors = fitLogBudget(
+    consoleErrors.map((e) => (e.text.length > LOG_ENTRY_CHARS ? { ...e, text: capLogText(e.text, LOG_ENTRY_CHARS) } : e)),
+    encodedSize, DIAGNOSE_ERRORS_CHARS, 'last',
+  );
   const olderErrors = older.length
     ? {
         count: older.length,
@@ -272,7 +284,10 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
     camera: { count: cameraCount, ok: !cameraMissing, needed: has3DContent },
     offScreen,
     uiOverflow,
-    consoleErrors,
+    consoleErrors: shownErrors.items,
+    // How many of the last 20 errors (the oldest of them) were left out of `consoleErrors` for its size; the
+    // console-logs tools (`level:'error'`) read them.
+    ...(shownErrors.omitted ? { consoleErrorsOmittedForSize: shownErrors.omitted } : {}),
     // Named so `consoleErrors: []` cannot be read as an absolute — it always means "none in the
     // last errorWindowMs", and now says so. Omitted (with olderErrors) when no window was applied.
     ...(windowing ? { errorWindowMs: opts.errorWindowMs, olderErrors } : {}),

@@ -146,8 +146,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       CONSOLE_LOGS_REPLY_DOC + ' The ring holds 1000 entries in the editor (512 on a debug device ' +
       'build), of which the first 128 are a PINNED boot prefix that is never evicted. ⚠️ `dropped` > 0 ' +
       'means entries between that boot prefix and the recent tail were evicted, so the log is NOT ' +
-      'contiguous — do not read a gap as "nothing was logged". (Error entries carry full stacks, so the ' +
-      'ring can exceed 20k tokens.) Raise limit=N for more, or narrow with level=/since=.',
+      'contiguous — do not read a gap as "nothing was logged". Raise limit=N for more, or narrow with level=/since=.',
     {
       level: z.enum(CONSOLE_LEVELS).optional().describe(CONSOLE_LOGS_PARAM_DOCS.level),
       limit: z.number().optional().describe(CONSOLE_LOGS_PARAM_DOCS.limit),

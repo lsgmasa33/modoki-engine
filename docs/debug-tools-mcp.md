@@ -2280,7 +2280,9 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   since #596/#597 — regardless of the filter). That last part is the
   point — a `level:'warn'` read still tells you whether any errors exist. It used to build the
   histogram over the already-filtered array, so "are there errors?" answered *no* (S3.8). Error
-  entries carry full stacks, so the whole ring can exceed 20k tokens.
+  entries carry full stacks, so the whole ring can exceed 20k tokens — the answer cannot: each entry's
+  text is cut at 4000 chars and the page fitted to 40k chars (`omittedForSize`, #1903; the rule is
+  [mcp-tool-conventions.md § 6](mcp-tool-conventions.md#6-response-budget-summary-first)).
 - **Asset authoring (no guessing JSON):** `modoki_asset_schema {material|particle|animation}` →
   field metadata + example; `modoki_create_asset` / `modoki_write_asset` (validated, warn-but-write);
   live tuning via `modoki_particle_set` / `modoki_anim_set_clip` / `modoki_anim_add_key` /

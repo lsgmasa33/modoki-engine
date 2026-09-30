@@ -136,6 +136,7 @@ import { resolveEntityAddress, type EntityAddress } from './entityRef';
 import { ERROR_CODES, codeFromBody, isFailureBody, type ErrorCode } from '../../tools/shared/errorCodes';
 import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
 import { describeFilter, emptyFilterHint, histogram } from '../../tools/shared/filterDisclosure';
+import { capLogText, encodedSize, fitLogBudget, LOG_ANSWER_CHARS, LOG_ENTRY_CHARS } from '../../tools/shared/logAnswer';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, headWithCounts, takeHead, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -948,6 +949,19 @@ registerAgentOp('console-logs', (params) => {
   const page = cursored
     ? { ...takeHead(logs, p.limit, CONSOLE_TAIL_DEFAULT), total: logs.length }
     : tailWithCounts(logs, (e) => e.level, { limit: p.limit, defaultLimit: CONSOLE_TAIL_DEFAULT });
+  // #1903: `limit` counts entries, and an entry has no size — one logged JSON blob or deep stack pushed the whole answer
+  // past the 60k cap, a `TOO_LARGE` envelope even at limit=1. So each entry's text is cut to a console entry's cap, and
+  // the page is fitted to a character budget from the end it reads: a tail keeps its newest, a cursored page its oldest,
+  // so `nextSeq` below continues right after the last row shown and skips nothing.
+  const fit = fitLogBudget(
+    page.items.map((e) => (e.text.length > LOG_ENTRY_CHARS ? { ...e, text: capLogText(e.text, LOG_ENTRY_CHARS) } : e)),
+    encodedSize, LOG_ANSWER_CHARS, cursored ? 'first' : 'last',
+  );
+  const items = fit.items;
+  const truncated = page.truncated || fit.omitted > 0;
+  const sizeNote = fit.omitted
+    ? ` ${fit.omitted} of the ${page.items.length} entries the limit took were left out to keep this answer under ${LOG_ANSWER_CHARS} chars (each entry's text is also cut at ${LOG_ENTRY_CHARS}).`
+    : '';
   // S3.8 — `byLevel`/`ringTotal` describe the WHOLE ring, `total` describes what MATCHED the
   // filter. The histogram used to be built over the already-filtered array, so `level:'warn'`
   // answered `byLevel:{warn:N}` — an agent using it to decide "are there errors?" concluded no
@@ -957,18 +971,19 @@ registerAgentOp('console-logs', (params) => {
   // The cursor for the NEXT read. A truncated cursored page continues right after its last row. Any
   // other read has seen everything that matched, so it moves to the newest seq in the WHOLE ring — a
   // `level:'error'` poll then does not re-read the warnings it filtered out.
-  const nextSeq = cursored && page.truncated ? (page.items.at(-1)?.seq ?? since) : newestSeq;
+  const nextSeq = cursored && truncated ? (items.at(-1)?.seq ?? since) : newestSeq;
   return {
-    logs: page.items,
+    logs: items,
     nextSeq,
     epoch,
     ...(cursorReset ? { cursorReset } : {}),
     // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows here, `totalCount` everything the
     // filter matched before the tail. `ringTotal` is a THIRD population — the whole ring, filter
     // ignored — so it keeps its own name rather than being folded into either.
-    returnedCount: page.items.length,
+    returnedCount: items.length,
     totalCount: page.total,
     ringTotal: whole.length,
+    ...(fit.omitted ? { omittedForSize: fit.omitted } : {}),
     byLevel,
     // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
     // and `logs`/`ring` above concatenate the two halves with nothing marking the seam. `dropped`
@@ -976,11 +991,13 @@ registerAgentOp('console-logs', (params) => {
     // is looking at boot plus a recent window with a real gap in between, not a continuous log. See
     // `getConsoleRingDropped`'s own doc comment (consoleRing.ts).
     dropped: getConsoleRingDropped(),
-    ...(page.truncated ? {
+    ...(truncated ? {
       truncated: true,
       hint: cursored
-        ? `Showing the OLDEST ${page.items.length} of ${page.total} entries after since=${since} (oldest first). Continue with since=${nextSeq} and this epoch, or raise limit=N.`
-        : tailHint('console entries', page.items.length, page.total, ', or narrow with level=/since='),
+        ? `Showing the OLDEST ${items.length} of ${page.total} entries after since=${since} (oldest first). Continue with since=${nextSeq} and this epoch${fit.omitted ? '' : ', or raise limit=N'}.${sizeNote}`
+        : fit.omitted
+          ? `Showing the last ${items.length} of ${page.total} console entries (newest last).${sizeNote} Read the rest oldest-first with since=${page.items[0].seq - 1} and this epoch, or narrow with level=/sinceMs=.`
+          : tailHint('console entries', items.length, page.total, ', or narrow with level=/since='),
     } : {}),
   };
 });

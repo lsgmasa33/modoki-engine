@@ -10,6 +10,8 @@
 
 import { EPOCH_BASE, SINCE_CURSOR_BASE } from './sinceCursor.js';
 
+import { LOG_ANSWER_CHARS, LOG_ENTRY_CHARS } from './logAnswer.js';
+
 export const CONSOLE_LEVELS = ['log', 'info', 'warn', 'error'] as const;
 export type ConsoleLevel = (typeof CONSOLE_LEVELS)[number];
 
@@ -28,7 +30,7 @@ export function atConsoleLevel(entryLevel: string, threshold: ConsoleLevel): boo
  *  `device_console_logs`) — two copies of these sentences are how the twins drifted (#1559 C-4). */
 export const CONSOLE_LOGS_PARAM_DOCS = {
   level: 'A THRESHOLD: this level or worse (warn = warn + error; log = info).',
-  limit: 'How many matching entries (default 50): the newest N bare, the oldest N after a since cursor. Pass a large one for the whole ring.',
+  limit: 'How many matching entries (default 50): the newest N bare, the oldest N after a since cursor. A large one is still fitted to the answer budget.',
   since: `${SINCE_CURSOR_BASE}, oldest first; pass back nextSeq with epoch. A timestamp is refused (that is sinceMs).`,
   epoch: `${EPOCH_BASE}.`,
   sinceMs: 'Only entries logged after this epoch-ms instant. Not with since.',
@@ -40,4 +42,6 @@ export const CONSOLE_LOGS_REPLY_DOC =
   '`returnedCount` is what came back, `totalCount` what MATCHED level=/since=/sinceMs=, and `ringTotal`+`byLevel` ' +
   'describe the WHOLE ring regardless of the filter. A bare read is the NEWEST 50; a since= read pages OLDEST-first ' +
   'from the cursor, so polling with since=<nextSeq> and epoch=<epoch> never skips a line. `cursorReset` (a sentence) ' +
-  'means the ring restarted (a reload) and the read began again at the start.';
+  'means the ring restarted (a reload) and the read began again at the start. Each entry\'s text is cut at ' +
+  `${LOG_ENTRY_CHARS} chars and the page fitted to ${LOG_ANSWER_CHARS} chars; \`omittedForSize\` counts what that fit left out ` +
+  '(page on with since=).';

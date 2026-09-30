@@ -9,11 +9,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { capLogText, LOG_LINE_CHARS } from '../../shared/logAnswer.js';
 
 /** Lines of the tail. The end of a build log is where its verdict and its error are. */
 export const BUILD_TAIL_LINES = 30;
-/** One line's cap: a minified asset path or a stack frame fits, a pasted blob does not. */
-export const BUILD_LINE_CHARS = 400;
+/** One line's cap — the shared one every log answer uses (`shared/logAnswer.ts`, #1903). */
+export const BUILD_LINE_CHARS = LOG_LINE_CHARS;
 
 // ESC [ … final byte — the colour codes a build tool writes even into a pipe.
 // eslint-disable-next-line no-control-regex
@@ -26,7 +27,7 @@ export function buildLogLines(chunks: readonly string[]): string[] {
 
 /** The last `maxLines` of `lines`, each cut to `lineChars` with the count of what was cut. */
 export function buildLogTail(lines: readonly string[], maxLines = BUILD_TAIL_LINES, lineChars = BUILD_LINE_CHARS): string[] {
-  return lines.slice(-maxLines).map((l) => (l.length > lineChars ? `${l.slice(0, lineChars)}… (+${l.length - lineChars} chars)` : l));
+  return lines.slice(-maxLines).map((l) => capLogText(l, lineChars));
 }
 
 const LOG_PREFIX = 'modoki-build-';

@@ -30,6 +30,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { adbBinary, adbArgs } from './androidDevices';
+import { capLogText, encodedSize, fitLogBudget, LOG_ANSWER_CHARS, LOG_LINE_CHARS } from '../../tools/shared/logAnswer';
 
 const execFileAsync = promisify(execFile);
 
@@ -98,13 +99,14 @@ export function parseCrashBuffer(out: string): AndroidCrash[] {
     const proc = /^Process:\s*([^,]+),\s*PID:\s*(\d+)/.exec(p.text);
     if (proc) { cur.process = proc[1]; cur.pid = Number(proc[2]); continue; }
     if (p.text.startsWith('at ') || p.text.startsWith('\tat ')) {
-      if (cur.frames.length < 12) cur.frames.push(p.text.trim());
+      if (cur.frames.length < 12) cur.frames.push(capLogText(p.text.trim(), LOG_LINE_CHARS));
       continue;
     }
     // The first non-Process, non-frame line after FATAL is the exception itself; later ones are
     // `Caused by:` chains, which are kept because that is usually where the real cause is named.
-    if (!cur.exception) cur.exception = p.text;
-    else if (p.text.startsWith('Caused by:') && cur.frames.length < 12) cur.frames.push(p.text);
+    // Each line cut to a log line's cap (#1903): an exception message can carry a whole payload.
+    if (!cur.exception) cur.exception = capLogText(p.text, LOG_LINE_CHARS);
+    else if (p.text.startsWith('Caused by:') && cur.frames.length < 12) cur.frames.push(capLogText(p.text, LOG_LINE_CHARS));
   }
   if (cur) crashes.push(cur);
   return crashes.reverse();   // newest first, matching every other listing here
@@ -188,7 +190,7 @@ export function filterAndroidDiag(records: AndroidDiagRecord[], pkg?: string): A
 
 /** Recent crashes + activity-manager kills, newest first. */
 export async function readAndroidDiagnostics(opts: { serial?: string; pkg?: string; limit?: number }): Promise<{
-  records: AndroidDiagRecord[]; totalSeen: number; matched: number;
+  records: AndroidDiagRecord[]; totalSeen: number; matched: number; omittedForSize: number;
 }> {
   const [crashOut, eventOut] = await Promise.all([
     adb(opts.serial, ['logcat', '-b', 'crash', '-d', '-v', 'threadtime', '-t', String(LOGCAT_TAIL)]),
@@ -199,9 +201,11 @@ export async function readAndroidDiagnostics(opts: { serial?: string; pkg?: stri
   const matched = filterAndroidDiag(all, opts.pkg);
   const asked = Number.isFinite(Number(opts.limit)) ? Math.max(1, Math.floor(Number(opts.limit))) : 20;
   const limit = Math.min(asked, MAX_RETURNED_LINES);
+  // 400 RECORDS is a count, not a size (#1903): fitted to a log answer's characters, newest first.
+  const fit = fitLogBudget(matched.slice(0, limit), encodedSize, LOG_ANSWER_CHARS, 'first');
   return {
-    records: matched.slice(0, limit),
-    totalSeen: all.length, matched: matched.length,
+    records: fit.items,
+    totalSeen: all.length, matched: matched.length, omittedForSize: fit.omitted,
   };
 }
 

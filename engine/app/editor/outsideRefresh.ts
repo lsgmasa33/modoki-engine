@@ -41,11 +41,14 @@ export function makeSceneConflictResolver(deps: {
 }): (c: SceneConflict) => Promise<SceneConflictAnswer> {
   const asking = new Set<string>();
   return async ({ urlPath, baseGuid, decision, focused }) => {
-    // A question already open in front of the human stays theirs: an unfocused release or an agent's answer must not
-    // take the change from under the dialog, whose Reload would then do nothing (review F4).
-    if (asking.has(urlPath)) return 'asking';
     const causes = deps.causes();
     const dirty = baseGuid ? causes.dirtyScenes.includes(baseGuid) : causes.sceneDirty;
+    // A question already open in front of the human stays theirs while there is unsaved work to decide about: an
+    // unfocused release or an agent's answer must not take the change from under the dialog, whose Reload would then do
+    // nothing (review F4). Once the scene is CLEAN (saved, or reloaded by a load) the dialog's question is moot, and a
+    // newer change reloads as any change to a clean scene does; the stale dialog's answer then finds nothing. Parked
+    // behind it instead, its Keep mine dropped that change with no unsaved work kept (#1906, measured live).
+    if (dirty && asking.has(urlPath)) return 'asking';
     const answer = decideSceneConflict({ dirty, focused, decision });
     if (answer === 'kept') console.log(`[agentBridge] ${urlPath} changed on disk — kept the unsaved edits (the next save overwrites the file)`);
     if (answer === 'held') console.warn(`[agentBridge] ${urlPath} changed on disk under unsaved edits — pending until someone chooses Reload or Keep mine`);

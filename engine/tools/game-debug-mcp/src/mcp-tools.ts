@@ -29,6 +29,7 @@ import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesRes
 import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
 import { PROFILER_ACTIONS } from '../../shared/profilerActions.js';
 import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS, CONSOLE_LOGS_REPLY_DOC } from '../../shared/consoleLevels.js';
+import { capLogText, fitLogBudget, LOG_ANSWER_CHARS, LOG_LINE_CHARS } from '../../shared/logAnswer.js';
 import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MIN_MS, DEVICE_WAIT_FOR_MAX_MS } from '../../shared/waitForTiming.js';
 import { foldEntityRef } from '../../shared/foldEntityRef.js';
 import { TIMEOUT_MS_BASE, PRECISION_BASE } from '../../shared/paramBases.js';
@@ -42,7 +43,7 @@ import { join } from 'path';
 const pExecFile = promisify(execFile);
 import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody, codeFromBody, optionsFromBody, BackendError, BackendShapeError,
-  deviceFail, caughtFailure, deviceReplyFailure, type DeviceResult,
+  deviceFail, caughtFailure, deviceReplyFailure, capText, type DeviceResult,
 } from './result.js';
 import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseNativeLogsReply, deviceListDecoder, describeClaim, SYNTHETIC_MECHANISM, decodeLeaseStatus, decodeDeviceRequestReply, decodeIdentity, decodeToolchain, type Decoder, type DeviceRequestReply, type LeaseStatus, type DeviceListClaim } from './reply.js';
 
@@ -2540,7 +2541,7 @@ async function coordScaleOrRefusal(
         // A listing says what it HID. "19 reports" when 99 exist is a different answer from "19
         // reports exist", and only one of them is true.
         const note = (Array.isArray(result)
-          ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
+          ? `[${String(body.shown)} of ${String(body.matched)} matching · ${String(body.totalOnDevice)} on device${body.omittedForSize ? ` · ${String(body.omittedForSize)} more within limit left out to keep this answer under ${LOG_ANSWER_CHARS} chars` : ''}${body.filteredTo ? ` · filtered to process '${String(body.filteredTo)}' (pass all:true for everything)` : ''}]\n`
           : '') + unverifiedNote(body);
         return { content: [{ type: 'text' as const, text: note + encodeStructuredResult(result) }] };
       } catch (e) {
@@ -2558,7 +2559,8 @@ async function coordScaleOrRefusal(
     'or a system kill, which the app cannot report about itself. ⚠️ The DIRECTION differs by ' +
     'platform: on iOS it streams FORWARD for `seconds` (start it, then reproduce — it cannot show ' +
     'something that already happened), while on Android it dumps logcat BACKWARD, so it needs no ' +
-    'capture window and `seconds` is ignored there.',
+    'capture window and `seconds` is ignored there. ' +
+    `Each line is cut at ${LOG_LINE_CHARS} chars and the newest fitted to ${LOG_ANSWER_CHARS} chars, saying how many older ones were left out.`,
     {
       limit: z.number().int().min(1).optional().describe('Max lines (default: 50)'),
       filter: z.string().optional().describe('Text filter (case-insensitive). Only return lines containing this string.'),
@@ -2621,11 +2623,18 @@ async function coordScaleOrRefusal(
         }
         // A partial read (some logs AND an error) keeps the logs and states the error — dropping
         // either half would be the same collapse in the other direction.
+        // #1903: every reader bounds lines by COUNT (in-app 50, the iOS syslog ring with no ceiling, Android 400
+        // "at ~100 chars a line"), and this answer was never encoded, so nothing bounded its size. Each line is cut to a
+        // log line's cap and the newest fitted to a log answer's characters, saying what was left out.
+        const fitted = fitLogBudget(parsed.logs.map((l) => capLogText(l, LOG_LINE_CHARS)), (l) => l.length + 1, LOG_ANSWER_CHARS, 'last');
+        const sizeNote = fitted.omitted
+          ? `[${fitted.omitted} older of ${parsed.logs.length} lines left out to keep this answer under ${LOG_ANSWER_CHARS} chars (each line is also cut at ${LOG_LINE_CHARS}) — narrow with filter or seconds]\n`
+          : '';
         const text = (parsed.error ? `[⚠️ the native log reader also reported: ${parsed.error}]\n` : '')
           // #1214: the filter is applied where the lines are read (in the app, or by the host's
           // logcat/syslog reader), so an unfiltered count is not available here — but an empty
           // FILTERED read must not say "No logs.", which reads as "nothing was logged".
-          + (parsed.logs.join('\n') || (filter
+          + (fitted.items.join('\n') || (filter
             ? `No line containing "${filter}" in this window (the filter is case-insensitive). Other lines may exist — drop \`filter\` to see them.`
             : 'No logs.'));
         // Say what the read actually WAS when it was a forward capture — an empty system result is
@@ -2639,7 +2648,7 @@ async function coordScaleOrRefusal(
             ? `[system log (logcat dump, backward)${body.device ? ` · ${String(body.device)}` : ''}${body.clamped ? ' · limit capped at 400 lines (response budget)' : ''}]\n`
             : `[system syslog${body.device ? ` · ${String(body.device)}` : ''} · streamed forward for ${String(body.capturedFor ?? seconds ?? 10)}s${body.truncated ? ` · older matching lines dropped past limit ${limit ?? 50}` : ''}]\n`)
           + unverifiedNote(body);
-        return { content: [{ type: 'text' as const, text: note + text }] };
+        return { content: [{ type: 'text' as const, text: capText(note + sizeNote + text) }] };
       } catch (e) {
         return caughtFailure('device_native_logs', 'read the native device logs (logcat / os_log)', e);
       }

@@ -2103,6 +2103,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
             return json({
               result: diag.records, device: picked.serial ?? 'the attached device',
               totalOnDevice: diag.totalSeen, matched: diag.matched, shown: diag.records.length,
+              ...(diag.omittedForSize ? { omittedForSize: diag.omittedForSize } : {}),
               filteredTo: pkg ?? null,
             });
           } catch (e) {

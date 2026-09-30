@@ -803,6 +803,16 @@ that says what was elided and which filter to reach for — never a severed blob
 - A declared filter must be a real parameter of that tool (enforced) — a hint that names a
   nonexistent filter is a dead end that reads as the agent's mistake.
 - Floats are rounded to 9 significant digits, so an edit is verified with a **tolerance**, never `===`.
+- **Raw log text is bounded by CHARACTERS, never by the count of entries** (#1900, #1903). An entry has no size —
+  one logged JSON blob, deep stack or pipe chunk is a single entry — so "the last 50" could be any size, and one
+  oversized entry sent the whole answer past the cap (an uninformative `TOO_LARGE`) or, where nothing encoded it,
+  past any bound. `engine/tools/shared/logAnswer.ts` is the one shape: each entry cut to a per-entry cap that says
+  how much it cut (`capLogText`: 400 chars a line, 4000 a console entry with its stack), then the entries fitted to a
+  character budget (`fitLogBudget`, 40k) from the end the reader wants — the newest of a tail, the head of a forward
+  cursor or a newest-first listing, contiguous so a cursor built on it skips nothing — and what the fit left out is
+  COUNTED in the answer (`omittedForSize`, or a note). Its users: `modoki_build`'s log tail, the console-logs op
+  behind both console tools, diagnose's `consoleErrors` (the verdict still counts every error), `device_native_logs`
+  and `device_crash_reports`' Android records.
 
 ## 7. One tool, one job
 

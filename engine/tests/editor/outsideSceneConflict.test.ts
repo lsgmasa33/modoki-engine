@@ -24,7 +24,9 @@
  *  `pendingOutsideChanges` → "U4/#4" alone (its hold now ends in a `finally`, so one failure cannot cascade).
  *  The third review's: the superseded check reading `writeEpoch` (bumped by a refused write too) instead of the landed
  *  count → "Cancel on the conflict"; `endOutsideChangeHold` removed → "once the release applied"; the replay's closing
- *  `notifyPending` removed → "U4/#4". */
+ *  `notifyPending` removed → "U4/#4".
+ *  #1906: the open-dialog check made unconditional again (ahead of the dirty test, as it was) → both "#1906" cases go
+ *  red, the other 23 stay green. */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 
@@ -219,6 +221,48 @@ describe('the human\'s answers (review F3, F4, and the untested Reload and later
     await settle();
     expect(kids(), 'the human\'s Reload did reload').toBe(2);
     expect(pendingOutsideChanges()).toEqual([]);
+  });
+
+  // #1906: the dialog's question is about unsaved work. Once the scene is clean under it, a NEWER outside write reloads as
+  // any write to a clean scene does, instead of parking behind the stale dialog, whose Keep mine then dropped it.
+  const plainX = () => (readTraitData(getAllEntities().find((e) => e.name === 'Plain')!.id, getTraitByName('Transform')!) as { x: number }).x;
+  async function newerWriteAfterClean(f: Fixture, makeClean: () => Promise<void>): Promise<void> {
+    await outsideSceneWrite(f); // Plain.x = 9 on disk
+    _setEditorFocusedForTests(() => true);
+    dialog.open = true;
+    await releaseOutsideChanges();
+    expect(dialog.answer, 'the dialog is up').not.toBeNull();
+    await makeClean();
+    expect(hasUnsavedChanges(), 'clean under the open dialog').toBe(false);
+    be.marked.clear();
+    const doc = JSON.parse(be.read(f.scenePath)!) as { entities: { traits?: { EntityAttributes?: { name?: string }; Transform?: { x: number } } }[] };
+    doc.entities.find((e) => e.traits?.EntityAttributes?.name === 'Plain')!.traits!.Transform!.x = 13;
+    be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: f.scenePath, kind: 'scene' }); // the watcher, with no release of its own
+    const r = await releaseOutsideChanges(); // the focus gain, the stale dialog still up
+    await settle();
+    expect(r.sceneConflicts, 'a clean scene is not a conflict').toEqual([]);
+    expect(r.applied).toEqual([f.scenePath]);
+    expect(plainX(), 'the newer write reloaded').toBe(13);
+    expect(dialog.asked, 'asked once, for the dirty scene only').toEqual([f.scenePath]);
+    dialog.answer!('keep'); // the stale dialog, answered at last
+    await settle();
+    expect(plainX(), 'its Keep mine drops nothing').toBe(13);
+    expect(pendingOutsideChanges()).toEqual([]);
+  }
+
+  it('#1906: the scene saved under the open dialog — a newer write reloads, and the stale Keep mine drops nothing', async () => {
+    const f = await kidApplied('c-h-saved', true);
+    await newerWriteAfterClean(f, async () => { expect((await saveAll({ allowDialog: false })).saved).toBe(true); });
+  });
+
+  it('#1906: the scene reloaded by a load under the open dialog (#1899) — the same', async () => {
+    const f = await kidApplied('c-h-loaded', true);
+    await newerWriteAfterClean(f, async () => {
+      expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+      await settle();
+      expect(pendingOutsideChanges(), 'the load covered the asked-about change').toEqual([]);
+    });
   });
 });
 

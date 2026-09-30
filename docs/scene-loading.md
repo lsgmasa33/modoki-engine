@@ -2705,7 +2705,12 @@ Where it applies:
   BEFORE the stack's debt is raised, so a kept scene keeps its undo. **Keep mine writes nothing**: a scene save sends
   no if-match (`writePrimaryScene` → an unconditional `/api/write-file`), so the world simply stays dirty and the next
   Cmd+S overwrites the file. Dismissing the dialog (Escape) puts the change back in the hold, asked again at the next
-  focus gain or refresh. #1878's two Apply splits (an outside scene write between an Apply and Cmd+S duplicating or
+  focus gain or refresh. **An open question holds only while its scene is dirty** (#1906): a newer change to a scene
+  that went CLEAN under the open dialog (saved, or reloaded by a load, #1899) reloads as any change to a clean scene
+  does, and the stale dialog's answer then finds nothing. Parked behind the dialog instead, its Keep mine dropped the
+  newer change with no unsaved work kept, and the editor showed the old file with nothing pending (measured live on
+  `8b8c6649c`). While the scene is still dirty the question stays the human's: an unfocused release or an agent's
+  `scene` answer does not take the change from under the dialog (review F4). #1878's two Apply splits (an outside scene write between an Apply and Cmd+S duplicating or
   losing the applied child) are what this closes: `outsideSceneConflict.test.ts`. A chosen Reload discards the unsaved
   edits, except in a kept base.
   **A PREFAB change no longer reloads — owner ruling 2026-09-30 (#1873 R1), reversing #1164 for prefabs, the
