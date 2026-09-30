@@ -79,6 +79,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+  // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
+  captureEntityIdentity: () => () => true,
   getAllEntities: () => getAllEntitiesImpl(),
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),

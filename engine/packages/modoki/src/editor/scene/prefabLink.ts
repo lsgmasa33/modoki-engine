@@ -19,6 +19,7 @@ import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
 import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
+import { unkeyedNodes, stripCreatedKeys } from './capturedKeys';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -484,18 +485,31 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
  *  It also clears the override marks on every entity it links, and its undo puts them back: the tree is written as it
  *  stands, so nothing in it overrides the document just written from it (Unity: a prefab made from an unpacked object
  *  has no overrides). A Detach leaves its marks on the plain tree until a reload, and linked with them they were saved
- *  as overrides equal to the template's values, which pinned them against every later edit of the prefab. */
+ *  as overrides equal to the template's values, which pinned them against every later edit of the prefab.
+ *
+ *  And its undo takes off every template key the create put on (#1884): a node that had none before it (`unkeyed`) and
+ *  has one now. The CAPTURE stamps them, not this tag — `serializePrefab` writes a scene-added node under a nested
+ *  instance as that row's added node, and keys it (`addedNodeIdentity`) — so the caller passes the tree's unkeyed nodes
+ *  as they were before its serialize; a redo's are taken here, before its seat. Left on, the node was plain again with
+ *  a key the save drops, so live and reloaded disagreed, and a later capture read the stale key as the node's identity.
+ *  A node keyed before the create (a nested instance's own template-added node) keeps its key. A redo that refuses takes
+ *  its seat back off the same way. Unity: undoing Create Prefab leaves an object with no prefab identity on it. */
 export function tagCreatedPrefab(
   rootEcsId: number, source: string, writtenPrefab: PrefabFile,
-  redo?: { keys: ReadonlyMap<string, string> },
+  opts?: { keys?: ReadonlyMap<string, string>; unkeyed?: ReadonlySet<number> },
 ): { guidRemap: Map<string, string>; undoKept: () => void; priorLinks: DetachSnapshot; keys: Map<string, string>; refused?: string } {
-  if (redo) seatTemplateKeys(rootEcsId, redo.keys);
+  const redo = opts?.keys;
+  const unkeyed = opts?.unkeyed ?? unkeyedNodes(rootEcsId);
+  if (redo) seatTemplateKeys(rootEcsId, redo);
   const piMeta = getTraitByName('PrefabInstance');
   const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
   // Taken without stripping (#1278), before the tag, then kept to what the tag wrote (`writes`).
   const snapshot = detachPrefabInstance(rootEcsId, { strip: false });
   const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo });
-  if (refused) return { guidRemap, undoKept: () => {}, priorLinks: { links: [], orphans: [] }, keys: new Map(), refused };
+  if (refused) {
+    stripCreatedKeys(unkeyed)();
+    return { guidRemap, undoKept: () => {}, priorLinks: { links: [], orphans: [] }, keys: new Map(), refused };
+  }
   const priorLinks: DetachSnapshot = {
     links: snapshot.links.filter((l) => writes.has(l.id)).map(({ frame, ...l }) => (writes.get(l.id) === 'link' && frame ? { ...l, frame } : l)),
     orphans: snapshot.orphans,
@@ -503,8 +517,9 @@ export function tagCreatedPrefab(
   const undoMarks = clearLinkedMarks(writes);
   const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
   const undoSettle = settleSwallowedKeptState(rootEcsId);
+  const undoKeys = stripCreatedKeys(unkeyed);
   return {
-    guidRemap, undoKept: () => { undoSettle(); undoUnpack(); undoMarks(); }, priorLinks,
+    guidRemap, undoKept: () => { undoSettle(); undoUnpack(); undoMarks(); undoKeys(); }, priorLinks,
     keys: writtenKeys(rootEcsId, guidRemap, writtenPrefab),
   };
 }
@@ -540,8 +555,8 @@ function writtenKeys(rootEcsId: number, guidRemap: ReadonlyMap<string, string>, 
 
 /** Put recorded template keys back on the nodes of the tree that hold those guids (a redo, before its plan reads them).
  *  Only inside the tree: a node that left it since is no row of the document, and a key on a scene-authored node makes
- *  the derive pass treat it as template-added (#1538). A redo that then refuses leaves them: each is the key the file
- *  holds for that node, which the create's undo leaves on it too. */
+ *  the derive pass treat it as template-added (#1538). A redo that then refuses takes them off again, as the create's
+ *  undo does (#1884, `tagCreatedPrefab`). */
 function seatTemplateKeys(rootEcsId: number, keys: ReadonlyMap<string, string>): void {
   for (const info of collectTree(rootEcsId, getAllEntities())) {
     const key = info.guid ? keys.get(info.guid) : undefined;

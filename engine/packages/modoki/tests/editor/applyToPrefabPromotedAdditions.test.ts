@@ -51,6 +51,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
 }));
 
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+  // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
+  captureEntityIdentity: () => () => true,
   getAllEntities: () => entityInfos,
   findEntity: (id: number) => entityIndex.get(id),
   markStructureDirty: vi.fn(),

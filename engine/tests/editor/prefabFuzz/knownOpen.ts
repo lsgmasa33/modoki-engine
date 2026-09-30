@@ -87,6 +87,17 @@ export const KNOWN_OPEN: KnownOpen[] = [
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
+    issue: 1884,
+    what: "#1880 T hunt seed 1021: Create Prefab's capture keyed a scene-added node under a nested instance (M, duplicated under a Q root), and the create's undo left the key on the now-plain node, which the save drops (live and reloaded disagreed). The tag's undo now takes off the keys the create put on (`tagCreatedPrefab`, `unkeyed`)",
+    repro: [
+      { kind: 'apply', u: [0.29802523739635944, 0.3361613943707198, 0.945519546745345, 0.4103981079533696, 0.5934181711636484, 0.4925757374148816, 0.5362330467905849, 0.5182884733658284] },
+      { kind: 'duplicate', u: [0.9487128253094852, 0.538364575477317, 0.6694632838480175, 0.7329504431691021, 0.6781804847996682, 0.14568979712203145, 0.22980895987711847, 0.1802657439839095] },
+      { kind: 'duplicate', u: [0.1251957667991519, 0.2849409447517246, 0.7024342324584723, 0.6058721421286464, 0.9169318166095763, 0.032831143820658326, 0.99941546167247, 0.837961915647611] },
+      { kind: 'createPrefab', u: [0.3009951172862202, 0.5536507710348815, 0.2304738739039749, 0.0306045722682029, 0.4852274665609002, 0.7178316684439778, 0.785573696019128, 0.1073915520682931] },
+      { kind: 'undo', u: [0.30228502908721566, 0.22505678399465978, 0.18138680350966752, 0.05093478667549789, 0.5482559408992529, 0.39591905171982944, 0.2582702897489071, 0.42935578618198633] },
+    ],
+  },
+  {
     issue: 1880,
     what: "lane T seed 1099: an outside edit added a row without raising the stated mark, and the next editor write (an Apply) kept the stale mark — the file broke v8's contract and the validator's promise that the next write corrects the mark was false. contentFor now restates a stated mark that is not above the highest row",
     repro: [

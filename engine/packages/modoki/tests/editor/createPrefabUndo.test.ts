@@ -44,6 +44,8 @@ vi.mock('../../src/editor/scene/prefabCommit', async (importOriginal) => ({
   parkPrefabChanges: async (restores: unknown, opts?: { rebuild?: () => void | Promise<void> }) => { restoreSpy(restores); await opts?.rebuild?.(); },
 }));
 vi.mock('../../src/editor/scene/prefab', () => ({
+  // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`): no tree here.
+  collectTree: () => [],
   warnInertPrefabSizes: () => undefined,
 }));
 vi.mock('../../src/editor/scene/prefabCache', () => ({
@@ -426,7 +428,7 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     // The written prefab is handed to tagging so it can check its freshly-computed plan against
     // the file that actually landed (#1278 close-out §2d) — the two are computed either side of
     // the write's await, which on a Replace includes the confirmReplace dialog.
-    expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK, expect.objectContaining({ id: OLD_ID }));
+    expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK, expect.objectContaining({ id: OLD_ID }), { unkeyed: expect.any(Set) });
     written = [];
     await res.action.undo();
     // #1868: restored in memory by the prefab's guid — which the manifest maps to the file really there — and nothing

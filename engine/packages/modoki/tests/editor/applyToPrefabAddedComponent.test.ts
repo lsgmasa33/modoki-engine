@@ -37,6 +37,8 @@ let entityInfos: { id: number; name: string; parentId: number; sortOrder: number
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
+  // The pre-capture snapshot resolves its nodes by guid (#1884, `capturedKeys.ts`).
+  findEntityByGuid: () => undefined,
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => entityIndex.set(e.id(), e),
   findEntityById: (id: number) => entityIndex.get(id),
@@ -46,6 +48,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
 }));
 
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
+  // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).
+  captureEntityIdentity: () => () => true,
   getAllEntities: () => entityInfos,
   findEntity: (id: number) => entityIndex.get(id),
   markStructureDirty: vi.fn(),

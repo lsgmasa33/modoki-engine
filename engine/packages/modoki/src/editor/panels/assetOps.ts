@@ -27,6 +27,7 @@ import {
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
+import { snapshotUnkeyed } from '../scene/capturedKeys';
 import { isResourceEntity } from '../../runtime/core/ecs/hierarchy';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason, parkPrefabChanges } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
@@ -730,6 +731,10 @@ export async function createPrefabFromEntity(
   // The live `nodeGuid` carries where the tree is an instance of it, then a unique name matches (Unity's Replace,
   // `nodeGuidsFor`). The id is known before the serialize here (the path is decided first), so once is enough. The rows
   // are the replaced BYTES, BOM dropped (`readPriorDocument` keeps one for the verbatim undo).
+  // The tree's nodes with no template key, before the serialize keys some of them (#1884): the tag's undo takes exactly
+  // those keys off again. Each with its identity check, as `sameRoot`: a node the commit's rebuild re-minted is not it.
+  // …and a create that writes nothing takes them off at once (`unkeyed.drop()`): nothing links the tree to a document.
+  const unkeyed = snapshotUnkeyed(entityId);
   const draft = serializePrefab(entityId, keptId, {
     bakeKeptState: true,
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
@@ -737,7 +742,13 @@ export async function createPrefabFromEntity(
   });
   // A refusal said, like every other (#1776 close-out review): the tree is empty, or holds an instance of the prefab it
   // would replace — a prefab that would contain itself. It was a bare null both panels only logged.
-  if (!draft) return { refused: `Create Prefab refused — the selection could not be written as a prefab: it is empty, or it holds an instance of ${at ?? savePath}, which cannot contain itself.` };
+  if (!draft) {
+    unkeyed.drop();
+    return { refused: `Create Prefab refused — the selection could not be written as a prefab: it is empty, or it holds an instance of ${at ?? savePath}, which cannot contain itself.` };
+  }
+  // The keys the serialize just put on, by guid — before any await, so a world switched during the write cannot lose them:
+  // a landing that tags nothing drops them below, and its redo seats them again from here (#1884's third review).
+  const stampedKeys = unkeyed.keyed();
   // An authoring write, so it reports an inert size (#42, #1251) — named by the file it lands on.
   const inertSizes = warnInertPrefabSizes(draft, savePath, getCachedPrefabSync);
   // A Replace serializes WITH the kept id, so `serializePrefab`'s own cycle guard refuses (null, above) a tree holding an
@@ -772,12 +783,13 @@ export async function createPrefabFromEntity(
       const id = ref.resolve();
       if (id == null) return;
       // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-      ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab));
+      ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab, { unkeyed: unkeyed.ids() }));
     },
   });
   // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only
   // logged, so a Create Prefab that wrote nothing looked like one that did nothing.
   if (!committed.ok) {
+    unkeyed.drop();
     if (committed.conflict) {
       const why = prefabConflictReason(savePath);
       return { refused: `Create Prefab refused — ${why.reason}.`, conflict: { parked: why.parked } };
@@ -797,6 +809,14 @@ export async function createPrefabFromEntity(
   // to the prefab it was just unlinked from (#1264 close-out review). False when the world was replaced during the
   // write and there was no tree left to tag.
   let tagged = priorLinks !== null;
+  // Landed, and nothing tagged (the world switched mid-write, or an adoption held the rebuild off and then failed without
+  // switching): the capture's keys come off, as for a write that did not land (#1884 rider review) — and the redo, which
+  // links the tree to the file, gets them to seat first (`keys`): the drop took the only copy, and its plan minted keys the
+  // file does not declare. In a world that did switch the snapshot resolves nothing, so the drop is a no-op there.
+  if (!tagged) {
+    keys = stampedKeys;
+    unkeyed.drop();
+  }
   /** The undo rebased the re-linked tree onto its template's CURRENT document (#1820): a template change since the
    *  create (a saved prefab edit, an outside edit) — so the tree is no longer the one the create's rows describe, in
    *  shape or in value, and the redo refuses rather than re-link it to them. */

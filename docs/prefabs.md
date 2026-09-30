@@ -1833,6 +1833,22 @@ The three landings:
 Only the step seats a prefab's caches or parks one; `tests/architecture/prefabStepCensus.test.ts` pins that, with the
 exceptions it names.
 
+**A door's pre-commit capture stamps come off when it lands nothing** (#1884). A template-form capture keys each
+scene-added node it writes as a template's added node (`addedNodeIdentity`), on the LIVE node, before the step runs.
+So a door whose step fails or conflicts, or which refuses after its capture, takes those keys back off, and so does its
+undo: a key on a plain node is one the save drops, so live and reloaded disagree. The door snapshots the tree's unkeyed
+nodes before its capture and drops what got keyed (`snapshotUnkeyed`, `editor/scene/capturedKeys.ts`), including after a
+landing that tagged nothing — whose redo then links the tree to the file, so Create Prefab records the keys right after
+its serialize and that redo seats them again (without them its plan minted keys the file does not declare). The snapshot names its nodes by durable guid, so a rebuild in place during the write (a
+nested prefab rebased meanwhile) does not hide one, and another create that linked the tree meanwhile re-derived their
+guids, so its keys stay. Two doors
+capture a live scene tree: **Create Prefab** (its serialize; the refused serialize, the failed write and the undo,
+below) and **Apply** (its writing plan's promotion; a failed write or a refusal after the plan. Its undo reloads the
+scene from before it). The rest capture nothing before their step, or capture a tree that is not the scene's: a model
+import's and a rig's temporary trees, deleted before the write, and the prefab-edit save's edit world, whose keys are
+the document's own (census 2026-09-30, #1884 close-out). Pinned by `createPrefabUndoTemplateKeys.test.ts` and
+`applyFailedTemplateKeys.test.ts`.
+
 **Behaviour changes a human sees (#1880 W, owner-approved plan):**
 - an undo or redo that used to "succeed" into a bad park now REFUSES, naming the prefab and why: the prefab was deleted
   since (*"<file> was deleted since, and was left deleted"*), or putting it back would make it contain itself;
@@ -2036,6 +2052,17 @@ member's row: false overrides, and Apply wrote one member's value into another's
     on the old key was lost (#1854's signature). The tag records each key the written document declares by the node's
     pre-stamp guid; not row-for-row as #1759 does for localIds, because those nodes sit inside a nested row's lists
     and the plan's capture carries no entity to pair them with.
+  - **…and the undo takes off every key the create put on** (#1884), both routes. The keys come from the create's
+    CAPTURE, not its tag: `serializePrefab` writes a scene-added node under a nested instance as that row's added
+    node and keys it (`addedNodeIdentity`), before the tag runs. So the caller takes the tree's unkeyed nodes BEFORE
+    its serialize (`unkeyedNodes`), and the tag's undo strips exactly those that are keyed afterwards. A redo takes its
+    own set before its seat, a redo that refuses strips its seat on the spot, and a create that writes nothing after
+    its serialize (the write fails or conflicts, or the serialize refuses) strips them before it returns — the rule for
+    every door, above ("A door's pre-commit capture stamps come off when it lands nothing"). A node keyed before the create (a
+    nested instance's own template-added node) keeps its key. Left on, the undone node was plain with a key the save
+    drops, so live and reloaded disagreed (fuzz seed 1021), and a later capture would read the stale key as its
+    identity. Unity: undoing Create Prefab leaves no prefab identity on the object. Detach's twin: U17 (#1874).
+    Pinned by `createPrefabUndoTemplateKeys.test.ts` and the fuzzer's REGRESSIONS.
   - **The redo refuses when the tree no longer plans to the written rows** (`planMismatch`, the unlogged half of
     `planMatchesFile`), before anything is linked. A Detach's undo can rebase the tree onto a newer template between
     the two halves. The tag used to log `not tagging … (N rows now vs M written)`, leave the tree unlinked and let the
