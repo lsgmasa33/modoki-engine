@@ -43,39 +43,52 @@ export interface KnownOpen {
 // renumbers ids, and no longer reaches the case. The case is stated id-free, from the run's own documents, in
 // prefabWholeListRebuild.test.ts (passing since F6e).
 export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 1822,
-    what: "Add Component re-adding a template-row trait on a nested member reconciles its marks against the effective base",
-    repro: [
-      { kind: 'removeComponent', u: [0.5, 0.5, 0, 0, 0, 0, 0, 0] },
-      { kind: 'addComponent', u: [0.38, 0.1, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\/marks\//.test(f.detail),
-    // A remove, then an add, with no undo after the remove (#1800's shape, fixed).
-    stops: (f, ops) => f.check === 'save→reload is not the identity'
-      && /\/marks\/\d+: (undefined|"[^"]*") vs "(Rotate3D|Renderable3DPrimitive)\.[^"]+"$/.test(f.detail) && (() => {
-        const r = ops.findIndex((o) => o.kind === 'removeComponent');
-        return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'addComponent') && !ops.slice(r + 1).some((o) => o.kind === 'undo');
-      })(),
-  },
-  {
-    issue: 1893,
-    what: "#1880 F6 precondition hunt seed 1294, SEEN by T4 but NOT a rebuild defect: addComponent, Create Prefab, an outside edit of the new prefab, and an undo the edit refuses. Every step's world AND the save→reload mark QR's Rotate3D (HR's row QR states it: the spawner marks what a row applies); the end-of-run undo/redo WALK leaves QR unmarked, and T4's no-op rebuild then puts back what a load gives (/marks/0 undefined vs \"Rotate3D.axis\"). Probed read-only 2026-09-30. Red on c879a0338 too; hidden in the first hunt behind seed 1233's signature. F6 cannot close it: the walk's mark restore needs its own fix (#1893)",
-    repro: [
-      { kind: 'addComponent', u: [0.9362869369797409, 0.44597287848591805, 0.2419073861092329, 0.062128879595547915, 0.2224271954037249, 0.8683678451925516, 0.7178896840196103, 0.7713594404049218] },
-      { kind: 'createPrefab', u: [0.4144869849551469, 0.4089658232405782, 0.20890062884427607, 0.9231097148731351, 0.3927326067350805, 0.41872269148007035, 0.3743586875498295, 0.5361575500573963] },
-      { kind: 'outsideEdit', u: [0.31801428459584713, 0.24425062886439264, 0.08957791281864047, 0.5608493906911463, 0.010221707867458463, 0.9444657859858125, 0.38045233697630465, 0.8559809618163854], check: 'rebuild-reload' },
-      { kind: 'undo', u: [0.33416790375486016, 0.11875490262173116, 0.21718760346993804, 0.011441385140642524, 0.756048726150766, 0.6167072555981576, 0.6525275206658989, 0.4093857652042061] },
-    ],
-    reproduces: (f) => f.check === 'a no-op rebuild is not the identity' && /\/marks\/\d+: undefined vs /.test(f.detail),
-    stops: (f, ops) => f.check === 'a no-op rebuild is not the identity' && /\/marks\/\d+: undefined vs /.test(f.detail) && ops.some((o) => o.kind === 'outsideEdit') && ops.some((o) => o.kind === 'createPrefab'),
-  },
+
 ];
 
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1908,
+    what: "#1880 F7d close-out reviewer's hunt seed 7035: Create Prefab of Plain swallowed the Leaf instance, a prefab-edit save then added N368 under Leaf's nested Q row (a template-keyed node, derived through the new prefab's frame), and the walk undid the create. The undo reversed only the renames its stamp recorded, so N368 kept a guid of the removed frame, and T4's no-op rebuild derived it from Leaf. The undo now re-derives what the rename did not put back (`rederiveUntaggedTree`)",
+    repro: [
+      { kind: 'delete', u: [0.9922234723344445, 0.25419696839526296, 0.9724069777876139, 0.02157533122226596, 0.8052881832700223, 0.635680423816666, 0.21592384902760386, 0.03853950975462794] },
+      { kind: 'duplicate', u: [0.5128551761154085, 0.3704429541248828, 0.8398871638346463, 0.27259831805713475, 0.10714971576817334, 0.2681458839215338, 0.28937951964326203, 0.7071443223394454] },
+      { kind: 'duplicate', u: [0.44347771094180644, 0.7516779908910394, 0.8279188156593591, 0.7128648075740784, 0.7334057167172432, 0.3092420408502221, 0.1351795664522797, 0.04367826017551124] },
+      { kind: 'duplicate', u: [0.2906466955319047, 0.6999254215043038, 0.684055763296783, 0.46166856307536364, 0.4662518159020692, 0.20644749351777136, 0.9519286109134555, 0.9016196748707443] },
+      { kind: 'addChild', u: [0.9158923369832337, 0.14369138306938112, 0.5217877929098904, 0.552900938084349, 0.8617593767121434, 0.30767782498151064, 0.45726604433730245, 0.499938894296065] },
+      { kind: 'reparent', u: [0.0831343992613256, 0.30519177368842065, 0.20855004177428782, 0.6858711536042392, 0.7577791549265385, 0.5839720091316849, 0.40913962107151747, 0.36408074758946896] },
+      { kind: 'prefabEdit', u: [0.3309700924437493, 0.6569233764894307, 0.030095250345766544, 0.3292503939010203, 0.03182138688862324, 0.31310038454830647, 0.5246154351625592, 0.5637344394344836], inner: [] },
+      { kind: 'reparent', u: [0.4849080129060894, 0.8767765865195543, 0.14639284345321357, 0.1775893692392856, 0.5844973872881383, 0.7068577264435589, 0.4774774038232863, 0.42278118222020566] },
+      { kind: 'apply', u: [0.22712836740538478, 0.056918145855888724, 0.2091925849672407, 0.5579740430694073, 0.20300210802815855, 0.4581769125070423, 0.18550380668602884, 0.7533313976600766], check: 'rebuild-reload' },
+      { kind: 'createPrefab', u: [0.8319152330514044, 0.4240915672853589, 0.774081488372758, 0.6779571161605418, 0.18596812221221626, 0.8411178649403155, 0.5994577289093286, 0.39294355921447277] },
+      { kind: 'createPrefab', u: [0.36320690135471523, 0.5803163331001997, 0.11267186934128404, 0.14586856472305954, 0.5242130625993013, 0.14677568222396076, 0.5161585139576346, 0.4315425059758127] },
+      { kind: 'detach', u: [0.568952620960772, 0.4017728406470269, 0.46309781284071505, 0.9847642516251653, 0.34594010980799794, 0.31427668663673103, 0.48893765080720186, 0.6272090403363109] },
+      { kind: 'undo', u: [0.19944138010032475, 0.6802376955747604, 0.41905965260230005, 0.7516806568019092, 0.724098558537662, 0.8392475042492151, 0.8702961588278413, 0.10933272331021726] },
+      { kind: 'createPrefab', u: [0.2597604226320982, 0.8615618792828172, 0.2960950138512999, 0.24999517458491027, 0.017052290262654424, 0.8436013632453978, 0.7143359621986747, 0.4162361358758062] },
+      { kind: 'prefabEdit', u: [0.4067807160317898, 0.6054713339544833, 0.7841467321850359, 0.8712482710834593, 0.9773289314471185, 0.14972905116155744, 0.39789173658937216, 0.4414561924058944], inner: [{ kind: 'addChild', u: [0.6456879598554224, 0.4813439839053899, 0.36877071065828204, 0.60108273755759, 0.8653484499081969, 0.13433217024430633, 0.1667198808863759, 0.8725880493875593] }] },
+    ],
+  },
+  {
+    issue: 1822,
+    what: "hunt seed 1002: Remove Component, then Add Component, of a Rotate3D an enclosing row (O's template row) states on a nested member: the add's `reconcileOverrideMarks` left `axis` unmarked for equalling the effective base, while a load marks every field an enclosing row states (I2). Closed under the Unity rule with no reader; #1893's walk was one, and the reconcile now marks what the enclosing row states",
+    repro: [
+      { kind: 'removeComponent', u: [0.5, 0.5, 0, 0, 0, 0, 0, 0] },
+      { kind: 'addComponent', u: [0.38, 0.1, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1893,
+    what: "#1880 F6 precondition hunt seed 1294: addComponent, Create Prefab (HR's row for QR now states the added Rotate3D), an outside edit of HR, and an undo it refuses. The end-of-run walk undoes and REDOES the Add Rotate3D, and the redo's `reconcileOverrideMarks` unmarked every field equal to the effective base, which HR's row now supplies. A load marks what an enclosing row states whatever its value (I2), so T4's no-op rebuild put the marks back. The reconcile now marks what the enclosing row states, as `takeUnmarkedFromBase` already did",
+    repro: [
+      { kind: 'addComponent', u: [0.9362869369797409, 0.44597287848591805, 0.2419073861092329, 0.062128879595547915, 0.2224271954037249, 0.8683678451925516, 0.7178896840196103, 0.7713594404049218] },
+      { kind: 'createPrefab', u: [0.4144869849551469, 0.4089658232405782, 0.20890062884427607, 0.9231097148731351, 0.3927326067350805, 0.41872269148007035, 0.3743586875498295, 0.5361575500573963] },
+      { kind: 'outsideEdit', u: [0.31801428459584713, 0.24425062886439264, 0.08957791281864047, 0.5608493906911463, 0.010221707867458463, 0.9444657859858125, 0.38045233697630465, 0.8559809618163854], check: 'rebuild-reload' },
+      { kind: 'undo', u: [0.33416790375486016, 0.11875490262173116, 0.21718760346993804, 0.011441385140642524, 0.756048726150766, 0.6167072555981576, 0.6525275206658989, 0.4093857652042061] },
+    ],
+  },
   {
     issue: 1892,
     what: "hunt seed 3097: an Apply after a Create Prefab, undone on the way back, restores the template with its #1774 mark raised (version 8, nextLocalId) on the same rows. staleFrames compared by raw JSON, read the frame the create's undo re-linked as stale and rebased it, and the create's redo refused (\"The tree changed since it was saved\") in a clean segment. One \"same document\" rule now (`documentContentKey`), which leaves the mark and the version out",

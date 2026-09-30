@@ -117,6 +117,8 @@ vi.mock('../../src/editor/scene/prefabLink', () => ({
   untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
   detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
   reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
+  // #1908: after the links are back, the stored roots they re-expose derive what the rename did not put back.
+  rederiveUntaggedTree: () => { calls.push('rederive'); },
   // #1880 W5's precheck: these trees lose no link. The rule is driven unmocked in engine/tests/editor/requireLinks.test.ts,
   // and through the real undo by the prefab fuzz's #1881 regression.
   requireLinks: async () => {},
@@ -497,7 +499,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     await action.undo();
     // #1461: the members' original guids go back BEFORE the links do — the snapshot addresses them by
     // the guids they held before the tag. Mutation: move `unstamp()` after the reattach in assetOps.
-    expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive']);
     expect(unstampSpy).toHaveBeenCalledWith(new Map([['g-old', 'g-derived']]));
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
@@ -508,7 +510,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     if (!res || res === 'declined' || 'refused' in res) throw new Error(String(res));
     calls.length = 0;
     await res.action.undo();
-    expect(calls).toEqual(['unstamp', 'untag', 'reattach']);
+    expect(calls).toEqual(['unstamp', 'untag', 'reattach', 'rederive']);
     expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 

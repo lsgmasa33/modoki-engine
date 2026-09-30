@@ -25,6 +25,7 @@ import {
 } from '@modoki/engine/runtime';
 import {
   setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, deleteEntitiesWithUndo, removeTraitFromEntitiesWithUndo, reparentEntity,
+  addTraitToEntitiesWithUndo,
 } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { detachPrefabInstanceWithUndo } from '../../packages/modoki/src/editor/undo/detachPrefabUndo';
@@ -500,6 +501,50 @@ describe("an undo after a SAVED edit of an ENCLOSING row leaves the nested insta
     await load(data);
     expect((await undoStep('undo')).did).toBe(true);
     await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: true });
+  });
+});
+
+describe("a component re-added where an ENCLOSING row states it is marked, as a load marks it (#1893)", () => {
+  const OI = 'dddddddd-0000-4000-8000-000000001893';
+  // O's row 3 (the nested P) states a Rotate3D on P's row 1 (R), which P's template does not define: what a Create
+  // Prefab writes when it wraps an instance whose member had an added component (seed 1294's HR row for QR). The values
+  // are the trait's defaults, so every field EQUALS the effective base, and the by-value rule alone unmarks them all.
+  const statedDoc = () => {
+    const d = oDoc() as ReturnType<typeof oDoc> & { entities: { overrides?: unknown }[] };
+    // …plus a field Rotate3D no longer persists (a renamed one the row still names: the load skips it, #1893 review).
+    d.entities[2].overrides = { 1: { Rotate3D: { axis: 'y', speed: 1, oldField: 5 } } };
+    return d;
+  };
+  const rotMarks = () => marksOf(idOf('R')).filter((k) => k.startsWith('Rotate3D.'));
+  beforeEach(async () => {
+    const d = statedDoc(); prefabs.set(O, d); setPrefabCache(O, d as never);
+    await load({ id: 's1893', version: 16, name: 'S', resources: [], entities: [{ id: 1, prefab: O, guid: OI, traits: { EntityAttributes: { name: 'OI', parentId: 0 } } }] } as unknown as SceneData);
+    clearHistory();
+    expect(rotMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']); // precondition: the load marks what the row states
+  });
+  /** The marks now, then after a save + reopen: they must match. */
+  async function marksAsReload(): Promise<string[]> {
+    const live = rotMarks();
+    await rebuild();
+    expect(rotMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+    return live;
+  }
+
+  // Mutation: drop the `markEnclosingStated` call from `reconcileOverrideMarks` — the re-add leaves both unmarked. And drop
+  // its `isPersistentTraitField` filter — the stale `oldField` the row names is marked live and not on a reload.
+  it('Remove Component, then Add Component: the re-added fields are marked', async () => {
+    removeTraitFromEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
+    addTraitToEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
+    expect(await marksAsReload()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+  });
+
+  // The walk's shape (seed 1294): the add's REDO runs the same reconcile. Same mutation.
+  it("Add Component's redo marks them too", async () => {
+    removeTraitFromEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
+    addTraitToEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
+    expect((await undoStep('undo')).did).toBe(true);
+    expect((await undoStep('redo')).did).toBe(true);
+    expect(await marksAsReload()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
   });
 });
 

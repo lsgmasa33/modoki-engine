@@ -23,7 +23,7 @@ import { missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRe
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { serializePrefab, parsedPrefabRows } from '../scene/prefabSerialize';
 import {
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, requireLinks,
+  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, rederiveUntaggedTree, detachPrefabInstance, reattachPrefabInstance, requireLinks,
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
@@ -892,6 +892,8 @@ async function createPrefab(
         untagEntityTreeAsInstance(id, savePath, prefab); // by the document's own guid (#1807)
         if (priorLinks) {
           reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id }), label);
+          // The frames the create swallowed anchor their members again: a node born since takes the guid a load derives (#1908).
+          rederiveUntaggedTree(id, guidRemap);
           // The links name the template the tree was built from, which can have changed since (#1820): onto the current one.
           rebasedByUndo = rebaseStaleInstancesSoon({ sources: priorSources() });
           relinkedChanged = relinkedFramesCheck(priorLinks);
@@ -916,6 +918,7 @@ async function createPrefab(
           else reportUndoFailure({ direction: 'Undo', label, detail: `the entity linked to ${savePath} no longer exists, so nothing was unlinked` });
           if (priorLinks) {
             reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
+            if (id != null) rederiveUntaggedTree(id, guidRemap); // as the create's undo above (#1908)
             rebasedByUndo = rebaseStaleInstancesSoon({ sources: priorSources() }); // as the create's undo above (#1820)
             relinkedChanged = relinkedFramesCheck(priorLinks); // as the create's undo above (#1830 close-out review)
           }

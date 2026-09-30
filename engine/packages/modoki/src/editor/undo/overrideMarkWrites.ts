@@ -12,7 +12,8 @@
  *  - {@link markOverrideIfInstance} marks unconditionally. It is what a DELIBERATE field edit does (the Inspector, a
  *    gizmo commit, agent `setTrait`): the user typed that value, so it stays an override even when it equals the base.
  *  - {@link reconcileOverrideMarks} applies the save's by-value rule: marked where the live value differs from the
- *    instance's base, unmarked where it equals it. It is for a write the user did not aim at that field: a sibling
+ *    instance's base, unmarked where it equals it — except a field a layer enclosing the instance STATES, which a load
+ *    marks whatever its value (I2) and so stays marked (#1893). It is for a write the user did not aim at that field: a sibling
  *    renumber rewrites every child's `sortOrder`, and marking them all would pin the whole child order of the
  *    instance, so a later template reorder or insert could never reach it (hub, 2026-09-28). The UI handles and a
  *    re-added trait use it too: the handle writes every axis of its field group, and a re-added trait is the
@@ -30,6 +31,7 @@
 
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
+import { isPersistentTraitField } from '../../runtime/core/ecs/traitSchema';
 import { findEntity, writeTraitField, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
 import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks, ROTATION_MARKS } from '../../runtime/loaders/overrideMarks';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -81,10 +83,13 @@ function fieldsOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Set<str
 }
 
 /** Settle the marks on `fields` of `meta` (every field the entity's trait holds when omitted) to the save's by-value
- *  rule: marked where the live value differs from the instance's base, unmarked where it equals it. A base that
+ *  rule: marked where the live value differs from the instance's base, unmarked where it equals it — and then marked,
+ *  whatever its value, where a layer enclosing the instance STATES it, as a load marks it (I2, #1893). A base that
  *  cannot be read marks, so what the screen shows is kept. No-op off an instance, for a tag, and for a trait the
  *  entity does not have. */
 export function reconcileOverrideMarks(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
+  // A tag has no values to diff, and needs no enclosing pass either: a load marks `Tag.` for one an enclosing row adds even
+  // where the scene removes it, and a Remove Component clears no mark, so a re-added tag finds its mark there (#1893 review).
   if (meta.name === 'PrefabInstance' || meta.category === 'tag') return;
   const m = memberEntity(entityId);
   if (!m || !m.entity.has(meta.trait)) return;
@@ -98,6 +103,26 @@ export function reconcileOverrideMarks(entityId: number, meta: TraitMeta, fields
     const differs = isRotation(f) ? rotationOff : off === null || off.has(f);
     if (differs) markOverride(m.entity, meta.name, f);
     else unmarkOverride(m.entity, meta.name, f);
+  }
+  // By value is not the whole rule: a field the layers enclosing the instance STATE is marked on a load whatever its
+  // value (I2), so unmarking it for equalling the base left the live world differing from the reload by that mark.
+  // Add Component's redo after a Create Prefab that moved the added trait into the new prefab's row did exactly that
+  // (#1893, seed 1294).
+  markEnclosingStated(m.entity, m.pi, [meta], fields);
+}
+
+/** Mark every field of `metas` (only `fields` when given) that the layers enclosing member `pi`'s instance STATE for
+ *  its row, exactly as a load marks them (docs/prefabs.md I2; `loadSceneFile.ts`' override apply): only the fields the
+ *  trait PERSISTS — a stale or renamed field the row still names is skipped there, so it is here (#1893 review). Every
+ *  write that settles marks has to leave them as a load does. */
+function markEnclosingStated(entity: NonNullable<ReturnType<typeof findEntity>>, pi: MemberPi, metas: readonly TraitMeta[], fields?: readonly string[]): void {
+  if (!pi.localId || !pi.rootInstanceId) return;
+  const stated = enclosingRowOverrides(pi.rootInstanceId)?.[pi.localId];
+  if (!stated) return;
+  for (const meta of metas) {
+    const fs = stated[meta.name];
+    if (!fs || typeof fs !== 'object') continue;
+    for (const f of Object.keys(fs)) if ((!fields || fields.includes(f)) && isPersistentTraitField(meta, f)) markOverride(entity, meta.name, f);
   }
 }
 
@@ -239,12 +264,7 @@ export function takeUnmarkedFromBase(entityId: number, traits?: readonly TraitMe
   }
   // A field the layers enclosing the instance STATE arrives override-marked on a load (docs/prefabs.md I2), so the
   // reload marks it: a restore that left it unmarked differed from the reload by that mark alone.
-  const stated = enclosingRowOverrides(root)?.[localId];
-  for (const meta of metas) {
-    const fs = stated?.[meta.name];
-    if (!fs || typeof fs !== 'object') continue;
-    for (const f of Object.keys(fs)) if (!fields || fields.includes(f)) markOverride(m.entity, meta.name, f);
-  }
+  markEnclosingStated(m.entity, m.pi, metas, fields);
 }
 
 /** Record each detached member's marks on it, right after the frame-ending that detached it (`endFrames`, or a

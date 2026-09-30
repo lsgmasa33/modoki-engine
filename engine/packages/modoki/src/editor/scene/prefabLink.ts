@@ -5,13 +5,13 @@ import { keptStateOf, restoreKeptState } from '../../runtime/core/ecs/keptOrphan
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { templateKeyOf, setTemplateKey, TemplateAddedKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
-import { endFrames, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
+import { endFrames, stampDerivedMemberGuids, applyGuidRemap, reloadDerivedGuids, identityTree, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { identitySubtree, noteFrameDoc, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { UndoRefusedError } from '../undo/undoFailure';
-import { durableGuid } from '../../runtime/core/assetRefRules';
+import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { clearOverrideMarks, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from '../undo/overrideMarkWrites';
@@ -174,6 +174,33 @@ function tagTree(
 export function unstampMemberGuids(remap: ReadonlyMap<string, string>): void {
   if (!remap.size) return;
   applyGuidRemap(new Map([...remap].map(([from, to]) => [to, from])));
+}
+
+/** After Create Prefab's undo has put the tree's prior links back: a member the create's stamp did NOT rename takes the
+ *  guid a load of the undone scene derives, every ref with it (#1908). The reversed rename ({@link unstampMemberGuids})
+ *  puts back what the stamp renamed, exactly as it was, and those are left alone (`restored`, the stamp's `from` side).
+ *  What it cannot reach is a node born AFTER the create: a prefab-edit save that added it to a swallowed instance's
+ *  template derived it under the created frame, which the undo just removed, and it kept that guid, so a reload or a
+ *  rebuild derived another and every ref to it dangled (hunt seed 7035). Each STORED root of the tree anchors its own
+ *  members again; the walk is the forward stamp's (`reloadDerivedGuids`: a rowed member is pinned, not derived). */
+export function rederiveUntaggedTree(rootEcsId: number, restored: ReadonlyMap<string, string>): void {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!piMeta || !eaMeta) return;
+  const world = getCurrentWorld();
+  const guidOf = (id: number) => (readTraitData(id, eaMeta) as { guid?: string } | null)?.guid ?? '';
+  const remap = new Map<string, string>();
+  const tree = identityTree(world);
+  for (const info of collectTree(rootEcsId, getAllEntities())) {
+    const pi = readTraitData(info.id, piMeta) as MemberPi | null;
+    const anchor = pi && isStoredRoot(pi, info.id) ? durableGuid(guidOf(info.id)) : '';
+    if (!anchor) continue;
+    for (const [e, next] of reloadDerivedGuids(world, info.id, anchor, tree)) {
+      const old = guidOf(e.id());
+      if (old && old !== next && !restored.has(old)) remap.set(old, next);
+    }
+  }
+  applyGuidRemap(remap, world);
 }
 
 /** Inverse of tagEntityTreeAsInstance — strip the PrefabInstance trait off the entities that
