@@ -8,7 +8,13 @@
  *  caches, prefab edit's world swaps and the undo stack. The fuzzer's own ops rarely reach the shape — Create Prefab on an
  *  instance ROOT (which unpacks it, #1814), then a saved edit of the SOURCE template under one of its members — so it is
  *  driven directly. Mutations: never refuse → the first case goes red (the redo reports did=true and logs "not tagging");
- *  always refuse → the second (accept) case goes red. */
+ *  always refuse → the second (accept) case goes red.
+ *
+ *  #1892 (hunt seed 3097): an Apply to the template since the create, UNDONE before the create's undo, restores the
+ *  template's rows with its #1774 mark raised (`stateRaisedMark`: version 8, `nextLocalId`). Same rows, same document:
+ *  the redo must re-link. It refused, because `staleFrames` compared by raw JSON and read the re-linked frame as expanded
+ *  from another document. Mutation: drop `version`/`nextLocalId`'s exemption from `documentContentKey` → the third case
+ *  goes red (the redo refuses "The tree changed since it was saved"). */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'fs';
@@ -32,6 +38,9 @@ import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreate
 import { createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { getAllEntities } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
+import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
+import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -113,6 +122,41 @@ describe("Create Prefab's redo after its undo rebased the tree (#1820)", () => {
     expect(r.did).toBe(true);
     expect(r.failed).toBeFalsy();
     expect(errors.filter((m) => m.includes('not tagging'))).toEqual([]);
+    expect(sourceOf(rootGuid)).toBe(newP);
+  }, 120_000);
+
+  it("#1892 — an Apply to the template since, undone first: same rows under a raised mark, the redo re-links to NewP", async () => {
+    const { f, rootGuid, newP } = await createdFromQ('redo-after-undone-apply');
+    // A second Q instance gains a child Z, and the Apply adds Z to Q (a new row: Q's mark goes up past it).
+    const q2 = await placePrefabFromPath(f.prefabs.Q.path, { tag: 'test', parentId: 0 });
+    await settle();
+    const { specs } = emptySpecs(q2!);
+    createEntityWithUndo('Create Z', q2!, specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...s.data, name: 'Z' } } : s)), () => {});
+    await settle();
+    const qBefore = getCachedPrefabSync(f.prefabs.Q.guid)!;
+    const keys = collectInstanceOverrideKeys(q2!, qBefore);
+    const applied = await applyToPrefabWithUndo(q2!, new Set([...keys.all, ...keys.nested]));
+    await settle();
+    expect(applied.applied, applied.refused).toBe(true);
+    expect(getCachedPrefabSync(f.prefabs.Q.guid)!.entities.map((e) => e.name)).toContain('Z');
+
+    // Undo back past the Apply and the child to the create: the Apply's undo puts Q's two rows back, mark kept.
+    for (let i = 0; i < 8 && sourceOf(rootGuid) === newP; i++) {
+      const u = await undoStep('undo');
+      await settle();
+      expect(u.did, `undo #${i + 1}`).toBe(true);
+    }
+    const qNow = getCachedPrefabSync(f.prefabs.Q.guid)! as typeof qBefore & { nextLocalId?: number };
+    // Premise: the restored Q holds the create-time rows, and differs from the create-time document in its mark alone.
+    expect(qNow.entities.map((e) => e.name)).toEqual(qBefore.entities.map((e) => e.name));
+    expect(qNow.nextLocalId, 'premise: the Apply\'s undo kept the raised mark').toBeGreaterThan((qBefore as { nextLocalId?: number }).nextLocalId ?? 0);
+    expect(sourceOf(rootGuid)).toBe(f.prefabs.Q.guid);
+    expect(childNames(rootGuid)).toEqual(['M']); // not rebased onto anything: Q holds what it held at the create
+
+    const r = await undoStep('redo');
+    await settle();
+    expect(r.failed?.error ?? '').toBe('');
+    expect(r.did).toBe(true);
     expect(sourceOf(rootGuid)).toBe(newP);
   }, 120_000);
 });

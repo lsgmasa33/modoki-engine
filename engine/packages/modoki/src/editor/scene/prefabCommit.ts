@@ -43,7 +43,7 @@ import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from 
 import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardDirtyAssets, assetWritesSettled, prefabWriteStarting, prefabWriteLanded } from './dirtyAssets';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { useEditorStore } from '../store/editorStore';
-import { localIdCounter, advanceLocalIdCounter, markUnstated, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
+import { localIdCounter, advanceLocalIdCounter, markUnstated, sameDocumentContent, canonicalJson, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -943,7 +943,7 @@ function withTopLevelNumbers(bytes: string, fields: Record<string, number>): str
     text = `${text.slice(0, open + 1)}${ws}${entries}${text.slice(open + 1 + ws.length)}`;
   }
   try {
-    if (canonical(JSON.parse(text)) !== canonical({ ...(before as object), ...fields })) return null;
+    if (canonicalJson(JSON.parse(text)) !== canonicalJson({ ...(before as object), ...fields })) return null;
   } catch { return null; }
   return bom + text;
 }
@@ -1042,7 +1042,7 @@ async function readState(path: string): Promise<'absent' | 'unreadable' | { byte
 
 /** Does `text` parse to `expected`, the way every prefab reader parses it (`fetchPrefabSource`: the zIndex migration
  *  on every entity)? An id-less file compares with the id the editor minted for it (#1664: Apply mints both sides').
- *  The localId high-water mark and the format version are not compared (#1774): this commit owns both where it raises the
+ *  The localId high-water mark and the format version are not compared (#1774, `sameDocumentContent`): this commit owns both where it raises the
  *  mark (`contentFor` stamps a restore with the version that claims it), and only ever raises them, so a file that
  *  differs from what the caller read in those alone holds nobody's change to protect. An undo's redo is the case: it is
  *  conditional on the bytes the undo recorded, which predate the mark the undo's own write had to keep. */
@@ -1054,12 +1054,10 @@ export function prefabTextIsDocument(text: string, doc: PrefabFile): boolean {
 
 function sameDocument(text: string, expected: PrefabFile): boolean {
   try {
-    const parsed = parsePrefabBytes(text) as PrefabFile & { nextLocalId?: unknown };
+    const parsed = parsePrefabBytes(text) as PrefabFile;
     if (!parsed || !Array.isArray(parsed.entities)) return false;
     if (!parsed.id && expected.id) parsed.id = expected.id;
-    const want = JSON.parse(JSON.stringify(expected)) as PrefabFile & { nextLocalId?: unknown };
-    for (const d of [parsed, want] as unknown as Array<Record<string, unknown>>) { delete d.nextLocalId; delete d.version; }
-    return canonical(parsed) === canonical(want);
+    return sameDocumentContent(parsed, expected); // the one rule (#1892): the mark and the version aside
   } catch { return false; }
 }
 
@@ -1070,11 +1068,3 @@ function expectsDocument(expected: PrefabExpectation, doc: PrefabFile): boolean 
   return prefabTextIsDocument(typeof expected === 'string' ? expected : jsonFileBody(expected), doc);
 }
 
-/** JSON with every object's keys sorted: two parses of one document compare equal whatever order a writer put them in. */
-function canonical(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-  if (v && typeof v === 'object') {
-    return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(v);
-}

@@ -13,6 +13,7 @@ import { collectTransientSubtreeIds } from './authoringScope';
 import { isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { durableGuid, isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { documentContentKey } from '../../runtime/core/localIdCounter';
 import { levelDoc, captureDoc } from './prefabBase';
 import { type PrefabEntity, type PrefabFile } from './prefab';
 import { getCachedPrefabSync, getPrefabSource, prefabCache } from './prefabCache';
@@ -163,13 +164,14 @@ export function rebuildTeardown(
 
 // ── A live frame built from another version of its document (#1483) ────────────────────────────────
 
-/** A document's content, memoised by object — two copies of one file (the runtime's and the editor's, each
- *  parsed and migrated the same way) compare equal. */
+/** A document's content ({@link documentContentKey}, the one "same document" rule — #1892), memoised by object: two
+ *  copies of one file (the runtime's and the editor's, each parsed and migrated the same way) compare equal, and so does
+ *  a restore that states a raised #1774 mark on the same rows (an Apply's undo). */
 const docText = new WeakMap<object, string>();
 
 function sameDocument(a: object, b: object): boolean {
   if (a === b) return true;
-  const text = (d: object) => { let t = docText.get(d); if (t === undefined) { t = JSON.stringify(d); docText.set(d, t); } return t; };
+  const text = (d: object) => { let t = docText.get(d); if (t === undefined) { t = documentContentKey(d); docText.set(d, t); } return t; };
   return text(a) === text(b);
 }
 

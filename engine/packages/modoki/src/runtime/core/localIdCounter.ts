@@ -63,3 +63,37 @@ export function markUnstated(doc: { version?: unknown; nextLocalId?: unknown } |
   if (!(typeof doc.version === 'number' && doc.version >= LOCAL_ID_MARK_VERSION)) return false;
   return positiveInt(doc.nextLocalId) === 0;
 }
+
+/** A prefab document's CONTENT as one string: what two copies of one document share whoever parsed them, every object's
+ *  keys sorted, and the mark (`nextLocalId`) and the format `version` left out. Those two are the ONLY fields a write
+ *  changes on a document it does not otherwise change: a restore that must keep a mark the undone write raised
+ *  (`stateRaisedMark`, an Apply's undo) states the mark and the version that claims it on the very rows it restores.
+ *  Nothing that expands a frame reads either: the version gates the mark ({@link markUnstated}), a newer build's refusal
+ *  and the restore's stamping, and the mark is read by the next write's allocator, always from the cached document. So a
+ *  document differing in them alone is the same document.
+ *
+ *  The ONE rule for "the same document" (#1892). There were two copies: `prefabCommit`'s (is a file still the document a
+ *  step recorded?) got #1774's exemption, and the frame-staleness one (`staleFrames`: was this frame expanded from another
+ *  document than the cache holds?) did not, so an Apply's undo made every frame expanded before the Apply read as stale
+ *  and rebased it — and Create Prefab's redo, told its undo had rebased the tree, refused in a clean segment. */
+export function documentContentKey(doc: object): string {
+  // Through JSON first, as a write would put it: an undefined field is no field.
+  const d = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+  delete d.nextLocalId;
+  delete d.version;
+  return canonicalJson(d);
+}
+
+/** {@link documentContentKey}'s equality: the same object, or the same content. */
+export function sameDocumentContent(a: object, b: object): boolean {
+  return a === b || documentContentKey(a) === documentContentKey(b);
+}
+
+/** JSON with every object's keys sorted: two parses of one document compare equal whatever order a writer put them in. */
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}

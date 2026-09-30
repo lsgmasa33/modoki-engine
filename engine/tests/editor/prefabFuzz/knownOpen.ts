@@ -62,6 +62,21 @@ export const KNOWN_OPEN: KnownOpen[] = [
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
+    issue: 1892,
+    what: "hunt seed 3097: an Apply after a Create Prefab, undone on the way back, restores the template with its #1774 mark raised (version 8, nextLocalId) on the same rows. staleFrames compared by raw JSON, read the frame the create's undo re-linked as stale and rebased it, and the create's redo refused (\"The tree changed since it was saved\") in a clean segment. One \"same document\" rule now (`documentContentKey`), which leaves the mark and the version out",
+    repro: [
+      { kind: 'copy', u: [0.08305942406877875, 0.5127813585568219, 0.33668679813854396, 0.29134805290959775, 0.04606970283202827, 0.6994702997617424, 0.7973081469535828, 0.8558187852613628] },
+      { kind: 'removeComponent', u: [0.8884330119471997, 0.10277236229740083, 0.46051879064179957, 0.07925234036520123, 0.6844077315181494, 0.02518709097057581, 0.3248041793704033, 0.551607099827379] },
+      { kind: 'delete', u: [0.13102866895496845, 0.31086081732064486, 0.750175739871338, 0.42185700964182615, 0.35874674771912396, 0.2673363380599767, 0.045505442190915346, 0.7950462235603482] },
+      { kind: 'apply', u: [0.5542727666907012, 0.9195215618237853, 0.3982940942514688, 0.6734568581450731, 0.5898221214301884, 0.316782349254936, 0.16543398541398346, 0.34312310721725225] },
+      { kind: 'undo', u: [0.692610566271469, 0.608316556783393, 0.2731552547775209, 0.118228311650455, 0.725551359821111, 0.49553341837599874, 0.1927620843052864, 0.13829107326455414] },
+      { kind: 'createPrefab', u: [0.24938192474655807, 0.28929753159172833, 0.39347980613820255, 0.7267137633170933, 0.06174082471989095, 0.5819875418674201, 0.29204655648209155, 0.41593156452290714] },
+      { kind: 'paste', u: [0.8302914018277079, 0.514023075113073, 0.21629563276655972, 0.5112984701991081, 0.9802664720918983, 0.6129663849715143, 0.35419818270020187, 0.37987144477665424] },
+      { kind: 'reparent', u: [0.1703200212214142, 0.6847647691611201, 0.284667911240831, 0.15500733256340027, 0.17932445579208434, 0.7033987145405263, 0.29029784305021167, 0.9917256725020707] },
+      { kind: 'apply', u: [0.2317333840765059, 0.7318516878876835, 0.27845529932528734, 0.9824815569445491, 0.9847806878387928, 0.03567962977103889, 0.2998678144067526, 0.5110596420709044] },
+    ],
+  },
+  {
     issue: 1884,
     what: "#1880 T hunt seed 1021: Create Prefab's capture keyed a scene-added node under a nested instance (M, duplicated under a Q root), and the create's undo left the key on the now-plain node, which the save drops (live and reloaded disagreed). The tag's undo now takes off the keys the create put on (`tagCreatedPrefab`, `unkeyed`)",
     repro: [

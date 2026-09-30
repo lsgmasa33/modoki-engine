@@ -1035,6 +1035,15 @@ problem with random fileIDs instead; the owner kept sequential numbers, which ar
     both where it raises the mark, and only ever raises them. So a file that differs from what the caller
     read in those alone holds nobody's change. The case this covers is an undo's redo: its expectation is
     the bytes the undo recorded, which predate the mark the undo had to keep.
+  - **So does every other "is this the same document?" question, through ONE rule** (#1892):
+    `documentContentKey` / `sameDocumentContent` in `localIdCounter.ts`. The other caller is the
+    stale-frame compare (`staleFrames`, I3): was this frame expanded from another document than the cache
+    holds? It had its own copy, a raw `JSON.stringify`, which never got the exemption. An Apply's undo
+    parks the pre-Apply rows with the mark raised, so every frame expanded before that Apply read as stale,
+    and each rebase caller respawned it for nothing. Create Prefab's undo also took the rebase as "the template
+    changed since the create", and its redo refused in a clean segment (hunt seed 3097). The mark and the
+    version change no row, and nothing that expands a frame reads either one, so a frame that differs in
+    them alone is current.
   - **The route's refusal counts as a conflict.** `prefab-mark-lowered` from the route means the file's
     mark rose past what the write was raised to (a later undo already kept it). The commit then re-reads
     the file and raises from it, like any other precondition miss. Without this, undoing two minting Applies
