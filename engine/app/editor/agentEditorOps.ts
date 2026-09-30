@@ -3796,7 +3796,16 @@ export function registerEditorAgentOps(): void {
         );
       }
       const editing = useEditorStore.getState().editingPrefab!;
-      const { saved, warnings, conflict } = await savePrefabEditReport({ overwrite: p.overwrite === true });
+      const { saved, warnings, conflict, notAuthored } = await savePrefabEditReport({ overwrite: p.overwrite === true });
+      // A world that is not authored is a REFUSAL with its real exits, as the posed-world refusals of the other ops are
+      // (#1873 close-out review) — Play included, since this writes a file (the create op's rule).
+      if (!saved && notAuthored) {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `prefab edit-save refused: ${warnings.join('; ')}. NOTHING was written, and the edit is still open and unsaved.`,
+          { options: getRunMode() === 'playing'
+            ? ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"]
+            : posedWorldExits().options });
+      }
       if (!saved && conflict) {
         throw new OpRefusal('REFUSED_BY_OP',
           `prefab edit-save refused: ${editing.path} changed on disk since this edit opened it (a save elsewhere, an outside edit or a git pull), so NOTHING was written and the edit is still open and unsaved.`,
@@ -3810,12 +3819,13 @@ export function registerEditorAgentOps(): void {
         // answers 409 with why, and without this the agent got three guesses and a pointer to a
         // console it cannot read. A produced reason nobody reads is this repo's #1 defect class, and
         // it shipped here once already (close-out review R2).
-        const why = warnings.length ? ` Reason: ${warnings.join('; ')}` : '';
-        throw new Error(
-          `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
-          'was not found in the edit world, serialization produced no prefab, or the file write was ' +
-          `rejected.${why || ' See the editor console for the [PrefabEdit] error.'}`,
-        );
+        // …and every failure the save makes carries one (#1873: the root-not-found branch answered the guesses below with
+        // no way to tell which). The guesses stay for a failure that somehow reports none.
+        throw new Error(warnings.length
+          ? `prefab edit-save FAILED for ${editing.path} — NOTHING was written: ${warnings.join('; ')}`
+          : `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
+            'was not found in the edit world, serialization produced no prefab, or the file write was ' +
+            'rejected. See the editor console for the [PrefabEdit] error.');
       }
       // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).
       return { ok: true, path: editing.path, guid: editing.guid, saved: true, ...(warnings.length ? { warnings } : {}) };

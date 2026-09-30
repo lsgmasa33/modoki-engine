@@ -444,9 +444,10 @@ const DECLS: Record<string, Decl> = {
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
       + "persists:'both' because action:'create' and 'apply' WRITE the .prefab.json "
       + "(commitPrefabWrite, conditional on what was read — #1692) while instantiate/detach/overrides/revert are "
-      + "live-only; the undo entry covers the live tagging/rebuild only, never a file write "
-      + '(undoing an overwrite would destroy an asset the agent never created — apply is the one '
-      + "exception: its undo DOES restore the pre-apply .prefab.json, because that write IS the op). "
+      + "live-only. No undo writes a file (#1868): apply's undo restores the pre-apply document IN MEMORY and parks it, "
+      + "so the file keeps the applied bytes until modoki_save_all writes the park (or modoki_discard_asset_edits drops it). "
+      + "create over an existing path is a Replace (the file keeps its guid); its undo unlinks the tree only and does NOT "
+      + "put the replaced document back (#1873 — the Hierarchy's Replace undo does). "
       + "'overrides' is READ-only discovery — it walks the SAME override-key enumeration "
       + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
       + "strings, so an agent can pick `keys` without guessing the "
@@ -470,8 +471,10 @@ const DECLS: Record<string, Decl> = {
       + "different values (two nested instances of it, applied into it) are a CONFLICT: refused whole, REFUSED_BY_OP, "
       + 'both keys in `options` — never last-write-wins. '
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
-      + 'prefab scene (world-destructive, so it takes `discardUnsaved` like load-scene, and it saves the '
-      + "current scene on the way in unless `discardUnsaved` skips that save, #1745), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
+      + 'prefab scene (world-destructive, so it refuses REQUIRES_SAVE over unsaved work like load-scene — scene edits, which '
+      + '`discardUnsaved` drops, and parked entries such as an undone Apply, which it does not: modoki_save_all first; '
+      + 'the Assets double-click saves scene edits instead, U21 — '
+      + "and it saves the current, clean scene on the way in unless `discardUnsaved` skips that save, #1745), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
       + 'reloads the return scene (also world-destructive, so it refuses on unsaved prefab edits and takes '
       + '`discardUnsaved` too, #1424). None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',
@@ -831,7 +834,7 @@ const DECLS: Record<string, Decl> = {
   modoki_validate_prefab: {
     kind: 'read', method: 'GET', route: '/api/validate-prefab', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/prefabs/probe.prefab.json' },
-    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement. ⚠️ Reads the prefab FILE ON DISK and DISCLOSES when the editor holds it unsaved (#889): same `staleInputs`/`staleInputsUnknown`/`staleInputsNote` fields, absent when clean. PATH-SCOPED, unlike its scene sibling — this pass consults no resolver, so only THIS document being unsaved can change the answer, which in practice means the prefab is open in prefab-edit.",
+    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement. ⚠️ Reads the prefab FILE ON DISK and DISCLOSES when the editor holds it unsaved (#889): same `staleInputs`/`staleInputsUnknown`/`staleInputsNote` fields, absent when clean. PATH-SCOPED, unlike its scene sibling — this pass consults no resolver, so only THIS document being unsaved can change the answer: the prefab open in prefab-edit, or a prefab an undone Apply or Replace parked (#1868).",
   },
   modoki_unused_assets: {
     kind: 'read', method: 'GET', route: '/api/unused-assets', requires: ['project'],

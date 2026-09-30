@@ -28,7 +28,7 @@ import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loa
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
-import { whyWorldNotAuthored } from './authoredWorld';
+import { notAuthoredExit, whyWorldNotAuthored } from './authoredWorld';
 import { canEdit } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -747,6 +747,9 @@ export interface PrefabEditSaveReport {
   /** The file changed on disk since this edit opened it (or last saved it), and was left as it is (#1692): nothing
    *  was written, and the edit is still open and unsaved. Saving again with `overwrite` replaces what is there. */
   conflict?: boolean;
+  /** The save was refused because the live world is not authored (a scrub, a preview, Play, a restore landing or
+   *  failed): `whyWorldNotAuthored`'s reason, also phrased in `warnings`. A refusal, not a failure (#1873). */
+  notAuthored?: string;
 }
 
 /** How a prefab-edit save treats a file that changed on disk under the open edit (#1692). */
@@ -800,10 +803,21 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
       'Saving now would bake preview/play mutations (a posed rig, a spawned prefab) into the prefab ' +
       'file, and every scene that instantiates it would inherit them. Exit preview / stop first.',
     );
-    return NOT_SAVED;
+    // The reason goes in the report too (#1873): the agent `edit-save` answered three guesses, none of them this one, and
+    // pointed at a console it cannot read. Cmd+S phrases a run-mode refusal from the mode itself. The Play/preview exit is
+    // named only while one is running: a restore still landing, or one that FAILED, reads 'stopped' and has its own way
+    // out in its reason (close-out review).
+    const exit = notAuthoredExit(notAuthored) ?? (canEdit() ? undefined : 'exit the preview or stop Play first');
+    return {
+      saved: false, notAuthored,
+      warnings: [`${notAuthored} — saving now could write a preview or Play pose into the prefab${exit ? `; ${exit}` : ''}`],
+    };
   }
   const serialized = serializePrefabEditWorld(editingPrefab.guid);
-  if ('error' in serialized) { console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`); return NOT_SAVED; }
+  if ('error' in serialized) {
+    console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`);
+    return { saved: false, warnings: [serialized.error] };
+  }
   const { prefab, runtimeExcluded, rows } = serialized;
   // The version `prefab` represents, captured BEFORE the write. `commitPrefabWrite` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as

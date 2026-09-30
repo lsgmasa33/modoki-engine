@@ -99,8 +99,14 @@ import { setCurrentScenePath, hasUnsavedChanges } from '../../packages/modoki/sr
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { pushAction } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
+import { runAgentOp } from '../../app/debug/agentBridge';
+import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { EntityAttributes } from '../../packages/modoki/src/runtime/core/traits/EntityAttributes';
+import { PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEditGuids';
 
 registerAllTraits();
+registerEditorAgentOps();
 if (typeof globalThis.localStorage === 'undefined') {
   const store = new Map<string, string>();
   (globalThis as unknown as { localStorage: Storage }).localStorage = {
@@ -255,5 +261,45 @@ describe("the save numbers its rows from what the edit opened, not from the cach
     expect(await quietly(() => savePrefabEditReport({ overwrite: true }))).toMatchObject({ saved: true });
     expect(onDisk().rootLocalId).toBe(1);
     expect(onDisk().entities[0]!.localId).toBe(1);
+  });
+});
+
+/** #1873 (third-pass review, lens ⑦): a save refused because the world is not authored (a scrub, a preview, Play) says
+ *  WHY in its report, so the agent `edit-save` names the cause. It answered "the root was not found, serialization
+ *  failed, or the write was rejected — see the console", none of them true, where Cmd+S named the scrub. */
+describe('a save refused in a world that is not authored says why, on the agent route too (#1873)', () => {
+  it('the report and the agent op name the scrub; once stopped, the same save lands', async () => {
+    edit();
+    setRunMode('scrub');
+    const report = await quietly(() => savePrefabEditReport());
+    expect(report.saved).toBe(false);
+    expect(report.warnings.join(' ')).toMatch(/scrub/);
+    const err = await quietly(() => runAgentOp('prefab', { prefabAction: 'edit-save' }).catch((e: Error) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/scrub/);
+    expect(err.message).not.toMatch(/root was not found/);
+    // A refusal with its real exits, like the other ops' posed-world refusals — not a bare Error that reads as a crash.
+    expect((err as Error & { code?: string }).code).toBe('REFUSED_BY_OP');
+    expect((err as Error & { options?: string[] }).options?.length).toBeGreaterThan(0);
+    expect(route.writes).toBe(0);
+    // The accept side: the refusal is the run mode's, not the save's.
+    setRunMode('stopped');
+    expect(await quietly(() => savePrefabEditReport())).toMatchObject({ saved: true });
+    expect(route.writes).toBe(1);
+  });
+
+  it("a save that cannot find the edit world's root says so too, where the agent listed three guesses", async () => {
+    edit();
+    for (const e of [...getCurrentWorld().query(EntityAttributes)]) {
+      if ((e.get(EntityAttributes) as { guid?: string } | undefined)?.guid === PREFAB_EDIT_ROOT_GUID) e.destroy();
+    }
+    const report = await quietly(() => savePrefabEditReport());
+    expect(report).toMatchObject({ saved: false });
+    expect(report.notAuthored).toBeUndefined();
+    expect(report.warnings.join(' ')).toMatch(/prefab root not found/);
+    const err = await quietly(() => runAgentOp('prefab', { prefabAction: 'edit-save' }).catch((e: Error) => e)) as Error;
+    expect(err.message).toMatch(/prefab root not found/);
+    expect(err.message).not.toMatch(/Either the prefab root/);
+    expect(route.writes).toBe(0);
   });
 });

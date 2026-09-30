@@ -136,10 +136,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'This tool trashes EXACTLY the paths you name. So deleting a .glb ' +
       'through it ORPHANS every mesh and material generated from it, with no way back except the ' +
       'OS trash. Name the sidecars and generated files yourself, or delete through the panel.\n\n' +
-      'It also does NOT evict the renderer\'s scene-scoped caches (mesh/material/prefab/particle): ' +
+      'It also does NOT evict the renderer\'s scene-scoped caches (mesh/material/particle): ' +
       'an asset already loaded into the open scene stays live until the next scene swap, even ' +
-      'though its file is gone. The panel\'s delete has the same limit — this is not a difference ' +
-      'between them.\n\n' +
+      'though its file is gone. A prefab IS evicted: its live instances stay as they are, and the ' +
+      'next reload shows a Missing Prefab. The panel\'s delete does the same.\n\n' +
       'REFUSES (REQUIRES_SAVE) while the editor holds a human\'s UNSAVED edit for a path you are ' +
       'deleting, or for anything inside a folder you are deleting: the delete would destroy it. ' +
       'modoki_save_all first, or discardUnsaved:true. An unsaved live-world scene edit does not ' +
