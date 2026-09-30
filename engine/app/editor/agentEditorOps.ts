@@ -3467,13 +3467,9 @@ export function registerEditorAgentOps(): void {
       }
       const name = getAllEntities().find(e => e.id === entityId)?.name ?? String(entityId);
       // Same entry the Hierarchy "Detach Prefab" menu pushes (`detachPrefabInstanceWithUndo`).
+      // A plain (non-instance) entity is refused above, by `detachRefusal`, as every other non-root is (#1874 close-out
+      // review); it used to reach here and fail after the fact (C7 re-audit).
       const snapshot = detachPrefabInstanceWithUndo(entityId, `Detach prefab "${name}"`, '[prefab detach]');
-      // It returns [] for a plain (non-instance) entity, recording nothing. Reporting {ok:true, detached:0} let an
-      // agent believe it had unpacked a prefab it hadn't — now a hard failure, matching the other structural ops.
-      // (C7 re-audit.)
-      if (!snapshot.links.length) {
-        throw new Error(`prefab detach: entity ${entityId} is not a prefab instance (nothing to unpack). Only an instantiated prefab can be detached.`);
-      }
       return { ok: true, detached: snapshot.links.length, saved: false };
     }
     // ── Override discovery/apply/revert (#2Tkw8CiWRATmHck2ze7q) ──

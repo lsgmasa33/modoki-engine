@@ -85,7 +85,7 @@ export function flatKeyedSteps(steps: readonly MemberStep[], doc: TemplateKeyDoc
 /** The keys the prefabs `doc` NESTS declare — every document reachable through its rows' and its reference nodes'
  *  `prefab`, recursively — and not `doc`'s own. What a prefab-edit copy keeps (`copySnapshot`): a key a deeper
  *  template declares names that template's node, which the copy still is; any other key is the edited document's, or
- *  one no document declares yet (an earlier copy's this session, a Detach's stale marker), and mints (#1809). */
+ *  one no document declares yet (an earlier copy's this session; a stale marker, as a Detach left before #1874), and mints (#1809). */
 export function nestedDeclaredKeys(doc: TemplateKeyDoc, readPrefab: (guid: string) => TemplateKeyDoc | null | undefined): Set<string> {
   const out = new Set<string>();
   const seen = new Set<string>();
@@ -249,7 +249,12 @@ export function recoverTemplateKey(
     seen.add(cur);
     const node = nodeOf(cur);
     if (!node) break;
-    if (node.guid) {
+    // Only an ancestor carrying `PrefabInstance` is tried as a template key's anchor. The anchor is always a prefab
+    // instance's root (a stored root, or a template reference node's); a member carries one too and is tried harmlessly,
+    // since no derive anchors there. A plain ancestor never is an anchor: a keyed plain node is a step on the path, and a
+    // plain entity with a guid is an unpacked one, whose children a template no longer adds. Tried as an anchor, a Detach's former reference root handed its unpacked child
+    // the key back — live, and at the next load's heal — and the child read as the template's again (#1874 review F1).
+    if (node.guid && node.pi) {
       for (const k of keys) {
         if (deriveMemberGuid(node.guid, [...steps, addedKeyStep(k)]) === self.guid) { memo.set(ecsId, k); return k; }
       }

@@ -322,8 +322,9 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
    *  and 0 always under `legacyKeyedParent`. `pastUnmarked`: past an UNMARKED plain ancestor too — only for the heal
    *  (`derivesFromAsKeyed`), where that ancestor is a keyed parent that lost its marker and stopping left the child
    *  unrecoverable (close-out review). The DERIVE stops there: a plain ancestor it cannot vouch for is also a Detach's
-   *  unpacked node (Detach leaves markers), and climbing past two of those under one instance gave both copies of a
-   *  duplicate one guid (close-out re-review). */
+   *  unpacked node, and climbing past two of those under one instance gave both copies of a duplicate one guid while
+   *  Detach left their markers (close-out re-review; Detach strips them since #1874, and the stop stays for any other
+   *  stale marker). */
   const keyedFrameRoot = (n: IdentityNode, pastUnmarked = false): number => {
     if (opts.legacyKeyedParent) return 0;
     const seen = new Set<number>([n.id]);

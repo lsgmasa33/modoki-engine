@@ -801,7 +801,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | # | Behaviour | Unity | Modoki | Verdict |
 |---|---|---|---|---|
 | U16 | Unpack | Makes the instance plain GameObjects with its overrides baked in. **Nested instances stay instances.** [M6 `UnpackingPrefabInstances`] | None. | **missing**, M: the nested frames become stored roots that carry their enclosing layer's edits as their own. The building block exists: `promoteOwnedRoots` / `endFrames` already turn owned nested roots into stored roots. |
-| U17 | Unpack Completely | Repeats until only plain GameObjects remain. Undoable. Acts on an instance root: `UnpackPrefabInstance` throws on a non-root, and the Hierarchy greys Unpack on one. [M6 `UnpackingPrefabInstances`, S6 `PrefabUtility.UnpackPrefabInstance`] | "Detach Prefab" (Hierarchy menu, agent `detach`): `detachPrefabInstance` strips `PrefabInstance` from the frame and every nested frame, bakes the values, and is undoable (`detachPrefabInstanceWithUndo`). Anything but an OUTERMOST instance root is refused on both surfaces, naming that root: a MEMBER (#1764, hub ruling on the owner's Unity rule) and, since #1869, an OWNED nested root too — Unity's `UnpackPrefabInstance` throws unless `IsOutermostPrefabInstanceRoot` (CS `Editor/Mono/Prefabs/PrefabUtility.cs`, `UnpackPrefabInstance`'s argument check: "UnpackPrefabInstance must be called with a root Prefab instance GameObject."). Unpacking a nested prefab restructured its outer instance, and a Revert of that instance then respawned the nested row beside the unpacked copy on one guid (#1792's third route). A stored root the scene added inside another instance is its own outermost root and detaches. (#1831's G1 study found this divergence first, from hunt seed 6302, which starts from such a detach.) `detachRefusal` is the one predicate. The agent refuses with its text, the Hierarchy's row is greyed with it as hover text, and the shared wrapper refuses a member itself. Before, the Hierarchy quietly detached the root, and the agent unpacked only the member and answered ok. | match |
+| U17 | Unpack Completely | Repeats until only plain GameObjects remain. Undoable. Acts on an instance root: `UnpackPrefabInstance` throws on a non-root, and the Hierarchy greys Unpack on one. [M6 `UnpackingPrefabInstances`, S6 `PrefabUtility.UnpackPrefabInstance`] | "Detach Prefab" (Hierarchy menu, agent `detach`): `detachPrefabInstance` strips `PrefabInstance` from the frame and every nested frame, bakes the values, and is undoable (`detachPrefabInstanceWithUndo`). **It also strips the template key** (`TemplateAddedKey`) from every node of that identity subtree, and its undo puts them back by guid (#1874). The key is template identity on a node a template added, which carries no link, so the link strip never visited it. Unpacked and moved under another instance of the same prefab, the node still read as that prefab's node: its next move was refused as a restructure, and an edit of that instance's own node saved both on one guid (I7). Unity: an unpacked object refers to no prefab. Its guid stays, as Unity keeps references across an unpack, and nothing re-derives the key from it: key recovery (`recoverTemplateKey` and the load's heal) anchors only at a prefab INSTANCE, and the roots the unpacked nodes derived from are plain now. It used to try any ancestor with a guid, so a node a template adds directly under a template reference root got its key back from the unpacked root (the #1874 review). A Detach aimed at anything but an instance root is refused (`detachRefusal`, the agent `detach`'s answer; the Hierarchy offers it on instances only): a node a template adds is part of its instance and is refused naming that instance's root, as a member is, and a plain entity nothing supplies is refused as not an instance. Before, a template node holding a nested instance unpacked it, lost its own key, and could then move out of its instance. Detach has no one-level mode, so there is no surviving nested frame whose keys would have to stay. Measured live and across a reload: `prefabDetachTemplateKeys.test.ts`. Anything but an OUTERMOST instance root is refused on both surfaces, naming that root: a MEMBER (#1764, hub ruling on the owner's Unity rule) and, since #1869, an OWNED nested root too — Unity's `UnpackPrefabInstance` throws unless `IsOutermostPrefabInstanceRoot` (CS `Editor/Mono/Prefabs/PrefabUtility.cs`, `UnpackPrefabInstance`'s argument check: "UnpackPrefabInstance must be called with a root Prefab instance GameObject."). Unpacking a nested prefab restructured its outer instance, and a Revert of that instance then respawned the nested row beside the unpacked copy on one guid (#1792's third route). A stored root the scene added inside another instance is its own outermost root and detaches. (#1831's G1 study found this divergence first, from hunt seed 6302, which starts from such a detach.) `detachRefusal` is the one predicate. The agent refuses with its text, the Hierarchy's row is greyed with it as hover text, and the shared wrapper refuses a member itself. Before, the Hierarchy quietly detached the root, and the agent unpacked only the member and answered ok. | match |
 | U18 | Prefab Mode, isolation | The scene is hidden and the prefab is edited alone. [M6 `EditingInPrefabMode`] | Double-click opens it alone (`openPrefabForEditing`). § "Prefab edit mode". | match |
 | U19 | Prefab Mode, in context | The scene stays visible but locked, shown gray, normal or hidden. It is the default for Open from the Inspector. [M6 `EditingInPrefabMode`] | None. | **missing**, L |
 | U20 | Opening and nesting Prefab Mode | Open button / P key on an instance; opening a nested prefab stacks a breadcrumb. [M22 `EditingInPrefabMode`] | Only from the Assets panel. `editingPrefab` holds one prefab, and the breadcrumb is always `scene › prefab`. The Inspector's source link only selects the asset. | **missing**: Open S, the stack M |
@@ -1857,6 +1857,37 @@ Tests: `engine/tests/editor/applyUndoIfMatch.test.ts` (memory, park and refusal)
 prefabs), `untitledApplyUndo.test.ts` and `prefabEditApplyUndo.test.ts` (the world rules, each mutation-checked),
 `applyPrefabDirtiesBase.test.ts`, `prefabPark.test.ts` (the park across a world swap, the flush, Overwrite/Cancel), and
 `engine/packages/modoki/tests/editor/applyToPrefabUndo.test.ts` (no scene save).
+
+### A capture that is RESPAWNED takes its reference nodes as rows; a capture that is READ keeps them legacy (#1826)
+
+A live capture of an instance's structure has two kinds of consumer, and they need a reference node (an `added` node
+carrying `prefab`, scene-added or template-added) in two different forms. **Do not fold this back into one form:** each
+half is load-bearing, and each has a test that goes red without it.
+
+- **Respawned** (a rebuild re-spawns the node from the capture): Revert, Apply's undo side, `refreshInstances`, and the
+  nested-frame re-apply, in all three of its channels (the whole lists, the diff's `own`, and a node row's `own`, the
+  scene's nodes under a template node it matched). These go through `captureStructureForRespawn` / `inRespawnForm`
+  (`prefabRebuild.ts`), which map the nodes onto the same frame captured with `{ rows: true }` through the SAVE's own map
+  (`writerFormOf`, keeping their placement), so the save and the respawn cannot state a node two ways. A channel missed is
+  the bug again: the node row's `own` was, until the close-out re-review and the side-effect hunt (seed 6068 in full)
+  found it. The respawn runs the loader's
+  one spawner, and the LEGACY channels fold wrongly there against a template member row: a `nestedStructure` slot owns
+  its frame and drops the inner layers' member values, and a `nestedOverrides` value loses to them. The result was a
+  template value lost live until a reload, or a scene edit lost outright (live and saved). The invariant is **what is
+  respawned equals what is saved**. Mechanism and measurements:
+  [prefab-structural-overrides.md](./prefab-structural-overrides.md) § the member-row bullet "Rows are written in the scene
+  FILE form".
+- **Read** (compared, listed, promoted): the comparisons against the chain's nodes (`diffFrameAdded`,
+  `subtractChainStructure`, the save's nested-frame diff), the override listing, and Apply's promotion into a template
+  (`insertAddedSubtree`, `toTemplateNodes`). These take `captureInstanceStructure` itself, in the legacy form. In rows form,
+  a template reference node compared as edited and was restated on every save. And the promotion, which reads the localId
+  channels, dropped the members' edits of the node it promoted: the first #1826 fix did that by capturing rows at the
+  source (its close-out review's F1).
+
+Tests: `engine/tests/editor/prefabPastedReferenceRebuild.test.ts`, which also asserts each node is respawned WHERE it sat.
+With no swap at the respawn, the rebuild cases go red; with none on a node row's `own`, its two cases; with the placement
+dropped, the two nested-frame cases; with the swap moved to the source, the promotion case and the template-added node
+case.
 
 ### A capture reads the document the frame was EXPANDED from (#1483)
 

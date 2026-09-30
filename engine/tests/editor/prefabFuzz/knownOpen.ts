@@ -7,7 +7,8 @@
  *
  *  Every entry carries a minimized repro. The self-test in prefabFuzz.test.ts runs it and
  *  asserts it still fails as described: once the bug is fixed that test goes red, which forces the entry out. Keep an
- *  entry only while its issue is open. */
+ *  entry only while its issue is open — or, for a finding the hub RECORDED as not worth fixing under the Unity line, while
+ *  that ruling stands (the entry quotes it). */
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
@@ -24,12 +25,43 @@ export interface KnownOpen {
 
 // Retired by #1869, whose refusals (a supplied object is not moved, reordered, detached out of its instance or saved as
 // a prefab of its own — Unity's rule) left their only route unreachable, and which a 300-seed hunt with the re-aimed ops
-// and a sweep of legal variants did not re-find: #1792 (every route refused; closed), #1808, #1826, #1829, #1851, and one
+// and a sweep of legal variants did not re-find: #1792 (every route refused; closed), #1808, #1826 (later re-found through a
+// legal copy/paste route and fixed: REGRESSIONS), #1829, #1851, and one
 // route each of #1796 (two: Create Prefab on a member), #1809 (Create Prefab on a member, then the directed Apply) and
 // #1820 (Create Prefab's undo, on a member). Also a route #1796's fix unmasked (outsideEdit → reparent → createPrefab: its
 // redo tagged, then a template-added node row read removed): with #1869 merged one of its draws lands on a refused gesture
 // and it no longer reproduces.
+/** A member-row pin (`/entities/<guid>/members//<guid>`) the undone scene holds and the start did not (#1872's 6112 ruling).
+ *  Open at the end: `firstDiff` truncates a value to 60 characters, so a pin's closing brace is there only for a short name. */
+const ORPHAN_PIN = /^\/entities\/[^/]+\/members\/\/[^:]+: undefined vs \{"guid":"/;
+
 export const KNOWN_OPEN: KnownOpen[] = [
+  {
+    issue: 1872,
+    what: "RECORDED, NOT FIXED (hub ruling on #1872, 2026-09-30, hunt seed 6112): after a Create Prefab Replace and its undo, "
+      + "another instance's scene entry keeps member-row pins for nodes the restored document lacks. R2 keeps them as orphans: "
+      + "invisible live, re-pinned on redo, no data lost, and Unity has no guid pins, so no parity row breaks — under the Unity "
+      + "line not necessary. The exact-undo check counts it as known instead of as a new failure",
+    repro: [
+      { kind: 'createPrefab', u: [0.4821872168686241, 0.5781428760383278, 0.8068451632279903, 0.7964789853431284, 0.8956084102392197, 0.8634210666641593, 0.8821827550418675, 0.17559894686564803] },
+      { kind: 'saveReload', u: [0.12917209044098854, 0.9993457132950425, 0.4456332845147699, 0.3148945670109242, 0.27193534770049155, 0.7236288734711707, 0.9839562796987593, 0.49794489960186183] },
+      { kind: 'addComponent', u: [0.6858119221869856, 0.44166501169092953, 0.2702495187986642, 0.4249933750834316, 0.9391482577193528, 0.9740877554286271, 0.4964993556495756, 0.527870450168848] },
+      { kind: 'outsideEdit', u: [0.7936539533548057, 0.6487562200054526, 0.09746655449271202, 0.12436967785470188, 0.23948954534716904, 0.7344678146764636, 0.7293013134039938, 0.5603649334516376] },
+      { kind: 'delete', u: [0.5299426834098995, 0.8294221076648682, 0.4245335999876261, 0.2495009545236826, 0.10550973517820239, 0.5390152304898947, 0.06301917973905802, 0.08649665536358953] },
+      { kind: 'instantiate', u: [0.2643461551051587, 0.7915758702438325, 0.39971554069779813, 0.46902241348288953, 0.3457602830603719, 0.24102397658862174, 0.6553696182090789, 0.7887468310073018] },
+      { kind: 'detach', u: [0.19833067059516907, 0.7785928265657276, 0.812209885334596, 0.941115039633587, 0.10178101062774658, 0.5686436970718205, 0.7078618051018566, 0.9855603233445436] },
+      { kind: 'createPrefab', u: [0.5239670593291521, 0.04276401875540614, 0.7352094016969204, 0.07793740695342422, 0.7273834308143705, 0.6193114884663373, 0.4926199687179178, 0.5636229075025767] },
+    ],
+    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && ORPHAN_PIN.test(f.detail),
+    // Only a pin the START lacks (undefined on the left), and only in a list with a later createPrefab that WOULD answer a
+    // Replace (`u[1] < 0.7`). The ops cannot say whether its target existed (the confirm is asked only on a name an earlier
+    // createPrefab wrote), so a list whose later createPrefab wrote a fresh file is claimed too: no route to an orphan pin
+    // without a Replace is known, and one would be claimed here unseen (close-out review).
+    stops: (f, ops) => f.check === 'undo to the start does not restore the scene' && ORPHAN_PIN.test(f.detail) && (() => {
+      const creates = ops.filter((o) => o.kind === 'createPrefab');
+      return creates.length >= 2 && creates.slice(1).some((o) => o.u[1] < 0.7);
+    })(),
+  },
   {
     issue: 1822,
     what: "Add Component re-adding a template-row trait on a nested member reconciles its marks against the effective base",
@@ -931,6 +963,40 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'apply', u: [0.3251761158462614, 0.7442192495800555, 0.7713342877104878, 0.16702440893277526, 0.4877705464605242, 0.4157228539697826, 0.6191448420286179, 0.6907118388917297] },
       { kind: 'undo', u: [0.6909999179188162, 0.029866117285564542, 0.14964473526924849, 0.8444509881082922, 0.10568741662427783, 0.5086566116660833, 0.2739753045607358, 0.9196435029152781] },
       { kind: 'apply', u: [0.3219535604584962, 0.8672106517478824, 0.028542581014335155, 0.31881513609550893, 0.421314514009282, 0.8669111975468695, 0.3148637036792934, 0.38400822319090366] },
+    ],
+  },
+  {
+    issue: 1826,
+    what: "win hunt seed 6068 (copy O, paste under P1, paste again under the copy's deep M, a field edit, Revert on P1): the rebuild respawned the scene-added reference node from its legacy channels, whose nested slot owned M's frame and dropped O's member-row value (y 8 → 0 live, the mark gone; a reload brought it back). What a rebuild respawns now takes its reference nodes in the save's rows form (captureStructureForRespawn)",
+    repro: [
+      { kind: 'copy', u: [0.04764881054870784, 0.778251877753064, 0.9165127624291927, 0.8202143374364823, 0.5160739088896662, 0.30105136916972697, 0.3395586118567735, 0.5821117775049061] },
+      { kind: 'paste', u: [0.829431097721681, 0.6632490910124034, 0.9748543882742524, 0.2753764765802771, 0.4062094173859805, 0.5706668577622622, 0.02846250729635358, 0.8327327019069344] },
+      { kind: 'paste', u: [0.4971544926520437, 0.9697078519966453, 0.09374690637923777, 0.7177969496697187, 0.6884505900088698, 0.12698264233767986, 0.8254657676443458, 0.6463707357179374] },
+      { kind: 'editField', u: [0.05857755406759679, 0.23396126460283995, 0.6570560841355473, 0.9813611928839236, 0.3386081038042903, 0.37557874084450305, 0.8002111616078764, 0.41747555905021727] },
+      { kind: 'revert', u: [0.10300773940980434, 0.9459807516541332, 0.23588446504436433, 0.0745482372585684, 0.41630160971544683, 0.058943358482792974, 0.7195065701380372, 0.8164950597565621] },
+    ],
+  },
+  {
+    issue: 1826,
+    what: "win hunt seed 6068 in full (40 ops, shrunk to 17: pastes, a detach and its undo, a prefab edit, an Apply, a Revert): the same loss through the nested re-apply's THIRD respawn channel, a node row's own (the scene's nodes under a template node the diff matched), which the first two swaps missed. The side-effect hunt of the review's rework found it, as the close-out re-review's F1 did",
+    repro: [
+      { kind: 'copy', u: [0.04764881054870784, 0.778251877753064, 0.9165127624291927, 0.8202143374364823, 0.5160739088896662, 0.30105136916972697, 0.3395586118567735, 0.5821117775049061] },
+      { kind: 'paste', u: [0.829431097721681, 0.6632490910124034, 0.9748543882742524, 0.2753764765802771, 0.4062094173859805, 0.5706668577622622, 0.02846250729635358, 0.8327327019069344] },
+      { kind: 'instantiate', u: [0.9183149840682745, 0.25740785943344235, 0.7204851771239191, 0.7574727605096996, 0.6275560890790075, 0.7380500256549567, 0.0380500394385308, 0.24560596933588386] },
+      { kind: 'duplicate', u: [0.45867150952108204, 0.8889311312232167, 0.6553237270563841, 0.8826946287881583, 0.08209927892312407, 0.7391018280759454, 0.9387767997104675, 0.5417016015853733] },
+      { kind: 'paste', u: [0.41638570884242654, 0.914155691396445, 0.7395338155329227, 0.9473394879605621, 0.8580705944914371, 0.11697058798745275, 0.269566950853914, 0.47782232123427093] },
+      { kind: 'cut', u: [0.44964234763756394, 0.20451960456557572, 0.5099765381310135, 0.7369749115314335, 0.19381901831366122, 0.7945801829919219, 0.3911868389695883, 0.7333693311084062] },
+      { kind: 'reparent', u: [0.17587015801109374, 0.6001306856051087, 0.4154316142667085, 0.6931810271926224, 0.7908522996585816, 0.5230817971751094, 0.5271925355773419, 0.292957806494087] },
+      { kind: 'reparent', u: [0.4868444362655282, 0.3777251096908003, 0.7665910834912211, 0.2440586043521762, 0.803527171490714, 0.32019355427473783, 0.33175959484651685, 0.47970069688744843] },
+      { kind: 'undo', u: [0.5613775083329529, 0.48646922945044935, 0.8626521269325167, 0.02826634724624455, 0.09759986284188926, 0.7997445240616798, 0.07392809446901083, 0.4688339759595692] },
+      { kind: 'paste', u: [0.4971544926520437, 0.9697078519966453, 0.09374690637923777, 0.7177969496697187, 0.6884505900088698, 0.12698264233767986, 0.8254657676443458, 0.6463707357179374] },
+      { kind: 'instantiate', u: [0.7205920538399369, 0.15561190876178443, 0.18718173122033477, 0.260292504215613, 0.529160360340029, 0.473796131554991, 0.2679348874371499, 0.23611482419073582] },
+      { kind: 'detach', u: [0.6561402042862028, 0.6178482088726014, 0.10798417637124658, 0.5458981564734131, 0.7687317614909261, 0.7641601394861937, 0.20470329094678164, 0.28006004402413964] },
+      { kind: 'undo', u: [0.016805007588118315, 0.5074693711940199, 0.7533267114777118, 0.43860757700167596, 0.8679894364904612, 0.2775770090520382, 0.38356187217868865, 0.4358381812926382] },
+      { kind: 'editField', u: [0.4026855924166739, 0.77651690505445, 0.9000584019813687, 0.33512756414711475, 0.005659426562488079, 0.1459284103475511, 0.29845964605920017, 0.35923183034174144] },
+      { kind: 'prefabEdit', u: [0.6602060906589031, 0.7722903699614108, 0.046306394739076495, 0.4354018848389387, 0.6383797195740044, 0.00757620926015079, 0.27335057221353054, 0.9655297582503408], inner: [{kind: 'editField', u: [0.2723894009832293, 0.3440808386076242, 0.38849525479599833, 0.34643942350521684, 0.2939225498121232, 0.4980644138995558, 0.7235275397542864, 0.5455082601401955]}] },
+      { kind: 'apply', u: [0.9444699522573501, 0.9697569771669805, 0.6445089119952172, 0.01745554292574525, 0.2604943821206689, 0.2058720807544887, 0.09563729888759553, 0.6979681747034192] },
+      { kind: 'revert', u: [0.10300773940980434, 0.9459807516541332, 0.23588446504436433, 0.0745482372585684, 0.41630160971544683, 0.058943358482792974, 0.7195065701380372, 0.8164950597565621] },
     ],
   },
   {

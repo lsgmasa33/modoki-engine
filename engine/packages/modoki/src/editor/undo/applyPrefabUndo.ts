@@ -35,7 +35,7 @@ import { getPrefabSource, preloadNestedPrefabsForSubtree } from '../scene/prefab
 import { captureInstanceOverrides } from '../scene/prefabInstanceOverrides';
 import { captureInstanceStructure } from '../scene/prefabCapture';
 import {
-  rebuildInstanceFromCapture, refreshBaseInstances, rebaseStaleInstances, captureNestedFrames,
+  rebuildInstanceFromCapture, refreshBaseInstances, rebaseStaleInstances, captureNestedFrames, captureStructureForRespawn,
   type NestedInstanceCapture,
 } from '../scene/prefabRebuild';
 import { applyToPrefabSelective, type ApplyResult } from '../scene/prefabApply';
@@ -163,7 +163,7 @@ export function captureSide(rootInstanceId: number, rootGuid: string, source: st
   return {
     rootGuid, source, prefab,
     overrides: captureInstanceOverrides(rootInstanceId, prefab),
-    structure: captureInstanceStructure(rootInstanceId, prefab),
+    structure: captureStructureForRespawn(rootInstanceId, prefab), // respawned by the undo's rebuild (#1826)
     nested: captureNestedFrames(rootInstanceId, source, prefab),
   };
 }

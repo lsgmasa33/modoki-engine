@@ -3,7 +3,7 @@
 
 import { keptStateOf, restoreKeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
-import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
+import { templateKeyOf, setTemplateKey, TemplateAddedKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { endFrames, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { identitySubtree, noteFrameDoc, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -256,9 +256,10 @@ export function untagEntityTreeAsInstance(rootEcsId: number, source: string, doc
  *  from, and the save keeps only marked fields, so relinked without them the instance's overrides were not saved. */
 export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; frame?: NonNullable<ReturnType<typeof frameRootDoc>>; marks: MarkCapture; }
 
-/** What a detach undoes: the links it stripped off the tree, and the members OUTSIDE the tree it promoted or
- *  unlinked because their frame ended with it (#1453). */
-export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; }
+/** What a detach undoes: the links it stripped off the tree, the members OUTSIDE the tree it promoted or unlinked
+ *  because their frame ended with it (#1453), and the template keys it stripped (#1874) — each by the node's guid, as
+ *  the links are. */
+export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string }[]; }
 
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
  *  root and EVERY descendant in its identity subtree (nested instances included), turning
@@ -325,12 +326,28 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
     });
   }
   let orphans: DetachedMember[] = [];
+  const keys: { ref: EntityRef; key: string }[] = [];
   if (strip) {
     orphans = recordDetachedMarks(endFrames(new Set(snapshot.map((s) => s.id)))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
+    // …and every TEMPLATE KEY in the tree (#1874): the key is template identity too, on a node the template added — a plain
+    // one carries no link, so the strip above never visits it. Left on, the unpacked node read as its template's node
+    // wherever it went: moved under another instance of that prefab it was refused a move as supplied by the prefab, and
+    // an edit of that instance's own node saved both nodes on one guid. Unity: an unpacked object refers to no prefab.
+    // Its guid stays (Unity keeps references across an unpack), and nothing recovers the key from it: recovery anchors only
+    // at a prefab instance (`templateKeyRecovery.ts`), and the roots it derived from are plain now (measured,
+    // prefabDetachTemplateKeys.test.ts). The target is an instance root: `detachRefusal` refuses any other, which both
+    // surfaces ask first (a plain target stripped its own key and unpacked the instances under it, the close-out review).
+    for (const info of tree) {
+      const e = findEntity(info.id);
+      const key = templateKeyOf(e);
+      if (!e || !key) continue;
+      keys.push({ ref: entityRef(info.id), key });
+      e.remove(TemplateAddedKey);
+    }
   }
   if (snapshot.length) markStructureDirty();
-  return { links: snapshot, orphans };
+  return { links: snapshot, orphans, ...(keys.length ? { keys } : {}) };
 }
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
@@ -343,8 +360,16 @@ export function reattachPrefabInstance(
   opts?: { rootEcsId?: number },
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  const { links: snapshot, orphans } = detached;
+  const { links: snapshot, orphans, keys = [] } = detached;
   if (!PrefabInstanceMeta || (!snapshot.length && !orphans.length)) return 0;
+  // The template keys the detach stripped (#1874), before the links: a rebase after this reads a node's key to know it for
+  // the template's. One whose node no longer resolves counts with the links below.
+  let missedKeys = 0;
+  for (const { ref, key } of keys) {
+    const live = ref.resolve();
+    const entity = live == null ? undefined : findEntity(live);
+    if (entity) setTemplateKey(entity, key); else missedKeys++;
+  }
   // Orphans first: relinking reverses a promotion's member rename, and the refs below resolve by guid.
   relinkDetachedMembersMarked(orphans);
   const unresolvedEntries: DetachedInstanceTrait[] = [];
@@ -370,7 +395,7 @@ export function reattachPrefabInstance(
     if (entry.frame && restored.rootInstanceId === entity.id()) noteFrameRootDoc(getCurrentWorld(), entity, entry.frame);
   }
   markStructureDirty();
-  if (!unresolvedEntries.length) return 0;
+  if (!unresolvedEntries.length) return missedKeys;
 
   // ⚠️ AN UNRESOLVED REF IS NOT A LOST LINK, and counting it as one made this report fire on
   // the very flow the #1272 fix makes work. The snapshot is taken with `strip: false`, so it also
@@ -383,7 +408,7 @@ export function reattachPrefabInstance(
   // (Limit: two sibling instances of the same prefab at the same localId are indistinguishable
   // here, so a genuine loss can be masked by a surviving twin. That under-reports rather than
   // crying wolf, which is the side to err on for something a human reads.)
-  if (opts?.rootEcsId == null) return unresolvedEntries.length;
+  if (opts?.rootEcsId == null) return unresolvedEntries.length + missedKeys;
   const present = new Set<string>();
   for (const info of collectTree(opts.rootEcsId, getAllEntities())) {
     const e = findEntity(info.id);
@@ -391,7 +416,7 @@ export function reattachPrefabInstance(
     const pi = e.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
     present.add(`${pi.source}|${pi.localId}|${pi.parentLocalId ?? 0}`);
   }
-  return unresolvedEntries.filter(({ data: d }) => !present.has(`${d.source}|${d.localId}|${d.parentLocalId ?? 0}`)).length;
+  return unresolvedEntries.filter(({ data: d }) => !present.has(`${d.source}|${d.localId}|${d.parentLocalId ?? 0}`)).length + missedKeys;
 }
 
 /** Detach's undo: put the links back ({@link reattachPrefabInstance}), then bring the instance onto the editor's current

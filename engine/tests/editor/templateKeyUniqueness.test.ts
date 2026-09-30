@@ -45,7 +45,7 @@ import { setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCa
 import { detachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
-import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { templateKeyOf, setTemplateKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { templateKeysOf, type TemplateKeyDoc } from '../../packages/modoki/src/runtime/loaders/templateKeyRecovery';
 import { validatePrefabData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -244,7 +244,8 @@ describe('a prefab-edit copy keeps the keys a NESTED prefab declares (close-out 
 });
 
 describe('a promotion does not carry a key its target document already declares', () => {
-  // Detach leaves the template-key markers on the unpacked nodes. Move the detached Extra into an instance's S frame,
+  // A STALE template-key marker on a plain node: Detach left one on every unpacked node until #1874, which strips them, so
+  // the test plants it after the Detach — the defence is for a stale marker from any source. Move the detached Extra into an instance's S frame,
   // which declares no key of O's, and it is listed as an added node there; Apply it into O and `toTemplateNodes` took the
   // stale marker, so O held KX twice — and the load's re-key then gave the SECOND in document order a new key, which could
   // be the original's. Mutation: drop `!declared?.has(marker)` in `toTemplateNodes` — the promoted node carries KX.
@@ -253,7 +254,8 @@ describe('a promotion does not carry a key its target document already declares'
     await load(scene([ROOT, ROOT2]));
     const detached = named('Extra', ROOT).id;
     detachPrefabInstance(rootId(ROOT));
-    expect(templateKeyOf(handleOf(detached))).toBe(KX); // premise: the marker outlived the Detach
+    expect(templateKeyOf(handleOf(detached))).toBe(''); // #1874: the Detach strips it…
+    setTemplateKey(handleOf(detached), KX); // …so the stale marker is planted
     setParent(detached, named('SA', ROOT2).id);
     const keys = collectInstanceOverrideKeys(named('SR', ROOT2).id, getCachedPrefabSync(S) as PrefabFile).added;
     expect(keys).toHaveLength(1); // premise: listed as an added node of the nested S instance
@@ -297,8 +299,9 @@ describe('a promotion does not carry a key its target document already declares'
 });
 
 describe('the derive does not climb past an unmarked node; the heal does (close-out re-review)', () => {
-  // Two O instances placed under an S instance's member and then DETACHED keep their Extras' KX markers (Detach leaves
-  // them). Duplicating the S instance must not derive both Extras from the S frame root plus KX. Mutation: let the derive
+  // Two O instances placed under an S instance's member and then DETACHED, their Extras holding stale KX markers (Detach
+  // left them until #1874, which strips them, so the test plants them). Duplicating the S instance must not derive both
+  // Extras from the S frame root plus KX. Mutation: let the derive
   // climb past unmarked ancestors (`pastUnmarked` true in `derivesFrom`) — both copies take one guid.
   it('a duplicate holding two detached copies of one keyed node gives them distinct guids', async () => {
     const ROOTS = 'dddddddd-0000-4000-8000-000000018197';
@@ -312,7 +315,8 @@ describe('the derive does not climb past an unmarked node; the heal does (close-
       detachPrefabInstance(d);
     }
     const extras = getAllEntities().filter((e) => e.name === 'Extra');
-    expect(extras.map((e) => templateKeyOf(handleOf(e.id)))).toEqual([KX, KX]); // premise: both keep the stale marker
+    expect(extras.map((e) => templateKeyOf(handleOf(e.id)))).toEqual(['', '']); // #1874: the Detach strips them…
+    for (const e of extras) setTemplateKey(handleOf(e.id), KX); // …so the stale markers are planted
     const copy = copySnapshot(snapshotEntity(rootId(ROOTS))!);
     const guids: string[] = [];
     const walk = (s: EntitySnapshot) => { if (find(s, 'Extra') === s) guids.push(guidIn(s)); s.children.forEach(walk); };

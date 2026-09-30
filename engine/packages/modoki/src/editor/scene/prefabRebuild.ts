@@ -32,7 +32,7 @@ import {
   captureInstanceMembers, enclosingFrames, frameMovesOf, liveRowLocalIds, memberTransforms, restoreInstanceMembers,
 } from './prefabMembers';
 import {
-  captureInstanceStructure, captureNestedChannels, chainNodesAsPlaced, reanchoredKeys, type InstanceStructure, keepsTemplateRows,
+  captureInstanceStructure, captureNestedChannels, chainNodesAsPlaced, reanchoredKeys, type InstanceStructure, keepsTemplateRows, writerFormOf,
   type KeptNodeReplace, liveTemplateKeys, moveChannelsOntoRows, nodeDiffDeps, resolveAddedNodeTokens,
   subtractChainOverrides, subtractChainStructure,
 } from './prefabCapture';
@@ -195,6 +195,14 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
         const { structure, replace } = subtractChainStructure(
           { ...full, added: full.added.filter(inWhole) }, { ...chainStructure, added: chainAdded.filter((n) => inWhole(n) && !pinnedOver(n)) }, keys);
         const own = [...nodes.own].flatMap(([lid, list]) => list.map((n) => ({ ...n, parentLocalId: lid })));
+        // What the re-apply RESPAWNS takes its reference nodes in the save's rows form (`inRespawnForm`, #1826); `full`
+        // above stays in the form the comparison against the chain's nodes reads.
+        let rowsForm: AddedEntity[] | undefined;
+        const rowsCapture = () => (rowsForm ??= captureInstanceStructure(id, childPrefab, { rows: true, layerTraits: layerAddedTraits(chainLayerHere, childPrefab) }).added);
+        const respawned = inRespawnForm([...structure.added, ...own], rowsCapture);
+        // …and a node row's `own` (the scene's nodes under a template node it matched), which `applyNodeRowsLive` spawns:
+        // the third channel the re-apply respawns from (the close-out re-review's F1).
+        const nodeRows = new Map([...nodes.nodeRows].map(([k, r]) => [k, r.own?.length ? { ...r, own: inRespawnForm(r.own, rowsCapture) } : r] as const));
         captures.push({
           chain,
           chainGuids,
@@ -202,15 +210,41 @@ function captureNestedInstanceOverrides(outerRootId: number, baseline: PrefabFil
           doc: childPrefab,
           overrides: subtractChainOverrides(
             captureInstanceOverrides(id, childPrefab), resolve(chainLayerHere.overrides) as Record<number, Record<string, Record<string, unknown>>>, childPrefab, memberTransforms(id)),
-          structure: { ...structure, added: [...structure.added, ...own] },
+          structure: { ...structure, added: respawned },
           replace,
-          ...(nodes.nodeRows.size || nodes.pinnedOver.size
-            ? { nodeRows: new Map([...nodes.nodeRows, ...[...nodes.pinnedOver].map((k) => [k, { removed: true }] as const)]) } : {}),
+          ...(nodeRows.size || nodes.pinnedOver.size
+            ? { nodeRows: new Map([...nodeRows, ...[...nodes.pinnedOver].map((k) => [k, { removed: true }] as const)]) } : {}),
         });
       }
     }
   }
   return captures;
+}
+
+/** `nodes` in the form the SAVE writes them — `writerFormOf` over `rowsCapture()`, the same live frame captured with
+ *  `{ rows: true }` — keeping where `nodes` places them. The capture runs only when `nodes` holds a reference node at any
+ *  depth: every other node is the same in both forms.
+ *
+ *  Why (#1826): a rebuild respawns a reference node through the loader's one spawner, and its LEGACY channels fold wrongly
+ *  against a template MEMBER ROW (a v6 row's `members`) there. A `nestedStructure` slot owns its frame, so the fold skips
+ *  the inner layers' rows, member values included: a pasted O copy's M lost O's `y = 8` live and got it back on reload
+ *  (seed 6068). And a `nestedOverrides` value merges into the fold's lower layer, UNDER every layer's rows, so O's row beat
+ *  the scene's own edit of that M and the next save wrote the template's value — for a scene-added node and for one a
+ *  template adds alike. As rows the node is the outermost layer, as the file states it: the respawn is the load of what
+ *  the save writes. Only what is RESPAWNED is swapped: the comparisons against the chain's nodes read the legacy form (in
+ *  rows a template reference node compared as edited, and was restated on every save), and so does Apply's promotion of
+ *  a node into a template (in rows its members' edits were dropped — the close-out review's F1). */
+function inRespawnForm(nodes: AddedEntity[], rowsCapture: () => AddedEntity[]): AddedEntity[] {
+  const holdsRef = (list: readonly AddedEntity[] | undefined): boolean => (list ?? []).some((n) => !!n.prefab || holdsRef(n.children));
+  return holdsRef(nodes) ? writerFormOf(rowsCapture(), { keepPlacement: true })(nodes) : nodes;
+}
+
+/** {@link captureInstanceStructure} for a capture a rebuild RESPAWNS from (`rebuildInstance`'s `structure`: a Revert, an
+ *  undo's side, a refresh): its reference nodes in the save's rows form ({@link inRespawnForm}, #1826). A capture that is
+ *  read instead — compared, listed, promoted — takes `captureInstanceStructure` itself. */
+export function captureStructureForRespawn(rootInstanceId: number, prefab: PrefabFile): InstanceStructure {
+  const s = captureInstanceStructure(rootInstanceId, prefab);
+  return { ...s, added: inRespawnForm(s.added, () => captureInstanceStructure(rootInstanceId, prefab, { rows: true }).added) };
 }
 
 /** Re-apply nested-instance captures onto a freshly rebuilt outer instance,
@@ -1075,7 +1109,7 @@ export function refreshInstances(
       // Every applied field leaves the source (#1469, U15): U13 reverted the enclosing overrides that could shadow one.
       captured = subtractFieldOverrides(captured, from.fields);
     }
-    const capturedStructure = captureInstanceStructure(oldRootId, baseline);
+    const capturedStructure = captureStructureForRespawn(oldRootId, baseline);
     rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure, baseline, remap);
   }
 

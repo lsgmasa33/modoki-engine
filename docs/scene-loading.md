@@ -1575,9 +1575,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     load-time re-key was built and dropped (owner ruling (A)), because it renamed keys the scenes' statements name
     (#1872's pinned whole lists and `a+<key>` node rows). No ordinary edit on an older build makes one (a copy of a
     keyed node took no key; a nested row's duplicate is a new frame, and a cross-frame repeat collides on no guid).
-    ⚠️ Open: a Detach leaves `TemplateAddedKey` on the unpacked nodes,
-    and a stale marker is the source of every remaining repeat (a promoted reference row's recaptured `added` still
-    carries one).
+    The known source of a stale marker, a Detach that left `TemplateAddedKey` on the nodes it unpacked, is closed
+    (#1874): Detach strips every key in the unpacked subtree (its undo puts them back), and key recovery anchors only
+    at a prefab instance, so nothing re-derives one from an unpacked root. The defences above stay, for a stale
+    marker from any other source ([prefabs.md](./prefabs.md) U17).
     - **Upgrading what the old rule wrote.** Scene v18: a load of a file below 18 re-heals keys under
       `legacyKeyedParent` (a node the file pinned at an old-rule guid), then renames every old guid to today's
       (`keyedGuidUpgrade`: the reload walk under both rules, rowed members included, applied with

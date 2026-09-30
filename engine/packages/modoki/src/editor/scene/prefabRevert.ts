@@ -14,14 +14,14 @@ import {
 } from './prefabCache';
 import { baseTokenResolver } from './prefabTokens';
 import { captureInstanceOverrides } from './prefabInstanceOverrides';
-import { captureInstanceStructure, type InstanceStructure, resolveAddedNodeTokens } from './prefabCapture';
+import { type InstanceStructure, resolveAddedNodeTokens } from './prefabCapture';
 import {
   enclosingLayer, enclosingRowOverrides, layerAuthoredStructureKeys, nestedFrameMoves, subtractFieldOverrides,
 } from './prefabChain';
 import {
   framesBuiltFromOtherRows, missingSourceRefusal, staleFramesRefusal, staleInstanceRefusal,
 } from './prefabFrames';
-import { rebuildInstance } from './prefabRebuild';
+import { captureStructureForRespawn, rebuildInstance } from './prefabRebuild';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
  *  not load (#1862). That is a live frame kept across a rebuild after its prefab was trashed, a nested one or #1738's
@@ -221,7 +221,7 @@ export async function revertOverridesSelective(
   // Capture the instance's current state against the prefab, then subtract the
   // reverted keys to get the state to re-apply after the rebuild.
   const fullOverrides = captureInstanceOverrides(rootInstanceId, prefab);
-  let fullStructure = captureInstanceStructure(rootInstanceId, prefab);
+  let fullStructure = captureStructureForRespawn(rootInstanceId, prefab); // the rebuild and its undo respawn from it (#1826)
   // Reverted, an outer row's removal came back and its added node was DELETED — neither is what the instance shows
   // with no override of its own (#1492's ruling, #1506 close-out review).
   for (const key of layerAuthoredStructureKeys(rootInstanceId, prefab, fullStructure)) {

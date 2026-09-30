@@ -500,11 +500,11 @@ export interface StructureCaptureOpts {
    *  template `key` and `guid: ''` — never the live guid, which every instance of the prefab would
    *  then spawn with. Default (scene form): the live durable guid, as a scene-authored node carries. */
   template?: boolean;
-  /** SCENE FILE form (#1468 Phase 4): a user-added reference node's edits go onto its member rows
-   *  (`moveChannelsOntoRows`). Set only by the scene writer — every other capture of a live instance
-   *  is an in-memory TRANSPORT (a rebuild, Apply, Revert) whose consumers re-spawn from the localId
-   *  channels against the same document, where a localId is a perfectly good address. Folding there
-   *  handed the editor's reference-node spawn a node it could not read, and a rebuild lost the edits. */
+  /** SCENE FILE form (#1468 Phase 4): a reference node's edits go onto its member rows (`moveChannelsOntoRows`). Set by
+   *  the scene writer, and by what a rebuild RESPAWNS (`captureStructureForRespawn`, #1826): the respawn runs the loader's
+   *  one spawner (`spawnReferenceNode`, #1783), which folds the legacy channels differently from the rows the save writes.
+   *  Every other capture is read, not respawned, and its readers take the localId channels — the comparisons against the
+   *  chain's nodes (in rows a template reference node compared as edited) and Apply's promotion into a template. */
   rows?: boolean;
   /** With `template`: a COMPARISON's capture, not a write (#1538) — a node's key is read off its marker or recovered,
    *  never minted and never stamped onto the live entity. A key stamped on a scene-authored node would make the
@@ -1406,8 +1406,8 @@ export function captureInstanceReference(
  *  If you add a field to `AddedEntity`, decide here whether it is per-instance.
  *
  *  `declared`: the keys the document these nodes are PROMOTED into already declares. A promoted node is scene-added, so
- *  it is not one of that document's nodes, and a live marker naming one of those keys is stale (a Detach leaves the
- *  markers on the unpacked nodes; move one into another instance of the same prefab and Apply it there): carried, it
+ *  it is not one of that document's nodes, and a live marker naming one of those keys is stale (a Detach left the markers
+ *  on the unpacked nodes until #1874; move one into another instance of the same prefab and Apply it there): carried, it
  *  was a second node with that key, and a keyed node's guid is its frame plus its key (#1809), so the two shared one.
  *  Such a node mints. A marker the document does not declare is the node's own identity (a deeper template's key) and
  *  is kept, as #1387 does so a re-save does not re-key. Every key written is added to `declared`, so two nodes of one
@@ -1890,14 +1890,16 @@ function traitRemovalStatements(live: string[] | undefined, chain: string[] | un
 
 /** Maps plain-capture nodes (what `frameAddedDiff` matched) to the WRITER's capture of the same entity, found by
  *  guid anywhere in `writer`'s trees — the form a scene row stores (a reference node carries its member rows there,
- *  which the plain capture does not). `parentLocalId` is written as 0: a row names the anchor. */
-function writerFormOf(writer: readonly AddedEntity[] | undefined): (nodes: readonly AddedEntity[]) => AddedEntity[] {
+ *  which the plain capture does not). `parentLocalId` is written as 0: a row names the anchor — unless `keepPlacement`,
+ *  for a rebuild's respawn, which spawns the nodes where the plain capture placed them (#1826,
+ *  `prefabRebuild.ts`'s `inRespawnForm`: the save and the respawn state a node in ONE form, through this one map). */
+export function writerFormOf(writer: readonly AddedEntity[] | undefined, opts: { keepPlacement?: boolean } = {}): (nodes: readonly AddedEntity[]) => AddedEntity[] {
   const byGuid = new Map<string, AddedEntity>();
   const index = (list: readonly AddedEntity[] | undefined) => {
     for (const n of list ?? []) { if (n.guid) byGuid.set(n.guid, n); index(n.children); }
   };
   index(writer);
-  return (nodes) => nodes.map((n) => ({ ...(byGuid.get(n.guid) ?? n), parentLocalId: 0 }));
+  return (nodes) => nodes.map((n) => ({ ...(byGuid.get(n.guid) ?? n), parentLocalId: opts.keepPlacement ? n.parentLocalId : 0 }));
 }
 
 /** {@link writerFormOf} for a prefab ROW's rows (#1533): the TEMPLATE capture of the same entity, found by the template

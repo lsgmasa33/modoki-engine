@@ -26,24 +26,31 @@ import type { ContextMenuItem } from '../components/ContextMenu';
 export function detachRefusal(id: number): { reason: string; rootId: number } | undefined {
   const meta = getTraitByName('PrefabInstance');
   const pi = meta ? readTraitData(id, meta) as { rootInstanceId?: number } | null : null;
+  const nameOf = (eid: number) => getAllEntities().find((e) => e.id === eid)?.name ?? String(eid);
+  const insteadOf = (outer: number, what: string) => ({
+    rootId: outer,
+    reason: `Detach the instance root "${nameOf(outer)}" instead: "${nameOf(id)}" is ${what}, and Detach unpacks a whole instance from its outermost root, as Unity's Unpack does.`,
+  });
+  // A target with no link is refused too (#1874 close-out review): Unity's Unpack takes an instance root only. Detached
+  // anyway, a node a template adds unpacked the instances under it (restructuring its instance, as a nested root's Detach
+  // would) and lost its own template key with them, so it moved out of its instance. One the prefab SUPPLIES is part of
+  // that instance, refused naming its root as a member is; any other plain entity is simply not an instance.
+  if (!pi) {
+    const outer = outermostPrefabRoot(id);
+    if (outer && outer !== id) return insteadOf(outer, 'a node it adds');
+    return { rootId: 0, reason: `"${nameOf(id)}" is not a prefab instance: Detach unpacks an instance from its root, as Unity's Unpack does.` };
+  }
   // Only an instance entity is detached at all; one the prefab does not supply (a stored root; a member whose root is not
   // live, or an owned root nothing owns that hangs under no instance root — each links to nothing a save could write it into) detaches itself.
   // Live by `findEntity` (inside the predicate), not by `getAllEntities`, which drops a parked pooled row
   // (`UIEntry.live:false`) with its subtree: a member of one read as rootless, so its greyed row came back enabled for a
   // Detach that strips nothing (close-out re-review). The list only supplies the names.
-  if (!pi?.rootInstanceId || !isSuppliedByPrefab(id)) return undefined;
+  if (!pi.rootInstanceId || !isSuppliedByPrefab(id)) return undefined;
   // No outermost root to name (a member whose root carries no `PrefabInstance`, a supplier chain that loops): nothing is
   // offered to detach instead, so this one detaches — refused, its link could be cut on neither surface (#1764's rule).
   const outer = outermostPrefabRoot(id);
   if (!outer || outer === id) return undefined;
-  const names = new Map(getAllEntities().map((e) => [e.id, e.name]));
-  const root = names.get(outer) ?? String(outer);
-  const self = names.get(id) ?? String(id);
-  const what = pi.rootInstanceId === id ? 'a prefab nested inside it' : 'a member of it';
-  return {
-    rootId: outer,
-    reason: `Detach the instance root "${root}" instead: "${self}" is ${what}, and Detach unpacks a whole instance from its outermost root, as Unity's Unpack does.`,
-  };
+  return insteadOf(outer, pi.rootInstanceId === id ? 'a prefab nested inside it' : 'a member of it');
 }
 
 /** The Hierarchy's "Detach Prefab" row for instance entity `id`: greyed on a member, with `detachRefusal`'s reason as
@@ -83,8 +90,9 @@ export function requireDetachedLinks(detached: DetachSnapshot): void {
   requireDetachedMembers(detached.orphans, idx, renames);
 }
 
-/** Detach instance `rootId` and record one undo entry. Returns the detach's snapshot; nothing is recorded when it
- *  stripped no link (`rootId` is not an instance). Throws `detachRefusal`'s reason for a member. `logTag` prefixes the warning an unresolved link gives. */
+/** Detach instance `rootId` and record one undo entry. Returns the detach's snapshot. Throws `detachRefusal`'s reason for
+ *  anything but an outermost instance root (a member, a nested root, a node a template adds, a plain entity), before
+ *  changing anything. `logTag` prefixes the warning an unresolved link gives. */
 export function detachPrefabInstanceWithUndo(rootId: number, label: string, logTag: string): DetachSnapshot {
   // The one entry both surfaces call, so a caller that skipped the check cannot unpack a member on its own (#1764).
   const refused = detachRefusal(rootId);
@@ -102,7 +110,7 @@ export function detachPrefabInstanceWithUndo(rootId: number, label: string, logT
       const unresolved = await reattachDetachedInstance(snapshot);
       // Reported, never discarded — that silence is what hid #1272 for as long as it did. Into the step (#1823), so
       // the undo answers PARTIAL rather than `did:true`.
-      if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${logTag} ${unresolved} prefab link(s) could not be put back — no longer addressable` });
+      if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${logTag} ${unresolved} prefab link(s) or template key(s) could not be put back — no longer addressable` });
     },
     redo: () => {
       const id = ref.require(); // I19: a root that is gone refuses, rather than reading as detached

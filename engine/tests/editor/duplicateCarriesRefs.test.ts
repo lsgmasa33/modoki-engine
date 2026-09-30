@@ -1226,8 +1226,10 @@ describe('a prefab written from a tree with moved members keeps the moves (#1437
   it('key recovery steps through a deleted home (homeSteps)', () => {
     const G = 'bbbbbbbb-0000-4000-8000-0000000000de';
     const K = 'cccccccc-0000-4000-8000-0000000000de';
+    // Node 1 is the instance ROOT the key derives from, so it carries a `PrefabInstance`: recovery anchors only at an
+    // instance (#1874 — a plain ancestor with a guid is an unpacked one).
     const nodes = new Map<number, KeyRecoveryNode>([
-      [1, { guid: G, parentId: 0, key: '', pi: null }],
+      [1, { guid: G, parentId: 0, key: '', pi: { localId: 1 } }],
       [2, { guid: deriveMemberGuid(G, [4, 2]), parentId: 1, key: '', pi: { localId: 2 }, extra: [4] }],
       [3, { guid: deriveMemberGuid(G, [4, 2, `+${K}`]), parentId: 2, key: '', pi: null }],
     ]);

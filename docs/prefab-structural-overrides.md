@@ -891,9 +891,27 @@ handed every edit to whichever member inherited the number, with nothing to say 
   a pre-v5 template's members (every prefab the released editor wrote), and a member with no durable
   guid. A nested frame's STRUCTURE moves all-or-nothing: the legacy slot is a replace statement, and
   half of it on rows would be one statement in two places.
-- **Rows are written only in the scene FILE form** (`StructureCaptureOpts.rows`, set by
-  `serializeScene` alone). Every other capture — a rebuild, Apply, Revert — is an in-memory transport
-  whose reference-node spawn reads the localId channels against the same document.
+- **Rows are written in the scene FILE form** (`StructureCaptureOpts.rows`, set by `serializeScene`) — **and in
+  whatever a rebuild RESPAWNS** (#1826): a Revert, an undo's side, a refresh and a nested frame's re-apply (all three of
+  its channels, a node row's `own` included) take their reference nodes as rows (`captureStructureForRespawn` /
+  `inRespawnForm`, `prefabRebuild.ts`, through the save's own `writerFormOf`), scene-added and template-added alike, so
+  the respawn is the load of what the save writes. The split and why it must stay two forms:
+  [prefabs.md](./prefabs.md) § "A capture that is RESPAWNED takes its reference nodes as rows". Every capture that is READ keeps the
+  localId channels. The legacy channels fold wrongly against a template MEMBER ROW (a v6 row's `members` stating a
+  value) in the loader's one expansion: a `nestedStructure` slot OWNS its frame, so the fold skips the inner layers'
+  rows, member values included (a pasted O copy's M lost O's `y = 8` live and got it back on reload — seed 6068); and
+  a `nestedOverrides` value merges into the fold's lower layer, UNDER every layer's rows, so O's row beat the scene's
+  own edit of that M and the next save wrote the template's value (data loss; also for a reference node H's template
+  adds, on a partial Revert of H1). Why not rows at the source: the readers take the legacy form — a comparison against
+  the chain's node (in rows a template reference node compared as edited and was restated on every save), and Apply's
+  promotion of a node into a template (in rows the members' edits were dropped: the close-out review's F1). And the
+  fold itself was left alone: it merges every outer layer's `nestedOverrides` into one map, so it cannot order a scene
+  edit against an inner row without carrying them per layer.
+  **Residual, recorded:** a scene FILE whose reference node still carries legacy `nestedOverrides` /
+  `nestedStructure` over a template with a member row folds the same way on LOAD — the v16 → v17 rung is a no-op and
+  converts nothing. Measured 2026-09-30 in this repo's corpus: 0 — no reference node in the 59 git-tracked scenes (57
+  of them below v17) carries either channel, and none of the 125 prefabs has a member row at all. The repo corpus is
+  not the user population; the hub holds whether that is worth more.
 - **Every reader of a scene's channels reads the rows too** — the resource preload, the save-time path
   guard, the build's tree-shaker, a duplicate's guid remint, validation, the member-path walk, and the
   loader's collection of a reference node's rows (a node hanging under a member now rides on that
