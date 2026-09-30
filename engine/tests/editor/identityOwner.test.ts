@@ -41,6 +41,7 @@ import { serializePrefab } from '../../packages/modoki/src/editor/scene/prefabSe
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { buildPrefabEditScene, savePrefabEditReport, PREFAB_EDIT_ROOT_GUID, _resetPrefabEditSessionRows } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { resetPrefabMarkRecord } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { deleteEntitiesWithUndo, undo } from '@modoki/engine/editor';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -99,6 +100,7 @@ const add = (label: string, parent: number, name: string) =>
   createEntityWithUndo(label, parent, [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name, parentId: parent } }], () => {})!;
 
 beforeEach(() => {
+  resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case
   clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   setRunMode('stopped');
   clearHistory();

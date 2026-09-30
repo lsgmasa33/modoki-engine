@@ -25,7 +25,7 @@ import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
 
-const route = vi.hoisted(() => ({ disk: new Map<string, string>(), assetWrites: 0, fail: false, gate: null as null | { reached: () => void; open: Promise<void> } }));
+const route = vi.hoisted(() => ({ disk: new Map<string, string>(), assetWrites: 0, fail: false, gate: null as null | { reached: () => void; open: Promise<void> }, readGate: null as null | { reached: () => void; open: Promise<void> } }));
 const sha = (t: string) => createHash('sha256').update(t.replace(/^\uFEFF/, '')).digest('hex');
 const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
@@ -50,6 +50,9 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 async function serve(url: string): Promise<Response> {
   const hit = [...route.disk.keys()].find((p) => url.endsWith(p));
   if (!hit) return url.includes('/api/') ? answer(200, { files: [] }) : answer(404, {});
+  // A file read the test holds open (`holdNextRead`): a write reads its file first (#1880 W), and that read is a window.
+  const g = route.readGate;
+  if (g) { route.readGate = null; g.reached(); await g.open; }
   return new Response(route.disk.get(hit)!, { status: 200 });
 }
 
@@ -63,18 +66,17 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
   setPrefabCache, getCachedPrefabSync, getPrefabSource,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { commitPrefabWrite, parkPrefabChanges, resetPrefabMarkRecord } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import {
   parkPrefab, peekDirtyAsset, clearDirtyAssets, flushDirtyAssets, getDirtyAssetPaths, keepParkedPrefabOverFileChange,
   overwriteParkedAsset,
 } from '../../packages/modoki/src/editor/scene/dirtyAssets';
-import { restorePrefabsInMemory } from '../../packages/modoki/src/editor/scene/prefabMemoryRestore';
 import { UndoRefusedError } from '../../packages/modoki/src/editor/undo/undoFailure';
 import { answerParkedConflicts } from '../../packages/modoki/src/editor/scene/saveCommand';
 import { decideUnsavedBeforeBuild } from '../../packages/modoki/src/editor/scene/unsavedGate';
 import { unsavedChangeCauses } from '../../packages/modoki/src/editor/scene/serialize';
 import { applyMovesToParkedDocs } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
-import { _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
+import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
@@ -175,6 +177,7 @@ async function parkAndSwap(): Promise<void> {
 }
 
 beforeEach(async () => {
+  resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   clearDirtyAssets();
@@ -183,6 +186,7 @@ beforeEach(async () => {
   route.assetWrites = 0;
   route.fail = false;
   route.gate = null;
+  route.readGate = null;
   vi.stubGlobal('fetch', serve);
   registerAsset(X, X_PATH, 'prefab');
   route.disk.set(X_PATH, jsonFileBody(diskDoc()));
@@ -331,7 +335,7 @@ describe('the close-out review\'s park findings (#1868)', () => {
     await getPrefabSource(X);
     parkPrefab(X_PATH, parkDoc(), diskDoc()); // an undone Apply: the park is A (y=5), the file B
     const saving = quietly(() => flushDirtyAssets()); // Save writes A…
-    const redo = quietly(() => restorePrefabsInMemory([{ source: X, doc: diskDoc(), from: parkDoc() }], { rebase: false })); // …a redo to B
+    const redo = quietly(() => parkPrefabChanges([{ source: X, doc: diskDoc(), from: parkDoc() }], { rebase: false })); // …a redo to B
     await Promise.all([saving, redo]);
     expect(diskRow('XA').y).toBe(5); // the file holds what Save wrote
     expect((peekDirtyAsset(X_PATH)?.data as PrefabFile | undefined)?.entities[1]!.traits).toMatchObject({ Transform: { y: 0 } }); // the redo is parked for the next Save
@@ -342,7 +346,7 @@ describe('the close-out review\'s park findings (#1868)', () => {
     parkPrefab(X_PATH, parkDoc(), diskDoc());
     route.disk.set(X_PATH, jsonFileBody({ ...diskDoc(), name: 'pulled' } as PrefabFile)); // a git pull
     expect(keepParkedPrefabOverFileChange(X_PATH)).toBe(true); // the watcher keeps the park
-    await quietly(() => restorePrefabsInMemory([{ source: X, doc: diskDoc(), from: parkDoc() }], { rebase: false }));
+    await quietly(() => parkPrefabChanges([{ source: X, doc: diskDoc(), from: parkDoc() }], { rebase: false }));
     expect(peekDirtyAsset(X_PATH)?.type).toBe('prefab'); // still unsaved: Save meets the pull and asks
     expect((await quietly(() => flushDirtyAssets())).failed).toEqual([expect.objectContaining({ path: X_PATH, conflict: true })]);
   });
@@ -376,6 +380,14 @@ describe('a park and a forward write that race (#1868 close-out re-review)', () 
     route.gate = { reached, open: new Promise<void>((r) => { open = r; }) };
     return { inFlight, open: () => open() };
   };
+  /** Hold the next file READ until `open()` — a write's first await (#1880 W: every write reads its file first). */
+  const holdNextRead = () => {
+    let open!: () => void;
+    let reached!: () => void;
+    const inFlight = new Promise<void>((r) => { reached = r; });
+    route.readGate = { reached, open: new Promise<void>((r) => { open = r; }) };
+    return { inFlight, open: () => open() };
+  };
   const next = () => { const d = diskDoc(); (d.entities[2]!.traits as { Transform: { x: number } }).Transform.x = 3; return d; };
 
   it('R1: a restore during a forward write waits for it, and the editor, the file and the registry agree after', async () => {
@@ -385,7 +397,7 @@ describe('a park and a forward write that race (#1868 close-out re-review)', () 
     await hold.inFlight;
     const z = diskDoc();
     (z.entities[2]!.traits as { Transform: { x: number } }).Transform.x = 9;
-    const restoring = quietly(() => restorePrefabsInMemory([{ source: X, doc: z, from: diskDoc() }], { rebase: false }).catch((e: unknown) => e));
+    const restoring = quietly(() => parkPrefabChanges([{ source: X, doc: z, from: diskDoc() }], { rebase: false }).catch((e: unknown) => e));
     hold.open();
     expect((await writing).ok).toBe(true);
     // The restore ran after the write: the editor held another document than it left, so it refused and changed nothing.
@@ -407,11 +419,48 @@ describe('a park and a forward write that race (#1868 close-out re-review)', () 
     expect(diskRow('XB').x).toBe(3);
   });
 
+  // #1880 W2: the write's mark reads the EDITOR's document too — its park included. The commit took the mark from what the
+  // caller read and the file alone, so a writer that read the FILE (a model re-import, the agent's create) wrote the
+  // file's lower mark and retired the park that held the higher one: numbers the park had handed out (an undone
+  // Apply's rows) were free again. Mutation: drop `counterOf(w.now.park?.doc)` (and the editor term) from the file
+  // landing's `need` — the file is written at 4.
+  it('a write over a park that holds a higher mark keeps that mark, though the writer read the file', async () => {
+    parkPrefab(X_PATH, { ...parkDoc(), nextLocalId: 9 }, diskDoc());
+    expect((await quietly(() => commitPrefabWrite(X, next(), { expected: diskDoc() }))).ok).toBe(true);
+    expect(onDisk().nextLocalId).toBe(9);
+    expect(peekDirtyAsset(X_PATH)).toBeNull(); // the write retired the park
+  });
+
+  // #1880 W6: Save's Overwrite of a park whose file was trashed since. Mutation: drop the overwrite's `state === 'absent'`
+  // refusal in `precheck` — the park writes the trashed prefab back.
+  it('an Overwrite answered over a deleted file refuses, keeps the park, and writes nothing', async () => {
+    parkPrefab(X_PATH, parkDoc(), diskDoc());
+    route.disk.delete(X_PATH);
+    expect(overwriteParkedAsset(X_PATH)).toBe(true);
+    const out = await quietly(() => flushDirtyAssets());
+    expect(out.failed).toEqual([expect.objectContaining({ path: X_PATH, error: expect.stringMatching(/was deleted since, so it was not written back/) })]);
+    expect(route.disk.has(X_PATH)).toBe(false);
+    expect(peekDirtyAsset(X_PATH)).not.toBeNull();
+  });
+
+  // #1880 close-out review, finding 2: a park is not held by the adoption gate — the undo step is its gate, and the gate's
+  // refusals are transient while a refused undo is dropped for good. Mutation: run `landParks` behind the gate again —
+  // the park waits for the route, then refuses ("the scene was replaced").
+  it('a park lands while a route is between its world call and its adopt', async () => {
+    let land!: () => void;
+    const adopting = withAdoption('scene-load', () => new Promise<void>((r) => { land = r; }));
+    try {
+      await quietly(() => parkPrefabChanges([{ source: X, doc: parkDoc(), from: diskDoc() }], { rebase: false }));
+      expect(peekDirtyAsset(X_PATH)).not.toBeNull();
+    } finally { land(); await adopting; }
+  });
+
   // Mutation: clear `overwrite` after every prefab flush, whether or not it wrote with it — this goes red.
   it('R4: an Overwrite answered while another flush writes survives that flush\'s conflict, for the Save that asked', async () => {
     parkPrefab(X_PATH, parkDoc(), diskDoc());
     route.disk.set(X_PATH, jsonFileBody({ ...diskDoc(), name: 'pulled' } as PrefabFile)); // the file changed meanwhile
-    const hold = holdNextWrite();
+    // Held at its READ: the flush meets the change there, before it writes (#1880 W), so that is its window now.
+    const hold = holdNextRead();
     const flushing = quietly(() => flushDirtyAssets()); // e.g. an agent save_all, which does not take the Cmd+S latch
     await hold.inFlight;
     expect(overwriteParkedAsset(X_PATH)).toBe(true); // the human answers Overwrite on the Cmd+S question

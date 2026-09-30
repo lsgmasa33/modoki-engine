@@ -43,8 +43,8 @@ vi.mock('../../src/editor/scene/serialize', () => ({
   isSceneLoadSwapping: () => false,
 }));
 
-vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
-  restorePrefabsInMemory: (...a: any[]) => restorePrefabsInMemory(...a),
+vi.mock('../../src/editor/scene/prefabCommit', () => ({
+  parkPrefabChanges: (...a: any[]) => restorePrefabsInMemory(...a),
 }));
 
 vi.mock('../../src/editor/scene/prefab', () => ({
@@ -92,6 +92,8 @@ vi.mock('../../src/editor/undo/undoManager', () => ({
   // A forward Apply holds world switches for its whole run (#1667).
   isWorldSwitchInProgress: () => false,
   beginWorldBoundOperation: () => () => {},
+  // …and holds agent edits off until its undo entry is pushed (#1880 W8).
+  beginSnapshotOperation: () => () => {},
 }));
 
 async function getModule() {

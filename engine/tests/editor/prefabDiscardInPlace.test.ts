@@ -8,7 +8,7 @@
  *  use X (`sceneManager.getCurrent`, a live instance), so the old path really reaches `sceneManager.loadScene`; that is
  *  spied, so "no reload" is asserted, not inferred from the values.
  *
- *  Mutations (each run, see the close-out): the discard goes back to `reloadPrefabFromDisk` → every case goes red
+ *  Mutations (each run, see the close-out): the discard goes back to the watcher's path (`handleSceneChanged`) → every case goes red
  *  (loadScene called, the edit or the stack gone); `markSceneDirty` inside the re-import → the clean-scene case goes red;
  *  the replay routes an in-place entry to `handleSceneChanged` → the deferred case goes red (loadScene called). */
 

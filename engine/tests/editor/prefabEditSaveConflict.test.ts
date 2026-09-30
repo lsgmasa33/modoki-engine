@@ -211,6 +211,16 @@ describe('a file changed on disk under the open edit (#1692)', () => {
     expect(onDisk().entities[0]!.name).toBe('Badge');
   });
 
+  // #1880 W6. Mutation: drop the overwrite's `state === 'absent'` refusal in `precheck` — the edit writes the file back.
+  it('an Overwrite over a prefab deleted since refuses, and does not write it back', async () => {
+    route.disk.delete(PATH); // trashed in the Assets panel while the edit was open
+    edit();
+    const res = await quietly(() => savePrefabEditReport({ overwrite: true }));
+    expect(res.saved).toBe(false);
+    expect(res.warnings.join(' ')).toMatch(/was deleted since, so it was not written back/);
+    expect(route.disk.has(PATH)).toBe(false);
+  });
+
   it('a write from elsewhere IN the editor (an Apply from a carried instance) is not mistaken for the open edit: the save is told', async () => {
     // The Apply's one write step, over the file as it was read. The editor cache follows it (I9) — the edit's save is
     // conditional on the session's OWN baseline, not on that entry.

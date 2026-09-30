@@ -13,7 +13,7 @@ export { backendFetch, backendPostJson, backendEventSource, backendBase, backend
 export { expectedHash, fileChangedRefusal, UndoRefusedError, reportUndoFailure } from './undo/undoFailure';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
-  pushAction, undo, redo, undoStep, undoStepPending, isExecutingUndoRedo, isUndoStepInFlight, beginForwardEdit, type UndoStepResult, type UndoShortfall, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
+  pushAction, undo, redo, undoStep, undoStepPending, isExecutingUndoRedo, isUndoStepInFlight, isSnapshotOperationInFlight, beginSnapshotOperation, beginForwardEdit, type UndoStepResult, type UndoShortfall, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
 export { assetDocAction, runAssetDocStep, captureAssetDocBaseline, type AssetDocBaseline, type AssetDocSide } from './undo/assetDocUndo';

@@ -19,7 +19,7 @@
  *  resolve instead of throwing on a skipped restore — the half-swapped and in-flight cases go red.
  *
  *  #1868: the undo writes no file, so the window these cases land a switch in is the undo's in-memory restore
- *  (`restorePrefabsInMemory`, entered before the world check), not its file install. */
+ *  (`parkPrefabChanges`, entered before the world check), not its file install. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
@@ -106,9 +106,9 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOri
   };
 });
 // The undo's restore, entered before it asks whether its world is still live — the window (`sm.window`).
-vi.mock('../../packages/modoki/src/editor/scene/prefabMemoryRestore', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabMemoryRestore')>();
-  return { ...real, restorePrefabsInMemory: async (...a: Parameters<typeof real.restorePrefabsInMemory>) => { await sm.window(); return real.restorePrefabsInMemory(...a); } };
+vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabCommit')>();
+  return { ...real, parkPrefabChanges: async (...a: Parameters<typeof real.parkPrefabChanges>) => { await sm.window(); return real.parkPrefabChanges(...a); } };
 });
 // Play's own awaits, which have nothing to do with the undo (#1579's Play case).
 vi.mock('../../packages/modoki/src/runtime/physics/physicsReady', () => ({ ensurePhysicsReady: async () => {} }));

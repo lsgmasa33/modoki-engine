@@ -23,12 +23,12 @@ import { missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRe
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { serializePrefab, parsedPrefabRows } from '../scene/prefabSerialize';
 import {
-  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance,
+  tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance, requireLinks,
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
 import { partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
 import { isResourceEntity } from '../../runtime/core/ecs/hierarchy';
-import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason } from '../scene/prefabCommit';
+import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason, parkPrefabChanges } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef, isInstanceRootCheck, type EntityRef } from '../undo/entityRef';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -36,7 +36,6 @@ import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { resolveRef } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { reportUndoFailure, fileChangedRefusal, UndoRefusedError } from '../undo/undoFailure';
-import { restorePrefabsInMemory } from '../scene/prefabMemoryRestore';
 import type { UndoAction } from '../undo/undoManager';
 import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
@@ -834,11 +833,15 @@ export async function createPrefabFromEntity(
     // ⚠️ And both directions carry a PRECONDITION (#1679): the prefab is global and this entry outlives edits made
     // elsewhere — double-click the new prefab, edit it, Cmd+S, Back, and this scene's Cmd+Z used to trash or overwrite
     // that save. A Replace's halves restore IN MEMORY (#1868) and refuse when the editor holds another document than the
-    // other half left (`restorePrefabsInMemory`); a create's redo re-links only while the file still holds `prefab`, and
+    // other half left (`parkPrefabChanges`); a create's redo re-links only while the file still holds `prefab`, and
     // writes the file only where it was deleted since. Each restore's rebuild puts this tree's links back (or on), and
     // its rebase brings every OTHER instance of a replaced prefab onto the restored document.
     undo: async () => {
       rebasedByUndo = false;
+      // A link this undo puts back that would be LOST — its entity gone with a prefab trashed since — refuses first,
+      // before anything changes (#1880 W5, seed 1012). The only await ahead of the tree checks below, so nothing after
+      // it can see a world this read spanned.
+      if (priorLinks && (tagged || replaced)) await requireLinks(priorLinks, `"${label}"`);
       // The tree this step tagged, asked BEFORE anything changes (#1795's second route, I19/I20): after a world swap it
       // can be gone, or a Missing Prefab placeholder (this prefab trashed, the scene reloaded) whose scene entry still
       // names the file. Asked only while the tree is tagged: an untagged tree has no link to undo.
@@ -871,7 +874,7 @@ export async function createPrefabFromEntity(
       // instance is rebased onto it, and Save writes it. By the prefab's guid, so a Rename since finds it where it is
       // (#1868 hub call e). Refused, before anything changes, when the editor holds another document than this Replace
       // left (a prefab-edit save since, an outside change) — the #1679 precondition, asked of memory.
-      await restorePrefabsInMemory([{ source: guid, doc: restored(), from: prefab }], {
+      await parkPrefabChanges([{ source: guid, doc: restored(), from: prefab }], {
         rebuild: () => {
           unstamp();
           // By the document's own guid (#1807): the manifest can still map it to a renamed path an undo just moved back.
@@ -971,7 +974,7 @@ export async function createPrefabFromEntity(
         tagged = true;
       };
       if (replaced) {
-        await restorePrefabsInMemory([{ source: guid, doc: prefab, from: restored() }], { rebuild });
+        await parkPrefabChanges([{ source: guid, doc: prefab, from: restored() }], { rebuild });
         return;
       }
       const committed = await commitPrefabWrite(savePath, prefab, { expected: null, bytes: content, rebuild });

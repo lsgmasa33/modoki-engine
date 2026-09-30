@@ -1,5 +1,5 @@
-/** #1877 C1: the in-memory restore (#1868) seats and parks a document that Save later writes, so it refuses what the
- *  write door (`commitPrefabWrites`) refuses, before anything changes — not only "this document moved on since the step":
+/** #1877 C1, #1880 W2: the undo's landing (`'park'`, #1868) seats and parks a document that Save later writes, so it
+ *  refuses what the write landing refuses — one invariant stage (`commitPrefabChanges`), before anything changes — not only "this document moved on since the step":
  *  - L2: the file is GONE (an Assets trash since the step evicts both caches). Restored, the park wrote the trashed prefab
  *    back at the next Save, behind a false "changed on disk" prompt. Unity brings no deleted asset back through an undo.
  *  - L1: the restored document would contain itself (I16) through a prefab changed outside the stack. Restored, Save
@@ -12,7 +12,7 @@ import { registerAsset } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { clearDirtyAssets, peekDirtyAsset } from '../../packages/modoki/src/editor/scene/dirtyAssets';
-import { restorePrefabsInMemory } from '../../packages/modoki/src/editor/scene/prefabMemoryRestore';
+import { parkPrefabChanges } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { UndoRefusedError } from '../../packages/modoki/src/editor/undo/undoFailure';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 
@@ -22,7 +22,7 @@ const A = 'cccccccc-0000-4000-8000-000001877a01';
 const B = 'cccccccc-0000-4000-8000-000001877a02';
 const AP = '/assets/prefabs/A1877.prefab.json';
 const BP = '/assets/prefabs/B1877.prefab.json';
-/** Files on disk: `/api/exists` answers from here, as the route does. */
+/** Files on disk: a GET answers from here, as the route does. */
 const disk = new Set<string>();
 
 const row = (localId: number, name: string, parentId: number, prefab?: string) => ({
@@ -48,6 +48,9 @@ beforeEach(() => {
       const asked = decodeURIComponent(String(url).split('path=')[1] ?? '');
       return new Response(JSON.stringify(disk.has(asked) ? { exists: true, path: asked } : { exists: false }), { status: 200 });
     }
+    // A prefab GET (`documentNow` reads a file no cache or park holds): what the file holds, or a 404 once it is gone.
+    const file = [AP, BP].find((p) => String(url).endsWith(p));
+    if (file) return disk.has(file) ? new Response(JSON.stringify(file === AP ? docA(true) : docB(false)), { status: 200 }) : new Response('', { status: 404 });
     return new Response(JSON.stringify({ files: [] }), { status: 200 });
   });
   for (const k of ['log', 'warn', 'info'] as const) vi.spyOn(console, k).mockImplementation(() => {});
@@ -55,34 +58,48 @@ beforeEach(() => {
 afterAll(() => { seat(A, AP, null); seat(B, BP, null); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('#1877 L2: the undo of a write to a prefab trashed since then refuses, and brings nothing back', () => {
-  // Mutation: `goneFiles` answers an empty set (or the refusal ignores `gone`) — the restore seats and parks A.
+  // Mutation: drop the park landing's exists check (`p.file === 'absent'`) — the restore seats and parks A.
   it('the file is gone and no cache holds it: refused, nothing seated, nothing parked', async () => {
     seat(A, AP, null); // the trash evicted both caches; `disk` has no A
-    const e = await refusal(restorePrefabsInMemory([{ source: A, doc: docA(false), from: docA(true) }], { rebase: false }));
+    const e = await refusal(parkPrefabChanges([{ source: A, doc: docA(false), from: docA(true) }], { rebase: false }));
     expect(e).toBeInstanceOf(UndoRefusedError);
     expect(String((e as Error).message)).toMatch(/was deleted since this step/);
     expect(getCachedPrefabSync(A)).toBeFalsy();
     expect(peekDirtyAsset(AP)).toBeNull();
   });
 
-  // Accept side. Mutation: the probe refuses every document no cache holds (drop the `exists === false` test).
+  // Accept side. Mutation: refuse every document no cache holds (`p.file !== 'absent'` read as gone) — this goes red.
   it('a document no cache holds whose file IS there restores, parked for Save', async () => {
     seat(A, AP, null);
     disk.add(AP);
-    await restorePrefabsInMemory([{ source: A, doc: docA(false), from: docA(true) }], { rebase: false });
+    await parkPrefabChanges([{ source: A, doc: docA(false), from: docA(true) }], { rebase: false });
     expect(getCachedPrefabSync(A)?.entities.map((r) => r.name)).toEqual(['AR']);
     expect(peekDirtyAsset(AP)).not.toBeNull();
   });
 });
 
+describe('#1880 close-out review: with nothing held, the file stands in for the precondition', () => {
+  // A rig-prefab undo (it survives world swaps) whose prefab nothing in the scene uses: its keys are cold. The file was
+  // trashed and put back with other content since. Parked over it, Save's precondition met the file it was parked over
+  // and overwrote it unasked. Mutation: ask the precondition of `p.now.editor` only — this restores and parks.
+  it('a cold prefab whose file holds another document than the step left refuses, and parks nothing', async () => {
+    seat(A, AP, null);
+    disk.add(AP); // the file holds docA(true)
+    const e = await refusal(parkPrefabChanges([{ source: A, doc: docA(false), from: { ...docA(true), name: 'A as the step left it' } as PrefabFile }], { rebase: false }));
+    expect(e).toBeInstanceOf(UndoRefusedError);
+    expect(String((e as Error).message)).toMatch(/changed since this step/);
+    expect(peekDirtyAsset(AP)).toBeNull();
+  });
+});
+
 describe('#1877 L1: a restore that would make a prefab contain itself refuses before anything changes (I16)', () => {
   // An Apply took B out of A; B's own prefab edit then placed an A and saved; undoing the Apply puts B back in A.
-  // Mutation: the refusal's I16 loop is skipped — A is seated nesting B while B nests A.
+  // Mutation: `landParks` skips `selfContaining` — A is seated nesting B while B nests A.
   it('A restored to nest B, while B (changed outside the stack) nests A: refused, A left as it was', async () => {
     seat(A, AP, docA(false));
     seat(B, BP, docB(true));
     disk.add(AP).add(BP);
-    const e = await refusal(restorePrefabsInMemory([{ source: A, doc: docA(true), from: docA(false) }], { rebase: false }));
+    const e = await refusal(parkPrefabChanges([{ source: A, doc: docA(true), from: docA(false) }], { rebase: false }));
     expect(e).toBeInstanceOf(UndoRefusedError);
     expect(String((e as Error).message)).toMatch(/would contain itself/);
     expect(getCachedPrefabSync(A)?.entities.map((r) => r.name)).toEqual(['AR']);
@@ -95,7 +112,7 @@ describe('#1877 L1: a restore that would make a prefab contain itself refuses be
     seat(A, AP, docA(false));
     seat(B, BP, docB(false));
     disk.add(AP).add(BP);
-    const e = await refusal(restorePrefabsInMemory([
+    const e = await refusal(parkPrefabChanges([
       { source: A, doc: docA(true), from: docA(false) },
       { source: B, doc: docB(true), from: docB(false) },
     ], { rebase: false }));
@@ -108,7 +125,7 @@ describe('#1877 L1: a restore that would make a prefab contain itself refuses be
     seat(A, AP, docA(false));
     seat(B, BP, docB(false));
     disk.add(AP).add(BP);
-    await restorePrefabsInMemory([{ source: A, doc: docA(true), from: docA(false) }], { rebase: false });
+    await parkPrefabChanges([{ source: A, doc: docA(true), from: docA(false) }], { rebase: false });
     expect(getCachedPrefabSync(A)?.entities.map((r) => r.name)).toEqual(['AR', 'HoldsB']);
   });
 });

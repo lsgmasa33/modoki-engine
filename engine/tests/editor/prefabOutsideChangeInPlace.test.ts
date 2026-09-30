@@ -3,7 +3,7 @@
  *  scene's unsaved edits, its dirty flag and its undo stack. It reverses #1164's disk-wins reload for prefab changes; an
  *  outside change to the scene FILE still reloads (pinned beside the prefab case in `deferredReloadWiring.test.ts`).
  *
- *  Driven through the watcher's own entry (`reloadPrefabFromDisk` is `handleSceneChanged({urlPath, kind:'prefab'})`, the
+ *  Driven through the watcher's own entry (`_watcherPrefabChangedForTests` is `handleSceneChanged({urlPath, kind:'prefab'})`, the
  *  message both watchers send), over a scene made to look OPEN and to use X, with `sceneManager.loadScene` spied — so
  *  "not reloaded" is asserted, not inferred. The world is loaded by the real loader (`loadSceneFile`) as in
  *  `prefabPark.test.ts`.
@@ -53,11 +53,18 @@ import { installEditorPrefabCacheWarm } from '../../packages/modoki/src/editor/s
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
-import { reloadPrefabFromDisk } from '../../app/debug/agentBridge';
+import { _watcherPrefabChangedForTests as reloadPrefabFromDisk } from '../../app/debug/agentBridge';
 import { getPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { loadManifestJson, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { markSceneDirty, clearSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { UnresolvedPrefabRef } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { resetPrefabMarkRecord, commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { reimportPrefabsInPlace } from '../../packages/modoki/src/editor/scene/prefabReimport';
+import { peekDirtyAsset, flushDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+import { localIdCounter } from '../../packages/modoki/src/runtime/core/localIdCounter';
+import { createEntityWithUndo } from '@modoki/engine/editor';
+import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
+import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 
 registerAllTraits();
@@ -155,6 +162,7 @@ const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
 
 let loadScene: ReturnType<typeof vi.spyOn>;
 beforeEach(async () => {
+  resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   clearDirtyAssets();
@@ -373,5 +381,201 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
     await renameY(() => { setPrefabCache(Y, applied); });
     expect((getCachedPrefabSync(Y)!.entities[0]!.traits as { Transform: { y: number } }).Transform.y, 'the Apply stands').toBe(9);
     releaseAllForScene(187_398);
+  });
+});
+
+/** #1880 W4: the watcher's every prefab branch is the prefab step's `'adopt'` landing — REPLACE, never evict (#1308). The
+ *  branches with no scene file open and in prefab edit evicted the runtime copy, so a synchronous runtime reader (a pooled
+ *  scroll view, a timeline spawn) read `undefined` until the next scene load. */
+describe('#1880 W4: an outside change is adopted through the prefab step on every watcher branch', () => {
+  const runtimeXA = () => ((getCachedPrefab(X) as PrefabFile | undefined)?.entities.find((e) => e.name === 'XA')?.traits as { Transform?: { y: number } } | undefined)?.Transform?.y;
+
+  // Mutation: the caches-only branch goes back to `evictRuntimePrefabs(); refreshEditorPrefabs()` — the reader reads undefined.
+  it('in prefab edit, a synchronous runtime reader reads the file\'s document, not undefined, and nothing reloads', async () => {
+    vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${H}` } as never);
+    outsideWrite();
+    await quietly(() => reloadPrefabFromDisk(X_PATH));
+    expect(loadScene).not.toHaveBeenCalled();
+    expect(runtimeXA()).toBe(5);
+    expect(getCachedPrefabSync(X)?.entities.find((e) => e.name === 'XA')?.traits).toMatchObject({ Transform: { y: 5 } });
+  });
+
+  it('with no scene file open, the same', async () => {
+    vi.spyOn(sceneManager, 'getCurrent').mockReturnValue(null as never);
+    outsideWrite();
+    await quietly(() => reloadPrefabFromDisk(X_PATH));
+    expect(runtimeXA()).toBe(5);
+  });
+
+  // Hub ruling (2026-09-30): an outside write cannot be refused, but a file that would contain itself is not seated; the
+  // editor keeps what it held, and the report names the prefab that closes the cycle. Mutation: skip the adopt's I16 —
+  // X is seated nesting H, which nests X.
+  it('a file written to contain itself is not seated, and the report names the cycle', async () => {
+    const before = getCachedPrefabSync(X);
+    route.disk.set(X_PATH, jsonFileBody({ ...diskDoc(), entities: [...diskDoc().entities, { localId: 4, prefab: H, nodeGuid: g(7), traits: { EntityAttributes: { name: 'XH', parentId: 1, guid: '' } } }] } as never));
+    const report = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(report.failed).toEqual([{ path: X_PATH, reason: expect.stringMatching(new RegExp(`would contain itself \\(it nests ${H_PATH}, which nests it back\\)`)) }]);
+    expect(report.reimported).toEqual([]);
+    expect(getCachedPrefabSync(X)).toBe(before);
+    expect(tf(I1, 'XA').y).toBe(0);
+  });
+});
+
+/** #1880 W4, hub ruling (A): the mark says "no number below me is handed out again", and an outside REWIND (a `git
+ *  checkout` of an older document) lowered it — the next minting writer, which reads the cached document's mark, then
+ *  numbered a new row at a number the scene still keys a newer member by. The adopt raises the mark in the CACHES only,
+ *  to the session's record and to what the caches held. */
+describe('#1880 close-out review: what the adopt must not seat, and what it must take again', () => {
+  // Finding 1. #1813: JSON that is not a prefab (no `entities`) is not a prefab document. Mutation: drop the
+  // `isPrefabDocument` test in `landAdopts` — the adopt throws ("nodes is not iterable") in the watcher's path.
+  it('an outside write of JSON that is not a prefab is reported, and the editor keeps what it held', async () => {
+    const before = getCachedPrefabSync(X);
+    route.disk.set(X_PATH, JSON.stringify({ id: X, name: 'X' }));
+    const report = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(report.failed).toEqual([{ path: X_PATH, reason: expect.stringMatching(/could not be read as a prefab/) }]);
+    expect(getCachedPrefabSync(X)).toBe(before);
+    expect(tf(I1, 'XA').y).toBe(0);
+  });
+
+  // Finding 3. A checkout that FLIPS a nesting direction arrives one file per event: X (now nesting H) first, while the
+  // caches still hold the old H (which nests X) — a cycle that is not there once H's event lands. Mutation: drop the
+  // retry in `landAdopts` — X stays refused, and I1 never gains the H it now nests.
+  it('a file refused as a cycle is taken again once the other file of the change lands', async () => {
+    const xNestsH = { ...diskDoc(), entities: [...diskDoc().entities, { localId: 4, prefab: H, nodeGuid: g(7), traits: { EntityAttributes: { name: 'XH', parentId: 1, guid: '' } } }] };
+    route.disk.set(X_PATH, jsonFileBody(xNestsH as never));
+    route.disk.set(H_PATH, jsonFileBody({ ...hDoc(), entities: [hDoc().entities[0]!] } as never));
+    await quietly(() => reloadPrefabFromDisk(X_PATH));
+    expect((getCachedPrefab(X) as PrefabFile).entities.map((e) => e.localId), 'premise: X refused while the old H nests it').toEqual([1, 2, 3]);
+    await quietly(() => reloadPrefabFromDisk(H_PATH));
+    expect((getCachedPrefab(X) as PrefabFile).entities.map((e) => e.localId)).toEqual([1, 2, 3, 4]);
+    expect(() => inInstance(I1, 'HR'), 'I1 is rebuilt onto it: the H it now nests (its root) is in it').not.toThrow();
+    expect(loadScene).not.toHaveBeenCalled();
+  });
+});
+
+describe('#1880 close-out re-review: a refused cycle waits for the prefab that closed it, and nothing else', () => {
+  const xNests = (ref: string) => ({ ...diskDoc(), entities: [...diskDoc().entities, { localId: 4, prefab: ref, nodeGuid: g(7), traits: { EntityAttributes: { name: 'XN', parentId: 1, guid: '' } } }] });
+  const yNestsX = () => ({ id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(8)), { localId: 2, prefab: X, nodeGuid: g(9), traits: { EntityAttributes: { name: 'YX', parentId: 1, guid: '' } } }] });
+  const yAlone = () => ({ id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(8))] });
+
+  // Re-review gap 1: a cycle through THREE prefabs is broken by its middle link. X (now nesting H) meets X→H→Y→X in the
+  // caches; Y's event (Y no longer nests X) breaks it. Mutation: store only the first link (`new Set([hit.ref])`) — Y is
+  // not it, and X is never taken again.
+  it('a cycle through three prefabs is taken again when its middle link lands', async () => {
+    registerAsset(Y, Y_PATH, 'prefab');
+    const hNestsY = { ...hDoc(), entities: [hDoc().entities[0]!, { localId: 2, prefab: Y, nodeGuid: g(6), traits: { EntityAttributes: { name: 'HY', parentId: 1, guid: '' } } }] };
+    setPrefabCache(H, hNestsY as never);
+    setPrefabCache(Y, yNestsX() as never);
+    route.disk.set(X_PATH, jsonFileBody(xNests(H) as never));
+    const first = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(first.failed[0]?.reason, 'premise: refused through H → Y → X').toMatch(/would contain itself/);
+    route.disk.set(Y_PATH, jsonFileBody(yAlone() as never));
+    await quietly(() => reimportPrefabsInPlace([Y_PATH]));
+    expect((getCachedPrefab(X) as PrefabFile).entities.map((e) => e.localId)).toEqual([1, 2, 3, 4]);
+    for (const k of [Y, H]) setPrefabCache(k, null as never);
+  });
+
+  // Re-review gap 2: the cycle is broken by an editor WRITE, not an outside change. Mutation: drop the retry after
+  // `landFiles`' rebase — X stays on its old document.
+  it('a cycle broken by an editor write is taken again', async () => {
+    route.disk.set(X_PATH, jsonFileBody(xNests(H) as never));
+    const first = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(first.failed[0]?.reason, 'premise: refused while H nests X').toMatch(/would contain itself/);
+    const hAlone = { ...hDoc(), entities: [hDoc().entities[0]!] } as PrefabFile;
+    expect((await quietly(() => commitPrefabWrite(H, hAlone, { expected: hDoc() }))).ok).toBe(true);
+    expect((getCachedPrefab(X) as PrefabFile).entities.map((e) => e.localId)).toEqual([1, 2, 3, 4]);
+  });
+
+  // Re-review gap 3: the prefab that closed the cycle is DELETED outside — that may end the cycle too, so the refused file
+  // is examined again (here it is still one: H's live frame still nests X, #1866's reader). Mutation: leave the deleted
+  // keys out of `landed` — X is never looked at again, and the delete's report has no row for it.
+  it('a deleted closer takes the refused file again', async () => {
+    route.disk.set(X_PATH, jsonFileBody(xNests(H) as never));
+    const first = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(first.failed[0]?.reason, 'premise: refused while H nests X').toMatch(/would contain itself/);
+    route.disk.delete(H_PATH);
+    const gone = await quietly(() => reimportPrefabsInPlace([H_PATH]));
+    expect(gone.deleted).toEqual([H_PATH]);
+    expect(gone.failed.map((f) => f.path), 'X was examined again').toEqual([X_PATH]);
+  });
+
+  // Re-review 3, item 2: a WRITE of the refused file itself does not retry it — re-read, it would be noted as changed (a
+  // read of X in flight refused for this step's own write) and seated a second time. Mutation: exclude nothing in
+  // `landFiles`' retry — the cache holds the re-read copy, not the document the write seated.
+  it('a write of the refused file itself does not take it again', async () => {
+    route.disk.set(X_PATH, jsonFileBody(xNests(H) as never));
+    await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    const fixed = { ...diskDoc(), name: 'X fixed' } as PrefabFile;
+    expect((await quietly(() => commitPrefabWrite(X, fixed, { expected: xNests(H) as never }))).ok).toBe(true);
+    expect(getCachedPrefabSync(X)).toBe(fixed);
+  });
+
+  // X nests Y while Y (held, nothing live uses it) nests X: a genuine cycle. An unrelated outside change to H lands after —
+  // it must not re-read X. Mutation: retry every refused path once anything lands (`closedBy` → true) — X, fixed on
+  // disk meanwhile with no event of its own, is re-read and re-seated (a new document object).
+  it('an unrelated adopt does not re-read a path refused as a cycle', async () => {
+    registerAsset(Y, Y_PATH, 'prefab');
+    const yNestsX = { id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(8)), { localId: 2, prefab: X, nodeGuid: g(9), traits: { EntityAttributes: { name: 'YX', parentId: 1, guid: '' } } }] };
+    setPrefabCache(Y, yNestsX as never);
+    route.disk.set(Y_PATH, jsonFileBody(yNestsX as never));
+    route.disk.set(X_PATH, jsonFileBody({ ...diskDoc(), entities: [...diskDoc().entities, { localId: 4, prefab: Y, nodeGuid: g(7), traits: { EntityAttributes: { name: 'XY', parentId: 1, guid: '' } } }] } as never));
+    const refused = await quietly(() => reimportPrefabsInPlace([X_PATH]));
+    expect(refused.failed[0]?.reason, 'premise: X is refused as a cycle').toMatch(/would contain itself/);
+    const before = getCachedPrefab(X);
+    route.disk.set(X_PATH, jsonFileBody(diskDoc())); // fixed on disk, with no event of its own yet
+    route.disk.set(H_PATH, jsonFileBody({ ...hDoc(), name: 'H edited' } as never));
+    const other = await quietly(() => reimportPrefabsInPlace([H_PATH]));
+    expect(other.reimported, 'premise: the unrelated adopt landed').toEqual([H_PATH]);
+    expect(getCachedPrefab(X), 'X was not re-read').toBe(before);
+    setPrefabCache(Y, null as never);
+  });
+});
+
+describe('#1880 W4 (A): an outside rewind does not lower the mark any minting writer reads', () => {
+  /** The newer X: XN added at 4, the mark at 5. */
+  const newer = (): PrefabFile => ({ ...diskDoc(), nextLocalId: 5, entities: [...diskDoc().entities, row(4, 'XN', 1, g(4))] } as unknown as PrefabFile);
+  const rewind = async () => {
+    route.disk.set(X_PATH, jsonFileBody(newer()));
+    for (const k of [X, X_PATH]) setPrefabCache(k, null);
+    await quietly(() => load(emptyScene()));
+    await quietly(() => load(scene()));
+    markSceneSaved();
+    expect(localIdCounter(getCachedPrefab(X) as PrefabFile), 'premise: the loader holds the newer mark').toBe(5);
+    route.disk.set(X_PATH, jsonFileBody(diskDoc())); // the rewind: rows 1-3, no mark (it derives 4)
+    await quietly(() => reloadPrefabFromDisk(X_PATH));
+  };
+
+  // Mutation: drop the adopt's raise (`need` ignored) — the cached mark is 4, and the Apply below numbers its row 4: XN's.
+  it('the cached document keeps the mark, and an Apply numbers its new row above it — not at the number XN had', async () => {
+    await rewind();
+    expect(getCachedPrefabSync(X)!.entities.map((e) => e.name), 'the rewind was taken').toEqual(['XR', 'XA', 'XB']);
+    expect(localIdCounter(getCachedPrefabSync(X)!)).toBe(5);
+    createEntityWithUndo('Add', rootOf(I2), [{ name: 'Transform', data: {} }, { name: 'EntityAttributes', data: { name: 'New', parentId: rootOf(I2) } }], () => {});
+    const keys = collectInstanceOverrideKeys(rootOf(I2), getCachedPrefabSync(X)!);
+    const applied = await quietly(() => applyToPrefabWithUndo(rootOf(I2), new Set(keys.all)));
+    expect(applied.applied, JSON.stringify(applied)).toBe(true);
+    const written = JSON.parse(route.disk.get(X_PATH)!) as PrefabFile & { nextLocalId: number };
+    expect(written.entities.find((e) => e.name === 'New')!.localId).toBe(5);
+    expect(written.nextLocalId).toBe(6);
+  });
+
+  // Pin (1): the raise changes nothing a human sees as unsaved. Mutation: land the raise as a PARK — red.
+  it('the raise is not unsaved work: no park, the scene clean, the stack empty', async () => {
+    await rewind();
+    expect(peekDirtyAsset(X_PATH)).toBeNull();
+    expect(worldHasUnsavedEdits()).toBe(false);
+    expect(canUndo()).toBe(false);
+  });
+
+  // Pin (3): the raise reaches the file with the next real write, and a Save with no prefab change writes nothing.
+  // Mutation: the write's mark ignores the editor's document — the file is written at 4.
+  it('a Save writes nothing for it, and the next write carries it to the file', async () => {
+    await rewind();
+    const text = route.disk.get(X_PATH);
+    expect((await quietly(() => flushDirtyAssets())).saved).toEqual([]);
+    expect(route.disk.get(X_PATH)).toBe(text);
+    const edited = { ...diskDoc(), name: 'X edited' } as PrefabFile;
+    expect((await quietly(() => commitPrefabWrite(X, edited, { expected: diskDoc() }))).ok).toBe(true);
+    expect((JSON.parse(route.disk.get(X_PATH)!) as { nextLocalId?: number }).nextLocalId).toBe(5);
   });
 });

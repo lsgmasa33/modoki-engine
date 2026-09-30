@@ -87,6 +87,28 @@ export const KNOWN_OPEN: KnownOpen[] = [
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
+    issue: 1880,
+    what: "lane T seed 1099: an outside edit added a row without raising the stated mark, and the next editor write (an Apply) kept the stale mark — the file broke v8's contract and the validator's promise that the next write corrects the mark was false. contentFor now restates a stated mark that is not above the highest row",
+    repro: [
+      { kind: 'reparent', u: [0.47770910640247166, 0.8178041507489979, 0.6369340941309929, 0.6863702349364758, 0.9003703948110342, 0.18058545305393636, 0.8215817357413471, 0.04941198998130858] },
+      { kind: 'delete', u: [0.499067502329126, 0.9298342380207032, 0.2906979222316295, 0.49646617053076625, 0.1884565125219524, 0.16665405174717307, 0.5789271560497582, 0.9049758883193135] },
+      { kind: 'editField', u: [0.669916127808392, 0.3902909515891224, 0.9860278882551938, 0.48131254594773054, 0.6519258550833911, 0.9486431477125734, 0.07681132107973099, 0.8623189509380609] },
+      { kind: 'apply', u: [0.33203068375587463, 0.058042194694280624, 0.09917373978532851, 0.3739689118228853, 0.44026124267838895, 0.1452095932327211, 0.13624857971444726, 0.546543656848371] },
+      { kind: 'outsideEdit', u: [0.7314007196109742, 0.11507661105133593, 0.0136238110717386, 0.5275846724398434, 0.34810297144576907, 0.8702871620189399, 0.2778983840253204, 0.748940470861271], check: "rebuild-reload" },
+      { kind: 'addChild', u: [0.6768837794661522, 0.8782731993123889, 0.015208997298032045, 0.12011798354797065, 0.21936977189034224, 0.9705852677579969, 0.5143393226899207, 0.16034760931506753] },
+      { kind: 'apply', u: [0.8724295785650611, 0.4672330424655229, 0.643474405631423, 0.3496431359089911, 0.013759419322013855, 0.6665663898456842, 0.04928848030976951, 0.8362166373990476], check: "rebuild-reload" },
+    ],
+  },
+  {
+    issue: 1881,
+    what: "seed 1012 (Duplicate, Create Prefab, trash a prefab nested in the tree, then the walk's undo): Create Prefab's undo put its links back after the change and counted 2 it could not; #1880 W5's `requireLinks` refuses before any change",
+    repro: [
+      { kind: 'duplicate', u: [0.793059557909146, 0.07850893028080463, 0.8062161759007722, 0.8035517330281436, 0.2764330352656543, 0.8323238401208073, 0.26245217374525964, 0.47499521006830037] },
+      { kind: 'createPrefab', u: [0.07576225162483752, 0.4839742570184171, 0.18013141467235982, 0.984006108250469, 0.7422482529655099, 0.5091050690971315, 0.9696242799982429, 0.537708398886025] },
+      { kind: 'trashPrefab', u: [0.6900484366342425, 0.5306535325944424, 0.7126782101113349, 0.8273992876056582, 0.3369053485803306, 0.45967397396452725, 0.8177091341931373, 0.2302168474998325] },
+    ],
+  },
+  {
     issue: 1877,
     what: "3b S1 (#1880 T1): after two Applies, an undo, Cmd+S (Save All lands the park, mark 7) and two more undos, the in-memory restore parked P with its localId mark back at 6, and the next Apply handed out row 6 again (I4). Fixed by #1877 C1: the restore takes the mark from what the editor holds (`documentNow`); re-found first by #1880's park mark check",
     repro: [

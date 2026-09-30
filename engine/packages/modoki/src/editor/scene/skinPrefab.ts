@@ -15,8 +15,7 @@ import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { type PrefabFile } from './prefab';
 import { classifyExistingPrefabId } from './prefabCache';
 import { serializeRebuildOver } from './prefabSerialize';
-import { restorePrefabsInMemory } from './prefabMemoryRestore';
-import { commitPrefabWrite, parsePrefabBytes } from './prefabCommit';
+import { commitPrefabWrite, parsePrefabBytes, parkPrefabChanges } from './prefabCommit';
 import { readPriorDocument } from '../panels/assetOps';
 import { pushAction, type UndoAction } from '../undo/undoManager';
 
@@ -122,8 +121,8 @@ export async function makeRigPrefabAsset(
     label,
     // A parked document's edit that also rebuilds the live frames placed from it (undoManager.ts).
     _isFileDirect: true, _rebasesLiveFrames: true,
-    undo: () => restorePrefabsInMemory([{ source: guid, doc: restored(), from: prefab }]),
-    redo: () => restorePrefabsInMemory([{ source: guid, doc: prefab, from: restored() }]),
+    undo: () => parkPrefabChanges([{ source: guid, doc: restored(), from: prefab }]),
+    redo: () => parkPrefabChanges([{ source: guid, doc: prefab, from: restored() }]),
   };
   pushAction(action);
   return { path: savePath, updated };

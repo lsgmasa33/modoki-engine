@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState, getAllEntities } from '@modoki/engine/runtime';
 import { markSceneSaved, pushAction } from '@modoki/engine/editor';
-import { undoStep, undoLabel, _resetHistoryContexts, beginForwardEdit, undoRefusedReason, WORLD_SWITCH_STALL_WARN_MS, FORWARD_EDIT_MAX_HOLD_MS } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undoStep, undoLabel, _resetHistoryContexts, beginForwardEdit, beginSnapshotOperation, undoRefusedReason, WORLD_SWITCH_STALL_WARN_MS, FORWARD_EDIT_MAX_HOLD_MS } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps, agentStepGate } from '../../app/editor/agentEditorOps';
 import { UNDO_RECORDING_OPS, NON_RECORDING_OPS } from '../../app/editor/agentOpUndoClass';
@@ -129,6 +129,25 @@ describe('prefab is classified by action', () => {
       // …and through runAgentOp, the path production takes: the gate must be handed the params.
       await expect(runAgentOp('prefab', { prefabAction: 'apply', entityGuid: 'x' })).rejects.toMatchObject({ code: 'REFUSED_BY_OP' });
     } finally { release(); await step; }
+  });
+});
+
+/** #1880 W8 (#1877 L5): an Apply to Prefab's undo reloads the scene as it was when the Apply BEGAN, so an agent edit
+ *  landing in one of its awaits would sit below its entry and be erased by it. Refused instead, until the Apply ends. */
+describe('an undo-recording agent op during an Apply to Prefab (#1880 W8)', () => {
+  // Mutation: drop the `isSnapshotOperationInFlight` check in `agentStepGate` — the edit runs, and would be erased.
+  it('is refused while the Apply holds, says why, and runs once it has released', async () => {
+    const release = beginSnapshotOperation();
+    try {
+      expect(agentStepGate('create-entity')).toMatchObject({ code: 'REFUSED_BY_OP', message: expect.stringContaining('an Apply to Prefab is in progress') });
+      await expect(runAgentOp('create-entity', { spec: { kind: 'empty' } })).rejects.toMatchObject({ code: 'REFUSED_BY_OP' });
+      // A read records nothing, so it is never refused.
+      expect(agentStepGate('editor-state')).toBeNull();
+      expect(agentStepGate('eval')).toBeNull();
+    } finally { release(); }
+    const hold = agentStepGate('create-entity');
+    expect(typeof hold, 'accept side: once the Apply ends, the edit runs').toBe('function');
+    if (typeof hold === 'function') hold();
   });
 });
 

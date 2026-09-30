@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
 import { startCountdown } from '../debug/countdownBanner';
 import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
@@ -78,9 +78,9 @@ detachPrefabInstanceWithUndo, detachRefusal,
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
-UndoRefusedError, isUndoStepInFlight, beginForwardEdit,
+UndoRefusedError, isUndoStepInFlight, isSnapshotOperationInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
-import { recordsUndo, stepRunningRefusal } from './agentOpUndoClass';
+import { recordsUndo, stepRunningRefusal, applyRunningRefusal } from './agentOpUndoClass';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
   getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
@@ -1369,6 +1369,8 @@ function prefabEditRefusalAsOpRefusal(op: string, run: () => unknown): unknown {
 export function agentStepGate(op: string, params?: unknown): OpRefusal | (() => void) | null {
   if (!recordsUndo(op, params)) return null;
   if (isUndoStepInFlight()) return stepRunningRefusal(op);
+  // An Apply in flight (#1880 W8): its undo restores the scene as it was when it began, so this edit would be erased.
+  if (isSnapshotOperationInFlight()) return applyRunningRefusal(op);
   return beginForwardEdit();
 }
 
@@ -1431,8 +1433,8 @@ export function registerEditorAgentOps(): void {
   // An OUTSIDE change to a prefab the open scene uses re-imports it in place (#1873 R1, owner ruling 2026-09-30). What
   // it cannot reach reloads over a clean scene; over unsaved work it is SAID — a toast for the human, the console for
   // the agent (`modoki_get_console_logs`) — and the reload is left to them.
-  setOutsidePrefabReimporter(async (paths) => {
-    const { report, needsReload } = await reimportOutsidePrefabChanges(paths);
+  setOutsidePrefabReimporter(async (paths, opts) => {
+    const { report, needsReload } = await reimportOutsidePrefabChanges(paths, opts);
     // The #1702 gate's own line, for a prefab nothing in the open scene uses (QA-PREFAB-0027 reads it).
     for (const x of report.unused) console.log(`[agentBridge] prefab change not used by the open scene — no reload (${x})`);
     for (const x of report.deleted) console.log(`[agentBridge] ${x} was deleted outside the editor — its instances stay as they are (a Missing Prefab on the next load)`);
@@ -1452,7 +1454,8 @@ export function registerEditorAgentOps(): void {
     // A replay that lands in prefab edit (the edit opened after the deferral): the world is the template, and only the
     // caches are re-read there (#1873 review), as a direct discard does.
     if (useEditorStore.getState().editingPrefab) {
-      for (const x of paths) await reloadPrefabFromDisk(x).catch((e) => console.error(`[discard-asset-edits] re-reading ${x} failed:`, e));
+      const rep = await reimportPrefabsInPlace(paths, { rebase: false });
+      for (const f of rep.failed) console.warn(`[discard-asset-edits] ${f.path} was not re-imported: ${f.reason}`);
       return;
     }
     const rep = await reimportPrefabsInPlace(paths);
@@ -2981,14 +2984,9 @@ export function registerEditorAgentOps(): void {
    *  document and every live instance is rebased onto it, so the scene's unsaved edits and its undo stack stay. It went
    *  through the watcher's path "as if the file had just changed", which is the disk-wins reload of the whole open scene
    *  (#1164) and dropped both. Deferred while the world may not be rebuilt (Play, a preview, a landing switch), and replayed
-   *  as a re-import once it may. In prefab edit the world is the template, and the watcher's path only re-reads the caches. */
+   *  as a re-import once it may. In prefab edit the world is the template, so only the caches take the file (the adopt landing, `rebase: false`). */
   const reimportDiscardedPrefabs = async (paths: string[]): Promise<PrefabReimportReport & { deferred?: string }> => {
-    if (useEditorStore.getState().editingPrefab) {
-      await Promise.all(paths.map((x) => reloadPrefabFromDisk(x).catch((e) => {
-        console.error(`[discard-asset-edits] ${x} was discarded, but re-reading it from disk failed:`, e);
-      })));
-      return { reimported: paths, failed: [], deleted: [], unused: [], notRebased: [], placeholders: [] };
-    }
+    if (useEditorStore.getState().editingPrefab) return reimportPrefabsInPlace(paths, { rebase: false });
     const suppressed = sceneReloadSuppressedReason();
     if (suppressed) {
       deferPrefabReimport(paths, suppressed);

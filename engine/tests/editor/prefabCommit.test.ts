@@ -111,13 +111,13 @@ import { LOCAL_ID_MARK_VERSION } from '../../packages/modoki/src/runtime/core/lo
 import {
   setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { commitPrefabWrite, commitPrefabWrites, resetPrefabMarkRecord } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { localIdCounter, markUnstated } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { withAdoption, _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
-import { undo, redo, undoStep, worldBoundOperationsHeld } from '../../packages/modoki/src/editor/undo/undoManager';
+import { undo, redo, undoStep, worldBoundOperationsHeld, isSnapshotOperationInFlight } from '../../packages/modoki/src/editor/undo/undoManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { writeTraitFieldWithUndo } from '@modoki/engine/editor';
@@ -213,6 +213,7 @@ const quietly = async <T,>(fn: () => Promise<T>): Promise<T> => {
 };
 
 beforeEach(async () => {
+  resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   route.disk.clear();
@@ -582,6 +583,24 @@ describe('a prefab write is serialized against scene adoption (#1698, #1667)', (
   });
 });
 
+// #1880 W8: the forward Apply holds the snapshot-operation count from its first line to its undo entry, so an agent edit
+// is refused across every await in between. Mutation: drop `beginSnapshotOperation` from `applyToPrefabWithUndo` — red.
+describe('a forward Apply holds agent edits off across its awaits (#1880 W8)', () => {
+  it('in flight while its write is held, and released once it has landed', async () => {
+    writeTraitFieldWithUndo(inInstance(I1, 'XB'), getTraitByName('Transform')!, 'x', 4);
+    const keys = collectInstanceOverrideKeys(rootOf(I1), getCachedPrefabSync(X)!);
+    let open!: () => void;
+    route.gate = new Promise<void>((r) => { open = r; });
+    const applying = quietly(() => applyToPrefabWithUndo(rootOf(I1), new Set(keys.fields)));
+    await vi.waitFor(() => expect(route.waiting).toBe(1));
+    expect(isSnapshotOperationInFlight()).toBe(true);
+    route.gate = null;
+    open();
+    expect((await applying).applied).toBe(true);
+    expect(isSnapshotOperationInFlight()).toBe(false);
+  });
+});
+
 describe('several prefab files as ONE step (#1692, for #1693)', () => {
   const Y = 'cccccccc-0000-4000-8000-000000001693';
   const Y_PATH = '/assets/prefabs/Y.prefab.json';
@@ -832,5 +851,54 @@ describe('Create Prefab\'s undo asks require before it unlinks (#1795\'s second 
     expect(r.failed?.error).toMatch(/N\.prefab\.json/);
     expect(route.disk.get(N_PATH)).toBe(edited);
     expect(linked()).toBe(false);
+  });
+});
+
+/** #1880 W3: I16's exemption for recorded `bytes` is a TRUE no-op only — bytes the file holds already. It was any bytes:
+ *  Create Prefab's redo writes the document back from the bytes it recorded, over a path deleted since, and a prefab it
+ *  nests could have placed it meanwhile. Written, the file contained itself. */
+describe('#1880 W3: recorded bytes are checked for a cycle unless the file holds them already', () => {
+  const Q = 'cccccccc-0000-4000-8000-000000001880';
+  const Q_PATH = '/assets/prefabs/Q1880.prefab.json';
+  /** X nesting Q, as a Create Prefab recorded it. */
+  const xNestsQ = (): PrefabFile => ({ ...xDoc(), entities: [...xDoc().entities, { ...row(5, 'HoldsQ', 1, g(5)), prefab: Q }] } as unknown as PrefabFile);
+  /** Q nesting X — placed by Q's own prefab edit since. */
+  const qNestsX = (): PrefabFile => ({ id: Q, version: 6, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, g(6)), { ...row(2, 'HoldsX', 1, g(7)), prefab: X }] } as unknown as PrefabFile);
+  beforeEach(() => {
+    registerAsset(X, X_PATH, 'prefab');
+    registerAsset(Q, Q_PATH, 'prefab');
+    route.disk.set(Q_PATH, jsonFileBody(qNestsX()));
+    setPrefabCache(Q, qNestsX());
+  });
+  afterAll(() => { setPrefabCache(Q, null); });
+
+  // Mutation: exempt every `bytes` write again (`skip: w.bytes !== undefined`) — X is written nesting Q, which nests X.
+  it('a create-redo into a nesting that is a cycle now refuses, and writes nothing', async () => {
+    route.disk.delete(X_PATH); // the created prefab, deleted since — the one path a create's redo writes back
+    const bytes = jsonFileBody(xNestsQ());
+    const res = await quietly(() => commitPrefabWrite(X, xNestsQ(), { expected: null, bytes }));
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/would contain itself/);
+    expect(route.disk.has(X_PATH)).toBe(false);
+  });
+
+  // Hub pin (2) for #1880 W4 (A): the no-op is judged against the FILE's text as read, not the cache's serialization — an
+  // adopt raises the cached mark above the file's, and judged against the cache the same bytes read as a change.
+  // Mutation: compare `w.bytes` with `jsonFileBody(w.now.editor)` — refused.
+  it('a no-op is judged by the file\'s text, though the editor holds the document with a raised mark', async () => {
+    const bytes = jsonFileBody(xNestsQ());
+    route.disk.set(X_PATH, bytes);
+    setPrefabCache(X, { ...xNestsQ(), nextLocalId: 12 } as PrefabFile); // an adopt's raise, in the caches only
+    const res = await quietly(() => commitPrefabWrite(X, xNestsQ(), { expected: bytes, bytes }));
+    expect(res.ok).toBe(true);
+  });
+
+  // Accept side: the file holds those bytes already, so the write is a no-op and writes no new shape. Mutation: drop the
+  // exemption altogether (`skip: () => false`) — refused.
+  it('bytes the file already holds are a no-op, exempt from the check', async () => {
+    const bytes = jsonFileBody(xNestsQ());
+    route.disk.set(X_PATH, bytes);
+    const res = await quietly(() => commitPrefabWrite(X, xNestsQ(), { expected: bytes, bytes }));
+    expect(res.ok).toBe(true);
   });
 });

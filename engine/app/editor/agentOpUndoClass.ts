@@ -25,6 +25,14 @@ export function stepRunningRefusal(what: string): OpRefusal {
     ] });
 }
 
+/** The refusal an undo-recording agent edit gets while an Apply to Prefab is in flight (#1880 W8, #1877 L5): the Apply's
+ *  undo reloads the scene as it was when the Apply began, so an edit landing now would be erased by that undo. */
+export function applyRunningRefusal(what: string): OpRefusal {
+  return new OpRefusal('REFUSED_BY_OP',
+    `${what} refused: an Apply to Prefab is in progress, and undoing it restores the scene as it was when it began, so an edit made now would be erased by that undo. Nothing was changed.`,
+    { options: ['retry once the Apply has finished'] });
+}
+
 /** Reaches a push, or runs code that can (`eval`: `modoki.composite`, `modoki.import`). `create-registered-asset`
  *  selects the new asset for some kinds, which pushes a selection entry. `set-traits` writes through the editor's
  *  trait writer, one composite entry per call (#1816). The asset-document ops push through `pushAssetUndo`. `dom-dnd`

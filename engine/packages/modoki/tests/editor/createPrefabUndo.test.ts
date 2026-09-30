@@ -39,8 +39,9 @@ let runtimeExcludedFixture = 0;
 /** A Replace's undo and redo restore in memory (#1868): recorded here, and the caller's rebuild run as the real one runs
  *  it — the real restore (caches, park, refusal) is driven unmocked in the engine suites (prefabCommit.test.ts). */
 const restoreSpy = vi.fn();
-vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
-  restorePrefabsInMemory: async (restores: unknown, opts?: { rebuild?: () => void | Promise<void> }) => { restoreSpy(restores); await opts?.rebuild?.(); },
+vi.mock('../../src/editor/scene/prefabCommit', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  parkPrefabChanges: async (restores: unknown, opts?: { rebuild?: () => void | Promise<void> }) => { restoreSpy(restores); await opts?.rebuild?.(); },
 }));
 vi.mock('../../src/editor/scene/prefab', () => ({
   warnInertPrefabSizes: () => undefined,
@@ -114,6 +115,9 @@ vi.mock('../../src/editor/scene/prefabLink', () => ({
   untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
   detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
   reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
+  // #1880 W5's precheck: these trees lose no link. The rule is driven unmocked in engine/tests/editor/requireLinks.test.ts,
+  // and through the real undo by the prefab fuzz's #1881 regression.
+  requireLinks: async () => {},
 }));
 vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
 

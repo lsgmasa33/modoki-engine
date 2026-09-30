@@ -88,6 +88,7 @@ vi.mock('../../src/editor/panels/assetOps', async (importOriginal) => ({
 // Every write, forward and undo, is ONE `commitPrefabWrite` (#1692). Modelled over `disk` with the route's rules: the
 // precondition over the bytes the disk holds (`expected` null means "nothing there"), then the write or delete. The real step's hashing and rebuild are driven unmocked in prefabCommit.test.ts.
 vi.mock('../../src/editor/scene/prefabCommit', () => ({
+  parkPrefabChanges: (...args: unknown[]) => restoreSpy(...args),
   parsePrefabBytes: (text: string) => JSON.parse(text.replace(/^\uFEFF/, '')),
   commitPrefabWrite: async (path: string, doc: { id?: string } | null, opts: { expected: unknown; bytes?: string }) => {
     const next = doc === null ? null : (opts.bytes ?? jsonFileBody(doc));
@@ -104,9 +105,6 @@ vi.mock('../../src/editor/scene/prefabCommit', () => ({
 
 // The undo's restore: recorded, not run — its own behaviour is covered where it runs unmocked.
 const restoreSpy = vi.fn(async (..._args: unknown[]) => {});
-vi.mock('../../src/editor/scene/prefabMemoryRestore', () => ({
-  restorePrefabsInMemory: (...args: unknown[]) => restoreSpy(...args),
-}));
 
 const pushActionSpy = vi.fn();
 vi.mock('../../src/editor/undo/undoManager', () => ({

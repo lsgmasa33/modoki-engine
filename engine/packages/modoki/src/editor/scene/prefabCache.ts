@@ -4,7 +4,6 @@
 
 import { isPrefabDocument } from '../../runtime/loaders/prefabRoot';
 import { prefabNests } from '../../runtime/loaders/prefabNesting';
-import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, setFrameDocFallback, frameDocReader } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -208,42 +207,22 @@ export function parkedPrefabRead(path: string): PrefabFile | null {
   return doc ? JSON.parse(JSON.stringify(doc)) as PrefabFile : null;
 }
 
-/** Re-read the cached copy of a prefab whose FILE changed on disk from outside the editor (#1169).
- *  `setPrefabCache` covers the editor's own writes; this covers a hand edit or a `git checkout`,
- *  which reach the editor only as a watcher event (`agentBridge.ts` `handleSceneChanged`). Without
- *  it the reload rebuilds instances from the new file while override capture keeps diffing them
- *  against this stale copy, and a trait or entity the new prefab added is saved as an override.
- *
- *  ⚠️ REFRESH, never delete (close-out review). This cache has SYNC readers that treat a miss as "not
- *  a prefab": `serializePrefab` flattens a nested instance it cannot find, and a prefab-edit save
- *  refuses once the edited prefab is gone from it. In prefab-edit mode no reload follows to fill a
- *  hole, so a delete made the next save inline a nested prefab and report success. So the new file is
- *  fetched FIRST and swapped in, and an unreadable file (a half-typed hand edit, a deletion) keeps the
- *  old entry — dropping it would also make the NEXT event skip the key as cold, so the fixed file
- *  would never be read. A key nobody has read is left cold rather than warmed.
- *
- *  Swapped only if nobody replaced the entry during the fetch: an Apply-to-Prefab landing then has
- *  already put the newer content in (its own write never reaches the watcher), and two external
- *  writes can race their refreshes. And the prefab OPEN in prefab-edit mode keeps its copy until the session
- *  ends, when the leaving repair refreshes it and rebases (#1666). ⚠️ The reason this skip was written — the edit's
- *  save diffed against this entry — no longer holds: since #1692 the save is conditional on the session's own
- *  baseline (`prefabEdit.ts` `editBaselineFor`), and every editor WRITE re-seats this entry anyway. What the skip still
- *  does is leave the entry behind an outside edit for the rest of the session, so an in-editor writer that reads it as
- *  what it read (an Apply from a carried instance) is refused as a conflict until the edit ends — the safe direction.
- *  Kept rather than removed with #1692, because the leaving repair is built on it and is being reworked by #1698.
- *
- *  Keyed by whatever ref the caller used, a GUID normally and a path for a not-yet-normalized
- *  instance, so both keys are refreshed. Does NOT touch the runtime cache: the watcher path evicts
- *  that itself. */
+/** Take the prefab at `path` from its FILE into both caches — the leave-prefab-edit repair (#1666) and the watcher's
+ *  refresher for a runtime with no re-importer — through the prefab step's `'adopt'` landing (#1880 W4), which holds
+ *  every rule this function used to carry itself:
+ *  - REFRESH, never delete (#1169's close-out review): this cache has SYNC readers that treat a miss as "not a prefab"
+ *    (`serializePrefab` flattens a nested instance it cannot find), so an unreadable file keeps the old entry and a key
+ *    nobody has read is left cold rather than warmed; the runtime copy is REPLACED (#1308);
+ *  - an editor write that landed during the read (an Apply) is kept, not overwritten by the older bytes.
+ *  - the prefab open in prefab edit keeps its editor copy until the session ends (#1666): an in-editor writer that read it
+ *    is refused as a conflict meanwhile, the safe direction.
+ *  Nothing is rebased here: the leave repair rebases next itself. */
 export async function refreshPrefabSourceForPath(path: string): Promise<void> {
-  const guid = getGuidForPath(path);
-  const editing = useEditorStore.getState().editingPrefab?.guid;
-  for (const key of guid ? [guid, path] : [path]) {
-    const before = prefabCache.get(key);
-    if (before === undefined || key === editing) continue;
-    const fresh = await fetchPrefabSource(key, { cache: 'no-store' });
-    if (fresh && prefabCache.get(key) === before) { seatEditorEntry(key, fresh); registerRead(key, fresh); }
-  }
+  // The prefab step's `'adopt'` landing (#1880 W4), caches only: the leave repair's rebase rebuilds, and the watcher's
+  // caller notes the change itself (`refreshPrefabSourceAfterDiskChange`). Imported when called: the step imports this
+  // module, so a static import would close a load-time cycle.
+  const { commitPrefabChanges } = await import('./prefabCommit');
+  await commitPrefabChanges([{ source: path, doc: null, expected: null, land: 'adopt' }], { rebase: false, fileChanged: false });
 }
 
 /** The watcher's refresh (`agentBridge.ts`, via `setPrefabSourceRefresher`): the file at `path` CHANGED on disk, so every

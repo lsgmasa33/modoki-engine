@@ -98,7 +98,8 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
     pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — \S+\.prefab\.json changed since this step/,
     why: 'I10, asked of memory since #1868: an Apply\'s or a Replace\'s undo and redo restore the prefab in memory only while '
       + 'the editor holds the document the other half left, and refuse once a prefab-edit save or an outside edit changed it '
-      + '(#1664, #1679, `prefabRestoreRefusal`). A refusal in a segment nothing outside the stack touched still fails, as '
+      + '(#1664, #1679, the park landing\'s precondition in `commitPrefabChanges`). A refusal in a segment nothing outside the '
+      + 'stack touched still fails, as '
       + '"undo refused in a clean segment"',
   },
   {
@@ -106,6 +107,12 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
     why: '#1877 C1: an Apply\'s or a Replace\'s undo and redo refuse, rather than resurrect, a prefab an Assets trash deleted '
       + 'since the step (Unity brings no deleted asset back through an undo). The trash taints the segment (`assetDelete`), so '
       + 'the refusal is forgiven only there',
+  },
+  {
+    pattern: /^\[undo\] Undo of "Save prefab "[^"]*"" was REFUSED — "Save prefab "[^"]*"" was not undone: \d+ of the prefab links? it puts back names? \S+\.prefab\.json, which was deleted since, so nothing was changed/,
+    why: '#1880 W5 (#1881, seed 1012): Create Prefab\'s undo asks `requireLinks` BEFORE it changes the tree, and refuses when '
+      + 'a link it puts back would be lost — its entity went with a prefab an Assets trash deleted since. It half-applied '
+      + 'and counted the miss afterwards. The trash taints the segment (`assetDelete`), so the refusal is forgiven only there',
   },
   {
     pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — \S+\.prefab\.json would contain itself once restored/,

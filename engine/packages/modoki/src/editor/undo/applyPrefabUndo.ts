@@ -23,9 +23,9 @@
  *  untitled scene, as Stop reloads one (#1575). Same reason, same rule in each: a rebase alone is not a
  *  substitute, and neither is a rebuild from the prefab's document. */
 
-import { pushAction, beginWorldBoundOperation, isWorldSwitchInProgress, type UndoAction } from './undoManager';
+import { pushAction, beginWorldBoundOperation, beginSnapshotOperation, isWorldSwitchInProgress, type UndoAction } from './undoManager';
 import { reportUndoFailure } from './undoFailure';
-import { restorePrefabsInMemory } from '../scene/prefabMemoryRestore';
+import { parkPrefabChanges } from '../scene/prefabCommit';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { serializeScene, isSceneLoadSwapping } from '../scene/serialize';
@@ -51,7 +51,7 @@ import { currentSceneKey } from '../scene/authoredSnapshot';
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
 /** Restore one side of an Apply (#1868, owner ruling D1 = Park): every prefab it wrote goes back IN MEMORY — both caches,
- *  and parked for Save, which writes it (`restorePrefabsInMemory`) — and the live world is rebuilt from the scene
+ *  and parked for Save, which writes it (`parkPrefabChanges`) — and the live world is rebuilt from the scene
  *  snapshot of that side (runtime loadScene — no history clear). Nothing is written and no scene is saved: Unity's Apply
  *  never saves the scene either, and the undo dirties it as every undo does. Re-selects the previously-inspected entity
  *  by guid (ids change on rebuild). Resolves `false` when the world it belongs to is no longer live, having restored the
@@ -77,7 +77,7 @@ async function restoreSnapshot(
   const key = currentSceneKey();
   const world = getCurrentWorld();
   let restored = false;
-  await restorePrefabsInMemory([
+  await parkPrefabChanges([
     { source, doc: prefab, from: expected },
     ...others.map((o) => ({ source: o.source, doc: o.doc, from: o.expected })),
   ], {
@@ -272,9 +272,13 @@ export async function applyToPrefabWithUndo(
     return { ...NOT_APPLIED, refused: 'a scene switch is in progress — apply again once it has landed.' };
   }
   const release = beginWorldBoundOperation();
+  // …and an agent edit is refused until the undo entry is pushed (#1880 W8): its undo reloads the scene as it was HERE,
+  // so an edit landing in one of the awaits would sit below this entry and be erased by it (#1877 L5).
+  const releaseSnapshot = beginSnapshotOperation();
   try {
     return await applyHeld(rootInstanceId, selectedKeys, targets, opts);
   } finally {
+    releaseSnapshot();
     release();
   }
 }

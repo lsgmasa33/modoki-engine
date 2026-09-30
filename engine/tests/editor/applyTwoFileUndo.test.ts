@@ -315,7 +315,7 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
   });
 
   it('an undo refused because O changed outside names O, the document that changed — not P', async () => {
-    // Mutation: name the first restore instead of the one whose document changed in `prefabRestoreRefusal` — the detail
+    // Mutation: name the first restore instead of the one whose document changed in `landParks` — the detail
     // blames P, which is untouched.
     const { nested, key } = editFive();
     const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([key])));
@@ -329,8 +329,9 @@ describe('#1732: a multi-file Apply and its undo report each file\'s outcome, no
     try { await undo(); } finally { for (const s of spies) s.mockRestore(); }
     expect([parked(P), parked(O)]).toEqual([undefined, undefined]); // refused whole: nothing restored
     const detail = errors.find((e) => e.includes('changed since this step'));
-    expect(detail).toContain(`${O} changed since this step`);
-    expect(detail).not.toContain(`${P} changed since`);
+    // A guid no manifest maps is named with its document's name (#1880 W: every refusal names the prefab).
+    expect(detail).toContain(`(${O}) changed since this step`);
+    expect(detail).not.toContain(`(${P}) changed since`);
   });
   // #1732's undo-side case (a second file that fails with the first stranded) went with #1868: an undo writes no file, so
   // it cannot fail part-way. The forward Apply's two cases above still hold that bar.

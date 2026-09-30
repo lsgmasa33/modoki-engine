@@ -91,6 +91,14 @@ const pqDoc = () => ({ id: PQ, version: 5, name: 'PQ', rootLocalId: 1, entities:
 ] });
 const install = (...docs: Array<{ id?: string }>) => { for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); } };
 const uninstall = (id: string) => { prefabs.delete(id); setPrefabCache(id, null); };
+/** What the disk holds at `url` (#1880 W: every write reads its file first): the last write there, else an INSTALLED
+ *  prefab's document — installed means on disk. Null for anything else: a prefab the cache does not hold is MISSING. */
+const onDisk = (url: string): Response | null => {
+  const last = writes.filter((w) => url.endsWith(w.path)).pop();
+  if (last) return new Response(last.content, { status: 200 });
+  const id = [...prefabs.keys()].find((k) => url.endsWith(k));
+  return id ? new Response(JSON.stringify(prefabs.get(id)), { status: 200 }) : null;
+};
 
 async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
@@ -159,8 +167,8 @@ beforeEach(() => {
   clearHistory();
   prefabs.clear();
   writes.length = 0;
-  // Nothing is on disk: a prefab the cache does not hold is MISSING, not merely cold.
-  vi.stubGlobal('fetch', async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => '' }));
+  // Nothing but the installed prefabs is on disk: a prefab the cache does not hold is MISSING, not merely cold.
+  vi.stubGlobal('fetch', async (url: string) => onDisk(String(url)) ?? ({ ok: false, status: 404, json: async () => ({}), text: async () => '' }));
 });
 afterAll(() => { for (const id of [P, Q, PQ]) setPrefabCache(id, null); vi.unstubAllGlobals(); getCurrentWorld()?.destroy(); });
 
@@ -689,7 +697,7 @@ describe('the template writers refuse a missing reference wherever it sits (#169
     prefabs.set(Q, qDoc());
     vi.stubGlobal('fetch', async (url: string) => String(url).includes('q1699')
       ? { ok: true, status: 200, json: async () => qDoc(), text: async () => JSON.stringify(qDoc()) }
-      : { ok: false, status: 404, json: async () => ({}), text: async () => '' });
+      : onDisk(String(url)) ?? { ok: false, status: 404, json: async () => ({}), text: async () => '' });
     writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'z', 3);
     const keys = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile);
     expect((await applyToPrefabSelective(rootOf(INST), new Set(keys.fields))).applied).toBe(true);
@@ -1178,7 +1186,7 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
     setPrefabCache(Q, null); // cold in the editor; readable on disk
     vi.stubGlobal('fetch', async (url: string) => String(url).includes('q1790')
       ? { ok: true, status: 200, json: async () => qDoc(), text: async () => JSON.stringify(qDoc()) }
-      : { ok: false, status: 404, json: async () => ({}), text: async () => '' });
+      : onDisk(String(url)) ?? { ok: false, status: 404, json: async () => ({}), text: async () => '' });
     expect(refusalOf(await create())).toBe('');
     expect(heldDoc().entities.filter((e) => e.prefab).map((e) => e.prefab)).toEqual([PQ]);
   });
@@ -1277,7 +1285,7 @@ describe('Create Prefab over R2 kept state: refuse a missing nested frame, bake 
     setPrefabCache(Q, null); // live nowhere, so no warm has seen it; readable on disk
     vi.stubGlobal('fetch', async (url: string) => String(url).includes('q1790f5')
       ? { ok: true, status: 200, json: async () => qDoc(), text: async () => JSON.stringify(qDoc()) }
-      : { ok: false, status: 404, json: async () => ({}), text: async () => '' });
+      : onDisk(String(url)) ?? { ok: false, status: 404, json: async () => ({}), text: async () => '' });
     expect(refusalOf(await create())).toBe('');
   });
 

@@ -44,9 +44,9 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
 const sm = vi.hoisted(() => ({ path: '', load: null as null | ((data: unknown) => Promise<void>), duringWrite: null as null | (() => void) }));
 // The undo's in-memory restore (#1868: it writes no file), entered before it asks whether its world is still live — where
 // an Exit can land. `duringWrite` runs there once, as it runs inside a forward write.
-vi.mock('../../packages/modoki/src/editor/scene/prefabMemoryRestore', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabMemoryRestore')>();
-  return { ...real, restorePrefabsInMemory: async (...a: Parameters<typeof real.restorePrefabsInMemory>) => { const f = sm.duringWrite; sm.duringWrite = null; f?.(); return real.restorePrefabsInMemory(...a); } };
+vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabCommit')>();
+  return { ...real, parkPrefabChanges: async (...a: Parameters<typeof real.parkPrefabChanges>) => { const f = sm.duringWrite; sm.duringWrite = null; f?.(); return real.parkPrefabChanges(...a); } };
 });
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();

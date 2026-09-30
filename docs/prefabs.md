@@ -1783,26 +1783,69 @@ undo step. The rest of the editor ran while it was in flight (#1833), the file c
 it could fail half-way (#1823), and it needed a restore owner for the renderer (#1844). None of that is left to guard
 once no file is written.
 
-`restorePrefabsInMemory` (`editor/scene/prefabMemoryRestore.ts`) is the one restore:
-1. **It refuses first**, changing nothing, when the editor holds another document for a prefab than the side the step
-   left (`prefabRestoreRefusal`). The document it checks is the park, or else the editor cache. That covers a
-   prefab-edit save since, and an outside change the watcher brought in. This is I10's precondition (#1664/#1679),
-   asked of memory instead of the file. The toast reads *"<file> changed since, and was left as it is"*.
-   **It also asks what the write door asks** (#1877 C1), because the park it leaves is written by Save. It refuses a
-   prefab whose file is GONE: no cache or park holds it, and `/api/exists` says so (an Assets trash since the step).
-   Restored, the park wrote the trashed prefab back at the next Save behind a false "changed on disk" prompt, and Unity
-   brings no deleted asset back through an undo. And it refuses a document that would contain itself (I16), read
-   through the restored set first, as `commitPrefabWrites` reads its batch: B's prefab edit placed an A after an Apply
-   took B out of A, and the undo put B back; Save then refused for good. The checks are `documentNow`, `goneFiles`
-   and `restoreCycleRefusal`.
-2. **Both caches** then hold the document (`seatCaches`, as a write's would). The caller runs its own `rebuild`
-   (Apply's world reload, Replace's untag or tag), then every other live frame is rebased onto the document.
-3. **The document is parked** in the dirty-asset registry (a `'prefab'` document kind, `dirtyAssets.ts`), with the
-   document its file holds as the baseline: the park's own record, else the EDITOR's copy, not the side the step
-   recorded. The two are the same document, but a Save since the step wrote the mark the editor holds, which can be
-   higher; read from the step, the next Apply after undo → Save → undo handed an undone row's number to a new one
-   (#1877 S1, I4). The mark is raised to the highest of the file's, the step's and the editor's. When the restored document IS what the file holds (a redo back to what
-   the forward write put there), the park is dropped instead, and nothing is left unsaved.
+**One step for every change to a prefab document** (#1880 W, `commitPrefabChanges` in `editor/scene/prefabCommit.ts`).
+The write door stated the invariants, and the in-memory restore every undo used stated most of them again, or did not
+(#1877 C1: the mark written back down, a self-containing restore, an undo that brought a trashed prefab back). Now each
+change carries how it LANDS, and every landing passes one stage, in this order, before anything changes:
+1. **the world gate** (I11): for a write and an adopt, the step holds world switches off; a write also waits for a route
+   mid-adoption and refuses in a world that is not adopted. A PARK's gate is the undo step that runs it — a world switch
+   that takes `beginWorldSwitch` waits for a running step (#1579); the watcher's hot reload does not, as it did not for
+   the old restore — and not the adoption gate, whose refusals are transient while a refused undo is dropped for good;
+2. **`documentNow`**: the ONE answer to what the editor holds (the park, else the cache) and what the file holds (read
+   for a write; else the editor's record of it: a clean park's baseline, or the cache). It replaced three computations
+   (the park's `onDisk`, the undo step's own `from`, the commit's re-read) that disagreed exactly where round 3 found
+   its bugs;
+3. **the precondition**: a write, that the file holds what the caller read (I10); a park, that the EDITOR holds what the
+   other half of the step left (the #1664/#1679 precondition asked of memory) — or, when nothing holds it, that the
+   FILE does. The toast reads *"<file> changed since,
+   and was left as it is"*;
+4. **the file exists**, for a write of a document and for a park: a prefab trashed since is not written or parked back.
+   Unity brings no deleted asset back through an undo either;
+5. **I16**, read through the step's own documents first. Only a TRUE no-op is exempt: `bytes` equal to the file's text
+   as just read (W3). Recorded bytes used to be exempt whatever the file held, so Create Prefab's redo wrote a document
+   back into a nesting that had become a cycle since;
+6. **the mark** (I4): the highest of the document's, the editor's (its park included), the file's, what `expected`
+   names, and the session's record (`markRecord`, hub ruling: an outside rewind cannot lower what this session handed
+   out), taken once;
+7. **land**, then **seat** both caches (REPLACE, never evict, #1308), the caller's `rebuild`, and the rebase.
+
+The three landings:
+- **`'file'`** (`commitPrefabWrite(s)`, which wrap it): every forward write and Save's flush of a park. It always READS
+  its file first: that read is the precondition's exact `ifMatch`, the exists check, and the mark's file term. A read
+  that fails (not a 404) is not a delete: one file then writes conditional on what the caller read, as before.
+- **`'park'`** (`parkPrefabChanges`): the undo and redo of Apply, Create Prefab's Replace and a rig update. Both caches
+  hold the document, the caller rebuilds, the rest is rebased, and the document is PARKED with the document its file
+  holds as the baseline — or the park is dropped when the document IS what the file holds (a redo back to what the
+  forward write put there), and nothing is left unsaved.
+- **`'adopt'`** (#1880 W4): the FILE already changed, and the editor takes it — the watcher's outside change (#1873 R1),
+  a discarded park (#1873 S2), the prefab-edit open's seed and the leave repair. It never refuses as a whole: a file
+  gone is adopted as gone (the instances stay, as Unity keeps a Missing Prefab, and a put-back re-seats them); a file
+  that would contain itself is not seated, and the report names the prefab that closes the cycle; an editor write that
+  landed during the read is kept; JSON that is not a prefab document is kept out as unreadable; and a file refused as a
+  cycle is taken again once a prefab on that cycle is adopted, deleted or written (a checkout that flips a nesting direction arrives one
+  file per event). It raises the mark to the session's record and to what both caches held, **in the
+  caches only** (hub ruling (A)): nothing is parked or written and `sameDocument` ignores the mark, so no precondition
+  or dirty flag moves, and the next real write carries it to the file. Every branch of the watcher goes through it — in
+  prefab edit and with no scene open too, where the runtime copy used to be EVICTED and a synchronous reader read
+  `undefined` until the next load. The prefab open in prefab edit keeps its editor copy against an outside change until
+  the session ends (the leave repair then takes the file).
+
+Only the step seats a prefab's caches or parks one; `tests/architecture/prefabStepCensus.test.ts` pins that, with the
+exceptions it names.
+
+**Behaviour changes a human sees (#1880 W, owner-approved plan):**
+- an undo or redo that used to "succeed" into a bad park now REFUSES, naming the prefab and why: the prefab was deleted
+  since (*"<file> was deleted since, and was left deleted"*), or putting it back would make it contain itself;
+- **Create Prefab's undo refuses before it changes anything** when a link it puts back would be lost — its entity went
+  with a prefab deleted since (#1881, W5 `requireLinks`). It used to unlink the tree and then report "N prefab links …
+  could not be put back";
+- an **Overwrite of a prefab deleted since refuses** (*"… was deleted since, so it was not written back"*) — Save's
+  Overwrite of a park, and the prefab-edit save's (W6);
+- an **agent edit made while an Apply to Prefab is in flight is refused** (*"an Apply to Prefab is in progress … retry
+  once the Apply has finished"*, W8): the Apply's undo reloads the scene as it was when the Apply began, so the edit
+  used to sit below the Apply's entry and be erased by its undo (#1877 L5). The human's forward edits are not held
+  (#1833), and an edit that SURVIVES the Apply's undo would need the undo to stop reloading its snapshot — not done;
+- a single-file prefab write makes one extra read of its file.
 
 **By guid, never by a recorded path** (hub call (e)): each step restores its prefab by the prefab's guid, resolved to
 wherever the file is now, so a Rename since the step does not strand it. A document read from an id-less file keeps

@@ -312,6 +312,31 @@ export function beginForwardEdit(): () => void {
   return release;
 }
 
+/** Forward operations in flight whose UNDO restores a scene snapshot taken when they STARTED — Apply to Prefab
+ *  (`applyToPrefabWithUndo`: its undo reloads the scene as it was before the Apply). An edit made during one of its
+ *  awaits pushes its entry BELOW the Apply's, and undoing the Apply then reloads the snapshot over it: the edit is
+ *  erased while its own entry stays on the stack (#1877 L5). An agent edit is REFUSED meanwhile (#1880 W8,
+ *  `agentStepGate`); the HUMAN's forward edits are not held (#1833's rule). A COUNT, since an Apply can start inside
+ *  another's window only by a route that holds neither — the count stays honest either way. */
+let _snapshotOps = 0;
+
+/** Hold {@link isSnapshotOperationInFlight} true until the returned release is called (once; idempotent). */
+export function beginSnapshotOperation(): () => void {
+  _snapshotOps += 1;
+  const alive = _forwardEditLiveness.capture();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (alive()) _snapshotOps -= 1;
+  };
+}
+
+/** Is a forward operation whose undo restores its start-of-op snapshot in flight? See {@link beginSnapshotOperation}. */
+export function isSnapshotOperationInFlight(): boolean {
+  return _snapshotOps > 0;
+}
+
 /** A world switch is in progress (#1579) — a forward operation that must land in one world refuses to start then. */
 export function isWorldSwitchInProgress(): boolean {
   return _worldSwitches > 0;
@@ -1034,6 +1059,7 @@ export function _resetHistoryContexts() {
   _captureStack.length = 0; // a test that threw mid-batch must not leak a capture frame
   _resetStepWindow(); // …nor a step window
   _forwardEdits = 0;
+  _snapshotOps = 0;
   _forwardEditLiveness.invalidateAll();
   undoStack.length = 0;
   redoStack.length = 0;

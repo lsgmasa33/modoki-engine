@@ -9,7 +9,8 @@ import { endFrames, stampDerivedMemberGuids, applyGuidRemap, type DetachedMember
 import { identitySubtree, noteFrameDoc, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
-import { getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
+import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
+import { UndoRefusedError } from '../undo/undoFailure';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { clearOverrideMarks, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
@@ -417,6 +418,36 @@ export function reattachPrefabInstance(
     present.add(`${pi.source}|${pi.localId}|${pi.parentLocalId ?? 0}`);
   }
   return unresolvedEntries.filter(({ data: d }) => !present.has(`${d.source}|${d.localId}|${d.parentLocalId ?? 0}`)).length + missedKeys;
+}
+
+/** Asked BEFORE a link change puts `detached`'s links back (#1880 W5, I19): refused — an `UndoRefusedError`, with
+ *  nothing changed — when a link would be LOST: the entity it goes on, or its root, no longer resolves, and the prefab it
+ *  names is gone (trashed since). Nothing can hold that link again. Create Prefab's undo used to change the tree anyway
+ *  and count the miss afterwards (`reportUnrestoredLinks`, #1272's tolerance), so it half-applied (seed 1012, #1881: a
+ *  prefab nested in the tree trashed, then the undo — "2 prefab links … could not be put back"). An unresolved link
+ *  whose prefab still EXISTS is #1272's own case — a held nested frame whose guid a reload re-derived keeps its link on
+ *  the entity that holds it now — and is not refused. Unity refuses an undo before it changes anything, and brings no
+ *  deleted asset back. Detach's undo asks the stricter {@link requireDetachedLinks}-style question first (every entity
+ *  live and plain), since a detach stripped every link it will put back. `what` names the step. */
+export async function requireLinks(detached: DetachSnapshot, what: string): Promise<void> {
+  const unresolved = new Map<string, number>();
+  for (const l of detached.links) {
+    if (l.ref.resolve() != null && l.rootRef.resolve() != null) continue;
+    const source = l.data.source as string | undefined;
+    if (source) unresolved.set(source, (unresolved.get(source) ?? 0) + 1);
+  }
+  for (const [source, n] of unresolved) {
+    // Imported when asked (a link to a gone prefab is rare): the step's module reaches the whole scene graph.
+    const { prefabFileGone } = await import('./prefabCommit');
+    if (!(await prefabFileGone(source))) continue;
+    // A trash prunes the manifest, so the path it lived at is asked of the manifest's memory.
+    const path = isGuid(source) ? (resolveRef(source) || lastKnownPathOf(source) || source) : source;
+    const file = path.split('/').pop() ?? path;
+    throw new UndoRefusedError(
+      `${what} was not undone: ${n} of the prefab link${n === 1 ? '' : 's'} it puts back name${n === 1 ? 's' : ''} ${path}, which was deleted since, so nothing was changed.`,
+      `${file} was deleted since — nothing was undone`,
+    );
+  }
 }
 
 /** Detach's undo: put the links back ({@link reattachPrefabInstance}), then bring the instance onto the editor's current

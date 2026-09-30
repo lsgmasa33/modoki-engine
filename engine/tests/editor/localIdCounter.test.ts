@@ -54,7 +54,7 @@ import { LOCAL_ID_MARK_VERSION } from '../../packages/modoki/src/runtime/core/lo
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { mergeRiggedPrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
-import { commitPrefabWrite, commitPrefabWrites } from '../../packages/modoki/src/editor/scene/prefabCommit';
+import { commitPrefabWrite, commitPrefabWrites, resetPrefabMarkRecord } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { jsonFileBody } from '../../packages/modoki/src/editor/backend/editorBackend';
 import { createPrefabFromEntity } from '../../packages/modoki/src/editor/panels/assetOps';
@@ -63,7 +63,7 @@ import { useEditorStore } from '../../packages/modoki/src/editor/store/editorSto
 import { deleteEntitiesWithUndo } from '@modoki/engine/editor';
 import { undo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { registerAsset, resolveRef } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { peekDirtyAsset, flushDirtyAssets, clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 
@@ -78,7 +78,11 @@ const row = (localId: number, name: string, parentId: number, nodeGuid: string, 
   localId, name, nodeGuid, ...(prefab ? { prefab } : {}),
   traits: { EntityAttributes: { name, parentId, guid: '' }, Transform: { x: 0, y: 0, z: 0 } },
 });
-const install = (...docs: Array<{ id?: string }>) => { for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); } };
+/** A prefab the project holds: both caches, and its FILE — a write is conditional on what the file holds, read first
+ *  (#1880 W: every write reads it). At the path its guid resolves to. */
+const install = (...docs: Array<{ id?: string }>) => {
+  for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); onDisk.set(resolveRef(d.id!) || d.id!, jsonFileBody(d)); }
+};
 
 async function load(data: SceneData): Promise<void> {
   const prev = getCurrentWorld();
@@ -117,6 +121,7 @@ const add = (label: string, parent: number, name: string) =>
 
 beforeEach(() => {
   clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
+  resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case too
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
@@ -324,6 +329,15 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     seatAt({ ...after, nextLocalId: 6 } as PrefabFile); // a later write's undo already raised the mark past what `after` says
     expect((await commitPrefabWrite(P, doc4, { expected: after })).ok).toBe(true);
     expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 6, entities: p3Doc().entities.map((e) => ({ localId: e.localId })) });
+  });
+
+  // #1880, seed 1099: an outside edit added row 5 and left the stated mark at 5; the next editor write restates it above
+  // every row. Mutation: drop `stale` from `contentFor`'s early return — the file keeps `nextLocalId: 5`.
+  it('a write of a document whose stated mark is not above its highest row states the mark above it', async () => {
+    const outside = { ...v8(5), entities: [...p3Doc().entities, row(5, 'E5', 1, 'eeeeeeee-0000-4000-8000-000000001099')] } as PrefabFile;
+    seatAt(outside);
+    expect((await commitPrefabWrite(P, JSON.parse(JSON.stringify(outside)) as PrefabFile, { expected: outside })).ok).toBe(true);
+    expect((JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId).toBe(6);
   });
 
   it('a mark raised into a document from before v8 claims v8, and sits where the serializer writes it', async () => {

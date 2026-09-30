@@ -15,9 +15,9 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { warnInertPrefabSizes } from './prefab';
-import { setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource } from './prefabCache';
+import { getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource } from './prefabCache';
 import { serializePrefab } from './prefabSerialize';
-import { commitPrefabWrite } from './prefabCommit';
+import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { getEditVersion } from '../undo/undoManager';
@@ -479,15 +479,20 @@ async function openPrefabForEditingSwitching(
   // and preload any nested children into the SAME (editor) cache — serializePrefab's
   // sync nested-instance detection reads it, so without this a nested instance would
   // flatten on save instead of round-tripping as a reference row.
-  setPrefabCache(guid, prefab);
+  // The seed is the prefab step's `'adopt'` landing (#1880 W4): both caches REPLACED under every key, and the document's
+  // localId mark raised to the session's record (hub ruling (A)) — in the caches only. It seats before its first await,
+  // so the token below is taken over the seed's own revision bump and nothing between.
+  const seeding = commitPrefabChanges([{ source: guid, doc: prefab, expected: null, land: 'adopt' }], { rebase: false, fileChanged: false });
   // From here the token is the seed's own — the seed bumped the revision itself — and it is asked once more after the
   // save and the human's dialog below: a write landing there made `prefab` older than the file this world would edit.
   const seeded = capturePrefabRead(asset.path);
   // …and the session's OWN copy of what it opened (#1692): the save's precondition and its row numbering. Not the
   // cache entry — every prefab write re-seats that — and a COPY: the edit scene is built from `prefab`'s trait bags, and
   // the loader edits them in place (a legacy `CameraFrame.showGizmo` is stripped), which would make every save of such a
-  // prefab look like a file changed on disk. Taken now, SEATED only once the swap has landed (below).
-  const opened = JSON.parse(JSON.stringify(prefab)) as PrefabFile;
+  // prefab look like a file changed on disk. Taken now, SEATED only once the swap has landed (below). Its mark is the
+  // seed's: the session's floor numbers new rows from it (#1774).
+  const opened = JSON.parse(JSON.stringify({ ...prefab, ...markOf(getCachedPrefabSync(guid)) })) as PrefabFile;
+  await seeding;
   await preloadNestedPrefabs(prefab);
 
   // Entering prefab-edit SWAPS the live world, and exitPrefabEdit reloads the return
@@ -766,6 +771,13 @@ export interface PrefabEditSaveOptions {
   overwrite?: boolean;
   /** Ask whether to replace it (the human's Cmd+S and Exit's Save). Absent and not `overwrite`: refuse. */
   confirmOverwrite?: (name: string, path: string) => Promise<boolean>;
+}
+
+/** The localId mark `doc` states (and the version that claims it), for a copy that must number from it; empty when it
+ *  states none. */
+function markOf(doc: PrefabFile | null | undefined): { nextLocalId?: number; version?: number } {
+  const d = doc as (PrefabFile & { nextLocalId?: number }) | null | undefined;
+  return d?.nextLocalId !== undefined ? { nextLocalId: d.nextLocalId, version: d.version } : {};
 }
 
 /** Save the in-progress prefab edit back to its `.prefab.json`. Returns true on success — the

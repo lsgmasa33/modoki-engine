@@ -3136,8 +3136,8 @@ export async function replaySuppressedSceneReloads(): Promise<number> {
 
 /** An OUTSIDE change to prefabs the open scene uses, re-imported in place (#1873 R1) — `reimportOutsidePrefabChanges`,
  *  installed by `agentEditorOps.ts`. `needsReload`: what it could not reach, over a clean scene, reloads after all. */
-let _outsidePrefabReimporter: ((paths: string[]) => Promise<{ needsReload: boolean }>) | null = null;
-export function setOutsidePrefabReimporter(fn: ((paths: string[]) => Promise<{ needsReload: boolean }>) | null): void {
+let _outsidePrefabReimporter: ((paths: string[], opts?: { rebase?: boolean }) => Promise<{ needsReload: boolean }>) | null = null;
+export function setOutsidePrefabReimporter(fn: ((paths: string[], opts?: { rebase?: boolean }) => Promise<{ needsReload: boolean }>) | null): void {
   _outsidePrefabReimporter = fn;
 }
 
@@ -3362,11 +3362,10 @@ function sceneInOpenChain(urlPath: string): boolean {
   return false;
 }
 
-/** Put the prefab at `urlPath` back to its FILE, everywhere — both caches, and a reload of the open scene when it uses
- *  it — exactly as an outside change of the file does. For a discarded parked prefab (#1868): its caches and live frames
- *  hold the discarded document, so dropping only the pending write would leave the editor showing one prefab, the file
- *  holding another, and the editor reporting clean. Call it once the park is gone, or the watcher's branch keeps it. */
-export function reloadPrefabFromDisk(urlPath: string): Promise<void> {
+/** Test seam: the watcher's own entry for a change to the prefab file at `urlPath` — what the Vite HMR and Electron IPC
+ *  paths call. No production caller: a discard re-imports through the prefab step (#1880 W4 deleted the route that sent
+ *  it here "as if the file had just changed"). */
+export function _watcherPrefabChangedForTests(urlPath: string): Promise<void> {
   return handleSceneChanged({ urlPath, kind: 'prefab' });
 }
 
@@ -3462,6 +3461,10 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // `getCachedPrefab` spawns — so the runtime eviction runs only on this path, once suppression is
   // over, and as late as possible (see the re-check below). Keyed by the path form the watcher sends.
   const prefabPaths = changedPrefabs;
+  // In the EDITOR, a prefab change is the prefab step's `'adopt'` landing (#1880 W4, installed by agentEditorOps.ts): both
+  // caches REPLACED with the file's document, never evicted (#1308: an eviction left every synchronous runtime reader —
+  // a pooled scroll view, a timeline spawn — reading `undefined` until the next scene load). The eviction below is for a
+  // runtime with no editor installed (a device build's watcher), whose only refresh it is.
   const evictRuntimePrefabs = (): void => { for (const urlPath of prefabPaths) invalidatePrefab(urlPath); };
   const refreshEditorPrefabs = async (): Promise<void> => {
     const refresh = _prefabSourceRefresher;
@@ -3470,11 +3473,12 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // `openScenePath`, not `getCurrent()` alone (#1712): a scene made by `newScene()` and then saved has a file but no
   // `SceneManager` entry, and returning here dropped every change to it silently.
   const current = openScenePath();
-  if (!current) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
-  // In prefab-edit mode the active "scene" is a synthetic in-memory scene
-  // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
-  // still re-read: the prefab-edit save reads it synchronously for the edited and nested prefabs.
-  if (current.startsWith('/__prefab-edit__/')) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
+  // No scene file open, or prefab-edit mode (a synthetic in-memory scene, `/__prefab-edit__/<guid>`, with no file on
+  // disk): the world is not rebuilt from the file — only the caches take it, which the prefab-edit save reads
+  // synchronously for the edited and nested prefabs.
+  const cachesOnly = !current || current.startsWith('/__prefab-edit__/');
+  if (cachesOnly && msg.kind === 'prefab' && _outsidePrefabReimporter) { await _outsidePrefabReimporter([...prefabPaths], { rebase: false }); return; }
+  if (cachesOnly) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // #1873 R1 — OWNER RULING 2026-09-30, the Unity way: an outside change to a PREFAB the open scene uses (a write, a
   // delete, a put-back) re-imports it and updates its instances IN PLACE, keeping the scene's unsaved edits, its dirty
   // flag and its undo stack. It reverses #1164's disk-wins for prefab changes; a change to a scene FILE still reloads
