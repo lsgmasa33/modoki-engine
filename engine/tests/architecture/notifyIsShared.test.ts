@@ -245,7 +245,6 @@ const EXEMPT: Readonly<Record<string, ExemptKind>> = {
   'engine/plugins/load-project-config.ts :: read': 'query',
   'engine/packages/modoki/src/runtime/loaders/sidecarSettings.ts :: resolve': 'query',
   'games/wordweave/runtime/stem.ts :: coValidate': 'query',
-  'games/slime-shooter/runtime/stem.ts :: coValidate': 'query',
   'engine/packages/modoki/src/editor/scene/authoredWorld.ts :: isPosed': 'query',
   'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook': 'async-sequential',
   'engine/packages/modoki/src/editor/undo/compositeAction.ts :: step': 'async-sequential',
