@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -50,20 +50,20 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, serializePrefab, missingPrefabPlaceholders, unexpandedNestedRefusal, staleFramesInTreeRefusal, tagCreatedPrefab, commitPrefabWrite, prefabConflictReason, prefabTextIsDocument, readPriorDocument, createdFrameRebuiltRefusal, relinkedFramesCheck, primeEditorPrefabCache, isEditorPrefabCached, warnInertPrefabSizes, parsedPrefabRows,
+  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, createPrefabFromEntity,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
-  classifyExistingPrefabId, untagEntityTreeAsInstance, unstampMemberGuids,
-  reattachPrefabInstance, detachPrefabInstanceWithUndo, detachRefusal,
-  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, partOfInstanceRefusal,
+detachPrefabInstanceWithUndo, detachRefusal,
+  restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT,
   applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, effectiveDefaults, DEFAULT_OVERRIDES_NOTE, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
-  pushAction, makePrefabInstantiateAction, placedPrefabPath, placedPrefabRefusal, entityRef, isInstanceRootCheck, placeholderWriteRefusal, assetDocAction,
+  pushAction, makePrefabInstantiateAction, placedPrefabPath, placedPrefabRefusal, entityRef, placeholderWriteRefusal, assetDocAction,
   getEditorViewportCamera, focusEntityInSceneView, setEditorViewPose, getEditorViewTarget, getEditorProjection, editorUiPreviewFollowsOrbit,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
+  reimportPrefabsInPlace, reimportOutsidePrefabChanges, type PrefabReimportReport,
   readEditorJournal, editorJournalSeq, editorJournalDroppedThrough, editorJournalEpoch, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
@@ -76,12 +76,12 @@ import {
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
-  reportUndoFailure, UndoRefusedError, fileChangedRefusal, isUndoStepInFlight, beginForwardEdit,
+UndoRefusedError, isUndoStepInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
 import { recordsUndo, stepRunningRefusal } from './agentOpUndoClass';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, captureEntityIdentity, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
+  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, currentCaptureSeq, resolveCapCursor, journalDroppedThroughCap, journalGapNote, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
@@ -529,6 +529,8 @@ interface PrefabParams {
   /** edit-save: the prefab changed on disk since the edit opened it, and the save refused (#1692) — `true` replaces
    *  what is on disk with this edit. Never implied: without it that save refuses and says so. */
   overwrite?: boolean;
+  /** create: consent to replacing the prefab already at `path` (#1873) — without it, a create over one refuses. */
+  replace?: boolean;
   /** instantiate: parent entity id (default root). */
   parentId?: number;
   /** instantiate: parent entity guid. Given with ANY `parentId` (0 included), the call is refused (#1223 D1). */
@@ -1424,6 +1426,37 @@ export function registerEditorAgentOps(): void {
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);
+  // An OUTSIDE change to a prefab the open scene uses re-imports it in place (#1873 R1, owner ruling 2026-09-30). What
+  // it cannot reach reloads over a clean scene; over unsaved work it is SAID — a toast for the human, the console for
+  // the agent (`modoki_get_console_logs`) — and the reload is left to them.
+  setOutsidePrefabReimporter(async (paths) => {
+    const { report, needsReload } = await reimportOutsidePrefabChanges(paths);
+    // The #1702 gate's own line, for a prefab nothing in the open scene uses (QA-PREFAB-0027 reads it).
+    for (const x of report.unused) console.log(`[agentBridge] prefab change not used by the open scene — no reload (${x})`);
+    for (const x of report.deleted) console.log(`[agentBridge] ${x} was deleted outside the editor — its instances stay as they are (a Missing Prefab on the next load)`);
+    for (const f of report.failed) console.warn(`[agentBridge] ${f.path} changed on disk but was not re-imported: ${f.reason}`);
+    if (report.reimported.length) console.log(`[agentBridge] re-imported ${report.reimported.join(', ')} in place — the scene's unsaved edits and undo are kept`);
+    const left = [...report.notRebased.map((n) => n.entity), ...report.placeholders.map((p) => p.entity)];
+    if (left.length && !needsReload) {
+      const msg = `${left.length} instance(s) of ${paths.map((x) => x.split('/').pop()).join(', ')} could not be updated in place (${left.join(', ')}), and the scene has unsaved changes, so it was not reloaded. Save or discard, then reload the scene to rebuild them.`;
+      console.warn(`[agentBridge] ${msg}`);
+      useEditorStore.getState().showToast(msg, 'warn');
+    }
+    return { needsReload };
+  });
+  // A discarded prefab re-import held through Play/a preview replays in place (#1873 S2). Nobody awaits a replay, so what
+  // it could not rebase goes to the console, as a deferred reload's failures do.
+  setPrefabReimporter(async (paths) => {
+    // A replay that lands in prefab edit (the edit opened after the deferral): the world is the template, and only the
+    // caches are re-read there (#1873 review), as a direct discard does.
+    if (useEditorStore.getState().editingPrefab) {
+      for (const x of paths) await reloadPrefabFromDisk(x).catch((e) => console.error(`[discard-asset-edits] re-reading ${x} failed:`, e));
+      return;
+    }
+    const rep = await reimportPrefabsInPlace(paths);
+    for (const f of rep.failed) console.warn(`[discard-asset-edits] ${f.path} was not re-imported: ${f.reason}`);
+    for (const n of rep.notRebased) console.warn(`[discard-asset-edits] "${n.entity}" was not rebased onto ${n.source}: ${n.reason} — reload the scene to rebuild it`);
+  });
   // …and a PARKED prefab keeps its park across a change on disk (#1868, hub call a), its baseline marked stale.
   setParkedPrefabKeeper(keepParkedPrefabOverFileChange);
   // set-traits is the device's raw op; the editor replaces it (#1816), as it replaces create/duplicate/delete, so an
@@ -2895,20 +2928,50 @@ export function registerEditorAgentOps(): void {
    *  `set_selection` taught us not to ship: there, a bare call cleared the selection, so one
    *  misspelled argument key silently became "clear everything". The caller must name `paths`, or
    *  say `all:true` and mean it. The refusal lists what is pending, so the naming is a copy-paste. */
+  /** Put discarded parked prefabs back to their files (#1873 S2): re-imported IN PLACE — both caches take the file's
+   *  document and every live instance is rebased onto it, so the scene's unsaved edits and its undo stack stay. It went
+   *  through the watcher's path "as if the file had just changed", which is the disk-wins reload of the whole open scene
+   *  (#1164) and dropped both. Deferred while the world may not be rebuilt (Play, a preview, a landing switch), and replayed
+   *  as a re-import once it may. In prefab edit the world is the template, and the watcher's path only re-reads the caches. */
+  const reimportDiscardedPrefabs = async (paths: string[]): Promise<PrefabReimportReport & { deferred?: string }> => {
+    if (useEditorStore.getState().editingPrefab) {
+      await Promise.all(paths.map((x) => reloadPrefabFromDisk(x).catch((e) => {
+        console.error(`[discard-asset-edits] ${x} was discarded, but re-reading it from disk failed:`, e);
+      })));
+      return { reimported: paths, failed: [], deleted: [], unused: [], notRebased: [], placeholders: [] };
+    }
+    const suppressed = sceneReloadSuppressedReason();
+    if (suppressed) {
+      deferPrefabReimport(paths, suppressed);
+      return { reimported: [], failed: [], deleted: [], unused: [], notRebased: [], placeholders: [], deferred: suppressed };
+    }
+    return reimportPrefabsInPlace(paths);
+  };
+
   /** Drop parked asset writes, the agent's way: an asset document's applied def stays LIVE (the op's documented scope),
    *  so its cache now differs from the file (#1710). A parked PREFAB cannot follow that rule (#1868): its caches AND its
    *  live frames hold the park, so the editor would show one prefab while the file holds another and report clean. It is
-   *  put back to its file through the watcher's own path instead, as if the file had just changed. `reloaded` settles
-   *  once every prefab reload has. */
-  const discardParkedAssets = (paths: string[] | undefined): { discarded: string[]; notPending: string[]; reloaded: Promise<void> } => {
+   *  re-imported from its file instead (`reimportDiscardedPrefabs`). `reimport` settles once that has; null when no
+   *  prefab was discarded. */
+  const discardParkedAssets = (paths: string[] | undefined): { discarded: string[]; notPending: string[]; reimport: Promise<(PrefabReimportReport & { deferred?: string }) | null> } => {
     const asked = paths ?? getDirtyAssetPaths();
     const prefabs = asked.filter((x) => peekDirtyAsset(x)?.type === 'prefab');
     const docs = discardDirtyAssets(asked.filter((x) => !prefabs.includes(x)), { cacheKeepsEdit: true });
     const parks = discardDirtyAssets(prefabs);
-    const reloaded = Promise.all(parks.discarded.map((x) => reloadPrefabFromDisk(x).catch((e) => {
-      console.error(`[discard-asset-edits] ${x} was discarded, but reloading it from disk failed:`, e);
-    }))).then(() => undefined);
-    return { discarded: [...docs.discarded, ...parks.discarded], notPending: docs.notPending, reloaded };
+    const reimport = parks.discarded.length ? reimportDiscardedPrefabs(parks.discarded) : Promise.resolve(null);
+    return { discarded: [...docs.discarded, ...parks.discarded], notPending: docs.notPending, reimport };
+  };
+
+  /** What a discard's prefab re-import says in a reply (#1873 S2): nothing when there was none. */
+  const reimportReply = (rep: (PrefabReimportReport & { deferred?: string }) | null) => !rep ? {} : {
+    // A prefab nothing in the scene uses was put back to its file too — its caches read the file (#1873 re-review).
+    ...(rep.reimported.length + rep.unused.length ? { reimported: [...rep.reimported, ...rep.unused] } : {}),
+    ...(rep.deferred ? { reimportDeferred: `${rep.deferred} — the prefab is re-imported in place once it is done` } : {}),
+    ...(rep.failed.length ? { reimportFailed: rep.failed } : {}),
+    ...(rep.notRebased.length ? {
+      notRebased: rep.notRebased,
+      notRebasedOptions: ["modoki_load_scene {path:<the open scene>, discardUnsaved:true} — reloads the scene from disk, which rebuilds them (and DROPS the scene's unsaved edits and undo)"],
+    } : {}),
   };
 
   registerAgentOp('discard-asset-edits', async (params) => {
@@ -2949,8 +3012,8 @@ export function registerEditorAgentOps(): void {
         { options: choices });
     }
     // The applied def stays LIVE (this op's documented scope), so the cache now differs from the file (#1710).
-    const { reloaded, ...r } = discardParkedAssets(p.all ? undefined : p.paths);
-    await reloaded;
+    const { reimport, ...r } = discardParkedAssets(p.all ? undefined : p.paths);
+    const reimported = reimportReply(await reimport);
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
     // that discards "everything" and then re-imports still bakes against the human's unsaved
@@ -2988,6 +3051,7 @@ export function registerEditorAgentOps(): void {
     return {
       ok: true,
       ...r,
+      ...reimported,
       remaining: getDirtyAssetPaths(),
       ...(parkedMeta.length ? { remainingImportSettings: parkedMeta } : {}),
       ...(parkedBaseScenes.length ? { remainingBaseScenes: parkedBaseScenes } : {}),
@@ -2998,7 +3062,9 @@ export function registerEditorAgentOps(): void {
         ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
           + 'def first if you need the value reverted too. A discarded PREFAB is the exception: it was '
-          + 'reloaded from its file, so the editor now shows what the file holds.'
+          + 're-imported from its file in place, so the editor now shows what the file holds, and the '
+          + "scene's unsaved edits and undo history are kept (an undo step that depended on the discarded "
+          + 'document refuses, saying so).'
         : 'Nothing was pending, so nothing changed.')
         + (leftBehind.length
           ? ` NOT covered by this call — this op owns the dirty-ASSET registry only, and these `
@@ -3248,208 +3314,49 @@ export function registerEditorAgentOps(): void {
     if (which === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
-      // The live subtree is what gets written — refuse a posed/played one (#1548), as the human path does.
-      // Unlike the live-world edits, Play is NOT exempt here: this writes a FILE, and a played subtree
-      // would be baked into the template.
-      if (getRunMode() === 'playing') {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${whyWorldNotAuthored()} — stop Play first, or the played pose is written into the prefab.`,
-          { options: ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] });
-      }
-      // Part of a prefab instance is not saved as a prefab of its own (#1869, Unity's rule) — the human path's refusal.
-      const part = partOfInstanceRefusal(entityId);
-      if (part) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${part}`,
-          { options: ['create the prefab from the instance root', "prefab {action:'detach'} on the outermost instance root first, then retry"] });
-      }
-      // A reference to a missing prefab holds its edits as a scene record, which a template cannot take (#1699, I8) — the
-      // human path refuses the same tree (`createPrefabFromEntity`).
-      const missing = missingPrefabPlaceholders(entityId)[0];
-      if (missing) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: "${missing.name}" is a reference to a missing prefab, so its edits cannot be written into a template until that prefab resolves.`,
-          { options: ['restore the missing prefab (the scene reload re-expands the reference), then retry', 'create the prefab from a subtree that does not hold it'] });
-      }
-      refuseEditOfPosedWorld('prefab create', 'the subtree may carry a pose, which would be written into the prefab file');
-      // `entityId` is a bare index carried across the three fetches below, with no world hold taken until the commit: a hot
-      // reload landing in one renumbers the world, and the id then names another instance of the same prefab (#1750 H1's
-      // class — measured on this op: IB's value written, `ok:true`). Captured here, in the adopted world (a landing switch
-      // was refused just above), and asked after the last await.
-      const adopted = captureAdoption()!;
-      // …and the root itself: a frame rebuilt in place re-mints ids in the same world (close-out reviews). Asked again
-      // inside the commit's rebuild, which acts on the raw id after the commit's own awaits.
-      const sameRoot = captureEntityIdentity(entityId);
-      // A Replace asked in another case is a Replace of the file that is THERE (#1273), as Create Prefab resolves it: every
-      // read, the write's `source` and the tag key on the disk's spelling from here. Keyed by the typed one, the commit
-      // seated a second editor-cache entry that no later write of the file updates, and an instantiate by that spelling
-      // then read the old document from it (#1753 close-out review).
-      const path = (await existingAssetPath(p.path)) ?? p.path;
-      const existing = await classifyExistingPrefabId(path);
-      // ⚠️ Refuse rather than mint a fresh file guid over a prefab that is THERE and unreadable — a
-      // 500, corrupt bytes, or one a newer build wrote (#1468, #896's class). The agent asked to
-      // create a prefab at a path, not to re-identify the asset already sitting on it, and every
-      // scene referencing the old id would dangle with the old bytes still on disk. Thrown, because
-      // this op's contract is that a refusal reaches the caller rather than the renderer console.
-      if (existing.kind === 'refuse') throw new Error(`prefab create refused: ${existing.reason}`);
-      const existingId = existing.kind === 'known' ? existing.id : undefined;
-      // Same cold-cache flatten as the human path (#1284) — classifyExistingPrefabId fetches
-      // raw and never touches the editor prefab cache, so nothing here warms it.
-      await preloadNestedPrefabsForSubtree(entityId);
-      // What is at `path` now, read ONCE (#1692) — the PARK over a parked prefab, as the human path reads it (#1868 D-i,
-      // `readPriorDocument`; before #1872 this read took the file): the bytes the write below is conditional on (I10), and — over an existing
-      // prefab, a Replace — the rows it overwrites, which a node with no live identity is matched against by name, the
-      // same matcher as Create Prefab's Replace (#1686, `nodeGuidsFor`). One read, so the rows matched are the rows the
-      // write replaces.
-      const prior = await readPriorDocument(path);
-      if (prior === null) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: the file at ${path} could not be read, so it was not overwritten blind.`);
-      }
-      // …and the id kept is the one THAT read carries (close-out review): the classify above read the file separately.
-      const priorId = prior ? (() => { try { return (JSON.parse(prior.replace(/^\uFEFF/, '')) as { id?: unknown }).id; } catch { return undefined; } })() : undefined;
-      const keptId = typeof priorId === 'string' && priorId ? priorId : existingId;
-      const replacing = keptId && prior ? parsedPrefabRows(prior.replace(/^\uFEFF/, '')) : undefined;
-      // …and after those awaits the world is asked again, as Create Prefab's Replace asks after its dialog: a Play
-      // started meanwhile would write its played pose (close-out review of #1686).
-      const late = whyWorldNotAuthored();
-      if (late) throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${late} — ${notAuthoredExit(late) ?? 'stop Play first, or the played pose is written into the prefab'}.`);
-      if (!adopted() || !sameRoot()) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${adopted() ? 'the entity was rebuilt in place (a prefab instance refreshed)' : 'the scene was reloaded'} while the prefab was being prepared, so entity ${entityId} may name another entity now. Nothing was written. Address it again (by guid) and retry.`);
-      }
-      // A nested frame that could not be expanded (#1790, owner ruling D; the human path's refusal) — after the warm, so a
-      // merely cold key is not a missing prefab, and after the LAST await (the prior read) and the world re-checks, as the human path asks them: a watcher
-      // refresh landing in that read changes the cache the answers are about, and a reload makes `entityId` another entity,
-      // whose refusal would name the wrong cause (#1815 close-out reviews).
-      const unexpanded = unexpandedNestedRefusal(entityId);
-      if (unexpanded) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${unexpanded}.`,
-          { options: ['restore the missing nested prefab (a scene reload re-expands it), then retry', 'create the prefab from a subtree that does not hold that instance'] });
-      }
-      // A frame built from other rows than the cache holds (#1815, I3; the human path's refusal).
-      const stale = staleFramesInTreeRefusal(entityId);
-      if (stale) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${stale}.`,
-          { options: ['reload the scene (it re-expands the instance from the current prefab), then retry', 'create the prefab from a subtree that does not hold that instance'] });
-      }
-      let runtimeExcluded = 0;
-      const prefab = serializePrefab(entityId, keptId, { bakeKeptState: true, replacing, onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
-      if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
-      // An authoring write (it can overwrite an existing template), so it reports an inert size like
-      // the human Save-as-Prefab does (#42, #1251) — in THIS response too, because the agent that
-      // authored it does not read the renderer console (the instantiate op's QA-ASSET-0014 rule above).
-      const warnings = warnInertPrefabSizes(prefab, path);
-      // Runtime entities under the selection (pooled UIEntries rows, timeline scrub/control spawns)
-      // are excluded from the file (#1306) — and the agent does not read the renderer console, so it
-      // is told here or not at all. Same reasoning as the inert-size warnings above (#1258).
-      if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
-      // ONE step (#1692): written only over what was at `path` when it was read above — nothing, or those bytes (I10) —
-      // then both caches, the tag of this tree, and a rebuild of every OTHER live instance of the prefab this overwrites
-      // (#1685's sibling: it used to seat the runtime cache alone, so the editor cache kept the old document under the guid).
-      type TaggedTree = { ref: ReturnType<typeof entityRef> } & ReturnType<typeof tagCreatedPrefab>;
-      // Set inside the commit's rebuild; `as` so the closure's assignment is not narrowed away.
-      let tagged = null as TaggedTree | null;
-      const committed = await commitPrefabWrite(path, prefab, {
-        expected: prior ?? null,
-        rebuild: (landed) => {
-          // The tree was rebuilt in place during the write (fourth close-out review): the id names another entity now, so
-          // nothing is tagged, and the reply says the file landed unlinked.
-          if (!sameRoot()) return;
-          // The tag reports the links it overwrote, for the undo to put back (#1278, #1830): only those, as the human flow.
-          // ⚠️ Mint the root's guid BEFORE the tag: it is the ANCHOR every member's derived guid comes
-          // from (#1461), and `entityRef` is what mints it. Taken after, the stamp has nothing to derive
-          // from and leaves the create window open. (Its other job — resolving the subtree across a world
-          // rebuild — is unchanged.) Inside the commit, BEFORE its rebase: the tagged tree is recorded as
-          // expanded from the new document, so the rebase leaves it alone and rebuilds only the others.
-          const ref = entityRef(entityId);
-          // The rename the tag stamped onto the members (old guid → new), for undo to reverse.
-          // By the path the file LANDED on (#1753 F4), as Create Prefab tags (`assetOps.ts`): a Replace asked as
-          // `enemy.prefab.json` over `Enemy.prefab.json` lands on the existing file, and the manifest knows only that
-          // spelling — tagged with the request's, the tag resolved no guid and stamped the raw path as the source, which
-          // the next load rejects (GUID-only), losing the instance. Through Create Prefab's tag (#1790), which also settles
-          // the kept state the new instance swallowed.
-          tagged = { ref, ...tagCreatedPrefab(entityId, landed.path, prefab) };
-        },
+      // Create Prefab ITSELF (#1873 C1) — the Hierarchy's and the Assets drop's function, not a copy of it. The copy this
+      // replaced drifted three ways: its Replace undo only unlinked, so the prefab it overwrote was lost (S1); it took a
+      // resource entity (L2); and it read disk where the human path read the park (#1872). Its refusals are the human
+      // text; only the ways out are the agent's.
+      const name = getAllEntities().find((e) => e.id === entityId)?.name ?? String(entityId);
+      /** The existing file the path named, when the call did not consent to replacing it. */
+      let declinedAt: string | undefined;
+      const result = await createPrefabFromEntity(entityId, p.path, `Save prefab "${name}"`, async (at) => {
+        // The Hierarchy asks "Replace existing asset?"; an agent says so up front, or the create is refused.
+        if (p.replace === true) return true;
+        declinedAt = at;
+        return false;
       });
-      if (!committed.ok && committed.conflict) {
-        // Which conflict (#1872 close-out review): over a prefab parked across an outside change, a retry meets it again.
-        const why = prefabConflictReason(path);
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${why.reason}.${why.parked ? '' : ' Retry to write over the new content.'}`,
-          why.parked ? { options: ['modoki_save_all, which reports the conflict with the outside change', 'modoki_discard_asset_edits for this prefab, then retry'] } : undefined);
+      if (result === 'declined') {
+        throw new OpRefusal('REFUSED_BY_OP',
+          `prefab create refused: ${declinedAt ?? p.path} already exists, and replace:true was not passed. Nothing was written.`,
+          { options: [
+            `modoki_prefab {action:'create', path:'${declinedAt ?? p.path}', replace:true} — replaces its content and keeps its guid, so placed instances stay linked; undo restores the replaced prefab (in memory, parked until modoki_save_all)`,
+            'create it at another path',
+          ] });
       }
-      // Any other failed write refuses WITH the commit's reason (#1776) — it answered a bare ok:false. The one channel a
-      // write's refusal travels in is `committed.error`, whoever produced it.
-      if (!committed.ok) {
-        throw new OpRefusal('REFUSED_BY_OP', `prefab create refused: ${path} was not written — ${committed.error ?? 'the write failed'}. Nothing was linked.`,
-          committed.options?.length ? { options: committed.options } : undefined);
+      if ('refused' in result) {
+        const options = result.notAuthored
+          ? (getRunMode() === 'playing' ? ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"] : posedWorldExits().options)
+          : result.conflict?.parked
+            ? ['modoki_save_all, which reports the conflict with the outside change', 'modoki_discard_asset_edits for this prefab, then retry']
+            // Somebody wrote the path while this create did (#1873 review): a retry meets that file, which only a Replace goes over.
+            : result.conflict ? (p.replace === true ? ['retry: the write goes over the new content']
+              : [`modoki_prefab {action:'create', path:'${p.path}', replace:true} — replaces what was written there meanwhile (keeps its guid)`, 'create it at another path'])
+              : result.options;
+        throw new OpRefusal('REFUSED_BY_OP', result.refused, options?.length ? { options } : undefined);
       }
-      const ok = committed.ok;
-      // The path the prefab really landed on (#1753 F4) — the existing file's own spelling after a Replace. The undo and
-      // redo below and the reply key on it, as the tag did.
-      const landedPath = committed.path;
-      if (committed.worldLeft) warnings.push('the scene changed while the prefab was written: the file landed, but the entity was not linked to it');
-      else if (ok && !tagged) warnings.push('the entity was rebuilt in place while the prefab was written: the file landed, but the entity was not linked to it');
-      if (tagged) {
-        const { ref, keys, priorLinks } = tagged;
-        let { guidRemap, undoKept } = tagged;
-        // Asked by the redo: whether a frame the undo relinked was rebuilt since (#1830 close-out review).
-        let relinkedChanged: () => string | null = () => null;
-        // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
-        // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
-        // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
-        // undoing an overwrite by deleting the file would destroy an asset the agent never
-        // created. File-direct writes are not undoable anywhere else in the MCP surface either.
-        const label = `Create prefab "${prefab.name ?? path}" (link only)`;
-        pushAction({
-          label,
-          undo: () => {
-            // Its target is the instance root this op tagged (I20): after a world swap it can be gone, or a Missing Prefab
-            // placeholder (the prefab trashed and the scene reloaded), and untagging and relinking one reached into a
-            // tree that is not the one tagged. `require` refuses both before anything changes (#1795's agent twin).
-            // …and still the tree this op tagged: a prefab-edit save or an outside edit since rebased it onto the file's new
-            // document, and unlinking it would keep that change as plain entities (#1795 review, the human undo's check).
-            const id = ref.require({ check: (x) => isInstanceRootCheck(x) ?? createdFrameRebuiltRefusal(x, prefab, landedPath) });
-            // Put the members' ORIGINAL guids back FIRST, and every ref with them: `priorLinks` was
-            // snapshotted one line before the tag and addresses each member by the guid it held then,
-            // so reattaching ahead of this would resolve nothing (#1461).
-            // The kept-state settle first (#1790): it restores entries under the guids the tag left.
-            undoKept(); undoKept = () => {};
-            unstampMemberGuids(guidRemap);
-            // Scoped to THIS prefab (#1272): a held nested instance keeps its own link rather
-            // than being stripped and restored from a guid that a Play→Stop may have re-minted.
-            untagEntityTreeAsInstance(id, landedPath, prefab); // by the document's guid, not the manifest (#1807)
-            const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
-            if (unresolved > 0) reportUndoFailure({ direction: 'Undo', label, detail: `${unresolved} prior prefab link(s) could not be put back — no longer addressable` });
-            relinkedChanged = relinkedFramesCheck(priorLinks);
-          },
-          redo: async () => {
-            ref.require(); // I19: a target that is gone refuses, rather than reading as done
-            const changed = relinkedChanged();
-            if (changed) throw new UndoRefusedError(`"${prefab.name ?? landedPath}" no longer describes the tree it was made from: ${changed}. Nothing was linked.`, `The tree changed since it was saved as ${landedPath.split('/').pop()} — nothing was redone`);
-            // The file must still hold the document it re-links to, as the human redo asks (#1795 review): after a
-            // prefab-edit save or an outside edit, the tag would plan the tree against rows the file no longer holds
-            // (I10), and after a delete it would link a file that is not there. Read where its guid lives now (a Rename
-            // moves it). This op writes no file on undo or redo, so an absent file refuses too.
-            const at = (prefab.id ? resolveRef(prefab.id) : undefined) ?? landedPath;
-            // The document the EDITOR holds (#1868, `readPriorDocument` takes the park first): a later Replace's or Apply's
-            // undo restores this one in memory only, and the file keeps the bytes it overwrote until a Save.
-            const onDisk = await readPriorDocument(at);
-            if (onDisk === null) return reportUndoFailure({ direction: 'Redo', label, detail: `${at} could not be read, so nothing was linked` });
-            if (onDisk === undefined || !prefabTextIsDocument(onDisk, prefab)) throw fileChangedRefusal([at]);
-            // I9, as the human redo: the key an eviction since the undo left cold is seated with the document the file holds.
-            if (prefab.id && !isEditorPrefabCached(prefab.id)) primeEditorPrefabCache(prefab.id, prefab);
-            // tagEntityTreeAsInstance re-runs planPrefabRows, the FLATTEN reader (#1284): cold,
-            // the re-planned rows drop the nested instance, planMatchesFile then disagrees with
-            // the file written warm, and the redo tags nothing at all.
-            await preloadNestedPrefabsForSubtree(ref.require()); // asked again: the read above can span a world swap
-            const after = ref.require(); // …and the await above too
-            // The keys the file holds go back on first (#1830), and a tree that no longer plans to its rows refuses.
-            const t = tagCreatedPrefab(after, at, prefab, { keys }); // undo reverses THIS run's rename
-            if (t.refused) throw new UndoRefusedError(`"${prefab.name ?? at}" no longer describes the tree it was made from: ${t.refused}. Nothing was linked.`, `The tree changed since it was saved as ${at.split('/').pop()} — nothing was redone`);
-            ({ guidRemap, undoKept } = t);
-          },
-        });
-      }
-      // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
-      // TAG on the source entity is separate and unsaved until modoki_save_all — reported so
-      // an agent doesn't conflate "the asset file landed" with "the scene linkage did too".
-      return { ok, source: landedPath, saved: ok, sceneLinkageSaved: false, ...(committed.error ? { error: committed.error } : {}), ...(warnings.length ? { warnings } : {}) };
+      pushAction(result.action);
+      // The agent does not read the renderer console, so what the human sees there or in a toast is in THIS response
+      // (QA-ASSET-0014's rule, #1258).
+      const warnings = [...result.inertSizes];
+      if (result.runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(result.runtimeExcluded));
+      if (result.unlinked) warnings.push(result.unlinked);
+      // `saved` describes the .prefab.json FILE write. The live-world PrefabInstance TAG on the source entity is separate
+      // and unsaved until modoki_save_all — reported so an agent doesn't conflate "the asset file landed" with "the scene
+      // linkage did too". `replaced`: the path held a prefab, whose content this replaced under its guid.
+      return { ok: true, source: result.savePath, saved: true, replaced: result.replaced, sceneLinkageSaved: false,
+        ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'detach') {
       refuseEditOfPosedWorld('prefab detach');
@@ -4573,7 +4480,7 @@ export function registerEditorAgentOps(): void {
    *  absent because it is not discardable at all (see the op header), and its absence from
    *  `DiscardableRegistry` is what makes that a type error rather than a runtime surprise. */
   const DISCARDERS = {
-    dirtyAsset: (paths: string[]) => discardParkedAssets(paths),
+    dirtyAsset: (paths: string[]) => { const { reimport, ...r } = discardParkedAssets(paths); return { ...r, settled: reimport }; },
     pendingMeta: (paths: string[]) => discardPendingMeta(paths),
     pendingBaseScene: (paths: string[]) => discardPendingBaseScenes(paths),
   } as const satisfies Record<DiscardableRegistry, (paths: string[]) => { discarded: string[] }>;
@@ -4692,7 +4599,7 @@ export function registerEditorAgentOps(): void {
    *  next author the same choice that produced #889. Version skew fails in the SAFE direction — a
    *  new backend against a stale tab gets `unknown agent op`, which Node classifies as `unknown`
    *  and refuses on. */
-  registerAgentOp('resolve-unsaved', (params) => {
+  registerAgentOp('resolve-unsaved', async (params) => {
     const { paths, registries, discard } = (params ?? {}) as {
       paths?: unknown; registries?: unknown; discard?: unknown;
     };
@@ -4797,15 +4704,20 @@ export function registerEditorAgentOps(): void {
       );
     }
     const discarded: Array<{ path: string; registry: UnsavedRegistry }> = [];
+    const reimports: Record<string, unknown> = {};
     for (const registry of Object.keys(DISCARDERS) as DiscardableRegistry[]) {
       if (!wantDiscard.has(registry)) continue;
       const targets = holds.filter((h) => h.registry === registry).map((h) => h.path);
       if (!targets.length) continue;
-      for (const path of DISCARDERS[registry](targets).discarded) discarded.push({ path, registry });
+      const out: { discarded: string[]; settled?: Promise<unknown> } = DISCARDERS[registry](targets);
+      for (const path of out.discarded) discarded.push({ path, registry });
+      // A discarded prefab's re-import is awaited (#1873 S2): the reply must not claim a state the editor has not reached.
+      const settled = await out.settled;
+      if (settled) Object.assign(reimports, reimportReply(settled as Parameters<typeof reimportReply>[0]));
     }
 
     // `covers` is what the caller checks BEFORE reading `holds` as an answer — see the header.
-    return { ok: true, holds, discarded, covers: [...asked] };
+    return { ok: true, holds, discarded, ...reimports, covers: [...asked] };
   });
 }
 

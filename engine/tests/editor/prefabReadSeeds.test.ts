@@ -458,7 +458,7 @@ describe('the agent `prefab create` tags by the path the file LANDED on (#1753 F
   it('a Replace asked in another case: the tag carries the guid, and the reply names the file that is there', async () => {
     const asked = X_PATH.toLowerCase();
     expect(asked, 'precondition: a different spelling').not.toBe(X_PATH);
-    const r = await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: SRC, path: asked })) as { ok?: boolean; source?: string };
+    const r = await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: SRC, path: asked, replace: true })) as { ok?: boolean; source?: string };
     expect(r.ok).toBe(true);
     expect(route.disk.has(asked), 'precondition: it landed on the existing file').toBe(false);
     expect(r.source, 'the spelling the route reported').toBe(X_PATH);
@@ -469,7 +469,7 @@ describe('the agent `prefab create` tags by the path the file LANDED on (#1753 F
 
   it('a later write of the file is what an instantiate by the typed spelling places — no second cache entry holds the old one', async () => {
     const asked = X_PATH.toLowerCase();
-    expect((await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: SRC, path: asked })) as { ok?: boolean }).ok).toBe(true);
+    expect((await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: SRC, path: asked, replace: true })) as { ok?: boolean }).ok).toBe(true);
     expect(getCachedPrefabSync(asked), 'no editor-cache entry under the typed spelling, which no later write would update').toBeNull();
     const written = route.disk.get(X_PATH)!;
     const doc = JSON.parse(written) as PrefabFile;

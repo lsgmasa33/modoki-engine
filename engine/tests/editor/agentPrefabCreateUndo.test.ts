@@ -17,11 +17,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
-  deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction,
+  deriveInstanceMemberGuids, getCurrentWorld, Transient, UIAction, Physics2D, getAllEntities, UIAnchor, UIElement,
 } from '@modoki/engine/runtime';
-import { clearHistory, markSceneSaved, undo, redo } from '@modoki/engine/editor';
+import { clearHistory, markSceneSaved, undo, redo, flushParked, parkedPrefab, createPrefabFromEntity } from '@modoki/engine/editor';
+import { RESOURCE_PREFAB_TEXT } from '../../packages/modoki/src/editor/scene/restructureRefusal';
 import {
-  setPrefabCache, evictDeletedEditorPrefabs, isEditorPrefabCached,
+  setPrefabCache, evictDeletedEditorPrefabs, isEditorPrefabCached, getCachedPrefabSync,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -49,6 +50,7 @@ let game: TestWorld | undefined;
 let origFetch: typeof globalThis.fetch;
 /** What the op wrote, served back to its reads: the redo re-links only while the file still holds its document. */
 const disk = new Map<string, string>();
+let takenMeanwhile = false;
 
 beforeEach(() => {
   game = createTestWorld({});
@@ -65,9 +67,17 @@ beforeEach(() => {
   // refuses, correctly. The real dev server answers an absent asset with its SPA fallback or a 404,
   // never with an empty 200, so the old stub was modelling a response nothing produces.
   disk.clear();
+  takenMeanwhile = false;
   globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
     const u = String(url);
+    // A file written to the path by somebody else while the create wrote (#1873 review F6): the create-only write 409s.
+    if (u.includes('/api/write-file') && takenMeanwhile) return { ok: false, status: 409, json: async () => ({ reason: 'if-none-match', existingPath: JSON.parse(init?.body ?? '{}').path }), text: async () => '' } as Response;
     if (u.includes('/api/write-file')) { const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string }; disk.set(b.path, b.content); }
+    // Whether the path holds a file: what a Replace is decided on (#1873 C1).
+    if (u.includes('/api/exists')) {
+      const at = decodeURIComponent(u.split('path=')[1] ?? '');
+      return { ok: true, status: 200, json: async () => ({ exists: disk.has(at), path: at }) } as Response;
+    }
     if (u.includes('/api/')) return { ok: true, status: 200, json: async () => ({ ok: true, files: [] }), text: async () => '{}' } as Response;
     const hit = [...disk.keys()].find((p) => u.endsWith(p));
     return hit !== undefined ? new Response(disk.get(hit)!, { status: 200 }) : { ok: false, status: 404, json: async () => ({}), text: async () => '' } as Response;
@@ -352,10 +362,100 @@ describe('agent prefab create — runtime entities left out are REPORTED in the 
     expect(kept.has(EntityAttributes)).toBe(true); // fixture sanity: the authored sibling is still there
   });
 
+  // #1251 close-out, moved here from a source check when the op became createPrefabFromEntity (#1873 C1): the inert size
+  // Create Prefab logs reaches the agent's reply, as `result.inertSizes`. Mutation: the op leaves `inertSizes` out of
+  // its `warnings` — the reply names nothing.
+  it('names an inert size in its reply', async () => {
+    game!.spawn(Transform(), EntityAttributes({ name: 'Panel', guid: 'g-inert-r' }), UIAnchor({ anchor: 'stretch' }), UIElement({ width: 90, widthUnit: '%' }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-inert-r', path: NEW_PATH }) as { ok: boolean; warnings?: string[] };
+      expect(res.ok).toBe(true);
+      expect((res.warnings ?? []).join(' ')).toMatch(/UIElement\.width is inert/);
+    } finally { warn.mockRestore(); }
+  });
+
   it('says nothing when the selection lost nothing', async () => {
     game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-quiet-r' }));
     const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-quiet-r', path: NEW_PATH }) as { ok: boolean; warnings?: string[] };
     expect(res.ok).toBe(true);
     expect((res.warnings ?? []).join(' ')).not.toContain('runtime entit');
+  });
+});
+
+/** #1873 C1: the agent create IS Create Prefab (`createPrefabFromEntity`). Its own copy's Replace undo only unlinked, so
+ *  the prefab it overwrote was lost (S1), and it took a resource entity (L2). */
+describe('agent prefab create — the Hierarchy\'s Create Prefab, Replace and refusals included (#1873 C1)', () => {
+  const OLD_GUID = 'eeeeeeee-0000-4000-8000-00000000e001';
+  const OLD_PATH = '/assets/prefabs/Old.prefab.json';
+  const oldDoc = {
+    id: OLD_GUID, version: 3 as const, name: 'Old', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Old', traits: { Transform: { x: 7 }, EntityAttributes: { name: 'Old', parentId: 0, guid: '' } } }],
+  };
+  const oldBytes = `${JSON.stringify(oldDoc, null, 2)}\n`;
+  const seatOld = () => {
+    disk.set(OLD_PATH, oldBytes);
+    registerAsset(OLD_GUID, OLD_PATH, 'prefab');
+    setPrefabCache(OLD_GUID, oldDoc as never);
+  };
+  const refusalOf = (params: Record<string, unknown>) =>
+    runAgentOp('prefab', params).then(() => null, (e: Error & { code?: string; options?: string[] }) => e);
+
+  // Mutation: the op's consent callback answers `true` unconditionally — the file is replaced without `replace:true`.
+  it('over an existing prefab, refuses without replace:true and writes nothing', async () => {
+    seatOld();
+    game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-nc-r' }));
+    const err = await refusalOf({ action: 'create', entityGuid: 'g-nc-r', path: OLD_PATH });
+    expect(err?.code).toBe('REFUSED_BY_OP');
+    expect(err?.message).toContain('replace:true');
+    expect(err?.options?.[0]).toMatch(/replace:true/);
+    expect(disk.get(OLD_PATH)).toBe(oldBytes);
+  });
+
+  // S1. Mutation: a Replace's undo takes the create branch (`if (!replaced)` → `if (true)` in `createPrefabFromEntity`'s
+  // undo) — the old document is not back and nothing parks, the agent copy's "link only" undo.
+  it('a Replace answers replaced:true, and its undo restores the old document in memory and parks it; Save writes it back', async () => {
+    seatOld();
+    const r = game!.spawn(Transform({ x: 1 }), EntityAttributes({ name: 'R', guid: 'g-rp-r' }));
+    const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rp-r', path: OLD_PATH, replace: true }) as { ok: boolean; replaced: boolean; source: string };
+    expect(res).toMatchObject({ ok: true, replaced: true, source: OLD_PATH });
+    const written = JSON.parse(disk.get(OLD_PATH)!) as { id: string; name: string };
+    expect(written, 'premise: the Replace kept the guid and wrote R').toMatchObject({ id: OLD_GUID, name: 'R' });
+    expect((r.get(PrefabInstance) as { source: string }).source).toBe(OLD_GUID);
+
+    await undo();
+
+    expect(r.has(PrefabInstance), 'the tree is unlinked').toBe(false);
+    expect((getCachedPrefabSync(OLD_GUID) as { name?: string } | null)?.name, 'the editor holds the replaced document again').toBe('Old');
+    expect((parkedPrefab(OLD_PATH) as { name?: string } | undefined)?.name, 'parked, for Save to write').toBe('Old');
+    expect(JSON.parse(disk.get(OLD_PATH)!).name, 'no undo writes a file (#1868)').toBe('R');
+
+    await flushParked('before-scene');
+    await flushParked('after-scene');
+    expect(JSON.parse(disk.get(OLD_PATH)!), 'Save writes the replaced document back').toEqual(oldDoc);
+    expect(parkedPrefab(OLD_PATH)).toBeUndefined();
+  });
+
+  // F6 (#1873 review). A path free when checked and written by somebody else meanwhile: the retry meets that file, which
+  // only a Replace goes over. Mutation: the plain 'retry' option whatever `replace` said — the option names no replace:true.
+  it('a create whose free path was written meanwhile names replace:true as the way over it', async () => {
+    game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-f6-r' }));
+    takenMeanwhile = true;
+    const err = await refusalOf({ action: 'create', entityGuid: 'g-f6-r', path: NEW_PATH });
+    expect(err?.code).toBe('REFUSED_BY_OP');
+    expect(err?.options?.[0], JSON.stringify(err?.options)).toMatch(/replace:true/);
+  });
+
+  // L2. Mutation: drop the `isResourceEntity` check at the top of `createPrefabFromEntity` — both routes write the file.
+  it('a resource entity is refused on both routes, with one text, and nothing is written', async () => {
+    game!.spawn(Physics2D(), EntityAttributes({ name: 'Physics', guid: 'g-res' }));
+    const res = getAllEntities().find((e) => e.guid === 'g-res')!.id;
+    const text = `Create Prefab refused — ${RESOURCE_PREFAB_TEXT}`;
+    const err = await refusalOf({ action: 'create', entityGuid: 'g-res', path: NEW_PATH });
+    expect(err?.code).toBe('REFUSED_BY_OP');
+    expect(err?.message).toBe(text);
+    const human = await createPrefabFromEntity(res, NEW_PATH, 'Save prefab "Physics"', async () => true);
+    expect(human).toEqual({ refused: text });
+    expect(disk.has(NEW_PATH)).toBe(false);
   });
 });

@@ -28,7 +28,7 @@ import type { SceneData, SceneEntityEntry, AddedEntity } from '../../runtime/loa
 import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
-import { notAuthoredExit, whyWorldNotAuthored } from './authoredWorld';
+import { notAuthoredAdvice, whyWorldNotAuthored } from './authoredWorld';
 import { canEdit } from '../../runtime/core/playState';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -815,7 +815,7 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
     // pointed at a console it cannot read. Cmd+S phrases a run-mode refusal from the mode itself. The Play/preview exit is
     // named only while one is running: a restore still landing, or one that FAILED, reads 'stopped' and has its own way
     // out in its reason (close-out review).
-    const exit = notAuthoredExit(notAuthored) ?? (canEdit() ? undefined : 'exit the preview or stop Play first');
+    const exit = notAuthoredAdvice(notAuthored);
     return {
       saved: false, notAuthored,
       warnings: [`${notAuthored} — saving now could write a preview or Play pose into the prefab${exit ? `; ${exit}` : ''}`],

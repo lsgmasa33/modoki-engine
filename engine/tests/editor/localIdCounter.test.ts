@@ -224,7 +224,7 @@ describe('#1774 guard: every minting writer numbers above the mark, and states i
     await load({ id: 'a', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
     const root = add('Add R', 0, 'R');
     for (const n of ['A', 'B', 'New']) add(`Add ${n}`, root, n);
-    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: PPATH });
+    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: PPATH, replace: true });
     expect(lids(onDiskDoc())).toEqual({ R: 1, A: 2, B: 3, New: 9 });
     expect(onDiskDoc().nextLocalId).toBe(10);
   });

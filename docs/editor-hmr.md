@@ -47,6 +47,13 @@ watcher event), and swapping to a different scene and back re-reads the prefab o
 scene does NOT also use it. **Verify any disk edit by querying the live spawned entity, never by
 re-reading the file you wrote.**
 
+**A PREFAB change does not reload the scene** (owner ruling 2026-09-30, #1873 R1, reversing #1164 for prefabs): it
+is re-imported IN PLACE — both caches REPLACED from the file (no eviction blank), every live instance rebased onto it
+with its own overrides kept, a delete keeping the live frames, a put-back re-expanding Missing Prefab placeholders —
+and the scene's unsaved edits, dirty flag and undo stack are kept. What that cannot reach reloads only a CLEAN scene.
+The rule and why: [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history). The eviction
+and re-read described above are what a SCENE reload (and that clean-scene fallback) relies on.
+
 **A reload over unsaved edits discards them (disk wins) and drops their undo history with them**, then
 makes the reloaded world the clean baseline (#1409). The exception is a base scene the reload KEEPS:
 its edits survive live and so does its dirty flag (#1417). The rule and why:
@@ -54,8 +61,9 @@ its edits survive live and so does its dirty flag (#1417). The rule and why:
 
 ### Which changes reload the scene at all (#1702)
 
-Because that reload costs the human their unsaved work, **only two kinds of change may trigger it: an
-EXTERNAL write to a loaded scene file, or to a prefab a loaded scene uses.** Two mechanisms enforce the
+Because that reload costs the human their unsaved work, **only an EXTERNAL write to a loaded scene file may trigger
+it** — since #1873 R1 a prefab a loaded scene uses is re-imported in place instead (above); it reloads only as the
+clean-scene fallback. (Before R1 this said two kinds: the scene file, or a prefab it uses.) Two mechanisms enforce the
 two halves, and each was missing before #1702. Trashing ANY prefab from the Assets panel reloaded the
 open scene, even one that never used it, and discarded its unsaved edits and the whole undo stack,
 the delete's own entry included (observed live on Windows, `win`, #1684 run; reproduced on macOS: a
@@ -104,7 +112,10 @@ Camera moved to y=42 came back at 2.417 with `canUndo:false`, the console naming
      file-direct `/api/asset-write`. Also unmarked: the scanner's GUID heal (`writeAssetGuid`). It
      rewrites only a file that has no id, which an external add already is.
 2. **A prefab change reloads only a scene that uses the prefab** (`openSceneUsesPrefab`), in either of
-   two ways, and otherwise still evicts and re-reads both prefab caches.
+   two ways, and otherwise still evicts and re-reads both prefab caches. ⚠️ Since #1873 R1 this gate is the
+   fallback path only (no re-importer installed): in the editor the in-place re-import runs ahead of it and asks the
+   same question itself (`usedLive` + the loaded scenes' refs, `prefabReimport.ts`), logging the same
+   `prefab change not used by the open scene — no reload (…)` line for an unused prefab (QA-PREFAB-0027 reads it).
    - **A loaded scene FILE names it.** `SceneManager` records each loaded scene's `prefabRefs`. It is
      derived from the refs `collectSceneResourceRefs` collected to acquire the scene, never from a
      list of its own, and holds each ref plus the path it resolved to at load.

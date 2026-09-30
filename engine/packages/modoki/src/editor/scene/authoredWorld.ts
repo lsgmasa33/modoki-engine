@@ -41,6 +41,17 @@ export function notAuthoredExit(reason: string | null): string | undefined {
   return reason === null ? undefined : _exits.get(reason);
 }
 
+/** The way out of `reason` for a writer's refusal, or undefined when the reason carries its own: the source's registered
+ *  exit ({@link notAuthoredExit}), else "stop Play" or "exit the preview" — whichever is RUNNING, and only while one is (#1873). A restore
+ *  still landing, or one that FAILED, reads 'stopped' and says what to do in its own reason; told to stop a Play that is
+ *  not running, the user was sent the wrong way. The one wording every writer's refusal uses. */
+export function notAuthoredAdvice(reason: string | null): string | undefined {
+  if (reason === null) return undefined;
+  const own = notAuthoredExit(reason);
+  if (own || canEdit()) return own;
+  return getRunMode() === 'playing' ? 'stop Play first' : 'exit the preview first';
+}
+
 /** Why the live world is NOT authored, or null when it is. The text is for a refusal message. */
 export function whyWorldNotAuthored(): string | null {
   if (!canEdit()) return `run-mode is '${getRunMode()}', not 'stopped'`;

@@ -102,7 +102,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefabApply.ts', in: 'commitApplyPlan', warned: true }, // Apply's writing half (#1693)
       { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
-      { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
+      // The agent `prefab create` IS createPrefabFromEntity since #1873 C1 (the row below): it writes nothing itself.
       { file: 'packages/modoki/src/editor/panels/assetOps.ts', in: 'createPrefabFromEntity', warned: true }, // Save-as-Prefab
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
@@ -126,8 +126,9 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
         ...GENERATED_PREFAB_WRITES,
       ],
       scanned: census.length,
-      // 11 since #1868 took the five undo/redo restores out and added Save's flush of a parked prefab.
-      floor: 11,
+      // 11 since #1868 took the five undo/redo restores out and added Save's flush of a parked prefab; 10 since #1873 C1
+      // deleted the agent create op's own write (it is createPrefabFromEntity now).
+      floor: 10,
       fix: 'call warnInertPrefabSizes(<the prefab>, <the same source>) before the write — it is an authoring write',
     });
   });
@@ -191,15 +192,9 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile'), 'no unguarded write is left in the action').toEqual([]);
   });
 
-  it("the agent create op answers with the warnings it computed — the agent never reads the renderer console (#1251 close-out)", () => {
-    const sf = parseSource(readScannedSource(path.join(ENGINE, 'app/editor/agentEditorOps.ts')).code, 'agentEditorOps.ts');
-    const kept = findNodes(sf, ts.isVariableDeclaration).filter((d) => {
-      const init = d.initializer && unwrapValue(d.initializer);
-      return isWarnCall(init);
-    });
-    expect(kept.length, 'one kept warnInertPrefabSizes result in the agent ops').toBe(1);
-    expect(returnsAnswering(kept[0], (v) => isBinding(v, kept[0])), 'the kept warnings ARE the response\'s `warnings`').toBe(1);
-  });
+  // The agent create op's answer (#1251 close-out: the agent never reads the renderer console) is behaviour-tested since
+  // #1873 C1, where the op became createPrefabFromEntity and its warnings arrive as `result.inertSizes`:
+  // `engine/tests/editor/agentPrefabCreateUndo.test.ts` ("names an inert size in its reply").
 
   it('the agent apply and edit-save ops answer with the warnings their save reported (#1258)', () => {
     // Both warn one call down (applyToPrefabSelective, savePrefabEditReport), so the op holds no warn call of its own —

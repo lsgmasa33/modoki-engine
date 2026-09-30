@@ -24,7 +24,7 @@ import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { withPrefabEditRefusalToast, toastIfPrefabEditReason } from './prefabEditRefusalToast';
 import { prefabEditRefusal } from '../scene/prefabEditRefusal';
-import { restructureRefusal, partOfInstanceRefusal } from '../scene/restructureRefusal';
+import { restructureRefusal, partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
@@ -1135,6 +1135,7 @@ export default function Hierarchy() {
     if (result === 'declined') return;
     if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
+    if (result.unlinked) useEditorStore.getState().showToast(result.unlinked, 'warn');
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     pushAction(result.action);
   }, []);
@@ -1549,7 +1550,8 @@ export default function Hierarchy() {
       { label: 'Focus', shortcut: 'F', onClick: () => handleFocus(entity) },
       { label: isActive ? 'Deactivate' : 'Activate', onClick: () => handleToggleActive(entity), disabled: dis },
       // Greyed on part of a prefab instance, with the refusal as its hover text, as Detach is (#1869, Unity's rule).
-      ...(() => { const part = partOfInstanceRefusal(entity.id); return [{ label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: !!dis || !!part, ...(part ? { title: part } : {}) }]; })(),
+      // A resource entity too, with its reason (#1873 L2): the same text `createPrefabFromEntity` refuses the agent with.
+      ...(() => { const why = dis ? RESOURCE_PREFAB_TEXT : partOfInstanceRefusal(entity.id); return [{ label: 'Create Prefab', onClick: () => handleCreatePrefab(entity), disabled: !!why, ...(why ? { title: why } : {}) }]; })(),
       ...(isPrefabInstance ? [detachPrefabMenuItem(entity.id, !!dis, () => handleDetachPrefab(entity))] : []),
       { label: '', separator: true },
       { label: 'Find References', onClick: () => openFindReferences(guid, entity.name), disabled: !guid },

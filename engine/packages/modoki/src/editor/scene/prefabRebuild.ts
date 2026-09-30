@@ -1179,7 +1179,7 @@ export function rebaseStaleInstancesSoon(opts: { sources?: ReadonlySet<string> }
 }
 
 /** Rebuild `stale` onto the documents it names, every nested prefab those read already cached. */
-function rebuildStaleFrames(stale: StaleFrame[]): number {
+export function rebuildStaleFrames(stale: StaleFrame[]): number {
   const pi = getTraitByName('PrefabInstance')!;
   const world = getCurrentWorld();
   // ORDER: a frame is rebuilt only once no other stale frame is left in what its teardown destroys (#1499). Its

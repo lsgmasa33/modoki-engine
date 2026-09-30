@@ -2,7 +2,7 @@
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
 import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
-import { whyWorldNotAuthored, notAuthoredExit } from './authoredWorld';
+import { whyWorldNotAuthored, notAuthoredAdvice } from './authoredWorld';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, identitySubtree } from '../../runtime/core/ecs/identityParents';
 import { toLocalIdKeys, memberRef, splitNestedKey, nestedKeyRef } from './overrideKeyGrammar';
@@ -233,7 +233,8 @@ async function planApply(
   // can revert. Refused here, the one function both the dialog and the agent `prefab apply` reach.
   const notAuthored = whyWorldNotAuthored();
   if (notAuthored) {
-    return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — ${notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first, or a pose would be written into the prefab'}` } };
+    const exit = notAuthoredAdvice(notAuthored);
+    return { result: { ...NOOP_APPLY, refused: `the live world is not authored (${notAuthored}) — ${exit ? `${exit}, or a pose would be written into the prefab` : 'a pose would be written into the prefab'}` } };
   }
   // An `+added` node that holds something a template cannot take is SKIPPED with the reason, and the other keys land
   // (refused whole, the dialog's default Apply All and the agent's key-less `apply` landed nothing, #1831 close-out

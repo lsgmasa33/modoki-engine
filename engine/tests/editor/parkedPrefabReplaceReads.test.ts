@@ -126,7 +126,7 @@ describe('a Replace of a parked prefab reads the park (#1872 B)', () => {
     const kit = createEntityWithUndo('Create Kit', 0, specs.map((s) => (s.name === 'EntityAttributes' ? { ...s, data: { ...s.data, name: 'Kit' } } : s)), () => {})!;
     await settle();
     const kitGuid = authored().find((e) => e.id === kit)!.guid!;
-    const err = await runAgentOp('prefab', { action: 'create', entityGuid: kitGuid, path }).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
+    const err = await runAgentOp('prefab', { action: 'create', entityGuid: kitGuid, path, replace: true }).then(() => null, (e: unknown) => e as { message?: string; options?: string[] });
     expect(err?.message).toMatch(/unsaved changes in the editor/);
     expect(err?.message).not.toMatch(/while this create was writing/);
     expect(JSON.stringify(err)).toMatch(/modoki_discard_asset_edits/);
@@ -151,7 +151,7 @@ describe('a Replace of a parked prefab reads the park (#1872 B)', () => {
     make(kit, 'Nut');
     await settle();
     const kitGuid = authored().find((e) => e.id === kit)!.guid!;
-    const res = await runAgentOp('prefab', { action: 'create', entityGuid: kitGuid, path }) as { ok?: boolean };
+    const res = await runAgentOp('prefab', { action: 'create', entityGuid: kitGuid, path, replace: true }) as { ok?: boolean };
     await settle();
     expect(res.ok).toBe(true);
     const written = JSON.parse(be.read(path)!) as PrefabFile;

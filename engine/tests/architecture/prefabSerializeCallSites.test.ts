@@ -4,9 +4,8 @@
  *  orphaned outright. No error, no repair pass, no mitigation.
  *
  *  WHY A CENSUS AND NOT A PROPERTY. The obvious guard — "every call passes a second argument" — is
- *  wrong in both directions. `assetOps`' Create Prefab deliberately passes `undefined`: it serializes
- *  a DRAFT before the human has chosen a destination, and the kept guid arrives later through
- *  `writeNewAssetDocument`'s `build(guid, kept)` callback. Meanwhile a call that passes
+ *  wrong in both directions. A caller can legitimately pass `undefined` (Create Prefab over a free
+ *  path mints). Meanwhile a call that passes
  *  `getGuidForPath(path) || undefined` satisfies the property and is still wrong, because the
  *  manifest has not indexed a freshly scanned file — which is exactly the defect `skinPrefab` carried
  *  (#1468). So the thing worth pinning is not the shape of the argument but that somebody LOOKED: a
@@ -38,13 +37,9 @@ const CALL_SITES: Record<string, string> = {
   'engine/packages/modoki/src/editor/panels/assetViews/ModelAssetView.tsx':
     'classifyExistingPrefabId(prefabPath) — the rigged re-import path; the merge then carries node identity',
   'engine/packages/modoki/src/editor/panels/assetOps.ts':
-    'DELIBERATELY none: a draft serialized before the destination is chosen. writeNewAssetDocument '
-    + 'supplies the kept guid to build(guid, kept). ⚠️ Node identity therefore MINTS on a Replace even '
-    + 'when the live tree is an instance of the prefab being replaced — stated rather than hidden. '
-    + 'The consequence is bounded and is the one the design chose: a stored key naming an old row '
-    + 'DANGLES, where positional renumbering would have repointed it at a different member.',
-  'engine/app/editor/agentEditorOps.ts':
-    'classifyExistingPrefabId(path) — throws rather than minting, so the agent sees the refusal',
+    'the kept id of the file a Replace lands on — read with the rows it is conditional on (`readPriorDocument`), else '
+    + 'classifyExistingDocumentId — and `replacing` those rows, so node identity is kept by `nodeGuidsFor` (#1686); a '
+    + 'fresh path mints. The agent `prefab create` is this function since #1873 C1 (its own copy was deleted).',
 };
 
 function productionSources(): { rel: string; abs: string }[] {

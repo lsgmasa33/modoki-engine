@@ -12,7 +12,7 @@
  *  `${targetFolder}/…`). They now live here so a fix lands in ONE place, and
  *  the logic is unit-testable without rendering a React panel. */
 
-import { whyWorldNotAuthored, notAuthoredExit } from '../scene/authoredWorld';
+import { whyWorldNotAuthored, notAuthoredAdvice } from '../scene/authoredWorld';
 import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, callBackend, postBackend, type BackendAnswer } from '../backend/editorBackend';
 import { warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import {
@@ -26,7 +26,8 @@ import {
   tagEntityTreeAsInstance, untagEntityTreeAsInstance, unstampMemberGuids, detachPrefabInstance, reattachPrefabInstance,
   tagCreatedPrefab, type DetachSnapshot,
 } from '../scene/prefabLink';
-import { partOfInstanceRefusal } from '../scene/restructureRefusal';
+import { partOfInstanceRefusal, RESOURCE_PREFAB_TEXT } from '../scene/restructureRefusal';
+import { isResourceEntity } from '../../runtime/core/ecs/hierarchy';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef, isInstanceRootCheck, type EntityRef } from '../undo/entityRef';
@@ -571,6 +572,25 @@ export interface CreatePrefabResult {
    *  silently came out with fewer members than the user selected is the surprise that gets filed
    *  as a bug weeks later (owner, 2026-09-17). 0 in the ordinary case. */
   runtimeExcluded: number;
+  /** The path held a prefab, and this replaced its content under its own guid (#1264): the undo restores it. */
+  replaced: boolean;
+  /** The template's inert sizes (#42, #1251) — also logged — for a caller whose reader is not the Console (the agent). */
+  inertSizes: string[];
+  /** The file landed, but the tree could not be linked to it (the world was replaced, or the tree rebuilt in place,
+   *  while it was written): said by the caller, since the prefab exists and the entity is not an instance of it. */
+  unlinked?: string;
+}
+
+/** Why Create Prefab wrote nothing, as a sentence for the human — and, for the agent op, which kind of refusal it is, so
+ *  it can name its own ways out (#1873: the agent create is this function, and answers with this text). */
+export interface CreatePrefabRefusal {
+  refused: string;
+  /** The live world is not authored: `whyWorldNotAuthored`'s reason. */
+  notAuthored?: string;
+  /** The file changed under the write (I10); `parked` when the path holds a parked prefab (a retry meets it again). */
+  conflict?: { parked: boolean };
+  /** A failed write's own ways out (`commitPrefabWrite`'s options). */
+  options?: string[];
 }
 
 /** Serialize an entity subtree to a `.prefab.json`, write it, register its
@@ -610,6 +630,12 @@ function idOf(text: string): string | undefined {
 /** A clause as a sentence: its first letter capitalised. */
 const sentence = (clause: string): string => clause.charAt(0).toUpperCase() + clause.slice(1);
 
+/** Create Prefab refused over a live world that is not authored: the reason, and its way out while it has one. */
+function notAuthoredRefusal(reason: string): CreatePrefabRefusal {
+  const exit = notAuthoredAdvice(reason);
+  return { refused: `Create Prefab refused — ${reason}.${exit ? ` ${sentence(exit)}.` : ''}`, notAuthored: reason };
+}
+
 export async function createPrefabFromEntity(
   entityId: number,
   /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
@@ -622,11 +648,14 @@ export async function createPrefabFromEntity(
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
   confirmReplace: (path: string) => Promise<boolean>,
-): Promise<CreatePrefabResult | 'declined' | { refused: string }> {
+): Promise<CreatePrefabResult | 'declined' | CreatePrefabRefusal> {
+  // A resource entity is a world singleton, not a node in the authored tree (#1248): as an instance, a placed copy is a
+  // second singleton (#1873 L2). Asked first — nothing about the world's state changes the answer.
+  if (isResourceEntity(entityId)) return { refused: `Create Prefab refused — ${RESOURCE_PREFAB_TEXT}` };
   // The live subtree is what gets written, so it must be authored (#1548) — a posed or played
   // entity saved as a prefab carries the pose into every future instance.
   const notAuthored = whyWorldNotAuthored();
-  if (notAuthored) return { refused: `Create Prefab refused — ${notAuthored}. ${sentence(notAuthoredExit(notAuthored) ?? 'exit the preview / stop Play first')}.` };
+  if (notAuthored) return notAuthoredRefusal(notAuthored);
   // Part of a prefab instance is not saved as a prefab of its own (#1869, Unity's rule): asked before anything awaits.
   const part = partOfInstanceRefusal(entityId);
   if (part) return { refused: `Create Prefab refused — ${part}` };
@@ -676,8 +705,9 @@ export async function createPrefabFromEntity(
   }
   // The question above is a modal: the world can have gone into Play or a preview while it was up.
   const stillNotAuthored = whyWorldNotAuthored();
-  if (stillNotAuthored) return { refused: `Create Prefab refused — ${stillNotAuthored}. ${sentence(notAuthoredExit(stillNotAuthored) ?? 'exit the preview / stop Play first')}.` };
-  const goneAtQuestion = gone('while the question was open');
+  if (stillNotAuthored) return notAuthoredRefusal(stillNotAuthored);
+  // Named by what the wait WAS (#1873 review): over a free path no question was asked — the wait was the path check.
+  const goneAtQuestion = gone(at != null ? 'while the question was open' : 'while the prefab was being prepared');
   if (goneAtQuestion) return goneAtQuestion;
   // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
   // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
@@ -710,7 +740,7 @@ export async function createPrefabFromEntity(
   // would replace — a prefab that would contain itself. It was a bare null both panels only logged.
   if (!draft) return { refused: `Create Prefab refused — the selection could not be written as a prefab: it is empty, or it holds an instance of ${at ?? savePath}, which cannot contain itself.` };
   // An authoring write, so it reports an inert size (#42, #1251) — named by the file it lands on.
-  warnInertPrefabSizes(draft, savePath, getCachedPrefabSync);
+  const inertSizes = warnInertPrefabSizes(draft, savePath, getCachedPrefabSync);
   // A Replace serializes WITH the kept id, so `serializePrefab`'s own cycle guard refuses (null, above) a tree holding an
   // instance of the very prefab it replaces — a prefab that would contain itself.
   const guid = keptId ?? draft.id ?? newGuid();
@@ -749,9 +779,14 @@ export async function createPrefabFromEntity(
   // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only
   // logged, so a Create Prefab that wrote nothing looked like one that did nothing.
   if (!committed.ok) {
-    return { refused: committed.conflict
-      ? `Create Prefab refused — ${prefabConflictReason(savePath).reason}.`
-      : `Create Prefab failed — ${savePath} was not written: ${committed.error ?? 'the write failed'}.` };
+    if (committed.conflict) {
+      const why = prefabConflictReason(savePath);
+      return { refused: `Create Prefab refused — ${why.reason}.`, conflict: { parked: why.parked } };
+    }
+    return {
+      refused: `Create Prefab failed — ${savePath} was not written: ${committed.error ?? 'the write failed'}.`,
+      ...(committed.options?.length ? { options: committed.options } : {}),
+    };
   }
   // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
   // (#1273). The instance tags and both undo directions key on it.
@@ -949,7 +984,11 @@ export async function createPrefabFromEntity(
       }
     },
   };
-  return { savePath, prefab, action, runtimeExcluded };
+  // The file landed and nothing was linked to it (the agent op said this; the Hierarchy said nothing, #1873).
+  const unlinked = tagged ? undefined : committed.worldLeft
+    ? `The scene changed while ${savePath} was written: the prefab was saved, but the entity was not linked to it.`
+    : `The entity was rebuilt in place while ${savePath} was written: the prefab was saved, but the entity was not linked to it.`;
+  return { savePath, prefab, action, runtimeExcluded, replaced, inertSizes, ...(unlinked ? { unlinked } : {}) };
 }
 
 /** Why instance root `id` cannot be un-created as the prefab document `doc`, or null: its own frame was expanded from

@@ -71,7 +71,7 @@ describe('prefab localId numbering — one procedure, one set of inputs (#1278)'
     const taggers = new Set(filesMentioning(TAG));
     const preservers = new Set(filesMentioning(PRESERVE));
     const replacers = filesMentioning('replacing').filter((f) => taggers.has(f));
-    expect(replacers.map((f) => f.replace(/\\/g, '/').split('/').pop()).sort()).toEqual(['agentEditorOps.ts', 'assetOps.ts']);
+    expect(replacers.map((f) => f.replace(/\\/g, '/').split('/').pop()).sort()).toEqual(['assetOps.ts']); // the agent `prefab create` reaches it (#1873 C1)
     for (const f of replacers) expect(preservers.has(f), `${f} preserves AND tags`).toBe(false);
   });
 

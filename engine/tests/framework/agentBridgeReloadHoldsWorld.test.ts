@@ -263,9 +263,10 @@ describe('S7: the scene-file debt is the adoption owner`s (#1744 residual)', () 
     await settle();
     expect(undoLabel(), 'premise: the lost offer adopted nothing').toBe('Delete Entity');
     expect(owedSceneFileChanges()).toEqual([normScenePath(SCENE)]);
-    changed('/games/g/runtime/assets/Crate.prefab.json', 'prefab'); // a later reload that carries no scene change
-    await settle();
-    expect(loadScene).toHaveBeenCalledTimes(2);
+    // The next ADOPT of the scene pays it. (This was a prefab change's reload; since #1873 R1 a prefab change re-imports
+    // in place and adopts nothing, so a scene open stands in for "a later adopt that carries no scene change".)
+    await adoptTo(SCENE);
+    expect(owedSceneFileChanges()).toEqual([]);
     expect(canUndo()).toBe(false);
   });
 });

@@ -31,37 +31,14 @@ export interface KnownOpen {
 // #1820 (Create Prefab's undo, on a member). Also a route #1796's fix unmasked (outsideEdit → reparent → createPrefab: its
 // redo tagged, then a template-added node row read removed): with #1869 merged one of its draws lands on a refused gesture
 // and it no longer reproduces.
-/** A member-row pin (`/entities/<guid>/members//<guid>`) the undone scene holds and the start did not (#1872's 6112 ruling).
- *  Open at the end: `firstDiff` truncates a value to 60 characters, so a pin's closing brace is there only for a short name. */
-const ORPHAN_PIN = /^\/entities\/[^/]+\/members\/\/[^:]+: undefined vs \{"guid":"/;
-
+// Retired by #1873 R1 (owner ruling 2026-09-30: an outside prefab change re-imports in place and keeps the undo stack):
+// #1872's ORPHAN-PIN route (hunt seed 6112; #1872's other entries below still reproduce) ran through an `outsideEdit` whose disk-wins reload dropped the stack, so
+// the walk back stopped short of the Replace's undo, and the orphan member-row pins it recorded were the undone scene's.
+// With the stack kept, that walk undoes the whole list and the scene comes back exact; a 200-seed hunt (1000-1199) did not
+// re-find the orphan pin. The mechanism the hub ruled on (#1872, 2026-09-30: pins kept as R2 orphans after a Replace's
+// undo) is NOT shown fixed — only this route to it is gone (confirmed: with R1's branch switched off, the repro reproduced). A re-found pin is a new failure again, and re-enters here
+// with a repro that reaches it without the reload.
 export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 1872,
-    what: "RECORDED, NOT FIXED (hub ruling on #1872, 2026-09-30, hunt seed 6112): after a Create Prefab Replace and its undo, "
-      + "another instance's scene entry keeps member-row pins for nodes the restored document lacks. R2 keeps them as orphans: "
-      + "invisible live, re-pinned on redo, no data lost, and Unity has no guid pins, so no parity row breaks — under the Unity "
-      + "line not necessary. The exact-undo check counts it as known instead of as a new failure",
-    repro: [
-      { kind: 'createPrefab', u: [0.4821872168686241, 0.5781428760383278, 0.8068451632279903, 0.7964789853431284, 0.8956084102392197, 0.8634210666641593, 0.8821827550418675, 0.17559894686564803] },
-      { kind: 'saveReload', u: [0.12917209044098854, 0.9993457132950425, 0.4456332845147699, 0.3148945670109242, 0.27193534770049155, 0.7236288734711707, 0.9839562796987593, 0.49794489960186183] },
-      { kind: 'addComponent', u: [0.6858119221869856, 0.44166501169092953, 0.2702495187986642, 0.4249933750834316, 0.9391482577193528, 0.9740877554286271, 0.4964993556495756, 0.527870450168848] },
-      { kind: 'outsideEdit', u: [0.7936539533548057, 0.6487562200054526, 0.09746655449271202, 0.12436967785470188, 0.23948954534716904, 0.7344678146764636, 0.7293013134039938, 0.5603649334516376] },
-      { kind: 'delete', u: [0.5299426834098995, 0.8294221076648682, 0.4245335999876261, 0.2495009545236826, 0.10550973517820239, 0.5390152304898947, 0.06301917973905802, 0.08649665536358953] },
-      { kind: 'instantiate', u: [0.2643461551051587, 0.7915758702438325, 0.39971554069779813, 0.46902241348288953, 0.3457602830603719, 0.24102397658862174, 0.6553696182090789, 0.7887468310073018] },
-      { kind: 'detach', u: [0.19833067059516907, 0.7785928265657276, 0.812209885334596, 0.941115039633587, 0.10178101062774658, 0.5686436970718205, 0.7078618051018566, 0.9855603233445436] },
-      { kind: 'createPrefab', u: [0.5239670593291521, 0.04276401875540614, 0.7352094016969204, 0.07793740695342422, 0.7273834308143705, 0.6193114884663373, 0.4926199687179178, 0.5636229075025767] },
-    ],
-    reproduces: (f) => f.check === 'undo to the start does not restore the scene' && ORPHAN_PIN.test(f.detail),
-    // Only a pin the START lacks (undefined on the left), and only in a list with a later createPrefab that WOULD answer a
-    // Replace (`u[1] < 0.7`). The ops cannot say whether its target existed (the confirm is asked only on a name an earlier
-    // createPrefab wrote), so a list whose later createPrefab wrote a fresh file is claimed too: no route to an orphan pin
-    // without a Replace is known, and one would be claimed here unseen (close-out review).
-    stops: (f, ops) => f.check === 'undo to the start does not restore the scene' && ORPHAN_PIN.test(f.detail) && (() => {
-      const creates = ops.filter((o) => o.kind === 'createPrefab');
-      return creates.length >= 2 && creates.slice(1).some((o) => o.u[1] < 0.7);
-    })(),
-  },
   {
     issue: 1822,
     what: "Add Component re-adding a template-row trait on a nested member reconciles its marks against the effective base",

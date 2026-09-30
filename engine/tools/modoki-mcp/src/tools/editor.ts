@@ -377,6 +377,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'SCOPE: this drops the pending WRITE, not the edit. The editor cache keeps the applied def '
       + 'until the asset is reloaded, so reading it back still shows your change — that is not a '
       + 'failed discard. To revert the VALUE too, apply the previous def first, then discard.\n\n'
+      + 'A parked PREFAB (an undone Apply) is the exception: it is re-imported from its file IN PLACE — '
+      + "its instances rebuilt, the scene's unsaved edits and undo kept (`reimported`; `notRebased` names any "
+      + 'instance it could not rebuild, with the reload that would). In Play it waits for Stop (`reimportDeferred`).\n\n'
       + 'A bare call is REFUSED and lists what is pending: dropping everything is unrecoverable, so '
       + 'name `paths`, or say `all:true`.',
     {
@@ -527,6 +530,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred). Not together with parentId.'),
       entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Only for an entity with no guid — use entityGuid.'),
       entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred). Not together with entityId.'),
+      replace: z.boolean().optional().describe("create: consent to replacing the prefab already at `path` — its content is replaced and its guid kept, so placed instances stay linked, and undo restores the old document (parked until modoki_save_all). Never implied; without it a create over an existing file is refused and nothing is written."),
       overwrite: z.boolean().optional().describe("edit-save: the prefab changed on disk since this edit opened it (a save elsewhere, an outside edit, a git pull), and the save was REFUSED — true replaces what is on disk with this edit. Never implied; without it that save refuses and nothing is written."),
       keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides except `keys.defaultOverrides` at the instance's own prefab (Unity's default overrides: acted on when named here or in `targets`, or sent by `target` into a containing prefab); an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
       target: z.string().optional().describe("apply: where every key is written — a prefab on the instance's chain (guid or path, from `overrides`' `targets[key].options`), or 'instance' for the instance's own prefab. A nested instance's edit can go into its own prefab or, as an override, into a prefab that contains it (Unity's 'Apply as Override in Prefab'). Omit for each key's `defaultTarget`. ALL-or-nothing."),

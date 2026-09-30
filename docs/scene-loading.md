@@ -2677,9 +2677,18 @@ Where it applies:
   too. This covers a same-path reload as well: `swapHistory` used to no-op on an unchanged key, so
   one undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the
   fresh world. (`newScene` and prefab-edit entry keep no base, so they clear every flag.)
-- **A scene hot-reload** (an external write to the open scene or a prefab it uses) replaces the
+- **A scene hot-reload** (an external write to the open scene's FILE) replaces the
   world from disk without going through the editor's `loadScene`. Disk wins over unsaved edits
-  (owner, 2026-09-13, #1164), except in a kept base. `agentBridge.ts` hands the editor's
+  (owner, 2026-09-13, #1164), except in a kept base.
+  **A PREFAB change no longer reloads — owner ruling 2026-09-30 (#1873 R1), reversing #1164 for prefabs, the
+  Unity way.** An outside write, delete or put-back of a prefab the open scene uses re-imports it and updates its
+  instances IN PLACE (`reimportOutsidePrefabChanges`, `editor/scene/prefabReimport.ts`), keeping the scene's unsaved
+  edits, its dirty flag and its undo stack. Why: the scene FILE did not change, so the reload rebuilt nothing a
+  re-import cannot, and it threw the scene's work away — an outside write to one prefab discarded unrelated unsaved scene
+  edits and the undo stack (#1873 R1, observed live). Unity reimports a changed prefab and keeps the open scene's unsaved
+  work (the ruling's premise; not verified from Unity source).
+  Only what the in-place path cannot reach (a frame left stale, a placeholder it could not re-expand) falls back to the
+  reload, and only over a CLEAN scene, where it loses nothing; over unsaved work it is reported and left to the user. `agentBridge.ts` hands the editor's
   `adoptWorldReloadedFromDisk` the kept set through `setWorldReloadedFromDiskHook` once the reload
   lands. Before #1409, `unsavedChanges` stayed true over a world that matched the file. #1409's
   first version then did nothing at all while any base was dirty, which left stale primary

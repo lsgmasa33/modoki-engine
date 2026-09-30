@@ -368,7 +368,9 @@ describe('discard-asset-edits — abandoning a parked write', () => {
     parkPrefab(PP, doc('parked'), doc('disk'));
     try {
       const r = await runAgentOp('discard-asset-edits', { paths: [PP] }) as { ok: boolean; discarded: string[] };
-      expect(r).toMatchObject({ ok: true, discarded: [PP] });
+      // `reimported` names it although nothing in the scene uses it (#1873 re-review): its caches read the file now.
+      // Mutation: the reply's `reimported` leaves out `unused` — this reads undefined.
+      expect(r).toMatchObject({ ok: true, discarded: [PP], reimported: [PP] });
       expect(getDirtyAssetPaths()).toEqual([]);
       // Dropping the write alone left the editor showing the discarded prefab while the file held another, reported clean.
       expect(getCachedPrefabSync(PG)?.name).toBe('disk');

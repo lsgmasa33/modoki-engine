@@ -126,7 +126,8 @@ describe('a refused prefab write carries a reason to every caller (#1776)', () =
     route.body = { error: `"${OUTSIDE}" is outside this project's asset roots, so nothing was written` };
     const err = await quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: ensureGuid(src), path: OUTSIDE })).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toBe(`prefab create refused: ${OUTSIDE} was not written — "${OUTSIDE}" is outside this project's asset roots, so nothing was written. Nothing was linked.`);
+    // The Hierarchy's own text (#1873 C1: the agent create IS Create Prefab).
+    expect((err as Error).message).toBe(`Create Prefab failed — ${OUTSIDE} was not written: "${OUTSIDE}" is outside this project's asset roots, so nothing was written.`);
   });
 
   it('the agent create over a {} body still names a reason', async () => {

@@ -489,6 +489,7 @@ import { registerBuiltinMaterialTypes } from './loaders/materialPresets';
 registerBuiltinMaterialTypes();
 export { isPrimitive, createPrimitiveMesh, PRIMITIVE_NAMES } from './loaders/primitives';
 export { PRIMITIVE_SPRITE_NAMES } from './loaders/sceneValidation';
+export { UnresolvedPrefabRef, unresolvedRefOf } from './core/unresolvedPrefabRef';
 export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWorld, spawnPrefabInstance, deriveInstanceMemberGuids, type SceneData, type LoadSceneOptions, type SceneResourceRef, type SceneEntityEntry } from './loaders/loadSceneFile';
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';

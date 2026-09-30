@@ -132,7 +132,7 @@ describe('set-traits parentId in the editor goes through planReparent (#1787)', 
     expect([sortOf(slot), canUndo()]).toEqual([slotSort, false]);
     // …and the agent's Create Prefab on a member (#1792's second route; Unity: "Can't save part of a Prefab instance as a
     // Prefab"). Mutation: drop the `partOfInstanceRefusal` call in the agent op — it goes on to write a file.
-    await expect(runAgentOp('prefab', { action: 'create', entityGuid: attrs(slot).guid, path: '/p1869.prefab.json' })).rejects.toThrow(/prefab create refused: Can't save part of a prefab instance as a prefab/);
+    await expect(runAgentOp('prefab', { action: 'create', entityGuid: attrs(slot).guid, path: '/p1869.prefab.json' })).rejects.toThrow(/Create Prefab refused — Can't save part of a prefab instance as a prefab/);
     expect([link(slot), canUndo()]).toEqual([root, false]);
     const added = spawn('Added', { parentId: root });
     // A dry run answers what the call would, for a mixed selection too (#1869 close-out review, finding 2: the pre-check

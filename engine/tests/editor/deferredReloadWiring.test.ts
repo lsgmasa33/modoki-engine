@@ -85,6 +85,25 @@ describe('registerEditorAgentOps wires the deferred hot reload', () => {
     expect(hasUnsavedChanges()).toBe(false);
   });
 
+  // #1873 R1 (owner ruling 2026-09-30): the same DIRTY world, the same stack — a change to a PREFAB the scene uses is
+  // re-imported in place and keeps both; only the scene FILE's own change reloads. Mutation: the prefab branch of
+  // `handleSceneChanged` skipped — the prefab change reloads too, and the stack is dropped.
+  it('a PREFAB change the scene uses keeps a dirty world and its stack; the scene file\'s change still reloads it', async () => {
+    _resetHistoryContexts();
+    swapHistory(SCENE_PATH);
+    markSceneSaved();
+    pushAction({ label: 'Reparent', undo: () => {}, redo: () => {} });
+    emit(PREFAB_PATH, 'prefab');
+    await settle();
+    expect(loadScene, 'a prefab change reloads nothing').not.toHaveBeenCalled();
+    expect(canUndo()).toBe(true);
+    expect(hasUnsavedChanges()).toBe(true);
+    emit(SCENE_PATH, 'scene');
+    await settle();
+    expect(loadScene, 'the scene file\'s change reloads').toHaveBeenCalledTimes(1);
+    expect(canUndo()).toBe(false);
+  });
+
   it('a change during Play is held, and the Stop edge replays it', async () => {
     setRunMode('playing');
     emit(SCENE_PATH, 'scene');

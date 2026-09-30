@@ -92,6 +92,10 @@ export function partOfInstanceRefusal(id: number): string | null {
   return isSuppliedByPrefab(id) ? PART_OF_INSTANCE_TEXT : null;
 }
 export const PART_OF_INSTANCE_TEXT = "Can't save part of a prefab instance as a prefab: create it from the instance root, or unpack the instance first.";
+/** Create Prefab of a RESOURCE entity (#1873 L2): a world singleton (Physics2D, Input…) is not a node in the authored tree
+ *  (#1248), and tagged as an instance, every placed copy of the prefab is a second singleton. One text for the Hierarchy's
+ *  greyed item, `createPrefabFromEntity` and the agent `prefab create` (which is that function). */
+export const RESOURCE_PREFAB_TEXT = "A resource entity is a world singleton, so it can't be saved as a prefab: every instance of it would be a second copy of that singleton.";
 
 /** Whether the prefab supplies entity `id` (see the module doc). */
 export function isSuppliedByPrefab(id: number): boolean {

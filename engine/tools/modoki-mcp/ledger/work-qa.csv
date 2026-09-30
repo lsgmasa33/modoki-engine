@@ -199,3 +199,5 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-29,work-qa,modoki_history,752,2763,174028,40580ec83
 2026-09-29,work-qa,modoki_delete_asset,-57,3779,173971,b3335ffd6
 2026-09-30,work-qa,modoki_delete_asset,50,3829,174547,9a5683510
+2026-09-30,work-qa,modoki_discard_asset_edits,305,1712,175153,02d64c260
+2026-09-30,work-qa,modoki_prefab,301,7096,175153,02d64c260

@@ -505,7 +505,7 @@ describe('#1686 close-out: the Replace\'s second serialize, and the agent create
     add('Add Keep', root, 'Keep');
     add('Add New', root, 'New');
     expect(getCachedPrefabSync(X)).toBeFalsy(); // precondition: cold
-    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: XPATH });
+    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: XPATH, replace: true });
     const written = JSON.parse(onDisk.get(XPATH)!) as PrefabFile;
     expect(written.entities.find((e) => e.name === 'Keep')?.nodeGuid).toBe(OLD.Keep);
     expect(written.entities.find((e) => e.name === 'XR')?.nodeGuid).toBe(OLD.XR);
@@ -524,7 +524,7 @@ describe('#1686 close-out: the Replace\'s second serialize, and the agent create
     await load({ id: 'a', version: 16, name: 'S', resources: [], entities: [] } as unknown as SceneData);
     const root = add('Add XR', 0, 'XR');
     add('Add Keep', root, 'Keep');
-    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: XPATH });
+    await runAgentOp('prefab', { action: 'create', entityGuid: getAllEntities().find((e) => e.id === root)!.guid, path: XPATH, replace: true });
     expect((JSON.parse(onDisk.get(XPATH)!) as PrefabFile).entities.find((e) => e.name === 'Keep')?.nodeGuid).toBe(OLD.Keep);
     setPrefabCache(X, null);
   });
@@ -546,7 +546,7 @@ describe('#1686 close-out: the Replace\'s second serialize, and the agent create
         writeTraitField(root, getTraitByName('Transform')!, 'x', 42);
         return true;
       });
-      expect(res).toEqual({ refused: expect.stringMatching(/^Create Prefab refused — /) }); // shown, as the gate above is
+      expect(res).toEqual({ refused: expect.stringMatching(/^Create Prefab refused — /), notAuthored: expect.any(String) }); // shown, as the gate above is
       expect(JSON.parse(onDisk.get(XPATH)!)).toEqual(doc);
     } finally { err.mockRestore(); setRunMode('stopped'); }
   });

@@ -318,16 +318,21 @@ describe('#1750 close-out: the agent `prefab create` of an instance another Appl
     release();
     const r = await create as { ok?: boolean; error?: string };
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/rebuilt in place/);
+    // The Hierarchy's text (#1873 C1), named by the path check it waited in — no Replace question was asked.
+    expect(r.error).toMatch(/was rebuilt while the prefab was being prepared \(a prefab instance refreshed in place\)/);
     expect(fs.posts.filter((p) => p.path.includes('FromIB'))).toEqual([]);
   });
 });
 
 describe('#1750 fourth review: the agent `prefab create` whose tree is rebuilt DURING its write', () => {
-  it('the file lands, the tree is NOT tagged (its id names a re-minted entity), and the reply says so', async () => {
+  // REWRITTEN for #1873 C1: the agent create is Create Prefab, which re-finds the tree BY GUID after its awaits (`entityRef`),
+  // so a tree re-minted in place during the write is the same tree, found where it now is, and linked — the old copy acted
+  // on a raw id and refused. The old "nothing tagged" check filtered `source` by the path, which never matches a guid, so it
+  // could not fail. Mutation: tag by the raw id captured before the write (`tagCreatedPrefab(entityId, …)` in the commit's
+  // rebuild) — IB's rebuilt root is not the one tagged.
+  it('the file lands and the tree, re-found by guid, is linked to the file it wrote', async () => {
     registerEditorAgentOps();
     const rootA = rootIdOf(ROOT_A);
-    const rootB = rootIdOf(ROOT_B);
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
     let reached!: () => void;
@@ -335,14 +340,16 @@ describe('#1750 fourth review: the agent `prefab create` whose tree is rebuilt D
     fs.hold = { holdPath: 'FromIB2', gate, reached };
     const create = quietly(() => runAgentOp('prefab', { prefabAction: 'create', entityGuid: ROOT_B, path: 'prefabs/FromIB2.prefab.json' }).catch((e: Error) => ({ ok: false, error: e.message })));
     await atWrite; // past every check of its own, inside the commit's write
+    const before = rootIdOf(ROOT_B);
     expect((await quietly(() => applyToPrefabWithUndo(rootA, new Set([keyOf(rootA)])))).applied, 'premise: the fan-out re-minted IB').toBe(true);
+    expect(rootIdOf(ROOT_B), 'premise: IB is at a new id now').not.toBe(before);
     release();
     const r = await create as { ok?: boolean; warnings?: string[] };
     expect(r.ok, 'the file landed').toBe(true);
-    expect(r.warnings?.join(' ')).toMatch(/rebuilt in place while the prefab was written/);
-    const tagged = all().filter((e) => (getCurrentWorld().entities.find((x) => x.id() === e.id)?.get(getTraitByName('PrefabInstance')!.trait) as { source?: string } | undefined)?.source?.includes('FromIB2'));
-    expect(tagged, 'whatever now holds the old id was tagged as the new prefab').toEqual([]);
-    void rootB;
+    const written = JSON.parse(fs.posts.find((p) => p.path.includes('FromIB2'))!.content) as { id: string };
+    const ib = getCurrentWorld().entities.find((x) => x.id() === rootIdOf(ROOT_B))!;
+    expect((ib.get(getTraitByName('PrefabInstance')!.trait) as { source?: string } | undefined)?.source).toBe(written.id);
+    expect(r.warnings?.join(' ') ?? '').not.toMatch(/not linked/);
   });
 });
 

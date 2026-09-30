@@ -1559,6 +1559,7 @@ export default function Assets() {
     if (result === 'declined') return;
     if (result && 'refused' in result) { useEditorStore.getState().showToast(result.refused, 'warn'); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
+    if (result.unlinked) useEditorStore.getState().showToast(result.unlinked, 'warn');
     if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     refresh();
 

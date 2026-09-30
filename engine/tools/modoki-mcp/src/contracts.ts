@@ -418,7 +418,9 @@ const DECLS: Record<string, Decl> = {
     notes: 'The counterpart to save_all for PARKED ASSET WRITES — drops them instead of persisting. '
       + 'NOT undoable: the pending doc is gone, which is why a bare call is refused and the caller '
       + 'must name `paths` or say `all:true`. Drops the WRITE, not the edit — the editor cache keeps '
-      + 'the applied def until the asset reloads.',
+      + 'the applied def until the asset reloads. A parked PREFAB is re-imported from its file in place '
+      + "(#1873): the open scene is NOT reloaded, so its unsaved edits and undo stay; an undo step that "
+      + 'depended on the discarded document refuses when it runs.',
   },
   modoki_create_entity: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-entity',
@@ -446,8 +448,10 @@ const DECLS: Record<string, Decl> = {
       + "(commitPrefabWrite, conditional on what was read — #1692) while instantiate/detach/overrides/revert are "
       + "live-only. No undo writes a file (#1868): apply's undo restores the pre-apply document IN MEMORY and parks it, "
       + "so the file keeps the applied bytes until modoki_save_all writes the park (or modoki_discard_asset_edits drops it). "
-      + "create over an existing path is a Replace (the file keeps its guid); its undo unlinks the tree only and does NOT "
-      + "put the replaced document back (#1873 — the Hierarchy's Replace undo does). "
+      + "create IS the Hierarchy's Create Prefab (#1873): the same refusals, word for word, and a resource entity is refused. "
+      + "Over an existing path it is refused unless `replace:true` consents; a Replace keeps the file's guid (placed instances stay "
+      + "linked), answers `replaced:true`, and its undo restores the replaced document IN MEMORY and parks it, as apply's does. "
+      + "A create's undo unlinks the tree and leaves the new file. "
       + "'overrides' is READ-only discovery — it walks the SAME override-key enumeration "
       + "'apply'/'revert' consume (collectInstanceOverrideKeys) and hands back the exact key "
       + "strings, so an agent can pick `keys` without guessing the "

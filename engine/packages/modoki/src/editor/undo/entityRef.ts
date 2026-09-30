@@ -178,7 +178,7 @@ function requireResolved(ref: EntityRef, id: number | null, expect?: RefExpect):
   if (now !== want) {
     const words = now === 'placeholder'
       ? placeholderRefusalWords(entityNameOf(id) || ref.name)
-      : `${label} is not a Missing Prefab any more (its prefab was restored and the scene reloaded), and this step was recorded against the placeholder`;
+      : `${label} is not a Missing Prefab any more (its prefab came back — re-imported in place, or the scene reloaded), and this step was recorded against the placeholder`;
     throw new UndoRefusedError(`${words}.`, words);
   }
   const why = expect?.check?.(id);

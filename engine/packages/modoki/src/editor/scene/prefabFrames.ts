@@ -10,7 +10,7 @@ import { memberRef, splitNestedKey } from './overrideKeyGrammar';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds } from './authoringScope';
-import { isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
+import { isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { durableGuid, isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { levelDoc, captureDoc } from './prefabBase';
@@ -229,14 +229,15 @@ export function missingSourceRefusal(rootInstanceId: number, source: string, ver
   return `${missingPrefabInstance(rootInstanceId, source)}, ${tail}, or Detach Prefab to keep it as plain entities.`;
 }
 
-/** `"QR" is an instance of "Q", a prefab that is missing (<ref>)`: how Revert and Apply name a live frame whose own prefab
- *  no longer loads (#1862's kept frame). Named by the document the frame was built from: a delete prunes the guid from the
- *  manifest, so no path is left to show. */
+/** `"QR" is an instance of "Q", a prefab that is missing (<path>)`: how Revert and Apply name a live frame whose own prefab
+ *  no longer loads (#1862's kept frame). Named by the document the frame was built from, and by the path the file had: a
+ *  delete prunes the guid from the manifest, so `resolveRef` answers nothing and the text showed a bare guid (#1873 L5) —
+ *  the prune remembers the path it dropped (`lastKnownPathOf`, #1834). The guid only when no path was ever known. */
 export function missingPrefabInstance(frameRoot: number, source: string): string {
   const name = getAllEntities().find((e) => e.id === frameRoot)?.name ?? 'this instance';
   const prefabName = levelDoc(frameRoot, source).doc?.name;
   return `"${name}" is an instance of ${prefabName ? `"${prefabName}", a prefab that is missing` : 'a prefab that is missing'} ` +
-    `(${resolveRef(source) || source})`;
+    `(${resolveRef(source) || (isGuid(source) ? lastKnownPathOf(source) : undefined) || source})`;
 }
 
 /** Each selected Apply key that reaches into a nested frame whose prefab does not load, with the reason it is not applied,

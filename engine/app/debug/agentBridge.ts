@@ -145,7 +145,7 @@ import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
 import { coveredCarriers } from './carrierCover';
 import { readConsoleSource } from './consoleSource';
-import { normScenePath } from '@modoki/engine/runtime';
+import { normScenePath, UnresolvedPrefabRef, unresolvedRefOf } from '@modoki/engine/runtime';
 import { getConsoleRingEntries, getConsoleRingDropped, getConsoleRingEpoch, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
 import { computeDiagnostics } from './diagnose';
@@ -3057,7 +3057,9 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
   } catch { /* not an editor context — no registry to clear */ }
 }
 
-type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean };
+/** `inPlace`: a prefab the editor itself put back to its file (a discarded park, #1873 S2) — replayed as an in-place
+ *  re-import (`setPrefabReimporter`), never as the disk-wins scene reload an outside change gets. */
+type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean; inPlace?: boolean };
 
 /** Scene/prefab changes that arrived while the reload was suppressed, keyed by `urlPath`, in the
  *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
@@ -3092,10 +3094,47 @@ export async function replaySuppressedSceneReloads(): Promise<number> {
   _suppressedReloads.clear();
   console.log(`[agentBridge] replaying ${pending.length} scene hot-reload(s) deferred during the run`);
   for (const m of pending) if (m.kind !== 'prefab') await handleSceneChanged(m);
-  const prefabs = pending.filter((m) => m.kind === 'prefab');
+  // A prefab the editor put back to its file is RE-IMPORTED in place (#1873 S2) — keyed by path, so an outside write of
+  // the same file since replaced its entry and takes the watcher's path below instead. Last: a reload replayed above
+  // rebuilds these prefabs from the runtime cache, which still holds the discarded document, and this puts them right.
+  const prefabs = pending.filter((m) => m.kind === 'prefab' && !m.inPlace);
   const last = prefabs.at(-1);
   if (last) await handleSceneChanged(last, prefabs.slice(0, -1).map((m) => m.urlPath));
+  const inPlace = pending.filter((m) => m.kind === 'prefab' && m.inPlace).map((m) => m.urlPath);
+  if (inPlace.length) {
+    // Suppressed again part-way (Play pressed mid-replay): held for the next replay, as a reload would be.
+    const again = sceneReloadSuppressedReason();
+    if (again || !_prefabReimporter) deferPrefabReimport(inPlace, again ?? 'no re-importer is installed');
+    else await _prefabReimporter(inPlace).catch((e) => console.error('[agentBridge] re-importing a discarded prefab failed:', e));
+  }
   return pending.length;
+}
+
+/** An OUTSIDE change to prefabs the open scene uses, re-imported in place (#1873 R1) — `reimportOutsidePrefabChanges`,
+ *  installed by `agentEditorOps.ts`. `needsReload`: what it could not reach, over a clean scene, reloads after all. */
+let _outsidePrefabReimporter: ((paths: string[]) => Promise<{ needsReload: boolean }>) | null = null;
+export function setOutsidePrefabReimporter(fn: ((paths: string[]) => Promise<{ needsReload: boolean }>) | null): void {
+  _outsidePrefabReimporter = fn;
+}
+
+/** Re-import prefabs in place — `reimportPrefabsInPlace`, installed by `agentEditorOps.ts` (this module cannot import the
+ *  editor package's scene layer). */
+let _prefabReimporter: ((paths: string[]) => Promise<unknown>) | null = null;
+export function setPrefabReimporter(fn: ((paths: string[]) => Promise<unknown>) | null): void {
+  _prefabReimporter = fn;
+}
+
+/** Hold an in-place re-import of `paths` for {@link replaySuppressedSceneReloads}: the world may not be rebuilt now (Play,
+ *  a preview, a landing switch — `reason`). The caches keep the document they hold until then, as a deferred reload's do. */
+export function deferPrefabReimport(paths: readonly string[], reason: string): void {
+  for (const urlPath of paths) {
+    // An outside write already waiting for this file wins: its reload reads the same file, and it is the owner's ruling.
+    const held = _suppressedReloads.get(urlPath);
+    if (held && !held.inPlace) continue;
+    _suppressedReloads.delete(urlPath);
+    _suppressedReloads.set(urlPath, { urlPath, kind: 'prefab', inPlace: true });
+  }
+  console.warn(`[agentBridge] prefab re-import deferred (${paths.join(', ')}) — ${reason}`);
 }
 
 /** Test seam: the deferred changes currently held, as `urlPath`s in replay order. */
@@ -3119,6 +3158,12 @@ function openSceneUsesPrefab(urlPath: string): boolean {
   for (const entry of sceneManager.getLoadedScenes().values()) {
     if (!entry.prefabRefs) return true;
     for (const ref of entry.prefabRefs) if (names(ref)) return true;
+  }
+  // …and a Missing Prefab placeholder of it (#1873 R1): a put-back re-expands it in place, and it carries no
+  // PrefabInstance, so without this a scene the manager has no entry for (#1712) skipped the put-back.
+  for (const e of getCurrentWorld().query(UnresolvedPrefabRef)) {
+    const ref = unresolvedRefOf(e);
+    if (ref && names(ref.source)) return true;
   }
   const meta = getTraitByName('PrefabInstance');
   if (!meta) return false;
@@ -3231,6 +3276,18 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
   // still re-read: the prefab-edit save reads it synchronously for the edited and nested prefabs.
   if (current.startsWith('/__prefab-edit__/')) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
+  // #1873 R1 — OWNER RULING 2026-09-30, the Unity way: an outside change to a PREFAB the open scene uses (a write, a
+  // delete, a put-back) re-imports it and updates its instances IN PLACE, keeping the scene's unsaved edits, its dirty
+  // flag and its undo stack. It reverses #1164's disk-wins for prefab changes; a change to a scene FILE still reloads
+  // (below). The scene file did not change, so a reload only threw that work away. What the in-place path cannot reach
+  // is reloaded below only over a CLEAN scene (`needsReload`); over unsaved work it is reported, never reloaded silently.
+  // Ahead of the #1702 gate below (R1 review F7): the re-import asks what uses the prefab itself — the loaded scenes'
+  // refs, live frames, a frame's unexpanded row, a placeholder — and one it finds unused only has its caches brought up
+  // to date, which is all the gate's early return does. The gate stays for the reload path (no re-importer installed).
+  if (msg.kind === 'prefab' && _outsidePrefabReimporter) {
+    const { needsReload } = await _outsidePrefabReimporter([...prefabPaths]);
+    if (!needsReload) return;
+  }
   // #1702: a prefab no loaded scene FILE uses changes nothing a reload from disk would rebuild — the reload only threw
   // away the open scene's unsaved edits and its undo stack. The owner's disk-wins ruling (#1164) is for "the open scene
   // or a prefab it uses", so a prefab change reloads only when the open scene uses one of the changed prefabs — a loaded

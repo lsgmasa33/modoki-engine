@@ -292,7 +292,8 @@ describe('refusals that depend on a HELD session, and prefab create (#1551/#1552
     exitPreviewMode('timeline');
     setRunMode('playing');
     const inPlay = await refusal('prefab', { action: 'create', entityGuid: 'g-held-a', path: '/assets/prefabs/x.prefab.json' });
-    expect(inPlay?.message).toMatch(/prefab create refused: run-mode is 'playing'.*stop Play first/);
+    expect(inPlay?.message).toBe("Create Prefab refused — run-mode is 'playing', not 'stopped'. Stop Play first."); // the human text (#1873 C1)
+    expect(inPlay?.options).toEqual([expect.stringMatching(/^modoki_play_control \{action:'stop'\}/)]);
     setRunMode('stopped');
   }));
 });
