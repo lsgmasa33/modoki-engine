@@ -373,6 +373,7 @@ describe('#1707: a Refresh of a nested frame rebuilds it as the load built it (f
     // row into C) only through `frameForward`.
     // Mutation: expand the rebuild as a plain top call (`rebuildInstance`'s `forward` ignored) — M loses z 7 and y 8 (the P
     // edit above goes red with it; the Q edit cannot see it, Q's frame having no nested row to forward into).
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     const withoutC = () => { const d = pDoc(); d.entities = d.entities.filter((e) => e.localId !== 4); return d; };
     install(withoutC());
     await load(sceneOf());

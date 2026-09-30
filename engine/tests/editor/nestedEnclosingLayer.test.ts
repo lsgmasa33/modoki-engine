@@ -204,6 +204,7 @@ describe('#1676: removing a component the enclosing ROW added to a nested member
   it('by a Refresh after an unrelated template change', async () => {
     // Mutation: drop `layerTraits` from `captureNestedInstanceOverrides`' capture — the rebuild re-expands N's
     // Rotate3D and nothing removes it.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     install(pDoc(), oWith(ROW_ROTATE));
     await load(scene(O, [ROOT1]));
     removeTraitFromEntitiesWithUndo([inInstance(ROOT1, 'A')], meta('Rotate3D'));
@@ -1108,6 +1109,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
 
     it('#1737: the Revert brings L back at the row\'s 6, listed nowhere, with the guids a load derives; save + reload keep it', async () => {
       // Mutation: expand without the forward state (`forward` in `rebuildInstance`) — L comes back at Q's bare 0.
+      // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
       install(qDoc(), pWithC(), oDeepRow());
       await load(scene(O, [ROOT1]));
       expect(xsOf('L')).toEqual([6]); // precondition: the row's deep statement holds
@@ -1129,6 +1131,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     it('#1737: the Revert\'s undo takes the frame away again, and its redo brings it back with the row\'s 6', async () => {
       // The redo is a rebuild from the captured reduced state (`rebuildInstanceFromCapture`), which holds nothing of C, so
       // the fix has to live inside the rebuild. Mutation: as above — L is 0 after the Revert and after the redo.
+      // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
       install(qDoc(), pWithC(), oDeepRow());
       await load(scene(O, [ROOT1]));
       deleteEntitiesWithUndo([inInstance(ROOT1, 'A')]);
@@ -1283,6 +1286,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       // `captureNestedInstanceOverrides`) — the layer's Extra is captured as the scene's own and comes back twice.
       //   And: expand without the forward state (`forward` in `rebuildInstance`) — the capture still subtracts the layer,
       //   so nothing brings it back: L is 0 and Extra is gone. The two halves hold only together.
+      // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
       const withExtra = () => {
         const o = oDeepRow();
         Object.assign(o.entities[3] as Record<string, unknown>, { nestedStructure: { 3: { added: [
@@ -1361,6 +1365,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
     it('a cycle THROUGH the stored root (Q nests O) does not grow a level across two Reverts', async () => {
       // The rebuild's expansion runs under the cycle stack a load had there (close-out review). Mutation: expand under a
       // FRESH stack (`new Set(forward.stack)` in `rebuildInstance`) — each Revert grows O's instance by one more level.
+      // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
       const qCyc = () => ({ ...qDoc(), entities: [...qDoc().entities, ref(3, 'Back', 1, 'eeeeeeee-0000-4000-8000-000000009999', O)] });
       install(qCyc(), pWithC(), oDeepRow());
       await load(scene(O, [ROOT1]));
@@ -1439,6 +1444,7 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       it('a Refresh of Q applies the node\'s deep ADDED node once', async () => {
         // Mutation: drop the forward seed from the nested capture (`enclosing` in `captureNestedInstanceOverrides`) — Extra
         // is captured as the scene's own and comes back twice.
+        // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
         install(sDoc(), qDeepDoc(), pDoc(), withT({ nestedStructure: { 3: { added: [
           { parentLocalId: 2, guid: '', key: 'k1737n', name: 'Extra', traits: { EntityAttributes: { name: 'Extra', parentId: 0 }, Transform: { x: 5, y: 0, z: 0 } }, children: [] },
         ] } } }));

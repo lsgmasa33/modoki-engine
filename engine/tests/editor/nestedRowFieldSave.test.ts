@@ -1611,6 +1611,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       // …and the edit is NOT re-applied onto P2's member that holds A's old number (#1767): this assertion was missing,
       // and the case stayed green while the rebuild wrote A's x onto B2. Mutation: drop the translation in
       // `reapplyNestedInstanceOverrides` — B2 shows 6.
+      // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
       expect(x(inInstance(ROOT1, 'B2'))).toBe(0);
     });
 
@@ -1743,6 +1744,7 @@ describe('#1771: a saved member reference is read against the document its frame
   it('#1767: a Refresh re-applies nothing of the old prefab onto the new one, and equals a reload of the same file', async () => {
     // Mutation: drop the `translateLocalIds` call in `reapplyNestedInstanceOverrides` — B2 shows 6 and C2 is deleted,
     // and the save persists both.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     install(pAB(), p2(), oDoc());
     await load(scene(O, [ROOT1]));
     setTf(inInstance(ROOT1, 'A'), 'x', 6);
@@ -1800,6 +1802,7 @@ describe('#1771: a saved member reference is read against the document its frame
     // P: R → A, M (3, nests Q); P2: R2 → B2, M2 (3, nests Q, ANOTHER nodeGuid). The scene edits QA inside N/M. Mutation:
     // follow the capture's chain by number again in `reapplyNestedInstanceOverrides` — M2 holds M's number, and its QA
     // shows 6 after the Refresh while a reload of the same file shows 0.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     const Q = 'cccccccc-0000-4000-8000-000000177110';
     const q = { id: Q, version: 5, name: 'Q', rootLocalId: 1, entities: [
       row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000177111'), row(2, 'QA', 1, 'eeeeeeee-0000-4000-8000-000000177112')] };

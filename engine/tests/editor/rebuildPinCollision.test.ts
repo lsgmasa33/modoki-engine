@@ -1,5 +1,6 @@
-/** A rebuild (Refresh, Revert, every `rebuildInstance` caller) runs the load's pin → derive → drop → settle sequence
- *  (#1777, `deriveMemberGuidsAfterPins`). Driven through the real loader and the real `rebuildInstance`. */
+/** A rebuild (Refresh, Revert, every rebuild caller) runs the load's pin → derive → drop → settle sequence
+ *  (#1777, `deriveMemberGuidsAfterPins`). Driven through the real loader and the real rebuild (`refreshInstances` →
+ *  `rebuildFromEntry` since #1880 F7d, whose settle IS the load's, `settleEntryRows`). */
 
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
@@ -89,7 +90,8 @@ afterAll(() => { setPrefabCache(P, null); getCurrentWorld()?.destroy(); });
  *  path: a renumber made it reachable). Before #1777 two entities held one guid after the Refresh and nothing reported it.
  *  Since #1882 the DERIVATION yields: N takes a salted guid, M keeps its pin (the identity the scene's refs hold), and X's
  *  `@member:2` token names M. Mutation: restore the carried members AFTER the derive in `rebuildInstance` — N derives the
- *  pinned guid first, and M's restore lands on it: two holders. */
+ *  pinned guid first, and M's restore lands on it: two holders.
+ * [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.] */
 describe('a rebuild never lets a new derivation take a restored pin (#1777, #1882)', () => {
   it('no two entities share a guid, M keeps its pin, N salts and it is reported, and a token names M', async () => {
     const collide = deriveMemberGuid(INST, [3]); // what N derives under the edited template

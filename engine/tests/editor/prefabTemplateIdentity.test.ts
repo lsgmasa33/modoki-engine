@@ -252,6 +252,7 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
     expect(JSON.stringify(written)).not.toMatch(/eeeeeeee-0000-4000-8000-0000000002e[12]/);
     // Apply refreshed the live instance from the written file: the keyed nodes re-expanded and were
     // derived by the rebuild. Mutation: drop `deriveInstanceMemberGuids` at the end of `rebuildInstance`.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     for (const name of ['OnSlot', 'OnInner']) {
       const guids = guidsNamed(name);
       expect(guids).toHaveLength(1);

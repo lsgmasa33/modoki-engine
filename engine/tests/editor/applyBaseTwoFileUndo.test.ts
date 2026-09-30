@@ -222,9 +222,10 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
   });
 
   it('target O, then P changes outside the history before the undo: the instance keeps P\'s new member AND its own 5', async () => {
-    // Close-out review of #1724: the side is rebuilt onto the CURRENT copy of its own prefab (`rebuildInstanceFromCapture`).
+    // Close-out review of #1724: the side is rebuilt onto the CURRENT copy of its own prefab (then `rebuildInstanceFromCapture`; `rebuildFrameFromSide` since #1880 F7d).
     // Mutation: rebuild it with `rebuildInstance` from the captured copy — the applied instance loses B (the member P
     // gained since), and its P frame reads as built from other rows, so Apply and Revert would refuse it.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     await applyFive(O);
     const grown = pDoc();
     (grown.entities as unknown[]).push(row(3, G(5), 'B', 1));
@@ -302,6 +303,7 @@ describe('#1741: undo of a U14 Apply made from the OUTER root keeps the nested f
     // The side's nested capture is keyed in the P it was read against; the frame expands the renumbered P by then (A is
     // row 7, and nothing is row 2). Mutation: skip the capture's translation in the re-apply (`translateLocalIds` in
     // `reapplyNestedInstanceOverrides`) — the 5 is written to row 2, which names nothing, and A reads 0.
+    // [Old per-frame route, deleted in #1880 F7d: this mutation's target no longer exists and it was not re-measured on the entry route; the case stays as the outcome.]
     await applyFiveFromOuter(O);
     const renumbered = pDoc();
     (renumbered.entities[1] as { localId: number }).localId = 7;

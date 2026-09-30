@@ -1,4 +1,4 @@
-/** #1431 — `rebuildInstance` carries the instance's scene OWNERSHIP (`EntityAttributes.sourceScene`)
+/** #1431 — a rebuild (`rebuildFromEntry` since #1880 F7d) carries the instance's scene OWNERSHIP (`EntityAttributes.sourceScene`)
  *  across its teardown + respawn, as it already carries the root's guid.
  *
  *  A base scene's instance that came back primary-owned left the base file on the next Save All
@@ -112,8 +112,9 @@ beforeEach(async () => {
 afterAll(() => { for (const id of [INNER, KIT]) setPrefabCache(id, null); getCurrentWorld()?.destroy(); });
 
 describe('a rebuild keeps the instance in the scene that owns it (#1431)', () => {
-  // Mutations: drop the sourceScene carry in `rebuildInstance` — every entity reads '' (primary); or
-  // stamp only the new ROOT — the members, the nested expansion and the added node stay ''.
+  // Mutations (re-measured on the entry route, #1880 F7d; each reddens 2 of these cases): drop the sourceScene carry in
+  // `rebuildFromEntry` — every entity reads '' (primary); or stamp only the new ROOT — the members, the nested expansion
+  // and the added node stay ''.
   it('a BASE scene\'s instance: members, the nested instance and the scene-added node keep the base stamp', () => {
     stampAll(BASE);
     expect(Object.keys(stamps()).sort()).toEqual(['InnerRoot', 'Kit', 'Leaf', 'Mine', 'Slot']); // precondition: the whole tree is here
