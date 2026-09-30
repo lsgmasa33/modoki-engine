@@ -135,7 +135,7 @@ export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets, assetCacheDiverged, assetCacheMatchesFile,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
   subscribeDirtyAssets, getDirtyAssetsVersion, isAssetDirty, getLastFlushedAsset,
-  getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, forgetFlushedAssetHash,
+  getLastFlushedAssetHash, getAssetFlushError, clearAssetIfMatch, noteOutsideChangeHeld, outsideChangeSuperseded, endOutsideChangeHold, forgetFlushedAssetHash,
   parkPrefab, parkedPrefab, overwriteParkedAsset, keepParkedPrefabOverFileChange,
   type AssetWriteOrigin, type DirtyDocType,
 } from './scene/dirtyAssets';
@@ -173,6 +173,7 @@ export { applyAssetPathMoves, unbindDeletedAssetEditors, getAssetFileOpVersion }
 export type { PathMove } from './utils/assetPaths';
 // The editor's own modals, for app-shell code that would otherwise reach for a native `alert`/`confirm` (#1594).
 export { alertInEditor, confirmInEditor } from './utils/saveDialog';
+export { openChoiceModal } from './components/choiceModal';
 export {
   registerCreatableAsset, unregisterCreatableAsset, getCreatableAssets, type CreatableAssetDef,
 } from './panels/creatableAssets';

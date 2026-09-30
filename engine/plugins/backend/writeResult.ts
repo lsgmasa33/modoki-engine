@@ -13,12 +13,22 @@ import fs from 'node:fs';
 import type { ServerResponse } from 'node:http';
 import type { BackendResult } from './editorBackendRouter';
 
+/** Headers every response of this host carries — today the outside changes the editor has not applied yet (#1879,
+ *  `tools/shared/pendingOutside.ts`). One per process: each host (the Vite dev server, Electron main) installs its own,
+ *  and both write every response through here. */
+let resultStamp: (() => Record<string, string> | undefined) | null = null;
+export function setResultStamp(fn: (() => Record<string, string> | undefined) | null): void {
+  resultStamp = fn;
+}
+
 export function writeBackendResult(
   res: ServerResponse,
   result: BackendResult,
   ifNoneMatch?: string | string[],
 ): void {
   res.statusCode = result.status ?? 200;
+  const stamp = resultStamp?.();
+  if (stamp) for (const [k, v] of Object.entries(stamp)) res.setHeader(k, v);
   if (result.headers) {
     for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
   }

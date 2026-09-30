@@ -365,6 +365,25 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     async ({ path }) => editorAction('save-all', path ? { path } : {}),
   );
   tool(
+    'modoki_refresh',
+    'Apply the outside file changes the editor is holding (Unity\'s AssetDatabase.Refresh()). The editor does NOT apply a '
+      + 'change made outside it (a git pull, a hand edit, your own Write/Bash edit of a scene, prefab or asset JSON, or a '
+      + 'file-direct modoki_mutate_scene / modoki_write_asset) until its window regains focus or this is called; until '
+      + 'then every tool answer lists them in pendingOutsideChanges and the editor shows their OLD contents. With a human '
+      + 'focused on the editor they see a 5 s countdown first, and a Cancel applies nothing (`cancelled:true`, still '
+      + 'pending). Returns `applied`, and `deferred` for what Play or a preview holds until Stop. A changed scene with '
+      + 'unsaved edits is never reloaded silently: a focused human is asked Reload / Keep mine (`awaitingHuman`), '
+      + 'otherwise it stays pending (`sceneConflicts` status `held`) until you pass `scene`.',
+    {
+      scene: z.enum(['reload', 'keep']).optional().describe(
+        'For a changed scene with unsaved edits, when no human has the editor focused: "reload" loses the unsaved edits '
+        + 'and takes the file; "keep" keeps them, and the next save overwrites the file. Ignored while a human is focused '
+        + '(they decide). Without it such a scene stays pending.',
+      ),
+    },
+    async ({ scene }) => editorAction('refresh', scene ? { scene } : {}),
+  );
+  tool(
     'modoki_discard_asset_edits',
     'ABANDON parked asset writes — the counterpart to modoki_save_all for the dirty-asset registry '
       + '(the pending asset defs — any ASSET_SCHEMA_TYPES type, not just particle/anim/timeline — '

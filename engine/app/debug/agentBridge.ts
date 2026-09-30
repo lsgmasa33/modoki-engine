@@ -170,6 +170,9 @@ import {
   listAgentTools, getAgentTool, agentToolsVersion, validateAgentToolArgs, coerceAgentToolArgs, type AgentToolDef,
 } from '@modoki/engine/runtime';
 import { startWatch, readWatch, listWatches, clearWatch, type StartWatchParams } from './watch';
+import { createOutsideChangeHold } from './outsideChangeHold';
+import { notifyListeners } from '@modoki/engine/runtime/core/notifyListeners';
+import { installFocusEdge } from './focusEdge';
 // Percept S3: resolved world transforms + hierarchy-deactivation set, both computed
 // each frame by transformPropagationSystem. Same module instance the renderers read.
 import {
@@ -3057,9 +3060,26 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
   } catch { /* not an editor context — no registry to clear */ }
 }
 
+/** Ends the hold of `urlPath`'s outside asset change, answering whether the editor wrote the file since
+ *  (`outsideChangeSuperseded`). False where there is no editor (a game page applies changes as they arrive). */
+async function heldAssetSuperseded(urlPath: string): Promise<boolean> {
+  try {
+    const { outsideChangeSuperseded, endOutsideChangeHold } = await import('@modoki/engine/editor');
+    const superseded = outsideChangeSuperseded(urlPath);
+    endOutsideChangeHold(urlPath);
+    return superseded;
+  } catch { return false; }
+}
+
 /** `inPlace`: a prefab the editor itself put back to its file (a discarded park, #1873 S2) — replayed as an in-place
- *  re-import (`setPrefabReimporter`), never as the disk-wins scene reload an outside change gets. */
-type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean; inPlace?: boolean };
+ *  re-import (`setPrefabReimporter`), never as the disk-wins scene reload an outside change gets. `reload`: a scene
+ *  change whose unsaved work someone chose to lose (#1879, "Reload"), so it is not asked about again. */
+type SceneChangedMsg = {
+  urlPath: string; kind: SceneChangedKind; viaSibling?: boolean; inPlace?: boolean; reload?: true;
+  /** An agent's answer (`modoki_refresh`'s `scene`) for a scene over unsaved work, carried ON the change: a release that
+   *  Play or an undo step defers replays later, outside the release that was given it. */
+  decision?: 'reload' | 'keep';
+};
 
 /** Scene/prefab changes that arrived while the reload was suppressed, keyed by `urlPath`, in the
  *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
@@ -3092,14 +3112,17 @@ export async function replaySuppressedSceneReloads(): Promise<number> {
   if (_suppressedReloads.size === 0 || sceneReloadSuppressedReason()) return 0;
   const pending = [..._suppressedReloads.values()];
   _suppressedReloads.clear();
-  console.log(`[agentBridge] replaying ${pending.length} scene hot-reload(s) deferred during the run`);
-  for (const m of pending) if (m.kind !== 'prefab') await handleSceneChanged(m);
+  console.log(`[agentBridge] replaying ${pending.length} held scene/asset change(s)`);
+  // One change that throws must not drop the rest of the batch: the map is already cleared (review U3).
+  const apply = (m: SceneChangedMsg, evict: readonly string[] = []) => handleSceneChanged(m, evict)
+    .catch((e) => console.error(`[agentBridge] applying the change to ${m.urlPath} failed:`, e));
+  for (const m of pending) if (m.kind !== 'prefab') await apply(m);
   // A prefab the editor put back to its file is RE-IMPORTED in place (#1873 S2) — keyed by path, so an outside write of
   // the same file since replaced its entry and takes the watcher's path below instead. Last: a reload replayed above
   // rebuilds these prefabs from the runtime cache, which still holds the discarded document, and this puts them right.
   const prefabs = pending.filter((m) => m.kind === 'prefab' && !m.inPlace);
   const last = prefabs.at(-1);
-  if (last) await handleSceneChanged(last, prefabs.slice(0, -1).map((m) => m.urlPath));
+  if (last) await apply(last, prefabs.slice(0, -1).map((m) => m.urlPath));
   const inPlace = pending.filter((m) => m.kind === 'prefab' && m.inPlace).map((m) => m.urlPath);
   if (inPlace.length) {
     // Suppressed again part-way (Play pressed mid-replay): held for the next replay, as a reload would be.
@@ -3107,6 +3130,7 @@ export async function replaySuppressedSceneReloads(): Promise<number> {
     if (again || !_prefabReimporter) deferPrefabReimport(inPlace, again ?? 'no re-importer is installed');
     else await _prefabReimporter(inPlace).catch((e) => console.error('[agentBridge] re-importing a discarded prefab failed:', e));
   }
+  notifyPending(); // what was deferred has now been applied (or deferred again, which notified already)
   return pending.length;
 }
 
@@ -3135,6 +3159,159 @@ export function deferPrefabReimport(paths: readonly string[], reason: string): v
     _suppressedReloads.set(urlPath, { urlPath, kind: 'prefab', inPlace: true });
   }
   console.warn(`[agentBridge] prefab re-import deferred (${paths.join(', ')}) — ${reason}`);
+}
+
+// ── #1879: outside changes wait for a refresh ──────────────────────────────────────────────────────────────────────
+
+/** Every watcher change waits here until the editor regains focus or an agent calls `modoki_refresh`
+ *  (`outsideChangeHold.ts` says why). */
+const _outsideHold = createOutsideChangeHold<SceneChangedMsg>();
+
+/** Scene changes over unsaved work whose "Reload / Keep mine" question is open in front of the human, by path. Still
+ *  pending: nothing of them is applied until the answer. */
+const _awaitingDecision = new Map<string, SceneChangedMsg>();
+
+const _pendingListeners = new Set<(paths: string[]) => void>();
+function notifyPending(): void {
+  notifyListeners(_pendingListeners, 'pendingOutsideChanges', [pendingOutsideChanges()]);
+}
+_outsideHold.onChange(() => notifyPending());
+
+/** The outside changes not applied yet: held, or waiting for a Reload / Keep mine answer. */
+export function pendingOutsideChanges(): string[] {
+  // …and what Play, a preview or a hold deferred at its release (not the editor's own in-place put-backs): until it
+  // replays, the editor shows the old file there too (review U4).
+  const deferred = [..._suppressedReloads.values()].filter((m) => !m.inPlace).map((m) => m.urlPath);
+  return [...new Set([..._outsideHold.paths(), ..._awaitingDecision.keys(), ...deferred])];
+}
+
+/** The outside changes Play, a preview or a hold deferred at a release, and why — a refresh cannot apply them; they
+ *  replay when that ends (review 2, #4). */
+export function deferredOutsideChanges(): { paths: string[]; reason: string | null } {
+  const paths = [..._suppressedReloads.values()].filter((m) => !m.inPlace).map((m) => m.urlPath);
+  return { paths, reason: paths.length ? sceneReloadSuppressedReason() : null };
+}
+
+/** The held changes the next release applies (not the open questions). */
+export function heldOutsideChanges(): string[] { return _outsideHold.paths(); }
+
+/** Scene changes whose "Reload / Keep mine" question is open in front of the human. */
+export function awaitingSceneDecisions(): string[] { return [..._awaitingDecision.keys()]; }
+
+/** Hear every change of {@link pendingOutsideChanges}. Returns the unsubscribe. */
+export function onPendingOutsideChanges(cb: (paths: string[]) => void): () => void {
+  _pendingListeners.add(cb);
+  return () => { _pendingListeners.delete(cb); };
+}
+
+/** Whether outside changes wait for a refresh. Only where the editor is (`agentEditorOps.ts` turns it on, with the
+ *  `refresh` op that applies them): a game page in dev has no way to refresh, so it applies them as they arrive, as
+ *  before #1879 (review U6). */
+let _holdEnabled = false;
+export function enableOutsideChangeHold(on: boolean): void { _holdEnabled = on; }
+
+/** A change the watcher raised: held until a focus gain or `modoki_refresh`, never applied on arrival (#1879). */
+export function holdOutsideChange(msg: SceneChangedMsg): void {
+  if (!_holdEnabled) { void handleSceneChanged(msg); return; }
+  _outsideHold.hold(msg);
+  // A parked asset document under this file would be written over the change by a Save before the release: the park —
+  // one there now, or one made before the release — gets a baseline no file matches, so that Save asks Overwrite or
+  // Cancel instead (#1879 close-out reviews, `noteOutsideChangeHeld`). Not a sibling-raised
+  // change (a shader body): the descriptor file itself did not change (see `dropParkedWriteFor`'s caller).
+  if (!msg.viaSibling && hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind)) {
+    void import('@modoki/engine/editor')
+      .then(({ noteOutsideChangeHeld }) => {
+        if (noteOutsideChangeHeld(msg.urlPath)) {
+          console.warn(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved edit — saving now asks whether to overwrite; the change applies at the next refresh`);
+        }
+      })
+      .catch(() => { /* not an editor context — no park to mark */ });
+  }
+}
+
+/** What a release decides for a scene change over unsaved work (#1879 part 3, owner ruling 2026-09-30): the editor asks
+ *  "Reload / Keep mine" instead of letting the disk win. `decision` is an agent's answer given with `modoki_refresh`
+ *  while no human has the editor focused; `focused` is whether one does. Installed by `agentEditorOps.ts`, which owns
+ *  the dirty state and the dialog. Answers:
+ *  - `clean`: nothing unsaved in the changed scene — reload, as always, and nothing to report;
+ *  - `reload`: the unsaved work is to be lost, by an agent's answer;
+ *  - `kept`: the unsaved work stays and the next save overwrites the file;
+ *  - `asking`: the question is open in front of the human (see {@link answerSceneConflict});
+ *  - `held`: nobody can answer now, so the change stays pending. */
+export type SceneConflictAnswer = 'clean' | 'reload' | 'kept' | 'asking' | 'held';
+export interface SceneConflict { urlPath: string; baseGuid?: string; decision?: 'reload' | 'keep'; focused: boolean }
+let _sceneConflictResolver: ((c: SceneConflict) => Promise<SceneConflictAnswer>) | null = null;
+export function setSceneConflictResolver(fn: ((c: SceneConflict) => Promise<SceneConflictAnswer>) | null): void {
+  _sceneConflictResolver = fn;
+}
+
+/** Whether a human has the editor focused. Installed with the focus edge; false where there is none (tests, a device). */
+let _editorFocused: () => boolean = () => false;
+export function editorWindowFocused(): boolean { return _editorFocused(); }
+/** Test seam: play a human who has (or has not) the editor focused. */
+export function _setEditorFocusedForTests(fn: () => boolean): void { _editorFocused = fn; }
+
+/** The release in progress, which collects what the scene branch of `handleSceneChanged` decided. Null outside one: a
+ *  change the Play deferral replays after Stop is asked about by the same rule, and an agent's answer rides on the
+ *  change itself (`SceneChangedMsg.decision`). */
+interface ReleaseState { conflicts: { urlPath: string; answer: SceneConflictAnswer }[] }
+let _release: ReleaseState | null = null;
+
+export interface OutsideReleaseReport {
+  /** Handed to the reload path. A change the Play deferral holds is in `deferred` instead. */
+  applied: string[];
+  /** Held by `sceneReloadSuppressedReason()` (Play, a preview, a switch landing): applied once authoring settles. */
+  deferred: string[];
+  /** Scene changes over unsaved work, and what became of each. */
+  sceneConflicts: { urlPath: string; answer: SceneConflictAnswer }[];
+}
+
+let _releaseChain: Promise<unknown> = Promise.resolve();
+
+/** Apply every held outside change as ONE batch, through the same replay a Play deferral takes (scene files first,
+ *  prefabs collapsed to one pass, in-place re-imports last). Serialized: a focus gain during a refresh's apply waits
+ *  for it. `decision` answers a scene-over-unsaved-work question when no human has the editor focused. */
+export function releaseOutsideChanges(opts: { decision?: 'reload' | 'keep' } = {}): Promise<OutsideReleaseReport> {
+  const run = async (): Promise<OutsideReleaseReport> => {
+    const msgs = _outsideHold.take();
+    if (!msgs.length) return { applied: [], deferred: [], sceneConflicts: [] };
+    for (const m of msgs) {
+      _suppressedReloads.delete(m.urlPath);
+      // THIS release's answer, or none: a change put back ("later", `held`) must not keep an older one (review 2, #1).
+      _suppressedReloads.set(m.urlPath, { ...m, decision: opts.decision });
+    }
+    notifyPending();
+    const state: ReleaseState = { conflicts: [] };
+    _release = state;
+    try { await replaySuppressedSceneReloads(); } finally { _release = null; }
+    const deferred = msgs.map((m) => m.urlPath).filter((p) => _suppressedReloads.has(p));
+    const unapplied = new Set([...deferred, ...state.conflicts.filter((c) => c.answer !== 'reload').map((c) => c.urlPath)]);
+    console.log(`[agentBridge] applied ${msgs.length - unapplied.size} outside change(s)` + (unapplied.size ? `; ${unapplied.size} not applied` : ''));
+    return { applied: msgs.map((m) => m.urlPath).filter((p) => !unapplied.has(p)), deferred, sceneConflicts: state.conflicts };
+  };
+  const next = _releaseChain.then(run, run);
+  _releaseChain = next.catch(() => {});
+  return next;
+}
+
+/** The human's answer to an open "Reload / Keep mine" question. `reload` reloads the scene from disk now; `keep` only
+ *  closes the question (the unsaved work stays, and the next save overwrites the file); `later` (the dialog dismissed)
+ *  puts the change back in the hold, so the next focus gain or refresh asks again. */
+export async function answerSceneConflict(urlPath: string, answer: 'reload' | 'keep' | 'later'): Promise<void> {
+  const msg = _awaitingDecision.get(urlPath);
+  if (!msg) return;
+  _awaitingDecision.delete(urlPath);
+  if (answer === 'later') _outsideHold.putBack([{ ...msg, decision: undefined }]);
+  notifyPending();
+  if (answer === 'reload') await handleSceneChanged({ ...msg, reload: true });
+}
+
+/** Test seam: forget every held change and open question. */
+export function _resetOutsideChangesForTests(): void {
+  _outsideHold.take();
+  _awaitingDecision.clear();
+  _release = null;
+  notifyPending();
 }
 
 /** Test seam: the deferred changes currently held, as `urlPath`s in replay order. */
@@ -3174,6 +3351,17 @@ function openSceneUsesPrefab(urlPath: string): boolean {
   return false;
 }
 
+/** Is `urlPath` a scene the open chain loads — the primary (also one `SceneManager` has no entry for, #1712) or a base?
+ *  The same match the scene branch of `handleSceneChanged` makes; none in prefab edit, whose world has no scene file. */
+function sceneInOpenChain(urlPath: string): boolean {
+  const current = openScenePath();
+  if (!current || current.startsWith('/__prefab-edit__/')) return false;
+  const want = normScenePath(urlPath);
+  if (normScenePath(current) === want) return true;
+  for (const entry of sceneManager.getLoadedScenes().values()) if (normScenePath(entry.path) === want) return true;
+  return false;
+}
+
 /** Put the prefab at `urlPath` back to its FILE, everywhere — both caches, and a reload of the open scene when it uses
  *  it — exactly as an outside change of the file does. For a discarded parked prefab (#1868): its caches and live frames
  *  hold the discarded document, so dropping only the pending write would leave the editor showing one prefab, the file
@@ -3198,6 +3386,13 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   const invalidateCachedAsset = hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind)
     ? ASSET_CACHE_INVALIDATORS[msg.kind]
     : undefined;
+  // The editor wrote this file since its outside change was held (the human chose Overwrite and saved): the change is
+  // gone from disk, and dropping the park now would throw away edits made after that save (#1879 close-out review 2).
+  // Nothing changed, so nothing to redraw — which is why it sits before the invalidator branch, not in it.
+  if (invalidateCachedAsset && await heldAssetSuperseded(msg.urlPath)) {
+    console.log(`[agentBridge] ${msg.urlPath}: the editor saved over its outside change since — nothing to apply`);
+    return;
+  }
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
     // ⚠️ Only when THIS asset's own file changed. `viaSibling` says the broadcast was raised by a
@@ -3240,6 +3435,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       _suppressedReloads.delete(m.urlPath); // re-insert, so replay order follows the latest write
       _suppressedReloads.set(m.urlPath, m);
     }
+    notifyPending();
     console.warn(`[agentBridge] scene hot-reload deferred (${msg.kind} change: ${msg.urlPath}) — ${reason}`);
   };
   const suppressed = sceneReloadSuppressedReason();
@@ -3251,7 +3447,10 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
   // A scene FILE changed: its undo stack is stale wherever it is — open, or parked because the scene is not (owner fork 4,
   // #1750) — so the debt is raised for the file itself, before anything below can return, and the next adopt that names
   // that scene pays it. A prefab change leaves every scene file alone and raises none (#1744).
-  if (msg.kind === 'scene') _adoptionHooks?.sceneFileChanged(msg.urlPath);
+  // Except a scene the open chain loads (the primary or a base): its debt waits for the #1879 question in the scene
+  // branch below, raised only when the reload goes ahead, because "Keep mine" keeps the scene AND its undo (review F3).
+  const inOpenChain = msg.kind === 'scene' && sceneInOpenChain(msg.urlPath);
+  if (msg.kind === 'scene' && !inOpenChain) _adoptionHooks?.sceneFileChanged(msg.urlPath);
   // #1169: a prefab change must evict the cached prefab BEFORE the scene reload below, or the reload
   // re-instantiates the OLD prefab: a load acquires before it releases, so the new scene id finds the
   // entry still owned and `fetchPrefab` returns on the cache hit. BOTH copies: the runtime cache
@@ -3316,6 +3515,23 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
       break;
     }
     if (!matchedAny) return; // touches no scene in the currently-loaded chain (a scene change carries no prefabs)
+    // #1879 part 3 (owner ruling 2026-09-30, amends #1164 for the dirty case): over unsaved work in the changed scene the
+    // editor ASKS "Reload / Keep mine" instead of letting the disk win. A clean scene reloads as before. Asked before the
+    // stack's debt below is raised: a kept scene keeps its undo.
+    if (!msg.reload && _sceneConflictResolver) {
+      const focused = editorWindowFocused();
+      // Registered BEFORE the resolver runs: its dialog may be answered before the resolver returns, and the answer finds
+      // the change here. Dropped again unless the question is left open.
+      _awaitingDecision.set(msg.urlPath, msg);
+      const answer = await _sceneConflictResolver({ urlPath: msg.urlPath, baseGuid: changedBaseGuid, decision: msg.decision, focused });
+      if (answer !== 'asking' && _awaitingDecision.get(msg.urlPath) === msg) _awaitingDecision.delete(msg.urlPath);
+      if (answer !== 'clean') _release?.conflicts.push({ urlPath: msg.urlPath, answer });
+      if (answer === 'asking') notifyPending();
+      if (answer === 'held') _outsideHold.putBack([{ ...msg, decision: undefined }]);
+      if (answer !== 'clean' && answer !== 'reload') return;
+    }
+    // The reload goes ahead: the scene's file changed under its stack (the debt held back above).
+    if (inOpenChain) _adoptionHooks?.sceneFileChanged(msg.urlPath);
     // A changed BASE leaves the primary's own file alone, but its stack was recorded over the base's old bytes too.
     if (changedBaseGuid) _adoptionHooks?.sceneFileChanged(current);
   }
@@ -3463,6 +3679,23 @@ export function initAgentBridge(): void {
   const reloadSource = sceneReloadSource({ hasBridge: !!bridge, hasHot: !!hot });
   if (!hot && !bridge) return;
 
+  // #1879: the held outside changes apply when the editor regains focus (Unity's Auto Refresh). Only where there is a
+  // real page to listen on; elsewhere `modoki_refresh` is the only way, which it always is too.
+  if (reloadSource && typeof window.addEventListener === 'function' && typeof document !== 'undefined') {
+    const edge = installFocusEdge(() => { void releaseOutsideChanges(); });
+    _editorFocused = () => edge.isFocused();
+  }
+  // …and the backend that drives this page's reloads hears the held list on every change, and stamps it on every answer
+  // (`tools/shared/pendingOutside.ts`). Sent once now too: a reloaded page holds nothing.
+  const pushPending = (paths: string[]): void => {
+    try {
+      if (reloadSource === 'bridge') bridge!.send('pending-outside', paths);
+      else if (reloadSource === 'vite') hot!.send('modoki:pending-outside', paths);
+    } catch (e) { console.warn('[agentBridge] could not tell the backend the pending outside changes:', e); }
+  };
+  onPendingOutsideChanges(pushPending);
+  pushPending(pendingOutsideChanges());
+
   // Belt-and-suspenders: the shared ring is already installed by `installConsoleRing.ts`'s eager
   // import by the time this runs (#596/#597 Stage 3a) — this call is now a thin shim, kept so
   // `/api/console-logs` still has something to fall back on if that ever changes.
@@ -3488,8 +3721,9 @@ export function initAgentBridge(): void {
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See
     // sceneReloadSource for why the Vite HMR path must NOT also drive reloads here.
     if (reloadSource === 'bridge') {
+      // Held, not applied: it waits for a focus gain or `modoki_refresh` (#1879).
       bridge.on('scene-changed', (data) => {
-        void handleSceneChanged(data as { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean });
+        holdOutsideChange(data as { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean });
       });
     }
     // Registered whenever the Electron bridge exists — dev included (#503). Unlike
@@ -3550,6 +3784,6 @@ export function initAgentBridge(): void {
   //    here too would double-reload AND bounce the scene on the editor's own writes
   //    (Vite's guard is never marked from this renderer). See sceneReloadSource.
   if (reloadSource === 'vite') {
-    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }) => { void handleSceneChanged(msg); });
+    hot.on('modoki:scene-changed', (msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }) => { holdOutsideChange(msg); });
   }
 }

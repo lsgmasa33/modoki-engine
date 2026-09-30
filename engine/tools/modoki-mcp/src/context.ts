@@ -15,6 +15,8 @@
 import { createFormatter, isFailureBody, codeFromBody, codeFromStatus, optionsFromBody, type ToolResult, type ToolErrorDetail } from './result.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
 import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
+import { notePendingHeader } from './pendingStamp.js';
+import { PENDING_OUTSIDE_HEADER } from '../../shared/pendingOutside.js';
 
 export type ToolContext = {
   /** Backend base URL, trailing slash stripped. Interpolated into error messages. */
@@ -126,6 +128,8 @@ export function createToolContext(config: { backend: string; token?: string }): 
       headers: { ...(token ? { 'X-Modoki-Token': token } : {}), ...(init?.headers as Record<string, string> | undefined) },
       signal: AbortSignal.timeout(timeoutMs),
     });
+    // Every answer names the outside changes the editor holds unapplied (#1879, `pendingStamp.ts`).
+    notePendingHeader(res.headers.get(PENDING_OUTSIDE_HEADER));
     const text = await res.text();
     let body: unknown = text;
     try { body = text ? JSON.parse(text) : undefined; } catch { /* keep raw text */ }

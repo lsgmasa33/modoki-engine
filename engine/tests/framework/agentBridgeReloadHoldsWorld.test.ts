@@ -47,7 +47,7 @@ const SCENE = '/games/g/runtime/assets/Main.scene.json';
 const OTHER = '/games/g/runtime/assets/Other.scene.json';
 const EDIT = '/__prefab-edit__/aaaaaaaa-0000-4000-8000-000000001750';
 
-const { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloads, runAgentOp } = await import('../../app/debug/agentBridge');
+const { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloads, runAgentOp, releaseOutsideChanges } = await import('../../app/debug/agentBridge');
 const { registerEditorAgentOps } = await import('../../app/editor/agentEditorOps');
 
 let handlers: Map<string, Handler[]>;
@@ -66,8 +66,11 @@ const settle = async () => {
   await new Promise((r) => setTimeout(r, 0));
   for (let i = 0; i < 10; i++) await Promise.resolve();
 };
+// Held since #1879 (the watcher's change waits for a focus gain or modoki_refresh); released at once, as a CHOSEN
+// reload: what a reload does is what these cases pin. The ask over unsaved work is `outsideSceneConflict.test.ts`.
 const changed = (urlPath: string, kind: 'scene' | 'prefab' = 'scene') => {
   for (const cb of handlers.get('scene-changed') ?? []) cb({ urlPath, kind });
+  void releaseOutsideChanges({ decision: 'reload' });
 };
 /** A scene open (or any route) that installs a world of its own and adopts it under `path`. */
 const adoptTo = (path: string) => withAdoption('scene-load', async (t) => {

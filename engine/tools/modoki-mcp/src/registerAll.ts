@@ -20,6 +20,7 @@ import type { ToolContext } from './context.js';
 import type { ToolDef } from './toolDef.js';
 import { errorDetailOf, retargetNarrowHint, type ToolResult } from './result.js';
 import { contractFor } from './contracts.js';
+import { withPendingStamp } from './pendingStamp.js';
 import { registerBatchTool } from './tools/batch.js';
 import { registerSceneTools } from './tools/scene.js';
 import { registerRenderTools } from './tools/render.js';
@@ -127,7 +128,10 @@ export function defineTool<S extends ZodRawShape>(
   // guesses which argument is the schema by shape-sniffing, and it rejects a ZodObject outright
   // ("expected a Zod schema or ToolAnnotations, but received an unrecognized object" — measured).
   // The config form passes `inputSchema` straight through to validation.
-  const handle = server.registerTool(name, { description, inputSchema: strict as never }, stamped as never) as unknown as { remove: () => void };
+  // The pending outside changes (#1879) ride on the answer the CLIENT gets — not on the registry's copy below, whose
+  // result a `modoki_batch` step parses as one JSON document (`pendingStamp.ts`).
+  const answered = (args: unknown) => withPendingStamp(() => stamped(args) as Promise<ToolResult>);
+  const handle = server.registerTool(name, { description, inputSchema: strict as never }, answered as never) as unknown as { remove: () => void };
   // The registry keeps the RAW shape: `modoki_batch` builds its own `z.object(shape).strict()`
   // per step, and a pre-built schema would deny it that. The STAMPED handler goes in too, so a
   // refusal reported inside a `modoki_batch` step names the step's tool, not nothing.

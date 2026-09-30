@@ -674,7 +674,11 @@ describe('the real registered surface', () => {
   // wheel), `focus_entity.distanceScale`, and get_editor_state's `modal` sentence (the only way an
   // agent learns a dialog is waiting on it). The other ~3.7 KB arrived through main from the other
   // clones' ledgers since the last pin — work-ai3's `modoki_open_project` (+2,014 B) is most of it.
-  const DEFINITION_BYTES = 171_375;
+  // 2026-09-30 (#1879, work-qa): RE-PINNED to 176,291 — +4,916 B over the 171,375 pin. work-qa's own share is +1,138 B:
+  // a new tool, `modoki_refresh` (the editor now HOLDS outside file changes until a focus gain or this call, owner
+  // 2026-09-30, and an agent must be able to apply them on demand — Unity's AssetDatabase.Refresh()). The other
+  // ~3.8 KB is the ledgers' growth since the last pin (175,153 before this change), mostly `modoki_prefab`.
+  const DEFINITION_BYTES = 176_291;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

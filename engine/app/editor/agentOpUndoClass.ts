@@ -69,7 +69,7 @@ export const NON_RECORDING_OPS: ReadonlySet<string> = new Set([
   'invalidate-assets', 'journal-events', 'layout-bounds', 'layout-settling', 'list-creatable-assets', 'load-scene',
   'new-scene', 'open-animation-editor', 'open-nine-slice-editor', 'open-particle-editor', 'open-skin-editor',
   'open-sprite-editor', 'pause', 'play', 'player-prefs-read', 'player-prefs-write', 'pose-clip', 'probe-key-reach',
-  'profiler', 'read-asset-def', 'read-asset-meta', 'render-scene', 'resolve-dom-point', 'resolve-entity',
+  'profiler', 'read-asset-def', 'read-asset-meta', 'refresh', 'render-scene', 'resolve-dom-point', 'resolve-entity',
   'resolve-entity-point', 'resolve-refs', 'resolve-unsaved', 'resume', 'save-all', 'scene-query', 'scene-state',
   'select-sprite-slice', 'set-animation-view-mode', 'set-collider-edit', 'set-focus-scope', 'set-game-view-device',
   'set-gizmo', 'set-playhead', 'set-scene-view-mode', 'set-selection', 'set-skin-mode', 'set-timescale',

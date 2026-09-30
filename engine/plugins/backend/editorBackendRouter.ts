@@ -18,6 +18,7 @@
  * part of the editorBackend client call surface.
  */
 
+import type { PendingOutside } from '../../tools/shared/pendingOutside';
 import fs from 'fs';
 // RELATIVE, not the `@modoki/engine/...` specifier — and never the `@modoki/engine/runtime`
 // barrel. Two separate reasons, both load-bearing:
@@ -401,6 +402,9 @@ export interface BackendContext {
    *  exact bytes written) so a watcher event that lands after the TTL is still
    *  recognized as a self-write while the on-disk bytes match (editor-core F9). */
   markEditorWrite(absPath: string, hash?: string | null): void;
+  /** The outside changes the editor has not applied yet (#1879): stamped on every answer by the host, and noted at once
+   *  by a route that writes a file outside the editor's own write guard. Absent in a test context. */
+  pendingOutside?: PendingOutside;
   /** SSR module loader, used by reimport handlers for postprocessor bakes. */
   ssrLoadModule(url: string): Promise<Record<string, unknown>>;
   /** Invalidate the virtual project-config module so the next reload picks up
@@ -3367,6 +3371,9 @@ async function describeUnresolvedAgainstLiveWorld(
       if (changed > 0) {
         stripBackfilledEntityIds(scene, backfilledIds);
         writeJsonAtomic(absPath, assetJsonBytes(scene)); // scene: matches serialize.ts (#835)
+        // An outside change, deliberately (docs/editor-hmr.md): the editor holds it until a refresh (#1879). Pending from
+        // this moment, not from the watcher's debounce, so this very answer says so.
+        notePendingOutsideWrite(ctx, absPath);
       }
       // ── C7: "no entity matching {guid}" was a LIE. ──
       // This route edits the scene FILE; create_entity/duplicate/prefab edit the LIVE world
@@ -3395,7 +3402,7 @@ async function describeUnresolvedAgainstLiveWorld(
         ...(alsoDeleted ? { alsoDeleted } : {}),
         ...(alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds } : {}),
         ...(alsoDeletedTotal ? { alsoDeletedTotal } : {}),
-        ...(liveHint ? { hint: liveHint } : {}),
+        ...(liveHint || changed > 0 ? { hint: [liveHint, changed > 0 ? REFRESH_HINT : null].filter(Boolean).join(' ') } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
         ...(applyCode ? { code: applyCode } : {}),
       });
@@ -4704,6 +4711,11 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       const outBytes = assetJsonBytes(out);
       writeJsonAtomic(abs, outBytes);
+      // A file-direct write is an outside change (docs/editor-hmr.md): held until a refresh (#1879), pending from now.
+      // Not an atlas: no watcher broadcast ever raises one (`NOT_LIVE_RELOADABLE` in liveReloadKinds.test.ts), so
+      // nothing would hold it and a refresh could not apply it — noted, it read as pending for the note's TTL (review U1).
+      const heldOutside = !selfWrite && type !== 'atlas';
+      if (heldOutside) notePendingOutsideWrite(ctx, abs);
       // ⚠️ **AFTER the write, and the order is the whole point** (the scar `/api/write-meta`
       // carries). Riding along with the probe meant a write that then threw — a read-only file,
       // ENOSPC — left the human's park destroyed with NOTHING written in its place. A failed write
@@ -4727,6 +4739,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // drift — after which every subsequent write 409s against a baseline that was never right.
       return json({
         ok: true, saved: true, warnings, path: assetPath,
+        ...(heldOutside ? { hint: REFRESH_HINT } : {}),
         sha256: crypto.createHash('sha256').update(outBytes).digest('hex'),
         // Present only when a park was in the way and the caller chose to proceed — never on a
         // clean write, so it stays a signal rather than a field readers learn to skip.
@@ -5939,6 +5952,9 @@ async function describeUnresolvedAgainstLiveWorld(
     // them generous headroom over the default relay timeout. Through `relayJson` because this route
     // carries most of the ops that NAME a §5 code: a bare `json(raw)` sent their refusal as a 200
     // (#1012), which only `postJson`'s `isFailureBody` rescued.
+    // A refresh right after a file-direct write applies it: wait (briefly) for the watcher to hand the renderer what a
+    // route noted, or the refresh would run a debounce ahead of the change it was called for (#1879).
+    if (action === 'refresh') await ctx.pendingOutside?.settled(1500);
     const relayed = await relayJson(ctx, action, relayParams, 60_000);
     // A success only: a refusal's `error` names paths in prose, and its status must pass untouched.
     if (relayed.kind === 'json' && relayed.status === undefined) {
@@ -6475,7 +6491,19 @@ export function isRelayTimeout(msg: string): boolean {
 /** Editor actions the /api/editor-action relay accepts (op names dispatched in
  *  the renderer by engine/app/editor/agentEditorOps.ts). Allowlisted so the relay
  *  can't invoke arbitrary renderer ops. Keep in sync with registerEditorAgentOps. */
+/** What a file-direct write's answer tells the agent (#1879): the editor does not show the file until a refresh. */
+const REFRESH_HINT = 'The editor holds this outside write until a refresh: call modoki_refresh to apply it, or the editor '
+  + 'shows the OLD file (pendingOutsideChanges lists what is held).';
+
+/** A route wrote `absPath` outside the editor's write guard: pending at once, in the watcher's own path form. */
+function notePendingOutsideWrite(ctx: BackendContext, absPath: string): void {
+  const url = ctx.pendingOutside ? ctx.absToAssetUrl(absPath) : null;
+  if (url) ctx.pendingOutside!.noteWrite(url);
+}
+
 const EDITOR_ACTIONS = new Set<string>([
+  // #1879: apply the outside changes the editor holds (Unity's AssetDatabase.Refresh()).
+  'refresh',
   'set-selection', 'set-gizmo', 'set-scene-view-mode', 'set-collider-edit',
   // GameView device simulation (#367). The READ half is not here — it is a GET route of its
   // own (/api/game-view-devices), because a read relayed through this POST relay would be a

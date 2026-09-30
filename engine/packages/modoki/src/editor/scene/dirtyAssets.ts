@@ -138,6 +138,10 @@ const lastFlushedSha = new Map<string, string>();
  *  too, which costs a refusal, never a false "holds". */
 const writeEpoch = new Map<string, number>();
 export function getAssetWriteEpoch(path: string): number { return writeEpoch.get(path) ?? 0; }
+/** The `writeEpoch` at which the last flush write of each path that LANDED started. Not `writeEpoch` itself, which a
+ *  refused write bumps too: a Save the human cancelled (its 409) is no editor write over an outside change (#1879 close-out
+ *  review 3). The START epoch, so a write already in flight when an outside change was held does not count as after it. */
+const landedWriteEpoch = new Map<string, number>();
 
 /** The flushes writing each path right now, settled when that FLUSH ends (its bookkeeping included — the park is
  *  dropped and `lastFlushed` recorded only after the whole loop). An asset-doc undo waits on these before reading the
@@ -320,7 +324,9 @@ export function markAssetDirty(
   path: string, type: AssetSchemaType, data: unknown, origin: AssetWriteOrigin = 'agent',
   ifMatch?: string,
 ): void {
-  dirty.set(path, { type, data, origin, ifMatch: ifMatch ?? dirty.get(path)?.ifMatch });
+  // A park of a file whose outside change is held and still on disk starts conflicted (#1879 close-out review 2).
+  const baseline = ifMatch ?? dirty.get(path)?.ifMatch ?? (outsideChangeStands(path) ? CHANGED_OUTSIDE_BASELINE : undefined);
+  dirty.set(path, { type, data, origin, ifMatch: baseline });
   flushErrors.delete(path); // a fresh edit supersedes the previous flush's failure
   bump();
 }
@@ -425,6 +431,43 @@ export function clearAssetIfMatch(path: string): boolean {
   return true;
 }
 
+/** A baseline no file's sha256 can equal: the file under this park changed OUTSIDE the editor. */
+export const CHANGED_OUTSIDE_BASELINE = 'changed-outside-the-editor';
+
+/** Outside changes to asset files the watcher HOLDS until a focus gain or `modoki_refresh` (#1879), each with the
+ *  editor's write count (`writeEpoch`) for that path when it was held. The park and the held change must not meet
+ *  silently in either direction (#1879 close-out reviews):
+ *  - a Save before the release must not write a park over the outside change — so a park of a held path, made before
+ *    the hold or after it, gets a baseline no file matches, and Cmd+S asks Overwrite or Cancel;
+ *  - once the editor HAS written the file since (the human chose Overwrite), the outside change is gone from disk, and the
+ *    release must apply nothing — dropping the park then threw away edits made after that save. */
+const heldOutside = new Map<string, number>();
+
+/** The watcher holds an outside change of `path` (a newer one restarts its count). Marks a park already there. */
+export function noteOutsideChangeHeld(path: string): boolean {
+  heldOutside.set(path, getAssetWriteEpoch(path));
+  const d = dirty.get(path);
+  if (!d || d.type === 'prefab') return false;
+  dirty.set(path, { ...d, ifMatch: CHANGED_OUTSIDE_BASELINE });
+  bump();
+  return true;
+}
+
+/** Has a write of the editor LANDED on `path` since its outside change was held (a refused Save does not count)? Then
+ *  that change is no longer on disk. */
+export function outsideChangeSuperseded(path: string): boolean {
+  const at = heldOutside.get(path);
+  return at !== undefined && (landedWriteEpoch.get(path) ?? 0) > at;
+}
+
+/** The release applied (or skipped) `path`'s held change: parks made from now on are ordinary. */
+export function endOutsideChangeHold(path: string): void { heldOutside.delete(path); }
+
+/** Is an outside change of `path` held and still on disk? A park made now must not be written over it unasked. */
+function outsideChangeStands(path: string): boolean {
+  return heldOutside.has(path) && !outsideChangeSuperseded(path);
+}
+
 /** True if any asset edit is pending a save. Folded into `hasUnsavedChanges()`. */
 export function hasDirtyAssets(): boolean { return dirty.size > 0; }
 
@@ -482,7 +525,7 @@ export function assetWrittenToDisk(path: string): boolean {
 }
 
 /** Test-only: drop every pending entry without writing it. */
-export function clearDirtyAssets(): void { dirty.clear(); cacheDiverged.clear(); lastFlushed.clear(); lastFlushedSha.clear(); lastFlushedHash.clear(); flushErrors.clear(); bump(); }
+export function clearDirtyAssets(): void { heldOutside.clear(); landedWriteEpoch.clear(); dirty.clear(); cacheDiverged.clear(); lastFlushed.clear(); lastFlushedSha.clear(); lastFlushedHash.clear(); flushErrors.clear(); bump(); }
 
 /** Drop pending asset writes WITHOUT writing them — the missing counterpart to `flushDirtyAssets`.
  *
@@ -573,6 +616,7 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
     for (const [path, entry] of dirty) {
       const { type, data, origin, ifMatch } = entry;
       writeEpoch.set(path, getAssetWriteEpoch(path) + 1);
+      const startedAt = getAssetWriteEpoch(path);
       const set = writesInFlight.get(path) ?? new Set<Promise<void>>();
       set.add(thisFlush);
       writesInFlight.set(path, set);
@@ -584,7 +628,7 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
         // that other flush's to use.
         const now = dirty.get(path);
         if (entry.overwrite && now?.type === 'prefab' && now.overwrite) dirty.set(path, { ...now, overwrite: undefined });
-        if (landed.ok) { saved.push(path); written.set(path, entry); continue; }
+        if (landed.ok) { saved.push(path); written.set(path, entry); landedWriteEpoch.set(path, startedAt); continue; }
         failed.push({ path, error: landed.error, ...(landed.conflict ? { conflict: true } : {}) });
         errorsByPath.set(path, { error: landed.error, conflict: landed.conflict });
         continue;
@@ -610,6 +654,7 @@ export async function flushDirtyAssets(): Promise<FlushResult> {
         }
         saved.push(path);
         written.set(path, entry);
+        landedWriteEpoch.set(path, startedAt);
         // The server's own hash of what it wrote — see `getLastFlushedAssetHash`. Absent from an
         // older backend's reply, in which case a CAS panel keeps its previous baseline and its next
         // save conflicts LOUDLY rather than writing against a baseline nobody vouched for.

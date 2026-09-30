@@ -14,12 +14,75 @@ Related: [editor-input.md](./editor-input.md) (the keymap contract), [debug-tool
 | You edit | What happens |
 |---|---|
 | `games/<id>/**.ts`, `games/<id>/game.ts` (game **code**) | **Full page reload** — the only thing that can apply it |
-| `games/<id>/runtime/assets/**` (scenes, prefabs, `.mat.json`, …) | No page reload; the **world** reloads via `modoki:scene-changed` |
+| `games/<id>/runtime/assets/**` (scenes, prefabs, `.mat.json`, …) | No page reload. **Held** until the editor window regains focus or an agent calls `modoki_refresh` (#1879, below); then the **world** reloads via `modoki:scene-changed` |
 | A shader **body** — `<name>.glsl` / `<name>.wgsl` | Same as above: remapped to its sibling `<name>.shader.json` and broadcast as `kind:'shader'` (#857) |
 | `games/<id>/tests/**`, `project.config.json` | Nothing (they don't affect the running editor) |
 | `editor/input/{keymap,focusScope,dispatcher}.ts`, `editor/createEditor.tsx` | **Full page reload** (registry can't survive a swap) |
 | `runtime/rendering/npr/**` | **Full page reload** (TSL nodes bake into compiled WGSL) |
 | Any other engine/editor source | Normal React Fast Refresh |
+
+### Outside changes wait for a focus gain or `modoki_refresh` (#1879)
+
+Owner, 2026-09-30: *"while a human is working on editor the reload doesn't happen. Editor must lose the focus and gain
+it again to trigger the reload."* And: *"for claude, claude can reload any time, and we show a toaster for a human with
+count down."* So the editor applies an outside change (a git pull, a hand edit, another tool, an agent's Write/Bash edit
+or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted on arrival, applied later in ONE batch.
+
+- **The hold.** Both watcher listeners in `initAgentBridge` hand the change to `holdOutsideChange`
+  (`outsideChangeHold.ts`: keyed by path, a rewrite moves the file to the end) instead of `handleSceneChanged`. Every
+  kind is held: scene, prefab and the `ASSET_CACHE_INVALIDATORS` kinds (whose `dropParkedWriteFor` discards a parked
+  edit, so it must wait too). NOT held: the manifest update (additive; a new file still appears in Assets), game and
+  shader CODE (the countdown below), and the editor's own put-backs (`reloadPrefabFromDisk`, a discarded park's
+  re-import), which are the editor's work, not an outside change.
+- **The release** (`releaseOutsideChanges`) moves the held batch into the #1164 deferral map and runs
+  `replaySuppressedSceneReloads`: scene files first, prefabs collapsed to one pass, in-place re-imports last, and
+  Play, a preview or a landing switch still defer it. Releases are serialized.
+- **A focus GAIN releases it** (`focusEdge.ts`, installed on the page's own `window`, both hosts): a `blur` counts as
+  a loss only when `document.hasFocus()` is still false 100 ms later (a move inside the page is not a loss), and the
+  next `focus` fires once. A `focus` while focused fires nothing, so working in the editor never reloads under the
+  human. An editor that starts unfocused counts its first focus as a gain. Measured live 2026-09-30: a hand edit held,
+  still held after `Finder` was brought forward, applied when the editor came back (`[agentBridge] applied 1 outside
+  change(s)`). ⚠️ Per #233 (editor-input.md) a focus event is never the ONLY way in: an agent-driven editor may never
+  be OS-focused, and a held change then waits for `modoki_refresh`.
+- **`modoki_refresh`** (the `refresh` op, `outsideRefresh.ts`) applies the held batch now. With the editor focused, the
+  human first sees the SHARED countdown (`countdownBanner.ts` `startCountdown`, the one the game-code reload uses: 5 s,
+  `hmr.banner.refresh-now` / `hmr.banner.cancel`). Cancel applies nothing and answers `cancelled: true`; the changes stay
+  pending. Unfocused, it applies at once. The backend waits up to 1.5 s for a write a route just noted to reach the
+  hold, so a refresh right after a file-direct write applies it.
+- **Every MCP answer names what is held.** The renderer pushes its list to its backend on every change (Electron
+  `bridge.send('pending-outside')`, Vite `modoki:pending-outside`); the host stamps it on every response it writes
+  (`writeBackendResult`, header `X-Modoki-Pending-Outside`, CAPPED at 50 paths plus the total count so a pull of
+  hundreds of files cannot make a giant header or a 431); the MCP server copies the last one a tool call saw into its
+  answer as `pendingOutsideChanges` / `pendingOutsideCount` / `pendingOutsideHint` (`pendingStamp.ts`, scoped per call,
+  spliced into the answer's JSON; a `modoki_batch` step is left alone and the batch's answer carries it once). The
+  header rides every stamped answer, the empty list too, so an error answer that bypasses the stamp keeps what the
+  tool's earlier call saw instead of reading as "nothing pending". A
+  file-direct route notes its own path at once (`notePendingOutsideWrite`), so its OWN answer lists it before the
+  watcher's debounce raises it; a note the renderer never confirms expires after 3 s. There is NO implicit flush on any
+  other call: a reload is always a deliberate act.
+- **A scene with unsaved edits is ASKED about** (owner ruling 2026-09-30, amends #1164 for the dirty case): see the
+  scene-reload paragraph below and [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
+
+- **A parked asset edit and a held outside write of the same file** (#1879 close-out reviews): until the release, a
+  Save would write the park straight over the outside change (most asset kinds send no `ifMatch`). So while the change
+  is held and still on disk, a park of that file, made before the hold or after it, carries a baseline no file matches
+  (`noteOutsideChangeHeld` / `markAssetDirty`, `dirtyAssets.ts`): Cmd+S asks Overwrite or Cancel
+  (`answerParkedConflicts`). **Cancel** keeps the park until the release, which drops it (`dropParkedWriteFor`, disk
+  wins) — the same end an outside write had before #1879, only later. **Overwrite** writes the park, and the editor's
+  write supersedes the held change (`outsideChangeSuperseded`: a write of the editor that LANDED after the hold; a Save
+  refused by the conflict does not count): the release then applies nothing, so edits made after that save survive it.
+- **Only where the editor is.** `agentEditorOps.ts` turns the hold on (`enableOutsideChangeHold`), with the `refresh` op
+  that applies it; a game page in dev has neither, and applies changes as they arrive.
+- **What Play or a hold deferred at a release stays in `pendingOutsideChanges`** until it replays; a refresh cannot
+  apply it and answers `deferred` with `deferredReason`. An agent's `scene` answer rides on the change
+  (`SceneChangedMsg.decision`), so it is carried out at that replay too — and only that release's answer: a change the
+  human sent back ("later", or `held`) carries none.
+- **Countdowns queue** (`startCountdown`): one banner, so a refresh countdown started during a game-code countdown waits
+  for it, and a Cancel always belongs to the countdown on screen; the persistent "Running STALE" banner comes back when
+  a countdown over it ends.
+
+Known limits, on purpose: the About/splash windows are separate OS windows, so switching to one and back is a focus
+gain; the focus events on Windows are unverified from a Mac (`win` re-checks it).
 
 ⚠️ **"The world reloads" does not mean every cached ASSET is re-read.** Per-kind invalidation on an
 external write lives in `ASSET_CACHE_INVALIDATORS` (`engine/app/debug/agentBridge.ts`) —
@@ -54,8 +117,11 @@ and the scene's unsaved edits, dirty flag and undo stack are kept. What that can
 The rule and why: [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history). The eviction
 and re-read described above are what a SCENE reload (and that clean-scene fallback) relies on.
 
-**A reload over unsaved edits discards them (disk wins) and drops their undo history with them**, then
-makes the reloaded world the clean baseline (#1409). The exception is a base scene the reload KEEPS:
+**An outside change to a scene with unsaved edits is ASKED about, never applied silently** (owner ruling 2026-09-30,
+#1879 part 3, amending #1164's disk-wins for the dirty case): a focused human gets the `scene-conflict` dialog, *Reload*
+/ *Keep mine*; nobody focused, it stays pending until `modoki_refresh {scene: 'reload' | 'keep'}`. A clean scene still
+reloads silently. A reload the human or agent CHOOSES discards the unsaved edits and drops their undo history with
+them, then makes the reloaded world the clean baseline (#1409). The exception is a base scene the reload KEEPS:
 its edits survive live and so does its dirty flag (#1417). The rule and why:
 [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
 
@@ -202,9 +268,9 @@ so, and the next Cmd+S wrote that stale world over the external change (a hand e
 
 Now the blocked change is recorded (keyed by path, logged as "scene hot-reload deferred") and
 `replaySuppressedSceneReloads` replays it through the same `handleSceneChanged` a live change takes, so
-it gets exactly the treatment it would have had one frame after Stop. **Disk wins** — including over
-unsaved edits the restored snapshot carried, which is what a stopped-mode external write already does
-(owner's call, 2026-09-13).
+it gets exactly the treatment it would have had one frame after Stop. A changed scene over unsaved edits the
+restored snapshot carried is ASKED about there too, since #1879 (the question lives in the replay's scene branch);
+until then disk won (owner's call, 2026-09-13).
 
 Three things about the replay are load-bearing:
 

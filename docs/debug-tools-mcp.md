@@ -1548,7 +1548,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*108 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*109 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1600,6 +1600,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_duplicate_entity` | POST `/api/editor-action` `duplicate-entity` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_mutate_scene` | POST `/api/scene-mutate` | live · undoable | editor + scene | entity | `{"ops":[{"op":"addEntity","name":"ContractProbe","parentId":0}]}` |
 | `modoki_prefab` | POST `/api/editor-action` `prefab` | both · undoable | editor + scene | entity | `{"action":"instantiate","path":"/assets/prefabs/probe.prefab.json"}` |
+| `modoki_refresh` | POST `/api/editor-action` `refresh` | live | editor | — | *(no args)* |
 | `modoki_reparent_entity` | POST `/api/editor-action` `reparent-entity` | live · undoable | editor + scene | entity | *(no args)* |
 | `modoki_save_all` | POST `/api/editor-action` `save-all` | file | editor | — | *(no args)* |
 | `modoki_set_transform` | POST `/api/scene-mutate` | live · undoable | editor + scene | entity | `{"entity":{"name":"ContractProbe"},"space":"local","position":[1,2,3]}` |

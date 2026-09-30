@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { sceneManager, setRunMode, registerAsset, unregisterAsset } from '@modoki/engine/runtime';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
-import { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloads } from '../../app/debug/agentBridge';
+import { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloads, releaseOutsideChanges } from '../../app/debug/agentBridge';
 import { beginWorldReplacement } from '../../packages/modoki/src/editor/scene/authoringSettle';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
@@ -31,8 +31,11 @@ let loadScene: ReturnType<typeof vi.spyOn>;
 /** Per-case override of what a prefab fetch answers — null means the file reads back unparsable. */
 let prefabFetch: (() => Response | Promise<Response>) | null = null;
 
+// Held since #1879 (the watcher's change waits for a focus gain or modoki_refresh); released at once, as a CHOSEN
+// reload: what a reload does is what these cases pin. The ask over unsaved work is `outsideSceneConflict.test.ts`.
 function emit(urlPath: string, kind: string): void {
   for (const cb of handlers.get('scene-changed') ?? []) cb({ urlPath, kind });
+  void releaseOutsideChanges({ decision: 'reload' });
 }
 async function settle(): Promise<void> {
   for (let i = 0; i < 10; i++) await Promise.resolve();

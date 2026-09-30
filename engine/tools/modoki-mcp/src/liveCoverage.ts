@@ -42,7 +42,7 @@ export const COVERED_BY_SMOKE: readonly string[] = [
   'modoki_write_player_prefs',
   'modoki_load_scene', 'modoki_set_selection', 'modoki_play_control', 'modoki_history',
   'modoki_tap', 'modoki_focus', 'modoki_dispatch_action', 'modoki_set_timescale', 'modoki_journal',
-  'modoki_hit_regions', 'modoki_profiler',
+  'modoki_hit_regions', 'modoki_profiler', 'modoki_refresh',
   'modoki_set_game_view_device', 'modoki_set_animation_view_mode',
   // UC3 (#1489): runs its tap in BOTH SceneView modes and restores the one it found, and in 'ui'
   // drags a translate-gizmo axis (mode AND space pinned, both restored) and undoes it.

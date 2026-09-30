@@ -27,7 +27,9 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, reloadPrefabFromDisk, setPrefabSourceRefresher, setParkedPrefabKeeper, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
+import { startCountdown } from '../debug/countdownBanner';
+import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
@@ -39,7 +41,7 @@ import {
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
   undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
-  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk,
+  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk, openChoiceModal,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
@@ -1459,6 +1461,29 @@ export function registerEditorAgentOps(): void {
   });
   // …and a PARKED prefab keeps its park across a change on disk (#1868, hub call a), its baseline marked stale.
   setParkedPrefabKeeper(keepParkedPrefabOverFileChange);
+  // #1879 part 3 (owner ruling 2026-09-30, amends #1164 for the dirty case): an outside change to a scene with unsaved
+  // edits ASKS "Reload / Keep mine" instead of letting the disk win. Unsaved = that scene's OWN edits: the primary's
+  // `sceneDirty` (the world's edit version against its save), a loaded base's dirty flag. Not the scene-guid registry
+  // alone for the primary: right after an Apply it reads clean while `sceneDirty` does not (#1878 re-verify). "Keep mine"
+  // needs no write: a scene save sends no if-match, so the next Cmd+S overwrites the file.
+  // #1879: outside changes wait for a focus gain or the `refresh` op below — only here, where that op exists.
+  enableOutsideChangeHold(true);
+  setSceneConflictResolver(makeSceneConflictResolver({
+    causes: unsavedChangeCauses,
+    ask: (urlPath) => openChoiceModal<'reload' | 'keep' | 'later'>({
+      kind: 'scene-conflict',
+      title: `${urlPath.split('/').pop() ?? urlPath} changed on disk`,
+      message: 'The scene file was changed outside the editor, and this scene has unsaved changes. Reload it from disk '
+        + '(your unsaved changes are lost), or keep your version (the next save overwrites the file)?',
+      choices: [
+        { value: 'reload', label: 'Reload', tone: 'danger' },
+        { value: 'keep', label: 'Keep mine', tone: 'primary' },
+      ],
+      cancelValue: 'later',
+      focus: 'keep',
+    }),
+    answer: answerSceneConflict,
+  }));
   // set-traits is the device's raw op; the editor replaces it (#1816), as it replaces create/duplicate/delete, so an
   // agent's write lands the way a human's Inspector edit does (`editorTraitWriter`). The whole call is ONE undo entry.
   // A posed world refuses it before any write, as it refuses every other editor write (a dry run writes nothing).
@@ -2751,6 +2776,30 @@ export function registerEditorAgentOps(): void {
       : '';
     throw new OpRefusal(flushedAll.length ? 'PARTIAL' : 'REFUSED_BY_OP', `${message}${note}`);
   }
+  // #1879: apply the held outside changes now — Unity's `AssetDatabase.Refresh()`. A human with the editor focused sees
+  // the shared countdown first, and a Cancel leaves everything pending (`outsideRefresh.ts`).
+  registerAgentOp('refresh', async (params) => {
+    const { scene } = (params ?? {}) as { scene?: unknown };
+    if (scene !== undefined && scene !== 'reload' && scene !== 'keep') {
+      throw new OpRefusal('REFUSED_BY_OP', `refresh: scene must be "reload" or "keep", got ${JSON.stringify(scene)}`);
+    }
+    return refreshOutsideChanges({
+      pending: heldOutsideChanges,
+      awaiting: awaitingSceneDecisions,
+      deferred: deferredOutsideChanges,
+      focused: editorWindowFocused,
+      countdown: (paths) => new Promise((resolve) => {
+        const what = paths.length === 1 ? paths[0].split('/').pop() : `${paths.length} changed files`;
+        startCountdown({
+          text: (msLeft) => `Claude is reloading ${what} from disk in ${Math.ceil(msLeft / 1000)}s`,
+          now: { id: 'refresh-now', label: 'Reload now' },
+          onElapse: () => resolve('go'),
+          onCancel: () => resolve('cancel'),
+        });
+      }),
+      release: releaseOutsideChanges,
+    }, scene);
+  });
   registerAgentOp('save-all', async (params) => {
     const { path: savePath } = (params ?? {}) as { path?: string };
     // Prefab-edit mode deliberately NULLS the scene path so a normal save can't target a real

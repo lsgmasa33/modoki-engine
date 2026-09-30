@@ -11,7 +11,7 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../../app/ecs/registerTraits';
-import { runAgentOp, initAgentBridge, peekSuppressedSceneReloads } from '../../../app/debug/agentBridge';
+import { runAgentOp, initAgentBridge, peekSuppressedSceneReloads, releaseOutsideChanges } from '../../../app/debug/agentBridge';
 import { registerEditorAgentOps } from '../../../app/editor/agentEditorOps';
 import { registerAsset, clearManifest } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import { loadSceneReporting, saveScene } from '../../../packages/modoki/src/editor/scene/serialize';
@@ -31,6 +31,7 @@ import { notifyListeners } from '../../../packages/modoki/src/runtime/core/notif
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templateIdentity';
 import { ROOT_URL, type FuzzBackend } from './backend';
+import { classifyJsonAssetPath } from '../../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
 
 type Handler = (data: unknown) => void;
 
@@ -197,7 +198,7 @@ export async function flushWatcher(be: FuzzBackend, before: Map<string, string>)
     if (!url.endsWith('.json')) continue;
     try {
       const id = (JSON.parse(text) as { id?: string }).id;
-      if (id) assets.push({ guid: id, path: url, type: url.endsWith('.prefab.json') ? 'prefab' : 'scene' });
+      if (id) assets.push({ guid: id, path: url, type: classifyJsonAssetPath(url) ?? 'scene' });
     } catch { /* unreadable: the host's scan skips it too */ }
   }
   bridge.emit('manifest-updated', { assets });
@@ -205,9 +206,14 @@ export async function flushWatcher(be: FuzzBackend, before: Map<string, string>)
   for (const url of changed.sort()) {
     if (be.marked.has(url)) continue;
     raised.push(url);
-    bridge.emit('scene-changed', { urlPath: url, kind: url.endsWith('.prefab.json') ? 'prefab' : 'scene' });
+    // Typed as the host's watcher types it (`classifySceneChange`, over the same classifier), so a particle or material
+    // change reaches the asset branch (#1879 review 2, #6); the fuzzer itself only writes scenes and prefabs.
+    bridge.emit('scene-changed', { urlPath: url, kind: classifyJsonAssetPath(url) ?? 'scene' });
   }
   be.marked.clear();
+  // The watcher only HOLDS a change (#1879); the editor applies the batch on a focus gain or `modoki_refresh`, which is
+  // this call. At once, as a refresh from an unfocused editor does: the fuzzer judges what a change does, not when.
+  await releaseOutsideChanges();
   await settle();
   return raised;
 }

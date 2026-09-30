@@ -30,6 +30,8 @@
  *  Deliberately plain DOM, not React: the banner must survive a render crash that has
  *  already taken the panel tree down, which is exactly case 2. */
 
+import { showBanner, startCountdown, COUNTDOWN_MS } from './countdownBanner';
+
 interface HmrStatus {
   /** Hot updates applied since this page loaded. 0 means "nothing has changed under me". */
   updates: number;
@@ -61,9 +63,8 @@ const RECENT_CAP = 10;
 const CRASH_WINDOW_MS = 2000;
 /** One reload per crash, ever. Without this a crash that reproduces on boot would loop. */
 const RELOAD_GUARD_KEY = 'modoki:hmr-recovered';
-/** Grace window before discarding unsaved work. Long enough to read the banner and
- *  hit Cancel or Save; short enough that the normal flow still feels immediate. */
-const DISCARD_GRACE_MS = 5000;
+/** Grace window before discarding unsaved work — the shared countdown's (`countdownBanner.ts`), also a refresh's. */
+const DISCARD_GRACE_MS = COUNTDOWN_MS;
 /** Set just before a reload that will drop unsaved edits, read back after it. The whole
  *  point: the loss outlives the page that caused it, so it can be reported. */
 const DISCARDED_KEY = 'modoki:hmr-discarded';
@@ -79,50 +80,6 @@ const HOOK_ORDER_SIGNATURES = [
 
 function isHookOrderError(message: string): boolean {
   return HOOK_ORDER_SIGNATURES.some((sig) => message.includes(sig));
-}
-
-const BANNER_ID = 'modoki-hmr-banner';
-
-/** `id` becomes the button's `data-ui-id`, `hmr.banner.<id>` — named, not found by its text, so an
- *  agent can press Cancel inside the discard countdown by aiming at it (#1470's sibling). */
-interface BannerAction { id: string; label: string; onClick: () => void }
-
-/** Show (or replace) the HMR banner. Returns a handle so a countdown can retarget the
- *  text without rebuilding the node (which would drop the user's click target). */
-function showBanner(text: string, actions: BannerAction[], tone: 'warn' | 'info' = 'warn'): {
-  setText: (t: string) => void; remove: () => void;
-} {
-  document.getElementById(BANNER_ID)?.remove();
-  const el = document.createElement('div');
-  el.id = BANNER_ID;
-  el.setAttribute('role', 'status');
-  el.dataset.uiId = 'hmr.banner';
-  const bg = tone === 'warn' ? '#7a3b00' : '#1f3a5f';
-  const border = tone === 'warn' ? '#c26a10' : '#3d6ea8';
-  el.style.cssText = [
-    'position:fixed', 'left:50%', 'transform:translateX(-50%)', 'top:8px', 'z-index:2147483647',
-    'display:flex', 'gap:10px', 'align-items:center',
-    'padding:8px 14px', 'border-radius:6px',
-    `background:${bg}`, 'color:#fff', `border:1px solid ${border}`,
-    'font:13px/1.4 system-ui,sans-serif', 'box-shadow:0 4px 14px rgba(0,0,0,.45)',
-  ].join(';');
-  const label = document.createElement('span');
-  label.textContent = text;
-  el.append(label);
-  for (const a of actions) {
-    const btn = document.createElement('button');
-    btn.textContent = a.label;
-    btn.dataset.uiId = `hmr.banner.${a.id}`;
-    btn.style.cssText =
-      `padding:3px 10px;border-radius:4px;border:0;background:#fff;color:${bg};font-weight:600;cursor:pointer`;
-    btn.onclick = a.onClick;
-    el.append(btn);
-  }
-  document.body.appendChild(el);
-  return {
-    setText: (t: string) => { label.textContent = t; },
-    remove: () => el.remove(),
-  };
 }
 
 /** Fire-and-forget editor-journal emit, so a discarded-work event is visible to
@@ -304,7 +261,7 @@ export function initHmrStaleness(
   //     which a Fast Refresh boundary upstream silently swallowed.
   // Same handling for both, deliberately: the reload WILL happen (stale is the worse failure),
   // but never at the cost of unsaved work without a readable warning that NAMES it (#850).
-  let countdown: ReturnType<typeof setInterval> | null = null;
+  let countdown: { stop: () => void } | null = null;
   const onCodeChanged = (label: string) => async (data: { file?: string }) => {
     const file = data?.file ?? label;
     const causes = await isDirty();
@@ -314,17 +271,15 @@ export function initHmrStaleness(
       return;
     }
 
-    // Read before the countdown is touched: an await between clearing one interval and setting the next would let an
+    // Read before the countdown is touched: an await between stopping one countdown and starting the next would let an
     // overlapping change leak the first.
     const liveWorld = causes.sceneDirty ? await liveWorldLabel() : null;
 
     // Dirty: the reload WILL happen (that is the chosen policy — stale code is the worse
     // failure), but never as a surprise. A grace window makes the warning readable and
     // leaves an escape hatch; doing nothing takes the loss.
-    if (countdown) clearInterval(countdown);
-    const deadline = Date.now() + DISCARD_GRACE_MS;
+    countdown?.stop();
     const discardNow = async (): Promise<void> => {
-      if (countdown) clearInterval(countdown);
       // RE-CHECK, don't trust the causes captured 5s ago. Saving is an advertised response to
       // this banner, so the common case is that the editor is CLEAN by now — recording a
       // discard that never happened would poison the one signal
@@ -339,39 +294,30 @@ export function initHmrStaleness(
     };
     const capitalized = capitalize(label);
     const lost = describeCauses(causes, false, liveWorld);
-    const text = (msLeft: number) =>
-      `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; ${lost} will be LOST`;
-    const banner = showBanner(text(DISCARD_GRACE_MS), [
-      { id: 'reload-now', label: 'Reload now', onClick: () => { void discardNow(); } },
-      {
-        id: 'cancel',
-        label: 'Cancel',
-        onClick: () => {
-          if (countdown) clearInterval(countdown);
-          // Cancelling is a deliberate choice to keep the edits AND the old build. That is
-          // a stale editor, so say so loudly and keep saying it — this is the state where
-          // measurements silently lie.
-          status.staleGameCode = true;
-          console.warn(
-            `[modoki] reload cancelled — this editor is now running STALE ${label} (${file}). ` +
-            `Save and reload before trusting anything you measure here.`,
-          );
-          journal('!hmr.stale-game-code', { file, kind: label });
-          showBanner(`Running STALE ${label} — reload to apply`, [
-            { id: 'reload', label: 'Reload', onClick: () => location.reload() },
-          ]);
-        },
+    countdown = startCountdown({
+      ms: DISCARD_GRACE_MS,
+      text: (msLeft) => `${capitalized} changed — reloading in ${Math.ceil(msLeft / 1000)}s; ${lost} will be LOST`,
+      now: { id: 'reload-now', label: 'Reload now' },
+      onElapse: () => { void discardNow(); },
+      onCancel: () => {
+        // Cancelling is a deliberate choice to keep the edits AND the old build. That is
+        // a stale editor, so say so loudly and keep saying it — this is the state where
+        // measurements silently lie.
+        status.staleGameCode = true;
+        console.warn(
+          `[modoki] reload cancelled — this editor is now running STALE ${label} (${file}). ` +
+          `Save and reload before trusting anything you measure here.`,
+        );
+        journal('!hmr.stale-game-code', { file, kind: label });
+        showBanner(`Running STALE ${label} — reload to apply`, [
+          { id: 'reload', label: 'Reload', onClick: () => location.reload() },
+        ], 'warn', { persistent: true });
       },
-    ]);
+    });
     console.warn(
       `[modoki] ${label} changed (${file}) and the editor has UNSAVED WORK (${describeCauses(causes, true, liveWorld)}) — ` +
       `reloading in ${DISCARD_GRACE_MS / 1000}s, which will discard it.`,
     );
-    countdown = setInterval(() => {
-      const left = deadline - Date.now();
-      if (left <= 0) void discardNow();
-      else banner.setText(text(left));
-    }, 250);
   };
   hot.on('modoki:game-code-changed', onCodeChanged('game code'));
   // A stale shader graph lies exactly the way stale game code does, so it gets the same

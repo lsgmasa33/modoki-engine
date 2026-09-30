@@ -822,6 +822,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | U13 | Applying to the inner asset clears the outer's override | "If Apply to Prefab 'Vase' is chosen and the 'Table' Prefab has an override of the value, this override in the 'Table' Prefab is reverted at the same time." [M22 `PrefabOverridesMultiLevel`] | The same (#1693, owner 2026-09-28, superseding #1492 ruling b): every enclosing level's statement of the applied field, tag or removed component is dropped, its file written in the same step, and Apply's undo restores it. | match |
 | U14 | Apply All on the outermost root | Targets the outer prefab only. Nested edits become overrides on the nested instance inside it. [M22 `PrefabOverridesMultiLevel`] | The same for fields, added tags, removed components and removed members (#1693, owner 2026-09-28, superseding the 2026-09-19 ruling): the outer instance lists them (`keys.nested`) and writes them into the outer prefab by default; the nested prefab only when picked. A nested frame's added nodes are still applied from the nested instance, which offers every target on the chain (U12); no listing on the outer one produces their key. | match for fields, components and removed members; **diverges** for added nodes (listed on the nested instance only) |
 | U15 | The instance after an Apply | The applied value now comes from the asset, so the override disappears. | The same: Apply takes what it applied out of the source instance's overrides (#1469), and nothing shadows it any more (U13). | match |
+| U15b | Apply, then close the scene without saving | Apply writes the prefab asset at once and leaves the scene dirty ([S6 `PrefabUtility.ApplyAddedGameObject`]: the object "becomes part of the Prefab Asset, and is no longer an override on the Prefab instance"). Discarding the scene leaves its file with the old added object, beside the asset's new child. INFERRED from the documented write model, not run in Unity. | The same since #1868 (Apply saves no scene): after an Apply of an added child, Don't Save and reopen shows the child twice (#1878 re-verify, 2026-09-30). The OTHER ways the two halves split, an outside write of the scene file between the Apply and Cmd+S, now ask Reload / Keep mine (#1879 part 3). | match |
 
 ### Unpack, Prefab Mode, Replace, Create
 
@@ -1850,8 +1851,8 @@ it, keeping its own overrides, as Unity's reimport does. It used to take the wat
 reload of the whole open scene, and an unrelated unsaved scene edit and the undo stack went with it. During Play or a
 preview it waits and replays as a re-import, not a reload. An instance it cannot rebase (a stale nested frame) is named
 in the reply's `notRebased`, whose way out is an explicit scene reload. An undo step that depended on the discarded
-document (the undone Apply's redo) refuses through its own precondition. An outside change to the file still reloads
-the scene (#1164; R1, the owner's call pending). An asset document's discard leaves its live edit. **A build or OTA publish** warns when
+document (the undone Apply's redo) refuses through its own precondition. An outside change to the file waits for a
+focus gain or `modoki_refresh` (#1879) and is then re-imported in place (#1873 R1). An asset document's discard leaves its live edit. **A build or OTA publish** warns when
 anything is unsaved (`confirmUnsavedBeforeBuild`), since a build reads the files.
 
 What the owner gives up (D1): after undoing an Apply, the file still holds the applied version until Cmd+S. A git

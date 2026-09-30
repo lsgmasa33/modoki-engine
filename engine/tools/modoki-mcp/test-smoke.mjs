@@ -2123,6 +2123,44 @@ await withCleanup(async () => {
   if (swept.isError) throw new Error(`UC15 could not trash its probes — they are STILL in the project (${UC15_PART}, ${UC15_MAT}): ${text(swept).slice(0, 300)}`);
 });
 
+// UC16 — #1879: an outside write is HELD until modoki_refresh, and the answers say so meanwhile. The router test
+// fakes the renderer; only a live editor proves the whole chain: the route's own note, the renderer's hold and its push
+// to the backend, the header on every answer, the MCP's splice, and the refresh relayed to the real release.
+const UC16_PART = `${SMOKE_DIR}/mcp-smoke-1879.particle.json`;
+{
+  const pre = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { name: 'mcp-smoke-1879' } })));
+  if (pre.assets?.length) throw new Error(`UC16 cannot run: ${pre.assets.map((a) => a.path).join(', ')} already exists — a previous run left it behind. Trash it and re-run.`);
+  await withCleanup(async () => {
+    const made = JSON.parse(text(await client.callTool({ name: 'modoki_create_asset', arguments: { type: 'particle', path: UC16_PART } })));
+    if (!made.ok) throw new Error(`UC16 could not scaffold its probe particle: ${JSON.stringify(made).slice(0, 300)}`);
+    const schema = JSON.parse(text(await client.callTool({ name: 'modoki_asset_schema', arguments: { type: 'particle' } })));
+    // A file-direct write (no selfWrite): an OUTSIDE change, pending from its own answer.
+    const wrote = JSON.parse(text(await client.callTool({ name: 'modoki_write_asset', arguments: { path: UC16_PART, type: 'particle', data: { ...schema.example, id: made.id, maxParticles: 123 }, replace: true } })));
+    if (!wrote.ok) throw new Error(`UC16 write_asset failed: ${JSON.stringify(wrote).slice(0, 300)}`);
+    if (!wrote.pendingOutsideChanges?.includes(UC16_PART) || typeof wrote.pendingOutsideCount !== 'number') {
+      throw new Error(`UC16 the write's own answer must list ${UC16_PART} in pendingOutsideChanges: ${JSON.stringify(wrote).slice(0, 400)}`);
+    }
+    // The watcher's copy reaches the renderer's hold: a later answer still lists it (the route's note lasts 3 s alone).
+    await new Promise((r) => setTimeout(r, 3500));
+    const held = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (!held.pendingOutsideChanges?.includes(UC16_PART)) {
+      throw new Error(`UC16 after the route's note expired, the renderer's hold must still list ${UC16_PART} — the renderer never held it, or never told the backend: ${JSON.stringify(held.pendingOutsideChanges)}`);
+    }
+    const refreshed = JSON.parse(text(await client.callTool({ name: 'modoki_refresh', arguments: {} })));
+    if (refreshed.cancelled) throw new Error('UC16 a human pressed Cancel on the refresh countdown — re-run without touching the editor');
+    if (!refreshed.applied?.includes(UC16_PART)) throw new Error(`UC16 modoki_refresh must apply ${UC16_PART}: ${JSON.stringify(refreshed).slice(0, 400)}`);
+    const after = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+    if (after.pendingOutsideChanges?.includes(UC16_PART)) throw new Error(`UC16 still pending after the refresh: ${JSON.stringify(after.pendingOutsideChanges)}`);
+    console.log('UC16 file-direct write → pending in its own answer and in the renderer\'s hold → modoki_refresh applies it → no longer pending ✓');
+  }, async () => {
+    const swept = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [UC16_PART], discardUnsaved: true } });
+    if (swept.isError) throw new Error(`UC16 could not trash its probe — it is STILL in the project (${UC16_PART}): ${text(swept).slice(0, 300)}`);
+    // The editor's own delete is marked, so the watcher should raise nothing here; a refresh leaves nothing pending behind
+    // either way.
+    await client.callTool({ name: 'modoki_refresh', arguments: {} });
+  });
+}
+
 } catch (e) {
   runFailure = e;
 }

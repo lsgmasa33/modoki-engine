@@ -100,7 +100,8 @@ import { resolveIconInputs, stampExtrasFrom, iconInputsToArgs } from '../scripts
 import { scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
-import { writeBackendResult } from './backend/writeResult';
+import { writeBackendResult, setResultStamp } from './backend/writeResult';
+import { createPendingOutside } from '../tools/shared/pendingOutside';
 import { openInOS } from './backend/osOpen';
 import { shipTranscoders } from './transcoders';
 
@@ -1747,6 +1748,10 @@ export function assetScannerPlugin(): Plugin {
   // The live trait-registry schema, pushed by the browser over the HMR socket
   // (see app/debug/agentBridge.ts). Used to validate scene/trait JSON server-side.
   let cachedSchema: SceneSchema | undefined;
+  // The outside changes the browser holds unapplied (#1879), stamped on every answer. Only the browser host's renderer
+  // pushes here; an Electron renderer pushes to main's backend.
+  const pendingOutside = createPendingOutside();
+  setResultStamp(() => pendingOutside.headers());
   // In-flight browser requests (e.g. /api/scene-state relays to the browser and
   // waits for its modoki:response). Lifecycle + timer bookkeeping live in
   // createBrowserRequestRegistry (above), factored out so it's unit-testable.
@@ -1977,6 +1982,9 @@ export function assetScannerPlugin(): Plugin {
       });
       // Kept as a second source: a tab loaded before the announce existed still gets counted, and
       // this is also the reconnect path for one whose hello raced a server restart.
+      ws.on('modoki:pending-outside', (data: unknown) => {
+        if (Array.isArray(data)) pendingOutside.fromRenderer(data.filter((p): p is string => typeof p === 'string'));
+      });
       ws.on('modoki:schema', (data: SceneSchema, client?: unknown) => {
         cachedSchema = data;
         if (client !== undefined) bridgeClients.add(client);
@@ -2168,6 +2176,7 @@ export function assetScannerPlugin(): Plugin {
             rebuildManifest,
             requestBrowser,
             getSchema: () => cachedSchema,
+            pendingOutside,
             markEditorWrite,
             ssrLoadModule: (url) => server.ssrLoadModule(url) as Promise<Record<string, unknown>>,
             invalidateProjectConfig: () => {

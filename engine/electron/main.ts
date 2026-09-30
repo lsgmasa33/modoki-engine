@@ -296,6 +296,8 @@ import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneVa
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListeners';
 import { createUnsavedGateClient } from './unsavedGateClient';
+import { createPendingOutside } from '../tools/shared/pendingOutside';
+import { setResultStamp } from '../plugins/backend/writeResult';
 import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /**
@@ -774,6 +776,10 @@ let resetHeldPointerOnReload: (() => void) | null = null;
 // ── R→M: the renderer's pushed trait schema (undefined ⇒ ref-only validation). ──
 let cachedSchema: SceneSchema | undefined;
 
+// ── R→M: the outside changes the renderer holds unapplied (#1879), stamped on every backend answer. ──
+const pendingOutside = createPendingOutside();
+setResultStamp(() => pendingOutside.headers());
+
 /** Ask the renderer's unsaved-work gate before a window close, a quit, a project switch or a
  *  reload discards it (#1419). The policy — two phases, and why a dead renderer proceeds — is in
  *  `unsavedGateClient.ts`. */
@@ -1176,6 +1182,8 @@ async function createWindow(backendBase: string) {
   // download, a 204 — observed on Electron 43.2. Clearing readiness there made the next Cmd+Q
   // skip the prompt on a still-dirty editor. `did-navigate` is main-frame and committed only.
   win.webContents.on('did-navigate', () => {
+    // A new page holds nothing: the old one's held changes are read from disk by the load (#1879).
+    pendingOutside.fromRenderer([]);
     gateRendererReady = false;
     unsavedGate.releaseAll();
     mountWaiter.onNavigate();
@@ -1734,6 +1742,7 @@ app.whenReady().then(async () => {
     getHeldPointer: () => inputRoutes.getHeldPointer(),
     requestBrowser: requestRenderer,
     getSchema: () => cachedSchema,
+    pendingOutside,
     markEditorWrite: (p, h) => state.backend.markEditorWrite(p, h),
     ssrLoadModule: (url) => getSsrLoadModule(state.root, REPO_ROOT).then((load) => load(url)),
     // main has no Vite module graph, and a project_settings write reaches THIS Electron backend
@@ -2098,6 +2107,8 @@ app.whenReady().then(async () => {
     if (!mainWindow || e.senderFrame !== mainWindow.webContents.mainFrame) return;
     if (msg.event === 'schema') {
       cachedSchema = msg.data as SceneSchema;
+    } else if (msg.event === 'pending-outside') {
+      if (Array.isArray(msg.data)) pendingOutside.fromRenderer(msg.data.filter((p): p is string => typeof p === 'string'));
     } else if (msg.event === 'menu-structure') {
       // Editor pushed its menu structure → rebuild the OS menu so its actions
       // (and dynamic labels/enabled state) show natively.

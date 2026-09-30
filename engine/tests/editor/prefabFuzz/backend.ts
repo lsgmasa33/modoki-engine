@@ -26,6 +26,7 @@ import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { loadManifestJson } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
+import { classifyJsonAssetPath } from '../../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
 
 /** Asset URLs the fuzzer's project serves: `/fuzz/...` maps onto the scratch directory. */
 export const ROOT_URL = '/fuzz';
@@ -74,7 +75,9 @@ export function makeFuzzBackend(): FuzzBackend {
       if (!url.endsWith('.json') || url.endsWith('.meta.json')) continue;
       let guid: string | undefined;
       try { guid = (JSON.parse(fs.readFileSync(p, 'utf8')) as { id?: string }).id; } catch { /* unreadable: no guid */ }
-      assets.push({ path: url, type: url.endsWith('.prefab.json') ? 'prefab' : 'scene', guid });
+      // The real classifier, so a test's particle or material is typed as one (#1879's parked-asset case); anything it
+      // does not know stays a scene, as every file here was before.
+      assets.push({ path: url, type: classifyJsonAssetPath(url) ?? 'scene', guid });
     }
     return { version: 2, assets, folders: [] };
   };

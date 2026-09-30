@@ -168,7 +168,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { ops: [{ op: 'addEntity', name: 'ContractProbe', parentId: 0 }] },
-    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first) — or, in prefab-edit mode, to the prefab-edit world (`prefabEditWorld`, /__prefab-edit__/<guid>), which is LIVE-ONLY: no file-direct fallback, 409 unless that world is loaded with its edit session open (#1254). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`. Refuses 409 `wrongKind` (with `existingType`) for a path that is not a scene — a `.prefab.json` used to be parsed and rewritten as one (#1472). And 409 REFUSED_BY_OP, `reason: scene-format-<too-new|too-old|unreadable>`, for a scene file this build cannot load — nothing is written.",
+    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first) — or, in prefab-edit mode, to the prefab-edit world (`prefabEditWorld`, /__prefab-edit__/<guid>), which is LIVE-ONLY: no file-direct fallback, 409 unless that world is loaded with its edit session open (#1254). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because applying the write reloads the scene over it (the editor holds the write until modoki_refresh or a focus gain, #1879, and the answer's pendingOutsideChanges lists it) — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`. Refuses 409 `wrongKind` (with `existingType`) for a path that is not a scene — a `.prefab.json` used to be parsed and rewritten as one (#1472). And 409 REFUSED_BY_OP, `reason: scene-format-<too-new|too-old|unreadable>`, for a scene file this build cannot load — nothing is written.",
   },
   modoki_set_transform: {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
@@ -410,6 +410,11 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'save-all',
     mutating: true, persists: 'file',
     notes: 'The ONLY route from a live edit to disk — persistence is manual.',
+  },
+  modoki_refresh: {
+    kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'refresh',
+    mutating: true, undoable: false, persists: 'live', requires: ['editor'],
+    notes: 'Applies the outside changes the editor holds (#1879): they apply on a focus gain of the editor window or here, never on another tool call. The backend waits up to 1.5 s for a file-direct write it just made to reach the hold before it relays. With a human focused: a 5 s countdown (hmr.banner.refresh-now / hmr.banner.cancel), and Cancel answers cancelled:true with nothing applied. A scene with unsaved edits is ASKED about (owner ruling 2026-09-30, amends #1164): the dialog `scene-conflict` (Reload / Keep mine) for a focused human, otherwise pending until `scene`. A reload of the open scene drops its undo stack, as any disk reload does.',
   },
   modoki_discard_asset_edits: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'discard-asset-edits',

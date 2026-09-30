@@ -2678,8 +2678,22 @@ Where it applies:
   one undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the
   fresh world. (`newScene` and prefab-edit entry keep no base, so they clear every flag.)
 - **A scene hot-reload** (an external write to the open scene's FILE) replaces the
-  world from disk without going through the editor's `loadScene`. Disk wins over unsaved edits
-  (owner, 2026-09-13, #1164), except in a kept base.
+  world from disk without going through the editor's `loadScene`. It is HELD until the editor regains focus or
+  `modoki_refresh` runs (#1879, [editor-hmr.md § Outside changes wait](editor-hmr.md#outside-changes-wait-for-a-focus-gain-or-modoki_refresh-1879)).
+  **Over unsaved edits the editor ASKS, "Reload / Keep mine"** (owner ruling 2026-09-30, #1879 part 3, amending
+  #1164's disk-wins, which stands for a clean scene): the `scene-conflict` dialog for a focused human; with nobody
+  focused the change stays pending until `modoki_refresh {scene: 'reload' | 'keep'}`, and a countdown never discards
+  unsaved scene work. Asked in `handleSceneChanged`'s scene branch (`setSceneConflictResolver`, installed by
+  `agentEditorOps.ts`; the decision is `outsideRefresh.ts`), so a change deferred through Play is asked about at its
+  replay too. "Unsaved" is the changed scene's OWN edits: the primary's `sceneDirty` (the edit version against its
+  save), a loaded base's dirty flag. Not the scene-guid registry for the primary: right after an Apply it reads clean
+  while `sceneDirty` does not (the #1878 re-verify), and keyed on it the question would never be asked there. Asked
+  BEFORE the stack's debt is raised, so a kept scene keeps its undo. **Keep mine writes nothing**: a scene save sends
+  no if-match (`writePrimaryScene` → an unconditional `/api/write-file`), so the world simply stays dirty and the next
+  Cmd+S overwrites the file. Dismissing the dialog (Escape) puts the change back in the hold, asked again at the next
+  focus gain or refresh. #1878's two Apply splits (an outside scene write between an Apply and Cmd+S duplicating or
+  losing the applied child) are what this closes: `outsideSceneConflict.test.ts`. A chosen Reload discards the unsaved
+  edits, except in a kept base.
   **A PREFAB change no longer reloads — owner ruling 2026-09-30 (#1873 R1), reversing #1164 for prefabs, the
   Unity way.** An outside write, delete or put-back of a prefab the open scene uses re-imports it and updates its
   instances IN PLACE (`reimportOutsidePrefabChanges`, `editor/scene/prefabReimport.ts`), keeping the scene's unsaved
@@ -2704,7 +2718,7 @@ Where it applies:
     the overtaking load found the base in both chains and KEPT the stale live copy, and nothing
     re-queued the change, so the external write was lost and a later save wrote the stale base over
     it (reproduced in review). Now the base is not kept, so the editor's adopt treats its edits as
-    discarded: disk wins, as it does for any hot reload (#1164).
+    discarded: disk wins, as it does for a reload the user or agent chose (#1164, #1879).
   - **[S6] After the swap** the hot reload is not rejected: a newer load is not a teardown, so it
     resolves. It adopts only while its world is still current (`sceneAdoption.ts`, #1698). In
     practice it resolves FIRST, because the tail's only yielding await is the scene managers'
