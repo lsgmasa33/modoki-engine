@@ -46,6 +46,19 @@ describe('editor ops resolve addresses through entityRef.ts (#1223)', () => {
     expect(a.isAlive() && b.isAlive()).toBe(true);
   });
 
+  // #1912: a miss beside a live ref used to delete the live one and answer ok:true with the miss in `skipped`.
+  // Mutation: refuse only when `deleted.length === 0` (the old all-miss check) — B is deleted and the call resolves.
+  it('delete-entities with one live ref and one miss refuses NOT_FOUND and deletes NOTHING (#1912)', async () => {
+    const a = game!.spawn(Transform(), EntityAttributes({ name: 'A' }));
+    const b = game!.spawn(Transform(), EntityAttributes({ name: 'B' }));
+    const gone = guidOf(a);
+    destroyEntity(a);
+    const err = await runAgentOp('delete-entities', { guids: [guidOf(b), gone] }).then(() => null, (e: unknown) => e);
+    expect(err).toMatchObject({ code: 'NOT_FOUND' });
+    expect((err as Error).message).toContain(`1 of 2 ref(s) matched no live entity — NOTHING was deleted. Missing: ${gone}`);
+    expect(b.isAlive()).toBe(true);
+  });
+
   // Mutation: in resolveParentId, go back to `p.parentGuid ? {guid} : p.parentId ? {id} : 0`.
   it('create-entity with parentGuid beside a non-zero parentId is refused, and creates nothing', async () => {
     const a = game!.spawn(Transform(), EntityAttributes({ name: 'A' }));

@@ -398,7 +398,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'failed discard. To revert the VALUE too, apply the previous def first, then discard.\n\n'
       + 'A parked PREFAB (an undone Apply) is the exception: it is re-imported from its file IN PLACE — '
       + "its instances rebuilt, the scene's unsaved edits and undo kept (`reimported`; `notRebased` names any "
-      + 'instance it could not rebuild, with the reload that would). In Play it waits for Stop (`reimportDeferred`).\n\n'
+      + 'instance it could not rebuild, with the reload that would). In Play it waits for Stop (`reimportDeferred`). A prefab '
+      + 'whose re-import FAILS answers `PARTIAL` with `reimportFailed` (path + reason): its write IS dropped, but the editor '
+      + 'did not take the file — the reason says what it holds instead. Do not repeat the call as a retry.\n\n'
       + 'A bare call is REFUSED and lists what is pending: dropping everything is unrecoverable, so '
       + 'name `paths`, or say `all:true`.',
     {
@@ -470,7 +472,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Delete one or more entities and their subtrees (undoable). Address them by `guids`; `ids` only ' +
       'for an entity with no guid. `deleted` lists the guids you named (`deletedNoGuidIds` for one with ' +
       'no guid); `alsoDeleted` lists the descendants the delete took with them (the first 100, with ' +
-      '`alsoDeletedTotal` when there were more). LIVE-world only: NOT saved to disk (run modoki_save_all to persist).',
+      '`alsoDeletedTotal` when there were more). ALL-or-nothing: a ref that matches no live entity refuses the ' +
+      'WHOLE call with NOT_FOUND, naming it, and NOTHING is deleted. LIVE-world only: NOT saved to disk (run modoki_save_all to persist).',
     {
       ids: z.array(z.number()).optional().describe('Runtime ids. Only for entities with no guid — an id for one that has a guid refuses the call. Use guids.'),
       id: z.number().optional().describe('Singular form of `ids`, for deleting one entity.'),
@@ -523,8 +526,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'ok:true) if the entity is not an instance, if ANY of the given `keys` matches no real ' +
       'override, or if the instance has no overrides at all. NOT every override is applyable: a ' +
       'scene-only or runtime-only field (EntityAttributes.editorFolder, read-backs) can be ' +
-      'REVERTED but cannot be written into a template — naming one in `keys` refuses, and an ' +
-      'omitted-keys apply reports it under `skippedKeys` rather than counting it as applied. ' +
+      'REVERTED but cannot be written into a template, and neither can an edit the template cannot ' +
+      'express (a move, a tag — `notWritten`, each with its reason). Naming one in `keys` refuses the ' +
+      'whole call before anything is written; an omitted-keys apply writes the rest and reports it under ' +
+      '`skippedKeys` (and `notWritten`) rather than counting it as applied. ' +
       'Persistence: instantiate/detach/overrides/revert are LIVE-world only. create and apply ' +
       'WRITE the .prefab.json to disk. create ALSO tags the source entities as a PrefabInstance ' +
       'in the LIVE world (unsaved) — run modoki_save_all to persist that linkage into the scene, ' +

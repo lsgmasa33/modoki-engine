@@ -204,6 +204,25 @@ describe('discarding a parked prefab re-imports it in place (#1873 S2)', () => {
     expect(tfOf(rootOf(HOLDER)).x, 'and it undoes the edit').toBe(0);
   });
 
+  // #1912: it answered ok:true with the failure in `reimportFailed`, which the tool description never mentioned — a
+  // discard that left the editor showing the discarded document read as done. Mutation: return `{ ok: true, ...reply }`
+  // unconditionally (drop the `reimportFailedPartial` branch) — this answers ok:true.
+  it('a re-import that FAILS answers PARTIAL: the write is dropped, the failure named, and not to repeat the call', async () => {
+    route.disk.set(X_PATH, '{ not json');
+
+    const r = await quietly(() => runAgentOp('discard-asset-edits', { paths: [X_PATH] })) as {
+      ok: boolean; code?: string; error?: string; options?: string[]; discarded: string[]; reimportFailed?: Array<{ path: string; reason: string }>;
+    };
+
+    expect(r).toMatchObject({ ok: false, code: 'PARTIAL', discarded: [X_PATH] });
+    expect(r.reimportFailed?.map((f) => f.path)).toEqual([X_PATH]);
+    expect(r.error).toContain(`the pending write(s) were dropped (${X_PATH}`);
+    expect(r.error).toContain('Do NOT repeat the discard');
+    expect(r.options?.[0]).toContain('modoki_refresh');
+    expect(peekDirtyAsset(X_PATH), 'the write IS dropped').toBeNull();
+    expect(tf(I1, 'XA').y, 'and the editor still shows the discarded document').toBe(5);
+  });
+
   it('over a CLEAN scene: still clean, nothing to undo, and not reloaded', async () => {
     expect(worldHasUnsavedEdits(), 'premise: clean').toBe(false);
     expect(canUndo(), 'premise: an empty stack').toBe(false);

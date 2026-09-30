@@ -425,7 +425,8 @@ const DECLS: Record<string, Decl> = {
       + 'must name `paths` or say `all:true`. Drops the WRITE, not the edit — the editor cache keeps '
       + 'the applied def until the asset reloads. A parked PREFAB is re-imported from its file in place '
       + "(#1873): the open scene is NOT reloaded, so its unsaved edits and undo stay; an undo step that "
-      + 'depended on the discarded document refuses when it runs.',
+      + 'depended on the discarded document refuses when it runs. A failed re-import answers PARTIAL (#1912): the write is '
+      + 'dropped either way, so it cannot be refused up front.',
   },
   modoki_create_entity: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-entity',

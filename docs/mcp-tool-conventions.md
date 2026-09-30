@@ -513,6 +513,19 @@ Rules:
 - **`PARTIAL` is a failure unless the tool documents partial success.** `save_all` returning flat
   `{ok:true}` when one asset's write failed is the shape this forbids. `/api/reimport` is the
   sanctioned exception and says so in its own description.
+  **Which of the two exits** is decided by WHEN the shortfall can be known (#1912). Knowable before
+  the first write → refuse the whole call up front: `delete_entities` resolves every ref before it
+  deletes, so a miss is `NOT_FOUND` and nothing is deleted, as `device_delete_entities` always
+  refused (`delete_entities` used to delete the rest and list the miss under an undocumented
+  `skipped`); and a
+  prefab `apply` whose explicit `keys` name one the template cannot express (a move, a tag;
+  `previewApply`'s `skipped`) refuses before writing, because `keys` promises ALL-or-nothing.
+  Knowable only after something landed → `PARTIAL`, saying what landed and not to repeat the call:
+  `discard_asset_edits` drops a parked prefab's write and THEN re-imports it, so a failed re-import
+  is `PARTIAL` with `reimportFailed` (a re-import DEFERRED by Play answers `ok:true` with
+  `reimportDeferred`, and a later failure reaches only the console). A form whose partial result is the documented contract stays
+  `ok:true` — an apply with `keys` OMITTED means "every override the template can take", and names
+  the rest under `skippedKeys`/`notWritten`.
 - **"Could not look" is never reported as "nothing is there."** `ota_status` currently maps every
   gcloud failure — expired auth, no network, bucket typo — onto `release:null, note:'No release.json
   published yet'`. An unreachable source is `NOT_AVAILABLE_HERE`, not an answer.

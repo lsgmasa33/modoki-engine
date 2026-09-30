@@ -108,6 +108,30 @@ describe('agent prefab op renders the Apply plan (#1736)', () => {
     expect(writes).toEqual([]);
   });
 
+  // #1912 close-out review: `keys` naming a move beside a conflicting pair was refused for the move alone, offering the
+  // pair as "the rest" — which is refused again as a conflict. Mutation: offer `rest` whatever `conflicting` holds (drop
+  // `&& !conflicting.length`) — the option comes back.
+  it('`keys` naming a move beside a conflict names both, and offers no "rest" that would be refused again', async () => {
+    const guid = instance(5, 9);
+    const byName = (n: string) => getAllEntities().find((e) => e.name === n)!.id;
+    const ea = getTraitByName('EntityAttributes')!;
+    // A move is read against the new parent's DURABLE guid, so Slot gets one; Slot2 is written under it raw, as an old
+    // file left it (#1869: no gesture moves a member any more).
+    writeTraitField(byName('Slot'), ea, 'guid', G(20));
+    writeTraitField(byName('Slot2'), ea, 'parentId', byName('Slot'));
+    const keys = (await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys: { all: string[]; nested: string[] } }).keys;
+    const moved = keys.all.filter((k) => k.startsWith('~moved.'));
+    expect(moved, `fixture: ${JSON.stringify(keys)}`).toHaveLength(1);
+    expect(keys.nested, 'fixture: the conflicting pair').toHaveLength(2);
+    const err = await runAgentOp('prefab', { action: 'apply', entityGuid: guid, keys: [...moved, ...keys.nested], target: 'frame' })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect((err as Error).message).toContain(`cannot be written into the prefab — ${moved[0]} (`);
+    expect((err as Error).message).toContain('The rest cannot be applied as they are either');
+    expect((err as { options?: unknown }).options).toBeUndefined();
+    expect(writes).toEqual([]);
+  });
+
   it('a clean `apply` answers each key\'s effect, worded as the dialog words it', async () => {
     // Mutation: drop `effects` from the `apply` answer.
     const guid = instance(5, 5);

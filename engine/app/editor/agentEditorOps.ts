@@ -657,8 +657,9 @@ export function prefabApplyRefusal(refused: string, landed?: boolean): Error {
     : new Error(`prefab apply refused: ${refused}`);
 }
 
-/** A SET member (`set-selection`/`delete-entities`): its live id, or null when it matched nothing, so
- *  the op can skip it and say so. Any OTHER refusal throws, and refuses the whole call: an `{id}` naming
+/** A SET member (`set-selection`/`delete-entities`): its live id, or null when it matched nothing.
+ *  `set-selection` skips a miss and says so; `delete-entities` collects them and refuses the whole call
+ *  before deleting anything (#1912), as the device twin does. Any OTHER refusal throws, and refuses the whole call: an `{id}` naming
  *  an entity that has a guid (#1223 D2), or a guid given beside an id (D1), is a wrong address, and
  *  skipping one quietly would act on the rest of a set the caller did not mean. */
 function resolveLiveIdOrSkip(ref: EntityAddress, op: string, miss: { stale?: string } = {}): number | null {
@@ -3049,6 +3050,26 @@ export function registerEditorAgentOps(): void {
     } : {}),
   };
 
+  /** A discard whose prefab re-import FAILED, as a PARTIAL verdict (#1912) — null when none failed. The write IS dropped,
+   *  but the editor did not take the file, so the discard did not do what it says; each failure's reason says what the
+   *  editor holds instead. It fails after the drop, so it cannot be refused up front, and the drop is not undone: the
+   *  answer says not to repeat the call (#1910's shape). */
+  const reimportFailedPartial = (dropped: string[], failed: PrefabReimportReport['failed'] | undefined) => !failed?.length ? null : {
+    ok: false as const, code: 'PARTIAL' as const,
+    error: `PARTIALLY APPLIED — the pending write(s) were dropped (${dropped.join(', ')}; nothing reaches disk on the next `
+      + `save), but ${failed.length} prefab(s) could not be re-imported from their file: `
+      + `${failed.map((f) => `${f.path} (${f.reason})`).join('; ')}. The editor did NOT take the file for them — each reason `
+      + 'says what it holds instead. Do NOT repeat the discard as a retry: the writes it dropped are gone, and a repeat '
+      + 'drops whatever is pending for the path NOW (a park that came back, listed in `remaining`).',
+    // Per reason (close-out review): a refresh re-imports only a file that CHANGED, so it is the way out of a broken file,
+    // not of a write or a park that won the race — those are the editor's document now.
+    options: [
+      'a reason about the FILE (unreadable, not a prefab, nests itself): if the file is at fault, fix it on disk, then modoki_refresh — it re-imports a changed prefab file in place',
+      'a reason about an editor write or a park: that is the document the editor holds now — modoki_get_editor_state `dirtyAssetPaths` says whether it is parked again',
+      "modoki_get_scene_state — the prefab's instances show what the editor holds for it now",
+    ],
+  };
+
   registerAgentOp('discard-asset-edits', async (params) => {
     const p = (params ?? {}) as { paths?: string[]; all?: boolean };
     const pending = getDirtyAssetPaths();
@@ -3123,8 +3144,7 @@ export function registerEditorAgentOps(): void {
         return Array.isArray(v) ? `${what} — ${v.join(', ')}` : what;
       })
       .filter((m): m is string => m !== null);
-    return {
-      ok: true,
+    const reply = {
       ...r,
       ...reimported,
       remaining: getDirtyAssetPaths(),
@@ -3136,10 +3156,10 @@ export function registerEditorAgentOps(): void {
       note: (r.discarded.length
         ? 'The pending WRITE(s) were dropped — nothing will reach disk on the next save. The live '
           + 'editor cache still holds the edited def until the asset is reloaded; apply the previous '
-          + 'def first if you need the value reverted too. A discarded PREFAB is the exception: it was '
-          + 're-imported from its file in place, so the editor now shows what the file holds, and the '
-          + "scene's unsaved edits and undo history are kept (an undo step that depended on the discarded "
-          + 'document refuses, saying so).'
+          + 'def first if you need the value reverted too. A discarded PREFAB is the exception: it is '
+          + 're-imported from its file in place — each one `reimported` lists now shows what its file holds '
+          + "(one in `reimportFailed` does not) — and the scene's unsaved edits and undo history are kept (an "
+          + 'undo step that depended on the discarded document refuses, saying so).'
         : 'Nothing was pending, so nothing changed.')
         + (leftBehind.length
           ? ` NOT covered by this call — this op owns the dirty-ASSET registry only, and these `
@@ -3149,6 +3169,8 @@ export function registerEditorAgentOps(): void {
             + 'these registries by name.'
           : ''),
     };
+    const partial = reimportFailedPartial(reply.discarded, reply.reimportFailed);
+    return partial ? { ...reply, ...partial } : { ok: true, ...reply };
   });
 
   // ── PlayerPrefs writes refuse an envelope too (#1551 review) ──
@@ -3240,8 +3262,15 @@ export function registerEditorAgentOps(): void {
       if (id == null) missing.push(r);
       else if (!deleted.includes(id)) deleted.push(id);
     }
-    if (deleted.length === 0) {
-      throw new OpRefusal('NOT_FOUND', 'delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.', { stale: miss.stale });
+    // ANY miss refuses the WHOLE call, before anything is deleted (#1912), as `device_delete_entities` does. It used to
+    // delete the rest and answer ok:true with the misses in `skipped` — a partial delete that read as complete, which
+    // the tool description never mentioned. Every ref resolves before the first delete, so this is decidable up front
+    // (conventions § "PARTIAL is a failure": what can be proven wrong before starting is refused before starting).
+    if (missing.length) {
+      throw new OpRefusal('NOT_FOUND',
+        `delete-entities: ${missing.length} of ${refs.length} ref(s) matched no live entity — NOTHING was deleted. `
+        + `Missing: ${missing.map((m) => m.guid ?? `#${m.id}`).join(', ')}. Runtime ids are reassigned on every scene reload; `
+        + 're-read them with get_scene_state, or address entities by guid.', { stale: miss.stale });
     }
     // Name them by guid BEFORE deleting (#1223 P2): the delete cascades, so a child also listed reads
     // no guid afterwards. The ids would be dead addresses the moment this returns.
@@ -3260,7 +3289,7 @@ export function registerEditorAgentOps(): void {
     for (const id of descendants.slice(0, ALSO_DELETED_CAP)) ensureGuid(id);
     const also = alsoDeletedFields(descendants);
     deleteEntitiesWithUndo(deleted, (sel) => setSelectionRaw(sel[0] ?? null, sel));
-    return { ok: true, ...named, ...also, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
+    return { ok: true, ...named, ...also, saved: false };
   });
   registerAgentOp('reparent-entity', async (params) => {
     refuseEditOfPosedWorld('reparent-entity');
@@ -3647,6 +3676,36 @@ export function registerEditorAgentOps(): void {
           perKey = checked.perKey;
         }
         const asked = p.target !== undefined || p.targets ? { default: p.target, perKey } : undefined;
+        // `keys` is ALL-or-nothing for a key the template cannot express too (a move, a tag — #1437/#1491), as it is for
+        // an excluded field above (#1912). It used to write the rest and answer ok:true with the key in `notWritten`. The
+        // dry plan is the one the write runs, so this is decided before anything is written. A dry run is exempt: it
+        // writes nothing, and its `notWritten` is the answer it was asked for.
+        if (p.keys && !p.dryRun) {
+          const preview = await previewApply(ctx.rootInstanceId, keySet, asked);
+          const unwritable = preview.skipped;
+          if (unwritable.length) {
+            const rest = [...keySet].filter((k) => !unwritable.some((x) => x.key === k));
+            // The rest is offered only when applying it would succeed: a conflict among it is refused too (#1736), and an
+            // option that is refused again is a false promise (close-out review). Uncapped: it is the caller's own list.
+            const conflicting = [...new Set(preview.conflicts.flatMap((c) => c.keys.map((k) => k.key)))];
+            // …and only when `keys` alone is what changes: a per-key `targets` entry for a dropped key is refused as a
+            // stray once the key is gone (second close-out review), so the prose names it instead. Compared canonically, as
+            // that stray check compares: a `targets` entry may spell the key another way (a localId).
+            const targeted = new Set(Object.keys(p.targets ?? {}).map((k) => canonicalOverrideKey(k, prefab)));
+            const strayTargets = unwritable.filter((x) => targeted.has(canonicalOverrideKey(x.key, prefab)));
+            throw new OpRefusal('REFUSED_BY_OP',
+              `prefab apply: ${unwritable.length} requested key(s) cannot be written into the prefab — `
+              + `${unwritable.map((x) => `${x.key} (${x.reason})`).join('; ')}. NOTHING was applied. `
+              + (conflicting.length
+                ? `The rest cannot be applied as they are either: ${conflicting.join(', ')} write one field with different `
+                  + "values (pass `dryRun: true` to see each key's effect). "
+                : rest.length
+                  ? `Drop them from \`keys\`${strayTargets.length ? ' and from `targets`' : ''} to apply the rest; `
+                  : 'Nothing else was named, so there is nothing left to apply; ')
+              + "prefabAction:'revert' resets them on this instance.",
+              rest.length && !conflicting.length && !strayTargets.length ? { options: [`keys:${JSON.stringify(rest)}`] } : {});
+          }
+        }
         // A dry run (#1736): the same plan the write would run, answered and not written.
         if (p.dryRun) {
           const plan = await previewApply(ctx.rootInstanceId, keySet, asked);
