@@ -121,6 +121,16 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'refused in a clean segment"',
   },
   {
+    pattern: /^\[PrefabEdit\] cannot save "[^"]*" — "[^"]*" (references|is a pasted reference to) the prefab [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}, which is missing or has no root, so this save cannot write it/,
+    why: '#1738 (owner ruling: refuse with a reason rather than write a node the save cannot place): a prefab-edit save '
+      + 'refuses while the edit holds an added reference node whose prefab is missing (`prefabEdit.ts`), since the '
+      + 'template capture would drop it and its edits silently. The fuzzer reaches it by trashing a prefab the edited one '
+      + 'nests (win hunt seed 6136: instantiate, Create Prefab, trash, a saved prefab edit). Only a GUID is forgiven: the '
+      + 'message names the prefab by `resolveRef(source) ?? source`, so a prefab the manifest still resolves prints a PATH, '
+      + 'and a refusal of one would be an expansion bug that nothing else catches (a refused save is only a trace note, '
+      + 'not a check, and no taint), so it must fail here (close-out review)',
+  },
+  {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — "[^"]*"( \([^)]*\))? (is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again)/,
     why: 'owner ruling R (#1819, #1827, #1793, 2026-09-29): an undo or redo whose target no longer resolves, or has become '
       + 'a Missing Prefab placeholder, refuses before any change and is dropped (`require`, entityRef.ts), and says so. A '
@@ -179,11 +189,26 @@ const OPTS = { expectedError };
  *  the failing step: judged on the whole list, an op AFTER the failure satisfied an op-shape clause (review). */
 const knownStop = (f: StepFailure, ops: readonly Op[]) => KNOWN_OPEN.find((k) => k.stops?.(f, ops.slice(0, f.step + 1)));
 
+/** Every tally the hunt prints: taints and the checks they skipped (#1845), op outcomes, backend routes. */
+const tallies = (): Map<string, number>[] => [taintCounts, skippedChecks, opOutcomes, be.routeCounts];
+
+/** Run `fn` with every tally left as it found it. The shrinker replays a failing seed dozens of times through the same
+ *  runner, so without this a hunt that finds more failures reports more taints (and ops, and routes) for that reason
+ *  alone, and two platforms' hunts stop being comparable, which is the tallies' whole job (win's Windows hunt). */
+async function uncounted<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = tallies().map((m) => new Map(m));
+  try { return await fn(); } finally {
+    tallies().forEach((m, i) => { m.clear(); for (const [k, n] of saved[i]!) m.set(k, n); });
+  }
+}
+
 async function shrunk(seed: number | string, ops: Op[], r: RunResult): Promise<{ text: string; min: Op[]; minFailure?: StepFailure }> {
   const f = r.failure!;
   const sig = signature(f);
-  const { ops: min, replays } = await shrink(be, ops, sig, OPTS);
-  const final = await runOps(be, min, OPTS);
+  const { min, replays, final } = await uncounted(async () => {
+    const s = await shrink(be, ops, sig, OPTS);
+    return { min: s.ops, replays: s.replays, final: await runOps(be, s.ops, OPTS) };
+  });
   const text = [
     `seed ${seed}: ${f.check} at step ${f.step} (${f.op})`,
     `  ${f.detail}`,
@@ -341,6 +366,44 @@ describe('#1789 prefab fuzz', () => {
     expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
     expect(ok.trace.join(' '), 'premise: the outside edit wrote a file').toMatch(/outsideEdit.* → done/);
     expect(taintCounts.get('outsideEdit') ?? 0).toBe(before + 1);
+  });
+
+  // Win's Windows hunt: the shrinker replays a failing seed through the same runner, so its replays were counted as the
+  // hunt's own taints, and a platform that found more failures reported more taints for that reason alone. A list whose
+  // failure (the #1845 plant: the editor's own save reads as an outside write) comes FIRST, so the shrinker's first cut
+  // replays the trailing outside edit alone, which taints. Measured on the raw `shrink`, which counts: that is the premise
+  // that the replays taint at all (close-out review: with the outside edit first, no replay ever tainted, and the test
+  // stayed green with the taint maps left out of the restore). Mutation: restore only `opOutcomes` and `routeCounts` in
+  // `uncounted` — this goes red.
+  it('harness: shrinking a failure leaves every tally the hunt prints as it found it', async () => {
+    const ops: Op[] = [
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.5, 0.5, 0.5, 0.5, 0, 0, 0, 0] }] },
+      { kind: 'outsideEdit', u: [0.1, 0.2, 0.3, 0.2, 0.5, 0.5, 0.5, 0.5] },
+    ];
+    const add = be.marked.add;
+    be.marked.add = function (this: Set<string>) { return this; } as typeof add;
+    try {
+      const snap = () => JSON.stringify(tallies().map((m) => [...m].sort()));
+      const taints = () => JSON.stringify([taintCounts, skippedChecks].map((m) => [...m].sort()));
+      const r = await runOps(be, ops, OPTS);
+      expect(r.failure?.check, 'premise: the list fails').toBe('unexpected outside write');
+      const beforeRaw = taints();
+      await shrink(be, ops, signature(r.failure!), OPTS);
+      expect(taints(), 'premise: the shrinker\'s own replays taint').not.toBe(beforeRaw);
+      const counted = snap();
+      const s = await shrunk('tally', ops, r);
+      expect(s.text, 'premise: the shrinker replayed the list').toMatch(/in [1-9]\d* replays/);
+      expect(snap()).toBe(counted);
+    } finally { be.marked.add = add; }
+  }, 60_000);
+
+  // Close-out review of the #1738 entry: the refusal names the prefab by guid only when the manifest no longer resolves
+  // it. A refusal naming a PATH is a prefab that still resolves and failed to expand, which nothing else in the runner
+  // would catch, so the allow-list must not forgive it. Mutation: widen the entry's guid back to `\S+` — this goes red.
+  it('harness: #1738\'s missing-prefab refusal is forgiven only for a prefab named by guid', () => {
+    const line = (named: string) => `[PrefabEdit] cannot save "OR" — "OR" references the prefab ${named}, which is missing or has no root, so this save cannot write it. The prefab file on disk still has it unchanged.`;
+    expect(expectedError(line('cccccccc-0000-4000-8003-cda036290000'))).toBe(true);
+    expect(expectedError(line('/fuzz/r1/prefabs/O.prefab.json'))).toBe(false);
   });
 
   // #1795 (hub ruling (i)): Create Prefab's undo leaves its file, so the walk to a segment's start may find it — but only

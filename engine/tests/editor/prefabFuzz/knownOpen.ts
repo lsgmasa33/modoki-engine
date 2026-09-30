@@ -87,7 +87,8 @@ export const KNOWN_OPEN: KnownOpen[] = [
 ];
 
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
- *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test"). */
+ *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
+ *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
     issue: 1830,
@@ -939,6 +940,16 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'addComponent', u: [0.07627140008844435, 0.7827790067531168, 0.40170716238208115, 0.3061293624341488, 0.2677302942611277, 0.6483881562016904, 0.9803187360521406, 0.7246397191192955] },
       { kind: 'apply', u: [0.10244770138524473, 0.7300383383408189, 0.5696746739558876, 0.06330077606253326, 0.6680648103356361, 0.5124142579734325, 0.8370073803234845, 0.5396201724652201] },
       { kind: 'delete', u: [0.036498465575277805, 0.042304785223677754, 0.4129279023036361, 0.6311721648089588, 0.4325354811735451, 0.039276400581002235, 0.29011039971373975, 0.29810293670743704] },
+    ],
+  },
+  {
+    issue: 1738,
+    what: "win hunt seed 6136 (instantiate, Create Prefab, trash, a saved prefab edit): the save's by-design #1738 refusal of a reference node whose prefab is missing failed the step as console.error \u2014 its wording was not in EXPECTED_ERRORS",
+    repro: [
+      { kind: 'instantiate', u: [0.4431566004641354, 0.7968979061115533, 0.40783188841305673, 0.5022549307905138, 0.19927031104452908, 0.6920147859491408, 0.2723008228931576, 0.9618998144287616] },
+      { kind: 'createPrefab', u: [0.0038380103651434183, 0.591657679527998, 0.6498477926943451, 0.16832039435394108, 0.2952046236023307, 0.20283732656389475, 0.14619030989706516, 0.46976823825389147] },
+      { kind: 'trashPrefab', u: [0.366121573606506, 0.12152830720879138, 0.5724751548841596, 0.37606001063250005, 0.03529732837341726, 0.28352958406321704, 0.45296140434220433, 0.5870168737601489] },
+      { kind: 'prefabEdit', u: [0.301515509840101, 0.43780972715467215, 0.667069936171174, 0.5753587565850466, 0.6484025486279279, 0.15705850371159613, 0.9615241875872016, 0.1484056394547224], inner: [] },
     ],
   },
 ];

@@ -649,7 +649,9 @@ list (`TaintCause` in `prefabFuzz/runner.ts`, each with the mechanism that makes
 A watcher raise with any other cause FAILS the step, as `unexpected outside write`. Planting #1840 back (the router marking
 by absolute path) turns every verify seed red that way on macOS, which a self-test pins. Every run counts the ops that
 tainted, by cause, and the checks each taint turned off: the verify test prints one line, and a hunt prints both tallies
-after its coverage. **Compare those counts between platforms.** A platform whose taints or skips run far above
+after its coverage. The shrinker's replays of a failing seed are NOT counted (`uncounted` in `prefabFuzz.test.ts` puts
+every printed tally back after the shrink), or a platform that found more failures would report more taints for that
+reason alone (win's Windows hunt). **Compare those counts between platforms.** A platform whose taints or skips run far above
 another's, on the same seeds, is turning the checks off for a reason the other does not have.
 
 **A deleted prefab's round trip (#1805).** A live instance of a prefab whose file was deleted stays expanded, while a
