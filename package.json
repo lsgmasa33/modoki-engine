@@ -37,7 +37,7 @@
     "gen:memory-index": "node scripts/gen-memory-index.mjs",
     "docs:api": "typedoc",
     "build": "node engine/scripts/build-web.mjs",
-    "typecheck": "tsc -b engine && tsc -p engine/tsconfig.test.json && npm --prefix engine/packages/modoki run typecheck && npm --prefix engine/tools/modoki-mcp run typecheck && npm --prefix engine/tools/game-debug-mcp run typecheck",
+    "typecheck": "node engine/scripts/tsc.mjs -b engine && node engine/scripts/tsc.mjs -p engine/tsconfig.test.json && npm --prefix engine/packages/modoki run typecheck && npm --prefix engine/tools/modoki-mcp run typecheck && npm --prefix engine/tools/game-debug-mcp run typecheck",
     "typecheck:projects": "node engine/scripts/typecheck-projects.mjs",
     "typecheck:projects:all": "node engine/scripts/typecheck-projects.mjs --all",
     "lint": "eslint --config engine/eslint.config.js --cache --cache-strategy content --cache-location node_modules/.tmp/.eslintcache .",

@@ -16,6 +16,7 @@ import { isProjectDir } from './projectRoots.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp, BUILD_STAMP_FILENAME } from './ota/buildStamp.mjs';
 import { subgameOutDir } from './subgameOutDir.mjs';
+import { TSC_NODE_ARGS } from './tscHeap.mjs';
 
 const repoRoot = process.cwd();
 const engineDir = path.join(repoRoot, 'engine');
@@ -74,8 +75,8 @@ const stampStart = readGitProvenance(abs);
 try {
   if (existsSync(tscBin)) {
     writeFileSync(scopedPath, JSON.stringify({ extends: './tsconfig.app.json', include }, null, 2) + '\n');
-    run(node, [tscBin, '-p', 'engine/tsconfig.app.scoped.json']);
-    run(node, [tscBin, '-p', 'engine/tsconfig.node.json']);
+    run(node, [...TSC_NODE_ARGS, tscBin, '-p', 'engine/tsconfig.app.scoped.json']);
+    run(node, [...TSC_NODE_ARGS, tscBin, '-p', 'engine/tsconfig.node.json']);
   } else {
     console.log('[build-subgame] typescript not installed — skipping typecheck (packaged build).');
   }

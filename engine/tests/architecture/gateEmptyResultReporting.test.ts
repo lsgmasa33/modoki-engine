@@ -41,7 +41,7 @@ function typecheckFixture(opts: { roots?: string[]; projects?: string[] }): stri
   // scopedTypecheckLib.mjs joins this list with #967: typecheck-projects.mjs now IMPORTS it, so
   // a fixture without it fails module resolution instead of exercising the floor.
   for (const f of ['typecheck-projects.mjs', 'scopedTypecheckLib.mjs', 'projectRoots.mjs',
-    'scopedTsconfig.mjs']) {
+    'scopedTsconfig.mjs', 'tscHeap.mjs']) {
     fs.copyFileSync(path.join(SCRIPTS, f), path.join(scripts, f));
   }
   const tscBin = path.join(dir, 'node_modules', 'typescript', 'bin');

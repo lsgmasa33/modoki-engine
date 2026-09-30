@@ -1896,7 +1896,11 @@ flush and every `commitPrefabWrites`). Until a Save's write lands, the park's ba
 "back to the file": the park was dropped, the file kept the saved document, the editor showed the redone one, and it
 reported clean (F1). **A park kept over an outside change is never dropped by a restore** (`fileChanged`, set by the
 watcher's keeper): its baseline no longer names the file, so the park stays for Save, which meets the change and asks
-(F2). An **Overwrite** answers one conflict: the flush that wrote with it clears it, whatever it did (F6), and a flush
+(F2). **The keeper runs when the change is HELD, not when the release applies it** (`holdOutsideChange`, the #1879
+hold). Marked only at the release, a redo during the hold back to the park's baseline dropped the park, and the release
+then adopted the outside file over the unsaved document silently, where Save used to ask (the #1879 × #1868 seam,
+`prefabParkOutsideHold.test.ts`, which runs each case with the change held AND arriving and requires the same outcome).
+A held change to an UNPARKED prefab is untouched until the release, which adopts it silently as before. An **Overwrite** answers one conflict: the flush that wrote with it clears it, whatever it did (F6), and a flush
 that did not leaves it for the Save that asked.
 
 **Save** flushes a parked prefab through `commitPrefabWrite` over its baseline. `/api/asset-write` refuses the type.

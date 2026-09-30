@@ -16,6 +16,7 @@ import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
 import { parseBuildTarget, nativeHealPlatforms } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
+import { TSC_NODE_ARGS } from './tscHeap.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
@@ -332,8 +333,8 @@ try {
     // makes the write unnecessary too. Doing it unconditionally EPERM'd every build from
     // such an install, dev or packaged, before the target-specific work even started.
     writeFileSync(scopedPath, JSON.stringify(scopedTsconfigContent(include), null, 2) + '\n');
-    run(node, [tscBin, '-p', 'engine/tsconfig.app.scoped.json']); // app + active game (scoped)
-    run(node, [tscBin, '-p', 'engine/tsconfig.node.json']);        // vite config / electron
+    run(node, [...TSC_NODE_ARGS, tscBin, '-p', 'engine/tsconfig.app.scoped.json']); // app + active game (scoped)
+    run(node, [...TSC_NODE_ARGS, tscBin, '-p', 'engine/tsconfig.node.json']);        // vite config / electron
   } else {
     console.log('[build-web] typescript not installed — skipping typecheck (packaged build).');
   }

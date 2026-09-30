@@ -909,6 +909,42 @@ ran under node and would have thrown. What is genuinely unexercised is a DOM nee
   looks clean** (an `exclude` inherited via `extends` beats a local `include`, compiling zero
   files and reporting a cheerful pass), which is why the guard checks coverage, not just errors.
 
+### The typecheck's heap (#1885)
+
+The large `tsc` programs in the gate and the builds run with `--max-old-space-size=4096`. The
+value lives in `engine/scripts/tscHeap.mjs`, which is read by the root and `@modoki/engine`
+`typecheck` scripts (through the `engine/scripts/tsc.mjs` wrapper), `typecheck-projects.mjs`,
+`build-web.mjs` and `build-subgame.mjs`. The two MCP servers' typechecks and the capacitor plugins'
+builds stay bare `tsc`: each pins its own TypeScript, and none is near the limit (table below). Node sizes its default old-space limit from the machine's RAM: about 2 GB on
+the public CI's 7 GB `macos-14` runner or on an 8 GB laptop, and 4.1 GB on the 64 GB hub Mac. The
+test program outgrew the smaller figure, and the public CI's `check (macos-14)` failed with a V8
+heap OOM in 2 of 3 runs.
+
+**Measure it COLD.** `engine/tsconfig.test.json` is `incremental`, so a local re-run reuses its
+`.tsbuildinfo` and reads about half the memory. A CI checkout never has that file. The issue first
+quoted a warm 1.92 GB as "94% of the limit", when the cold program was already past it. The floors
+below were bisected over `--max-old-space-size` with a fresh `--tsBuildInfoFile` (Mac, 2026-09-30,
+4,590 files in the test program):
+
+| program | cold floor | max RSS at 4 GB, cold / warm |
+|---|---|---|
+| `engine/tsconfig.test.json` | **2.05–2.30 GB** (OOM at 2048) | 2.54 / 1.33 GB |
+| `engine/tsconfig.app.json` (private tree, all games) | 1.54–1.79 GB | 2.02 GB cold |
+| `engine/packages/modoki` `tsconfig.test.json` | 1.03–1.54 GB | — |
+| `tsconfig.check.json`, both MCP servers (bare `tsc`) | < 1.03 GB | — |
+
+The headroom is about 1.8x over the worst cold floor, and the two big programs run one after the
+other, so the peak on a 7 GB runner is one program's RSS. The cap sets a limit and reserves nothing,
+so RSS at 4 GB matched the default-heap run on this Mac (2.75 / 1.42 GB before the change).
+**Re-measure cold when a lane adds a lot of test files.** The test program grows with every lane.
+A test asserting a memory figure would be flaky, so none exists.
+
+⚠️ **Keep it a node FLAG.** A POSIX `NODE_OPTIONS=… tsc` prefix in an npm script does not run under
+Windows' cmd.exe ([windows.md](windows.md)). The root `package.json` also ships verbatim into the
+public snapshot (`publish-engine-oss.sh` renames it and nothing else), so the script is what
+reaches all four places: the public CI's three legs, the private `ci.yml`, local `verify` and the
+`win` clone. A workflow `env:` would have fixed only the runners.
+
 ### The SCOPED per-project typecheck — `typecheck:projects` (#24, #967)
 
 `npm run typecheck` compiles ONE WIDE program: `engine/tsconfig.app.json` includes `app` plus ALL

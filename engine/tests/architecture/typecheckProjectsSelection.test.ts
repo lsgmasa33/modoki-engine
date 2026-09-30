@@ -54,7 +54,7 @@ function makeRepo({ template = false, projects = true }: { template?: boolean; p
   const scripts = join(dir, 'engine', 'scripts');
   mkdirSync(scripts, { recursive: true });
   for (const f of ['typecheck-projects.mjs', 'scopedTypecheckLib.mjs', 'projectRoots.mjs',
-      'scopedTsconfig.mjs']) {
+      'scopedTsconfig.mjs', 'tscHeap.mjs']) {
     copyFileSync(join(SCRIPTS, f), join(scripts, f));
   }
   // A stand-in tsc, so the module-load check passes. Safe: every assertion here is about the
@@ -193,7 +193,7 @@ describe('the scoped-typecheck project selection', () => {
     const scripts = join(dir, 'engine', 'scripts');
     mkdirSync(scripts, { recursive: true });
     for (const f of ['typecheck-projects.mjs', 'scopedTypecheckLib.mjs', 'projectRoots.mjs',
-      'scopedTsconfig.mjs']) {
+      'scopedTsconfig.mjs', 'tscHeap.mjs']) {
       copyFileSync(join(SCRIPTS, f), join(scripts, f));
     }
     const tscBin = join(dir, 'node_modules', 'typescript', 'bin');

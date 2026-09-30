@@ -42,6 +42,8 @@ const MACHINERY_PATHS = [
   'engine/scripts/typecheck-projects.mjs',
   // ...and this file, which now holds MACHINERY_PATHS itself and the coverage predicates.
   'engine/scripts/scopedTypecheckLib.mjs',
+  // ...and the heap every scoped tsc runs under (#1885): lowering it can OOM a project this branch never touched.
+  'engine/scripts/tscHeap.mjs',
 ];
 
 /** Every path in MACHINERY_PATHS must exist — a stale entry silently stops escalating. Asserted by

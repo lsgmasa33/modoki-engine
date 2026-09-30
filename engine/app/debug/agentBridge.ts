@@ -3214,6 +3214,12 @@ export function enableOutsideChangeHold(on: boolean): void { _holdEnabled = on; 
 export function holdOutsideChange(msg: SceneChangedMsg): void {
   if (!_holdEnabled) { void handleSceneChanged(msg); return; }
   _outsideHold.hold(msg);
+  // A PARKED prefab's baseline goes stale NOW, as it did when the change applied on arrival (`handleSceneChanged`'s
+  // keeper). Marked only at the release, a restore during the hold (a redo back to the park's baseline) dropped the park
+  // as "back to the file", and the release then adopted the outside file over it, silently, where Save used to ask.
+  if (msg.kind === 'prefab' && _parkedPrefabKeeper?.(msg.urlPath)) {
+    console.warn(`[agentBridge] ${msg.urlPath} changed on disk under an unsaved prefab edit — kept the edit; saving asks whether to overwrite`);
+  }
   // A parked asset document under this file would be written over the change by a Save before the release: the park —
   // one there now, or one made before the release — gets a baseline no file matches, so that Save asks Overwrite or
   // Cancel instead (#1879 close-out reviews, `noteOutsideChangeHeld`). Not a sibling-raised

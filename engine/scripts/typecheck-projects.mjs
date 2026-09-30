@@ -101,6 +101,7 @@ import { discoverProjects, PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { MACHINERY_PATHS, countProgramFiles, foreignProjects, stripFileList,
   KNOWN_CROSS_PROJECT } from './scopedTypecheckLib.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
+import { TSC_NODE_ARGS } from './tscHeap.mjs';
 
 /** Derived from THIS FILE, never `process.cwd()` (#944, from main). The old `cwd` form made the
  *  script's subject depend on where it was invoked from: run from anywhere but the repo root it
@@ -392,7 +393,7 @@ function main() {
     try {
       // `--listFiles` prints every file in the program alongside the normal check. It is what
       // turns "exit 0" into evidence — see the contributed-count below.
-      listed = execFileSync(process.execPath, [tscBin, '-p', configPath, '--listFiles'], {
+      listed = execFileSync(process.execPath, [...TSC_NODE_ARGS, tscBin, '-p', configPath, '--listFiles'], {
         cwd: repoRoot,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
