@@ -21,6 +21,7 @@ import { guidForEntityId, isTemplateExcludedField, localToEcsGuid, type PrefabFi
 import { getCachedPrefabSync } from './prefabCache';
 import { withKeptStateBake } from './prefabTokens';
 import { captureInstanceReference, captureRowChannels, toTemplateNodes, toTemplateStructure } from './prefabCapture';
+import { declaredTemplateKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 
 /** Insert an added subtree into `prefab` with fresh localIds (continuing the BFS
  *  counter). The subtree root's parentId(localId) is set to `parentLocalId`;
@@ -71,6 +72,7 @@ export function insertAddedSubtree(
       const rc = withKeptStateBake(true, () => captureRowChannels(liveEcs, node.prefab!, liveChild, ref, false, !!tokens?.readOnly));
       recaptured = { added: ref.added, nestedStructure: rc.nestedStructure, members: rc.members };
     }
+    const declared = recaptured ? undefined : declaredTemplateKeys(prefab as TemplateKeyDoc);
     const refRow: PrefabFile['entities'][number] = {
       localId: myLocalId,
       // A row that did not exist a moment ago: Apply promoted an added node into the template, so it
@@ -82,13 +84,15 @@ export function insertAddedSubtree(
       prefab: node.prefab,
       overrides: node.overrides,
       // The node was captured in SCENE form (live guids); a prefab row is a template (#1387).
-      added: recaptured ? recaptured.added : toTemplateNodes(node.added),
+      // Promoted into `prefab`: a live marker naming a key `prefab` already declares is stale, and mints (#1809). Read NOW,
+      // so a row an earlier promotion of this Apply pushed counts.
+      added: recaptured ? recaptured.added : toTemplateNodes(node.added, declared),
       removed: node.removed,
       removedTraits: node.removedTraits,
       // Both nested channels travel with the node (#1381): the node was the outermost layer for its
       // own nested rows, and once promoted the ROW is — so its slot becomes the row's.
       nestedOverrides: node.nestedOverrides,
-      nestedStructure: recaptured ? recaptured.nestedStructure : toTemplateStructure(node.nestedStructure),
+      nestedStructure: recaptured ? recaptured.nestedStructure : toTemplateStructure(node.nestedStructure, declared),
       ...(recaptured?.members ? { members: recaptured.members } : {}),
     };
     prefab.entities.push(refRow);

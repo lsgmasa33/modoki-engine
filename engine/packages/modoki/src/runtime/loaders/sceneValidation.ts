@@ -14,6 +14,7 @@
 
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { sceneEntryGuid } from './authoredEntityGuids';
+import { sameFrameRepeatedKeys, type TemplateKeyDoc } from './templateKeyRecovery';
 import { isSizeInert } from '../ui/anchorLayout';
 import {
   isElementMarginInert, MARGIN_KEYS,
@@ -1402,6 +1403,12 @@ export function validatePrefabData(data: unknown): ValidationResult {
     warnings.push(...collapsedNewlineWarnings(e.traits, prefabLabel));
   }
   warnings.push(...localIdMarkWarnings(data as { nextLocalId?: unknown }, entities));
+  // A template key twice in one frame is a DEFECT, not advice: the two nodes derive one guid (#1809). Reported, never
+  // rewritten (owner ruling (A)); only a hand edit or a merge makes one. The validator has one tier, so it says so.
+  const name = typeof (data as { name?: unknown }).name === 'string' ? ` "${(data as { name: string }).name}"` : '';
+  for (const { frame, key } of sameFrameRepeatedKeys(data as TemplateKeyDoc)) {
+    warnings.push(`ERROR: prefab${name} declares template key ${key} twice in one frame (${frame}) — the two nodes derive the same guid, so every ref to either lands on one of them; give one a new key (a hand edit or a merge made this; the editor never writes it)`);
+  }
   // schemaApplied stays false: no trait schema is consulted (see above), and claiming otherwise
   // would tell a caller its type checks ran when they did not.
   return { warnings, schemaApplied: false };

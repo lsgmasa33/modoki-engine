@@ -12,7 +12,7 @@ import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRo
 import { sameOrientation, sameRotationScale } from '../../runtime/scene/transformSpace';
 import { hasDocKey } from '../../runtime/core/docKeys';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity, markStructureDirty, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
@@ -26,7 +26,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap } from '../../runtime/loaders/prefabOverrides';
 import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, type ForwardState } from './prefabBase';
-import { parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
+import { parseMemberToken, memberToken, memberPathKey, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import { childrenBySibling, localToEcsGuid, type PrefabFile, valuesEqual } from './prefab';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
 import {
@@ -358,8 +358,8 @@ export function templateMoves(
     const index = memberPathIndex(getCurrentWorld(), f.id);
     for (const [key, token] of Object.entries(f.moved)) {
       const t = parseMemberToken(token);
-      const member = index.get(key);
-      const target = t && !t.up ? index.get(memberPathKey(t.path)) : null;
+      const member = memberPathLookup((k) => index.get(k), memberPathSteps(key));
+      const target = t && !t.up ? memberPathLookup((k) => index.get(k), t.path) : null;
       if (member && target) base.set(member.id(), target.id());
     }
   }
@@ -532,6 +532,10 @@ function addedNodeIdentity(ecsId: number, template: boolean | undefined, readOnl
   if (!key) {
     key = recoverTemplateKey(ecsId) || newGuid();
     setTemplateKey(entity, key);
+    // A key is an input of the identity resolver (a keyed node derives from its frame root, #1809), and a save's scope
+    // reuses one resolver while the structure version stands still: bump it, or the rest of this save asks a resolver
+    // that never saw this key (close-out review).
+    markStructureDirty();
   }
   return { guid: '', key };
 }
@@ -1403,19 +1407,29 @@ export function captureInstanceReference(
  *    node's moves and `insertAddedSubtree` omits the field from the row it writes, so a reference
  *    node reached through `added`, `children` or a `nestedStructure` slot was the gap.
  *
- *  If you add a field to `AddedEntity`, decide here whether it is per-instance. */
-export function toTemplateNodes(nodes: AddedEntity[] | undefined): AddedEntity[] | undefined {
+ *  If you add a field to `AddedEntity`, decide here whether it is per-instance.
+ *
+ *  `declared`: the keys the document these nodes are PROMOTED into already declares. A promoted node is scene-added, so
+ *  it is not one of that document's nodes, and a live marker naming one of those keys is stale (a Detach leaves the
+ *  markers on the unpacked nodes; move one into another instance of the same prefab and Apply it there): carried, it
+ *  was a second node with that key, and a keyed node's guid is its frame plus its key (#1809), so the two shared one.
+ *  Such a node mints. A marker the document does not declare is the node's own identity (a deeper template's key) and
+ *  is kept, as #1387 does so a re-save does not re-key. Every key written is added to `declared`, so two nodes of one
+ *  promotion carrying the same marker (two detached copies of one template) do not both write it (close-out review). */
+export function toTemplateNodes(nodes: AddedEntity[] | undefined, declared?: Set<string>): AddedEntity[] | undefined {
   if (!nodes) return nodes;
   return nodes.map((n) => {
     const live = n.guid ? localToEcsGuid(n.guid) : 0;
-    const key = n.key || (live ? templateKeyOf(findEntity(live)) : '') || newGuid();
+    const marker = live ? templateKeyOf(findEntity(live)) : '';
+    const key = n.key || (marker && !declared?.has(marker) ? marker : '') || newGuid();
+    declared?.add(key);
     const traits = { ...n.traits };
     const ea = traits['EntityAttributes'];
     if (ea && ea !== true && 'guid' in ea) { const { guid: _drop, ...rest } = ea; traits['EntityAttributes'] = rest; }
     const { members: _rows, moved: _moves, ...scene } = n;
-    const out: AddedEntity = { ...scene, guid: '', key, traits, children: toTemplateNodes(n.children) ?? [] };
-    if (n.added) out.added = toTemplateNodes(n.added);
-    if (n.nestedStructure) out.nestedStructure = toTemplateStructure(n.nestedStructure);
+    const out: AddedEntity = { ...scene, guid: '', key, traits, children: toTemplateNodes(n.children, declared) ?? [] };
+    if (n.added) out.added = toTemplateNodes(n.added, declared);
+    if (n.nestedStructure) out.nestedStructure = toTemplateStructure(n.nestedStructure, declared);
     return out;
   });
 }
@@ -1425,11 +1439,11 @@ export function toTemplateNodes(nodes: AddedEntity[] | undefined): AddedEntity[]
  *  and the test is about the invariant, not about the API. */
 export const toTemplateNodesForTest = toTemplateNodes;
 
-export function toTemplateStructure(paths: NestedStructurePaths | undefined): NestedStructurePaths | undefined {
+export function toTemplateStructure(paths: NestedStructurePaths | undefined, declared?: Set<string>): NestedStructurePaths | undefined {
   if (!paths) return paths;
   const out: NestedStructurePaths = {};
   // `moved` never enters a template: its values are live scene guids (the rule `toTemplateNodes` states).
-  for (const [k, { moved: _moves, ...v }] of Object.entries(paths)) out[k] = v.added ? { ...v, added: toTemplateNodes(v.added) } : v;
+  for (const [k, { moved: _moves, ...v }] of Object.entries(paths)) out[k] = v.added ? { ...v, added: toTemplateNodes(v.added, declared) } : v;
   return out;
 }
 

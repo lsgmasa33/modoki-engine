@@ -8,7 +8,8 @@
  *
  *  Such a node now carries `AddedEntity.key` (template-local, guid-shaped, stable across saves) and
  *  `guid: ''`. The loader spawns it with this marker; `deriveInstanceMemberGuids` derives its guid
- *  per instance by stepping `'+' + key` along the member path; a template write reads the key back
+ *  per instance as its frame root's path plus `'+' + key` (#1809: never through the anchor it hangs under, so a
+ *  template that drops or moves that anchor leaves the guid where it was); a template write reads the key back
  *  off the marker, so re-saving a prefab does not re-key it. A SCENE-authored node keeps its `guid`
  *  and never carries a key — which kind a node is follows from the field it carries.
  *

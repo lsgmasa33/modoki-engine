@@ -25,7 +25,7 @@ import {
   resolveKeyLevel, carrierOf, nodeSlot, type ApplyTargets, type LevelSlot,
 } from './prefabApplyTargets';
 import { conflictRefusal, effectsFingerprint, prefabFileName, formatEffectValue, REMOVED_VALUE, type ApplyConflict, type EditEffect, type KeyEffect } from './prefabApplyEffects';
-import { parseMemberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
+import { parseMemberToken, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import {
   guidForEntityId, isTemplateExcludedField, localToEcsGuid, type PrefabEntity, type PrefabFile, resolveInstanceContext,
   valuesEqual, warnInertPrefabSizes,
@@ -34,6 +34,7 @@ import { getCachedPrefabSync, getPrefabSource, preloadNestedPrefabsForSubtree, w
 import { settleSwallowedKeptState } from './prefabTokens';
 import { collectComparableTraits } from './prefabInstanceOverrides';
 import { captureInstanceStructure, toTemplateNodes } from './prefabCapture';
+import { declaredTemplateKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { layerAuthoredStructureKeys } from './prefabChain';
 import {
   collectInstanceRoots, framesBuiltFromOtherRows, missingNestedFrameKeys, missingPrefabInstance, missingSourceRefusal,
@@ -754,22 +755,34 @@ async function planApply(
   /** Each `+added.` key an enclosing level takes, as the template node it becomes (fresh keys, `toTemplateNodes`) and
    *  each node's template key → live guid, for the carry. */
   const outerAdded = new Map<string, { tpl: AddedEntity; keyed: Map<string, string> }>();
+  /** Per target prefab, the template keys it declares, plus every key this Apply has written into it: a promotion may not
+   *  write a key twice into one document (#1809), across promotions of one Apply as within one. */
+  const declaredBy = new Map<string, Set<string>>();
   /** Promote the added node `key` names — every node of its subtree — at level `level`'s writer, at its `+key` path. */
   const promoteOuterAdded = (key: string, ctx: ChainCtx, level: number): void => {
     const node = addedByGuid.get(key.slice('+added.'.length));
     const slot = ctx.slots.find((sl) => sl.level === level);
     if (!node || !slot || addedNodeRefusal(slot, ctx.frameDoc, node)) return;
     const levelWriter = writerAt(ctx.base.levels[level]!.root);
-    const tpl = toTemplateNodes([node])![0]!;
+    // A live marker naming a key the level's prefab already declares is stale (a detached node moved here), and mints:
+    // carried, it was a second node with that key in one frame, and so on one guid (#1809).
+    let declared = declaredBy.get(slot.source);
+    if (!declared) {
+      const levelDoc = getCachedPrefabSync(slot.source);
+      declaredBy.set(slot.source, (declared = levelDoc ? declaredTemplateKeys(levelDoc as TemplateKeyDoc) : new Set()));
+    }
+    const tpl = toTemplateNodes([node], declared)![0]!;
     const keyed = new Map<string, string>();
-    const pathsFrom = (live: AddedEntity, t: AddedEntity, parent: MemberStep[] | undefined): void => {
-      const steps = parent && t.key ? [...parent, addedKeyStep(t.key)] : undefined;
+    // Every node of the subtree, children too, derives from the FRAME ROOT's path plus its own key (#1809): a keyed
+    // node's guid names its frame and its key, never its anchor or a keyed parent.
+    const pathsFrom = (live: AddedEntity, t: AddedEntity, frame: MemberStep[] | undefined): void => {
+      const steps = frame && t.key ? [...frame, addedKeyStep(t.key)] : undefined;
       if (live.guid && steps) levelWriter.promote(live.guid, steps);
       if (live.guid && t.key) keyed.set(t.key, live.guid);
-      live.children.forEach((c, i) => { if (t.children[i]) pathsFrom(c, t.children[i]!, steps); });
+      live.children.forEach((c, i) => { if (t.children[i]) pathsFrom(c, t.children[i]!, frame); });
     };
     const anchor = memberOf(ctx.frameRoot, node.parentLocalId);
-    pathsFrom(node, tpl, anchor ? levelWriter.pathOf(guidForEntityId(anchor)) : undefined);
+    pathsFrom(node, tpl, anchor ? levelWriter.pathOf(guidForEntityId(ctx.frameRoot)) : undefined);
     outerAdded.set(key, { tpl, keyed });
   };
 
@@ -1133,7 +1146,8 @@ async function planApply(
     const paths = new Set(['', ...memberPathRecords({ prefab: prefabId }, readNew).self.keys()]);
     const live = Object.entries(newPrefab.moved).filter(([k, v]) => {
       const t = parseMemberToken(v);
-      return paths.has(k) && !!t && !t.up && paths.has(memberPathKey(t.path));
+      const has = (p: string) => (paths.has(p) ? true : undefined);
+      return !!memberPathLookup(has, memberPathSteps(k)) && !!t && !t.up && !!memberPathLookup(has, t.path);
     });
     if (live.length !== Object.keys(newPrefab.moved).length) newPrefab.moved = live.length ? Object.fromEntries(live) : undefined;
     if (!newPrefab.moved) delete newPrefab.moved;

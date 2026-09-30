@@ -16,7 +16,7 @@ import { templateKeyOf } from '../templateIdentity';
 import { memberRowsToWrite } from './memberRows';
 import { notifyGuidRemap } from './guidRemap';
 import { memberPathKey } from '../templateRefs';
-import { worldIdentityParents, type IdentityParents, type TemplateDocReader } from './identityParents';
+import { worldIdentityParents, type IdentityOptions, type IdentityParents, type TemplateDocReader } from './identityParents';
 
 type Pi = { localId?: number; parentLocalId?: number; ownerGuid?: string };
 
@@ -176,6 +176,8 @@ export function memberPathIndex(
   out.set('', root);
   const stack: [Entity, MemberStep[]][] = [[root, []]];
   const seen = new Set<number>([rootEcsId]);
+  // Each node's path, for a keyed node, which continues from its FRAME ROOT rather than its parent (#1809).
+  const pathOf = new Map<number, MemberStep[]>([[rootEcsId, []]]);
   while (stack.length) {
     const [e, path] = stack.pop()!;
     for (const c of children.get(e.id()) ?? []) {
@@ -183,7 +185,9 @@ export function memberPathIndex(
       seen.add(c.id());
       const step = memberStepOf(c, piMeta.trait);
       if (step === null) continue;
-      const at = [...path, ...parents.of(c.id()).extra, step];
+      const from = parents.derivesFrom(c.id());
+      const at = [...(from.parentId === e.id() ? path : pathOf.get(from.parentId) ?? path), ...from.extra, step];
+      pathOf.set(c.id(), at);
       const key = memberPathKey(at);
       out.set(key, out.has(key) ? null : c);
       const pi = c.has(piMeta.trait) ? c.get(piMeta.trait) as MemberPi : null;
@@ -197,9 +201,9 @@ export function memberPathIndex(
  *  resolver it was built from — whose `extra` steps a path walk needs beside the parent. */
 export interface IdentityTree { children: Map<number, Entity[]>; parents: IdentityParents }
 
-export function identityTree(world: World, fallback?: TemplateDocReader): IdentityTree {
+export function identityTree(world: World, fallback?: TemplateDocReader, opts?: IdentityOptions): IdentityTree {
   const attrMeta = getTraitByName('EntityAttributes');
-  const parents = worldIdentityParents(world, fallback);
+  const parents = worldIdentityParents(world, fallback, opts);
   const children = new Map<number, Entity[]>();
   if (!attrMeta) return { children, parents };
   for (const e of world.entities as Iterable<Entity>) {
@@ -262,7 +266,11 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
  *  guid the reload DERIVES through its key, whatever a scene says: the load merges a scene's record of it onto the
  *  template node, and pins that record's member rows only once the node's guid is the derived one (#1758). So the walk
  *  takes it, and continues into its frame from its derived guid: a member no row pins derives from THAT guid. */
-export function reloadDerivedGuids(world: World, rootEcsId: number, anchor: string, tree: IdentityTree = identityTree(world)): Map<Entity, string> {
+export function reloadDerivedGuids(
+  world: World, rootEcsId: number, anchor: string, tree: IdentityTree = identityTree(world),
+  /** `withRowed`: every member the walk reaches, a rowed one too — what its path derives, not what a reload keeps. */
+  opts: { withRowed?: boolean } = {},
+): Map<Entity, string> {
   const piMeta = getTraitByName('PrefabInstance');
   const out = new Map<Entity, string>();
   if (!piMeta || !anchor) return out;
@@ -275,11 +283,41 @@ export function reloadDerivedGuids(world: World, rootEcsId: number, anchor: stri
       const stored = isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id());
       if (stored && !templateKeyOf(e)) continue; // a stored guid: the save writes it
       const guid = deriveMemberGuid(from, memberPathSteps(key));
-      if (!rowed.has(e.id())) out.set(e, guid);
+      if (opts.withRowed || !rowed.has(e.id())) out.set(e, guid);
       if (stored && depth < 64) walk(e.id(), guid, depth + 1);
     }
   };
   walk(rootEcsId, anchor, 0);
+  return out;
+}
+
+/** The scene v17→v18 upgrade's rename (#1809): old guid → new, for every entity whose derived guid a template-keyed node
+ *  changes — the node itself (now derived from its frame root, not where it hangs), a keyed child, and the members of a
+ *  keyed reference root, which derive from its guid. Both guids are {@link reloadDerivedGuids}' answers, below every
+ *  unkeyed stored root with a durable guid (a scene instance, a scene-authored reference node: each its own walk), one
+ *  walked under `legacyKeyedParent` — the rule v17 files were written under, and one of the only two places it survives
+ *  (see `identityParents.ts`). An entity whose two answers agree is not in the map, so a world holding no keyed node
+ *  renames nothing. The loader applies it with {@link applyGuidRemap}, which also moves a node that still HOLDS the old
+ *  guid (a v17 scene's pinned scene-form node) and every ref naming it. */
+export function keyedGuidUpgrade(world: World): Map<string, string> {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const out = new Map<string, string>();
+  if (!piMeta || !eaMeta) return out;
+  const now = identityTree(world);
+  const before = identityTree(world, undefined, { legacyKeyedParent: true });
+  for (const e of world.entities as Iterable<Entity>) {
+    if (!e.has(piMeta.trait) || templateKeyOf(e) || !isStoredRoot(e.get(piMeta.trait) as MemberPi, e.id())) continue;
+    const anchor = durableGuid((e.get(eaMeta.trait) as { guid?: string } | undefined)?.guid);
+    if (!anchor) continue;
+    // Rowed members too: the upgrade asks what each path derives under each rule, and a member of a keyed reference root
+    // (which derives from the root's guid) is renamed whether or not the next save would write it a row.
+    const old = reloadDerivedGuids(world, e.id(), anchor, before, { withRowed: true });
+    for (const [member, guid] of reloadDerivedGuids(world, e.id(), anchor, now, { withRowed: true })) {
+      const was = old.get(member);
+      if (was && was !== guid) out.set(was, guid);
+    }
+  }
   return out;
 }
 

@@ -28,7 +28,23 @@
  *    or its owner, whichever document has the row there (a nested row under a nested row).
  *  - **Anything else** — a stored root, a keyed or scene-added node, a plain entity — and any member whose
  *    document or row cannot be found: its LIVE parent, with no extra steps. That is the answer a member
- *    with no home always got, and it is right for everything that has not moved. */
+ *    with no home always got, and it is right for everything that has not moved.
+ *
+ *  **Where a node's GUID derives from is a second answer ({@link IdentityParents.derivesFrom}), and differs only for a
+ *  template-KEYED node** (`TemplateAddedKey`: an added node or a reference node's root that a prefab document declares,
+ *  #1387): the ROOT of the frame it lives in, with no extra steps (#1809, owner ruling 2026-09-30, the Unity way). Its
+ *  guid is that frame's path plus `'+key'`, so the anchor it hangs under, a keyed parent or a removed ancestor never
+ *  enters it: an Apply that drops its anchor row re-anchors it to the frame root and its guid stays. Unity's
+ *  GlobalObjectId is the same pair, the prefab instance and the object's own id in its file. The frame is the first
+ *  ancestor that has a `PrefabInstance` (past keyed ancestors; the heal also past unmarked ones): that ancestor when it is a root, else its
+ *  `rootInstanceId`; with none (a key the #1808 drop should already have removed), the answer above. ⚠️ One residual:
+ *  a node anchored AT a nested row hangs at that row's root, so it takes that nested frame; if the template then drops
+ *  the nested row itself, the node re-anchors to the outer frame and its guid changes once. The live tree cannot tell
+ *  that anchor from the inner frame's own root, which is where a node the inner frame declares hangs too. Its identity
+ *  PARENT stays its live parent: the tree (what goes when a node goes, I6, and `moved`) is hierarchy, not identity.
+ *  ⚠️ The old rule (derive from the live parent) survives in exactly TWO places, both only to upgrade what it wrote:
+ *  `legacyKeyedParent` here (the scene v17→v18 upgrade in `loadSceneFile.ts`) and its twin in `memberPaths.ts` (a raw
+ *  v17 file's duplicate remint). Nothing else may ask for it. */
 
 import type { Entity, World } from 'koota';
 import { getTraitByName } from './traitRegistry';
@@ -49,8 +65,13 @@ export type TemplateDocReader = (source: string, root?: number) => TemplateDoc |
 /** The `PrefabInstance` fields the resolver reads. */
 export type IdentityPi = { source?: string; localId?: number; parentLocalId?: number; parentNodeGuid?: string; rootInstanceId?: number; ownerGuid?: string } | null;
 
-/** One entity as the resolver sees it: a live one, or a node of a snapshot (`planCopyGuids`). */
-export interface IdentityNode { id: number; parentId: number; guid: string; pi: IdentityPi }
+/** One entity as the resolver sees it: a live one, or a node of a snapshot (`planCopyGuids`). `key`: its template
+ *  key (`TemplateAddedKey`), when it has one. */
+export interface IdentityNode { id: number; parentId: number; guid: string; pi: IdentityPi; key?: string }
+
+/** `legacyKeyedParent`: answer a keyed node with its LIVE parent, the rule before #1809. Only the scene v17→v18
+ *  upgrade asks for it, to know the guids v17 files hold (see the docblock above). */
+export interface IdentityOptions { legacyKeyedParent?: boolean }
 
 /** An entity's identity parent, and the steps of the gone template rows between it and the entity — led by a
  *  `FRAME_STEP` when that parent is a nested root standing for a row of the entity's frame (#1484). */
@@ -68,6 +89,13 @@ export interface IdentityParents {
   /** The frame whose ROW `id` is (I6): a member's `rootInstanceId`, an owned nested root's {@link ownerOf}. 0 for a
    *  stored root, a scene-added node, a plain entity, and an owned root whose owner is unknown. */
   frameOf(id: number): number;
+  /** Where `id`'s derived path continues from, and the steps between: {@link of} for everything but a template-keyed
+   *  node, which derives from its frame root with no steps (see the module docblock). Every walk that BUILDS a path asks
+   *  this; every walk that asks where a node BELONGS asks {@link of}. */
+  derivesFrom(id: number): IdentityParent;
+  /** {@link derivesFrom} as if `id` were template-keyed, whether or not it still carries its marker: where a key
+   *  recovery must start (`templateKeyRecovery.ts`), since a node that lost its marker is the one it asks about. */
+  derivesFromAsKeyed(id: number): IdentityParent;
 }
 
 // ── The per-world document registry ─────────────────────────────────────────────────────────────
@@ -213,7 +241,7 @@ function docIndex(doc: TemplateDoc): DocIndex {
 }
 
 /** Resolve identity parents over `nodes`. Built once per walk: callers ask it per entity. */
-export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: TemplateDocReader): IdentityParents {
+export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: TemplateDocReader, opts: IdentityOptions = {}): IdentityParents {
   const byId = new Map<number, IdentityNode>();
   const idOfGuid = new Map<string, number>();
   for (const n of nodes) {
@@ -290,6 +318,23 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
     else if (n.pi.parentLocalId) put(ownerOf(n.id), n.pi.parentLocalId, n.id);
   }
 
+  /** A keyed node's frame root (see the docblock): past keyed ancestors to the first with a `PrefabInstance`; 0 for none,
+   *  and 0 always under `legacyKeyedParent`. `pastUnmarked`: past an UNMARKED plain ancestor too — only for the heal
+   *  (`derivesFromAsKeyed`), where that ancestor is a keyed parent that lost its marker and stopping left the child
+   *  unrecoverable (close-out review). The DERIVE stops there: a plain ancestor it cannot vouch for is also a Detach's
+   *  unpacked node (Detach leaves markers), and climbing past two of those under one instance gave both copies of a
+   *  duplicate one guid (close-out re-review). */
+  const keyedFrameRoot = (n: IdentityNode, pastUnmarked = false): number => {
+    if (opts.legacyKeyedParent) return 0;
+    const seen = new Set<number>([n.id]);
+    for (let p = byId.get(n.parentId); p && !seen.has(p.id); p = byId.get(p.parentId)) {
+      seen.add(p.id);
+      if (p.pi?.rootInstanceId) return isRoot(p) ? p.id : p.pi.rootInstanceId;
+      if (!p.key && !pastUnmarked) return 0;
+    }
+    return 0;
+  };
+
   const memo = new Map<number, IdentityParent>();
   const of = (id: number): IdentityParent => {
     const hit = memo.get(id);
@@ -334,6 +379,16 @@ export function resolveIdentityParents(nodes: Iterable<IdentityNode>, readDoc: T
 
   return {
     of,
+    derivesFrom: (id) => {
+      const n = byId.get(id);
+      const frame = n?.key ? keyedFrameRoot(n) : 0;
+      return frame ? { parentId: frame, extra: [] } : of(id);
+    },
+    derivesFromAsKeyed: (id) => {
+      const n = byId.get(id);
+      const frame = n ? keyedFrameRoot(n, true) : 0;
+      return frame ? { parentId: frame, extra: [] } : of(id);
+    },
     parentOf: (id) => of(id).parentId,
     moved: (id) => { const r = of(id); return r.extra.some((s) => !isFrameStep(s)) || r.parentId !== (byId.get(id)?.parentId ?? 0); },
     ownerOf,
@@ -404,8 +459,8 @@ export function closeIdentityScope(): void {
 
 /** {@link resolveIdentityParents} over the live `world`, reading the documents it expanded and then
  *  `fallback`. */
-export function worldIdentityParents(world: World, fallback?: TemplateDocReader): IdentityParents {
-  if (scopeDepth > 0 && !fallback) {
+export function worldIdentityParents(world: World, fallback?: TemplateDocReader, opts?: IdentityOptions): IdentityParents {
+  if (scopeDepth > 0 && !fallback && !opts?.legacyKeyedParent) {
     // A module stubbed by an explicit export list (the editor's tests do this to `entityUtils`) throws on a
     // missing export; with no version to compare, build fresh — the uncached answer is always right.
     let version: number;
@@ -415,10 +470,10 @@ export function worldIdentityParents(world: World, fallback?: TemplateDocReader)
     scoped = { world, version, parents };
     return parents;
   }
-  return buildWorldIdentityParents(world, fallback);
+  return buildWorldIdentityParents(world, fallback, opts);
 }
 
-function buildWorldIdentityParents(world: World, fallback?: TemplateDocReader): IdentityParents {
+function buildWorldIdentityParents(world: World, fallback?: TemplateDocReader, opts?: IdentityOptions): IdentityParents {
   const eaMeta = getTraitByName('EntityAttributes');
   const piMeta = getTraitByName('PrefabInstance');
   const nodes: IdentityNode[] = [];
@@ -426,10 +481,10 @@ function buildWorldIdentityParents(world: World, fallback?: TemplateDocReader): 
   for (const e of world.entities as Iterable<Entity>) {
     const ea = eaMeta && e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { parentId?: number; guid?: string }) : undefined;
     const pi = piMeta && e.has(piMeta.trait) ? (e.get(piMeta.trait) as IdentityPi) : null;
-    nodes.push({ id: e.id(), parentId: ea?.parentId ?? 0, guid: ea?.guid ?? '', pi });
+    nodes.push({ id: e.id(), parentId: ea?.parentId ?? 0, guid: ea?.guid ?? '', pi, key: templateKeyOf(e) || undefined });
     packed.set(e.id(), packedOf(e));
   }
-  return resolveIdentityParents(nodes, frameDocReader(world, fallback ?? defaultFallback, packed));
+  return resolveIdentityParents(nodes, frameDocReader(world, fallback ?? defaultFallback, packed), opts);
 }
 
 /** Before an OWNED nested root moves, record which frame owns it (`PrefabInstance.ownerGuid`): the frame

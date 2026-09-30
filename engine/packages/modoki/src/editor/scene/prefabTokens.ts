@@ -13,7 +13,7 @@ import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { templateReferenceNode } from './prefabBase';
-import { isMemberToken, parseMemberToken, memberToken, memberPathKey, type MemberStep } from '../../runtime/core/templateRefs';
+import { isMemberToken, parseMemberToken, memberToken, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
 
 /** Which entities of `tree` become ROWS of the prefab, and what localId each one gets.
@@ -128,7 +128,10 @@ export function templateTokenizer(rootEcsId: number, all: EntityInfo[], ecsToLoc
       if (step === null) continue;
       // A written row under a written NESTED root steps across that frame, as the reloaded expansion derives it (#1484).
       const crosses = id !== rootEcsId && ecsToLocal.has(id) && piOf(id)?.rootInstanceId === id;
-      const at = ecsToLocal.has(c.id) ? [...path, ...(crosses ? [FRAME_STEP] : []), step] : [...path, ...identity.of(c.id).extra, step];
+      // A template-keyed node continues from its FRAME ROOT's path, not its parent's (#1809, `derivesFrom`).
+      const from = identity.derivesFrom(c.id);
+      const at = ecsToLocal.has(c.id) ? [...path, ...(crosses ? [FRAME_STEP] : []), step]
+        : [...(from.parentId === id ? path : pathById.get(from.parentId) ?? path), ...from.extra, step];
       if (c.guid) pathInRoot.set(c.guid, at);
       pathById.set(c.id, at);
       if (!isStoredRoot(pi, c.id) || ecsToLocal.has(c.id)) stack.push([c.id, at]);
@@ -298,7 +301,8 @@ export function baseTokenResolver(rootInstanceId: number): (value: unknown) => u
     if (!t || !frame || !eaMeta) return token;
     let index = indexes.get(frame);
     if (!index) { index = memberPathIndex(world, frame); indexes.set(frame, index); }
-    const target = index.get(memberPathKey(t.path));
+    const within = index;
+    const target = memberPathLookup((k) => within.get(k), t.path);
     const guid = target ? ((target.get(eaMeta.trait) as { guid?: string }).guid ?? '') : '';
     return guid || token;
   };

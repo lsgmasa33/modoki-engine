@@ -6,7 +6,7 @@ import { getCurrentWorld, spawnEntity, destroyEntity, indexEntityGuid, findEntit
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
-import { durableGuid, deriveMemberGuid, entityStep, isStoredRoot, isDerivedMember, parseSteps, type MemberPi } from '../core/assetRefRules';
+import { durableGuid, deriveMemberGuid, entityStep, isStoredRoot, isDerivedMember, parseSteps, memberPathSteps, type MemberPi } from '../core/assetRefRules';
 import { deriveAuthoredEntityGuids } from './authoredEntityGuids';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
@@ -19,7 +19,7 @@ import {
   descendStructureLayers, foldStructureLayers, type StructureLayer,
   type NestedOverridePaths,
 } from './prefabOverrides';
-import { SCENE_FORMAT_VERSION } from '../core/version';
+import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
 import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
@@ -34,13 +34,13 @@ import { Transient } from '../core/traits/Transient';
 import { TemplateAddedKey, templateKeyOf, setTemplateKey } from '../core/templateIdentity';
 import { noteTemplateDoc, templateKeysIn, recoverTemplateKey, healMissesIn, type KeyRecoveryNode } from './templateKeyRecovery';
 import { packedOf, isPackedAlive, type PackedEntity } from '../core/ecs/entityTable';
-import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, memberPathKey, type MemberStep } from '../core/templateRefs';
+import { rebaseMemberTokens, hasMemberToken, isMemberToken, parseMemberToken, memberPathLookup, type MemberStep } from '../core/templateRefs';
 import { mapStringValues } from '../core/assetRefRules';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { keptOrphanRowsOf, setKeptOrphanRows, dropKeptOrphanRows, clearKeptOrphanRows, keptLegacyOf, setKeptLegacy, type KeptLegacy } from '../core/ecs/keptOrphanRows';
-import { memberPathIndex, identityTree } from '../core/ecs/memberHome';
-import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
+import { memberPathIndex, identityTree, applyGuidRemap, keyedGuidUpgrade } from '../core/ecs/memberHome';
+import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityOptions, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
@@ -535,6 +535,14 @@ function migrateV15toV16(data: SceneData): void {
  *  its trait removals — then drop them all on its next save. */
 function migrateV16toV17(data: SceneData): void {
   if (data.version >= 17) return;
+  data.version = 17;
+}
+
+/** v17 → v18 (#1809): nothing in the DATA changes, so the rung only stamps. What changes is what a keyed node's guid
+ *  means, and the old guids a v17 file holds can only be renamed on the expanded world — `deriveMemberGuidsAfterPins`
+ *  does it when the file's own version (read before this ladder) is below {@link FLAT_KEYED_GUIDS_SCENE_VERSION}. */
+function migrateV17toV18(data: SceneData): void {
+  if (data.version >= 18) return;
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -945,12 +953,13 @@ function drainAfterDerive(world: World): void {
   // the outermost. Moving twice would take the member through a parent no record names.
   const chosen = new Map<number, { m: AfterDerive['moves'][number]; parentGuid: string }>();
   for (const m of q.moves) {
-    const ecsId = m.ecsId ?? at(m.frameRoot, m.memberPath ?? '\0')?.id();
+    // Through the lookup, so a move key written before #1809 (a keyed node's path through its anchor) still names it.
+    const ecsId = m.ecsId ?? (m.memberPath !== undefined ? memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, memberPathSteps(m.memberPath))?.id() : undefined);
     if (!ecsId) continue; // the instance removed the member its prefab moves: nothing to move
     const prev = chosen.get(ecsId);
     if (prev && !prev.m.base && m.base) continue;
     const t = isMemberToken(m.parentGuid) ? parseMemberToken(m.parentGuid) : null;
-    const parentGuid = !t ? m.parentGuid : t.up ? '' : guidOfHandle(at(m.frameRoot, memberPathKey(t.path)));
+    const parentGuid = !t ? m.parentGuid : t.up ? '' : guidOfHandle(memberPathLookup((k) => at(m.frameRoot, k) ?? undefined, t.path) ?? null);
     if (!parentGuid) console.warn(`${m.logPrefix} a prefab's move names ${m.parentGuid}, which is no member; left at its row`);
     chosen.set(ecsId, { m: { ...m, ecsId }, parentGuid });
   }
@@ -1574,7 +1583,9 @@ function dropCollidingPins(world: World, pinned: ReadonlySet<number>): void {
  *  FILE by `derivedMemberPaths` + `sceneAnchorOf` (engine/plugins/asset-fs-ops.ts, #1324/#1339), and
  *  over a live subtree by `planCopyGuids` (`core/copyIdentity.ts`: the editor's duplicate/paste and
  *  the device op, #1338) — change all three. Both mirrors step a keyed node by its key too (#1430). */
-function deriveMemberGuidsOnly(world: World): void {
+/** `healOnly`: skip the derive and run only the key heal — the scene v17→v18 upgrade's pass under `legacyKeyedParent`,
+ *  which recovers the key of a node a v17 scene pinned at an old-rule guid (#1809). */
+function deriveMemberGuidsOnly(world: World, opts: IdentityOptions & { healOnly?: boolean } = {}): void {
   const piMeta = getTraitByName('PrefabInstance');
   const attrMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !attrMeta) return;
@@ -1603,16 +1614,17 @@ function deriveMemberGuidsOnly(world: World): void {
     const derivedMember = isDerivedMember(pi, e.id(), key);
     // durableGuid: a runtime guid (#1210) is neither an identity to keep nor an anchor to derive from.
     rows.set(e.id(), { handle: e, origGuid: durableGuid(ea.guid), parentId: ea.parentId ?? 0, stepId, extra: [], hasPI, keyed: !!key, storedRoot, derivedMember });
-    nodes.push({ id: e.id(), parentId: ea.parentId ?? 0, guid: ea.guid ?? '', pi: pi as IdentityPi });
+    nodes.push({ id: e.id(), parentId: ea.parentId ?? 0, guid: ea.guid ?? '', pi: pi as IdentityPi, key: key || undefined });
   }
   // A member moved inside its instance steps from its TEMPLATE parent (#1437), read from the document the
   // frame was expanded from, with a step for each template row between that is gone (#1468 Phase 6). Asked
   // only of the rows a walk actually reaches: on a runtime spawn that is the new instance's members, not the
   // whole world (close-out review: resolving every row cost ~1 ms a spawn at 3000 entities).
-  const parents = resolveIdentityParents(nodes, frameDocReader(world, undefined, packedById));
+  // A template-KEYED node derives from its frame root, past its anchor and any keyed parent (#1809, `derivesFrom`).
+  const parents = resolveIdentityParents(nodes, frameDocReader(world, undefined, packedById), opts);
   const place = (row: Row | undefined): Row | undefined => {
-    if (row && row.hasPI && !row.placed) {
-      const at = parents.of(row.handle.id());
+    if (row && (row.hasPI || row.keyed) && !row.placed) {
+      const at = parents.derivesFrom(row.handle.id());
       row.parentId = at.parentId;
       row.extra = at.extra;
       row.placed = true;
@@ -1651,6 +1663,7 @@ function deriveMemberGuidsOnly(world: World): void {
   };
 
   for (const [id, row] of rows) {
+    if (opts.healOnly) break;
     if ((!row.hasPI && !row.keyed) || row.origGuid) continue; // only members / keyed added nodes that lack a guid
     const derived = resolve(id, row);
     if (!derived) continue;
@@ -1711,10 +1724,11 @@ function deriveMemberGuidsOnly(world: World): void {
       if (!inside(id)) continue;
       const tried = `${row.origGuid}|${keys.size}|${chainOf(id)}`;
       const packed = packedOf(row.handle as unknown as Entity);
-      if (misses.get(packed) === tried) continue;
-      const key = recoverTemplateKey(id, nodeOf, keys, memo, isTop);
+      // The upgrade's legacy heal asks again what today's rule just missed, so it neither reads nor records a miss.
+      if (!opts.legacyKeyedParent && misses.get(packed) === tried) continue;
+      const key = recoverTemplateKey(id, nodeOf, keys, memo, isTop, (n) => parents.derivesFromAsKeyed(n));
       if (key) { setTemplateKey(row.handle, key); row.keyed = true; misses.delete(packed); }
-      else misses.set(packed, tried);
+      else if (!opts.legacyKeyedParent) misses.set(packed, tried);
     }
   }
 
@@ -1737,8 +1751,14 @@ function settleDerivedGuids(world: World): void {
  *  spelling. A rebuild used to derive and settle with no guard at all: a restored pin equal to a guid the NEW template's
  *  derivation hands another member left two entities on one guid, unreported, and a template's `@member` token could
  *  resolve to the wrong one (#1777). `pinned` is the set of entities the caller pinned; only those can be dropped. */
-export function deriveMemberGuidsAfterPins(world: World, pinned: ReadonlySet<number>): void {
+export function deriveMemberGuidsAfterPins(world: World, pinned: ReadonlySet<number>, opts: { fromSceneVersion?: number } = {}): void {
   deriveMemberGuidsOnly(world);
+  // A scene written before keyed guids were frame-rooted names them by the old rule (#1809): give back the keys of the
+  // nodes it pinned at old guids, then rename every old guid to today's, before the pins are checked and tokens settle.
+  if (opts.fromSceneVersion !== undefined && opts.fromSceneVersion < FLAT_KEYED_GUIDS_SCENE_VERSION) {
+    deriveMemberGuidsOnly(world, { legacyKeyedParent: true, healOnly: true });
+    applyGuidRemap(keyedGuidUpgrade(world), world);
+  }
   if (pinned.size) dropCollidingPins(world, pinned);
   // Tokens and moves only once every guid is final (#1761): a dropped pin re-derives its member.
   settleDerivedGuids(world);
@@ -1860,7 +1880,8 @@ function resolveTemplateFrames(world: World): void {
       if (!t) return token;
       const frame = t.up ? (climb ??= templateFrameClimber(world))(rootId, t.up) : rootId;
       if (!frame) return token;
-      const target = (t.up ? indexOf(frame) : index).get(memberPathKey(t.path));
+      const within = t.up ? indexOf(frame) : index;
+      const target = memberPathLookup((k) => within.get(k), t.path);
       const guid = target ? ((target.get(attrMeta.trait) as { guid?: string }).guid ?? '') : '';
       return guid || token;
     };
@@ -2718,6 +2739,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // and a per-call clear would wipe the marks an earlier scene in the chain seeded
   // (A9 defect 1) — see the `clearMarks` docblock on LoadSceneOptions.
   if (options.clearMarks !== false) clearAllOverrideMarks();
+  // The version the file was WRITTEN in, before the ladder stamps it: the keyed-guid upgrade runs on the world, after the
+  // derive, so it asks this rather than the rung (#1809).
+  const sourceVersion = typeof data.version === 'number' ? data.version : 0;
   migrateV8toV9(data);
   migrateV9toV10(data);
   migrateV10toV11(data);
@@ -2727,6 +2751,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV14toV15(data);
   migrateV15toV16(data);
   migrateV16toV17(data);
+  migrateV17toV18(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
@@ -3123,7 +3148,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   // …then give every remaining member a stable, addressable GUID so entities can reference into
   // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
   // name all land here, deriving exactly what they always did.
-  deriveMemberGuidsAfterPins(world, pinned);
+  deriveMemberGuidsAfterPins(world, pinned, { fromSceneVersion: sourceVersion });
   for (const [entryRootId, keyed] of templateNodeRows) keepTemplateNodeOrphans(world, entryRootId, keyed);
   retryGuidParents(world, guidParentMisses);
 }

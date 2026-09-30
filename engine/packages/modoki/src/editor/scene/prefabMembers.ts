@@ -9,11 +9,11 @@ import { memberRowKeysIn, memberRowsIn, memberRowsToWrite } from '../../runtime/
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
-import { durableGuid, isOwnedRoot, isFrameStep, type MemberPi } from '../../runtime/core/assetRefRules';
+import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptMemberOrphans, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { levelDoc } from './prefabBase';
-import { parseMemberToken, memberPathKey } from '../../runtime/core/templateRefs';
+import { parseMemberToken, memberPathLookup } from '../../runtime/core/templateRefs';
 import { type PrefabFile } from './prefab';
 
 // ── Instance-keyed scan cost (review F11 — measured, no index threaded) ──────
@@ -117,7 +117,7 @@ export function enclosingFrames(rootInstanceId: number): { root: number; doc: Pr
 
 export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (ecsId: number) => string {
   const eaMeta = getTraitByName('EntityAttributes');
-  type Frame = { index: ReturnType<typeof memberPathIndex>; pathOf: Map<number, string>; moved: Record<string, string> };
+  type Frame = { index: ReturnType<typeof memberPathIndex>; movedOf: Map<number, string> };
   let frames: Frame[] | null = null;
   const frameChain = (): Frame[] => {
     const world = getCurrentWorld();
@@ -125,7 +125,14 @@ export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (
       .map((f) => ({ root: f.root, moved: frameMovesOf(f.root, f.doc) }))
       .filter((f): f is { root: number; moved: Record<string, string> } => !!f.moved).map((f) => {
         const index = memberPathIndex(world, f.root);
-        return { index, pathOf: new Map([...index].filter(([, e]) => e).map(([k, e]) => [e!.id(), k])), moved: f.moved };
+        // Each move by the member its key names — through the lookup, so a key written before #1809 (a keyed node's path
+        // through its anchor) still finds it.
+        const movedOf = new Map<number, string>();
+        for (const [key, token] of Object.entries(f.moved)) {
+          const member = memberPathLookup((k) => index.get(k), memberPathSteps(key));
+          if (member) movedOf.set(member.id(), token);
+        }
+        return { index, movedOf };
       });
   };
   return (ecsId) => {
@@ -133,8 +140,8 @@ export function prefabMoveTargets(rootInstanceId: number, prefab: PrefabFile): (
     frames ??= frameChain();
     let base = '';
     for (const f of frames) {
-      const t = parseMemberToken(f.moved[f.pathOf.get(ecsId) ?? '\0'] ?? '');
-      const target = t && !t.up ? f.index.get(memberPathKey(t.path)) : null;
+      const t = parseMemberToken(f.movedOf.get(ecsId) ?? '');
+      const target = t && !t.up ? memberPathLookup((k) => f.index.get(k), t.path) : null;
       if (target) base = (target.get(eaMeta.trait) as { guid?: string }).guid ?? '';
     }
     return base;

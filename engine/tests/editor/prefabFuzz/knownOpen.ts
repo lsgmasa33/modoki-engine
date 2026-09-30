@@ -21,10 +21,6 @@ export interface KnownOpen {
   stops?: (f: StepFailure, ops: readonly Op[]) => boolean;
 }
 
-/** The op before the failure, reloads aside: for a route that shows at the next save→reload after the op that exposes it,
- *  keying on that op being LAST is what keeps a stop from claiming any later failure in a list that merely holds it. */
-const lastOp = (ops: readonly Op[]) => ops.filter((o) => o.kind !== 'saveReload').at(-1)?.kind;
-
 
 // Retired by #1869, whose refusals (a supplied object is not moved, reordered, detached out of its instance or saved as
 // a prefab of its own — Unity's rule) left their only route unreachable, and which a 300-seed hunt with the re-aimed ops
@@ -33,42 +29,7 @@ const lastOp = (ops: readonly Op[]) => ops.filter((o) => o.kind !== 'saveReload'
 // #1820 (Create Prefab's undo, on a member). Also a route #1796's fix unmasked (outsideEdit → reparent → createPrefab: its
 // redo tagged, then a template-added node row read removed): with #1869 merged one of its draws lands on a refused gesture
 // and it no longer reproduces.
-/** The last three ops (reloads aside) are a delete, a SAVED prefab edit (`u[1] < 0.65` saves) and an undo: Delete's undo
- *  respawning a snapshot older than the template the edit saved. Adjacent, so a list that merely holds the three somewhere
- *  is not claimed (the planted-regression guard). */
-const deleteThenSavedEditThenUndo = (ops: readonly Op[]) => {
-  const [d, e, u] = ops.filter((o) => o.kind !== 'saveReload').slice(-3);
-  return d?.kind === 'delete' && e?.kind === 'prefabEdit' && e.u[1] < 0.65 && u?.kind === 'undo';
-};
-const CHANGED_GUID = /\(an entity changed guid\)$/;
-
 export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 1809,
-    what: "the anchor-row guid change, through Delete's undo after a saved prefab edit dropped the anchor row (close-out review)",
-    repro: [
-      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
-      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
-      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && CHANGED_GUID.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && CHANGED_GUID.test(f.detail) && deleteThenSavedEditThenUndo(ops),
-  },
-  {
-    issue: 1809,
-    what: "the same, through Detach's undo after a prefab-edit save deleted the anchor row (its rebase re-anchors, keeps the guid)",
-    repro: [
-      { kind: 'detach', u: [0.025726123247295618, 0.6438882742077112, 0.055156498216092587, 0.2290809666737914, 0.325337108457461, 0.7244618884287775, 0.937406157143414, 0.4990142297465354] },
-      { kind: 'prefabEdit', u: [0.5476142126135528, 0.18346081534400582, 0.2778930668719113, 0.278214025311172, 0.27691279095597565, 0.6830818050075322, 0.0016407903749495745, 0.34888543910346925], inner: [{ kind: 'delete', u: [0.19734677020460367, 0.22199939331039786, 0.5219223950989544, 0.29861879511736333, 0.49865362676791847, 0.32312997709959745, 0.16570315975695848, 0.15814896672964096] }] },
-      { kind: 'undo', u: [0.47763126995414495, 0.6631570672616363, 0.7647192350123078, 0.0125291314907372, 0.2069809422828257, 0.5996168968267739, 0.4597687148489058, 0.01827254961244762] },
-    ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /\(an entity changed guid\)$/.test(f.detail),
-    stops: (f, ops) => f.check === 'save→reload is not the identity' && /\(an entity changed guid\)$/.test(f.detail) && lastOp(ops) === 'undo' && (() => {
-      const d = ops.findIndex((o) => o.kind === 'detach');
-      const e = ops.findIndex((o, i) => i > d && o.kind === 'prefabEdit' && o.u[1] < 0.65 && !!o.inner?.some((x) => x.kind === 'delete'));
-      return d >= 0 && e >= 0 && ops.slice(e + 1).some((o) => o.kind === 'undo');
-    })(),
-  },
   {
     issue: 1822,
     what: "Add Component re-adding a template-row trait on a nested member reconciles its marks against the effective base",
@@ -980,6 +941,62 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'createPrefab', u: [0.0038380103651434183, 0.591657679527998, 0.6498477926943451, 0.16832039435394108, 0.2952046236023307, 0.20283732656389475, 0.14619030989706516, 0.46976823825389147] },
       { kind: 'trashPrefab', u: [0.366121573606506, 0.12152830720879138, 0.5724751548841596, 0.37606001063250005, 0.03529732837341726, 0.28352958406321704, 0.45296140434220433, 0.5870168737601489] },
       { kind: 'prefabEdit', u: [0.301515509840101, 0.43780972715467215, 0.667069936171174, 0.5753587565850466, 0.6484025486279279, 0.15705850371159613, 0.9615241875872016, 0.1484056394547224], inner: [] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "Delete's undo after a saved prefab edit dropped the anchor row: the rebase re-anchored the keyed node and kept its guid, the reload derived another (was KNOWN_OPEN; fixed by deriving a keyed node from its frame root, the Unity way)",
+    repro: [
+      { kind: 'delete', u: [0.02, 0, 0, 0, 0, 0, 0, 0] },
+      { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'delete', u: [0.15, 0.5, 0.5, 0, 0, 0, 0, 0] }] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "Detach's undo after a prefab-edit save deleted the anchor row: the same rebase (was KNOWN_OPEN)",
+    repro: [
+      { kind: 'detach', u: [0.025726123247295618, 0.6438882742077112, 0.055156498216092587, 0.2290809666737914, 0.325337108457461, 0.7244618884287775, 0.937406157143414, 0.4990142297465354] },
+      { kind: 'prefabEdit', u: [0.5476142126135528, 0.18346081534400582, 0.2778930668719113, 0.278214025311172, 0.27691279095597565, 0.6830818050075322, 0.0016407903749495745, 0.34888543910346925], inner: [{ kind: 'delete', u: [0.19734677020460367, 0.22199939331039786, 0.5219223950989544, 0.29861879511736333, 0.49865362676791847, 0.32312997709959745, 0.16570315975695848, 0.15814896672964096] }] },
+      { kind: 'undo', u: [0.47763126995414495, 0.6631570672616363, 0.7647192350123078, 0.0125291314907372, 0.2069809422828257, 0.5996168968267739, 0.4597687148489058, 0.01827254961244762] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "#1831 hunt seed 52: a Delete inside an instance, then an Apply, dropped the row a keyed node hangs under; its guid changed on reload",
+    repro: [
+      { kind: 'delete', u: [0.6995459569152445, 0.4692440126091242, 0.925465441076085, 0.14738976070657372, 0.1254213151987642, 0.2452597978990525, 0.8375669901724905, 0.2795277084223926] },
+      { kind: 'apply', u: [0.18453670502640307, 0.07353104162029922, 0.8836200351361185, 0.9087016845587641, 0.13220753101632, 0.7051906674169004, 0.17632998549379408, 0.44616461638361216] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "#1831 hunt seed 208 (editField, Apply, delete, save\u2192reload, Apply): the same",
+    repro: [
+      { kind: 'editField', u: [0.43252027384005487, 0.30455148313194513, 0.12510684435255826, 0.35393382515758276, 0.5243591470643878, 0.6808256064541638, 0.34482107195071876, 0.9128175110090524] },
+      { kind: 'apply', u: [0.5401981819886714, 0.9833217167761177, 0.6220702491700649, 0.7820049456786364, 0.7201114508789033, 0.5151209577452391, 0.6677789050154388, 0.1101147923618555] },
+      { kind: 'delete', u: [0.09509853785857558, 0.1733004874549806, 0.7537630847655237, 0.24513555597513914, 0.2605592079926282, 0.9342146618291736, 0.05207347613759339, 0.9333211013581604] },
+      { kind: 'saveReload', u: [0.18028137739747763, 0.4548219458665699, 0.4665694765280932, 0.34894793829880655, 0.3701279640663415, 0.34367631655186415, 0.10366322263143957, 0.7963432953692973] },
+      { kind: 'apply', u: [0.21407024026848376, 0.13395719486288726, 0.3858836283907294, 0.870954223908484, 0.957652852172032, 0.6814525281079113, 0.03478979133069515, 0.39107713918201625] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "work-ai's hunt seed 7018 (instantiate, delete, Apply): the same",
+    repro: [
+      { kind: 'instantiate', u: [0.5719347195699811, 0.8136770059354603, 0.5990205884445459, 0.739400121383369, 0.25479283300228417, 0.9134822161868215, 0.43771372525952756, 0.5492035846691579] },
+      { kind: 'delete', u: [0.8338866247795522, 0.7534691514447331, 0.31723364163190126, 0.4215981762390584, 0.42713380814529955, 0.5028764205053449, 0.9942377656698227, 0.809980405960232] },
+      { kind: 'apply', u: [0.8177705984562635, 0.16685707564465702, 0.39900506334379315, 0.41232000361196697, 0.527749179629609, 0.2596365693025291, 0.5486904385033995, 0.21155882999300957] },
+    ],
+  },
+  {
+    issue: 1809,
+    what: "win's hunt seed 6858 (a saved prefab-edit reparent, instantiate, delete, Apply): the same",
+    repro: [
+      { kind: 'prefabEdit', u: [0.5173346495721489, 0.08749266993254423, 0.8221204644069076, 0.18406294146552682, 0.3249459487851709, 0.8549291610252112, 0.2693206842523068, 0.9086369727738202], inner: [{ kind: 'reparent', u: [0.22139877150766551, 0.8194225707557052, 0.8731111134402454, 0.3676116168498993, 0.9742902971338481, 0.127988196676597, 0.6087110303342342, 0.1887473629321903] }] },
+      { kind: 'instantiate', u: [0.7440747111104429, 0.43991357320919633, 0.6826722382102162, 0.4947671240661293, 0.6600351938977838, 0.9901851266622543, 0.6497153099626303, 0.006117034703493118] },
+      { kind: 'delete', u: [0.6108392698224634, 0.46971312118694186, 0.05811715195886791, 0.6591711670625955, 0.9784175350796431, 0.0649864545557648, 0.2063837342429906, 0.6221727712545544] },
+      { kind: 'apply', u: [0.21948481863364577, 0.29272619541734457, 0.5293124683666974, 0.5085932151414454, 0.07048665941692889, 0.9514830820262432, 0.5172908876556903, 0.5575136966072023] },
     ],
   },
 ];

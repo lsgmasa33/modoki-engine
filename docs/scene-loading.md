@@ -1558,6 +1558,39 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     `TemplateAddedKey` marker, and a keyed reference node's root gets the same marker.
     `deriveInstanceMemberGuids` derives both, stepping `'+' + key` (`addedKeyStep`). The `+` keeps
     the step disjoint from every numeric one, so no existing derived guid moves.
+  - **A keyed node's identity is its FRAME plus its key (#1809, owner ruling 2026-09-30, the Unity way).** Its guid
+    is `deriveMemberGuid` over the path of the root of the frame it lives in, plus `'+' + key` — not over the anchor
+    it hangs under, nor through a keyed parent (a keyed child is flat too). The frame is the first ancestor past other
+    keyed nodes that has a `PrefabInstance`: that ancestor when it is a root, else its `rootInstanceId`. The rule
+    before it derived through the live parent, so an Apply that dropped the anchor row re-anchored the node to the
+    frame root with its old guid live and a different one on reload, and every ref to it dangled (#1809; a Delete in
+    an instance then an Apply reached it, hunt seeds 52, 208, 7018 and win's 6858). One spelling:
+    `IdentityParents.derivesFrom`, which the derive, `memberPathIndex`, `planCopyGuids`, the tokenizer and key
+    recovery (`derivesFromAsKeyed`) all ask; `memberPaths.ts` mirrors it for a file; `promoteOuterAdded` promotes at
+    `[frame path, '+key']`. The identity PARENT stays the live one, since the tree (I6: what goes when a node goes)
+    is hierarchy, not identity. Keys are unique within one prefab document (a prefab-edit copy mints a fresh key for
+    every keyed node no NESTED prefab declares; a promotion through `toTemplateNodes` does not carry a live marker
+    whose key its target declares or already wrote). A SAME-frame repeat a hand edit or a merge brings in is
+    reported by the prefab validator (`sameFrameRepeatedKeys`, `modoki_validate_prefab`) and never rewritten: a
+    load-time re-key was built and dropped (owner ruling (A)), because it renamed keys the scenes' statements name
+    (#1872's pinned whole lists and `a+<key>` node rows). No ordinary edit on an older build makes one (a copy of a
+    keyed node took no key; a nested row's duplicate is a new frame, and a cross-frame repeat collides on no guid).
+    ⚠️ Open: a Detach leaves `TemplateAddedKey` on the unpacked nodes,
+    and a stale marker is the source of every remaining repeat (a promoted reference row's recaptured `added` still
+    carries one).
+    - **Upgrading what the old rule wrote.** Scene v18: a load of a file below 18 re-heals keys under
+      `legacyKeyedParent` (a node the file pinned at an old-rule guid), then renames every old guid to today's
+      (`keyedGuidUpgrade`: the reload walk under both rules, rowed members included, applied with
+      `applyGuidRemap`) before pins are checked and tokens settle; the next save writes 18. Prefab v9: a member token
+      naming a keyed node is written flat (`@member:3.+B`, where v8 wrote `@member:3.5.+A.+B`); `memberPathLookup`
+      still reads the old spelling, and the write gate stops a v8 build saving over a v9 file, whose prefab edit would
+      turn a flat token into a dangling guid.
+    - ⚠️ **Accepted cost (owner):** a node that already hit #1809 in a saved file may change its guid once more on
+      first load, and a ref already broken stays broken. Keyed nodes shipped in v0.7.2 and v0.7.3; the committed corpus held none when this landed.
+    - ⚠️ **One residual in the rule:** a node anchored AT a nested row hangs at that row's root and takes that nested
+      frame (the live tree cannot tell that anchor from the inner frame's own root); if the template then drops the
+      nested row itself, the node re-anchors to the outer frame and changes guid once. The file walk (`memberPaths`)
+      gives such a node the same frame, so the two still agree.
   - **Load heals a lost key (#1426).** A scene save writes a keyed node as its guid and no key (see
     "Which kind a node is" below), so a reload spawns it unkeyed. Before, a member token naming the
     node then stayed a literal `@member:…` string in the live world, a dead reference in a shipped

@@ -212,7 +212,8 @@ export function deriveGuid(seed: string): string {
 /** The guid a prefab-instance MEMBER derives on load: `anchor` is the durable guid of its nearest
  *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
  *  ({@link memberStepId}; a keyed added node steps as `'+' + key` — `addedKeyStep`, #1387, which
- *  cannot collide with a numeric step, so every numeric path hashes exactly as it always did). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
+ *  cannot collide with a numeric step, so every numeric path hashes exactly as it always did — and its path is its
+ *  FRAME root's plus that one step, never through its anchor or a keyed parent: `IdentityParents.derivesFrom`, #1809). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
  *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `copySnapshot`
  *  for an editor subtree) predict it with it, so a copy's refs land where a reload puts the members. */
 export function deriveMemberGuid(anchor: string, path: readonly MemberStep[]): string {

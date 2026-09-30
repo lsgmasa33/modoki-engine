@@ -77,7 +77,17 @@ export const ENGINE_VERSION = '0.1.0';
 // `<frame chain>/a+<key>` (#1516). They let a scene edit one template node, or remove one more trait, without
 // restating — and so pinning — everything beside it. Required for the REFUSE reason v14-v16 were: an older build
 // would ignore the new channels and drop them on its next save.
-export const SCENE_FORMAT_VERSION = 17;
+// v18: no shape change — the guids a scene holds for template-KEYED nodes change meaning (#1809, owner ruling
+// 2026-09-30, the Unity way): a keyed node's guid is now derived from the root of its frame plus its key, not from the
+// anchor it hangs under and any keyed parent. A v17 file's refs name the old guids (keyed nodes shipped in v0.7.2 and
+// v0.7.3), so a load of a file below {@link FLAT_KEYED_GUIDS_SCENE_VERSION} renames them once, after the derive, from
+// the legacy rule's answers to today's (`keyedGuidUpgrade`, `memberHome.ts`); the next save writes 18. The rung itself
+// only stamps: rungs see raw data, and the old guids need the expanded world. Required for the REFUSE reason too: an
+// older build would read a v18 scene's refs with the old rule and name nothing.
+export const SCENE_FORMAT_VERSION = 18;
+/** The scene format whose keyed-node guids are frame-rooted (#1809): a file below it is renamed on load. A literal, not
+ *  {@link SCENE_FORMAT_VERSION}, which moves on with every later bump while this stays the version the rule arrived in. */
+export const FLAT_KEYED_GUIDS_SCENE_VERSION = 18;
 
 /** The oldest scene format this build reads; an older scene, or one with no `version` at all, is
  *  REFUSED. No released editor ever wrote a scene below v8: the first tag, v0.1.0, wrote 8, and v8
@@ -122,8 +132,17 @@ export const MIN_READABLE_SCENE_FORMAT_VERSION = 8;
  *  which would derive the deleted member's guid and take over every ref to it. An older build opens a v8 file (nothing on
  *  the loading path reads the field) but its serializer rebuilds the document and would drop the mark, so the write gate
  *  stops it saving. No migration: a file without the mark derives it from its highest row (`localIdCounter`), and its
- *  next write states it. */
-export const PREFAB_FORMAT_VERSION = 8;
+ *  next write states it.
+ *
+ *  v9: a member TOKEN naming a template-keyed node is FLAT (#1809, owner ruling 2026-09-30, the Unity way) — its
+ *  frame's path plus `+key`, with no step for the anchor it hangs under or a keyed parent (`@member:3.+B`, where v8
+ *  wrote `@member:3.5.+A.+B`). What an older build's SAVE would destroy: a flat token for a keyed node that is NOT
+ *  directly under its frame root. v0.7.3's prefab edit maps the token to a guid (`editGuidAt`) under the old rule, which
+ *  names no entity, and its tokenizer writes that raw guid back (a guid no frame names falls through as itself), so the
+ *  reference is rewritten into a dangling guid. The write gate stops that save. Reads stay compatible both ways: this
+ *  build reads a v8 token through `memberPathLookup` (the anchor steps dropped), and an older build only fails to
+ *  resolve a flat one. No migration: no committed prefab held a keyed node or a member token when this landed. */
+export const PREFAB_FORMAT_VERSION = 9;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

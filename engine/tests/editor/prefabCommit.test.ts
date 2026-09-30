@@ -107,6 +107,7 @@ import {
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction, clearHistory, deleteEntityWithUndo, createEntityWithUndo } from '@modoki/engine/editor';
 import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+import { LOCAL_ID_MARK_VERSION } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import {
   setPrefabCache, getCachedPrefabSync, getPrefabSource, evictDeletedEditorPrefabs,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -252,7 +253,8 @@ async function replaceXFromI2(): Promise<void> {
  *  replaced bytes with that mark and the format version that claims it spliced in, every other byte kept (#1774). */
 const restoredOverMark = (mark: number | undefined) => {
   expect(mark, 'precondition: the write minted rows above X\'s own').toBeGreaterThan(Math.max(...xDoc().entities.map((e) => e.localId)) + 1);
-  return jsonFileBody({ nextLocalId: mark, ...xDoc(), version: PREFAB_FORMAT_VERSION } as never);
+  // A mark raise claims the version the mark arrived in, not today's format (`contentFor`, #1797; they differ since v9).
+  return jsonFileBody({ nextLocalId: mark, ...xDoc(), version: LOCAL_ID_MARK_VERSION } as never);
 };
 
 describe('Create Prefab → Replace rebuilds every OTHER live instance (#1685)', () => {

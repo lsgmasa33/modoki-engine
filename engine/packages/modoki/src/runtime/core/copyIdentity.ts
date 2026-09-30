@@ -96,7 +96,7 @@ export function planCopyGuids<N>(
     const guid = dataOf(node, 'EntityAttributes')?.guid;
     const lp = liveParent.get(node);
     byId.set(idOf(node), node);
-    nodes.push({ id: idOf(node), parentId: lp === undefined ? 0 : idOf(lp), guid: typeof guid === 'string' ? guid : '', pi: dataOf(node, 'PrefabInstance') as IdentityPi });
+    nodes.push({ id: idOf(node), parentId: lp === undefined ? 0 : idOf(lp), guid: typeof guid === 'string' ? guid : '', pi: dataOf(node, 'PrefabInstance') as IdentityPi, key: keyOf(node) || undefined });
   }
   const parents = resolveIdentityParents(nodes, readDoc ?? (() => undefined));
   // The resolver sees the snapshot alone, so a frame outside the copy answers 0 or an id no node has — and for an OWNED
@@ -137,6 +137,9 @@ export function planCopyGuids<N>(
     else identityChildren.set(parent, [node]);
   }
   const visited = new Set<N>();
+  // The context each visited node hands its children: a keyed node continues from its FRAME ROOT's, not its parent's
+  // (#1809, `IdentityParents.derivesFrom`).
+  const handed = new Map<N, { anchor: string; path: (number | string)[]; inInstance: boolean }>();
   // `inInstance`: some ancestor within the copy (or the node itself) is an instance root the
   // serializer STORES and that is not itself template-added — not an owned nested root, which is
   // copied as an independent instance (#1354), and not a keyed REFERENCE node, which belongs to the
@@ -150,14 +153,18 @@ export function planCopyGuids<N>(
     const key = ctx?.inInstance ? keyOf(node) : '';
     const storedRoot = isStoredRoot(pi, idOf(node));
     const inInstance = (storedRoot && !keyOf(node)) || !!ctx?.inInstance;
-    const path = ctx && [...ctx.path, ...parents.of(idOf(node)).extra, entityStep(pi, key)];
+    const from = key ? parents.derivesFrom(idOf(node)) : parents.of(idOf(node));
+    const frameNode = key ? byId.get(from.parentId) : undefined;
+    const base = (frameNode !== undefined && handed.get(frameNode)) || ctx;
+    const path = base && [...base.path, ...from.extra, entityStep(pi, key)];
     // Derived only while it stays a member of a frame in the copy: a promoted root anchors, a stripped member is plain.
     const derived = !!ctx && (!!key || (links.get(node) === 'keep' && !storedRoot));
-    const guid = derived ? deriveMemberGuid(ctx!.anchor, path!) : mint();
+    const guid = derived ? deriveMemberGuid(base!.anchor, path!) : mint();
     guidOf.set(node, guid);
     if (key) keyed.add(node);
     if (oldGuid) remap.set(oldGuid, guid);
-    const next = derived && !storedRoot ? { anchor: ctx!.anchor, path: path!, inInstance } : { anchor: guid, path: [], inInstance };
+    const next = derived && !storedRoot ? { anchor: base!.anchor, path: path!, inInstance } : { anchor: guid, path: [], inInstance };
+    handed.set(node, next);
     for (const child of identityChildren.get(node) ?? []) visit(child, next);
   };
   visit(root, null);

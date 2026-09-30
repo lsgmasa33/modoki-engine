@@ -24,6 +24,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { remintSceneEntityGuids, derivedMemberPaths, derivedMemberPathsByAnchor } from '../../plugins/asset-fs-ops';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 registerAllTraits();
 
@@ -49,7 +50,9 @@ const outerDoc = {
  *  guid of its own (its members derive from ROOT) and one with its own guid (they derive from it). */
 function baseScene(refs: string[]): SceneData {
   return {
-    id: 'scene-asset', version: 8, name: 'S', resources: [],
+    // The current format: its refs are taken from a LIVE world, so they are today's guids. A file below v18 names keyed
+    // nodes by the rule before #1809, and the remint reads it that way (`sceneMemberAnchors`' legacy walk).
+    id: 'scene-asset', version: SCENE_FORMAT_VERSION, name: 'S', resources: [],
     entities: [
       {
         id: 1, prefab: OUTER, guid: ROOT,

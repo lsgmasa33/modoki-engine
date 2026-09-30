@@ -7,6 +7,7 @@ import { durableGuid, memberRowNodes, deriveMemberGuid, addedKeyStep, parseSteps
 import { memberPathKey } from '../core/templateRefs';
 import { descendPathKeyed, mergeNestedStructurePaths } from './prefabOverrides';
 import { sceneEntryGuid } from './authoredEntityGuids';
+import { FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/version';
 
 /** Reads a prefab document by its asset guid; `null`/`undefined` when it cannot. */
 export type PrefabReader = (prefabGuid: string) => unknown;
@@ -70,6 +71,12 @@ type Base = { tag: AnchorTag; done: Step[][]; path: Step[]; id: string };
  *  Aliased rather than re-declared: the type is `MemberStep` and lives in `assetRefRules` (#1468). */
 type Step = MemberStep;
 
+/** `legacyKeyedParent`: a template-keyed node derives from where it HANGS (its anchor's path, and a keyed parent's), the
+ *  rule before #1809. ⚠️ The file-walk twin of `IdentityParents`' flag of the same name, and one of the only two places
+ *  that rule survives: the duplicate remint of a raw v17 scene file, whose refs name the old guids
+ *  (`engine/plugins/asset-fs-ops.ts`). Nothing else may pass it. */
+export type MemberWalkOptions = { guidLess?: boolean; orphans?: 'parent' | 'skip'; legacyKeyedParent?: boolean };
+
 /** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
  *  {@link deriveMemberChain}) a member can derive at below
  *  `node` — a scene instance root or an `added[]` node that carries its own guid — grouped by the
@@ -94,7 +101,7 @@ type Step = MemberStep;
  *  Over-generating is harmless — the caller maps a derived guid only where the document holds it —
  *  so removed members need no special case. */
 export function derivedMemberPathsByAnchor(
-  node: AddedNode, readPrefab: PrefabReader, opts: { guidLess?: boolean; orphans?: 'parent' | 'skip' } = {},
+  node: AddedNode, readPrefab: PrefabReader, opts: MemberWalkOptions = {},
 ): { self: string[]; parent: string[] } {
   const r = memberPathRecords(node, readPrefab, opts);
   return { self: [...r.self.keys()], parent: [...r.parent.keys()] };
@@ -107,7 +114,7 @@ export function derivedMemberPathsByAnchor(
  *  old path to its new one (#1437). Each map is path → identity; a path two identities share (a keyless
  *  added level) keeps the first. */
 export function memberPathRecords(
-  node: AddedNode, readPrefab: PrefabReader, opts: { guidLess?: boolean; orphans?: 'parent' | 'skip' } = {},
+  node: AddedNode, readPrefab: PrefabReader, opts: MemberWalkOptions = {},
 ): { self: Map<string, string>; parent: Map<string, string> } {
   const out = { self: new Map<string, string>(), parent: new Map<string, string>() };
   let size = 0;
@@ -202,23 +209,29 @@ export function memberPathRecords(
         if (!n || typeof n !== 'object') continue;
         const at = n.parentLocalId ?? rootLocalId;
         const b = baseOf(at);
-        if (b) addedNode(n, b, depth, idOf(at));
+        // Its frame is this one — unless its anchor IS a nested row, whose root it then hangs at and whose frame the live
+        // rule gives it (`keyedFrameRoot` stops at the first root; see the residual in `identityParents.ts`).
+        if (b) addedNode(n, b, depth, idOf(at), rows.get(at)?.prefab && at !== rootLocalId ? { base: b, id: idOf(at) } : { base: root, id: frame });
       }
     }
   };
 
-  /** One `added[]` node hanging at `base`, below the entity whose identity is `owner`. */
-  const addedNode = (n: AddedNode, base: Base, depth: number, owner: string): void => {
+  /** One `added[]` node hanging at `base`, below the entity whose identity is `owner`, in the frame rooted at
+   *  `inFrame.base` whose identity is `inFrame.id`. */
+  const addedNode = (n: AddedNode, base: Base, depth: number, owner: string, inFrame: { base: Base; id: string }): void => {
     const ownGuid = durableGuid(typeof n.guid === 'string' ? n.guid : '');
-    // A template-keyed node (no guid) derives itself, stepping by its key (#1387).
+    // A template-keyed node (no guid) derives itself, stepping by its key (#1387), from its FRAME's root — not from
+    // where it hangs (#1809): its identity is the frame and the key, so neither its anchor nor a keyed parent enters it.
     const key = !ownGuid && typeof n.key === 'string' && n.key ? addedKeyStep(n.key) : '';
-    const id = `${owner}/a${key || (n.prefab ? 'r' : '0')}`;
+    const flat = !!key && !opts.legacyKeyedParent;
+    const from = flat ? inFrame.base : base;
+    const id = `${flat ? inFrame.id : owner}/a${key || (n.prefab ? 'r' : '0')}`;
     if (n.prefab) {
       const child = docOf(n.prefab);
       if (!child) return;
       // With its own guid it is its own anchor: its root and members belong to its own walk. Its
       // orphan rows do not — `spawnNestedInstance` parents them to `base`, which is ours.
-      const here = ownGuid ? SKIP : under(base, id, key || (child.rootLocalId ?? 1));
+      const here = ownGuid ? SKIP : under(from, id, key || (child.rootLocalId ?? 1));
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
       // still anchors its members on the guid it derives (#1349).
@@ -227,9 +240,9 @@ export function memberPathRecords(
     }
     // A plain node with its own guid anchors everything below it (its own walk).
     if (ownGuid) return;
-    const here = under(base, id, key || 0);
+    const here = under(from, id, key || 0);
     if (key) emit(here);
-    if (Array.isArray(n.children)) for (const c of n.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, here, depth, id);
+    if (Array.isArray(n.children)) for (const c of n.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, here, depth, id, inFrame);
   };
 
   try {
@@ -243,7 +256,7 @@ export function memberPathRecords(
       }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
-      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, { tag: 'self', done: [], path: [], id: '' }, 0, '');
+      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') { const self: Base = { tag: 'self', done: [], path: [], id: '' }; addedNode(c, self, 0, '', { base: self, id: '' }); }
     }
   } catch (e) {
     if (e instanceof MemberWalkTooLarge) return { self: new Map(), parent: new Map() };
@@ -295,7 +308,7 @@ export function sceneAnchorOf(entry: SceneEntry, entries: SceneEntry[]): string 
  *  `null` when nothing a reload does can be predicted there — see {@link sceneAnchorOf}). */
 export type SceneMemberAnchor = {
   node: AddedNode;
-  opts: { guidLess?: boolean; orphans?: 'parent' | 'skip' };
+  opts: MemberWalkOptions;
   self: string | null;
   parent: string | null;
 };
@@ -308,12 +321,16 @@ export type SceneMemberAnchor = {
 export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberAnchor[] {
   type Row = AddedNode & { traits?: { EntityAttributes?: { guid?: unknown } } };
   const out: SceneMemberAnchor[] = [];
+  // A file below v18 names keyed nodes by the rule before #1809, and a duplicate of it stays that version, its own first
+  // load upgrading it (`keyedGuidUpgrade`). So its carries map old-rule guids to old-rule guids: the one caller of
+  // memberPaths' `legacyKeyedParent` (see `identityParents.ts`).
+  const legacy = typeof scene.version === 'number' && scene.version < FLAT_KEYED_GUIDS_SCENE_VERSION ? { legacyKeyedParent: true } : {};
   const visit = (rows: unknown, topLevel: boolean): void => {
     if (!Array.isArray(rows)) return;
     for (const row of rows as Row[]) {
       if (!row || typeof row !== 'object') continue;
       const anchor = durableGuid(typeof row.guid === 'string' ? row.guid : '');
-      if (anchor && !topLevel) out.push({ node: row, opts: {}, self: anchor, parent: null });
+      if (anchor && !topLevel) out.push({ node: row, opts: { ...legacy }, self: anchor, parent: null });
       visit(row.children, false);
       visit(row.added, false);
       // A member row's added nodes (Phase 4, #1468) define anchors exactly as `added` does.
@@ -331,7 +348,7 @@ export function sceneMemberAnchors(scene: Record<string, unknown>): SceneMemberA
     const ownGuid = sceneEntryGuid(entry); // the loader's reader (#1798)
     out.push({
       node: entry,
-      opts: { guidLess: !!entry.prefab && !ownGuid, orphans: 'parent' },
+      opts: { guidLess: !!entry.prefab && !ownGuid, orphans: 'parent', ...legacy },
       self: ownGuid || null,
       parent: sceneAnchorOf(entry as SceneEntry, entries as SceneEntry[]),
     });

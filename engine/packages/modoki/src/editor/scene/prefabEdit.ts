@@ -35,6 +35,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
 import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
+import { flatKeyedSteps, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
 /** Guid prefix stamped on EVERY member of the synthetic edit scene, carrying that member's
@@ -204,7 +205,13 @@ function editGuidAt(prefab: PrefabFile, path: readonly MemberStep[]): string | n
   for (let i = 0; i < path.length; i++) {
     const row = typeof path[i] === 'number' ? rows.get(path[i] as number) : undefined;
     if (!row) return null;
-    if (row.prefab) return i === path.length - 1 ? sentinel(row.localId) : deriveMemberGuid(sentinel(row.localId), path.slice(i + 1));
+    // Past a nested row, a keyed node's path is its frame's plus its key (#1809); a token written before that spells the
+    // anchor's steps too, and derived as written it named no entity, which the save then wrote back raw.
+    if (row.prefab) {
+      if (i === path.length - 1) return sentinel(row.localId);
+      const read = (g: string) => getCachedPrefabSync(g) as TemplateKeyDoc | null | undefined;
+      return deriveMemberGuid(sentinel(row.localId), flatKeyedSteps(path.slice(i + 1), read(row.prefab), read));
+    }
     if (i === path.length - 1) return sentinel(row.localId);
   }
   return null;

@@ -75,6 +75,23 @@ export function memberPathKey(path: readonly MemberStep[]): string {
   return path.map(formatStep).join('.');
 }
 
+/** What `get` holds under the member path `path` (a token's, or a `moved` key's). A path ending in a template key that
+ *  names nothing is also tried with the steps before that key dropped, longest prefix first: a template-keyed node's
+ *  path is its frame's plus its key (#1809), while a document written before it spells the steps to its anchor and any
+ *  keyed parent (`3.5.+A.+B` for today's `3.+B`). Keys are unique within a document, so the first hit is the node;
+ *  prefabs have no migration ladder, so the reader is what upgrades them, and the next write writes the flat form.
+ *  `undefined` when nothing matches; a `null` hit (a path two nodes share) is returned as found. */
+export function memberPathLookup<T>(get: (key: string) => T | undefined, path: readonly MemberStep[]): T | undefined {
+  const exact = get(memberPathKey(path));
+  const last = path[path.length - 1];
+  if (exact !== undefined || typeof last !== 'string' || !last.startsWith('+')) return exact;
+  for (let i = path.length - 2; i >= 0; i--) {
+    const hit = get(memberPathKey([...path.slice(0, i), last]));
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
+}
+
 /** `value` with every member token rebased onto `segments`: the path from the top call's root to
  *  the instance the value is applied to, one segment per nesting level. A `^` climbs one segment. A
  *  token that climbs past the top keeps the climbs left over, counted from the top call's root: a

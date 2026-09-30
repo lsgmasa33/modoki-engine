@@ -31,11 +31,13 @@ import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requir
 import { placeholderWriteRefusal, placeholderWriteRefusalAny, isMissingPrefabPlaceholder, isUnderPrefabInstance, placeholderRefusalWords, entityNameOf } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
+import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
+import { nestedDeclaredKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { resolveAffectedScenes, markSceneDirty, rawSourceScene, adoptParentScene } from '../scene/sceneDirty';
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
-import { prefabNestingReader } from '../scene/prefabCache';
+import { prefabNestingReader, getCachedPrefabSync } from '../scene/prefabCache';
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 
@@ -589,9 +591,30 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
     const t = s.traits.find((x) => x.meta.name === name);
     return t && t.data !== true ? t.data : null;
   };
-  const keyOf = (s: EntitySnapshot): string => {
+  const markedKey = (s: EntitySnapshot): string => {
     const tk = s.markers?.TemplateAddedKey;
     return tk && tk !== true && typeof tk.key === 'string' ? tk.key : '';
+  };
+  // In a prefab being EDITED, a copy is new content of that document, so a keyed node in it takes a fresh key: keys are
+  // unique within a document (#1809, owner ruling), and a copy keeping the original's wrote the same key twice into the
+  // saved file. EXCEPT a key a NESTED prefab declares: that is the nested template's node, which the copy still is —
+  // re-keyed, the save wrote it as the edited prefab's own and removed the template's (close-out review). The test is
+  // "a deeper document declares it", not "the edited one does": the cached edited document knows nothing minted this
+  // session, so a copy of a copy kept that key and repeated it (close-out re-review). Unity's rule: an added object gets
+  // a new fileID, a nested prefab's object keeps its own. In a SCENE, a copied whole instance is another instance of the
+  // same template and keeps every key (#1430). Minted once per node, so the plan derives with the key the marker carries.
+  const edited = prefabEditWorldGuid();
+  const editedDoc = edited ? getCachedPrefabSync(edited) : null;
+  const deeper = editedDoc
+    ? nestedDeclaredKeys(editedDoc as unknown as TemplateKeyDoc, (g) => getCachedPrefabSync(g) as unknown as TemplateKeyDoc | null)
+    : null;
+  const fresh = deeper ? new Map<EntitySnapshot, string>() : null;
+  const keyOf = (s: EntitySnapshot): string => {
+    const key = markedKey(s);
+    if (!key || !fresh || deeper!.has(key)) return key;
+    let minted = fresh.get(s);
+    if (!minted) fresh.set(s, (minted = newGuid()));
+    return minted;
   };
   const { guidOf, remap, keyed, links } = planCopyGuids(snapshot, (s) => s.children, dataOf, (s) => s.id, newGuid, keyOf, frameDocReader(getCurrentWorld()));
   // Once every new guid is known: a parent's ref can name a child and vice versa.

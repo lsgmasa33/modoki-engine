@@ -193,7 +193,8 @@ describe('duplicate-entity (runtime twin)', () => {
     const r = await runAgentOp('duplicate-entity', { guid: 'aaaaaaaa-0000-4000-8000-0000000014d1' }) as DupReply;
     const copy = copiedExtra(extra.id());
     expect(templateKeyOf(copy)).toBe(KEY);
-    expect((copy.get(EntityAttributes) as { guid: string }).guid).toBe(deriveMemberGuid(r.roots![0]!.guid!, [2, `+${KEY}`]));
+    // Its frame root (the copied instance) plus its key, not through Member, the anchor it hangs under (#1809).
+    expect((copy.get(EntityAttributes) as { guid: string }).guid).toBe(deriveMemberGuid(r.roots![0]!.guid!, [`+${KEY}`]));
   });
 
   it('a copied member hands its template-added node no key (#1430)', async () => {

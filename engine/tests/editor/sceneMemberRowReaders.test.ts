@@ -84,8 +84,10 @@ describe('readers of a scene`s instance channels walk the member rows (#1468 Pha
     const keyed = { guid: '', key: 'k-row', name: 'K', traits: {}, children: [] };
     const node = { prefab: P, members: { [`/${NODE}`]: { added: [keyed] } } };
     const paths = [...memberPathRecords(node, (g) => (g === P ? prefab : null)).self.keys()];
-    // Row localId 2, then the node's key step — the path the loader derives it at.
-    expect(paths).toContain('2.+k-row');
+    // Its frame's path (the top frame: none), then the node's key step — the path the loader derives it at. Not through
+    // row 2, the member the row names: a keyed node derives from its frame root, not its anchor (#1809).
+    expect(paths).toContain('+k-row');
+    expect(paths).not.toContain('2.+k-row');
   });
 
   it('…and in a NESTED frame: the nested root`s own row, and a row one frame down', () => {
@@ -106,7 +108,9 @@ describe('readers of a scene`s instance channels walk the member rows (#1468 Pha
     const docs: Record<string, unknown> = { [P]: inner, [O]: outer };
     const paths = [...memberPathRecords(node, (g) => docs[g] ?? null).self.keys()];
     expect(paths).toContain('3.+k-root');
-    expect(paths).toContain('3.2.+k-deep');
+    // Anchored at the nested frame's member 2, it still derives from that frame's root (#1809).
+    expect(paths).toContain('3.+k-deep');
+    expect(paths).not.toContain('3.2.+k-deep');
   });
 
   it('a reference node added on a row is a scene member ANCHOR', () => {

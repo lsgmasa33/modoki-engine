@@ -39,6 +39,12 @@ export function prefabEditWorldPath(): string | null {
   return p.startsWith(PREFAB_EDIT_SCENE_PREFIX) ? p : null;
 }
 
+/** The guid of the prefab the loaded prefab-edit world edits (the tail of {@link prefabEditWorldPath}), or `null`. */
+export function prefabEditWorldGuid(): string | null {
+  const p = prefabEditWorldPath();
+  return p ? p.slice(PREFAB_EDIT_SCENE_PREFIX.length) || null : null;
+}
+
 /**
  * The prefab-edit world's handle ONLY while the edit SESSION for that same prefab is open — what an agent may edit
  * and then persist with `edit-save`. `session` is the store's `editingPrefab`, passed in so this stays a pure read.

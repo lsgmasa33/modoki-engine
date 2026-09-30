@@ -48,6 +48,9 @@ import {
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } from '@modoki/engine/editor';
 import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
+// What a mark raise stamps: the version the mark ARRIVED in, not today's format (`contentFor`, #1797) — equal to
+// PREFAB_FORMAT_VERSION until v9 (#1809), which is when these expectations had to say which they meant.
+import { LOCAL_ID_MARK_VERSION } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { mergeRiggedPrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
@@ -301,7 +304,7 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     const old = { ...p3Doc(), version: 5 };
     const compact = `\uFEFF${JSON.stringify(old)}\n`;
     expect((await commitPrefabWrite(P, JSON.parse(JSON.stringify(old)) as PrefabFile, { expected: jsonFileBody(v8(9)), bytes: compact })).ok).toBe(true);
-    expect(onDisk.get(PPATH)).toBe(compact.replace('{"id"', '{"nextLocalId":9,"id"').replace('"version":5', `"version":${PREFAB_FORMAT_VERSION}`));
+    expect(onDisk.get(PPATH)).toBe(compact.replace('{"id"', '{"nextLocalId":9,"id"').replace('"version":5', `"version":${LOCAL_ID_MARK_VERSION}`));
   });
 
   it('bytes the splice cannot address exactly (a key spelled twice) are re-serialized with the raised mark instead', async () => {
@@ -311,7 +314,7 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     const doc = JSON.parse(JSON.stringify(old)) as PrefabFile;
     expect((await commitPrefabWrite(P, doc, { expected: jsonFileBody(v8(9)), bytes: compact })).ok).toBe(true);
     expect(onDisk.get(PPATH)).toBe(jsonFileBody(doc));
-    expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 9, version: PREFAB_FORMAT_VERSION });
+    expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 9, version: LOCAL_ID_MARK_VERSION });
   });
 
   it('a write the route refuses for a LOWER mark re-reads the file and lands raised to it, when the file is the document read', async () => {
@@ -330,7 +333,7 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     const old = { ...p3Doc(), version: 5 } as PrefabFile;
     expect((await commitPrefabWrite(P, old, { expected: v8(9) })).ok).toBe(true);
     const { id, name, rootLocalId, entities } = p3Doc();
-    expect(onDisk.get(PPATH)).toBe(jsonFileBody({ id, version: PREFAB_FORMAT_VERSION, name, rootLocalId, nextLocalId: 9, entities } as never));
+    expect(onDisk.get(PPATH)).toBe(jsonFileBody({ id, version: LOCAL_ID_MARK_VERSION, name, rootLocalId, nextLocalId: 9, entities } as never));
   });
 
   it('a redo handed the SAME document and recorded bytes lands every time, however often an earlier call raised it', async () => {
@@ -359,7 +362,7 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     seatAt({ ...e, nextLocalId: 7 } as PrefabFile);
     const b = `${JSON.stringify({ ...p3Doc(), version: 5 })}\n`;
     expect((await commitPrefabWrite(P, JSON.parse(b) as PrefabFile, { expected: jsonFileBody(e), bytes: b })).ok).toBe(true);
-    expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 7, version: PREFAB_FORMAT_VERSION });
+    expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 7, version: LOCAL_ID_MARK_VERSION });
   });
 
   it('accept side: bytes that lower nothing are written verbatim, formatting and all', async () => {

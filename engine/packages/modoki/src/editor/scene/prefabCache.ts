@@ -485,12 +485,13 @@ export function recoverTemplateKey(ecsId: number, memo = new Map<number, string>
     const ea = readTraitData(id, eaMeta);
     if (!ea) return undefined;
     const pi = piMeta ? readTraitData(id, piMeta) as { localId?: number; parentLocalId?: number } | null : null;
-    // By IDENTITY, as the derive pass walked it (#1437): a member moved inside its instance steps from its
-    // template parent (`identityParents.ts`).
-    const at = pi ? (identity ??= worldIdentityParents(getCurrentWorld())).of(id) : { parentId: (ea.parentId as number) || 0, extra: [] };
-    return { guid: durableGuid(ea.guid as string), parentId: at.parentId, key: templateKeyOf(findEntity(id)), pi, extra: at.extra };
+    const key = templateKeyOf(findEntity(id));
+    // By where the derive pass continues from (#1437, #1809): a member moved inside its instance from its template
+    // parent, a keyed node from its frame root (`identityParents.ts`).
+    const at = pi || key ? (identity ??= worldIdentityParents(getCurrentWorld())).derivesFrom(id) : { parentId: (ea.parentId as number) || 0, extra: [] };
+    return { guid: durableGuid(ea.guid as string), parentId: at.parentId, key, pi, extra: at.extra };
   };
-  return recoverKeyFrom(ecsId, nodeOf, keys, memo);
+  return recoverKeyFrom(ecsId, nodeOf, keys, memo, undefined, (id) => (identity ??= worldIdentityParents(getCurrentWorld())).derivesFromAsKeyed(id));
 }
 
 /** Seed (or evict) both prefab caches with a document READ from disk — `openPrefabForEditing`'s read (`fetchPrefabSource`).
