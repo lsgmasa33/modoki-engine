@@ -25,6 +25,7 @@ import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
 import { getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
+import { matchFsRuntimeAsset, isProjectRoot, setOpenProjectRoots, toOpenProjectScenePath } from './scene/openProjectScenePath';
 import { withAdoption } from './scene/sceneAdoption';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
@@ -137,39 +138,15 @@ export function resolveBootSceneOverride(override: string | null | undefined, sc
  *  unregistered scene) falls back to the raw candidate, preserving the dev `?url`
  *  behaviour. Requires the manifest to be loaded first. The `doFetch` injection
  *  point exists for unit testing. */
-// Matches a dev-mode `/@fs/<abs>/runtime/assets/<rest>` candidate — produced when
-// config.ts's `?url` import resolves OUTSIDE Vite's root — capturing `<rest>` so it can
-// be rewritten to the asset-scanner's `/assets/<rest>` convention for the OPEN project
-// (flat-project layout: `<projectRoot>/runtime/assets` → `/assets`).
-//
-// ⚠️ The match alone does NOT prove the file belongs to the open project. findAssetRoots
-// serves THREE roots that all end in `/runtime/assets/`: `/assets` (the open project),
-// `/modoki/assets` (the engine's built-ins), and `/<root>/<id>/assets` (every OTHER
-// project in a multi-project repo). Rewriting any of the latter two to `/assets/…` would
-// silently point at a same-named file under the open project — a wrong-file load, which
-// is worse than the boot failure this rewrite exists to prevent. So the rewrite must be
-// CONFIRMED — by origin when we have the open project's root, else by manifest name match
-// (see canonicalBootScenePath) — before it is used.
-const FS_RUNTIME_ASSETS_RE = /^\/@fs\/(.*)\/runtime\/assets\/(.+)$/;
-
-/** Normalize a filesystem path for a Windows-safe prefix comparison: forward slashes,
- *  lowercase (Windows paths are case-insensitive), no trailing separator. */
-function normalizeFsPath(p: string): string {
-  const s = p.replace(/\\/g, '/').toLowerCase();
-  return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
-}
-
-/** Segment-aware: is `child` the same path as, or inside, `parent`? Avoids a bare
- *  `startsWith` false-positive on a prefix-sharing sibling (`sling` vs `sling-evil`). */
-function isWithinPath(child: string, parent: string): boolean {
-  const c = normalizeFsPath(child), p = normalizeFsPath(parent);
-  return c === p || c.startsWith(`${p}/`);
-}
-
+// A dev-mode `/@fs/<abs>/runtime/assets/<rest>` candidate — config.ts's `?url` import resolved OUTSIDE Vite's root —
+// is rewritten to `/assets/<rest>` only once `<abs>` is CONFIRMED to be the open project's: by origin when we have its
+// root, else by manifest name match. Why the shape alone proves nothing, and why the root comes in two spellings:
+// scene/openProjectScenePath.ts.
 export async function canonicalBootScenePath(
   scenePath: string,
   doFetch: typeof fetch = fetch,
-  projectRoot?: string,
+  /** The open project's root — or its spellings, as opened and realpath'd (#1898). */
+  projectRoot?: string | readonly string[],
 ): Promise<string> {
   // Already a registered manifest path (the working-copy canonical) → nothing to do.
   if (getGuidForPath(scenePath)) return scenePath;
@@ -179,19 +156,18 @@ export async function canonicalBootScenePath(
   // root-relative `sirv`, so a project on a DIFFERENT DRIVE than the running Vite
   // process's cwd 404s internally and silently falls through to the SPA `index.html`
   // (a 200 OK `<!doctype …>` body) — which is why fetching it can't be trusted at all.
-  const fsMatch = scenePath.match(FS_RUNTIME_ASSETS_RE);
+  const fsMatch = matchFsRuntimeAsset(scenePath);
   if (fsMatch) {
-    const [, absPrefix, rest] = fsMatch;
-    const openProjectPath = `/assets/${rest}`;
-    // Prefer disambiguating by ORIGIN — does the `/@fs/<abs>` prefix actually sit inside the
-    // open project's root? This is strictly safer than the manifest check below (it can't be
+    const { abs: absPrefix, assetPath: openProjectPath } = fsMatch;
+    const roots = projectRoot === undefined ? [] : typeof projectRoot === 'string' ? [projectRoot] : projectRoot;
+    // Prefer disambiguating by ORIGIN — is the `/@fs/<abs>` prefix the open project's root
+    // itself? This is strictly safer than the manifest check below (it can't be
     // fooled by a same-named file in a sibling project or the engine's built-ins) and doesn't
     // depend on the manifest having caught up yet, which the manifest-only check below could
     // race on a cold boot. `projectRoot` is optional (backward-compatible: a caller that can't
     // supply it — e.g. no `/api/identity` reachable yet — falls through to the manifest check).
-    if (projectRoot) {
-      return isWithinPath(absPrefix, projectRoot) ? openProjectPath : scenePath;
-    }
+    const inside = isProjectRoot(absPrefix, roots.filter(Boolean));
+    if (inside !== null) return inside ? openProjectPath : scenePath;
     // No project root available: fall back to the OLD name-based check. Only accept the
     // rewrite when the manifest actually registers it; an unregistered rewrite is discarded
     // and we fall through, so the worst case stays the pre-existing boot failure rather than
@@ -295,7 +271,8 @@ export async function loadFirstScene(
       if (outcome !== 'superseded') return undefined;
       if (!deps.settle) return onSuperseded(p);
       if (await deps.settle()) return onSuperseded(p);
-      if (getCurrentScenePath() === p) return p;
+      // The editor stores the open project's `/assets/` spelling of a `/@fs/` candidate (#1898).
+      if (getCurrentScenePath() === toOpenProjectScenePath(p)) return p;
       if (retried) return undefined;
     }
   };
@@ -760,10 +737,14 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // silently accepted. Best-effort: `/api/identity` is the main-process backend's own
     // route (always reachable under Electron), but a failure here just falls back to the
     // old name-based check in canonicalBootScenePath, never blocks boot.
+    // Both spellings of the root (#1898): Vite's `/@fs/` paths are realpaths, so a project opened through a link
+    // (`/tmp` → `/private/tmp`) matches only `projectRootReal`. Kept module-wide too, for setCurrentScenePath.
     const projectRoot = await backendFetch('/api/identity')
       .then((r) => (r.ok ? r.json() : null))
-      .then((data: { projectRoot?: string } | null) => data?.projectRoot)
-      .catch(() => undefined);
+      .then((data: { projectRoot?: string; projectRootReal?: string } | null) =>
+        [data?.projectRoot, data?.projectRootReal].filter((r): r is string => typeof r === 'string' && r.length > 0))
+      .catch(() => [] as string[]);
+    setOpenProjectRoots(projectRoot);
 
     // Re-open the .rig2d the user was last editing in the Skin panel. A rig is a
     // scene-independent asset (loaded by path, sprites resolved via the manifest), so
@@ -843,7 +824,8 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       } else {
         // The override missed (typo/ambiguous) and boot fell through to the remembered or
         // default candidate — that IS a normal boot, so persist it as usual.
-        localStorage.setItem(LAST_SCENE_KEY, loadedPath);
+        // In the spelling setCurrentScenePath stored (#1898): a raw `/@fs/` fallback that loaded must not undo it.
+        localStorage.setItem(LAST_SCENE_KEY, toOpenProjectScenePath(loadedPath));
       }
       // Re-open the clip the user was editing last time (same scene only).
       restoreLastAnimationClip();

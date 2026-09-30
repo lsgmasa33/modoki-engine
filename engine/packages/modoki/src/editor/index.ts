@@ -193,6 +193,7 @@ export { placedPrefabPath, placedPrefabRefusal } from './scene/prefabPlace';
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export {
   hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked, adoptWorldReloadedFromDisk,
+  setSceneFileLoadObserver,
   type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
   type FlushPhase, type ParkedFlushResults,
 } from './scene/serialize';

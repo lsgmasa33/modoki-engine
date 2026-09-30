@@ -239,8 +239,8 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_build',
     'Run a build + deploy exactly like the editor Build menu (web / iOS device / Android ' +
-      'device / playable ad). Consumes the build stream to completion and returns {ok, log} or ' +
-      'the failure tail. HEAVY: native builds run xcodebuild/gradle and install on a device — ' +
+      'device / playable ad). Consumes the build stream to completion and returns {ok, log (the last lines), ' +
+      'logLines, logPath (the whole log, a local file)} or the failure tail. HEAVY: native builds run xcodebuild/gradle and install on a device — ' +
       'minutes long. playable = a single self-contained HTML at games/<id>/ads/index.html.',
     {
       platform: z.enum(['web', 'ios', 'android', 'playable'])

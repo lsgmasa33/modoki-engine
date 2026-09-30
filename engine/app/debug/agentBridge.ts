@@ -3343,6 +3343,48 @@ export async function answerSceneConflict(urlPath: string, answer: 'reload' | 'k
   if (answer === 'reload') await handleSceneChanged({ ...msg, reload: true });
 }
 
+/** A scene load is about to READ `urlPath` from disk (#1899) — `serialize.ts`'s load, every route (an agent's
+ *  `load_scene`, the menu, the Assets panel), installed by `agentEditorOps.ts`. What it reads IS the outside change a hold,
+ *  a deferral or an open "Reload / Keep mine" question lists for that file right now, so {@link sceneFileLoaded} drops
+ *  exactly those entries once the load's world is adopted: left listed, `pendingOutsideChanges` named a file the editor
+ *  already shows, and the next focus gain or refresh reloaded it a second time — over any edit made since.
+ *  Returns the holds it covers (their `heldSeq`s), handed back to {@link sceneFileLoaded}. Only those: one held while the
+ *  load was in flight may postdate the bytes read, and one a release has taken into its local batch at this instant is
+ *  in none of the lists — it is not covered, so it replays and reloads as usual (a reload too many at worst). A mark
+ *  bound instead dropped that one too, although the load had not started its history fresh for it (close-out re-review,
+ *  measured). By `heldSeq`, not by object: a release copies each change it defers.
+ *  A covered change means the scene's undo stack was recorded over bytes the file no longer has, so the load adopts with
+ *  a fresh history (`freshIncoming`), as the release's reload would have (#1744). NOT raised as the owner's debt
+ *  (`sceneFileChanged`): the load's route registered before it, so its adopt could not pay it, and the NEXT adopt of
+ *  that scene dropped a stack recorded over the new bytes (close-out review F1); a load that then failed left it owed
+ *  too (F2). */
+export function sceneFileLoadBegins(urlPath: string): number[] {
+  return outsideSceneChangesFor(urlPath).map((m) => m.heldSeq!);
+}
+
+/** The load {@link sceneFileLoadBegins} announced was adopted: the held, deferred or asked-about changes it covered are
+ *  applied. An open question's dialog stays on screen until answered; its answer then finds nothing to apply. */
+export function sceneFileLoaded(urlPath: string, covered: readonly number[]): void {
+  if (!covered.length) return;
+  const seqs = new Set(covered);
+  const read = (m: SceneChangedMsg) => m.heldSeq !== undefined && seqs.has(m.heldSeq);
+  const dropped = _outsideHold.drop(read).length;
+  let more = 0;
+  for (const [k, m] of [..._suppressedReloads]) if (read(m)) { _suppressedReloads.delete(k); more++; }
+  for (const [k, m] of [..._awaitingDecision]) if (read(m)) { _awaitingDecision.delete(k); more++; }
+  if (!dropped && !more) return;
+  console.log(`[agentBridge] a load of ${urlPath} read the file — its held outside change is applied`);
+  notifyPending();
+}
+
+/** The held, deferred and asked-about changes to the scene FILE `urlPath` — by path, so never a prefab or asset the scene
+ *  uses (a load takes those from its caches, which only their own refresh brings up to date). */
+function outsideSceneChangesFor(urlPath: string): SceneChangedMsg[] {
+  const want = normScenePath(urlPath);
+  return [..._outsideHold.peek(), ..._suppressedReloads.values(), ..._awaitingDecision.values()]
+    .filter((m) => m.heldSeq !== undefined && normScenePath(m.urlPath) === want);
+}
+
 /** Test seam: forget every held change and open question. */
 export function _resetOutsideChangesForTests(): void {
   _outsideHold.take();

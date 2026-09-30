@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused, sceneFileLoadBegins, sceneFileLoaded } from '../debug/agentBridge';
 import { startCountdown } from '../debug/countdownBanner';
 import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
@@ -77,7 +77,7 @@ detachPrefabInstanceWithUndo, detachRefusal,
   type PrefabFile,
   causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
-  editorStateCurrent, captureAdoption, recordSceneFileChanged, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
+  editorStateCurrent, captureAdoption, recordSceneFileChanged, setSceneFileLoadObserver, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
 UndoRefusedError, isUndoStepInFlight, isSnapshotOperationInFlight, beginForwardEdit,
 } from '@modoki/engine/editor';
 import { recordsUndo, stepRunningRefusal, applyRunningRefusal } from './agentOpUndoClass';
@@ -1427,6 +1427,8 @@ export function registerEditorAgentOps(): void {
   onWorldHoldsSettled(() => { void replaySuppressedSceneReloads(); });
   onAdoptionsSettled(() => { void replaySuppressedSceneReloads(); });
   setSceneAdoptionHooks({ capture: captureAdoption, settled: () => adoptionsSettled() === null, sceneFileChanged: recordSceneFileChanged });
+  // A scene load reads its file, so it applies that file's held outside change (#1899): the hold drops it.
+  setSceneFileLoadObserver({ begins: sceneFileLoadBegins, loaded: sceneFileLoaded });
   // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
   // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`, and `refreshPrefabSourceAfterDiskChange` for the note (#1752).
   setPrefabSourceRefresher(refreshPrefabSourceAfterDiskChange);

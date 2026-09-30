@@ -265,6 +265,22 @@ describe('canonicalBootScenePath (gap #2 — boot the working-copy scene, not a 
       expect(doFetch).not.toHaveBeenCalled();
     });
 
+    // #1898: every case above is a Windows path. On a Mac `/@fs/` swallows the POSIX path's own leading slash, and the
+    // check never matched its root there — so every Mac boot kept the `/@fs/` spelling.
+    it('rewrites a POSIX `/@fs/` path inside the root (Mac/Linux)', async () => {
+      const doFetch = vi.fn();
+      const result = await canonicalBootScenePath('/@fs/Users/me/games/sling/runtime/assets/scenes/L.json', doFetch as never, '/Users/me/games/sling');
+      expect(result).toBe('/assets/scenes/L.json');
+      expect(doFetch).not.toHaveBeenCalled();
+    });
+
+    it('accepts the root\'s realpath — Vite\'s `/@fs/` is one, the root is as opened (`/tmp` → `/private/tmp`)', async () => {
+      const FS_PATH = '/@fs/private/tmp/p/runtime/assets/scenes/main.scene.json';
+      const doFetch = vi.fn(async () => jsonResponse(null, false, 404));
+      expect(await canonicalBootScenePath(FS_PATH, doFetch as never, '/tmp/p')).toBe(FS_PATH);
+      expect(await canonicalBootScenePath(FS_PATH, doFetch as never, ['/tmp/p', '/private/tmp/p'])).toBe('/assets/scenes/main.scene.json');
+    });
+
     it('falls back to the manifest-based check when projectRoot is not supplied', async () => {
       registerAsset(SCENE_GUID, '/assets/scenes/main.json', 'scene');
       const FS_PATH = '/@fs/E:/Projects/modoki/demos/postfx-demo/runtime/assets/scenes/main.json';

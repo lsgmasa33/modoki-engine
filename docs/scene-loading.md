@@ -2440,6 +2440,20 @@ Two consequences worth knowing:
   stops loading once a scene it did not load is current. A switch still in flight when the walk's
   next load starts is not covered. Mechanism: async-lifetime.md § An operation made of
   SEVERAL loads.
+- **The open project's scenes have ONE spelling in the editor: `/assets/…` (#1898).** Vite serves
+  the same file as `/@fs/<abs>/runtime/assets/…` too — what a game's `config.ts` `?url` import
+  resolves to (so a scaffolded project's default scene), and what an explicit `/@fs/` load names —
+  and that spelling used to be stored as-is: `get_editor_state.scenePath` read `/@fs/…` after
+  `modoki_open_project` and on a fresh launch, so `modoki_wait_for {editor:{scenePath:'/assets/…'}}`
+  never matched. `setCurrentScenePath` (every writer goes through it) and `loadScene`'s entry both
+  map it (`editor/scene/openProjectScenePath.ts`), so the load, its undo key, its journal and the
+  persisted last scene agree. The mapping is taken only when `<abs>` IS the open project's root,
+  by origin: `/modoki/assets` and every other project's assets also end in `/runtime/assets/`, as
+  does a package under `node_modules`. Two causes, both measured live on a Mac: the boot
+  canonicalizer's `/@fs/` capture dropped a POSIX path's own leading slash, so its origin check
+  had never matched outside Windows (its tests only used `/@fs/E:/…`); and Vite's `/@fs/` path is a
+  REALPATH while the root is as opened (`/tmp/x` vs `/private/tmp/x`), so `/api/identity` also
+  reports `projectRootReal` and the check accepts either.
 
 `loadScene` flow — a scene may declare `baseScene`, so this is a **chain** load, not a
 single-scene one (see [Base scenes](#base-scenes-nestable-cross-scene-persistence)):

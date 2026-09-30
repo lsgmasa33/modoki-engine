@@ -17,6 +17,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
 import { notePendingHeader } from './pendingStamp.js';
 import { PENDING_OUTSIDE_HEADER } from '../../shared/pendingOutside.js';
+import { buildLogLines, buildLogTail, writeBuildLog } from './buildLog.js';
 
 export type ToolContext = {
   /** Backend base URL, trailing slash stripped. Interpolated into error messages. */
@@ -684,7 +685,8 @@ export function createToolContext(config: { backend: string; token?: string }): 
   /** Consume a build-family SSE stream (/api/build, /api/add-native-target) to
    *  completion. The server emits `event: step|status|message` frames; `status`
    *  carries DONE | FAILED:<tail> | <progress>. Returns the final outcome + a log
-   *  tail so the agent sees WHY a build failed, not just THAT it did. */
+   *  tail so the agent sees WHY a build failed, not just THAT it did — a bounded tail of
+   *  LINES, their count, and a file with the whole log (#1900, `buildLog.ts`). */
   async function consumeBuildStream(path: string, timeoutMs: number): Promise<ToolResult> {
     // Like the JSON tools: identify the editor FIRST, so a wrong-editor warning lands on this
     // result too. A build can plausibly be the session's first call, and it's the LAST tool
@@ -708,10 +710,18 @@ export function createToolContext(config: { backend: string; token?: string }): 
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
+    // Every chunk, for the file: the answer carries only a tail (`logAnswer`).
     const log: string[] = [];
     let buf = '';
     let outcome: { ok: boolean; step?: string; error?: string } | null = null;
-    const pushLog = (line: string) => { log.push(line); if (log.length > 200) log.shift(); };
+    const pushLog = (chunk: string) => { log.push(chunk); };
+    // `/api/build?platform=web` → `build-web`: which build a log file holds.
+    const label = `${path.replace(/^\/api\//, '').split('?')[0]}-${new URLSearchParams(path.split('?')[1] ?? '').get('platform') ?? ''}`;
+    const logAnswer = () => {
+      const lines = buildLogLines(log);
+      return { tail: buildLogTail(lines), lines: lines.length, path: writeBuildLog(log, label) };
+    };
+    const fullLogOption = (file: string | null) => (file ? [`read the whole log (${file}) for what the tail cut`] : []);
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -743,35 +753,39 @@ export function createToolContext(config: { backend: string; token?: string }): 
         if (outcome) break;
       }
     } catch (e) {
+      const answer = logAnswer();
       return fail({
         code: 'NOT_AVAILABLE_HERE',
         what: `run the build at ${path}`,
         why: `the build stream broke mid-run: ${e instanceof Error ? e.message : String(e)}. Whether the build itself finished is UNKNOWN — the connection died, not necessarily the build.`,
-        got: log.slice(-40).join('\n'),
-        options: ['check the editor is still running, then look at its terminal for the rest of the build'],
+        got: answer.tail.join('\n'),
+        options: ['check the editor is still running, then look at its terminal for the rest of the build', ...fullLogOption(answer.path)],
       });
     } finally {
       try { await reader.cancel(); } catch { /* ignore */ }
     }
     if (!outcome) {
+      const answer = logAnswer();
       return fail({
         code: 'NOT_AVAILABLE_HERE',
         what: `run the build at ${path}`,
         why: 'the build stream closed without a final DONE/FAILED status, so the outcome is unknown.',
-        got: log.slice(-40).join('\n'),
-        options: ['re-run the build', 'check the editor terminal — a crashed build step can close the stream silently'],
+        got: answer.tail.join('\n'),
+        options: ['re-run the build', 'check the editor terminal — a crashed build step can close the stream silently', ...fullLogOption(answer.path)],
       });
     }
     if (!outcome.ok) {
+      const answer = logAnswer();
       return fail({
         code: 'REFUSED_BY_OP',
         what: `run the build at ${path}`,
         why: `the build FAILED at step: ${outcome.step}${outcome.error ? ` — ${outcome.error}` : ''}`,
-        got: log.slice(-40).join('\n'),
-        options: ['fix the cause in the log tail above, then re-run', 'the failing STEP names which stage to look at (web compile / cap sync / native build)'],
+        got: answer.tail.join('\n'),
+        options: ['fix the cause in the log tail above, then re-run', 'the failing STEP names which stage to look at (web compile / cap sync / native build)', ...fullLogOption(answer.path)],
       });
     }
-    return ok({ ok: true, log: log.slice(-40) });
+    const answer = logAnswer();
+    return ok({ ok: true, log: answer.tail, logLines: answer.lines, ...(answer.path ? { logPath: answer.path } : {}) });
   }
 
   return {

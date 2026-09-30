@@ -22,6 +22,10 @@ export interface OutsideChangeHold<M extends HeldChange> {
    *  for the same path is newer and wins. */
   putBack(msgs: readonly M[]): void;
   paths(): string[];
+  /** The held changes, in replay order, left held. */
+  peek(): M[];
+  /** Remove every held change `pred` picks (a load that read the file applied it, #1899). Returns what it removed. */
+  drop(pred: (msg: M) => boolean): M[];
   onChange(cb: (paths: string[]) => void): () => void;
 }
 
@@ -49,6 +53,13 @@ export function createOutsideChangeHold<M extends HeldChange>(): OutsideChangeHo
       if (changed) notify();
     },
     paths,
+    peek: () => [...held.values()],
+    drop(pred) {
+      const out = [...held.values()].filter(pred);
+      for (const m of out) held.delete(m.urlPath);
+      if (out.length) notify();
+      return out;
+    },
     onChange(cb) { listeners.add(cb); return () => { listeners.delete(cb); }; },
   };
 }

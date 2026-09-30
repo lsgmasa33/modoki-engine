@@ -155,6 +155,7 @@ export interface SceneFile {
 // `@modoki/engine/editor` still surfaces it from this module.
 import { isTraitDefault, writtenTraitKeys } from './traitDefault';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
+import { toOpenProjectScenePath } from './openProjectScenePath';
 export { isTraitDefault };
 
 
@@ -765,6 +766,19 @@ let _currentBaseScene: string | undefined;
 export function getCurrentBaseScene() { return _currentBaseScene; }
 export function setCurrentBaseScene(baseScene: string | undefined) { _currentBaseScene = baseScene; }
 
+/** Told when a scene load starts reading its file and when its world is adopted (#1899): the app's outside-change hold
+ *  (`agentBridge.ts`'s `sceneFileLoadBegins` / `sceneFileLoaded`, installed by `agentEditorOps.ts`) drops the held changes
+ *  to the file that the load read. `begins` names the holds its read covers, handed back to `loaded`; any at all makes
+ *  the adopt start the scene's history fresh. Null in a host with no hold. */
+export interface SceneFileLoadObserver {
+  begins(path: string): readonly number[];
+  loaded(path: string, covered: readonly number[]): void;
+}
+let _sceneFileLoadObserver: SceneFileLoadObserver | null = null;
+export function setSceneFileLoadObserver(observer: SceneFileLoadObserver | null): void {
+  _sceneFileLoadObserver = observer;
+}
+
 export function getCurrentScenePath() { return _currentScenePath; }
 const scenePathListeners = new Set<() => void>();
 /** Called whenever the editor's scene path changes — a save giving an untitled world a file swaps no world, and a
@@ -773,7 +787,11 @@ export function onScenePathChange(fn: () => void): () => void {
   scenePathListeners.add(fn);
   return () => { scenePathListeners.delete(fn); };
 }
-export function setCurrentScenePath(path: string | null) {
+export function setCurrentScenePath(scenePath: string | null) {
+  // ONE spelling for the open project's scenes (#1898): every writer — each load's adoption, save, save-as, new scene —
+  // passes through here, and a `/@fs/<abs>/runtime/assets/…` path of the open project is stored as `/assets/…`, the
+  // form the edit routes, `modoki_wait_for` and the next boot all compare against. See openProjectScenePath.ts.
+  const path = scenePath === null ? null : toOpenProjectScenePath(scenePath);
   const changed = path !== _currentScenePath;
   _currentScenePath = path;
   if (changed) notifyListeners([...scenePathListeners], 'scene path', []);
@@ -1690,6 +1708,9 @@ export async function loadSceneReporting(
   // driving, and its late onProgress must not write stale counts — so only the
   // latest epoch touches sceneLoadStatus.
   const stillLive = loadEpoch.begin();
+  // Loaded, keyed (undo history, journal) and adopted under the spelling setCurrentScenePath stores (#1898), so a `/@fs/`
+  // load of an open-project scene is not a second identity of the same file.
+  scenePath = toOpenProjectScenePath(scenePath);
   // A newer request than any edit-open still waiting to swap (#1700).
   beginWorldRequest();
   let adoptedHere: World | null = null;
@@ -1747,6 +1768,8 @@ async function loadSceneRequest(
     // One pending adoption from here to the adopt (#1698): the owner reads the outgoing world's dirt now, before the
     // await (#1409) — the outgoing world stays live and editable while the new one loads.
     return await withAdoption('scene-load', async (adoption) => {
+      // Before the read (#1899): only an outside change held by now is one this load's bytes can include.
+      const covered = _sceneFileLoadObserver?.begins(scenePath);
       const { world, keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
         ...(gameId !== undefined ? { gameId } : {}),
         // Resources acquire in parallel; each completion (on a cold cache, a finished
@@ -1764,10 +1787,13 @@ async function loadSceneRequest(
       // unless the outgoing world held work this load discarded (#1409); a kept base keeps its dirty flag (#1417). Both
       // rules live in the owner. (Play→Stop does not come through here — it restores via `sceneManager` directly.)
       const adopted = adoption.offer({
-        world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids }, journal: { path: scenePath },
+        world, path: scenePath, baseScene: 'loaded', journal: { path: scenePath },
+        // An outside change this read applies (#1899): the stack under this key was recorded over the old bytes (#1744).
+        history: { key: scenePath, keptBaseGuids, ...(covered?.length ? { freshIncoming: true } : {}) },
       });
       if (!adopted) return 'superseded';
       onAdopted(world);
+      if (covered) _sceneFileLoadObserver?.loaded(scenePath, covered);
       // Reported for the scene the editor adopted, even when a newer request began (#1425 — close-out review of #1698):
       // that request installed nothing, so these managers are the ones running on screen.
       _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);

@@ -675,6 +675,11 @@ const CDP_NONCE = newCdpNonce();
  *  job is to let a client confirm it is talking to the editor it meant to. */
 let resolvedBackendPort = 0;
 
+/** `p`'s realpath, or null when it cannot be resolved (gone, unreadable). */
+function realpathOrNull(p: string): string | null {
+  try { return fs.realpathSync.native(p); } catch { return null; }
+}
+
 /** MODOKI_SCENE — a launch-scoped scene override (issue #43), resolved once at startup
  *  alongside the project (`resolveInitialProject` below). Exposed via `/api/boot-scene`
  *  for the renderer's boot-scene resolution. Env, not a CLI arg: the launcher→main hop is
@@ -1826,6 +1831,9 @@ app.whenReady().then(async () => {
       return { kind: 'json', body: {
         repoRoot: REPO_ROOT,
         projectRoot: state.root,
+        // The root's realpath, which is how Vite spells it in an `/@fs/` url: a project opened through a link
+        // (`/tmp` → `/private/tmp`) only matches this one (#1898, editor/scene/openProjectScenePath.ts).
+        projectRootReal: realpathOrNull(state.root),
         backendPort: resolvedBackendPort,
         pid: process.pid,
         branch: gitBranch(REPO_ROOT),

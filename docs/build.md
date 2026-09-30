@@ -744,7 +744,14 @@ second probe is precisely what this module was consolidated to remove (#159). Fu
 
 An agent does not need the CLI recipes below. **`modoki_build {platform}`** drives the same
 `/api/build` the menu does — same toolchain resolution, same per-step cwd, same one-at-a-time slot
-— and consumes the SSE stream to completion, returning `{ok, log}` or the failure tail. For a
+— and consumes the SSE stream to completion, returning `{ok, log, logLines, logPath}` or the failure tail. The
+answer is summary-first (#1900): `log` is the last 30 LINES, each cut at 400 chars, `logLines` counts them all, and
+`logPath` is a file on the agent's machine (`modoki-build-*.log` in the OS temp dir, swept after a day) holding the
+whole log; a failure's `got` is the same tail, with the file named in its options. It used to be the last 40 SSE
+frames — each one a raw pipe CHUNK, not a line — and one web build's Vite asset listing was a single 60,535-char frame,
+so the answer came to 72,902 chars, over the 60k cap, and arrived as a `TOO_LARGE` envelope saying `log: "array(40)"`.
+`modoki_add_native_target` and `modoki_ota_publish` share the same reader (`consumeBuildStream`); the other
+log answers still bounded by entry count are #1903. For a
 native platform it also **installs and launches on the attached device**, so a successful call
 leaves the app running rather than leaving you an artifact to deploy by hand.
 

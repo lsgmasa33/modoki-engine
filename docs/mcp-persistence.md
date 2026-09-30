@@ -920,8 +920,10 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   copied byte for byte and left the collision to that heal. A binary, a `.layout.json`, a JSON file the
   scanner types as no asset, and unparseable JSON are written as they came.
 - **The reply names every file in the asset-root form (#1562).** The renderer builds the reply from
-  its own paths, and the open scene's path is whatever spelling it was opened under. That is Vite's
-  `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. So a Save As answered
+  its own paths, and the open scene's path was whatever spelling it was opened under — Vite's
+  `/@fs/<abs>` for a boot candidate or an explicit `/@fs/` load. (Since #1898 the editor stores an
+  open-project scene as `/assets/…` whatever it was opened by — scene-loading.md, the boot walk
+  bullets — so this mapping now matters only for a path of another root.) So a Save As answered
   `scenePath: "/assets/…"` (the backend's disk spelling of the copy) beside
   `savedAsCopyOf: "/@fs/…"` for the scene the caller addresses as `/assets/…`, and the live smoke read
   that as "a copy of some other file". A plain save answered `scenePath: "/@fs/…"`, which

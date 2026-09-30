@@ -59,7 +59,25 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   tool's earlier call saw instead of reading as "nothing pending". A
   file-direct route notes its own path at once (`notePendingOutsideWrite`), so its OWN answer lists it before the
   watcher's debounce raises it; a note the renderer never confirms expires after 3 s. There is NO implicit flush on any
-  other call: a reload is always a deliberate act.
+  other call: a reload is always a deliberate act. The one thing that clears an entry without a release is a load that
+  READ the file (next bullet).
+- **A scene load applies its own file's held change (#1899).** `load_scene`, the menu or the Assets panel re-reads the
+  scene from disk, so it shows the outside change a hold, a deferral or an open *Reload / Keep mine* question still
+  lists. `serialize.ts`'s load tells the bridge before its read (`sceneFileLoadBegins`, which names the holds listed
+  for the file at that instant by their `heldSeq`) and after its adopt (`sceneFileLoaded`), which drops exactly those.
+  Not every hold of the file: one held while the load was in flight may postdate the bytes it read, and one a release
+  has taken into its local batch is in no list when the load begins — both replay and reload as usual. (A sequence-mark
+  bound dropped the second too, although the load had not started its history fresh for it, and the stale stack
+  outlived it with nothing left to reload the scene — close-out re-review, measured.) Left listed (observed live), the
+  entry stayed in `pendingOutsideChanges` and the next refresh reloaded the scene a SECOND time, over whatever was
+  edited since. When the read covers a change, the load adopts with a fresh history itself (`freshIncoming`): the stack
+  was recorded over the old bytes (#1744). One accepted over-drop: a dirty scene whose open *Reload / Keep mine*
+  question is covered after its unsaved work was SAVED over the change (then loaded clean) loses the stack that Keep
+  mine would have kept — a scene file has no supersede tracking on either path. ⚠️ Not as the owner's debt (`recordSceneFileChanged`): raised inside the load's route,
+  which registered first, its own adopt could not pay it, and the NEXT adopt of the scene dropped a stack recorded
+  over the new bytes (close-out review F1, measured at the real seam). A load of the scene does NOT apply a held
+  PREFAB or asset change it uses — it takes those from caches — and prefab edit-open and the asset editors, which do
+  read their file fresh, still leave the entry listed: #1902.
 - **A scene with unsaved edits is ASKED about** (owner ruling 2026-09-30, amends #1164 for the dirty case): see the
   scene-reload paragraph below and [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).
 
@@ -87,7 +105,8 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   counts.
 - **Only where the editor is.** `agentEditorOps.ts` turns the hold on (`enableOutsideChangeHold`), with the `refresh` op
   that applies it; a game page in dev has neither, and applies changes as they arrive.
-- **What Play or a hold deferred at a release stays in `pendingOutsideChanges`** until it replays; a refresh cannot
+- **What Play or a hold deferred at a release stays in `pendingOutsideChanges`** until it replays (or a load of that
+  scene reads it, above); a refresh cannot
   apply it and answers `deferred` with `deferredReason`. An agent's `scene` answer rides on the change
   (`SceneChangedMsg.decision`), so it is carried out at that replay too — and only that release's answer: a change the
   human sent back ("later", or `held`) carries none.
