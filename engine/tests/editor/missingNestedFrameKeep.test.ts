@@ -442,3 +442,38 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     }
   });
 });
+
+describe('#1877 L4: a kept reference node INSIDE another reference node is kept too', () => {
+  // A scene-added P node under H1, and a Q node dropped under that P node's A: the Q node rides in the P node's rows,
+  // not in any `children`. Mutation: `withoutKeptNodes` walks `children` only (`withoutKeptNodesInside` returns `n`) —
+  // the Revert respawns Q as a placeholder beside the kept frame, M goes, and no undo brings it back.
+  it('Q trashed, a Revert on H1: Q stays one live frame (no placeholder), M survives, and the undo keeps it', async () => {
+    const f = await startRun(be, noNest, 'keep-1877-l4');
+    const hr = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!.id;
+    const pNode = await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.P.path)!), f.prefabs.P.path, hr);
+    await settle();
+    const a = getAllEntities().find((e) => e.name === 'A' && piOf(e.id)?.rootInstanceId === pNode)!.id;
+    const qNode = await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.Q.path)!), f.prefabs.Q.path, a);
+    await settle();
+    const qGuid = getAllEntities().find((e) => e.id === qNode)!.guid!;
+    const mGuid = getAllEntities().find((e) => e.name === 'M' && e.parentId === qNode)!.guid!;
+    await trashQ(f);
+    expect(getAllEntities().filter((e) => e.guid === qGuid)).toHaveLength(1);
+    expect(writeTraitFieldWithUndo(hr, getTraitByName('Transform')!, 'y', 9)).toBeFalsy();
+    await settle();
+    const sel = new Set(collectInstanceOverrideKeys(hr, getCachedPrefabSync(f.prefabs.H.guid)!).all.filter((k) => /\.Transform\.y$/.test(k)));
+    expect(sel.size).toBe(1);
+    expect(await revertOverridesWithUndo(hr, sel)).not.toBeNull();
+    await settle();
+    const alive = () => ({
+      holders: getAllEntities().filter((e) => e.guid === qGuid).length,
+      placeholder: placeholderGuids().has(qGuid),
+      m: getAllEntities().some((e) => e.guid === mGuid),
+    });
+    expect(alive()).toEqual({ holders: 1, placeholder: false, m: true });
+    const u = await undoStep('undo');
+    await settle();
+    expect(u.failed ?? null).toBeNull();
+    expect(alive()).toEqual({ holders: 1, placeholder: false, m: true });
+  });
+});

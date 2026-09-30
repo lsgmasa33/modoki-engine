@@ -4,6 +4,7 @@
  *  a non-root entity gets detached to the scene root on every apply. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode as setRunModeForAuthoring } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -83,7 +84,7 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab
 // @ts-expect-error mock global
 global.fetch = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
 
-beforeEach(() => { testWorld = createWorld(); index.clear(); });
+beforeEach(() => { testWorld = createWorld(); index.clear(); setRunModeForAuthoring('stopped'); });
 const getModule = () => Promise.all([import('../../src/editor/scene/prefabApply'), import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2]) => ({ ...m0, ...m1, ...m2 }));
 
 const SRC = 'aaaaaaaa-0000-4000-8000-000000000abc';
@@ -108,12 +109,21 @@ describe('apply-to-prefab refresh preserves the instance parent', () => {
 
     // Edit a field on the instance, then apply it back → triggers a full refresh.
     index.get(rootId)!.set(Transform, { x: 7, y: 0, z: 0 });
+    const rootBefore = index.get(rootId);
     const result = await applyToPrefabSelective(rootId, new Set(['1.Transform.x']));
+    // The Apply LANDED. Until #1877 this file never set the run mode, every Apply here was refused as "not authored", and
+    // the parent check below held because nothing was ever rebuilt. Mutation: drop the `setRunMode('stopped')` above.
+    expect(result.refused).toBeUndefined();
+    expect(result.applied).toBe(true);
     expect(result.promotedAdditions).toBe(0);
 
     // After refresh, exactly one Widget instance exists and it is STILL under Mount.
     const widgets = getAllEntitiesImpl().filter((e) => e.name === 'Widget');
     expect(widgets).toHaveLength(1);
+    // …and it IS the refreshed one: a refresh respawns the instance (a new entity handle; koota recycles the id), so a
+    // parent kept by never rebuilding would pass the parent check too (#1877). Mutation: skip `refreshInstances` in
+    // `commitApplyPlan` (`prefabApply.ts`).
+    expect(index.get(widgets[0].id)).not.toBe(rootBefore);
     expect(widgets[0].parentId).toBe(mount.id());
   });
 });

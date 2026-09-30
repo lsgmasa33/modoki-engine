@@ -175,7 +175,12 @@ describe('revertOverridesSelective', () => {
     expect(memberData(result!.newRootId, 1, 'Spin')).toBeUndefined();
   });
 
-  it('undo restores the full pre-revert state; redo re-applies the revert', async () => {
+  // What this proves is the Revert's RESULT: the full and the reduced payloads each rebuild their own state. It does not
+  // drive the undo entry (`revertOverridesWithUndo`), which this file's world mock cannot resolve a ref in — that wiring
+  // is `engine/tests/editor/revertUndoCurrentPrefab.test.ts`'s (swapping the entry's undo and redo turns it red, and left
+  // this case green: #1877). Mutation for this case: `revertOverridesSelective` returns `fullOverrides` as the reduced
+  // payload (`prefabRevert.ts`).
+  it('the Revert\'s result carries both states: a rebuild from the full payload restores the edit, from the reduced one reverts it', async () => {
     const { m, root } = await setup();
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
@@ -187,11 +192,11 @@ describe('revertOverridesSelective', () => {
     const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result!;
     expect(memberData(result!.newRootId, 2, 'EngineFlame')!.idleScale).toBe(0.1); // reverted
 
-    // Undo → rebuild with the full (pre-revert) overrides: idleScale back to 0.5.
+    // The full (pre-revert) payload: idleScale back to 0.5.
     let cur = m.rebuildInstance(result!.newRootId, source, prefab, fullOverrides, fullStructure);
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.5);
 
-    // Redo → rebuild with the reduced overrides: idleScale reverted again.
+    // The reduced payload: idleScale reverted again.
     cur = m.rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.1);
     expect(currentRoot()).toBe(cur); // single live instance, no leaks

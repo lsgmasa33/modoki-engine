@@ -102,6 +102,17 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + '"undo refused in a clean segment"',
   },
   {
+    pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — .* was deleted since this step, so it was left deleted/,
+    why: '#1877 C1: an Apply\'s or a Replace\'s undo and redo refuse, rather than resurrect, a prefab an Assets trash deleted '
+      + 'since the step (Unity brings no deleted asset back through an undo). The trash taints the segment (`assetDelete`), so '
+      + 'the refusal is forgiven only there',
+  },
+  {
+    pattern: /^\[undo\] (Undo|Redo) of "(Apply to Prefab|Save prefab "[^"]*")" was REFUSED — \S+\.prefab\.json would contain itself once restored/,
+    why: '#1877 C1, I16 at the restore: a prefab-edit save made the other prefab nest this one since the step, so putting this '
+      + 'one back would make it contain itself. The save taints the segment (`prefabEditSave`)',
+  },
+  {
     pattern: /^\[PrefabEdit\] cannot save ".*" — serialize produced no prefab/,
     after: /^\[Prefab\] refusing to save — nesting .* creates a cycle/,
     why: 'the same I16 refusal as reported by the prefab-edit save — allowed only right after the cycle line above',

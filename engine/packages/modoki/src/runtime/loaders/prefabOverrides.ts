@@ -391,6 +391,15 @@ export function descendMemberRowKeys<R>(rows: Record<string, R> | undefined, com
 export interface StructureLayer<D, R> {
   /** Path-keyed whole-frame slots for this frame's nested descendants (`nestedStructure`). */
   slots?: Record<string, D>;
+  /** This layer's LEGACY field values for this frame's own members (a row's `overrides`, or what its path-keyed
+   *  `nestedOverrides` address at this frame), and its path-keyed values for the frames below (`valuePaths`, keyed from
+   *  this frame). Folded at this layer's depth (#1877 S4): before this layer's rows, AFTER the rows of every layer inside
+   *  it. Merged into one map instead, every layer's legacy values sat under every layer's rows, so an INNER template's
+   *  member row beat an OUTER prefab's `nestedOverrides` edit of the same field (outermost-wins inverted), and a
+   *  prefab-edit save, which still writes nested values there, lost its edit on the next load. Unity: an override on an
+   *  instance always wins over the asset it instances. */
+  values?: OverrideMap;
+  valuePaths?: NestedOverridePaths;
   /** Member rows keyed from this frame (`members`): direct keys fold here, deeper ones descend. */
   rows?: Record<string, R>;
   /** What this layer's row in the frame ABOVE says about this frame's root (`forwardRoot`). */
@@ -410,17 +419,18 @@ export interface StructureLayer<D, R> {
  *  ({@link foldStructureLayers}) — because a slot owns one frame, not the frames nested under it. */
 export function descendStructureLayers<D, R>(
   layers: readonly StructureLayer<D, R>[],
-  row: { localId?: number; nodeGuid?: string; nestedStructure?: Record<string, D>; members?: Record<string, R> },
+  row: { localId?: number; nodeGuid?: string; nestedStructure?: Record<string, D>; members?: Record<string, R>; overrides?: OverrideMap; nestedOverrides?: NestedOverridePaths },
   forwardRoots: readonly (ReadonlyMap<number, R> | undefined)[] = [],
 ): { layers: StructureLayer<D, R>[]; direct?: D; foldFrom: number } {
   const lid = row.localId ?? 0;
-  const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members }];
+  const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members, values: row.overrides, valuePaths: row.nestedOverrides }];
   let direct: D | undefined;
   let foldFrom = 0;
   layers.forEach((layer, i) => {
     const { direct: d, forward } = descendPathKeyed(layer.slots, lid);
     if (d) { direct = d; foldFrom = i + 1; }
-    out.push({ slots: forward, rows: descendMemberRowKeys(layer.rows, row.nodeGuid ?? ''), rootRow: forwardRoots[i]?.get(lid) });
+    const v = descendNestedOverrides(layer.valuePaths, lid);
+    out.push({ slots: forward, rows: descendMemberRowKeys(layer.rows, row.nodeGuid ?? ''), rootRow: forwardRoots[i]?.get(lid), values: v.direct, valuePaths: v.forward });
   });
   return { layers: out, direct, foldFrom };
 }
@@ -439,6 +449,11 @@ export function foldStructureLayers<A extends { parentLocalId: number }>(
   const forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[] = [];
   for (let i = 0; i < layers.length; i++) {
     const layer = layers[i]!;
+    // This layer's legacy values at its own depth (`StructureLayer.values`), over every layer inside it. A slot owns the
+    // structural lists only, so a layer inside one still states its values. `lower` may already hold them (the spawner and
+    // `foldRowStep` merge every layer's legacy values into it, outer winning); stating them again here is what puts them
+    // over the rows of the layers inside.
+    if (layer.values) channels = { ...channels, overrides: mergeOverrideMaps(channels.overrides, layer.values) };
     // A layer inside the slot still FORWARDS: what its row states about a nested root's interior (`own`,
     // `traitRemovals`…) belongs to the frame below, which the slot does not own. Only its statements about
     // THIS frame are replaced — the nested root's `removed` included, which `forwardRoot` never carries.
@@ -656,7 +671,7 @@ function foldDocOf(prefab: Record<string, unknown>): AnyFoldDoc {
 function topFrame(doc: AnyFoldDoc, opts: EffectiveMemberOptions): FrameFold {
   const slots = isRecord(opts.nestedStructure) ? opts.nestedStructure as Record<string, AnySlot> : undefined;
   const rows = isRecord(opts.members) ? opts.members as Record<string, AnyRow> : undefined;
-  const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows }];
+  const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows, valuePaths: isRecord(opts.nestedOverrides) ? opts.nestedOverrides as NestedOverridePaths : undefined }];
   const lower = { overrides: opts.overrides, removedTraits: opts.removedTraits };
   const { channels, forwardRoots } = rows ? foldStructureLayers(doc, layers, 0, lower) : { channels: lower, forwardRoots: [] };
   return { overrides: channels.overrides, removedTraits: channels.removedTraits, forward: { nestedOverrides: opts.nestedOverrides, layers, forwardRoots } };

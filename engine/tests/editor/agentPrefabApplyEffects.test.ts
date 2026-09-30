@@ -99,7 +99,9 @@ describe('agent prefab op renders the Apply plan (#1736)', () => {
   });
 
   it('`apply` of that conflict is REFUSED whole, naming both keys — never a silent last-write-wins', async () => {
-    // Mutation: drop the conflicts check in `applyToPrefabSelective` — the Apply writes P with A.x = 9.
+    // Mutation: drop BOTH conflict checks in `applyToPrefabSelective` (the dry plan's and the writing plan's) — the Apply
+    // writes P with A.x = 9. Either one alone still refuses (#1877): the dry plan's own job, refusing before the writing
+    // plan's promotion stamps keys on live nodes, is not observable in any shape tried here.
     const guid = instance(5, 9);
     await expect(runAgentOp('prefab', { action: 'apply', entityGuid: guid, target: 'frame' }))
       .rejects.toMatchObject({ code: 'REFUSED_BY_OP', options: expect.arrayContaining([expect.stringContaining(':')]) });

@@ -433,4 +433,35 @@ describe('#1774: undoing two minting Applies in a row lands both, and Save keeps
     expect(saved.entities.map((e) => e.name)).toEqual(['R', 'A', 'B']);
     expect(saved.nextLocalId).toBe(mark);
   });
+
+  // #1877 S1: a Save BETWEEN the two undos wrote the first undo's raised mark to the file; the second undo stated the
+  // mark its step recorded — lower — and the next Apply handed E2's number to a new row. Mutation: the restore's `onDisk`
+  // falls back to `r.from` over the editor's copy, and its mark drops `now` (`prefabMemoryRestore.ts`).
+  it('Apply E1, Apply E2, undo, Save, undo, undo, Apply E3 — E3 does not take the number E2 had', async () => {
+    install(p3Doc());
+    onDisk.set(PPATH, JSON.stringify(p3Doc()));
+    registerAsset(P, PPATH, 'prefab');
+    await load(sceneOfP());
+    const inst = () => getAllEntities().find((e) => e.guid === INST)!.id;
+    // Every added node the instance holds: after the undos E1 is one again, so E3's Apply promotes both.
+    const applyNew = async (name: string, promoted = 1) => {
+      add(`Add ${name}`, inst(), name);
+      const keys = collectInstanceOverrideKeys(inst(), getCachedPrefabSync(P) as PrefabFile);
+      expect((await applyToPrefabWithUndo(inst(), new Set(keys.added))).promotedAdditions).toBe(promoted);
+    };
+    const file = () => JSON.parse(onDisk.get(PPATH)!) as PrefabFile;
+    await applyNew('E1');
+    await applyNew('E2');
+    const e2 = file().entities.find((e) => e.name === 'E2')!.localId;
+    await undo(); // Apply E2
+    expect((await flushDirtyAssets()).failed).toEqual([]); // Cmd+S
+    const savedMark = file().nextLocalId!;
+    expect(savedMark).toBeGreaterThan(e2);
+    await undo(); // Add E2
+    await undo(); // Apply E1
+    expect((peekDirtyAsset(PPATH)?.data as PrefabFile | undefined)?.nextLocalId).toBe(savedMark);
+    await applyNew('E3', 2);
+    expect(file().entities.filter((e) => e.localId === e2).map((e) => e.name)).toEqual([]);
+    expect(file().nextLocalId).toBeGreaterThanOrEqual(savedMark);
+  });
 });

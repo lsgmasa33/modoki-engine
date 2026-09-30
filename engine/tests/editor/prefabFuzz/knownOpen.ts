@@ -38,6 +38,10 @@ export interface KnownOpen {
 // re-find the orphan pin. The mechanism the hub ruled on (#1872, 2026-09-30: pins kept as R2 orphans after a Replace's
 // undo) is NOT shown fixed — only this route to it is gone (confirmed: with R1's branch switched off, the repro reproduced). A re-found pin is a new failure again, and re-enters here
 // with a repro that reaches it without the reload.
+/** A rotation override mark the reload has and the live instance did not (#1877 L3's ruling): the save wrote the rotation
+ *  whole. `firstDiff`'s shape: `/<guid>/marks/<n>: <before> vs <after>`. */
+const ROTATION_MARK_GAINED = /\/marks\/\d+: (undefined|"[^"]*") vs "Transform\.r[xyz]"$/;
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
     issue: 1822,
@@ -53,6 +57,28 @@ export const KNOWN_OPEN: KnownOpen[] = [
         const r = ops.findIndex((o) => o.kind === 'removeComponent');
         return r >= 0 && ops.slice(r + 1).some((o) => o.kind === 'addComponent') && !ops.slice(r + 1).some((o) => o.kind === 'undo');
       })(),
+  },
+  {
+    issue: 1877,
+    what: "RECORDED, NOT FIXED (hub ruling on #1877 L3, 2026-09-30, hunt seed 6141): rotation is ONE value at capture. A nested "
+      + "member that marks one rotation axis saves all three once its prefab chain states a rotation (here another instance's "
+      + "Apply wrote one), and the reload marks all three. The pose is identical and nothing is lost; a whole-rotation override "
+      + "is Unity's shape (one quaternion). docs/prefab-structural-overrides.md § 'Rotation is one value at CAPTURE'",
+    repro: [
+      { kind: 'editField', u: [0.8245361184235662, 0.721022822195664, 0.6410565862897784, 0.7320433466229588, 0.023687092820182443, 0.8627953890245408, 0.8687168564647436, 0.22536573628894985] },
+      { kind: 'addComponent', u: [0.9335073961410671, 0.4554951183963567, 0.13746482715941966, 0.7277926572132856, 0.9457328307908028, 0.5185847785323858, 0.017960927914828062, 0.4788104626350105] },
+      { kind: 'addChild', u: [0.7099425268825144, 0.8615996283479035, 0.7452403204515576, 0.15435807057656348, 0.4432230154052377, 0.2558262166567147, 0.2723121785093099, 0.14863884262740612] },
+      { kind: 'editField', u: [0.17561221146024764, 0.09309955895878375, 0.3831488615833223, 0.9897731747478247, 0.15052448329515755, 0.24598310375586152, 0.23946041311137378, 0.2331087829079479] },
+      { kind: 'undo', u: [0.9496529882308096, 0.534789051162079, 0.6968676869291812, 0.7102659102529287, 0.6786708643194288, 0.2407134745735675, 0.562990696169436, 0.008048190735280514] },
+      { kind: 'revert', u: [0.35954819968901575, 0.9535820393357426, 0.4697693297639489, 0.7321670651435852, 0.3745289696380496, 0.4718909375369549, 0.0651649427600205, 0.4542001651134342] },
+      { kind: 'editField', u: [0.6345414887182415, 0.6539725128095597, 0.39188395254313946, 0.11149989580735564, 0.21026441198773682, 0.8501439979299903, 0.696764413267374, 0.13693811022676528] },
+      { kind: 'apply', u: [0.5851294826716185, 0.6396306017413735, 0.4806813143659383, 0.4945907967630774, 0.3846156981308013, 0.16354771074838936, 0.31058057653717697, 0.12416864838451147] },
+    ],
+    reproduces: (f) => f.check === 'save→reload is not the identity' && ROTATION_MARK_GAINED.test(f.detail),
+    // Only a rotation mark the RELOAD gains (the left side lacks it), and only once something could have made the chain state
+    // a rotation: an Apply, or a prefab edit saved. A rotation mark LOST still fails.
+    stops: (f, ops) => f.check === 'save→reload is not the identity' && ROTATION_MARK_GAINED.test(f.detail)
+      && ops.some((o) => o.kind === 'apply' || o.kind === 'prefabEdit'),
   },
 ];
 

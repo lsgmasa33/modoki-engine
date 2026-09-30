@@ -1979,7 +1979,7 @@ export function instantiatePrefabIntoWorld(
     return 0;
   }
   const segments = _segments ?? [];
-  const layers = _layers ?? [{ slots: nestedStructure, rows: structure?.members, rootRow: structure?.rootRow }];
+  const layers = _layers ?? [{ slots: nestedStructure, rows: structure?.members, rootRow: structure?.rootRow, valuePaths: nestedOverrides }];
   // The frame's member ROWS, translated into this document's localIds and folded over the legacy
   // channels (Phase 4, #1468) — FIRST, so everything below, token noting included, sees one set of
   // channels in the address space of the document it is expanding. A row names its member by minted

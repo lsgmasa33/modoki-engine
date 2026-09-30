@@ -91,7 +91,11 @@ export function rebuildTeardown(
       const id = stack.pop()!;
       for (const c of childrenOf.get(id) ?? []) {
         if (toDestroy.has(c) || isParked(c) || isKept(c)) continue;
-        if (!members.has(c) && guidById.get(id) && unexpandable(c, true)) {
+        // Kept only when it is OURS: a #1484 row of ANOTHER frame hanging under ours (`foreign`) is parked below and
+        // re-seated by guid as it hung, whether or not its prefab can be expanded. Kept, `seatKeptFrames` looked for its
+        // row among the unexpanded rows of an owner this rebuild never re-expanded, found none, and deleted it — and the
+        // save wrote that frame REMOVED (#1877 S3).
+        if (!members.has(c) && guidById.get(id) && !foreign(c) && unexpandable(c, true)) {
           kept.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)!, owned: true });
           continue;
         }
@@ -133,7 +137,12 @@ export function rebuildTeardown(
       const frame = frameOf(parked[i]!.id);
       if (frame !== rootInstanceId && !toDestroy.has(frame)) continue;
       // With its subtree, which the walk stopped at: a foreign-owned root parks with everything under it (#1484).
-      const [{ id }] = parked.splice(i, 1);
+      const [{ id, parentGuid }] = parked.splice(i, 1);
+      // …unless its prefab cannot be expanded: its owner is torn down here, so the respawn records its row unexpanded,
+      // and it is KEPT as #1862 keeps our own (`seatKeptFrames` takes it off that list). The keep above asks `foreign`
+      // first (#1877 S3), so a frame owned by a nested frame of ours, two levels down, reaches here, not there; taken,
+      // it went with nothing to respawn it (#1877 close-out review).
+      if (unexpandable(id, true)) { kept.push({ id, parentGuid, owned: true }); grew = true; continue; }
       take([id]);
       grew = true;
     }

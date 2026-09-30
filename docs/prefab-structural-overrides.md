@@ -332,6 +332,11 @@ Operate on the deep-cloned `newPrefab`:
   large scale on one axis does not hide a change on another.
   (Before #1498 the save subtracted by key, and an edit to ANY rotation component of such a member was
   dropped.)
+  **Rotation is one value at CAPTURE, and the live override marks can be narrower until the next save**
+  (#1877 L3, seed 6141; hub ruling: recorded, not fixed). Marks one axis, say `rx`; once the chain states a
+  rotation for that member (another instance's Apply wrote one), the save writes all three and the reload marks
+  all three. The pose is the same and nothing is lost. A whole-rotation override is Unity's shape too (one
+  quaternion).
 
 The live instance's applied **added** entities are deleted from the live world
 before refresh (so the re-instantiated prefab member replaces them rather than
@@ -1253,6 +1258,14 @@ it, and after MID restores `Leaf`, OUTER still hides it.
     prefab row's additions under a nested root whenever a scene slot sat one frame up (review F1). Once there are two
     row layers, a merged slot map cannot say which layer a slot came from, and without that the loader
     would re-apply a row's deletion over a scene slot that un-deleted the member.
+- **A layer's legacy VALUES fold at its own depth** (#1877 S4). A layer carries its path-keyed
+  `nestedOverrides` too (`StructureLayer.values` for this frame, `valuePaths` below it), descended with its rows,
+  and `foldStructureLayers` states them before that layer's rows and after every inner layer's. So an outer
+  prefab's legacy nested value beats an inner template's member row (it used to lose: every layer's legacy values
+  were merged into one map under every layer's rows), and within a layer the row beats its own legacy value. Both
+  the prefab-edit save and Apply's `writeStated` still write nested values in the legacy channel. A layer built by
+  hand (the spawner's top call, `nodeForward`, the rebuild's kept legacy layer, the pure reader's `topFrame`) carries
+  its `valuePaths`, or its values fold under the inner rows again.
 - **The scene over a row.** `chainLayer` (`prefabBase.ts`) folds the row layers along the path, so
   a scene's baseline includes what the prefab rows state and an untouched scene writes nothing for them.
   A scene row that un-deletes what a prefab row deleted is folded after it, and wins.

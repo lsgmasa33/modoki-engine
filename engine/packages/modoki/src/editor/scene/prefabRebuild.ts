@@ -804,8 +804,11 @@ export function rebuildInstance(
   // Still a TOP call: its own token scope, resolved by the derive below once the member guids are restored, and the
   // forwarded state applied at its NESTED rows only. The root's own members take their layer from `overrides`/`structure`.
   const forwardedOverrides = legacy?.nestedOverrides ? mergeNestedOverridePaths(forward?.nestedOverrides, legacy.nestedOverrides) : forward?.nestedOverrides;
-  // The kept structure slots are the OUTERMOST structural layer (layers run innermost first), as a load makes the entry's.
-  const forwardedLayers = legacy?.nestedStructure ? [...(forward?.layers ?? []), { slots: legacy.nestedStructure }] : forward?.layers;
+  // The kept structure slots and values are the OUTERMOST layer (layers run innermost first), as a load makes the entry's —
+  // its values folded at that depth too (#1877 S4, `StructureLayer.values`).
+  const forwardedLayers = legacy?.nestedStructure || legacy?.nestedOverrides
+    ? [...(forward?.layers ?? []), { slots: legacy.nestedStructure, valuePaths: legacy.nestedOverrides }]
+    : forward?.layers;
   const newRootId = forward || legacy
     ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), forwardedOverrides, forwardedLayers)
     : instantiatePrefab(prefab, parentId);
@@ -923,16 +926,41 @@ export function rebuildInstance(
   return newRootId;
 }
 
-/** `added` without the reference nodes {@link rebuildInstance} keeps live (by guid, at any depth of `children`), noting in
- *  `found` each one it took out. */
+/** `added` without the reference nodes {@link rebuildInstance} keeps live (by guid), noting in `found` each one it took
+ *  out. At ANY depth, through every channel a node can hang in — the walk `collectReferenceNodeRows` makes: a plain
+ *  node's `children`, a reference node's own `added` (legacy form) and `nestedStructure[*].added`, and its member rows'
+ *  `added`/`own` (the rows form a respawn capture is in). Walking `children` alone missed a kept node inside another
+ *  reference node: it was respawned as a placeholder beside the kept frame, which was then dropped as unnamed, and the
+ *  gesture's undo could not bring it back (#1877 L4). */
 function withoutKeptNodes(added: AddedEntity[] | undefined, keep: ReadonlyMap<string, unknown>, found: Set<string>): AddedEntity[] | undefined {
   if (!added) return added;
   const out: AddedEntity[] = [];
   for (const n of added) {
     if (n.prefab && n.guid && keep.has(n.guid)) { found.add(n.guid); continue; }
-    out.push(n.children?.length ? { ...n, children: withoutKeptNodes(n.children, keep, found)! } : n);
+    out.push(withoutKeptNodesInside(n, keep, found));
   }
   return out;
+}
+
+function withoutKeptNodesInside(n: AddedEntity, keep: ReadonlyMap<string, unknown>, found: Set<string>): AddedEntity {
+  let node = n;
+  if (n.children?.length) node = { ...node, children: withoutKeptNodes(n.children, keep, found)! };
+  if (n.added?.length) node = { ...node, added: withoutKeptNodes(n.added, keep, found) };
+  if (n.nestedStructure) {
+    node = { ...node, nestedStructure: Object.fromEntries(Object.entries(n.nestedStructure).map(([k, delta]) =>
+      [k, delta?.added ? { ...delta, added: withoutKeptNodes(delta.added, keep, found) } : delta])) };
+  }
+  if (n.members) {
+    node = { ...node, members: Object.fromEntries(Object.entries(n.members).map(([k, row]) => {
+      const r = row as SceneMemberRow & { added?: AddedEntity[]; own?: AddedEntity[] };
+      return [k, {
+        ...r,
+        ...(Array.isArray(r.added) ? { added: withoutKeptNodes(r.added, keep, found) } : {}),
+        ...(Array.isArray(r.own) ? { own: withoutKeptNodes(r.own, keep, found) } : {}),
+      }];
+    })) };
+  }
+  return node;
 }
 
 /** Put back the nested frames {@link rebuildTeardown} KEPT because their prefab could not be expanded (#1862), once the

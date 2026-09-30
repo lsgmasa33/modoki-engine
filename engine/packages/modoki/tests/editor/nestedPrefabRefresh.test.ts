@@ -243,7 +243,7 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     const { instantiatePrefab, setPrefabCache, setPrefabSource, applyToPrefabSelective } = await getModule();
     setPrefabCache(INNER, innerPrefab as any);
     setPrefabCache(OUTER, outerPrefab as any);
-    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
 
     const outerRoot = instantiatePrefab(outerPrefab as any); setPrefabSource(outerRoot, { id: OUTER });
     const m2 = memberByLocal(outerRoot, 2);
@@ -255,6 +255,7 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     const m1 = memberByLocal(outerRoot, 1);
     writeTraitFieldImpl(m1, TRAITS[0], 'x', 7); markOverride(index.get(m1), 'Transform', 'x');
 
+    const rootBefore = index.get(outerRoot);
     await applyToPrefabSelective(outerRoot, new Set(['1.Transform.x']));
 
     // The outer apply took effect, and exactly one nested copy remains, correctly
@@ -263,6 +264,13 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     expect(xsNamed('I1')).toHaveLength(1);
     expect(xsNamed('I2')).toHaveLength(1);
     const newRoot = (() => { let r = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { const p = pi as any; if (p.source === OUTER && p.rootInstanceId === e.id()) r = e.id(); }); return r; })();
+    // The APPLY's refresh rebuilt it, not only the commit's rebase: that refresh alone takes the applied field out of the
+    // clicked instance's override marks (#1469). Without this every assertion here also held with Apply's
+    // `refreshInstances` skipped, since the commit's `rebaseStaleInstances` rebuilds the frame anyway, applied mark and
+    // all (#1877). Mutation: skip `refreshInstances` in `commitApplyPlan` (`prefabApply.ts`).
+    expect(index.get(newRoot)).not.toBe(rootBefore);
+    const newM1 = memberByLocal(newRoot, 1);
+    expect([...(getOverrideMarkSet(index.get(newM1)) ?? [])]).not.toContain('Transform.x');
     const newM2 = memberByLocal(newRoot, 2);
     const newInner = innerRootUnder(newM2);
     expect(newInner).toBeGreaterThan(0); // nested copy hangs under the rebuilt M2

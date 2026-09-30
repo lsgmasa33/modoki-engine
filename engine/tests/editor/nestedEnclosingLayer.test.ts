@@ -1203,6 +1203,19 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       expect(xsOf('L')).toEqual([7]);
     });
 
+    it('#1877 S4: the gained frame\'s own row states L too — the scene\'s kept legacy value, the OUTER layer, still wins', async () => {
+      // Row C carries its own `overrides` for L (x = 3). The rebuild hands the kept legacy channel in as the outermost
+      // layer, and its values fold at that depth. Mutation: drop `valuePaths` from that layer (`prefabRebuild.ts`) — C's
+      // own 3 is stated again over the merged 7.
+      install(qDoc(), pDoc(), oWith({}));
+      await load(legacyScene());
+      const withC = pWithC();
+      Object.assign(withC.entities.find((e) => (e as { localId?: number }).localId === 3) as Record<string, unknown>, { overrides: { 2: { Transform: { x: 3 } } } });
+      install(withC);
+      await rebaseStaleInstances();
+      expect(xsOf('L')).toEqual([7]);
+    });
+
     it('#1780 close-out F2: a legacy nestedStructure removal into a frame the Refresh gains applies there too, as a load does', async () => {
       // Mutations: forward no kept `nestedStructure` in `rebuildInstance` — L is live after the Refresh, where a load of
       // the same scene removes it; settle no `nestedStructure` in `settleKeptLegacy` — the save states the removal twice
