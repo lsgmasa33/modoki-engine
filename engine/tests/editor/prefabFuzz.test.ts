@@ -74,9 +74,9 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
-import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS } from './prefabFuzz/knownOpen';
-import { signature, checkRoundTrip, firstDiff, nodeMoved } from './prefabFuzz/checks';
+import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { setRunMode } from '@modoki/engine/runtime';
 
@@ -201,7 +201,7 @@ const OPTS = { expectedError };
 const knownStop = (f: StepFailure, ops: readonly Op[]) => KNOWN_OPEN.find((k) => k.stops?.(f, ops.slice(0, f.step + 1)));
 
 /** Every tally the hunt prints: taints and the checks they skipped (#1845), op outcomes, backend routes. */
-const tallies = (): Map<string, number>[] => [taintCounts, skippedChecks, opOutcomes, be.routeCounts];
+const tallies = (): Map<string, number>[] => [taintCounts, skippedChecks, opOutcomes, be.routeCounts, checksRun];
 
 /** Run `fn` with every tally left as it found it. The shrinker replays a failing seed dozens of times through the same
  *  runner, so without this a hunt that finds more failures reports more taints (and ops, and routes) for that reason
@@ -305,7 +305,7 @@ describe('#1789 prefab fuzz', () => {
   // test: the cause list is closed by its type, and the guard is the "unexpected outside write" self-test below.
   afterAll(() => {
     const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
-    process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}\n`);
+    process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}; #1880 checks run: ${tally(checksRun)}\n`);
   });
 
   for (const r of REGRESSIONS) {
@@ -449,6 +449,57 @@ describe('#1789 prefab fuzz', () => {
     expect(trashedPrefabReferenced(Kbytes, '/fuzz/r0/prefabs/K.prefab.json', ['{"source":"cccccccc-0000-4000-8000-00000000abcd"}'])).toBe(true);
     expect(trashedPrefabReferenced(undefined, '/fuzz/r0/prefabs/K.prefab.json', ['{"prefab":"/fuzz/r0/prefabs/K.prefab.json"}'])).toBe(true);
     expect(trashedPrefabReferenced(Kbytes, '/fuzz/r0/prefabs/K.prefab.json', ['{"source":"another"}', wrote])).toBe(false);
+  });
+
+  // #1880 T1: the undo walk sets the localId mark and the version aside only in the direction a restore may move them. It
+  // deleted both, so a walk that gave back a LOWER mark (#1877 3b S1's damage) compared equal. Mutation: restore the
+  // unconditional delete in `diffFiles` — the two reject expectations pass through as null and fail.
+  it('harness: the undo walk forgives a RAISED mark or version, and rejects a lowered one (#1880 T1)', () => {
+    const P = '/fuzz/r0/prefabs/P.prefab.json';
+    const doc = { id: 'cccccccc-0000-4000-8000-000000001880', version: 9, name: 'P', rootLocalId: 1, nextLocalId: 7,
+      entities: [{ localId: 1, name: 'P', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001880', traits: { EntityAttributes: { name: 'P', parentId: 0, guid: '' } } }] };
+    const text = (d: object) => `${JSON.stringify(d, null, 2)}\n`;
+    const at = (d: object) => new Map([[P, text(d)]]);
+    expect(diffFiles(at(doc), at(doc))).toBeNull();
+    // Accept side: a restore that raised the mark, and one that claims a newer version with it.
+    expect(diffFiles(at(doc), at({ ...doc, nextLocalId: 9 }))).toBeNull();
+    expect(diffFiles(at({ ...doc, version: 5 }), at(doc))).toBeNull();
+    // Reject side: the same document with its mark, or its version, gone down.
+    expect(diffFiles(at(doc), at({ ...doc, nextLocalId: 6 }))).toMatch(/localId mark went down \(7 → 6\)/);
+    expect(diffFiles(at(doc), at({ ...doc, version: 8 }))).toMatch(/format version went down/);
+  });
+
+  // #1880 T1 (close-out re-review): the two exemptions the held checks take, pinned on their reject side. Mutation: give the
+  // mark check `handEdited` (the document match) instead of `handBytes` — the first expectation fails; make `carried`
+  // accept any version of a seen document — the third fails.
+  it('harness: a lowered park of a hand edit is still mark-checked, and I15 carries a seen document only at a seen version or v8 (#1880 T1)', () => {
+    const P = '/fuzz/r0/prefabs/P.prefab.json';
+    const doc = (mark: number, version = 9) => JSON.stringify({ id: 'cccccccc-0000-4000-8000-000000001880', version, rootLocalId: 1, nextLocalId: mark, entities: [{ localId: 1 }] }, null, 2);
+    const hand = doc(7);
+    const lowered = JSON.stringify(JSON.parse(doc(6)));
+    const sets = handEditedPaths(new Map([[P, lowered]]), new Set([hand]));
+    expect([...sets.handBytes], 'a park of the hand document with a LOWER mark is not the hand edit').toEqual([]);
+    expect([...sets.handEdited], 'the file checks still skip it as the hand edit').toEqual([P]);
+    const { see, carried } = carryTracker();
+    see(doc(7, 5));
+    expect(carried(doc(9, 7)), 'a seen document at a version it never had (v7) is a new write').toBe(false);
+    expect(carried(doc(9, 8)), 'at v8, the version a raised mark claims').toBe(true);
+    expect(carried(doc(9, 5)), 'at the version it was seen at').toBe(true);
+  });
+
+  // #1880 T1: the mark check reads what the editor HOLDS — a park laid over its file — and never lets a document's mark
+  // go down across steps. Mutation: make `checkMarks` return [] — the first reject expectation fails; drop its handEdited
+  // skip — the hand-edit expectation fails.
+  it('harness: the mark check fails a held document whose mark went down, and skips a hand edit (#1880 T1)', () => {
+    const P = '/fuzz/r0/prefabs/P.prefab.json';
+    const doc = (mark: number) => JSON.stringify({ id: 'cccccccc-0000-4000-8000-000000001880', version: 9, rootLocalId: 1, nextLocalId: mark, entities: [{ localId: 1 }] });
+    const marks = new Map<string, number>();
+    expect(checkMarks(new Map([[P, doc(7)]]), marks, new Set())).toEqual([]);
+    expect(checkMarks(new Map([[P, doc(9)]]), marks, new Set())).toEqual([]); // up is lawful
+    const down = checkMarks(new Map([[P, doc(6)]]), marks, new Set([P]));
+    expect(down.map((f) => [f.check, f.detail])).toEqual([['I4 high-water mark went down', `${P} (parked): 9 → 6`]]);
+    // A hand edit is held to nothing (the runner forgets the document's mark when an outside edit writes it).
+    expect(checkMarks(new Map([[P, doc(2)]]), marks, new Set(), new Set([P]))).toEqual([]);
   });
 
   // #1838: the round trip holds a rotation as ONE value, an orientation (#1490's rule), not three numbers.
@@ -628,7 +679,8 @@ describe('#1789 prefab fuzz', () => {
 
   it('harness: a run is reproducible — the same list twice gives the same trace and the same outcome', async () => {
     const ops = generate(VERIFY_SEEDS[0], VERIFY_LEN);
-    const [a, b] = [await runOps(be, ops, OPTS), await runOps(be, ops, OPTS)];
+    // Uncounted: seed 1 runs as a verify seed already, and the tallies say what the verify SEEDS covered (close-out review).
+    const [a, b] = await uncounted(async () => [await runOps(be, ops, OPTS), await runOps(be, ops, OPTS)]);
     // Only the run's TAG differs: a second run of one list takes the next occurrence (the tag's low 16 bits), and the tag is
     // both the run's folder and every run guid's last group (`harness.ts` `tagFor`). Masked in both places — a guid only by
     // its occurrence digits, so the list hash before them must still match. The folder alone was masked until a trace line

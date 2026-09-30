@@ -15,6 +15,7 @@ import { findEntity } from '@modoki/engine/runtime';
 import { unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { piOf } from './harness';
 import { sameOrientation } from '../../../packages/modoki/src/runtime/scene/transformSpace';
+import { localIdCounter } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 
 /** `console`: every console.error line the end walk logged, allowlisted or not, when the walk's identity check fails —
  *  the line that names the mechanism (a refusal's full text, a "not tagging" reason) is often there, not in `detail`. */
@@ -198,6 +199,30 @@ export function checkFiles(
     state.set(id, 'done');
   };
   for (const id of docs.keys()) visit(id, []);
+  return out;
+}
+
+/** Per run: every prefab document's localId high-water mark (by id), the highest the EDITOR has held it at. */
+export type MarkHistory = Map<string, number>;
+
+/** I4's mark never goes down (#1774, docs/prefabs.md § "The localId high-water mark"), read off what the editor HOLDS:
+ *  `view` is the prefab files with every PARKED document laid over its file (#1868), since a park is what the next
+ *  writer mints from and what Save writes. A park whose mark is lower than one the editor held for that document before
+ *  hands out a number an earlier row took (#1877 3b S1: a restore after a Save wrote a higher mark). The file under a park
+ *  is not read: it may lawfully hold a lower mark than the park until Save lands it. A hand edit (`handEdited`) is held to
+ *  nothing; the runner forgets the document's mark when an outside edit writes it, as it does the localId history. */
+export function checkMarks(view: ReadonlyMap<string, string>, marks: MarkHistory, parked: ReadonlySet<string>, handEdited: ReadonlySet<string> = new Set()): Failure[] {
+  const out: Failure[] = [];
+  for (const [path, text] of view) {
+    if (!path.endsWith('.prefab.json') || handEdited.has(path)) continue;
+    let doc: Doc;
+    try { doc = JSON.parse(text) as Doc; } catch { continue; } // `checkFiles` reports an unparseable file
+    if (!doc.id) continue;
+    const now = localIdCounter(doc);
+    const was = marks.get(doc.id);
+    if (was !== undefined && now < was) out.push({ check: 'I4 high-water mark went down', detail: `${path}${parked.has(path) ? ' (parked)' : ''}: ${was} → ${now}` });
+    marks.set(doc.id, Math.max(was ?? 0, now));
+  }
   return out;
 }
 

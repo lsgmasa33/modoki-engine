@@ -33,6 +33,8 @@ import { revertOverridesWithUndo } from '../../../packages/modoki/src/editor/und
 import { undoStep, breakUndoCoalescing } from '../../../packages/modoki/src/editor/undo/undoManager';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../../packages/modoki/src/editor/scene/prefabEdit';
 import { saveScene, loadSceneReporting } from '../../../packages/modoki/src/editor/scene/serialize';
+import { flushDirtyAssets } from '../../../packages/modoki/src/editor/scene/dirtyAssets';
+import { answerParkedConflicts } from '../../../packages/modoki/src/editor/scene/saveCommand';
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
@@ -47,7 +49,18 @@ export type OpKind =
   | 'apply' | 'revert' | 'prefabEdit' | 'undo' | 'redo' | 'saveReload'
   | 'trashPrefab' | 'renamePrefab' | 'outsideEdit';
 
-export interface Op { kind: OpKind; u: number[]; inner?: Op[] }
+export interface Op {
+  kind: OpKind; u: number[]; inner?: Op[];
+  /** A `saveReload` that is Cmd+S (#1880 T1): `all` flushes every parked prefab first, then saves and reloads; `all-no-reload`
+   *  stops at the save, as Cmd+S does, so the undo stack survives it. WRITTEN INTO THE OP by the generator, never derived
+   *  from `u` at run time: a list recorded before the field existed (REGRESSIONS, KNOWN_OPEN) carries draws that would
+   *  otherwise select it, and would silently stop testing what it was recorded for (close-out review: #1794's regression
+   *  passed with #1794's fix deleted). */
+  save?: 'all' | 'all-no-reload';
+  /** An Apply or outside edit the runner checks rebuild ≡ reload after (#1880 T2) — written by the generator, for the same
+   *  reason: the check reloads the scene and drops the undo stack, so a recorded list must never gain it unasked. */
+  check?: 'rebuild-reload';
+}
 
 /** Relative weights. Structure-changing ops and the three that CHECK (save→reload, undo, apply) are weighted up. */
 const WEIGHTS: Record<OpKind, number> = {
@@ -84,6 +97,10 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
         const n = 1 + Math.floor(next() * 4);
         op.inner = Array.from({ length: n }, () => draw(pickKind(INNER)));
       }
+      // The variants are read off draws the op already made (no draw is added, so every seed's list and every later draw
+      // are what they were), and WRITTEN into the op, which a replay or a recorded repro then carries as it is.
+      if (op.kind === 'saveReload' && op.u[1]! >= 0.65) op.save = op.u[3]! < 0.5 ? 'all-no-reload' : 'all';
+      if ((op.kind === 'apply' || op.kind === 'outsideEdit') && op.u[7]! >= 0.7) op.check = 'rebuild-reload';
       ops.push(op);
     }
     return ops;
@@ -95,7 +112,8 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
 /** A short, stable spelling of an op for reports. */
 export function describe(op: Op): string {
   const u = op.u.slice(0, 4).map((x) => x.toFixed(3)).join(',');
-  return op.inner ? `${op.kind}(${u})[${op.inner.map(describe).join('; ')}]` : `${op.kind}(${u})`;
+  const tag = op.save ? `{${op.save}}` : op.check ? `{${op.check}}` : '';
+  return op.inner ? `${op.kind}${tag}(${u})[${op.inner.map(describe).join('; ')}]` : `${op.kind}${tag}(${u})`;
 }
 
 // ── Execution ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -123,6 +141,9 @@ export interface RunState {
    *  ruling (i)), so the walk to a segment's start may find it still there — holding exactly this document, at that path
    *  or wherever a Rename moved it. A list, not keyed by path: a later create can reuse the path a rename freed. */
   created?: string[];
+  /** Set by an Apply that landed: the guid of the TOP-LEVEL entity its instance hangs under. The rebuild ≡ reload check
+   *  (#1880 T2) leaves that subtree out, since an Apply rewrites its own instance's statements, not only the template. */
+  appliedTop?: string;
   /** Set by an Assets file op that landed (a trash: `to` null; a rename): it is not undoable (#1868, owner ruling D2), so
    *  the runner carries it into the segment's baseline rather than expecting the walk to put it back. */
   fileOp?: { from: string; to: string | null };
@@ -162,7 +183,7 @@ const noSelect = () => {};
 
 /** Every prefab DOCUMENT the run has seen that is in no file now (by id), with the last path and text it had. One whose
  *  last path another file holds now is left out: restored there, it would overwrite that file. */
-function deletedPrefabs(st: RunState): Array<[string, string]> {
+export function deletedPrefabs(st: RunState): Array<[string, string]> {
   const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
   const present = new Set([...st.be.snapshot()].filter(([p]) => p.endsWith('.prefab.json')).map(([, t]) => idOf(t)));
   return [...(st.lastPrefabs ?? new Map<string, [string, string]>())].filter(([id, [p]]) => !present.has(id) && st.be.read(p) === undefined).map(([, entry]) => entry);
@@ -408,8 +429,10 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const preview = await previewApply(root, new Set(sel), targets);
       const blocked = applyBlocked({ ...preview, request: 'r' }, 'r');
       if (blocked) { st.note = blocked; return 'refused'; }
+      const topGuid = (() => { let id = root; for (let e = ents.find((x) => x.id === id); e?.parentId; e = ents.find((x) => x.id === id)) id = e.parentId; return ents.find((x) => x.id === id)?.guid; })();
       const result = await applyToPrefabWithUndo(root, sel, targets, { expect: preview.fingerprint });
       if (result.refused) { st.note = result.refused; return 'refused'; }
+      st.appliedTop = topGuid;
       return result.applied ? 'done' : 'refused';
     }
     case 'prefabEdit': {
@@ -446,6 +469,22 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     }
     case 'saveReload': {
       if (editing()) return 'noop';
+      // `op.save` (#1880 T1): Cmd+S as the editor runs it, Save All (`runSaveAll`): every PARKED prefab (an undone prefab
+      // write, #1868) is flushed to its file BEFORE the scene is written. The scene-only save alone never landed a park, so
+      // every bug that needs a park written between two undos (#1877 3b S1: the restore lowering the localId mark below
+      // what a Save wrote) was out of reach. A conflict (the file changed under the park) is answered as the modal would
+      // be, Overwrite or Cancel, by `u[2]`. `all-no-reload` stops at the save, as Cmd+S does: the reload drops the undo
+      // stack, and the bugs a Save All exposes live in the undos AFTER it. No round trip is measured then.
+      if (op.save) {
+        const flushed = await answerParkedConflicts(await flushDirtyAssets(), async () => u[2] < 0.5);
+        st.note = `save all: ${flushed.saved.length} parked flushed${flushed.failed.length ? `, ${flushed.failed.length} left parked` : ''}`;
+        if (op.save === 'all-no-reload') {
+          const saved = await saveScene({ allowDialog: false });
+          if (!saved.saved) { st.note += `; save: ${saved.reason}`; return 'refused'; }
+          st.note += '; no reload';
+          return 'done';
+        }
+      }
       const before = worldTree();
       const unexpanded = unexpandedRows(); // the frames the live world could not expand (#1831 G1 M1, `forgiveExpandedFrames`)
       const s1 = await saveScene({ allowDialog: false });
@@ -481,7 +520,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const after = worldTree();
       // Said in the trace, so a test can see the plain reload really gave placeholders (production's shape), not an
       // expansion from an entry the dance left behind.
-      if (gone.length) st.note = `${gone.length} deleted prefab(s) restored for the comparison; ${placeholderGuids().size} placeholder(s) on the plain reload`;
+      if (gone.length) st.note = `${st.note ? `${st.note}; ` : ''}${gone.length} deleted prefab(s) restored for the comparison; ${placeholderGuids().size} placeholder(s) on the plain reload`;
       const s2 = await saveScene({ allowDialog: false });
       if (!s2.saved) throw new Error(`second save: ${s2.reason}`);
       st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '', ...(gone.length ? { restored, unexpanded } : {}) };

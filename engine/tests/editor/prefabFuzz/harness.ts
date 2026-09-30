@@ -29,6 +29,7 @@ import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loader
 import { SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../../../packages/modoki/src/runtime/core/notifyListeners';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
+import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templateIdentity';
 import { ROOT_URL, type FuzzBackend } from './backend';
 
 type Handler = (data: unknown) => void;
@@ -107,8 +108,8 @@ export interface Fixture {
 }
 
 /** #1707's fixture (expansionTwinParity.test.ts), fresh guids per run: Q: QR → M. P: R → A → B and R → C, a row
- *  expanding Q whose overrides move M. O: OR → N, a row expanding P that states something through every channel a
- *  template row carries. H: one entity, the host a scene-added reference node hangs under. */
+ *  expanding Q whose overrides move M and whose member row states M.z. O: OR → N, a row expanding P that states
+ *  something through every channel a template row carries, M.z among them through the legacy carrier (#1880 T1). H: one entity, the host a scene-added reference node hangs under. */
 function fixtureDocs(f: Fixture, g: (k: number) => string) {
   const { Q, P, O, H } = f.prefabs;
   const row = (localId: number, name: string, parentId: number, nodeGuid: string, x = 0) => ({
@@ -120,7 +121,10 @@ function fixtureDocs(f: Fixture, g: (k: number) => string) {
     P: { id: P.guid, version: 5, name: 'P', rootLocalId: 1, entities: [
       row(1, 'R', 0, gR), row(2, 'A', 1, gA, 2), row(3, 'B', 2, gB, 3),
       { localId: 4, name: 'C', nodeGuid: gC, prefab: Q.guid, traits: { EntityAttributes: { name: 'C', parentId: 1, guid: '' } },
-        overrides: { 2: { Transform: { x: 4 } } } },
+        overrides: { 2: { Transform: { x: 4 } } },
+        // M.z through a member ROW, the inner layer. O's row N states the same field through the legacy carrier, the outer
+        // layer (#1880 T1: one field in two layers through both carriers, #1877 3b S4's shape). Outermost wins: 7 in O.
+        members: { [`/${gM}`]: { traits: { Transform: { z: 9 } } } } },
     ] },
     O: { id: O.guid, version: 6, name: 'O', rootLocalId: 1, entities: [
       row(1, 'OR', 0, gOR),
@@ -361,11 +365,15 @@ export function worldTree(): Record<string, unknown> {
       ? [...(getOverrideMarkSet(ent as never) ?? [])].filter((m) => e.traits.includes(m.split('.')[0]) && !blankRef(m)).sort()
       : [];
     const unresolved = ent ? unresolvedRefOf(ent as never) : undefined;
+    // A node's template key (`TemplateAddedKey`, #1809): not a registered trait, so the walk above never lists it, and a
+    // reload or a rebuild that lost or re-minted one read as identical (#1877's fuzz blind spots, #1880 T1). A guid is
+    // derived FROM the key, so a key change often shows as a guid change too, but not under a pinned guid.
+    const templateKey = ent ? templateKeyOf(ent as never) : '';
     const key = guidOf.get(e.id)!;
     // A placeholder is compared by the prefab it names. Its record's FORM follows where it sits (a scene entry, or a node
     // under a parent), so a reparent legitimately turns one into the other; the byte-identity of a second save is what
     // holds the record's content.
-    out[out[key] ? `${key}#dup${e.id}` : key] = { traits, marks, ...(unresolved ? { unresolved: unresolved.source } : {}) };
+    out[out[key] ? `${key}#dup${e.id}` : key] = { traits, marks, ...(templateKey ? { templateKey } : {}), ...(unresolved ? { unresolved: unresolved.source } : {}) };
   }
   return out;
 }

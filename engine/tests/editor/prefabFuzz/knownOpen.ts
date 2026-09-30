@@ -87,6 +87,20 @@ export const KNOWN_OPEN: KnownOpen[] = [
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
+    issue: 1877,
+    what: "3b S1 (#1880 T1): after two Applies, an undo, Cmd+S (Save All lands the park, mark 7) and two more undos, the in-memory restore parked P with its localId mark back at 6, and the next Apply handed out row 6 again (I4). Fixed by #1877 C1: the restore takes the mark from what the editor holds (`documentNow`); re-found first by #1880's park mark check",
+    repro: [
+      { kind: 'addChild', u: [0.5, 0.08823529411764706, 0.1, 0, 0, 0, 0, 0] },
+      { kind: 'apply', u: [0.21428571428571427, 0.1, 0, 0.9, 0, 0, 0, 0] },
+      { kind: 'addChild', u: [0.5, 0.6578947368421053, 0.2, 0, 0, 0, 0, 0] },
+      { kind: 'apply', u: [0.6428571428571429, 0.1, 0, 0.9, 0, 0, 0, 0] },
+      { kind: 'undo', u: [0, 0, 0, 0, 0, 0, 0, 0] },
+      // Save All with no reload (Cmd+S): the park lands in the file, and the undo stack stays.
+      { kind: 'saveReload', u: [0, 0.9, 0.9, 0.1, 0, 0, 0, 0], save: 'all-no-reload' },
+      { kind: 'undo', u: [0.4, 0, 0, 0, 0, 0, 0, 0] },
+    ],
+  },
+  {
     issue: 1830,
     what: "Create Prefab's redo minted a fresh TemplateAddedKey for a node an undone Duplicate had respawned without its marker, instead of the key the file holds (#1830's own repro; the redo now puts the written keys back)",
     repro: [

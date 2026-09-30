@@ -574,6 +574,31 @@ mechanically:
 - The generator writes only shapes a real producer writes (#1839): an outside edit is a hand edit of a value, or a new
   plain row under a plain row as a merged editor Add Child numbers it. Never a plain row under a reference row, which no
   editor write produces and which reads as a false I7.
+- **What the editor HOLDS is checked, not only the files** (#1880 T1). A third of the generated saves are Save All
+  (`op.save`): every PARKED prefab (#1868) is flushed first, a conflict answered Overwrite or Cancel, and half of those
+  stop at the save with no reload, as Cmd+S does, so the undo stack survives the save.
+  ⚠️ The generator WRITES the variant into the op; the executor never derives it from `u`. A recorded repro carries draws
+  that would otherwise select it: when it did, #1794's regressions passed with #1794's fix deleted (close-out review). The file checks (I4, I16, the validator) and a mark check
+  (`checkMarks`: a document's localId mark never goes down across steps) read the files with each park laid over its
+  file. #1877's 3b S1 (a restore parking a mark below what a Save wrote) was out of reach before: the scene-only save
+  never landed a park, and the undo walk's file comparison deleted the mark. That comparison now forgives the mark and
+  the version only going UP. The world tree carries each node's `TemplateAddedKey`, and the fixture states M.z in two
+  layers through both carriers (P's row C by member row, O's row N by legacy value).
+- **A rebuild is checked against a load** (#1880 T2). After the 30% of generated Applies and outside edits the generator
+  marks (`op.check`), the rebuilt world must equal LOADING the scene as it stood before the op under the new template, marks included; the
+  Apply's own top-level instance is left out (the Apply rewrote its statements too). The round trip cannot see a rebuild
+  that drops an edit and then saves the loss consistently (#1877 S3, L4). The check reloads the scene, so the run goes on
+  from the post-op scene saved and loaded back, with the undo stack reset; a recorded repro without the field keeps its
+  recorded path. On the 8 verify seeds it checks ONE Apply and four outside edits (of seven marked Applies, five were
+  no-ops and one was skipped for a deleted prefab); its Apply leg is held by hunts, which the summary line's counts make
+  visible.
+- **A no-op rebuild is the identity** (#1880 T4). Each run ends by rebuilding every stored instance from its own capture
+  onto the document it was expanded from (`refreshInstances`, what a rebase does). The respawn form of a capture is
+  pinned to the live world only by this; the save's rows form is pinned by the round trip.
+- The verify run's summary line says how often T2 and T4 ran, and why a marked T2 op did not check (a skip reason, or
+  the op a no-op) (`#1880 checks run`), since a check that never runs guards nothing. The fold's precedence has its own oracle, outside the fuzzer:
+  `engine/packages/modoki/tests/runtime/prefabFoldOracle.test.ts` (#1880 T3) draws random layer stacks and holds the pure
+  fold and the spawner to Unity's rule, outermost layer wins.
 
 The test's header lists what it cannot see (no concurrency, a simulated watcher, one scene, no Play). Read it before
 concluding that an area is covered.
