@@ -1,6 +1,7 @@
 /** Apply: planning which live overrides go into which prefab file, and committing that plan.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { referenceRowAt, rowAt } from '../../runtime/loaders/prefabOverrides';
 import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
 import { whyWorldNotAuthored, notAuthoredAdvice } from './authoredWorld';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -478,7 +479,7 @@ async function planApply(
   function memberNameIn(frameRoot: number, frameDoc: PrefabFile, lid: number): string {
     const ecs = memberOf(frameRoot, lid);
     const live = ecs && eaMetaForApply ? (readTraitData(ecs, eaMetaForApply)?.name as string) : '';
-    return live || frameDoc.entities.find((e) => e.localId === lid)?.name || `member ${lid}`;
+    return live || rowAt(frameDoc, lid)?.name || `member ${lid}`;
   }
   /** What a SLOT is (#1736, #1728): one field of one member, stated in one document at one place in it — the row
    *  `rowLid` and the path below it for an override on an enclosing prefab, none for a template's own row. The pool
@@ -595,14 +596,14 @@ async function planApply(
       newPrefab.entities = newPrefab.entities.filter((e) => !drop.has(e.localId));
       if (newPrefab.entities.length !== before) {
         writtenCount++;
-        setEffect(key, source, ownName, false, { op: 'removeMember', member: oldPrefab.entities.find((e) => e.localId === localId)?.name || `member ${localId}` });
+        setEffect(key, source, ownName, false, { op: 'removeMember', member: rowAt(oldPrefab, localId)?.name || `member ${localId}` });
       }
       continue;
     }
     // Structural: remove a component from a member.
     if (key.startsWith('-trait.')) {
       const [, localIdStr, traitName] = key.split('.');
-      const prefabEntity = newPrefab.entities.find((e) => e.localId === Number(localIdStr));
+      const prefabEntity = rowAt(newPrefab, Number(localIdStr));
       if (prefabEntity && traitName in prefabEntity.traits) {
         delete prefabEntity.traits[traitName];
         writtenCount++;
@@ -618,7 +619,7 @@ async function planApply(
     if (key.startsWith('+trait.')) {
       const [, localIdStr, tagName] = key.split('.');
       const tagMeta = getTraitByName(tagName);
-      const prefabEntity = newPrefab.entities.find((e) => e.localId === Number(localIdStr));
+      const prefabEntity = rowAt(newPrefab, Number(localIdStr));
       const ecsId = localToEcs.get(Number(localIdStr));
       if (!tagMeta || tagMeta.category !== 'tag') { skipped.push({ key, reason: `${tagName} is not a registered tag` }); continue; }
       if (!prefabEntity || !ecsId) { skipped.push({ key, reason: 'its member is not part of this prefab instance' }); continue; }
@@ -664,7 +665,7 @@ async function planApply(
     // A ref to another member of this instance goes into the template as a member token (#1352).
     const liveValue = writer.value(liveData[fieldName]);
 
-    const prefabEntity = newPrefab.entities.find((e) => e.localId === localId);
+    const prefabEntity = rowAt(newPrefab, localId);
     if (!prefabEntity) continue;
     let traitBag = prefabEntity.traits[traitName];
     if (traitBag === true) continue; // already a tag in the prefab — nothing to set
@@ -692,7 +693,7 @@ async function planApply(
     // Decided against the document as READ, not as this Apply has changed it so far (#1727: a second key of the same
     // component found the first one's bag and said "set field" of a component it was adding).
     const member = memberNameIn(rootInstanceId, oldPrefab, localId);
-    const adds = oldPrefab.entities.find((e) => e.localId === localId)?.traits[traitName] === undefined;
+    const adds = rowAt(oldPrefab, localId)?.traits[traitName] === undefined;
     const bag = traitBag as Record<string, unknown>;
     setEffect(key, source, ownName, false, adds
       ? { op: 'addComponent', member, trait: traitName, fields: shown(liveData, bag) }
@@ -809,7 +810,7 @@ async function planApply(
     const slot = ctx.slots.find((sl) => sl.level === level)!;
     const at = await docFor(slot.source, level, ctx.base.levels[level]!.root);
     if (!at) return false;
-    const carrier = at.doc.entities.find((x) => x.localId === slot.rowLid && x.prefab);
+    const carrier = referenceRowAt(at.doc, slot.rowLid);
     if (!carrier) { skipped.push({ key: reportAs, reason: `its row is no longer in Prefab '${at.doc.name}'` }); return false; }
     const levelWriter = writerAt(ctx.base.levels[level]!.root);
     const tName = at.doc.name || slot.source;
@@ -850,7 +851,7 @@ async function planApply(
         skipped.push({ key: reportAs, reason: `Prefab '${at.doc.name}' cannot name that member (a row on the way has no identity) — re-save it once` });
         return false;
       }
-      setEffect(reportAs, slot.source, tName, true, { op: 'removeMember', member: ctx.frameDoc.entities.find((e) => e.localId === lid)?.name || `member ${lid}` });
+      setEffect(reportAs, slot.source, tName, true, { op: 'removeMember', member: rowAt(ctx.frameDoc, lid)?.name || `member ${lid}` });
     } else if (key.startsWith('+trait.')) {
       const [, lidStr, tag] = key.split('.');
       const lid = Number(lidStr);
@@ -975,7 +976,7 @@ async function planApply(
     if (key.startsWith('+trait.') || key.startsWith('-trait.')) {
       const [, lidStr, t] = parts;
       const lid = Number(lidStr);
-      const row = at.doc.entities.find((e) => e.localId === lid);
+      const row = rowAt(at.doc, lid);
       if (!row) { skipped.push({ key: reportAs, reason: 'its member is no longer in that prefab' }); return false; }
       if (key.startsWith('+trait.')) row.traits[t!] = true;
       else delete row.traits[t!];
@@ -990,13 +991,13 @@ async function planApply(
     const lid = Number(lidStr);
     const ecs = memberOf(ctx.frameRoot, lid);
     const meta = getTraitByName(t!);
-    const row = at.doc.entities.find((e) => e.localId === lid);
+    const row = rowAt(at.doc, lid);
     if (!ecs || !meta || !row || meta.category === 'tag' || !isPersistentTraitField(meta, f!) || isTemplateExcludedField(meta, f!)) return false;
     const live = clonePersistable(readTraitDataFull(ecs, meta));
     if (!live) return false;
     // Whether the component is ADDED is decided against the document as read (#1727): a second frame of the same
     // prefab found the first one's bag already written, took its own write for a one-field edit, and said so.
-    const bag = at.pristine.entities.find((e) => e.localId === lid)?.traits[t!];
+    const bag = rowAt(at.pristine, lid)?.traits[t!];
     const cur = row.traits[t!];
     if (bag === true || cur === true) return false;
     const fields = bag ? { [f!]: w.value(live[f!]) } : w.bag(meta, live);
@@ -1025,7 +1026,7 @@ async function planApply(
       if (!cur || !statedFields(cur, sl.path, mk, w.lid, w.trait)) continue;
       const at = await docFor(sl.source, sl.level, w.ctx.base.levels[sl.level]!.root);
       if (!at) break;
-      const carrier = at.doc.entities.find((x) => x.localId === sl.rowLid && x.prefab);
+      const carrier = referenceRowAt(at.doc, sl.rowLid);
       if (!carrier) continue;
       // Not what this same Apply wrote there itself — at THIS slot: this row, this path (#1728).
       const whole = slotOf(at.doc, sl.rowLid, sl.path, w.lid, w.trait, '*');
@@ -1118,7 +1119,7 @@ async function planApply(
       const parts = splitNestedKey(x.key);
       let doc: PrefabFile | null | undefined = oldPrefab;
       for (const lid of parts ? memberPathSteps(parts.chain) : []) {
-        const r: PrefabEntity | undefined = typeof lid === 'number' ? doc?.entities.find((en) => en.localId === lid) : undefined;
+        const r: PrefabEntity | undefined = typeof lid === 'number' ? rowAt(doc, lid) : undefined;
         rows.push(r?.name ?? '?');
         doc = r?.prefab ? getCachedPrefabSync(r.prefab) : null;
       }

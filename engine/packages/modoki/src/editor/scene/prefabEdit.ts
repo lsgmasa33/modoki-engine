@@ -7,6 +7,7 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { onGuidRemap, remapGuidMapKeys } from '../../runtime/core/ecs/guidRemap';
 import type { Entity, World } from 'koota';
 import type { PrefabFile, PrefabEntity } from './prefab';
@@ -660,7 +661,7 @@ export function collectPreservedLocalIds(
     if (!guid.startsWith(PREFAB_EDIT_LOCAL_GUID_PREFIX)) {
       // A member ADDED in this session that an earlier save already wrote: the row it was written at (#1662).
       const at = saved?.get(guid);
-      const there = at ? current?.entities.find((e) => e.localId === at.localId) : undefined;
+      const there = at ? rowAt(current, at.localId) : undefined;
       if (at && entity.id() !== rootEcsId && (!there || there.nodeGuid === at.nodeGuid)) added.push([entity.id(), at.localId]);
       return;
     }
@@ -975,7 +976,8 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
         : `"${name}" is a pasted reference to the prefab ${missing}, which is missing or has no root, so this save cannot write it, and it exists only in this edit. Restore that prefab and save again, or delete "${name}" to save without it` };
     }
     const localId = preservedLocalIds.get(e.id());
-    const row = localId === undefined ? undefined : previous.entities.find((r) => r.localId === localId && r.prefab === ref.source);
+    const at = rowAt(previous, localId);
+    const row = at?.prefab === ref.source ? at : undefined;
     if (row) { unresolvedRows.set(e.id(), structuredClone(row)); continue; }
     // A COPY (a duplicate or a paste) has no row of its own in the file. Its record is the edit world's entry, which
     // names a member of this prefab by this edit's ids, not by a member token, wherever `editWorldRefs` rewrote one. So

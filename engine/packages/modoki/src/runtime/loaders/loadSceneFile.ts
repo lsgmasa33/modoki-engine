@@ -6,7 +6,7 @@ import { getCurrentWorld, spawnEntity, destroyEntity, indexEntityGuid, findEntit
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
-import { durableGuid, deriveMemberGuid, entityStep, isStoredRoot, isDerivedMember, parseSteps, memberPathSteps, type MemberPi } from '../core/assetRefRules';
+import { durableGuid, deriveMemberGuid, deriveMemberGuidAvoiding, entityStep, isStoredRoot, isDerivedMember, parseSteps, memberPathSteps, type MemberPi } from '../core/assetRefRules';
 import { deriveAuthoredEntityGuids } from './authoredEntityGuids';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
@@ -16,7 +16,7 @@ import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
   descendPathKeyed, nestedPathKey, mergeNestedStructurePaths,
-  descendStructureLayers, foldStructureLayers, type StructureLayer,
+  foldStructureLayers, foldRowStep, referenceRowAt, type StructureLayer, type FoldRow, type FoldDoc, type ForwardState,
   type NestedOverridePaths,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/version';
@@ -1327,7 +1327,7 @@ export function legacyPathReached(source: string, key: string, read: PrefabDocRe
   // A path key is row localIds, one per level (`nestedPathKey`), parsed by the one grammar owner.
   for (const step of parseSteps(key)) {
     const lid = typeof step === 'number' ? step : NaN;
-    const row = doc?.entities?.find((r) => (r.localId ?? 0) === lid && r.prefab);
+    const row = referenceRowAt(doc, lid);
     if (!row) return false;
     doc = read(row.prefab!) as { entities?: PrefabFileEntry[] } | null | undefined;
     // A child that loads but expands to no root reaches no frame either (#1768).
@@ -1378,6 +1378,47 @@ export type ReferenceNodeRows = [rootGuid: string, members: Record<string, Scene
  *  Collected from the DOCUMENT rather than at the spawn, because those spawns happen several frames
  *  down inside `applyStructureCore`'s ops and the node's own stored `guid` is a perfectly good handle
  *  to the root once it exists. */
+/** Every list of nodes that hangs INSIDE node `n`, in one order: its `added` (a reference node's legacy form), its
+ *  `children`, each `nestedStructure[*].added`, and each member row's `added` then `own` (Phase 4 and v17's rows form).
+ *  ⚠️ THE channel set (#1880 F3b): every walk of "the nodes inside a node" goes through this or {@link mapNodeChannels}, so
+ *  a channel added to the format is added here once. Three walks listed their own channels and disagreed (#1877 L4: a
+ *  kept reference node inside another was missed by a walk that took `children` alone). */
+export function nodeChannels(n: AddedEntity): AddedEntity[][] {
+  const out: AddedEntity[][] = [];
+  if (Array.isArray(n.added)) out.push(n.added);
+  if (Array.isArray(n.children)) out.push(n.children as AddedEntity[]);
+  for (const delta of Object.values(n.nestedStructure ?? {})) if (Array.isArray(delta?.added)) out.push(delta.added as AddedEntity[]);
+  for (const r of Object.values(n.members ?? {})) {
+    const row = r as { added?: unknown; own?: unknown } | null | undefined;
+    if (Array.isArray(row?.added)) out.push(row.added as AddedEntity[]);
+    if (Array.isArray(row?.own)) out.push(row.own as AddedEntity[]);
+  }
+  return out;
+}
+
+/** {@link nodeChannels}, rebuilding: `n` with each channel list replaced by `f(list)` (a list `f` returns unchanged is
+ *  kept by reference). A channel `n` does not have stays absent. */
+export function mapNodeChannels(n: AddedEntity, f: (list: AddedEntity[]) => AddedEntity[]): AddedEntity {
+  let node = n;
+  if (Array.isArray(n.added)) node = { ...node, added: f(n.added) };
+  if (Array.isArray(n.children)) node = { ...node, children: f(n.children as AddedEntity[]) as typeof n.children };
+  if (n.nestedStructure) {
+    node = { ...node, nestedStructure: Object.fromEntries(Object.entries(n.nestedStructure).map(([k, delta]) =>
+      [k, Array.isArray(delta?.added) ? { ...delta, added: f(delta.added as AddedEntity[]) } : delta])) as typeof n.nestedStructure };
+  }
+  if (n.members) {
+    node = { ...node, members: Object.fromEntries(Object.entries(n.members).map(([k, row]) => {
+      const r = row as SceneMemberRow & { added?: AddedEntity[]; own?: AddedEntity[] };
+      return [k, {
+        ...r,
+        ...(Array.isArray(r.added) ? { added: f(r.added) } : {}),
+        ...(Array.isArray(r.own) ? { own: f(r.own) } : {}),
+      }];
+    })) as typeof n.members };
+  }
+  return node;
+}
+
 export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[] = [], keyed?: ReferenceNodeRows[]): ReferenceNodeRows[] {
   if (!Array.isArray(nodes)) return out;
   for (const n of nodes as AddedEntity[]) {
@@ -1388,12 +1429,9 @@ export function collectReferenceNodeRows(nodes: unknown, out: ReferenceNodeRows[
     // A TEMPLATE reference node (#1542) stores no guid — its root derives one — so it is handed back by its KEY, for a
     // caller that can find its root once the derive has run (`keepTemplateNodeOrphans`).
     else if (n.prefab && n.key) keyed?.push([n.key, n.members ?? {}, n.prefab, n]);
-    collectReferenceNodeRows(n.added, out, keyed);
-    collectReferenceNodeRows(n.children, out, keyed);
-    for (const delta of Object.values(n.nestedStructure ?? {})) collectReferenceNodeRows(delta?.added, out, keyed);
-    // …and a member row's `added` (Phase 4, #1468): a reference node hanging under a member now
-    // rides on that member's row, and its own rows must be pinned exactly as before.
-    for (const r of Object.values(n.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), out, keyed);
+    // Every channel (`nodeChannels`) — a member row's `added` included (Phase 4, #1468): a reference node hanging under
+    // a member rides on that member's row, and its own rows must be pinned exactly as before.
+    for (const list of nodeChannels(n)) collectReferenceNodeRows(list, out, keyed);
   }
   return out;
 }
@@ -1512,32 +1550,27 @@ function applyStoredMemberRows(
   console.warn(`[loadSceneFile] ${count} member row${count === 1 ? '' : 's'} in instance ${rootGuid} name no node the template still declares: ${named}${count > 5 ? `, +${count - 5} more` : ''} — kept, in case the template edit is undone`);
 }
 
-/** The UNIQUENESS guard (#1468 Phase 2B): a guid a ROW pinned can be one another member
- *  DERIVES, and then two entities answer to one address — #1355's shape, which nothing in this
- *  format previously had any reason to check, because a member's guid was only ever derived and the
- *  derived set is internally collision-free (one hash per anchor+path).
+/** The UNIQUENESS guard (#1468 Phase 2B, direction reversed by #1882): two entities must never answer to one guid.
  *
- *  Reachable without anything being corrupt: a row pins member M to the guid it had at some earlier
- *  path, the template moves M, and whatever now occupies M's old path derives that same guid.
+ *  **A pin meeting a DERIVATION never reaches here** (#1882). Reachable without anything being corrupt: a row pins member
+ *  M to the guid it had at some earlier path, the template moves or renumbers it, and whatever now occupies M's old path
+ *  derives that same guid (#1882: Create Prefab kept B's P-era guid while renumbering it, and Q's new row derived it).
+ *  The derive steps around every guid an entity already holds (`deriveMemberGuidAvoiding`, in `deriveMemberGuidsOnly`),
+ *  so the NEW node takes a salted guid and the PIN keeps its address. Phase 2B made the pin yield instead, reasoning that
+ *  a de-derived member would be unaddressable; the salt answers that, and the pin yielding was the harm: the pin is the
+ *  identity the scene's refs and rows hold, so dropping it retargeted every ref to M onto the new node
+ *  (prefabSerialize.ts' Replace note; #1882's save pinned both, and this pass dropped both). Unity never retargets an
+ *  existing reference onto a new object.
  *
- *  **The PIN yields, not the derived member**, and that direction is the whole safety of this: an
- *  un-pinned member falls back to derivation, which is where it was before v16 and is addressable;
- *  a de-derived member would have no guid at all and become unaddressable, a failure v16 did not
- *  have. So this clears the pin and re-runs the derive, which fills exactly the guids it cleared.
+ *  **What is left is two PINS on one guid** — a damaged document, since no writer stores one guid twice. Both are equally
+ *  suspect, so both are dropped and re-derived (salting around everything still held), each reported loudly. The scene
+ *  keeps its rows, so the next save writes them back and the collision returns on every load until someone repairs the
+ *  document — the right behaviour (silently rewriting a row is how identity gets lost) and why it must be visible.
  *
- *  ⚠️ Reported per entity, and loudly. The scene keeps its row, so the next save writes it back and
- *  the collision returns on every load until someone repairs the document — which is the right
- *  behaviour (silently rewriting a row is how identity gets lost) and the reason it must be visible.
- *
- *  ⚠️ **Run to a FIXPOINT, because one pass can create the collision it is fixing.** The re-derive
- *  fills the cleared members with values that can themselves meet a pin that was not dropped: row
- *  `/gM` pins M to a guid K derives (M's pin goes), row `/gN` pins N to M's OWN derivation — which
- *  had one holder at scan time, so nothing was dropped there — and the re-derive then hands M that
- *  same guid. Two members, one address, no warning: the #1355 shape arriving through the guard.
- *  Raised as PLAUSIBLE by the Phase 2B close-out review, which could not build the two-pin fixture;
- *  I could, so it is CONFIRMED and pinned by a test that reddens on a single pass. It terminates
- *  because `cleared` only ever increments alongside `live.delete(id)` and the loop returns when a
- *  pass clears nothing, so `live` shrinks by at least one per pass and is bounded by `pinned`.
+ *  ⚠️ **Run to a FIXPOINT.** Built for Phase 2B's cascade, when a re-derive could hand a member the guid a second pin held.
+ *  The re-derive now salts around every held guid, so a second pass should find nothing, and the loop is kept as the
+ *  guard's own bound. It terminates because `cleared` only ever increments alongside `live.delete(id)` and the loop returns
+ *  when a pass clears nothing, so `live` shrinks by at least one per pass and is bounded by `pinned`.
  *
  *  ⚠️ **The re-derive here is the derive ALONE (`deriveMemberGuidsOnly`); the load settles tokens and moves
  *  once, after this returns (#1761).** Both drain their queues exactly once (`drainAfterDerive` does
@@ -1661,6 +1694,10 @@ function deriveMemberGuidsOnly(world: World, opts: IdentityOptions & { healOnly?
     return row;
   };
 
+  // Every guid an entity HOLDS before this pass (a pin, a stored root, any durable guid): a derivation never takes one
+  // (#1882, `deriveMemberGuidAvoiding`). Taken before the pass, so the answer does not depend on iteration order.
+  const holderOf = new Map<string, Row>();
+  for (const row of rows.values()) if (row.origGuid && !holderOf.has(row.origGuid)) holderOf.set(row.origGuid, row);
   // The guid each guid-less row derives ('' = unaddressable), memoised: a guid-less stored root is
   // resolved on demand when a member below it needs its guid as the anchor. `null` marks a row
   // in progress, so a parent cycle resolves to '' instead of recursing.
@@ -1686,7 +1723,14 @@ function deriveMemberGuidsOnly(world: World, opts: IdentityOptions & { healOnly?
       path.unshift(...cur.extra, cur.stepId);
       cur = place(rows.get(cur.parentId));
     }
-    const derived = anchor ? deriveMemberGuid(anchor, path) : ''; // no anchored ancestor → unaddressable
+    if (!anchor) { derivedOf.set(id, ''); return ''; } // no anchored ancestor → unaddressable
+    // Salted inside the memo, so a stored root's members anchor on the guid it actually takes.
+    const { guid: derived, salt } = deriveMemberGuidAvoiding(anchor, path, (g) => holderOf.has(g));
+    if (salt) {
+      const nameOf = (r: Row) => String((r.handle.get(attrMeta.trait) as { name?: unknown }).name ?? '?');
+      const plain = deriveMemberGuid(anchor, path);
+      console.warn(`[loadSceneFile] "${nameOf(row)}" derives guid ${plain}, which "${nameOf(holderOf.get(plain)!)}" already holds (a stored member row, or another identity) — "${nameOf(row)}" takes ${derived} instead and "${nameOf(holderOf.get(plain)!)}" keeps its guid; the next save stores it (#1882)`);
+    }
     derivedOf.set(id, derived);
     return derived;
   };
@@ -1947,6 +1991,10 @@ export interface PrefabExpansion {
   /** This instance's path from the TOP call's root, one segment per nesting level (#1352) — the recursion's. Absent on a
    *  top call, which registers its root for member-token resolution. Every value applied is rebased onto it. */
   segments?: MemberStep[][];
+  /** The recursion's (#1880 F2): the `overrides` and `structure` lists handed in are ALREADY this frame's fold — the
+   *  shared step `foldRowStep` ran it over `layers` — so the call folds nothing again, and these are what that fold
+   *  forwarded to this frame's nested roots. */
+  folded?: { forwardRoots: ForwardState<NestedStructureDelta, SceneMemberRow>['forwardRoots'] };
 }
 /** A document reader for the expansion: a prefab ref to its document, or nothing when it is not cached. */
 export type ExpansionReader = (ref: string) => TemplateDoc | null | undefined;
@@ -1985,11 +2033,17 @@ export function instantiatePrefabIntoWorld(
   // channels in the address space of the document it is expanding. A row names its member by minted
   // identity, so this is the moment a template renumber stops mattering: `prefab` is the CURRENT
   // document, whatever it was when the scene was saved. Every layer's rows fold, inner first (#1533).
-  const lower = { overrides, added: structure?.added, removed: structure?.removed, removedTraits: structure?.removedTraits };
-  const { channels: folded, forwardRoots } = foldStructureLayers(prefab, layers, _foldFrom, lower);
-  if (folded !== lower && structure) {
-    overrides = folded.overrides;
-    structure = { ...structure, added: folded.added, removed: folded.removed, removedTraits: folded.removedTraits };
+  // A nested row's frame arrives folded (`expand.folded`): the parent ran the shared step, `foldRowStep` (#1880 F2).
+  let forwardRoots: ForwardState<NestedStructureDelta, SceneMemberRow>['forwardRoots'];
+  if (expand.folded) forwardRoots = expand.folded.forwardRoots;
+  else {
+    const lower = { overrides, added: structure?.added, removed: structure?.removed, removedTraits: structure?.removedTraits };
+    const r = foldStructureLayers(prefab, layers, _foldFrom, lower);
+    forwardRoots = r.forwardRoots;
+    if (r.channels !== lower && structure) {
+      overrides = r.channels.overrides;
+      structure = { ...structure, added: r.channels.added, removed: r.channels.removed, removedTraits: r.channels.removedTraits };
+    }
   }
   // The keys this document declares are the candidates a later heal of this world tries (#1426).
   noteTemplateDoc(world, prefab as Parameters<typeof noteTemplateDoc>[1]);
@@ -2025,44 +2079,32 @@ export function instantiatePrefabIntoWorld(
       const child = read(entry.prefab) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
       const rowLocalId = entry.localId ?? 0;
       if (!child) { console.warn(`[loadSceneFile] nested prefab not cached: ${entry.prefab}`); if (rowLocalId) unexpanded.push(rowLocalId); continue; }
-      // Overrides an OUTER layer addressed at this nested row: `direct` hits this
-      // child's own members (merged over the row's own overrides — outer wins);
-      // `forward` reaches deeper and is threaded into the child's expansion. The
-      // row may ALSO carry its own deep overrides, which the outer layer wins over.
-      const { direct: outerDirect, forward: outerForward } = descendNestedOverrides(nestedOverrides, rowLocalId);
-      const childOverrides = outerDirect ? mergeOverrideMaps(entry.overrides, outerDirect) : entry.overrides;
-      const childNested = mergeNestedOverridePaths(entry.nestedOverrides, outerForward);
-      // The same split for the STRUCTURAL channel (#1358): `structDirect` is what the outer layer
-      // edited INSIDE this row's own expansion, `structForward` reaches deeper. The outer layer's
-      // structure REPLACES the row's per-field lists rather than merging element-wise — a scene that
-      // deleted a member of this expansion is stating the whole list for that instance, and merging
-      // two `removed` arrays would make an un-delete unrepresentable.
-      // Per LAYER since #1533: the row's own (`nestedStructure`, `members`) joins the ones reaching this frame,
-      // innermost, and `structDirect` is the slot of the outermost layer that addresses the row.
-      const { layers: childLayers, direct: structDirect, foldFrom } = descendStructureLayers(layers, entry, forwardRoots);
+      // ONE step of the shared fold (#1880 F2, `foldRowStep`, the step the effective base and the validator walk): the
+      // layers reaching this frame (the row's own innermost, each outer one descended), an outer slot OWNING the three
+      // lists when one addresses this path (all three from it, an absent one read as EMPTY — per-field fallback made "the
+      // row's own list no longer applies" unrepresentable), and every layer's member rows and legacy values folded over
+      // them, inner first. The child call takes the result and folds nothing again (`expand.folded`).
+      const step = foldRowStep(
+        entry as unknown as FoldRow<AddedEntity, NestedStructureDelta, SceneMemberRow>,
+        { layers, forwardRoots },
+        child as unknown as FoldDoc<AddedEntity, NestedStructureDelta, SceneMemberRow>,
+      );
+      const forward = step.forward!;
       const { forward: outerStructForward } = descendPathKeyed(nestedStructure, rowLocalId);
       // The row's OWN deep structure (#1381) sits under what the outer layer forwarded — outer wins per path.
       // Kept beside the layers for what reads the merged view (token noting); the layers are what apply.
       const structForward = mergeNestedStructurePaths(entry.nestedStructure, outerStructForward);
       // This row's own frame, one component down the identity chain (Phase 3, #1468) — the OUTERMOST layer's
       // rows, which `applyStructureCore` reads for moves (a template's rows carry none).
-      const childMembers = childLayers[childLayers.length - 1]!.rows;
+      // ⚠️ `members` rides ALONGSIDE the slot's ownership rule, never inside it: an outer layer owning this row's three
+      // structural lists says nothing about identity, and a slot that omitted the rows would drop every stored guid.
+      const childMembers = forward.layers[forward.layers.length - 1]!.rows;
       const childRoot = instantiatePrefabIntoWorld(
-        world, child, 0, undefined, entry.prefab, childOverrides,
-        // Once an outer layer addresses this path it OWNS the interior: all three lists come from
-        // it, with an absent one read as EMPTY rather than falling back to the row. Per-field
-        // fallback made "the row's own list no longer applies" unrepresentable — a scene that
-        // deleted the last member of a row-authored `added` wrote nothing for it and the member came
-        // back on the next load.
-        // ⚠️ `members` rides ALONGSIDE that ownership rule, never inside it: an outer layer owning
-        // this row's three structural lists says nothing about identity, and a `structDirect` that
-        // omitted the rows would drop every stored guid inside this expansion.
-        structDirect
-          ? { added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {}, moved: structDirect.moved, members: childMembers }
-          : { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, members: childMembers },
-        stack, childNested,
+        world, child, 0, undefined, entry.prefab, step.channels.overrides,
+        { added: step.channels.added, removed: step.channels.removed, removedTraits: step.channels.removedTraits, ...(step.moved ? { moved: step.moved } : {}), members: childMembers },
+        stack, undefined,
         structForward,
-        { read, segments: [...segments, rowPathInPrefab(prefab, rowLocalId)], layers: childLayers, foldFrom },
+        { read, segments: [...segments, rowPathInPrefab(prefab, rowLocalId)], layers: forward.layers, folded: { forwardRoots: forward.forwardRoots } },
       );
       // Stamp parentLocalId so a later serialize knows which row produced this
       // instance (and can store/restore its scene-level overrides).

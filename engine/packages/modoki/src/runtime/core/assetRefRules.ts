@@ -223,6 +223,37 @@ export function deriveMemberGuid(anchor: string, path: readonly MemberStep[]): s
   return deriveGuid(`${anchor}|${path.join('.')}`);
 }
 
+/** {@link deriveMemberGuid}, unless another entity already HOLDS that guid (#1882): then the first salted seed no one holds,
+ *  `anchor|path#1`, `#2`, …. The holder is a PIN (a guid the scene's rows stored, applied before the derive) or any other
+ *  durable guid; the derivation is a node nothing references yet, so IT yields. The pin yielding instead retargeted
+ *  every ref to the pinned member onto the new node (prefabSerialize.ts' Replace note, #1882's B and N956).
+ *  Deterministic given what is held, so a reload and a rebuild agree, and the next save pins the salted guid as a row.
+ *  `#` is in no step's grammar ({@link parseStep}), so no salted seed equals an unsalted one. ⚠️ The one spelling:
+ *  `deriveMemberGuidsOnly` is its only caller, so every derive (load, rebuild, instantiate) salts the same way. */
+export function deriveMemberGuidAvoiding(anchor: string, path: readonly MemberStep[], held: (guid: string) => boolean): { guid: string; salt: number } {
+  const plain = deriveMemberGuid(anchor, path);
+  if (!held(plain)) return { guid: plain, salt: 0 };
+  for (let salt = 1; ; salt++) {
+    const guid = saltedMemberGuid(anchor, path, salt);
+    if (!held(guid)) return { guid, salt };
+  }
+}
+
+function saltedMemberGuid(anchor: string, path: readonly MemberStep[], salt: number): string {
+  return deriveGuid(`${anchor}|${path.join('.')}#${salt}`);
+}
+
+/** Whether `guid` is what a member at `path` below `anchor` DERIVES: its plain derivation or a salted one
+ *  ({@link deriveMemberGuidAvoiding}). For a site that asks "derived or stored?" of a guid it did not derive itself —
+ *  key recovery, the stored-guid compare — without the holders the derive saw. Salts past the bound are not recognised:
+ *  one needs that many guids already held on one path's chain. */
+export function isMemberDerivation(guid: string, anchor: string, path: readonly MemberStep[]): boolean {
+  if (guid === deriveMemberGuid(anchor, path)) return true;
+  for (let salt = 1; salt <= RECOGNISED_SALTS; salt++) if (guid === saltedMemberGuid(anchor, path, salt)) return true;
+  return false;
+}
+const RECOGNISED_SALTS = 8;
+
 /** A template-keyed added node's step in {@link deriveMemberGuid}'s path (#1387; see
  *  `templateIdentity.ts`). The `+` keeps it disjoint from every numeric localId step, which is what
  *  leaves every existing derived guid unchanged. */

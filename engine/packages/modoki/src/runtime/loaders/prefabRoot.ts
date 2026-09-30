@@ -1,4 +1,5 @@
 import { prefabContainsItself, type NestingReader } from './prefabNesting';
+import { rowAt } from '../core/prefabRowAt';
 
 /** Whether a prefab document expands to a ROOT (#1768). A document that loads but yields no root — its `rootLocalId`
  *  names no row, or names a reference row whose prefab cannot be read, or one that nests itself — cannot be expanded,
@@ -26,7 +27,7 @@ type RootDoc = { id?: string; rootLocalId?: number; entities?: ReadonlyArray<{ l
 
 const rootRowOf = (doc: RootDoc) => {
   const rid = doc.rootLocalId ?? 1;
-  return (doc.entities ?? []).find((e) => (e.localId ?? 0) === rid);
+  return rowAt(doc, rid);
 };
 
 /** `doc` expands to a root, reading a reference root's prefab through `read`. `stack` holds the documents already

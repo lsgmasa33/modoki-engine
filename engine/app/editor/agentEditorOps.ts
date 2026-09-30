@@ -3332,7 +3332,7 @@ export function registerEditorAgentOps(): void {
       pushAction(makePrefabInstantiateAction({
         label: `Instantiate "${(prefab as PrefabFile).name ?? path}"`,
         initialId: rootId,
-        respawn: async () => {
+        respawn: async (rootGuid) => {
           // By the document's guid (a Rename is not undoable, #1868 D2), as the human's placement does.
           const at = placedPrefabPath((prefab as PrefabFile).id, path);
           const readAgain = capturePrefabRead(at);
@@ -3341,7 +3341,7 @@ export function registerEditorAgentOps(): void {
           const other = placedPrefabRefusal((prefab as PrefabFile).id, again as PrefabFile, at);
           if (other) throw other;
           // Required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses the redo.
-          const id = await instantiatePrefabInstance(again as PrefabFile, at, parentRef ? () => parentRef.require() : 0, readAgain);
+          const id = await instantiatePrefabInstance(again as PrefabFile, at, parentRef ? () => parentRef.require() : 0, readAgain, rootGuid);
           return id;
         },
         remove: (id) => { deleteEntity(id); },

@@ -332,11 +332,18 @@ Operate on the deep-cloned `newPrefab`:
   large scale on one axis does not hide a change on another.
   (Before #1498 the save subtracted by key, and an edit to ANY rotation component of such a member was
   dropped.)
-  **Rotation is one value at CAPTURE, and the live override marks can be narrower until the next save**
-  (#1877 L3, seed 6141; hub ruling: recorded, not fixed). Marks one axis, say `rx`; once the chain states a
-  rotation for that member (another instance's Apply wrote one), the save writes all three and the reload marks
-  all three. The pose is the same and nothing is lost. A whole-rotation override is Unity's shape too (one
-  quaternion).
+  **Rotation is ONE override, at every depth and in the marks** (#1880 F5, owner-approved with the #1880 plan, the
+  Unity way; it closes #1877 L3, hunt seed 6141). A mark on any of `Transform.rx/ry/rz` is a mark on all three
+  (`ROTATION_MARKS` in `runtime/loaders/overrideMarks.ts`, the one store every mark goes through: an edit, the
+  reparent's compensation, the load's seeding, a restore), and `reconcileOverrideMarks` decides the three as one.
+  The top-level and nested captures save what is marked, so both save the rotation whole. Unity:
+  `TransformRotationGUI` writes `m_Rotation.quaternionValue = Quaternion.Euler(x, y, z)` even when only X changed
+  (UnityCsReference, `Editor/Mono/Inspector/TransformRotationGUI.cs`), and the manual's prefab YAML example lists
+  "the other rotation components" beside the one it shows. **This changes top-level behaviour:** an instance that
+  turned one axis now pins its whole rotation, so a later template edit of another axis no longer reaches it.
+  A scene saved per axis before this gains the other two axes' marks at load and writes them at its next save.
+  Before, the live marks could be narrower than the save (one axis marked; all three saved once the chain stated a
+  rotation), and the reload marked all three.
 
 The live instance's applied **added** entities are deleted from the live world
 before refresh (so the re-instantiated prefab member replaces them rather than
@@ -1425,17 +1432,22 @@ without a word, and the writer's re-emit had nothing to read.
   A node is a scene node when anything in its SUBTREE holds a guid: a node with a runtime guid is captured
   `guid: ''` and its durable child would otherwise pass through. A scene REFERENCE node keeps its own
   rows, converted the same way, since its rows are keyed as a template's are.
-- **The settle drops a node the re-apply re-homed (`unhomed`).** A kept row's nodes that the re-apply
-  re-anchored to the instance root (an addition whose member the template dropped) are live there and
-  saved there, so a restore of the member must not spawn them again (review F1). A durable guid says so
-  directly. A node with a RUNTIME guid is captured `guid: ''`, so it matched nothing, and the restore
-  spawned it again with its durable child, two entities sharing one guid (#1568). For a guid-less node the
-  re-apply's own rule answers instead: a node on a MEMBER row whose frame is live was re-anchored to that
-  frame's root. A NODE row's (`a+<key>`) nodes went with their template node and are not re-homed.
+- **What the scene hung under a member the template drops VANISHES with it, in the rebuild as at load (#1880 F3a,
+  hub ruling B′, 2026-09-30).** R2 / fork 2 (owner, 2026-09-24) keeps such a member's row, `added`/`own` included,
+  and a template that brings the member back brings them back. The rebuild used to RE-HOME them instead: the respawn
+  re-anchored an addition whose member the template dropped at the instance root (`applyStructureCore`'s "anchor
+  missing" rule), and the settle then stripped them from the kept row (review F1, and for a runtime-guid node #1568
+  C2, a session design). A reload of the same scene kept them in the row, so a rebuild and a reload disagreed (hunt
+  seed 1127, T2). Now the respawn leaves them out (`withoutGoneMemberNodes`: an addition anchored at a KEYED member the
+  new document no longer has, only while the settle is active, `rowsSettleActive`, so nothing is dropped that no row
+  keeps), the row keeps them, and a restore of the member — a Refresh or an undo — spawns them EXACTLY once, guid and
+  key intact (#1568 C2's duplicate stays fixed: there is no live copy to duplicate). The settle still leaves out a
+  row's node that is live anyway. A pre-v5 member writes no row, so its additions keep the root as their home. Hub's
+  first ruling (A, re-anchor to the frame root) was retracted the same day: it reversed fork 2.
 - **A rebuild carries every torn-down node's key (#1567).** `rebuildInstance` respawns from a scene-form
   capture, which holds a node's guid and never its key, and only a guid DERIVED from the key can recover
   it. So a node whose guid is not derived — a reference node the user dropped this session (a v4 guid),
-  or a node the re-apply re-homed (its derivation path changed) — came back unkeyed. The next template
+  or (before #1880 F3a) a node the re-apply re-homed — came back unkeyed. The next template
   save minted it a new key, which re-keyed every member guid under it in every scene instance, and the
   next Refresh's settle gate read the node as no template node, so its kept rows minted a new key on
   every save. The rebuild now reads each torn-down entity's key MARKER by guid before the teardown

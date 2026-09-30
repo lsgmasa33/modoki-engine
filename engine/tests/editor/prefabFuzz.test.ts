@@ -78,7 +78,7 @@ import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, 
 import { KNOWN_OPEN, REGRESSIONS } from './prefabFuzz/knownOpen';
 import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { setRunMode } from '@modoki/engine/runtime';
+import { setRunMode, getAllEntities } from '@modoki/engine/runtime';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -321,6 +321,17 @@ describe('#1789 prefab fuzz', () => {
       expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
     }, 60_000);
   }
+
+  // #1880 F3a (hub ruling B′, R2 / fork 2): 1127's P instance vanishes with M at the Apply (the regression above holds
+  // that half through T2, rebuild ≡ reload), and an UNDO of that Apply brings it back EXACTLY once — not lost, not twice
+  // (#1568 C2's duplicate). Its root guid is seeded per run (`installSeededUuids`), so it is found by that. Mutation:
+  // re-anchor in the respawn (skip `withoutGoneMemberNodes`) — the undo's rebase spawns it beside the re-homed copy (I7).
+  it('regression #1880: 1127 + an undo of its Apply — the P instance dropped with M comes back once', async () => {
+    const repro = [...REGRESSIONS.find((r) => r.issue === 1880 && r.what.startsWith('hunt seed 1127'))!.repro, { kind: 'undo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] }] as typeof REGRESSIONS[number]['repro'];
+    const res = await runOps(be, repro, OPTS);
+    expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
+    expect(getAllEntities().filter((e) => e.guid?.startsWith('1000000d-') && e.name === 'R')).toHaveLength(1);
+  }, 60_000);
 
   // #1835: the one real window the renderer's manifest has — a route whose inline rebuild THROWS replies
   // `manifestRebuilt: false`, and the move lands before any push. #1828's drop redo must still tag by the document's guid

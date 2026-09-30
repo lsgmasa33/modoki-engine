@@ -10,6 +10,7 @@
  *  row's `overrides` (the frame the row expands), its `nestedOverrides[path]` (a frame deeper down), and a member row
  *  in its `members` (v6 rows, folded over both — `foldStructureLayers`). */
 
+import { referenceRowAt, rowAt } from '../../runtime/loaders/prefabOverrides';
 import type { FrameBase } from './prefabBase';
 import type { PrefabFile, PrefabEntity } from './prefab';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -42,7 +43,7 @@ export function chainSlots(base: FrameBase): LevelSlot[] {
       const step = levels[i]!.step;
       if (step.kind !== 'row') { guids = null; break; }
       path.push(step.row);
-      const g = levels[i - 1]!.doc?.entities.find((e) => e.localId === step.row)?.nodeGuid;
+      const g = rowAt(levels[i - 1]!.doc, step.row)?.nodeGuid;
       if (g && guids) guids.push(g);
       else guids = null;
     }
@@ -62,7 +63,7 @@ export function nodeSlot(base: FrameBase): { path: number[]; pathGuids: string[]
     const step = levels[i]!.step;
     if (step.kind !== 'row') { guids = null; break; }
     path.push(step.row);
-    const g = levels[i - 1]!.doc?.entities.find((e) => e.localId === step.row)?.nodeGuid;
+    const g = rowAt(levels[i - 1]!.doc, step.row)?.nodeGuid;
     if (g && guids) guids.push(g);
     else guids = null;
   }
@@ -76,7 +77,7 @@ export function nodeSlot(base: FrameBase): { path: number[]; pathGuids: string[]
 export function memberKeyAt(slot: Pick<LevelSlot, 'pathGuids'>, frameDoc: PrefabFile, lid: number): string | null {
   if (!slot.pathGuids) return null;
   if (lid === (frameDoc.rootLocalId ?? 1)) return slot.pathGuids.length ? `/${slot.pathGuids.join('/')}` : null;
-  const g = frameDoc.entities.find((e) => e.localId === lid)?.nodeGuid;
+  const g = rowAt(frameDoc, lid)?.nodeGuid;
   return g ? `/${[...slot.pathGuids, g].join('/')}` : null;
 }
 
@@ -222,14 +223,14 @@ export function addedNodeRefusal(slot: LevelSlot, frameDoc: PrefabFile, node: Ad
  *  (and, `inclusive`, level `level` itself)? A field written at a level that already gives the member the component is an
  *  edit of it; one written where nothing does ADDS it, whole. */
 export function traitInside(slots: readonly LevelSlot[], base: FrameBase, frameDoc: PrefabFile, level: number, lid: number, trait: string, inclusive = false): boolean {
-  const row = frameDoc.entities.find((e) => e.localId === lid);
+  const row = rowAt(frameDoc, lid);
   if (row && row.traits[trait] !== undefined) return true;
   return slots.some((s) => (inclusive ? s.level >= level : s.level > level) && !!statedFields(carrierOf(base, s)!, s.path, memberKeyAt(s, frameDoc, lid), lid, trait));
 }
 
 /** The row slot `s` names, read from the chain's documents (never written through). */
 export function carrierOf(base: FrameBase, s: LevelSlot): PrefabEntity | undefined {
-  return base.levels[s.level]?.doc?.entities.find((e) => e.localId === s.rowLid && e.prefab);
+  return referenceRowAt(base.levels[s.level]?.doc, s.rowLid);
 }
 
 /** The level a key goes to when the caller names none (owner ruling (a), 2026-09-28): the frame's own template —
@@ -243,7 +244,7 @@ export function defaultKeyLevel(base: FrameBase, slots: readonly LevelSlot[], fr
   if (kind !== 'field' && kind !== 'removedTrait') return n;
   const parts = key.split('.');
   const [lid, trait] = kind === 'field' ? [Number(parts[0]), parts[1]!] : [Number(parts[1]), parts[2]!];
-  if (frameDoc.entities.find((e) => e.localId === lid)?.traits[trait] !== undefined) return n;
+  if (rowAt(frameDoc, lid)?.traits[trait] !== undefined) return n;
   for (let i = slots.length - 1; i >= 0; i--) {
     const s = slots[i]!;
     if (statedFields(carrierOf(base, s)!, s.path, memberKeyAt(s, frameDoc, lid), lid, trait)) return s.level;
@@ -264,7 +265,7 @@ export function resolveKeyLevel(
   if (level === n) {
     if (key.startsWith('-trait.')) {
       const [, lidStr, trait] = key.split('.');
-      const row = frameDoc.entities.find((e) => e.localId === Number(lidStr));
+      const row = rowAt(frameDoc, Number(lidStr));
       if (row && row.traits[trait!] === undefined) return { skip: `Prefab '${frameDoc.name}' has no ${trait} on that member to remove — the prefab that adds it can stop adding it` };
     }
     return n;

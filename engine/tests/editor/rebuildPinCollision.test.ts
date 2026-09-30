@@ -20,7 +20,8 @@ import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
 import { captureInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabCapture';
-import { rebuildInstance } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { rebuildInstance, refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -85,15 +86,14 @@ const targetOf = (name: string) => ((readTraitData(named(name)[0]!.id, getTraitB
 beforeEach(() => { setRunMode('stopped'); clearHistory(); prefabs.clear(); clearKeptMemberOrphans(); });
 afterAll(() => { setPrefabCache(P, null); getCurrentWorld()?.destroy(); });
 
-/** #1777: a rebuild pins the member guids it carried across its teardown, then derives the rest — with no collision guard,
- *  where the load has `dropCollidingPins`. Here M's stored row pins it to the guid the EDITED template's derivation hands
- *  the new member N (M once derived at that path: a renumber made it reachable). Before the fix two entities held one guid
- *  after the Refresh and nothing reported it. X's `@member:2` token must name M by the guid M ends up with: settled before
- *  the drop, it kept the dropped pin, which N holds (#1761's shape through the rebuild). Now the rebuild runs the load's sequence, so the pin yields exactly as a reload's
- *  would. Mutations: derive with an empty pinned set in `rebuildInstance` (the guard never sees the pin); settle before the
- *  drop in `deriveMemberGuidsAfterPins` (the token keeps N's guid) — each goes red. */
-describe('a rebuild drops a restored pin that collides with a new derivation (#1777)', () => {
-  it('no two entities share a guid, the drop is reported, and a token names the member by its final guid', async () => {
+/** #1777: a rebuild pins the member guids it carried across its teardown, then derives the rest, as the load does. Here
+ *  M's stored row pins it to the guid the EDITED template's derivation hands the new member N (M once derived at that
+ *  path: a renumber made it reachable). Before #1777 two entities held one guid after the Refresh and nothing reported it.
+ *  Since #1882 the DERIVATION yields: N takes a salted guid, M keeps its pin (the identity the scene's refs hold), and X's
+ *  `@member:2` token names M. Mutation: restore the carried members AFTER the derive in `rebuildInstance` — N derives the
+ *  pinned guid first, and M's restore lands on it: two holders. */
+describe('a rebuild never lets a new derivation take a restored pin (#1777, #1882)', () => {
+  it('no two entities share a guid, M keeps its pin, N salts and it is reported, and a token names M', async () => {
     const collide = deriveMemberGuid(INST, [3]); // what N derives under the edited template
     install(before());
     await load({
@@ -106,23 +106,28 @@ describe('a rebuild drops a restored pin that collides with a new derivation (#1
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       rebuildInstance(getAllEntities().find((e) => e.guid === INST)!.id, P, after() as unknown as PrefabFile, {}, {}, before() as unknown as PrefabFile);
-      expect(warn.mock.calls.some((c) => String(c[0]).includes(`stored member row pins guid ${collide}`))).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes(`derives guid ${collide}, which "M" already holds`))).toBe(true);
     } finally { warn.mockRestore(); }
 
     expect(sharedGuids()).toEqual([]);
-    expect(guidOf('N')).toBe(collide);
-    expect(guidOf('M')).toBeTruthy();
+    expect(guidOf('M')).toBe(collide);
+    expect(guidOf('N')).toBeTruthy();
+    expect(guidOf('N')).not.toBe(collide);
     expect(targetOf('X')).toBe(guidOf('M'));
   });
 });
 
 /** The rebuild's two OTHER pin sites (#1777 close-out review: deleting either left every test green). Each pins a guid the
- *  edited template derives for a new member N at localId 3, so the pin must yield exactly as the carried member's does.
+ *  edited template derives for a new member N at localId 3; since #1882 the pin stays and N salts, as with the carried
+ *  member. What each site must do is land its pin BEFORE the derive:
  *  - A user-added REFERENCE node inside the instance stores its members' rows on the node (#1482); the rebuild respawns
- *    the node and restores those rows. Mutation: drop `pinned` from that `restoreInstanceMembers` call.
+ *    the node and restores those rows. Mutation: restore the reference-node rows after the derive.
  *  - A row the load KEPT as an orphan (its node was gone from the template) is replayed live when the edited template
- *    brings the node back (#1535). Mutation: drop `pinned` from `settleKeptOrphans`. */
-describe('a rebuild drops a colliding pin from every site it pins (#1777 close-out)', () => {
+ *    brings the node back (#1535). ⚠️ This case pins the OUTCOME, not `settleKeptOrphans`: for a top-level instance the
+ *    carried members (`captureInstanceMembers` writes kept orphans back) land the same pin before the derive, so moving
+ *    `settleKeptOrphans` after the derive stays green (measured, #1882). Its own reach is a nested frame's OUTER orphan
+ *    rows (`rowWritingRoot`), not built here. */
+describe('a rebuild lands every pin it restores before the derive, so a new derivation salts around it (#1777 close-out, #1882)', () => {
   const P2 = 'cccccccc-0000-4000-8000-000000001778';
   const gLR = 'eeeeeeee-0000-4000-8000-000000001775';
   const gLK = 'eeeeeeee-0000-4000-8000-000000001776';
@@ -157,9 +162,10 @@ describe('a rebuild drops a colliding pin from every site it pins (#1777 close-o
 
     const warned = rebuildOnto(withN());
 
-    expect(warned.some((w) => w.includes(`stored member row pins guid ${collide}`))).toBe(true);
+    expect(warned.some((w) => w.includes(`derives guid ${collide}, which "LK" already holds`))).toBe(true);
     expect(sharedGuids()).toEqual([]);
-    expect(guidOf('N')).toBe(collide);
+    expect(guidOf('LK')).toBe(collide);
+    expect(guidOf('N')).not.toBe(collide);
   });
 
   it('a kept orphan row the edited template backs again', async () => {
@@ -174,9 +180,70 @@ describe('a rebuild drops a colliding pin from every site it pins (#1777 close-o
 
     const warned = rebuildOnto(withN([row(4, 'O', 1, gOrphan)]));
 
-    expect(guidOf('O') === collide || guidOf('N') === collide, 'fixture: the replay pinned O to what N derives').toBe(true);
-    expect(warned.some((w) => w.includes(`stored member row pins guid ${collide}`))).toBe(true);
+    expect(warned.some((w) => w.includes(`derives guid ${collide}, which "O" already holds`))).toBe(true);
     expect(sharedGuids()).toEqual([]);
-    expect(guidOf('N')).toBe(collide);
+    expect(guidOf('O'), 'the replayed pin keeps its guid').toBe(collide);
+    expect(guidOf('N')).not.toBe(collide);
+  });
+});
+
+/** #1882, hunt seed 1044's shape: a NESTED frame is rebuilt (an Apply to Q refreshes every Q frame) while a pin of the
+ *  OUTER frame holds the guid a new member of the nested one derives. R was made by Create Prefab from a P instance before
+ *  #1882 M2 (a), so R numbers its rows by position (QR=2, A=3, B=4) while B keeps the guid it derived under P's numbering,
+ *  INST|2.3 — exactly what Q's new row 3 derives under R's nested Q at step 2. The nested rebuild's own pins were the only
+ *  ones its collision pass saw, so two entities shared B's guid (I7); a save then pinned both, the load dropped both, and
+ *  every ref to B retargeted onto N. Since #1882 the derivation yields in every derive (load and rebuild alike), so:
+ *  B keeps its guid and its refs, and N takes ONE salted guid — live after the rebuild, after a reload of the scene as it
+ *  was, and after a save → reload that pins it. Mutation: return the plain derivation from `deriveMemberGuidAvoiding` —
+ *  B and N share a guid after the rebuild. */
+describe('a nested frame\'s new member never takes an OUTER frame\'s pin (#1882)', () => {
+  const Q = 'cccccccc-0000-4000-8000-000000188211';
+  const R = 'cccccccc-0000-4000-8000-000000188212';
+  const INST_R = 'dddddddd-0000-4000-8000-000000188212';
+  const HOLDER = 'dddddddd-0000-4000-8000-000000188213';
+  const n = (k: number) => `eeeeeeee-0000-4000-8000-0000001882${String(k).padStart(2, '0')}`;
+  const qV1 = () => ({ id: Q, version: 6, name: 'Q', rootLocalId: 1, entities: [row(1, 'QR', 0, n(11)), row(2, 'M', 1, n(12))] });
+  const qV2 = () => ({ id: Q, version: 6, name: 'Q', rootLocalId: 1, nextLocalId: 4, entities: [row(1, 'QR', 0, n(11)), row(2, 'M', 1, n(12)), row(3, 'N956', 1, n(13))] });
+  const rDoc = () => ({ id: R, version: 6, name: 'R', rootLocalId: 1, nextLocalId: 5, entities: [
+    row(1, 'R', 0, n(1)), { ...row(2, 'QR', 1, n(2)), prefab: Q }, row(3, 'A', 1, n(3)), row(4, 'B', 3, n(4)),
+  ] });
+  /** The scene: R's instance with B pinned at its P-era guid, and a plain entity whose action targets B. */
+  const scene = (bGuid: string) => ({ id: 's1882', version: 18, name: 'S', resources: [], entities: [
+    { id: 1, prefab: R, guid: INST_R, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } }, members: { [`/${n(4)}`]: { guid: bGuid, name: 'B' } } },
+    { id: 2, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER }, UIAction: { bindings: [{ event: 'click', kind: 'call', action: 'noop', target: bGuid }] } } },
+  ] } as unknown as SceneData);
+
+  it('B keeps its guid and its refs; N takes one salted guid, live, after a reload, and after save → reload', async () => {
+    const pinB = deriveMemberGuid(INST_R, [2, 3]); // B's P-era guid = what N956 derives under R's nested Q
+    install(qV1()); install(rDoc());
+    await load(scene(pinB));
+    expect(guidOf('B'), 'fixture: the row pins B').toBe(pinB);
+    expect(named('N956'), 'fixture: Q has no N956 yet').toHaveLength(0);
+
+    // The Apply's refresh of every Q frame: R's nested QR, rebuilt onto Q with row 3.
+    install(qV2());
+    const nested = getAllEntities().find((e) => e.name === 'QR' && e.parentId === getAllEntities().find((x) => x.guid === INST_R)!.id)!.id;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      refreshInstances(Q, [nested], qV1() as unknown as PrefabFile, qV2() as unknown as PrefabFile);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes(`derives guid ${pinB}, which "B" already holds`))).toBe(true);
+    } finally { warn.mockRestore(); }
+    expect(sharedGuids()).toEqual([]);
+    expect(guidOf('B')).toBe(pinB);
+    expect(targetOf('Holder')).toBe(pinB);
+    const salted = guidOf('N956');
+    expect(salted).not.toBe(pinB);
+
+    // A reload of the scene as it was saved BEFORE the Apply: the load salts the same way.
+    const quiet = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await load(scene(pinB));
+      expect([guidOf('B'), guidOf('N956'), targetOf('Holder')]).toEqual([pinB, salted, pinB]);
+      // …and a save → reload, which pins N956's salted guid as a row.
+      const saved = await serializeScene();
+      await load(saved as unknown as SceneData);
+    } finally { quiet.mockRestore(); }
+    expect(sharedGuids()).toEqual([]);
+    expect([guidOf('B'), guidOf('N956'), targetOf('Holder')]).toEqual([pinB, salted, pinB]);
   });
 });

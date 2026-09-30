@@ -9,9 +9,9 @@
  *  died; the document makes both unnecessary. */
 
 import type { Entity, World } from 'koota';
-import { getCurrentWorld, indexEntityGuid } from './world';
+import { getCurrentWorld, indexEntityGuid, findEntityByGuid } from './world';
 import { getAllTraits, getTraitByName } from './traitRegistry';
-import { deriveMemberGuid, remapGuidValues, durableGuid, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, type MemberStep, type MemberPi } from '../assetRefRules';
+import { deriveMemberGuidAvoiding, remapGuidValues, durableGuid, memberPathSteps, entityStep, isStoredRoot, isOwnedRoot, type MemberStep, type MemberPi } from '../assetRefRules';
 import { templateKeyOf } from '../templateIdentity';
 import { memberRowsToWrite } from './memberRows';
 import { notifyGuidRemap } from './guidRemap';
@@ -255,6 +255,12 @@ export function applyGuidRemap(remap: ReadonlyMap<string, string>, world: World 
   notifyGuidRemap(remap, world);
 }
 
+/** Whether an entity other than `self` holds `guid`: what the load's derive steps around (`deriveMemberGuidAvoiding`). */
+function heldByOther(world: World, guid: string, self: Entity): boolean {
+  const holder = findEntityByGuid(guid, world);
+  return !!holder && holder !== self;
+}
+
 /** Every entity below the frame root `rootEcsId` whose guid a RELOAD derives, with the guid it derives from `anchor`
  *  (the root's guid) — the loader's coverage (`deriveMemberGuidsOnly`), walked down the identity tree instead of up.
  *  A member the next save writes a ROW for is left out: the reload pins the guid it already has (`memberRowsToWrite`,
@@ -282,7 +288,8 @@ export function reloadDerivedGuids(
       if (!key || !e) continue; // the root itself, and a step two siblings share
       const stored = isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id());
       if (stored && !templateKeyOf(e)) continue; // a stored guid: the save writes it
-      const guid = deriveMemberGuid(from, memberPathSteps(key));
+      // Around a guid another entity holds, as the load's derive (#1882): a reload salts past a pin.
+      const guid = deriveMemberGuidAvoiding(from, memberPathSteps(key), (g) => heldByOther(world, g, e)).guid;
       if (opts.withRowed || !rowed.has(e.id())) out.set(e, guid);
       if (stored && depth < 64) walk(e.id(), guid, depth + 1);
     }
@@ -439,7 +446,7 @@ export function promoteOwnedRoots(roots: Iterable<number>, world: World = getCur
       if (isStoredRoot(e.has(piMeta.trait) ? (e.get(piMeta.trait) as MemberPi) : null, e.id())) continue; // a stored root keeps its stored guid
       if (keyed.has(e.id())) continue; // a stored row states its guid — see the docblock
       const old = guidOf(e);
-      const next = deriveMemberGuid(anchor, memberPathSteps(key));
+      const next = deriveMemberGuidAvoiding(anchor, memberPathSteps(key), (g) => heldByOther(world, g, e)).guid; // as the load (#1882)
       if (old && old !== next) remap.set(old, next);
     }
   }

@@ -411,14 +411,16 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     expect(promoted[0].moved).toBeUndefined();
   });
 
-  it('drops a pin that collides with a guid another member DERIVES, and says so', async () => {
+  it('a derivation that meets a PIN yields to a salted guid: the pinned member keeps its address, and it says so (#1882)', async () => {
     // The uniqueness guard. The derived set is internally collision-free (one hash per anchor+path),
     // so a collision can only be a PIN meeting a derivation — reachable with nothing corrupt: a row
     // pins a member to the guid it had at an earlier path, the template moves it, and whatever now
     // occupies the old path derives that guid. Two entities, one address: #1355's shape.
     //
-    // The PIN yields, never the derived member: an un-pinned member falls back to derivation, where
-    // it was before v16; a de-derived member would have no guid at all.
+    // The DERIVATION yields (#1882, reversing #1468 Phase 2B's "the pin yields"): the pin is the identity the scene's
+    // refs and rows hold, and yielding it retargeted every ref to it onto the new node. The derived member takes a
+    // salted guid instead, so it is not left unaddressable (the reason the pin used to yield). Mutation: return the
+    // plain derivation from `deriveMemberGuidAvoiding` — Label and Badge share a guid.
     const { template, scene } = await placedInstance();
     const labelsGuid = guidOf('Label');
     const collided = JSON.parse(JSON.stringify(scene)) as { entities: SceneEntityEntry[] };
@@ -432,13 +434,20 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
 
     await load(collided as unknown as SceneData);
 
-    expect(guidOf('Label')).toBe(labelsGuid);          // the DERIVED member keeps the address
-    expect(guidOf('Badge')).not.toBe(labelsGuid);      // the PIN was dropped
-    expect(guidOf('Badge')).toBeTruthy();              // …and it derived one instead, not nothing
-    const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('also holds'));
+    expect(guidOf('Badge')).toBe(labelsGuid);          // the PIN keeps its address
+    expect(guidOf('Label')).not.toBe(labelsGuid);      // the derivation yielded…
+    expect(guidOf('Label')).toBeTruthy();              // …to a guid, not to nothing
+    const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('already holds'));
     expect(line).toBeDefined();
+    expect(line).toContain('"Label"');                 // both holders named
     expect(line).toContain('"Badge"');
     warn.mockRestore();
+
+    // …and the salted guid is the one the next save pins: a save → reload gives every member the same guid again.
+    const saved = await serializeScene() as unknown as { entities: SceneEntityEntry[] };
+    const [label, badge] = [guidOf('Label'), guidOf('Badge')];
+    await load(saved as unknown as SceneData);
+    expect([guidOf('Label'), guidOf('Badge')]).toEqual([label, badge]);
   });
 
   it('keeps key AND guid when the member is re-parented inside its instance (R1)', async () => {
@@ -499,14 +508,13 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     }
   });
 
-  it('drops pins to a FIXPOINT — one pass can create the collision it is fixing', async () => {
-    // Raised as PLAUSIBLE by the Phase 2B close-out review, which could not build this fixture. It
-    // takes TWO pins in one instance, arranged so the re-derive that repairs the first collision
-    // hands a member the guid the second pin is holding:
+  it('two pins and a derivation meeting in a chain end with every member addressable and distinct', async () => {
+    // Built for the Phase 2B close-out's cascade, when the PIN yielded: the re-derive that repaired one collision handed
+    // a member the guid a second pin held. Since #1882 a derivation never takes a held guid (it salts), so no pin meets
+    // a derivation here; the fixture stays as the invariant over two pins and a derived path they sit on:
     //
-    //   row(Badge) pins D3 — which Label DERIVES  → collision, Badge's pin drops, Badge derives D4
-    //   row(Panel) pins D4 — nobody held D4 at scan time, so nothing was dropped there
-    //   → without a second pass, Panel and Badge both answer to D4, silently
+    //   row(Badge) pins D3 — which Label DERIVES  → Label salts
+    //   row(Panel) pins D4 — Badge's own derivation, which Badge (pinned) no longer takes
     const { template, scene } = await placedInstance();
     await load(withoutRows(scene));
     const [d2, d3, d4] = [guidOf('Panel'), guidOf('Label'), guidOf('Badge')];

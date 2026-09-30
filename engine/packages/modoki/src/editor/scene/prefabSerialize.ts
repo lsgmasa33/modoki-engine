@@ -2,6 +2,7 @@
  *  re-import merge.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents } from '../../runtime/core/ecs/identityParents';
@@ -12,7 +13,7 @@ import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegist
 import { getAllEntities, readTraitData, readTraitDataFull, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { runtimeExcludedMessage } from './authoringScope';
 import { newGuid, getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
-import { mapStringValues } from '../../runtime/core/assetRefRules';
+import { mapStringValues, isStoredRoot, memberStepId, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
@@ -20,7 +21,7 @@ import { captureDoc } from './prefabBase';
 import {
   authoringEntitiesFor, collectTree, isTemplateExcludedField, type PrefabEntity, type PrefabFile,
 } from './prefab';
-import { wouldCreateCycle } from './prefabCache';
+import { wouldCreateCycle, getCachedPrefabSync } from './prefabCache';
 import {
   type NodeExits, templateTokenizer, withKeptStateBake, withNodeExits, withRewritingPrefab,
 } from './prefabTokens';
@@ -216,7 +217,7 @@ function nodeGuidsFor(
   // identity and the name match: a selection that is a MEMBER of an instance of the target carries that member's
   // nodeGuid, and a new root named like no row would mint — either re-binds the root's localId to another node.
   const rootLid = replacing?.rootLocalId ?? 1;
-  const rootGuid = replacing?.entities?.find((r) => r.localId === rootLid)?.nodeGuid;
+  const rootGuid = rowAt(replacing, rootLid)?.nodeGuid;
   if (rootGuid && isGuid(rootGuid)) { claimed.set(rootGuid, selectedEntityId); carried.set(selectedEntityId, rootGuid); }
   const take = (ecsId: number, guid: string): void => {
     // The root, bound above: its own live nodeGuid (a member's, when the selection is one) must not re-bind it.
@@ -400,10 +401,15 @@ function serializePrefabBody(
   const nestedRowIds = new Set(nestedRefs.keys());
   const nodeGuidOf = nodeGuidsFor(flatTree, existingId, opts?.preserveNodeGuids, selectedEntityId, nestedRowIds, opts?.replacing);
   // A Replace keeps the numbering of every row it carries identity for (#1759): `planPrefabRows` numbered by position.
-  if (opts?.replacing && !opts.preserveLocalIds) {
-    const kept = replaceNumbering(flatTree, selectedEntityId, nodeGuidOf.carried, opts.replacing);
-    if (kept) { ecsToLocal.clear(); for (const [id, lid] of kept) ecsToLocal.set(id, lid); }
-  }
+  // A fresh Create of an instance root keeps each member's step in that instance (#1882).
+  const kept = opts?.preserveLocalIds ? null
+    : opts?.replacing ? replaceNumbering(flatTree, selectedEntityId, nodeGuidOf.carried, opts.replacing)
+    : existingId ? null
+    : instanceStepNumbering(flatTree, selectedEntityId);
+  // …and its mark carries the source document's: a number the source freed above the kept steps stays unused, since a
+  // pin can still hold its old derivation (#1880 close-out review 4).
+  const keptFrom = kept && !opts?.preserveLocalIds && !opts?.replacing && !existingId ? instanceSourceOf(selectedEntityId) : null;
+  if (kept) { ecsToLocal.clear(); for (const [id, lid] of kept) ecsToLocal.set(id, lid); }
   const rowParent = rowParentsFor(selectedEntityId, flatTree, allEntities, ecsToLocal, opts?.rowParents, nestedRowIds);
   // A ref from one member of the written tree to another becomes a member TOKEN (#1352): the file is a
   // template, and the live guid it held names the SOURCE entity in every instance.
@@ -586,7 +592,7 @@ function serializePrefabBody(
   // The high-water mark (#1774): above every row written, and never below the document this write replaces or lands
   // over — prefab-edit's session floor, a Replace's document, a rebuild's prior file. `commitPrefabWrites` holds the same
   // line against the file on disk; stating it here keeps the bytes a caller records before the commit the bytes written.
-  advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0);
+  advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0, keptFrom);
   assertNoRuntimeGuids(file, 'a serialized prefab');
   opts?.onRows?.(ecsToLocal);
   writtenRows.set(file.entities, new Map(flatTree.filter((e) => e.guid).map((e) => [e.guid!, ecsToLocal.get(e.id)!])));
@@ -617,13 +623,61 @@ function replaceNumbering(
   const rootLid = replacing.rootLocalId ?? 1;
   // Above the replaced document's high-water mark, not just its rows: a number an EARLIER write freed at the top is
   // below the mark and above every row (#1774).
-  let next = Math.max(rootLid, localIdCounter(replacing) - 1);
+  return keptNumbering(flatTree, selectedEntityId, rootLid, Math.max(rootLid, localIdCounter(replacing) - 1), (id) => {
+    const g = carried.get(id);
+    return g ? oldLocal.get(g) : undefined;
+  });
+}
+
+/** The document of the stored instance root `selectedEntityId`, when it is one and its document is cached. */
+function instanceSourceOf(selectedEntityId: number): PrefabFile | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  const pi = piMeta ? readTraitData(selectedEntityId, piMeta) as (MemberPi & { source?: unknown }) | null : null;
+  if (!pi || !isStoredRoot(pi, selectedEntityId) || typeof pi.source !== 'string') return null;
+  return getCachedPrefabSync(pi.source) ?? null;
+}
+
+/** The localIds a fresh Create Prefab of an INSTANCE ROOT writes (#1882; #1759's rule, Unity's fileIDs): each row of that
+ *  instance's own frame keeps its step in it (`memberStepId`: a member's localId, an owned nested root's row), the root
+ *  keeps its own, and every other row is numbered above the source document's high-water mark.
+ *
+ *  The root keeps its guid through the Create, and so does every member (they are pinned in the scene's rows), so the
+ *  new prefab's derivations share the anchor those guids were derived from. Positional numbering handed an old step to
+ *  another node: a row later added at that path derived a member's kept guid, two entities shared it, and the load's
+ *  collision pass retargeted the member's refs (#1882: B kept R|2.3 while R numbered it 4; Q's new row 3 under R's
+ *  nested Q at step 2 derived R|2.3). Kept steps make each derivation EQUAL its pin. Null for anything else: a subtree
+ *  of an instance anchors on a new root, so no old derivation is reachable. */
+function instanceStepNumbering(flatTree: readonly EntityInfo[], selectedEntityId: number): Map<number, number> | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  const rootPi = piMeta ? readTraitData(selectedEntityId, piMeta) as (MemberPi & { source?: unknown }) | null : null;
+  if (!piMeta || !rootPi || !isStoredRoot(rootPi, selectedEntityId)) return null;
+  const identity = worldIdentityParents(getCurrentWorld());
+  const stepOf = (id: number): number | undefined => {
+    if (identity.frameOf(id) !== selectedEntityId) return undefined;
+    return memberStepId(readTraitData(id, piMeta) as MemberPi) || undefined;
+  };
+  const rootLid = rootPi.localId || 1;
+  const source = instanceSourceOf(selectedEntityId);
+  let floor = Math.max(rootLid, source ? localIdCounter(source) - 1 : 0);
+  for (const e of flatTree) floor = Math.max(floor, stepOf(e.id) ?? 0);
+  return keptNumbering(flatTree, selectedEntityId, rootLid, floor, stepOf);
+}
+
+/** `selectedEntityId` → `rootLid`; each other row its `keptLocal` number when that is free; every row left over is
+ *  numbered above `floor`, in tree order. The one numbering both a Replace and a Create of an instance root keep by. */
+function keptNumbering(
+  flatTree: readonly EntityInfo[],
+  selectedEntityId: number,
+  rootLid: number,
+  floor: number,
+  keptLocal: (ecsId: number) => number | undefined,
+): Map<number, number> {
+  let next = floor;
   const out = new Map<number, number>([[selectedEntityId, rootLid]]);
   const used = new Set<number>([rootLid]);
   for (const e of flatTree) {
     if (out.has(e.id)) continue;
-    const g = carried.get(e.id);
-    const lid = g ? oldLocal.get(g) : undefined;
+    const lid = keptLocal(e.id);
     if (lid && !used.has(lid)) { out.set(e.id, lid); used.add(lid); }
   }
   for (const e of flatTree) if (!out.has(e.id)) out.set(e.id, ++next);

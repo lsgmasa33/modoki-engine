@@ -794,7 +794,7 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/prefabOverrides.ts:142' },
   // The shared path fold (#1707): the document shapes it reads and the state it threads, all localId-keyed.
   ...[['SlotLists.removedTraits', 440], ['SlotLists.moved', 441], ['FoldRow.overrides', 449], ['FoldRow.nestedOverrides', 450],
-    ['FoldRow.removedTraits', 453], ['ForwardState.nestedOverrides', 468], ['ForwardState.forwardRoots', 470]].map(([f, line]) => ({
+    ['FoldRow.removedTraits', 453], ['ForwardState.forwardRoots', 470]].map(([f, line]) => ({
     item: `loaders/prefabOverrides.ts::${f}`,
     reason: `not-entity: keyed by a prefab member's row localId in the frame's own document — the path fold (foldRowStep/foldPath, #1707), computed per call and never held across one; loaders/prefabOverrides.ts:${line}` })),
   ...[['FrameFold.overrides', 606], ['FrameFold.removedTraits', 607]].map(([f, line]) => ({

@@ -13,15 +13,15 @@ import { beginWorldBoundOperation } from '../undo/undoManager';
 import { getAllEntities, deleteEntities, readTraitData, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { newGuid, resolveRef } from '../../runtime/loaders/assetManifest';
+import { newGuid, resolveRef, isGuid } from '../../runtime/loaders/assetManifest';
 import { durableGuid, nodeRowKey, remapGuidValues, memberPathSteps } from '../../runtime/core/assetRefRules';
 import { memberPathLookup } from '../../runtime/core/templateRefs';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, mergeNestedOverridePaths, deriveMemberGuidsAfterPins, memberPathIndex, queuePrefabMoves, collectReferenceNodeRows } from '../../runtime/loaders/loadSceneFile';
+import { keptMemberOrphans, setKeptMemberOrphans, rowBackedTest, deriveMemberGuidsAfterPins, memberPathIndex, queuePrefabMoves, collectReferenceNodeRows, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { translateLocalIds, docRows } from '../../runtime/loaders/memberTranslation';
-import { foldMemberRowChannels, mergeTraitRemovals } from '../../runtime/loaders/prefabOverrides';
+import { foldMemberRowChannels, mergeTraitRemovals, rowAt } from '../../runtime/loaders/prefabOverrides';
 import { frameForward, chainLayer, layerAddedTraits, levelDoc, keptLegacyForward, settleKeptLegacy } from './prefabBase';
 import { collectTree, localToEcsGuid, type PrefabFile } from './prefab';
 import {
@@ -252,7 +252,7 @@ export function captureStructureForRespawn(rootInstanceId: number, prefab: Prefa
 /** Re-apply nested-instance captures onto a freshly rebuilt outer instance,
  *  re-locating each nested root by walking its `parentLocalId` chain from the new
  *  outer root (ids changed, the chain didn't). */
-function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: NestedInstanceCapture[]): void {
+function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: NestedInstanceCapture[], settles = false, dropped: Set<string> = new Set()): void {
   if (!captures.length) return;
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
@@ -308,13 +308,15 @@ function reapplyNestedInstanceOverrides(newOuterRootId: number, captures: Nested
     // whatever that row expands NOW (I4, #1767). A template row that kept its nodeGuid while its prefab changed puts
     // another prefab here, and the old numbers named the new prefab's members one for one. Translated by nodeGuid, as
     // a reload translates the scene's rows: an edit to a member the new document does not have is dropped (R2 keeps
-    // its row), and across two prefabs a number is never matched by position. ⚠️ One difference from a reload stays, and
-    // it is the rebuild's standing rule, not this translation's: a scene-ADDED node under a dropped member is
-    // re-anchored to the frame root (`translateCarried` → `applyStructureCore`), where a reload keeps it in the orphan row.
+    // its row), and across two prefabs a number is never matched by position. A scene-ADDED node under a dropped member
+    // vanishes with it, kept in its orphan row, as a reload keeps it (#1880 F3a, `withoutGoneMemberNodes`).
     const nowSource = (readTraitData(cur, PrefabInstanceMeta)?.source as string) || cap.source;
     const childPrefab = levelDoc(cur, nowSource).doc ?? getCachedPrefabSync(nowSource);
     if (!childPrefab) continue;
     let { overrides, structure } = cap;
+    // Against the document the frame expands NOW (`childPrefab`, a re-pointed row's new prefab included), recording what
+    // it leaves out for the settle, which reads `dropped` after this re-apply (#1880 close-out re-review 1).
+    if (settles && structure.added) structure = { ...structure, added: withoutGoneMemberNodes(structure.added, cap.doc, childPrefab, dropped)! };
     const lid = translateLocalIds(cap.doc, childPrefab, { acrossPrefabs: nowSource !== cap.source });
     if (lid) ({ overrides, structure } = translateCarried(lid, overrides, structure));
     if (cap.replace.length) deleteEntities(freshCopies(cur, cap.replace));
@@ -347,17 +349,19 @@ function applyNodeRowsLive(frameRoot: number, rows: ReadonlyMap<string, SceneMem
   const all = getAllEntities();
   const childrenOf = new Map<number, number[]>();
   for (const e of all) { const list = childrenOf.get(e.parentId); if (list) list.push(e.id); else childrenOf.set(e.parentId, [e.id]); }
+  // A key two live nodes carry names NEITHER (#1880 F3c, `applyNodeRows`' rule): 0 marks it, and its row is missed.
   const byKey = new Map<string, number>();
+  const note = (key: string, id: number) => { if (key) byKey.set(key, byKey.has(key) ? 0 : id); };
   const walk = (id: number) => {
     for (const c of childrenOf.get(id) ?? []) {
       const key = templateKeyOf(findEntity(c));
       if (readTraitData(c, piMeta)) {
         // A member, or another instance — not walked into. A template REFERENCE node's root is one, and is still
         // this frame's node: its row can delete it (re-review R3b — missed, a Refresh brought it back).
-        if (key && !byKey.has(key)) byKey.set(key, c);
+        note(key, c);
         continue;
       }
-      if (key && !byKey.has(key)) byKey.set(key, c);
+      note(key, c);
       walk(c);
     }
   };
@@ -402,6 +406,39 @@ function savedMemberRows(root: number, source: string): Record<string, SceneMemb
 /** The frame a row key addresses: the key minus its last component ('' = the row-writing root's own frame). */
 const rowFrameKey = (key: string): string => key.slice(0, Math.max(0, key.lastIndexOf('/')));
 
+/** Whether the rebuild of `rootInstanceId` settles the kept-orphan store (R2): its row-writing root has a durable guid and
+ *  a readable document — `captureRowsForSettle`'s own precondition. Only then may the respawn leave out what the scene hung
+ *  under a member the template dropped ({@link withoutGoneMemberNodes}): the settle keeps it in that member's orphan row. */
+function rowsSettleActive(rootInstanceId: number): boolean {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  const rowRoot = rowWritingRoot(rootInstanceId);
+  const guid = eaMeta && rowRoot ? durableGuid((readTraitData(rowRoot, eaMeta) as { guid?: string } | null)?.guid) : '';
+  const source = piMeta && rowRoot ? ((readTraitData(rowRoot, piMeta)?.source as string) || '') : '';
+  return !!guid && !!source && !!getCachedPrefabSync(source);
+}
+
+/** `added` without the nodes the scene hung under a member `from` had and `to` no longer has (#1880 F3a, hub ruling B′,
+ *  2026-09-30): R2 / fork 2 (owner, 2026-09-24) — they vanish with the member, kept in its orphan row by the settle, and
+ *  a template that brings the member back brings them back, once. The rebuild used to re-anchor them at the frame root
+ *  (`applyStructureCore`'s "anchor missing" rule) while a reload of the same scene kept them in the row: rebuild ≠
+ *  reload (hunt seed 1127). Only a member with a `nodeGuid` qualifies — a pre-v5 row writes no member row, so nothing
+ *  would keep the node, and the root stays its home. Asked in `from`'s numbering, before translation. */
+function withoutGoneMemberNodes(added: AddedEntity[] | undefined, from: PrefabFile, to: PrefabFile, dropped: Set<string>): AddedEntity[] | undefined {
+  if (!added?.length || from === to) return added;
+  const kept = new Set((to.entities ?? []).map((e) => e.nodeGuid).filter((g): g is string => !!g && isGuid(g)));
+  const gone = (lid: number): boolean => {
+    const row = rowAt(from, lid);
+    return !!row && row.localId !== (from.rootLocalId ?? 1) && !!row.nodeGuid && isGuid(row.nodeGuid) && !kept.has(row.nodeGuid);
+  };
+  const out = added.filter((n) => {
+    if (!gone(n.parentLocalId)) return true;
+    if (n.guid) dropped.add(n.guid);
+    return false;
+  });
+  return out.length === added.length ? added : out;
+}
+
 /** The kept-orphan store (R2, `keptMemberOrphans`) across a rebuild, left exactly as a RELOAD of the same scene would
  *  leave it (#1535). A Refresh — and an Apply, a Revert, and the undo of each — is the other route a template change
  *  reaches an open scene by, and it kept this store only half: a row's guid, and the node rows of a frame it
@@ -428,6 +465,11 @@ const rowFrameKey = (key: string): string => key.slice(0, Math.max(0, key.lastIn
  *  shielded anyway: the first rebuild already kept its row, and a kept row wins.) */
 function captureRowsForSettle(
   rootInstanceId: number, baseline: PrefabFile, prefab: PrefabFile, toDestroy: ReadonlySet<number>, remap: ReadonlyMap<string, string>,
+  /** Guids the respawn leaves out under a dropped member (`withoutGoneMemberNodes`, the nested ones at the re-apply,
+   *  after this call): not live, whatever holds them when the settle runs. Read then, not now. */
+  dropped: ReadonlySet<string> = new Set(),
+  /** The respawn may leave something out, so the settle must run even onto the same outer document. */
+  mayDrop = false,
 ): (newRootId: number, pinned?: Set<number>) => void {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
@@ -439,13 +481,10 @@ function captureRowsForSettle(
   // nor bring one back, so it skips the save capture (review F6). Only that case: judged any other way, "can a row
   // become unbacked" is a second copy of `rowBackedTest`, and the first one (`declaresAll`) missed a nested row's
   // prefab ref and lost an edit (re-review).
-  if (prefab === baseline && !Object.keys(keptMemberOrphans(rowRootGuid) ?? {}).length) return () => {};
+  if (prefab === baseline && !mayDrop && !Object.keys(keptMemberOrphans(rowRootGuid) ?? {}).length) return () => {};
   const frameIds = new Map<string, number>([['', rowRoot]]);
   for (const [id, key] of memberRowKeysIn(rowRoot)) frameIds.set(key, id);
   const torn = (key: string) => toDestroy.has(frameIds.get(rowFrameKey(key)) ?? 0);
-  // The rows keyed by a nested ROOT: their nodes hang at that instance's root, and die with it when the template drops
-  // its row — nothing re-homes them (`unhomed` below). Read now, while the ids are the torn-down tree's.
-  const frameRootKeys = new Set([...frameIds].filter(([key, id]) => key && piMeta && (readTraitData(id, piMeta)?.rootInstanceId as number) === id).map(([key]) => key));
   // Every level is read from its frame record — the document the torn frames were built from, while the cache already
   // holds the new one — as a save reads it (#1685).
   let rows = savedMemberRows(rowRoot, rowSource);
@@ -462,22 +501,17 @@ function captureRowsForSettle(
     const kept = keptMemberOrphans(rowRootGuid) ?? {};
     const next: Record<string, SceneMemberRow> = {};
     const replay: Record<string, SceneMemberRow> = {};
-    // A kept row's `added`/`own` nodes the re-apply RE-HOMED (an addition whose anchor the template dropped moves to
-    // the instance root, `applyStructureCore`) are live elsewhere now, and saved there: kept here too, a restore of the
-    // member spawned them a second time, with the same guid (review F1). Only the ones nothing live carries stay.
-    // A node with a RUNTIME guid is captured with none, so no guid can say it is live (#1568): the re-apply's own rule
-    // does — a node added under a member the template dropped is re-anchored to its frame's root, so if that frame is
-    // live, so is the node. Two rows are not re-homed: a NODE row's nodes went with their template node, and a nested
-    // ROOT's with its instance (close-out review).
-    const liveGuids = new Set(getAllEntities().map((e) => e.guid).filter((g): g is string => !!g));
-    const liveFrames = new Set(['', ...memberRowKeysIn(root).values()]);
-    const unhomed = (key: string, row: SceneMemberRow): SceneMemberRow => {
+    // Nothing re-homes a kept row's `added`/`own` nodes any more (#1880 F3a, B′): the respawn leaves out what the scene
+    // hung under a member the template dropped (`withoutGoneMemberNodes`), so they vanish with it and stay in its row
+    // (R2, fork 2), as a reload keeps them. A node live anyway (nothing this rebuild did put it there) is not kept twice:
+    // a restore of the member would spawn it a second time, with the same guid (review F1).
+    const liveGuids = new Set(getAllEntities().map((e) => e.guid).filter((g): g is string => !!g && !dropped.has(g)));
+    const unhomed = (_key: string, row: SceneMemberRow): SceneMemberRow => {
       const out: SceneMemberRow = { ...row };
-      const rehomed = !nodeRowKey(key.slice(key.lastIndexOf('/') + 1)) && !frameRootKeys.has(key) && liveFrames.has(rowFrameKey(key));
       for (const ch of ['added', 'own'] as const) {
         const nodes = row[ch];
         if (!nodes) continue;
-        const left = nodes.filter((n) => !liveGuids.has(n.guid) && !(rehomed && !n.guid));
+        const left = nodes.filter((n) => !liveGuids.has(n.guid));
         if (left.length === nodes.length) continue;
         if (left.length) out[ch] = left;
         else delete out[ch];
@@ -535,7 +569,7 @@ function replayRowsLive(rowRoot: number, rows: Record<string, SceneMemberRow>, p
     const targetDoc = isFrameRoot(hit.id) ? docOf(hit.id) : docOf(hit.frameRoot);
     const statements = row.traitRemovals ?? {};
     const lid = (readTraitData(hit.id, piMeta)?.localId as number) || 0;
-    const authored = Object.keys(targetDoc?.entities.find((e) => e.localId === lid)?.traits ?? {});
+    const authored = Object.keys(rowAt(targetDoc, lid)?.traits ?? {});
     const desired = Array.isArray(row.removedTraits) ? new Set(mergeTraitRemovals(row.removedTraits, statements)) : null;
     const restore = desired ? authored.filter((t) => !desired.has(t)) : Object.keys(statements).filter((t) => statements[t] === false);
     if (restore.length && targetDoc) frame.restored.push([hit.id, targetDoc, restore]);
@@ -549,7 +583,7 @@ function replayRowsLive(rowRoot: number, rows: Record<string, SceneMemberRow>, p
     if (fresh.length) deleteEntities(fresh);
     for (const [id, targetDoc, names] of f.restored) {
       const lid = (readTraitData(id, piMeta)?.localId as number) || 0;
-      const authored = targetDoc.entities.find((e) => e.localId === lid)?.traits ?? {};
+      const authored = rowAt(targetDoc, lid)?.traits ?? {};
       const entity = findEntity(id);
       for (const name of names) {
         const meta = getTraitByName(name);
@@ -691,6 +725,12 @@ export function rebuildInstance(
   // re-save that renumbered them would otherwise hand every edit to whichever member inherited the
   // number. Today's callers (Apply and its undo) are additive and never renumber, so this is the
   // function honouring its own contract — it accepts a baseline other than the document it rebuilds.
+  // What the scene hung under a member the new template dropped vanishes with it (R2, fork 2): the settle keeps it.
+  const settles = rowsSettleActive(rootInstanceId);
+  // The guids it leaves out: they are gone from the world once the rebuild ends, whatever holds them for a moment (a
+  // missing-prefab node the teardown KEEPS, then drops as unnamed, `seatKeptFrames`), so the settle keeps them in the row.
+  const dropped = new Set<string>();
+  if (settles) structure = { ...structure, added: withoutGoneMemberNodes(structure.added, baseline, prefab, dropped) };
   const lidOf = translateLocalIds(baseline, prefab);
   if (lidOf) ({ overrides, structure } = translateCarried(lidOf, overrides, structure));
 
@@ -778,7 +818,10 @@ export function rebuildInstance(
   for (const [guid, key] of Object.entries(structure.templateKeys ?? {})) if (!carriedKeys.has(guid)) carriedKeys.set(remap.get(guid) ?? guid, key);
   // The kept-orphan store (R2) is left as a reload would leave it (#1535): read what a save would write for what the
   // teardown destroys, BEFORE it does, and settle the store once the re-apply has run.
-  const settleKeptOrphans = captureRowsForSettle(rootInstanceId, baseline, prefab, toDestroy, remap);
+  // A nested frame can drop a member under an unchanged outer document, decided only at the re-apply: then the settle
+  // must not take its "nothing can change" shortcut (#1880 close-out review 3).
+  const mayDrop = dropped.size > 0 || (settles && nestedCaptures.some((c) => c.doc !== getCachedPrefabSync(c.source)));
+  const settleKeptOrphans = captureRowsForSettle(rootInstanceId, baseline, prefab, toDestroy, remap, dropped, mayDrop);
   for (const p of [...parked, ...kept]) if (eaMeta) writeTraitField(p.id, eaMeta, 'parentId', 0);
   // What the delete's frame ending detaches INSIDE a kept frame is put straight back (close-out review): a kept root that
   // was ever moved carries an `ownerGuid` link naming the root torn down here, so `promoteOwnedRoots` promoted it to a
@@ -803,14 +846,14 @@ export function rebuildInstance(
   const beforeSpawn = new Set(getAllEntities().map((e) => e.id));
   // Still a TOP call: its own token scope, resolved by the derive below once the member guids are restored, and the
   // forwarded state applied at its NESTED rows only. The root's own members take their layer from `overrides`/`structure`.
-  const forwardedOverrides = legacy?.nestedOverrides ? mergeNestedOverridePaths(forward?.nestedOverrides, legacy.nestedOverrides) : forward?.nestedOverrides;
   // The kept structure slots and values are the OUTERMOST layer (layers run innermost first), as a load makes the entry's —
   // its values folded at that depth too (#1877 S4, `StructureLayer.values`).
   const forwardedLayers = legacy?.nestedStructure || legacy?.nestedOverrides
     ? [...(forward?.layers ?? []), { slots: legacy.nestedStructure, valuePaths: legacy.nestedOverrides }]
     : forward?.layers;
   const newRootId = forward || legacy
-    ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), forwardedOverrides, forwardedLayers)
+    // The legacy values ride the layers alone (#1880 F1): the kept ones as the outermost layer's `valuePaths`.
+    ? instantiatePrefab(prefab, parentId, new Set(forward?.stack ?? []), undefined, forwardedLayers)
     : instantiatePrefab(prefab, parentId);
   // Preserve the instance root's stable guid across the teardown+respawn so refs
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the
@@ -832,7 +875,7 @@ export function rebuildInstance(
   }
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
-  reapplyNestedInstanceOverrides(newRootId, nestedCaptures);
+  reapplyNestedInstanceOverrides(newRootId, nestedCaptures, settles, dropped);
   // Before the member restore and the derive below: a replayed row's guid and move go through them like any other.
   // Every guid this rebuild PINS — a kept row replayed here, the carried members and reference-node rows below — so the
   // derive can drop one that collides with a derivation, exactly as the load does (#1777).
@@ -943,24 +986,7 @@ function withoutKeptNodes(added: AddedEntity[] | undefined, keep: ReadonlyMap<st
 }
 
 function withoutKeptNodesInside(n: AddedEntity, keep: ReadonlyMap<string, unknown>, found: Set<string>): AddedEntity {
-  let node = n;
-  if (n.children?.length) node = { ...node, children: withoutKeptNodes(n.children, keep, found)! };
-  if (n.added?.length) node = { ...node, added: withoutKeptNodes(n.added, keep, found) };
-  if (n.nestedStructure) {
-    node = { ...node, nestedStructure: Object.fromEntries(Object.entries(n.nestedStructure).map(([k, delta]) =>
-      [k, delta?.added ? { ...delta, added: withoutKeptNodes(delta.added, keep, found) } : delta])) };
-  }
-  if (n.members) {
-    node = { ...node, members: Object.fromEntries(Object.entries(n.members).map(([k, row]) => {
-      const r = row as SceneMemberRow & { added?: AddedEntity[]; own?: AddedEntity[] };
-      return [k, {
-        ...r,
-        ...(Array.isArray(r.added) ? { added: withoutKeptNodes(r.added, keep, found) } : {}),
-        ...(Array.isArray(r.own) ? { own: withoutKeptNodes(r.own, keep, found) } : {}),
-      }];
-    })) };
-  }
-  return node;
+  return mapNodeChannels(n, (list) => withoutKeptNodes(list, keep, found)!);
 }
 
 /** Put back the nested frames {@link rebuildTeardown} KEPT because their prefab could not be expanded (#1862), once the
@@ -998,7 +1024,7 @@ function seatKeptFrames(kept: readonly KeptFrame[], newRootId: number, unnamed: 
     // one the frame was built in, and falling back to the old NUMBER there claimed another unexpanded row (close-out
     // review). The number only for a frame with no identity (pre-v5). Either way the row must expand this frame's prefab.
     const rows = (rec?.doc as PrefabFile | undefined)?.entities ?? [];
-    const row = pi?.parentNodeGuid ? rows.find((r) => r.nodeGuid === pi.parentNodeGuid) : rows.find((r) => r.localId === pi?.parentLocalId);
+    const row = pi?.parentNodeGuid ? rows.find((r) => r.nodeGuid === pi.parentNodeGuid) : rowAt(rows, pi?.parentLocalId);
     // Resolved paths compared only when there IS one: a kept frame's prefab is missing, so in the dev editor its guid was
     // pruned, and two unresolvable refs read as `undefined === undefined` (close-out review 2).
     const at = pi?.source ? resolveRef(pi.source) : undefined;

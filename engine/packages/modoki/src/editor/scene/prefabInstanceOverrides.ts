@@ -2,6 +2,7 @@
  *  applying the override map.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitDataFull, writeTraitField, findEntity } from '../../runtime/core/ecs/entityUtils';
@@ -23,7 +24,7 @@ export function getOverrideValues(
   resolveBase?: (value: unknown) => unknown,
 ): Record<string, Record<string, unknown>> {
   const result: Record<string, Record<string, unknown>> = {};
-  const prefabEntity = prefab.entities.find((e) => e.localId === entityLocalId);
+  const prefabEntity = rowAt(prefab, entityLocalId);
   if (!prefabEntity) return result;
 
   for (const [traitName, currentData] of Object.entries(currentTraits)) {
@@ -245,7 +246,7 @@ export function captureInstanceOverrides(
     const markSet = getOverrideMarkSet(entity);
 
     // The MARK GATE (`gateOnMarks`): a divergence alone is not an override, only a recorded (marked) one is.
-    gateOnMarks(diffs, markSet, prefab.entities.find((e) => e.localId === localId), () => movedOf(entity.id(), !!diffs['Transform']));
+    gateOnMarks(diffs, markSet, rowAt(prefab, localId), () => movedOf(entity.id(), !!diffs['Transform']));
 
     // A MARKED value equal to its base is a recorded override too (`foldMarkedEqual`).
     foldMarkedEqual(diffs, markSet, currentTraits);

@@ -2,7 +2,7 @@
  *  and applying live structure to an instance. */
 
 import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
-import { getCurrentWorld, spawnEntity, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { deleteEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
@@ -103,6 +103,9 @@ export async function instantiatePrefabInstance(
   parent: number | (() => number) = 0,
   /** From `capturePrefabRead(sourcePath)`, taken before the caller's read. Omitted, the window starts here. */
   readAt: () => boolean = capturePrefabRead(sourcePath),
+  /** The root guid to mint instead of a fresh one: an undo step's redo putting its instance back (`prefabInstantiateUndo.ts`).
+   *  Minted BEFORE the members derive, so they derive from it as a reload derives them. */
+  rootGuid?: string,
 ): Promise<number> {
   // Loaded here, not at the top: the refusal reads the loaded scene through `SceneManager`, and a static import put that
   // whole module under every reader of this one. Before the read-token check, so check → spawn stays synchronous.
@@ -120,7 +123,7 @@ export async function instantiatePrefabInstance(
   });
   // SYNCHRONOUS from the check to the prime (close-out review): with an await between them, a commit whose cache seat was
   // already queued could land in the gap, and the prime put the older document back over it after all.
-  const rootId = spawnPrefabInstance(prefab, parentId);
+  const rootId = spawnPrefabInstance(prefab, parentId, rootGuid);
   if (!rootId) return rootId;
   // Under a base entity the new instance belongs to that base (#1429). Every caller's redo re-runs this
   // helper, so the stamp comes back with it.
@@ -144,7 +147,7 @@ export async function instantiatePrefabAsync(prefab: PrefabFile, parentId: numbe
 }
 
 /** `instantiatePrefabAsync`'s synchronous half: the nested prefabs are already in the cache. */
-function spawnPrefabInstance(prefab: PrefabFile, parentId: number): number {
+function spawnPrefabInstance(prefab: PrefabFile, parentId: number, rootGuid?: string): number {
   const rootId = instantiatePrefab(prefab, parentId);
   // The prefab file clears EntityAttributes.guid (templates carry no per-instance
   // identity), so a freshly-instantiated root has an empty guid until the next
@@ -157,8 +160,11 @@ function spawnPrefabInstance(prefab: PrefabFile, parentId: number): number {
     const rootEntity = findEntity(rootId);
     if (rootEntity?.has(attrMeta.trait)) {
       const ea = rootEntity.get(attrMeta.trait) as Record<string, unknown>;
+      // A redo's recorded guid, unless another live entity holds it: two entities under one identity is worse than the
+      // fresh guid the redo then keeps.
+      const restored = rootGuid && durableGuid(rootGuid) && !findEntityByGuid(rootGuid) ? rootGuid : undefined;
       // A runtime guid (#1210) is not an identity: mint over it like an empty one.
-      if (!durableGuid(ea.guid as string)) { rootEntity.set(attrMeta.trait, { ...ea, guid: newGuid() }); indexEntityGuid(rootEntity); }
+      if (restored || !durableGuid(ea.guid as string)) { rootEntity.set(attrMeta.trait, { ...ea, guid: restored ?? newGuid() }); indexEntityGuid(rootEntity); }
     }
   }
   // Stamp stable member GUIDs so the new instance's children are referenceable.

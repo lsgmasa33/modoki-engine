@@ -36,6 +36,7 @@
  *    is an ordinary anchor, and `keyed` leaves it out so the caller drops the key.
  *  See docs/scene-loading.md § "Guid uniqueness is a PER-FILE rule, not a repo-wide one" (the subtree duplicate bullet). */
 
+import { rowAt } from './prefabRowAt';
 import { deriveMemberGuid, entityStep, isStoredRoot } from './assetRefRules';
 import { resolveIdentityParents, type IdentityNode, type IdentityPi, type TemplateDocReader } from './ecs/identityParents';
 
@@ -115,7 +116,7 @@ export function planCopyGuids<N>(
     const source = (dataOf(ownerNode, 'PrefabInstance') as Pi)?.source;
     const doc = source && readDoc ? readDoc(source, owner) : undefined;
     if (!doc) return true; // no document to ask: where it hangs is every walk's answer, and this one's too
-    const row = doc.entities?.find((e) => e.localId === pi.parentLocalId);
+    const row = rowAt(doc, pi.parentLocalId);
     return !!row && row.prefab === pi.source && (!row.nodeGuid || !pi.parentNodeGuid || row.nodeGuid === pi.parentNodeGuid);
   };
   const links = new Map<N, CopyLink>();

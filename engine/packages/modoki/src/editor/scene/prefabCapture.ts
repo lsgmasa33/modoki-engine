@@ -2,6 +2,7 @@
  *  and subtracting what the enclosing chain already states.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { rowAt } from '../../runtime/core/prefabRowAt';
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { placedAnchor } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -16,7 +17,7 @@ import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../.
 import { filterAuthoringVisible } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
-import { durableGuid, nodeRowComponent, deriveMemberGuid, memberPathSteps, isStoredRoot } from '../../runtime/core/assetRefRules';
+import { durableGuid, nodeRowComponent, isMemberDerivation, memberPathSteps, isStoredRoot } from '../../runtime/core/assetRefRules';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
@@ -24,7 +25,7 @@ import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { asAddedNode } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
-import { keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
+import { keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap } from '../../runtime/loaders/prefabOverrides';
 import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, type ForwardState } from './prefabBase';
 import { parseMemberToken, memberToken, memberPathKey, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
@@ -1196,7 +1197,7 @@ export function moveChannelsOntoRows(
     const ecs = byFrame.get(frameRoot)?.get(lid);
     if (ecs) return rowed.get(ecs) ?? '';
     if (live) return '';
-    const g = doc.entities.find((e) => e.localId === lid)?.nodeGuid;
+    const g = rowAt(doc, lid)?.nodeGuid;
     return g && isGuid(g) && (frameRoot === rootId || frameKey) ? `${frameKey}/${g}` : '';
   };
 
@@ -1486,7 +1487,7 @@ export function subtractChainOverrides(
   for (const [lid, traits] of Object.entries(live)) {
     const chainTraits = chain[Number(lid)];
     if (!chainTraits) continue;
-    const member = childPrefab.entities.find((e) => e.localId === Number(lid));
+    const member = rowAt(childPrefab, Number(lid));
     for (const [trait, fields] of Object.entries(traits)) {
       const chainFields = chainTraits[trait];
       if (!chainFields || typeof chainFields !== 'object') continue;
@@ -1729,7 +1730,8 @@ function storedMemberGuids(rootGuid: string): Set<string> {
   for (const [key, e] of memberPathIndex(getCurrentWorld(), root.id())) {
     if (!key || !e) continue;
     const guid = (e.get(eaMeta.trait) as { guid?: string } | undefined)?.guid;
-    if (guid && guid !== deriveMemberGuid(anchor, memberPathSteps(key))) out.add(guid);
+    // A salted derivation is one a reload reproduces too (#1882): not stored.
+    if (guid && !isMemberDerivation(guid, anchor, memberPathSteps(key))) out.add(guid);
   }
   return out;
 }
@@ -1811,13 +1813,10 @@ export function liveTemplateKeys(nodes: readonly AddedEntity[], deep = false, in
       const e = n.guid ? findEntityByGuid(n.guid) : undefined;
       const key = e ? (templateKeyOf(e as Parameters<typeof templateKeyOf>[0]) || recoverTemplateKey(e.id(), memo)) : '';
       if (key) out.set(n.guid, key);
-      // `deep`: a template node's children carry keys too, and v17 node rows address them (#1516).
-      if (deep && !n.prefab) walk(n.children ?? []);
-      if (intoReferences && n.prefab) {
-        walk(n.added ?? []);
-        for (const st of Object.values(n.nestedStructure ?? {})) walk(st.added ?? []);
-        for (const r of Object.values(n.members ?? {})) { walk(r.added ?? []); walk(r.own ?? []); }
-      }
+      // The flags choose which nodes the walk ENTERS, never which channels (#1880 F3b, `nodeChannels`): `deep` a plain
+      // (template) node, whose children carry keys too and which v17 node rows address (#1516); `intoReferences` a
+      // reference node.
+      if (n.prefab ? intoReferences : deep) for (const list of nodeChannels(n)) walk(list);
     }
   };
   walk(nodes);

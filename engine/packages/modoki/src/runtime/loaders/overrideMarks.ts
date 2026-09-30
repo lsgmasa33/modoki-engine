@@ -43,6 +43,15 @@ import { packedOf, type PackedEntity } from '../core/ecs/entityTable';
 const marks = new Map<PackedEntity, Set<string>>();
 const keyOf = (trait: string, field: string) => `${trait}.${field}`;
 
+/** ROTATION IS ONE VALUE (#1880 F5, owner-approved, the Unity way): a mark on any of `Transform.rx/ry/rz` is a mark on
+ *  all three. Unity records a rotation edit as one quaternion (`TransformRotationGUI` writes
+ *  `m_Rotation.quaternionValue` whole even when one Euler field changed), so an instance that turned one axis pins its
+ *  whole rotation against later template edits. Stated HERE, the one store every mark goes through (an edit, the
+ *  reparent's compensation, the load's seeding, a restore), so the top-level and nested captures, which save what is
+ *  marked, save the rotation whole without a rule of their own. */
+export const ROTATION_MARKS = ['Transform.rx', 'Transform.ry', 'Transform.rz'] as const;
+const groupOf = (key: string): readonly string[] => ((ROTATION_MARKS as readonly string[]).includes(key) ? ROTATION_MARKS : [key]);
+
 function setFor(entity: Entity): Set<string> {
   const key = packedOf(entity);
   let s = marks.get(key);
@@ -52,20 +61,22 @@ function setFor(entity: Entity): Set<string> {
 
 /** Record that `field` of `trait` is an explicit override on this instance member. */
 export function markOverride(entity: Entity, trait: string, field: string): void {
-  setFor(entity).add(keyOf(trait, field));
+  const s = setFor(entity);
+  for (const k of groupOf(keyOf(trait, field))) s.add(k);
 }
 
 /** Take back the mark on `field` of `trait`: an editor write that put the field back at its base, or the undo of
  *  the write that marked it (#1709). */
 export function unmarkOverride(entity: Entity, trait: string, field: string): void {
-  marks.get(packedOf(entity))?.delete(keyOf(trait, field));
+  const s = marks.get(packedOf(entity));
+  if (s) for (const k of groupOf(keyOf(trait, field))) s.delete(k);
 }
 
 /** Re-apply "Trait.field" keys read off another entity with {@link getOverrideMarkSet} — a respawn
  *  of the same logical member (undo, a carried entity) or a copy of it. */
 export function restoreOverrideMarks(entity: Entity, keys: Iterable<string>): void {
   const s = setFor(entity);
-  for (const k of keys) s.add(k);
+  for (const k of keys) for (const g of groupOf(k)) s.add(g);
 }
 
 /** The set of "Trait.field" keys explicitly overridden on this member (or undefined). */

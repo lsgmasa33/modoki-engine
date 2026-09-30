@@ -848,9 +848,12 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
     expect(JSON.stringify(node().members ?? {})).toBe(first);
   });
 
-  // P4: a node a member row adds, re-homed to the instance root when the template drops that member, keeps its authored
-  // key. Its derived guid no longer derives from where it hangs. Mutation: skip the key carry in `rebuildInstance`.
-  it('a node re-homed by the re-apply keeps its authored key', async () => {
+  // P4: a node a member row adds, when the template drops that member, keeps its authored key. Since #1880 F3a (hub
+  // ruling B′: R2 / fork 2) it vanishes with the member into the kept row instead of being re-homed at the instance root,
+  // so the key is asserted where it now lives — in the kept row the save writes — and on the node that comes back with
+  // the member. Mutation: skip `keySceneNodes` in `captureRowsForSettle` — the kept row carries no key, and the node
+  // comes back under a new one.
+  it('a node that vanishes with its member keeps its authored key, in the kept row and when it comes back', async () => {
     const KK = 'dddddddd-0000-4000-8000-000000061567';
     const kid = { parentLocalId: 0, guid: '', key: KK, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: { x: 4 } }, children: [] };
     install(midDoc());
@@ -858,10 +861,13 @@ describe('#1567: a rebuild keeps a template-keyed node\'s key', () => {
     expect(inMid('Kid')).toHaveLength(1); // precondition
     install(innerNoLeaf());
     await quietly(() => rebaseStaleInstances());
+    expect(inMid('Kid')).toHaveLength(0); // gone with Leaf (R2, fork 2)
+    const saved = JSON.stringify(serializePrefab(root, OUTER2));
+    expect(saved).toContain(KK); // kept in Leaf's row, key and all
+    install(innerDoc);
+    await quietly(() => rebaseStaleInstances());
     expect(inMid('Kid')).toHaveLength(1);
     expect(templateKeyOf(entityOf(inMid('Kid')[0]!.id))).toBe(KK);
-    const saved = JSON.stringify(serializePrefab(root, OUTER2));
-    expect(saved).toContain(KK);
   });
 
   // The spawn core stamps a key only on a node with no guid; a kept row's node carries both (`keySceneNodes`), and its
@@ -968,10 +974,13 @@ describe('#1568: prefab-edit Refresh R2 gaps', () => {
     expect(all().filter((e) => e.name === 'Kid')).toHaveLength(1);
   });
 
-  // C2: a node with a runtime guid is captured with none, so the settle could not see that the re-apply had re-homed it,
-  // kept it in the orphan row too, and the restore spawned it — and its durable child — a second time.
-  // Mutation: in `captureRowsForSettle`'s `unhomed`, drop the guid-less clause.
-  it('a runtime-guid node the re-apply re-homed is not spawned again when its member comes back', async () => {
+  // C2: a node with a runtime guid is captured with none. When the re-apply RE-HOMED it, the settle could not see that,
+  // kept it in the orphan row too, and the restore spawned it — and its durable child — a second time. Since #1880 F3a
+  // (hub ruling B′: R2 / fork 2) nothing re-homes it: it vanishes with Leaf into the kept row, and comes back EXACTLY once
+  // with Leaf, its durable child under its own guid. The flipped assertion is the precondition (was "re-homed, not
+  // lost": now "kept in the orphan row, not lost, back with the member"). Mutation: re-anchor in the respawn (skip
+  // `withoutGoneMemberNodes`) — P is live after the drop AND kept in the row, and the restore spawns it twice.
+  it('a runtime-guid node under a member the template drops vanishes with it and comes back once, its child\'s guid intact', async () => {
     const CG = 'eeeeeeee-0000-4000-8000-0000000000c2';
     install(midDoc());
     install(innerWith(leafRow()));
@@ -980,7 +989,7 @@ describe('#1568: prefab-edit Refresh R2 gaps', () => {
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'C', parentId: p.id(), guid: CG }));
     install(innerWith());
     await quietly(() => rebaseStaleInstances());
-    expect(inMid('P')).toHaveLength(1); // precondition: re-homed, not lost
+    expect(inMid('P')).toHaveLength(0); // precondition: gone with Leaf, kept in its row (not lost: it comes back below)
     install(innerWith(leafRow()));
     await quietly(() => rebaseStaleInstances());
     expect(inMid('P')).toHaveLength(1);

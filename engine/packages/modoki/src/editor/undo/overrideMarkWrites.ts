@@ -28,9 +28,10 @@
  *  component, and the next save dropped the values the screen still showed. Unity keeps its overrides as data on the
  *  instance (`m_Modifications`), which its undo snapshots like any other; this is that rule for Modoki's side store. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity, writeTraitField, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
-import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { markOverride, unmarkOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks, ROTATION_MARKS } from '../../runtime/loaders/overrideMarks';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
 import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { getCachedPrefabSync } from '../scene/prefabCache';
@@ -89,8 +90,13 @@ export function reconcileOverrideMarks(entityId: number, meta: TraitMeta, fields
   if (!m || !m.entity.has(meta.trait)) return;
   const off = fieldsOffBase(entityId, meta, m.pi);
   const list = fields ?? Object.keys(collectComparableTraits(entityId, [meta])[meta.name] ?? {});
+  // Rotation is ONE mark (#1880 F5, `ROTATION_MARKS`): decided once for the group, or an axis equal to its base would
+  // unmark the whole rotation another axis just marked.
+  const isRotation = (f: string) => (ROTATION_MARKS as readonly string[]).includes(`${meta.name}.${f}`);
+  const rotationOff = off === null || [...off].some(isRotation);
   for (const f of list) {
-    if (off === null || off.has(f)) markOverride(m.entity, meta.name, f);
+    const differs = isRotation(f) ? rotationOff : off === null || off.has(f);
+    if (differs) markOverride(m.entity, meta.name, f);
     else unmarkOverride(m.entity, meta.name, f);
   }
 }
@@ -207,7 +213,7 @@ export function takeUnmarkedFromBase(entityId: number, traits?: readonly TraitMe
   const prefab = getCachedPrefabSync(source);
   if (!prefab) return;
   const base = instanceBase(root, prefab);
-  const baseEntity = base.entities.find((x) => x.localId === localId);
+  const baseEntity = rowAt(base, localId);
   if (!baseEntity) return;
   const resolve = baseTokenResolver(root);
   const metas = (traits ?? getAllTraits()).filter((t) => t.category !== 'tag' && m.entity.has(t.trait));

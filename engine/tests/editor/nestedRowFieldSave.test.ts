@@ -1327,9 +1327,12 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(getAllEntities().filter((e) => e.name === 'A')).toHaveLength(1);
     });
 
-    it('a scene-ADDED node under a member a Refresh drops is kept ONCE — re-homed live, not also in the kept row (review F1)', async () => {
-      // Mutation: keep the row whole in the settle (`unhomed` returning its input) — the save holds X twice, and the
-      // restore spawns a second X with the same guid.
+    it('a scene-ADDED node under a member a Refresh drops VANISHES with it, kept in its row, and comes back ONCE (review F1, #1880 F3a B′)', async () => {
+      // Flipped by #1880 F3a (hub ruling B′, 2026-09-30): R2 / fork 2 (owner, 2026-09-24) — what the scene hung under a
+      // member the template drops vanishes with it and returns with it. The rebuild used to RE-HOME X at the instance root
+      // while a reload of the same scene kept it in the orphan row (rebuild ≠ reload, hunt seed 1127); review F1's point
+      // stands — X is never spawned twice. Mutations: re-anchor in the respawn (skip `withoutGoneMemberNodes`) — X is live
+      // after the drop; keep the row whole in the settle AND re-home — the restore spawns a second X with the same guid.
       const gX = 'ffffffff-0000-4000-8000-000000001535';
       const xNode = { parentLocalId: 0, guid: gX, name: 'X', children: [],
         traits: { EntityAttributes: { name: 'X', parentId: 0, guid: gX }, Transform: { x: 3, y: 0, z: 0 } } };
@@ -1340,14 +1343,51 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       await load(sc as unknown as SceneData);
       install(pNoA());
       expect(await rebaseStaleInstances()).toBe(1);
-      expect(xs()).toHaveLength(1);
+      expect(xs()).toHaveLength(0); // gone with A…
       const dropped = await entryOf(P);
-      expect((rows(dropped)[`/${gA}`] as { added?: unknown }).added).toBeUndefined();
+      expect(JSON.stringify(rows(dropped)[`/${gA}`])).toContain(gX); // …and kept in A's row, not lost
+      // A reload of what the Refresh left agrees: rebuild ≡ reload.
+      await load((await serializeScene()) as unknown as SceneData);
+      expect(xs()).toHaveLength(0);
       install(pDoc());
       expect(await rebaseStaleInstances()).toBe(1);
       expect(xs()).toHaveLength(1);
+      expect(getAllEntities().filter((e) => e.guid === gX)).toHaveLength(1);
       await load((await serializeScene()) as unknown as SceneData);
       expect(xs()).toHaveLength(1);
+    });
+
+    it('a reference node whose prefab went MISSING, under a member a Refresh drops, vanishes into its row too, and comes back once (#1880 F3a review 1)', async () => {
+      // Y is a live instance of S when S is trashed, so the teardown KEEPS its frame for a moment (`rebuildTeardown`'s
+      // unexpandable keep): the settle read it as live and stripped it from the row, and `seatKeptFrames` then deleted it
+      // as unnamed — gone from the world AND the row. Mutation: count dropped guids as live in the settle (`liveGuids`
+      // without the `dropped` exclusion) — Y is in neither after the drop.
+      const S = 'cccccccc-0000-4000-8000-000000001536';
+      const sDoc = { id: S, version: 6, name: 'S', rootLocalId: 1, entities: [
+        { localId: 1, name: 'SR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001536', traits: { EntityAttributes: { name: 'SR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },
+      ] };
+      const gY = 'ffffffff-0000-4000-8000-000000001536';
+      const yNode = { parentLocalId: 0, guid: gY, name: 'SR', prefab: S, traits: {}, children: [] };
+      const sc = scene(P, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gA}`]: { added: [yNode] } };
+      const ys = () => getAllEntities().filter((e) => e.guid === gY);
+      install(pDoc(), sDoc);
+      await load(sc as unknown as SceneData);
+      expect(ys(), 'premise: Y is a live instance of S').toHaveLength(1);
+      prefabs.delete(S); setPrefabCache(S, null); // S is trashed
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+      install(pNoA());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(ys()).toHaveLength(0);
+      expect(JSON.stringify(rows(await entryOf(P))[`/${gA}`])).toContain(gY);
+      install(pDoc());
+      expect(await rebaseStaleInstances()).toBe(1);
+      expect(ys()).toHaveLength(1);
+      await load((await serializeScene()) as unknown as SceneData);
+      expect(ys()).toHaveLength(1);
+      } finally { warn.mockRestore(); err.mockRestore(); }
     });
 
     it('a kept `false` on an owned nested ROOT restores the trait the row removes from it (review F2)', async () => {
@@ -1408,6 +1448,32 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       // and the case stayed green while the rebuild wrote A's x onto B2. Mutation: drop the translation in
       // `reapplyNestedInstanceOverrides` — B2 shows 6.
       expect(x(inInstance(ROOT1, 'B2'))).toBe(0);
+    });
+
+    it('a scene node under a member of a nested row RE-POINTED to another prefab vanishes into the member\'s row, as a reload keeps it (#1880 close-out re-review 1)', async () => {
+      // The frame now expands P2, which has no A: the node the scene hung under A goes with A (R2, fork 2). Judged against
+      // the frame's OLD source it was re-homed at P2's root and lost from the row (rebuild != reload). Mutation: filter
+      // the nested capture against `getCachedPrefabSync(cap.source)` instead of the frame's document now — X is live.
+      const P2 = 'cccccccc-0000-4000-8000-000000001544';
+      const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001545'), row(2, 'B2', 1, 'eeeeeeee-0000-4000-8000-000000001546')] };
+      const swapped = () => { const d = oDoc(); (d.entities[3] as Record<string, unknown>).prefab = P2; return d; };
+      const gX = 'ffffffff-0000-4000-8000-000000001537';
+      const xNode = { parentLocalId: 0, guid: gX, name: 'X', children: [], traits: { EntityAttributes: { name: 'X', parentId: 0, guid: gX }, Transform: { x: 3, y: 0, z: 0 } } };
+      const sc = scene(O, [ROOT1]) as unknown as { entities: Array<Record<string, unknown>> };
+      sc.entities[1]!.members = { [`/${gN}/${gA}`]: { added: [xNode] } };
+      const xs = () => getAllEntities().filter((e) => e.guid === gX);
+      install(pDoc(), p2, oDoc());
+      await load(sc as unknown as SceneData);
+      expect(xs(), 'premise: X hangs under A').toHaveLength(1);
+      install(swapped());
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(await rebaseStaleInstances()).toBe(1);
+        expect(xs()).toHaveLength(0);
+        expect(JSON.stringify(rows((await saved()).entry)[`/${gN}/${gA}`])).toContain(gX);
+        await load((await serializeScene()) as unknown as SceneData);
+        expect(xs()).toHaveLength(0);
+      } finally { warn.mockRestore(); }
     });
 
     it('a Refresh dropping a node from row N\'s nestedStructure SLOT keeps the scene edit to it (re-review 3)', async () => {

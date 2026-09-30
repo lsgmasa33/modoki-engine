@@ -14,8 +14,9 @@
  *  template write calls the same function. Runtime never MINTS a key — only the editor does, when
  *  nothing matches — so the result depends only on the world and the prefab documents. */
 
+import { rowAt } from './prefabOverrides';
 import type { World } from 'koota';
-import { deriveMemberGuid, addedKeyStep, entityStep, memberRowNodes, isFrameStep, type MemberStep } from '../core/assetRefRules';
+import { isMemberDerivation, addedKeyStep, entityStep, memberRowNodes, isFrameStep, type MemberStep } from '../core/assetRefRules';
 import type { PackedEntity } from '../core/ecs/entityTable';
 
 /** The slice of a prefab document the key walk reads (a `PrefabFile` / loader doc fits structurally). */
@@ -107,7 +108,7 @@ export function walkFramePath(
       flat.push(s);
     } else {
       flat.push(s);
-      if (typeof s === 'number' && !enter(top.doc.entities.find((e) => e.localId === s)?.prefab)) return null;
+      if (typeof s === 'number' && !enter(rowAt(top.doc, s)?.prefab)) return null;
     }
     depth.push(stack.length - 1);
   }
@@ -238,7 +239,8 @@ export function recoverTemplateKey(
     // the key back — live, and at the next load's heal — and the child read as the template's again (#1874 review F1).
     if (node.guid && node.pi) {
       for (const k of keys) {
-        if (deriveMemberGuid(node.guid, [...steps, addedKeyStep(k)]) === self.guid) { memo.set(ecsId, k); return k; }
+        // A salted derivation too (#1882): a keyed node whose plain guid a pin held took a salted one, and the save stored it.
+        if (isMemberDerivation(self.guid, node.guid, [...steps, addedKeyStep(k)])) { memo.set(ecsId, k); return k; }
       }
     }
     if (isTop?.(cur)) break;

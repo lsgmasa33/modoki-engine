@@ -4,6 +4,7 @@
  *  answers; the re-import (`prefabReimport.ts`) reports by them. */
 
 import { type PrefabFile } from './prefab';
+import { rowAt } from '../../runtime/core/prefabRowAt';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { resolveRef, isGuid, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
@@ -28,7 +29,7 @@ export function usedLive(keys: ReadonlySet<string>): boolean {
       if (d.rootInstanceId !== entity.id()) return;
       const rec = frameRootDoc(world, entity);
       const rows = (rec?.doc as PrefabFile | undefined)?.entities ?? [];
-      if (rec?.unexpanded?.some((lid) => names(rows.find((r) => r.localId === lid)?.prefab))) used = true;
+      if (rec?.unexpanded?.some((lid) => names(rowAt(rows, lid)?.prefab))) used = true;
     });
   }
   return used || placeholdersOf(keys).length > 0;

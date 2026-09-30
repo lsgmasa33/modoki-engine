@@ -16,6 +16,7 @@
  *  The caller asks whether the world may be rebuilt now (Play, a preview, a landing switch) and defers otherwise; this
  *  holds the world against a switch while it runs, as `rebaseStaleInstancesSoon` does. */
 
+import { rowAt } from '../../runtime/core/prefabRowAt';
 import { commitPrefabChanges } from './prefabCommit';
 import { preloadNestedPrefabs, getCachedPrefabSync, preloadNestedPrefabsForSubtree } from './prefabCache';
 import { staleFrames, type StaleFrame } from './prefabFrames';
@@ -115,7 +116,7 @@ async function reexpandPlaceholders(sources: ReadonlySet<string>): Promise<void>
       if (!d.source || d.rootInstanceId !== entity.id()) return;
       const rec = frameRootDoc(world, entity);
       const rows = (rec?.doc as PrefabFile | undefined)?.entities ?? [];
-      if (rec?.unexpanded?.some((lid) => { const r = rows.find((x) => x.localId === lid); return !!r?.prefab && names(r.prefab); })) roots.add(entity.id());
+      if (rec?.unexpanded?.some((lid) => { const r = rowAt(rows, lid); return !!r?.prefab && names(r.prefab); })) roots.add(entity.id());
     });
     const frames: StaleFrame[] = [];
     for (const root of roots) {

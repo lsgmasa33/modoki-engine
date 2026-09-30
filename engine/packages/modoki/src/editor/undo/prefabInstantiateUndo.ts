@@ -8,127 +8,32 @@
  *  mutable slot here makes that impossible: undo always tears down whatever is
  *  currently live, redo re-instantiates and updates the slot.
  *
- *  Redo RESTORES THE ORIGINAL GUIDS, it does not just re-spawn. `respawn()` runs
- *  the ordinary instantiate path, which mints a fresh guid per entity — so an
- *  undo+redo used to hand the user a visually identical subtree under a brand-new
- *  identity (measured: guid 45cd77c4… became b0b3c186… on redo, QA-ASSET-0018).
- *  Under the GUID-only-refs design that silently orphans every reference minted
- *  against the entity in between, with nothing on screen to show for it, so the
- *  captured guids are stamped back over the respawned subtree below. */
+ *  Redo RESTORES THE ORIGINAL IDENTITY, it does not just re-spawn. The ordinary instantiate mints a fresh root guid, so
+ *  an undo+redo used to hand the user a visually identical subtree under a brand-new identity (measured: guid 45cd77c4…
+ *  became b0b3c186… on redo, QA-ASSET-0018), silently orphaning every reference minted against it in between. So the
+ *  redo hands the respawn the root guid it recorded, and the respawn mints THAT before the members derive.
+ *
+ *  ⚠️ The ROOT guid is the instance's whole identity. Every member's guid derives from it and its template path
+ *  (`deriveMemberGuid`), and a fresh instantiate stores no member guid of its own. So the members come back by the same
+ *  derivation a reload runs, on whatever the template holds now. The redo used to stamp each captured member guid back
+ *  by `name#siblingIndex` instead, over members the respawn had ALREADY derived from a throwaway root guid: a sibling
+ *  added between the undo and the redo (an outside edit adding a row whose name sorts first) shifted every index under
+ *  it, no path matched, and only the root got its guid back. Every member kept a guid derived from the throwaway root, so
+ *  refs to them dangled and a reload changed them all (#1880 T4, hunt seed 1044). */
 import type { UndoAction } from './undoManager';
 import { entityRef, type EntityRef } from './entityRef';
 import { reportUndoFailure, UndoRefusedError } from './undoFailure';
 import { StalePrefabRead } from '../scene/stalePrefabRead';
 import { PrefabEditRefusalError } from '../scene/prefabEditRefusalError';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
-import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
-  from '../../runtime/core/ecs/entityUtils';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { durableGuid, entityStep, type MemberPi } from '../../runtime/core/assetRefRules';
-import { templateKeyOf } from '../../runtime/core/templateIdentity';
-import { findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 
-/** Structural address of one entity within an instantiated subtree, e.g.
- *  `""` (the root) or `"Arm#0/Hand#1"`. Keyed by NAME + sibling index rather than by
- *  position in a flat list so a prefab that gained or lost a child between the undo and
- *  the redo still re-identifies the children it does still have, instead of shifting every
- *  guid one slot along — which would be worse than minting fresh ones. */
-type SubtreePath = string;
-
-/** Walk `rootId`'s subtree depth-first in a canonical order (siblings by sortOrder, then
- *  name, then TEMPLATE identity — a member's step or a keyed node's key — then id), returning each entity's id and
- *  structural path. Both instantiations of one prefab produce the same paths.
- *
- *  ⚠️ This is DELIBERATELY not `compareSiblings` (the Hierarchy/serializer rule, which
- *  tiebreaks on the GUID) — it used to claim it matched the Hierarchy, and #500 made that
- *  false when the panel moved to a guid tiebreak. Keeping the claim would have been the
- *  tempting fix; changing the order to restore it is the dangerous one. This function
- *  exists to map guids BY STRUCTURAL PATH, so ordering by guid is circular: the path is
- *  built from `name#index`, and a guid tiebreak would let a re-instantiation that mints
- *  different guids produce a different sibling order, shifting every path one slot and
- *  breaking exactly the re-identification this is for. Name-then-id is structural, which
- *  is the property that matters here. Agreement with the panel is not. */
-function subtreePaths(rootId: number, flat: EntityInfo[]): { id: number; path: SubtreePath }[] {
-  const childrenByParent = new Map<number, EntityInfo[]>();
-  for (const e of flat) {
-    if (e.parentId > 0) {
-      let arr = childrenByParent.get(e.parentId);
-      if (!arr) { arr = []; childrenByParent.set(e.parentId, arr); }
-      arr.push(e);
-    }
-  }
-  // Two siblings with one sortOrder and one name are told apart by their TEMPLATE identity — the step every identity walk
-  // gives them (`entityStep`: a keyed node's key FIRST, then a member's localId or a nested root's parentLocalId) —
-  // before the ecs id. The ecs id is not structural: a respawn hands ids out in another order, and the redo then stamped
-  // each captured guid on the OTHER sibling, so every ref to either silently swapped (#1831 hunt seed 5785; Unity:
-  // undo/redo restores the same objects, same identities). Key first because two keyed reference roots of one prefab
-  // share a member step (close-out review). ⚠️ Residual: siblings from DIFFERENT frames (a moved member beside an outer
-  // member with the same localId) can still share a step, and fall back to the ecs id as before.
-  const piMeta = getTraitByName('PrefabInstance');
-  const rankOf = (e: EntityInfo): string => {
-    const pi = piMeta ? (readTraitData(e.id, piMeta) as MemberPi) : null;
-    const key = templateKeyOf(findEntity(e.id));
-    if (!pi && !key) return '2:';
-    const step = entityStep(pi, key);
-    return typeof step === 'number' ? `0:${String(step).padStart(12, '0')}` : `1:${step}`;
-  };
-  for (const arr of childrenByParent.values()) {
-    arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || rankOf(a).localeCompare(rankOf(b)) || a.id - b.id);
-  }
-  const out: { id: number; path: SubtreePath }[] = [];
-  // ⚠️ A parent cycle REFUSES, naming the entity, instead of recursing until the stack overflows (#1793 defence in
-  // depth, hub 2026-09-29). #1793's redo parented an instance root under its own member, and this walk was where it
-  // threw `Maximum call stack size exceeded`. The drop's parent is resolved by guid now, so this should never fire.
-  const visited = new Set<number>();
-  const walk = (id: number, path: SubtreePath) => {
-    if (visited.has(id)) {
-      const name = flat.find((e) => e.id === id)?.name ?? String(id);
-      throw new UndoRefusedError(`[Prefab] refusing to walk the instance under entity ${rootId}: "${name}" (entity ${id}) is its own ancestor — a parent cycle (#1793).`,
-        `"${name}" is inside its own subtree (a parent cycle), so this step was not applied.`);
-    }
-    visited.add(id);
-    out.push({ id, path });
-    const kids = childrenByParent.get(id) ?? [];
-    kids.forEach((k, i) => walk(k.id, `${path}${path ? '/' : ''}${k.name}#${i}`));
-  };
-  if (flat.some((e) => e.id === rootId)) walk(rootId, '');
-  return out;
-}
-
-/** Snapshot the subtree's guids by structural path. Reads only — prefab instantiation
- *  already mints a guid per entity, and an entity that somehow has none is simply not
- *  recorded (there is no identity to preserve). */
-function captureSubtreeGuids(rootId: number): Map<SubtreePath, string> {
+/** The durable guid `rootId` carries, or undefined (#1210: a runtime guid belongs to the world it was minted in). */
+function rootGuidOf(rootId: number): string | undefined {
   const eaMeta = getTraitByName('EntityAttributes');
-  const out = new Map<SubtreePath, string>();
-  if (!eaMeta) return out;
-  for (const { id, path } of subtreePaths(rootId, getAllEntities())) {
-    // Durable only (#1210): a runtime guid belongs to the world it was minted in, so stamping it back
-    // onto a respawn would keep a dead address alive instead of the respawn's own.
-    const guid = durableGuid(readTraitData(id, eaMeta)?.guid as string);
-    if (guid) out.set(path, guid);
-  }
-  return out;
-}
-
-/** Stamp the captured guids back onto a freshly respawned subtree, matching by structural
- *  path. Skips a guid another live entity still holds — re-using it would put two entities
- *  under one identity, which is strictly worse than the fresh guid the respawn already
- *  gave this one. */
-function restoreSubtreeGuids(rootId: number, captured: Map<SubtreePath, string>): void {
-  const eaMeta = getTraitByName('EntityAttributes');
-  if (!eaMeta || captured.size === 0) return;
-  for (const { id, path } of subtreePaths(rootId, getAllEntities())) {
-    const want = captured.get(path);
-    if (!want) continue;
-    const current = (readTraitData(id, eaMeta)?.guid as string) || '';
-    if (current === want) continue;
-    const holder = findEntityByGuid(want);
-    if (holder && holder.id() !== id) continue;
-    writeTraitField(id, eaMeta, 'guid', want);
-    const ent = findEntity(id);
-    if (ent) indexEntityGuid(ent);
-  }
+  return eaMeta ? durableGuid(readTraitData(rootId, eaMeta)?.guid as string) || undefined : undefined;
 }
 
 export function makePrefabInstantiateAction(opts: {
@@ -138,8 +43,9 @@ export function makePrefabInstantiateAction(opts: {
   /** Re-instantiate the prefab; return the new root id, or `null` if it could
    *  not be spawned (e.g. the prefab file was deleted between undo and redo) — in
    *  which case the live id is left unchanged, matching the original
-   *  early-return behavior (nothing new exists to track). */
-  respawn: () => Promise<number | null>;
+   *  early-return behavior (nothing new exists to track). `rootGuid` is the root guid to mint instead of a fresh one
+   *  (`instantiatePrefabInstance`'s `rootGuid`): the members derive from it. */
+  respawn: (rootGuid: string | undefined) => Promise<number | null>;
   /** Tear down the live instance. Safe to call with a stale id (no-op). */
   remove: (id: number) => void;
 }): UndoAction {
@@ -147,9 +53,9 @@ export function makePrefabInstantiateAction(opts: {
   // tears down the right entity after a world rebuild (Play→Stop). The instance
   // root carries a stable guid from instantiation (prefab.ts mints one).
   let currentRef: EntityRef = entityRef(opts.initialId);
-  // Captured at action-creation time, refreshed after every redo so a subsequent
-  // undo→redo keeps restoring the SAME identities rather than the last respawn's.
-  let capturedGuids = captureSubtreeGuids(opts.initialId);
+  // Recorded at action-creation time, and re-read after every redo: a redo that could not take it (another live entity
+  // holds it) keeps the guid the respawn minted, and the next undo→redo restores that one.
+  let rootGuid = rootGuidOf(opts.initialId);
   return {
     label: opts.label,
     // The scene the new instance belongs to: a base, when it was dropped under a base entity (#1429).
@@ -165,7 +71,7 @@ export function makePrefabInstantiateAction(opts: {
       // undoes the step before this one, as it would after any dropped entry.
       let id: number | null;
       try {
-        id = await opts.respawn();
+        id = await opts.respawn(rootGuid);
       } catch (e) {
         // A prefab-edit refusal (#1817, #1836) is a refusal too: the redo would place what the edit world cannot save.
         if (e instanceof StalePrefabRead || e instanceof PrefabEditRefusalError) throw new UndoRefusedError(e.message, e.message);
@@ -185,8 +91,7 @@ export function makePrefabInstantiateAction(opts: {
         });
         return;
       }
-      restoreSubtreeGuids(id, capturedGuids);
-      capturedGuids = captureSubtreeGuids(id);
+      rootGuid = rootGuidOf(id);
       currentRef = entityRef(id);
     },
   };

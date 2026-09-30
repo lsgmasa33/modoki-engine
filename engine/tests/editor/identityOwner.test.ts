@@ -332,20 +332,24 @@ describe('#1761: a template\'s member token resolves AFTER the pins are final �
   ] } as unknown as SceneData);
   const target = () => (readTraitData(one('B'), getTraitByName('UIAction')!) as { bindings: Array<{ target: string }> }).bindings[0]!.target;
 
-  it('A\'s stored pin collides with B\'s derivation and is dropped: B\'s token still names A, not B', async () => {
-    // Mutation: settle inside the first derive again (`deriveInstanceMemberGuids` before `dropCollidingPins` in the
-    // load) — the token resolves to A's pinned guid, which B holds once the pin is dropped: B's action targets itself.
+  it('A and B pinned to ONE guid are both dropped, and B\'s token names A by its FINAL guid', async () => {
+    // Two pins on one guid is the collision left to `dropCollidingPins` since #1882 (a pin meeting a DERIVATION salts the
+    // derivation instead, `sceneMemberRows.test.ts`): both pins are suspect, both drop, both re-derive. The token must be
+    // resolved after that. Mutation: settle inside the first derive (`settleDerivedGuids` right after the first
+    // `deriveMemberGuidsOnly` in `deriveMemberGuidsAfterPins`) — the token keeps the dropped guid, which nothing holds.
     install(tDoc());
     await load(sceneWith());
     const derivedB = getAllEntities().find((e) => e.id === one('B'))!.guid!;
     expect(target()).toBe(getAllEntities().find((e) => e.id === one('A'))!.guid); // precondition: the token resolves
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await load(sceneWith({ [`/${gA}`]: { guid: derivedB, name: 'A' } })); // a damaged row: A pinned to B's derivation
-    const dropped = warn.mock.calls.some((c) => String(c[0]).includes('dropping the pin'));
+    // A damaged pair: A and B both pinned to B's derivation.
+    await load(sceneWith({ [`/${gA}`]: { guid: derivedB, name: 'A' }, '/eeeeeeee-0000-4000-8000-000000176103': { guid: derivedB, name: 'B' } }));
+    const dropped = warn.mock.calls.filter((c) => String(c[0]).includes('dropping the pin')).length;
     warn.mockRestore();
-    expect(dropped).toBe(true); // precondition: the collision is real and the pin yields
+    expect(dropped).toBe(2); // precondition: both pins yield
     const guidA = getAllEntities().find((e) => e.id === one('A'))!.guid;
-    expect(guidA).not.toBe(derivedB);
+    const guidB = getAllEntities().find((e) => e.id === one('B'))!.guid;
+    expect(new Set([guidA, guidB]).size).toBe(2);
     expect(target()).toBe(guidA);
   });
 });
@@ -377,8 +381,9 @@ describe('#1759: a Replace keeps every matched row\'s localId, and numbers a new
   };
 
   it('the #1759 repro: delete A and add X on I0, Replace — I1\'s B keeps its guid, X takes neither A\'s nor B\'s, and no pin is dropped', async () => {
-    // Mutation: return null from `replaceNumbering` (positional numbering) — B is written at 2 and X at 3, B derives A's
-    // old guid, its stored pin collides and is dropped ("dropping the pin"), and I1's B reloads under A's guid.
+    // Mutation: return null from `replaceNumbering` (positional numbering) — B is written at 2 and X at 3, and the
+    // numbering assert goes red (measured). Before #1882 B then derived A's old guid, its stored pin was dropped, and I1's
+    // B reloaded under A's guid; since #1882 the colliding derivation salts instead, so the numbering is what is left.
     await twoInstances();
     const before = { A: inInst(I1, 'A').guid, B: inInst(I1, 'B').guid };
     const saved = await serializeScene() as unknown as SceneData; // I1's member rows pin A's and B's guids

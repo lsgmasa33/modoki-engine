@@ -26,6 +26,7 @@
  *  drifting from it the next time one of the two changes. One builder
  *  (`collectInstanceOverrideListing`), one set of key shapes, two consumers. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData, getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
@@ -164,7 +165,7 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     // applied, and a MARKED value equal to its base is listed, as the save keeps it — except a field an enclosing row
     // states, whose value arrives marked too and would be listed as this instance's own.
     const marks = getOverrideMarkSet(entity);
-    gateOnMarks(diffs, marks, base.entities.find((e) => e.localId === localId), () => movedOf(ecsId, !!diffs['Transform']));
+    gateOnMarks(diffs, marks, rowAt(base, localId), () => movedOf(ecsId, !!diffs['Transform']));
     foldMarkedEqual(diffs, marks, currentTraits, layerRows?.[localId]);
     if (Object.keys(diffs).length === 0) return;
 
@@ -178,11 +179,11 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
       if (typeof ea?.parentId === 'number') parentEcsId = ea.parentId as number;
     }
     if (!name) {
-      const prefabEntity = prefab.entities.find((e) => e.localId === localId);
+      const prefabEntity = rowAt(prefab, localId);
       name = (prefabEntity?.name as string) || `localId ${localId}`;
     }
 
-    const prefabEntity = base.entities.find((e) => e.localId === localId);
+    const prefabEntity = rowAt(base, localId);
     const traitNodes: TraitNode[] = [];
     for (const [traitName, fields] of Object.entries(diffs)) {
       if (getTraitByName(traitName)?.category === 'tag') {
@@ -301,7 +302,7 @@ export function collectInstanceOverrideListing(rootInstanceId: number, prefab: P
   const added = structure.added.filter((node) => !!node.guid).map((node) => ({ node, key: addedKey(node.guid) }));
   const unaddressableAdded = structure.added.length - added.length;
   const refOf = documentMemberRefs(prefab);
-  const prefabName = (localId: number) => prefab.entities.find((e) => e.localId === localId)?.name || `localId ${localId}`;
+  const prefabName = (localId: number) => rowAt(prefab, localId)?.name || `localId ${localId}`;
   const removedEntities = structure.removed.map((localId) => ({ localId, name: prefabName(localId), key: removedEntityKey(refOf(localId)) }));
   const removedTraits: RemovedTraitNode[] = [];
   for (const [localIdStr, names] of Object.entries(structure.removedTraits)) {

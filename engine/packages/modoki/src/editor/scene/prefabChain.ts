@@ -2,6 +2,7 @@
  *  nested frame moves.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { nestedMoveRef } from './overrideKeyGrammar';
@@ -31,7 +32,7 @@ export function memberOverrideKeys(
   const moved = () => !!rootInstanceId && instanceMovedMembers(rootInstanceId, prefab)(entityId, !!diffs['Transform']);
   const entity = findEntity(entityId);
   const marks = entity ? getOverrideMarkSet(entity) : null;
-  gateOnMarks(diffs, marks, base.entities.find((e) => e.localId === localId), moved);
+  gateOnMarks(diffs, marks, rowAt(base, localId), moved);
   foldMarkedEqual(diffs, marks, currentTraits, rootInstanceId ? enclosingRowOverrides(rootInstanceId)?.[localId] : undefined);
   const out = new Set<string>();
   for (const [traitName, fields] of Object.entries(diffs)) for (const field of Object.keys(fields)) out.add(`${traitName}.${field}`);

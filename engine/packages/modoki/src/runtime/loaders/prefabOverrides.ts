@@ -24,6 +24,9 @@ import { docRows, placedAnchor } from './memberTranslation';
 /** localId → trait name → field → value. */
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
 
+import { rowAt, referenceRowAt } from '../core/prefabRowAt';
+export { rowAt, referenceRowAt };
+
 /** Deep-merge two per-localId override maps (localId → trait → field → value).
  *  `b` wins on conflicts. Used to overlay a scene's nested-instance overrides on
  *  top of a prefab row's own overrides. Neither input is mutated. */
@@ -190,10 +193,15 @@ export function applyNodeRows<A extends KeyedNode<A>>(
   hit: Set<string> = new Set(),
 ): { nodes: A[] | undefined; hit: Set<string> } {
   if (!nodes || !rows.size) return { nodes: nodes as A[] | undefined, hit };
+  // A key two nodes carry names NEITHER (#1880 F3c, as `memberPathIndex` and the fold's `replaced()` answer): a hand edit or
+  // merge repeated it, the validator reports it, and a row applied to both would edit a node its writer never meant.
+  const seen = new Map<string, number>();
+  const count = (list: readonly A[]): void => { for (const n of list) { if (n.key) seen.set(n.key, (seen.get(n.key) ?? 0) + 1); if (n.children?.length) count(n.children); } };
+  count(nodes);
   const walk = (list: readonly A[]): A[] => {
     const out: A[] = [];
     for (const node of list) {
-      const row = node.key ? rows.get(node.key) : undefined;
+      const row = node.key && seen.get(node.key) === 1 ? rows.get(node.key) : undefined;
       if (row) hit.add(node.key!);
       if (row?.removed === true) continue;
       const children = node.children?.length ? walk(node.children) : node.children;
@@ -450,9 +458,8 @@ export function foldStructureLayers<A extends { parentLocalId: number }>(
   for (let i = 0; i < layers.length; i++) {
     const layer = layers[i]!;
     // This layer's legacy values at its own depth (`StructureLayer.values`), over every layer inside it. A slot owns the
-    // structural lists only, so a layer inside one still states its values. `lower` may already hold them (the spawner and
-    // `foldRowStep` merge every layer's legacy values into it, outer winning); stating them again here is what puts them
-    // over the rows of the layers inside.
+    // structural lists only, so a layer inside one still states its values. The layer is their ONE carrier (#1880 F1): no
+    // caller pre-merges them into `lower` any more, so this line is the only place a nested frame's legacy values land.
     if (layer.values) channels = { ...channels, overrides: mergeOverrideMaps(channels.overrides, layer.values) };
     // A layer inside the slot still FORWARDS: what its row states about a nested root's interior (`own`,
     // `traitRemovals`…) belongs to the frame below, which the slot does not own. Only its statements about
@@ -501,41 +508,56 @@ export interface FoldDoc<A, D, R> {
  *  layers reaching it, and what each of them forwarded to its nested roots. Applied at the frame's NESTED rows only:
  *  what the layers say of the frame's own members is the `channels` part {@link foldRowStep} returns beside it. */
 export interface ForwardState<D, R> {
-  nestedOverrides?: NestedOverridePaths;
   layers: StructureLayer<D, R>[];
   forwardRoots: readonly (ReadonlyMap<number, R> | undefined)[];
 }
 
+/** The legacy values `layers` state for THIS frame's members, merged: innermost first, the outer layer winning. The one
+ *  carrier of legacy values is the layer (#1880 F1, `StructureLayer.values`); a reader that needs them merged (a frame the
+ *  fold cannot expand, token noting) derives them here rather than keeping a second carrier beside the layers. */
+export function layerValues<D, R>(layers: readonly StructureLayer<D, R>[]): OverrideMap | undefined {
+  let out: OverrideMap | undefined;
+  for (const l of layers) if (l.values) out = mergeOverrideMaps(out, l.values);
+  return out;
+}
+
+/** {@link layerValues} for the frames BELOW: every layer's path-keyed `valuePaths`, merged, the outer layer winning. */
+export function layerValuePaths<D, R>(layers: readonly StructureLayer<D, R>[]): NestedOverridePaths | undefined {
+  let out: NestedOverridePaths | undefined;
+  for (const l of layers) out = mergeNestedOverridePaths(out, l.valuePaths);
+  return out;
+}
+
 /** ONE nested row expanded (#1707, I1's expansion side): what the layers above a frame (`state`) and the nested row
- *  `row` itself put on the row's child frame, whose document is `child`. The spawner's order: the row's `overrides` under
- *  the outer layer's forwarded direct ones, the row's lists unless an outer slot owns the frame (then the slot's, an
- *  absent list read as empty, and the slot's `moved`), and then every layer's member rows folded over both, inner first.
- *  `forward` is what the child frame hands ITS nested rows; null without a child document.
+ *  `row` itself put on the row's child frame, whose document is `child`. The row's lists unless an outer slot owns the
+ *  frame (then the slot's, an absent list read as empty, and the slot's `moved`), then each layer, inner first — the row's
+ *  own as the innermost — stating its legacy values and folding its member rows over them (`foldStructureLayers`; the
+ *  layer is the one carrier of legacy values, #1880 F1). `forward` is what the child frame hands ITS nested rows; null
+ *  without a child document.
  *
- *  The one statement of that step the pure readers share: the editor's effective base (`prefabBase.ts` `foldPath`), the
- *  validator and the UIEntries pool (`effectivePrefabMemberTraits`). The spawner still states it itself
- *  (`instantiatePrefabIntoWorld`, which the editor's `instantiatePrefab` calls since #1783); a test pins the two against
- *  each other. */
+ *  THE step, since #1880 F2: the spawner (`instantiatePrefabIntoWorld`, which the editor's `instantiatePrefab` calls since
+ *  #1783) calls it for every nested row, as the pure readers do — the editor's effective base (`prefabBase.ts`
+ *  `foldPath`), the validator and the UIEntries pool (`effectivePrefabMemberTraits`). */
 export function foldRowStep<A extends { parentLocalId: number }, D extends SlotLists<A>, R extends MemberRowChannels<A>>(
   row: FoldRow<A, D, R>,
   state: ForwardState<D, R>,
   child: FoldDoc<A, D, R> | null,
 ): { channels: FrameChannels<A>; moved?: Record<number, string>; forward: ForwardState<D, R> | null } {
-  const lid = row.localId ?? 0;
-  const { direct, forward } = descendNestedOverrides(state.nestedOverrides, lid);
-  const overrides = direct ? mergeOverrideMaps(row.overrides, direct) : row.overrides;
-  const pending = mergeNestedOverridePaths(row.nestedOverrides, forward);
   const d = descendStructureLayers(state.layers, row, state.forwardRoots);
+  // The row's own legacy values and the outer layers' reach the frame through the LAYERS only (#1880 F1): the row's as
+  // the innermost layer's `values`, each outer one's at its depth (`foldStructureLayers`). No pre-merge under the rows —
+  // that put every layer's legacy values under every layer's rows (#1877 S4).
   // An outer layer addressing this path OWNS the interior — all three lists, absent read as empty (`structDirect`).
   const lower: FrameChannels<A> = d.direct
-    ? { overrides, added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
-    : { overrides, added: row.added, removed: row.removed, removedTraits: row.removedTraits };
-  if (!child) return { channels: lower, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}), forward: null };
+    ? { overrides: undefined, added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
+    : { overrides: undefined, added: row.added, removed: row.removed, removedTraits: row.removedTraits };
+  // No document to fold rows over: the layers' values still reach its members, in their order.
+  if (!child) return { channels: { ...lower, overrides: layerValues(d.layers) }, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}), forward: null };
   const folded = foldStructureLayers(child, d.layers as StructureLayer<unknown, MemberRowChannels<A>>[], d.foldFrom, lower);
   return {
     channels: folded.channels,
     ...(d.direct ? { moved: d.direct.moved ?? {} } : {}),
-    forward: { nestedOverrides: pending, layers: d.layers, forwardRoots: folded.forwardRoots as ForwardState<D, R>['forwardRoots'] },
+    forward: { layers: d.layers, forwardRoots: folded.forwardRoots as ForwardState<D, R>['forwardRoots'] },
   };
 }
 
@@ -552,7 +574,7 @@ export function foldPath<A extends { parentLocalId: number }, D extends SlotList
   let state: ForwardState<D, R> = seed ?? { layers: [{}], forwardRoots: [] };
   if (!path.length) return { overrides: {}, structure: {}, forward: state };
   for (let i = 0; i < path.length; i++) {
-    const row = docs[i]?.entities.find((e) => e.localId === path[i] && e.prefab);
+    const row = referenceRowAt(docs[i], path[i]);
     if (!row) break;
     const step = foldRowStep(row, state, docs[i + 1] ?? null);
     if (i === path.length - 1) {
@@ -674,7 +696,7 @@ function topFrame(doc: AnyFoldDoc, opts: EffectiveMemberOptions): FrameFold {
   const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows, valuePaths: isRecord(opts.nestedOverrides) ? opts.nestedOverrides as NestedOverridePaths : undefined }];
   const lower = { overrides: opts.overrides, removedTraits: opts.removedTraits };
   const { channels, forwardRoots } = rows ? foldStructureLayers(doc, layers, 0, lower) : { channels: lower, forwardRoots: [] };
-  return { overrides: channels.overrides, removedTraits: channels.removedTraits, forward: { nestedOverrides: opts.nestedOverrides, layers, forwardRoots } };
+  return { overrides: channels.overrides, removedTraits: channels.removedTraits, forward: { layers, forwardRoots } };
 }
 
 /** The trait bag an instance of `prefab` would carry on its ROOT entity — or `null` when no root

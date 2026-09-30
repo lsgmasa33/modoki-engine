@@ -92,7 +92,9 @@ function pInstance(): { guid: string; root: number } {
   edit(byName('A'), 'Transform', 'x', 7);
   return { guid: 'g-p-root', root };
 }
-const ROOT_DEFAULTS = [`${G(1)}.EntityAttributes.name`, `${G(1)}.EntityAttributes.sortOrder`, `${G(1)}.Transform.rx`, `${G(1)}.Transform.x`];
+// The rx edit marks the WHOLE rotation (#1880 F5: rotation is one value, Unity's one quaternion), so rx, ry and rz are all
+// default overrides of the root.
+const ROOT_DEFAULTS = [`${G(1)}.EntityAttributes.name`, `${G(1)}.EntityAttributes.sortOrder`, `${G(1)}.Transform.rx`, `${G(1)}.Transform.ry`, `${G(1)}.Transform.rz`, `${G(1)}.Transform.x`];
 
 describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
   it('`overrides` lists the root\'s name, sort order, position and rotation as default overrides, and not the member\'s', async () => {
@@ -156,6 +158,26 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     const { guid } = pInstance();
     const res = await runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: [`${G(1)}.Transform.x`] }) as { newRootId: number };
     expect(read(res.newRootId, 'Transform')).toMatchObject({ x: 0, rx: 0.5 });
+  });
+
+  // #1880 close-out review 2: rotation is ONE value (F5), so one axis selected is the whole rotation. Reverted or applied
+  // alone, the two left behind re-marked it through the grouped mark store, and the override stayed. Mutation: drop the
+  // rotation expansion in `toLocalIdKeys` — both cases still list a rotation override after the gesture.
+  it('a Revert naming ONE rotation axis reverts the whole rotation: no rotation override is left', async () => {
+    const { guid } = pInstance();
+    const res = await runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: [`${G(1)}.Transform.rx`] }) as { newRootId: number };
+    expect(read(res.newRootId, 'Transform')).toMatchObject({ rx: 0, ry: 0, rz: 0 });
+    const ov = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys: { all: string[] } };
+    expect(ov.keys.all.filter((k) => /\.Transform\.r[xyz]$/.test(k))).toEqual([]);
+  });
+
+  it('an Apply naming ONE rotation axis writes the whole rotation to the template and leaves none on the instance', async () => {
+    const { guid } = pInstance();
+    const res = await runAgentOp('prefab', { action: 'apply', entityGuid: guid, keys: [`${G(1)}.Transform.rx`] }) as { appliedKeys: string[] };
+    expect(res.appliedKeys).toContain(`${G(1)}.Transform.rx`); // reported as the caller named it
+    expect(templateRow(P, 1).Transform).toMatchObject({ rx: 0.5, ry: 0, rz: 0 });
+    const ov = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys: { all: string[] } };
+    expect(ov.keys.all.filter((k) => /\.Transform\.r[xyz]$/.test(k))).toEqual([]);
   });
 
   it('an instance whose only overrides are default overrides: Apply All refuses and names them, writing nothing', async () => {

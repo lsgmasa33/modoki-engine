@@ -1,14 +1,18 @@
-/** Integration: undo→redo of a prefab instantiate restores the ORIGINAL guids (QA-ASSET-0018).
+/** Integration: undo→redo of a prefab instantiate restores the ORIGINAL identity (QA-ASSET-0018).
  *
  *  Measured on games/anim-bug: dropping a probe prefab onto the Hierarchy spawned guid
  *  45cd77c4-…, undo removed it, and redo brought back a visually identical Cube under
  *  b0b3c186-… — a different identity. Redo re-runs the ordinary instantiate path, which
- *  mints a fresh guid per entity, so under the GUID-only-refs design every reference minted
+ *  mints a fresh ROOT guid, so under the GUID-only-refs design every reference minted
  *  against the entity between the instantiate and the undo is silently orphaned by a plain
  *  undo+redo, with nothing on screen to show for it.
  *
- *  Mocks only world/traitRegistry (as undoSurvivesPlayStop.test.ts does) and drives the REAL
- *  action, with a `respawn` that mints fresh guids exactly like instantiatePrefabAsync. */
+ *  Since #1880 T4 / #1882 M1 the redo hands the respawn the ROOT guid it recorded, and the members DERIVE from it (a
+ *  fresh instantiate stores no member guid of its own): the per-member name#index stamp is gone. So the fake respawn here
+ *  does what the real one does — takes the root guid it is handed, else mints one, and derives each child from the
+ *  root — and the action is the REAL one. The real-respawn cases are `engine/tests/editor/instantiateUndoSiblingIdentity`.
+ *
+ *  Mocks only world/traitRegistry (as undoSurvivesPlayStop.test.ts does). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
@@ -75,13 +79,14 @@ const eaMeta = traitDefs[0];
 let guidSeq = 0;
 const freshGuid = () => `guid-${++guidSeq}`;
 
-/** One prefab instantiation: a root "Cube" with two children, each with a NEWLY minted guid —
- *  the behaviour that makes redo lose the identity. */
-function instantiate(): number {
-  const root = testWorld.spawn(EntityAttributes({ name: 'Cube', guid: freshGuid(), parentId: 0 }));
+/** One prefab instantiation, as the real one does it: the root takes `rootGuid` when it is handed one (a redo), else a
+ *  fresh guid, and each child DERIVES from the root's guid (`deriveMemberGuid`'s shape: the root plus the child's step). */
+function instantiate(rootGuid?: string): number {
+  const guid = rootGuid ?? freshGuid();
+  const root = testWorld.spawn(EntityAttributes({ name: 'Cube', guid, parentId: 0 }));
   entityIndex.set(root.id(), root);
   for (const [i, name] of ['Arm', 'Leg'].entries()) {
-    const child = testWorld.spawn(EntityAttributes({ name, guid: freshGuid(), parentId: root.id(), sortOrder: i }));
+    const child = testWorld.spawn(EntityAttributes({ name, guid: `${guid}|${i + 2}`, parentId: root.id(), sortOrder: i }));
     entityIndex.set(child.id(), child);
   }
   return root.id();
@@ -106,12 +111,15 @@ function guidsByName(rootId: number): Record<string, string> {
   return out;
 }
 
+const findHolder = (guid: string) => getAllEntities().some((e) => readTraitData(e.id, eaMeta as never)!.guid === guid);
+
 function makeAction(initialId: number) {
   let live = initialId;
   return makePrefabInstantiateAction({
     label: 'Instantiate "Cube"',
     initialId,
-    respawn: async () => { live = instantiate(); return live; },
+    // The real respawns mint the handed root guid unless another live entity holds it (`spawnPrefabInstance`).
+    respawn: async (rootGuid) => { live = instantiate(rootGuid && !findHolder(rootGuid) ? rootGuid : undefined); return live; },
     remove: (id) => destroySubtree(id),
   });
 }
@@ -134,7 +142,7 @@ describe('prefab instantiate undo→redo keeps the entity identity', () => {
 
     await action.redo();
     const newRoot = getAllEntities().find((e) => e.parentId === 0)!.id;
-    // The respawn minted guid-4/5/6; the action must have stamped guid-1/2/3 back.
+    // The respawn was handed guid-1 for the root, and the children derived from it.
     expect(guidsByName(newRoot)).toEqual(before);
   });
 
@@ -178,30 +186,24 @@ describe('prefab instantiate undo→redo keeps the entity identity', () => {
     await action.redo();
     const newRoot = getAllEntities().find((e) => e.parentId === 0 && e.name === 'Cube')!.id;
     // Two entities under one identity is worse than the fresh guid the respawn gave it.
-    expect(readTraitData(newRoot, eaMeta as never)!.guid).not.toBe(before.Cube);
+    const fresh = readTraitData(newRoot, eaMeta as never)!.guid as string;
+    expect(fresh).not.toBe(before.Cube);
     expect(readTraitData(squatter.id(), eaMeta as never)!.guid).toBe(before.Cube);
-    // The children are uncontested, so they still come back under their original guids.
-    expect(guidsByName(newRoot).Arm).toBe(before.Arm);
+    // The children derive from the root they came back under, as a reload would derive them (#1882 M1).
+    expect(guidsByName(newRoot).Arm).toBe(`${fresh}|2`);
   });
 });
 
-/** #1210: a runtime guid belongs to the world it was minted in. Redo must keep the respawn's own
- *  address rather than stamp a dead one back — only DURABLE guids are identity worth restoring.
- *  The runtime guid sits on a CHILD: the action's own `entityRef(initialId)` already mints a durable
- *  guid over the ROOT's before capture, so a root-only case could not tell the guard from its absence. */
-describe('prefab instantiate redo does not restore runtime guids (#1210)', () => {
-  it('a child\'s runtime guid captured before undo is not stamped onto the respawn', async () => {
-    const rootId = instantiate();
-    const arm = getAllEntities().find((e) => e.name === 'Arm')!;
-    const armEntity = entityIndex.get(arm.id) as { set(t: unknown, v: unknown): void; get(t: unknown): Record<string, unknown> };
-    armEntity.set(EntityAttributes, { ...armEntity.get(EntityAttributes), guid: formatRuntimeGuid(1, 1) });
-    const before = guidsByName(rootId);
+/** #1210: a runtime guid belongs to the world it was minted in. Redo must keep the respawn's own address rather than
+ *  hand a dead one back — only a DURABLE root guid is identity worth restoring (`rootGuidOf`). */
+describe('prefab instantiate redo does not restore a runtime root guid (#1210)', () => {
+  it('a root whose guid is a runtime guid is not handed back to the respawn', async () => {
+    const rootId = instantiate(formatRuntimeGuid(1, 1));
     const action = makeAction(rootId);
     await action.undo();
     await action.redo();
     const after = guidsByName(getAllEntities().find((e) => e.parentId === 0)!.id);
-    expect(after.Arm).not.toBe(formatRuntimeGuid(1, 1)); // the respawn's own address stands
-    expect(after.Cube).toBe(before.Cube);                 // durable identity is still restored
-    expect(after.Leg).toBe(before.Leg);
+    expect(after.Cube).not.toBe(formatRuntimeGuid(1, 1)); // the respawn's own address stands
+    expect(after.Arm).toBe(`${after.Cube}|2`);
   });
 });

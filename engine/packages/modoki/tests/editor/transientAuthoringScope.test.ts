@@ -70,6 +70,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
+  // #1882: the derive and the instantiate ask who holds a guid (a derivation steps around it); answered from this index.
+  findEntityByGuid: (guid: string) => [...index.values()].find((e: any) => e.has?.(EntityAttributes) && e.get(EntityAttributes).guid === guid),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },

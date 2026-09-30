@@ -4,8 +4,8 @@
  *    redo was exactly that id, recycled by koota during the call's own first pass, so the root was parented under its
  *    own member. And a parent that stops being the same entity during the spawn refuses once the walk has run, with what the
  *    call spawned taken back out.
- *  - `subtreePaths` (the instantiate undo's guid capture) REFUSES on a parent cycle, naming the entity, where it recursed
- *    until `Maximum call stack size exceeded`. */
+ *  (The instantiate undo's guid walk, `subtreePaths`, and its parent-cycle refusal went with #1880 T4 / seed 1044: the
+ *  redo restores the root guid alone and the members derive from it, so nothing walks the subtree.) */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
@@ -28,7 +28,6 @@ import { getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRu
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { instantiatePrefab, instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
-import { makePrefabInstantiateAction } from '../../packages/modoki/src/editor/undo/prefabInstantiateUndo';
 import { UndoRefusedError } from '../../packages/modoki/src/editor/undo/undoFailure';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -109,26 +108,5 @@ describe('a placement resolves its parent AFTER the instantiate\'s awaits (#1793
     const root = await instantiatePrefabInstance(doc(), '/assets/prefabs/R.prefab.json', () => { order.push('parent'); return x; }, () => { order.push('read'); return true; });
     expect(order).toEqual(['read', 'parent']);
     expect(readTraitData(root, ea())?.parentId).toBe(x);
-  });
-});
-
-describe('the instantiate undo\'s subtree walk refuses a parent cycle (#1793)', () => {
-  const action = (initialId: number) => makePrefabInstantiateAction({ label: 'Instantiate "R"', initialId, respawn: async () => null, remove: () => {} });
-
-  // Mutation: remove the visited set's throw in `subtreePaths` — the walk recurses until the stack overflows.
-  it('a cycle refuses, naming the entity, instead of overflowing the stack', () => {
-    const a = spawnNamed('Cyc A');
-    const b = spawnNamed('Cyc B', a);
-    writeTraitField(a, ea(), 'parentId', b);
-    let thrown: unknown;
-    try { action(a); } catch (e) { thrown = e; }
-    expect(thrown).toBeInstanceOf(UndoRefusedError);
-    expect(String((thrown as Error).message)).toMatch(/"Cyc A" \(entity \d+\) is its own ancestor — a parent cycle/);
-  });
-
-  it('(accept) a tree with no cycle records its guids as before', () => {
-    const a = spawnNamed('Tree A');
-    spawnNamed('Tree B', a);
-    expect(() => action(a)).not.toThrow();
   });
 });

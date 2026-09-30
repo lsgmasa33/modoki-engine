@@ -18,6 +18,7 @@
  *  The two spellings cannot collide: a guid is 36 characters with hyphens, a localId is digits. Neither
  *  contains `.` or `:`, which is what lets the key shapes keep their separators. */
 
+import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { isGuid } from '../../runtime/core/assetRefRules';
 import { localIdOfMember } from '../../runtime/loaders/memberTranslation';
 
@@ -30,7 +31,7 @@ export type KeyDocReader = (prefabRef: string) => KeyDoc | null | undefined;
 /** The member part a key should carry for row `localId` of `doc`: its `nodeGuid`, or the localId itself
  *  when the row has none. */
 export function memberRef(doc: KeyDoc, localId: number): string {
-  const g = doc.entities.find((e) => e.localId === localId)?.nodeGuid;
+  const g = rowAt(doc, localId)?.nodeGuid;
   return g && isGuid(g) ? g : String(localId);
 }
 
@@ -48,7 +49,7 @@ export function nestedMoveRef(doc: KeyDoc, chain: readonly number[], lid: number
   let cur: KeyDoc | null | undefined = doc;
   for (const row of chain) {
     refs.push(cur ? memberRef(cur, row) : String(row));
-    const ref: string | undefined = cur?.entities.find((e) => e.localId === row)?.prefab;
+    const ref: string | undefined = rowAt(cur, row)?.prefab;
     cur = ref ? readDoc(ref) : null;
   }
   return `~moved.${refs.join('.')}:${cur ? memberRef(cur, lid) : String(lid)}`;
@@ -68,7 +69,7 @@ export function nestedKeyRef(doc: KeyDoc, chain: readonly number[], inner: strin
   let cur: KeyDoc | null | undefined = doc;
   for (const row of chain) {
     refs.push(cur ? memberRef(cur, row) : String(row));
-    const ref: string | undefined = cur?.entities.find((e) => e.localId === row)?.prefab;
+    const ref: string | undefined = rowAt(cur, row)?.prefab;
     cur = ref ? readDoc(ref) : null;
   }
   const prefix = NESTED_KINDS.find((k) => inner.startsWith(k)) ?? '';
@@ -95,7 +96,7 @@ export function toLocalIdKey(key: string, doc: KeyDoc, readDoc: KeyDocReader): s
       const lid: number | null = cur ? localIdOfRef(cur, ref) : null;
       if (lid === null) return null;
       lids.push(lid);
-      const prefab: string | undefined = cur!.entities.find((e) => e.localId === lid)?.prefab;
+      const prefab: string | undefined = rowAt(cur!.entities, lid)?.prefab;
       cur = prefab ? readDoc(prefab) : null;
     }
     const inner = cur ? toLocalIdKey(nested.inner, cur, readDoc) : null;
@@ -123,7 +124,7 @@ export function toLocalIdKey(key: string, doc: KeyDoc, readDoc: KeyDocReader): s
       const lid: number | null = cur ? localIdOfRef(cur, ref) : null;
       if (lid === null) return null;
       lids.push(lid);
-      const prefab: string | undefined = cur!.entities.find((e) => e.localId === lid)?.prefab;
+      const prefab: string | undefined = rowAt(cur!.entities, lid)?.prefab;
       cur = prefab ? readDoc(prefab) : null;
     }
     const lid = cur ? localIdOfRef(cur, body.slice(colon + 1)) : null;
@@ -141,11 +142,18 @@ export function toLocalIdKeys(keys: Iterable<string>, doc: KeyDoc, readDoc: KeyD
   const out = new Set<string>();
   const original = new Map<string, string>();
   const unresolved: string[] = [];
+  const put = (n: string, k: string) => { out.add(n); if (!original.has(n)) original.set(n, k); };
   for (const k of keys) {
     const n = toLocalIdKey(k, doc, readDoc);
     if (n === null) { unresolved.push(k); continue; }
-    out.add(n);
-    if (!original.has(n)) original.set(n, k);
+    put(n, k);
+    // ROTATION IS ONE VALUE (#1880 F5, `ROTATION_MARKS`): one axis selected is the whole rotation. Reverted or applied
+    // alone, the two left behind re-marked it (the mark store groups them), so the Revert or Apply looked done and the
+    // rotation stayed pinned (#1880 close-out review 2). Unity records and reverts `m_LocalRotation` whole.
+    const axis = /\.Transform\.r[xyz]$/.exec(n);
+    // The siblings answer to the axis the caller NAMED (`original`): its per-key target is theirs, or they would land at
+    // the default level, another prefab than the one picked (#1880 close-out re-review 2), and the report names what was asked.
+    if (axis) for (const a of ['rx', 'ry', 'rz']) put(`${n.slice(0, axis.index)}.Transform.${a}`, k);
   }
   return { keys: out, original, unresolved };
 }

@@ -13,16 +13,14 @@
  *  rows over those. {@link chainLayer} is the same fold from a stored root the caller names, for the writers that walk
  *  down from one (the save, the rebuild). */
 
+import { rowAt } from '../../runtime/core/prefabRowAt';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { isStoredRoot, isOwnedRoot, durableGuid, type MemberPi } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
-import {
-  foldStructureLayers, foldPath as sharedFoldPath,
-  type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState,
-} from '../../runtime/loaders/prefabOverrides';
+import { foldStructureLayers, foldPath as sharedFoldPath, type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState, referenceRowAt } from '../../runtime/loaders/prefabOverrides';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptLegacyChannels, setKeptLegacyChannels, legacyPathReached } from '../../runtime/loaders/loadSceneFile';
 import { type PrefabFile } from './prefab';
@@ -105,7 +103,6 @@ export type ForwardState = SharedForwardState<NestedStructureDelta, SceneMemberR
 export function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
   const layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: node.nestedStructure, rows: node.members, valuePaths: node.nestedOverrides }];
   return {
-    nestedOverrides: node.nestedOverrides,
     layers,
     forwardRoots: node.members && doc ? foldStructureLayers(doc, layers, 0, {}).forwardRoots : [],
   };
@@ -135,7 +132,7 @@ export function chainLayer(
   const docs: (PrefabFile | null)[] = [topDoc !== undefined ? topDoc : levelDoc(top, source).doc];
   let at = top;
   for (let i = 0; i < path.length; i++) {
-    const row = docs[i]?.entities.find((e) => e.localId === path[i] && e.prefab);
+    const row = referenceRowAt(docs[i], path[i]);
     if (!row) break;
     at = at ? ownedRootAt(at, path[i]!) : 0;
     docs.push(at ? levelDoc(at, row.prefab!).doc : getCachedPrefabSync(row.prefab!));
@@ -148,7 +145,7 @@ export function chainLayer(
 export function docChainLayer(topDoc: PrefabFile | null, path: readonly number[]): { overrides: OverrideMap; structure: LayerStructure } {
   const docs: (PrefabFile | null)[] = [topDoc];
   for (let i = 0; i < path.length; i++) {
-    const row = docs[i]?.entities.find((e) => e.localId === path[i] && e.prefab);
+    const row = referenceRowAt(docs[i], path[i]);
     if (!row) break;
     docs.push(getCachedPrefabSync(row.prefab!));
   }
@@ -320,7 +317,7 @@ export function settleKeptLegacy(legacy: { rootGuid: string; source: string; pre
 export function layerAddedTraits(layer: Pick<FrameLayer, 'overrides'>, doc: PrefabFile): Record<number, string[]> {
   const out: Record<number, string[]> = {};
   for (const [lid, traits] of Object.entries(layer.overrides)) {
-    const row = doc.entities.find((e) => e.localId === Number(lid));
+    const row = rowAt(doc, Number(lid));
     if (!row || row.prefab) continue;
     const names = Object.keys(traits).filter((t) => row.traits[t] === undefined);
     if (names.length) out[Number(lid)] = names;
