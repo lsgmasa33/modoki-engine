@@ -2847,6 +2847,25 @@ describeCases('QA case references', () => {
     expect(undeclared).toEqual([]);
   });
 
+  // The check above validates the value only where the text DEMANDS a declaration, so a case that
+  // declares one without mentioning a save is never read. QA-EDITOR-0023 carried `scene_write: none`
+  // that way until a later step added a save (2026-10-01). A declared value is a claim a reader
+  // trusts, so it must be one of the three wherever it appears.
+  it('a declared scene_write is one of its values, whether or not the case mentions a save', () => {
+    const bad: string[] = [];
+    let declared = 0;
+    for (const c of cases) {
+      const v = c.fm?.fields.scene_write;
+      if (v === undefined) continue;
+      declared++;
+      if (typeof v !== 'string' || !SCENE_WRITE_VALUES.includes(v)) {
+        bad.push(`${c.rel}: scene_write: ${JSON.stringify(v)} is not one of ${SCENE_WRITE_VALUES.join(' | ')}`);
+      }
+    }
+    expect(declared).toBeGreaterThan(100);
+    expect(bad).toEqual([]);
+  });
+
   it('a case that writes its fixture scene restores it (#1095)', () => {
     const offenders: string[] = [];
     let checked = 0;
