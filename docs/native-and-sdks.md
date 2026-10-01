@@ -1232,7 +1232,8 @@ in the engine's `runtime/core/attribution.ts`, and every game's `app-services` r
   getting no consent signal, not a regional opt-out. (3) The answer is read once per launch, so a change
   in Settings applies at the next launch — EXCEPT MAX's flags: AppLovin stores `has_user_consent` /
   `is_do_not_sell` across launches and the allow path never resets them, so a player who denied once and
-  allows later keeps non-personalized ads. Privacy-safe, a revenue cost; raised with the hub (#1920).
+  allows later keeps non-personalized ads. Privacy-safe, a revenue cost, and KEPT that way (owner, 2026-10-01,
+  on #1920): resetting them on an Allow could assert consent for an EEA player who declined in UMP.
 - **Observed on an iOS simulator** (iPhone 17, Court Debug build, 2026-10-01), with Court's ATT answer
   preset in the simulator's TCC store — the state a tap leaves, not the tap. **Denied:** the bridge ran
   `requestTrackingAuthorization` → `anonymizeUser` → `start` for AppsFlyer, `setHasUserConsent` and
