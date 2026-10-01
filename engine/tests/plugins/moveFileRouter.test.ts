@@ -43,6 +43,9 @@ let browserFailure: Error | null = null;
 /** #1362: what the renderer answers for the `openAssetEditor` probe. `null` = nothing held.
  *  `'skew'` = a pre-#1362 renderer that refuses the unknown registry, which must NOT read as clear. */
 let editorHold: { path: string } | 'skew' | null = null;
+/** #1648 S2: run DURING the renderer's unsaved/held-editor probe — i.e. inside the route's `await`, between its
+ *  early never-clobber check and its fs call. Lets a test put a file on the destination exactly there. */
+let duringProbe: (() => void) | null = null;
 
 function makeCtx(): BackendContext {
   return {
@@ -66,6 +69,7 @@ function makeCtx(): BackendContext {
       // also the realistic shape (a renderer that lacks `apply-asset-path-moves` but answers
       // `resolve-unsaved` — which is literally what one of those tests simulates).
       if (op === 'resolve-unsaved') {
+        duringProbe?.();
         const registries = (params as { registries?: string[] }).registries ?? [];
         // #1362: the openAssetEditor probe. A SKEWED renderer answers without covering it, which
         // `unsavedGate` must turn into `unknown` and the route must refuse on — the fail-open that
@@ -104,6 +108,7 @@ beforeEach(() => {
   rec = { marked: [], asked: [] };
   browserFailure = null;
   editorHold = null;
+  duringProbe = null;
 });
 afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -378,20 +383,26 @@ describe('/api/move-file distinguishes NO renderer from an UNREPAIRED one (#867 
     warn.mockRestore();
   });
 
-  it('refuses to repair an un-canonicalizable path rather than sending an unmatchable one', async () => {
-    // `absToAssetUrl` returns null for exactly one input `resolveAssetPath` accepts: the asset
-    // ROOT itself, which `modoki_move_asset`'s bare z.string() does accept. Falling back to the
-    // raw string would ship the very defect the canonicalization fixes — a path the renderer
-    // cannot match — and report it as a successful repair.
-    //
-    // Moved to the SECOND root, because a destination inside the first is refused by the
-    // dest-inside-source guard before this branch is reached. An earlier version of this test
-    // did exactly that and was vacuous: it wrapped its assertions in `if (r.status === undefined)`
-    // and the 400 made the body never run.
-    const r = (await move('/', '/other/root')) as { status?: number; body?: { repairFailed?: string } };
+  // #1648 S1. This test used to PIN the defect: moving the asset ROOT (`/`) answered 200 and only the renderer repair was
+  // refused — the whole tree had already moved. A root is now refused before anything moves.
+  it.each(['/', '/other/'])('REFUSES to move an asset ROOT (%s) — nothing moves, nothing is sent', async (root) => {
+    fs.writeFileSync(path.join(tmp, 'keep.txt'), 'x');
+    fs.writeFileSync(path.join(tmp2, 'keep2.txt'), 'y');
+    const r = (await move(root, '/moved-root')) as { status?: number; body?: Record<string, unknown> };
+    expect(r.status).toBe(400);
+    expect(r.body?.assetRoot).toBe(true);
+    expect(fs.existsSync(path.join(tmp, 'keep.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(tmp2, 'keep2.txt'))).toBe(true);
+    expect(rec.asked).toHaveLength(0);
+  });
+
+  it('ACCEPT SIDE: a real FOLDER inside a root still moves, and is repaired with prefix', async () => {
+    fs.mkdirSync(path.join(tmp, 'sub'));
+    fs.writeFileSync(path.join(tmp, 'sub', 'a.txt'), 'x');
+    const r = (await move('/sub', '/other/sub')) as { status?: number; body?: Record<string, unknown> };
     expect(r.status).toBeUndefined();
-    expect(r.body?.repairFailed).toMatch(/not an asset-root path/);
-    expect(rec.asked).toHaveLength(0);   // nothing unmatchable was sent
+    expect(fs.existsSync(path.join(tmp2, 'sub', 'a.txt'))).toBe(true);
+    expect(rec.asked[0].params).toEqual({ moves: [{ from: '/sub', to: '/other/sub', prefix: true }] });
   });
 });
 
@@ -511,5 +522,45 @@ describe('a held asset editor refuses the move (#1362)', () => {
     expect(r?.status).toBe(503);
     expect(r?.body?.code).toBe('UNSAVED_STATE_UNKNOWN');
     expect(fs.existsSync(path.join(tmp, 'assets', 'tex.png'))).toBe(true);
+  });
+});
+
+/** #1648 S2: the never-clobber check sat on the wrong side of the renderer probe's `await`. A file that landed on the
+ *  destination during the probe (a second concurrent move, another writer) passed the early check and was destroyed by
+ *  the rename — both moves answered ok. The check is now asked again, synchronously, right before the fs call. */
+describe('the destination is re-checked after the probe (#1648 S2)', () => {
+  it('move-file: a destination that appears DURING the probe is refused 409, and both files survive', async () => {
+    fs.writeFileSync(path.join(tmp, 'a.mat.json'), '{"id":"A"}');
+    duringProbe = () => { fs.writeFileSync(path.join(tmp, 'x.mat.json'), '{"id":"B"}'); };
+    const r = (await move('/a.mat.json', '/x.mat.json')) as { status?: number };
+    expect(r.status).toBe(409);
+    expect(fs.readFileSync(path.join(tmp, 'x.mat.json'), 'utf8')).toBe('{"id":"B"}');
+    expect(fs.readFileSync(path.join(tmp, 'a.mat.json'), 'utf8')).toBe('{"id":"A"}');
+  });
+
+  it('duplicate-asset: a destination that appears DURING the gate is refused 409, and is not overwritten', async () => {
+    fs.writeFileSync(path.join(tmp, 'a.png'), 'source-bytes');
+    duringProbe = () => { fs.writeFileSync(path.join(tmp, 'c.png'), 'other-writer'); };
+    const r = (await handleBackendRequest(makeCtx(), {
+      method: 'POST', urlPath: '/api/duplicate-asset', query: new URLSearchParams(), body: { from: '/a.png', to: '/c.png' },
+    })) as { status?: number };
+    expect(r.status).toBe(409);
+    expect(fs.readFileSync(path.join(tmp, 'c.png'), 'utf8')).toBe('other-writer');
+  });
+
+  it('ACCEPT SIDE: with nothing landing during the probe, the move and the duplicate both go through', async () => {
+    fs.writeFileSync(path.join(tmp, 'a.mat.json'), '{"id":"A"}');
+    fs.writeFileSync(path.join(tmp, 'b.png'), 'bytes');
+    let probed = 0;
+    duringProbe = () => { probed++; };
+    const mv = (await move('/a.mat.json', '/x.mat.json')) as { status?: number };
+    const dup = (await handleBackendRequest(makeCtx(), {
+      method: 'POST', urlPath: '/api/duplicate-asset', query: new URLSearchParams(), body: { from: '/b.png', to: '/c.png' },
+    })) as { status?: number };
+    expect(probed).toBeGreaterThanOrEqual(2);   // the hook really ran inside both routes' awaits
+    expect(mv.status).toBeUndefined();
+    expect(dup.status).toBeUndefined();
+    expect(fs.existsSync(path.join(tmp, 'x.mat.json'))).toBe(true);
+    expect(fs.readFileSync(path.join(tmp, 'c.png'), 'utf8')).toBe('bytes');
   });
 });

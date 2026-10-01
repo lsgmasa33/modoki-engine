@@ -272,13 +272,30 @@ describe('A-7: an agent delete refuses while a human holds unsaved work on the p
     expect(trashed).toEqual([]);
   });
 
-  it('the asset ROOT (no canonical url) is gated against every hold, not skipped', async () => {
+  // #1648 S1. This used to assert only that a root delete refuses WHEN SOMETHING IS HELD — the accept side, nothing
+  // held, trashed the whole asset tree and answered ok:true. A root is now refused before any gate, held or not.
+  it.each(['/', '/.'])('the asset ROOT (%s) is refused outright, with nothing held — nothing is trashed', async (root) => {
     write('/fx/spark.particle.json', '{}');
-    heldNow = [{ path: '/fx/spark.particle.json', registry: 'dirtyAsset' }];
+    heldNow = [];
     const ctx = makeCtx({ absToAssetUrl: () => null as unknown as string });
-    const r = await post('/api/delete-asset', { paths: ['/'] }, ctx);
-    expect(r.status).toBe(409);
+    const r = await post('/api/delete-asset', { paths: [root] }, ctx);
+    expect(r.status).toBe(400);
+    expect(r.body).toMatchObject({ assetRoot: true });
     expect(trashed).toEqual([]);
+  });
+
+  // #1956: the route now adds a named file's sidecars to the batch. They are NOT probed for a held asset editor — their
+  // asset already is, and each global probe is a renderer round trip of up to 1.5s.
+  it('the held-editor probe runs once per NAMED path, not once more per sidecar the route added', async () => {
+    write('/tex/a.png', 'png');
+    write('/tex/a.png.meta.json', '{}');
+    write('/tex/a.png.meta.local.json', '{}');
+    heldNow = [];
+    const r = await post('/api/delete-asset', { path: '/tex/a.png' });
+    expect(r.body).toMatchObject({ ok: true, trashed: 3 });
+    const editorProbes = asked.filter((a) => a.op === 'resolve-unsaved'
+      && ((a.params as { registries?: string[] }).registries ?? []).includes('openAssetEditor'));
+    expect(editorProbes).toHaveLength(1);
   });
 
   it('a live-world edit does not refuse: deleting the file does not destroy the world', async () => {

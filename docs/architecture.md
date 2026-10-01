@@ -972,8 +972,26 @@ production backend path the DMG ships, not a Vite-only surrogate:
   wrapping the same router. The renderer's backend client is pointed at it via
   `window.__modokiBackendBase`. It takes a fixed port (`MODOKI_BACKEND_PORT`, a stable
   MCP target) or an ephemeral one, and restricts CORS `Access-Control-Allow-Origin` to
-  the exact Vite origin (the loopback backend is privileged — fs writes / builds — so
-  `'*'` would invite CSRF / DNS-rebind from any page the user visits).
+  the exact Vite origin.
+
+**Both hosts refuse a cross-site request (#1955).** ACAO only stops a page from READING a reply: a
+browser still DELIVERS a "simple" cross-origin POST (text/plain body, no preflight) and any no-cors GET
+(`<img src>`, a navigation), so ACAO alone never stopped CSRF. `engine/plugins/backend/requestOrigin.ts`
+decides, at the Electron backend's entry (before the C6 token gate and the SSE build proxy) and ahead of
+every `/api` route in the Vite middleware (`/api/exit` included):
+- **Origin.** A request that carries one must come from an own origin: a loopback host NAME on the port
+  the request arrived on, the backend's Vite page origin, or a URL Vite reports serving. An own Origin
+  passes whatever else the request says.
+- **Sec-Fetch-Site**, when there is no Origin: `cross-site` is refused. This is what stops `<img
+  src=".../api/exit">`. The editor's own loads are `same-origin`/`same-site` (an IP-literal site ignores
+  the port), and a typed URL is `none`.
+- **Host (DNS rebinding).** A rebound page's same-origin GETs carry no Origin, so the Origin check cannot
+  see them. The Vite host is covered by Vite's own `hostValidationMiddleware`, which runs before this
+  plugin (this repo sets no `allowedHosts`). The Electron backend has no such check of its own, so it
+  requires a loopback `Host` name (`localhost`, `127.0.0.1`, `[::1]`, any port, any case).
+
+curl, the MCP server and Node send none of these headers and are unaffected. Every refusal is logged
+with its reason. The underlying smell, routes that change state on a GET, is tracked separately (#1967).
 
 Two host-specific concerns stay out of the shared router:
 

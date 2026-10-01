@@ -12,6 +12,7 @@ import { createEditorWriteGuard, fingerprintFile } from './editorWriteGuard';
 import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatcher';
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
+import { foreignRequestRefusal } from './backend/requestOrigin';
 import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
@@ -2125,6 +2126,26 @@ export function assetScannerPlugin(): Plugin {
           const result = await serveProjectAsset(staticCtx, urlPath);
           if (result) {
             writeBackendResult(res, result, req.headers['if-none-match']);
+            return;
+          }
+        }
+
+        // Cross-site gate (#1955), ahead of EVERY /api route — /api/exit and the SSE build routes included.
+        // A foreign page cannot read a reply here, but its simple POST and its no-cors GET (`<img src>`)
+        // are still delivered. A present Origin must be own (the loopback hosts on the port this request
+        // arrived on, or a URL Vite reports serving, a LAN `--host` one too); with no Origin, a
+        // `Sec-Fetch-Site: cross-site` is refused (requestOrigin.ts). The Host check is Vite's own
+        // `hostValidationMiddleware`, which runs before this. curl, MCP and Node send none of these.
+        if (req.url && (req.url.startsWith('/api/') || req.url === '/assets.manifest.json')) {
+          const refusal = foreignRequestRefusal(req.headers, {
+            ports: [req.socket?.localPort],
+            origins: [...(server.resolvedUrls?.local ?? []), ...(server.resolvedUrls?.network ?? [])],
+          });
+          if (refusal) {
+            console.warn(`[asset-scanner] refused ${req.method} ${req.url.split('?')[0]}: ${refusal.reason}`);
+            res.statusCode = 403;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify(refusal.body));
             return;
           }
         }

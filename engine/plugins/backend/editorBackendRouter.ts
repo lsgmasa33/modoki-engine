@@ -54,7 +54,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT, fingerprintBytes, fingerprintFile } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, SIDECAR_SUFFIXES } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
@@ -635,6 +635,36 @@ function wrongKindRefusal(ctx: BackendContext, absPath: string, expected: string
   return exists
     ? json({ error: `${shown} is not a ${expected} (it is typed '${kind}'). Nothing was written.`, wrongKind: true, existingType: kind }, 409)
     : json({ error: `${shown} would be typed '${kind}' by its name, not '${expected}'. Nothing was written.`, wrongKind: true, nameType: kind }, 409);
+}
+
+/** A delete or move whose operand IS an asset root, or null (#1648 S1).
+ *
+ *  `resolveAssetPath` maps `/assets/`, `/assets/.` and `/games/<id>/assets/` to the root folder itself (the relative
+ *  part is empty, which its traversal guard rightly lets through), so without this one path a segment short trashed or
+ *  moved the project's whole asset tree, answered `ok:true`. `absToAssetUrl` names every path strictly INSIDE a root
+ *  and returns null for the root itself, and a path `resolveAssetPath` accepted cannot be outside every root, so null
+ *  here means exactly "this is a root". */
+function assetRootOperandRefusal(ctx: BackendContext, absPath: string, input: string, verb: 'delete' | 'move'): BackendResult | null {
+  if (ctx.absToAssetUrl(absPath) !== null) return null;
+  return json({
+    error: `Refusing to ${verb} ${input}: it is an asset ROOT folder, not a file or folder inside one. Nothing was changed.`,
+    assetRoot: true,
+    options: ['name a file or folder INSIDE the root (e.g. /assets/fx) — modoki_list_assets lists valid paths'],
+  }, 400);
+}
+
+/** True when a move or copy to `absTo` would overwrite something (the never-clobber rule of move-file and
+ *  duplicate-asset). A case-only rename (`Sprites` → `sprites`) on a case-insensitive disk resolves to the SAME entry
+ *  as the source, which is not a collision, so "same entry" is decided by inode+device, never by string compare.
+ *  ⚠️ Asked twice by each route: early, to refuse before an expensive renderer probe, and AGAIN synchronously right
+ *  before the fs call (#1648 S2). The early answer goes stale across the probe's `await` — two concurrent moves to one
+ *  name both passed it and the second rename destroyed the first file. */
+function destinationTaken(absFrom: string, absTo: string): boolean {
+  if (!fs.existsSync(absTo) || absTo === absFrom) return false;
+  try {
+    const a = fs.statSync(absFrom), b = fs.statSync(absTo);
+    return !(a.ino === b.ino && a.dev === b.dev);
+  } catch { return true; /* stat failed → treat as a real collision */ }
 }
 
 function rebuildManifestInline(ctx: BackendContext): boolean {
@@ -3443,15 +3473,38 @@ async function describeUnresolvedAgainstLiveWorld(
       // The REQUEST string rides along with the abs path. `failed` below is reported back in the
       // caller's own strings, not canonicalised ones — see the comment on the reply. Keeping the
       // pair here is what makes that possible without a second lookup.
-      const resolved: Array<{ input: string; abs: string }> = [];
+      const resolved: Array<{ input: string; abs: string; sidecar?: true }> = [];
       const missing: string[] = [];
       const absOf = new Map<string, string>();
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
         if (!absPath) return outsideAssetRoots('Path outside allowed directories');
+        const rootRefusal = assetRootOperandRefusal(ctx, absPath, p, 'delete');
+        if (rootRefusal) return rootRefusal;
         absOf.set(p, absPath);
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
         resolved.push({ input: p, abs: absPath });
+      }
+      // ── A file's sidecars go WITH it (#1648 S4) ──────────────────────────────────────────────────
+      // A binary asset's GUID lives in its `.meta.json`. Trashing the file alone left that sidecar behind, and the next
+      // file imported at the same path silently INHERITED the dead asset's GUID, so every ref to the deleted asset now
+      // showed the new one. Unity deletes an asset's .meta with it, and removes an orphaned one. The Assets panel always
+      // named the pair itself (`deletionPathsFor`); the agent tool told its caller to, and nothing checked. Expanded
+      // here so every caller gets it. Idempotent: a request that already names a sidecar adds nothing, since the list is
+      // de-duplicated by `samePath`. Only sidecars that EXIST are added, so `trashed` still counts real files. `ifMatch`
+      // stays on the named file (the sidecar follows it, it is not a separate expectation), and a sidecar is not
+      // probed for a held asset editor: its asset already is. A named file that is already GONE still has its
+      // sidecars taken (it is reported in `missing`): an orphaned .meta.json is exactly the GUID trap above, and
+      // Unity removes an orphan too. That is what lets the model-import prune send one request per texture.
+      const sidecars: string[] = [];
+      for (const [input, abs] of absOf) {
+        if (SIDECAR_SUFFIXES.some((s) => abs.endsWith(s))) continue;
+        for (const suffix of SIDECAR_SUFFIXES) {
+          const sideAbs = abs + suffix;
+          if (!fs.existsSync(sideAbs) || resolved.some((r) => samePath(r.abs, sideAbs))) continue;
+          resolved.push({ input: input + suffix, abs: sideAbs, sidecar: true });
+          sidecars.push(input + suffix);
+        }
       }
       // Single-path back-compat: a lone non-existent target is still a 404 — unless the caller stated what it
       // expects there, and then a gone file is a failed precondition (409 below), as on `/api/write-file`.
@@ -3496,9 +3549,8 @@ async function describeUnresolvedAgainstLiveWorld(
       //   through a symlinked folder lexically, and a refusal gate that misses is the unsafe
       //   direction. The cost on a case-sensitive volume is a refusal for a different file of the
       //   same name in another case.
-      // • The asset ROOT. `absToAssetUrl` returns null for it, so it is not in `candidates` and the
-      //   probe was skipped outright while `resolved` still went to the trash. A resolved path with
-      //   no canonical url is treated as containing everything.
+      // (The asset ROOT, which `absToAssetUrl` cannot name, used to slip past this match too. It is now
+      // refused before any gate (#1953), so every resolved path has a canonical url in `candidates`.)
       // ⚠️ Held-editor refusal (#1362): a delete destroys the modal's unsaved edits AND the file,
       // which is the strictly worse half of the move case the owner ruled on. Honours this route's
       // OWN escapes rather than inventing stricter ones — `rendererWrite` is the editor deleting
@@ -3508,15 +3560,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // not about a route being forbidden to proceed when told to.)
       if (rendererWrite !== true && discardUnsaved !== true) {
         for (const target of resolved) {
+          if (target.sidecar) continue;
           const refusal = await heldAssetEditorRefusal(ctx, target.abs, 'delete');
           if (refusal) return json(refusal.body, refusal.status);
         }
       }
       if (resolved.length > 0 && rendererWrite !== true && discardUnsaved !== true) {
         const probed = await unsavedGate(ctx, null, { registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene'] });
-        const uncanonical = candidates.length < resolved.length;
         const underDelete = (held: string) => {
-          if (uncanonical) return true;
           const p = held.toLowerCase();
           return candidates.some(({ move }) => {
             const from = move.from.toLowerCase();
@@ -3670,6 +3721,8 @@ async function describeUnresolvedAgainstLiveWorld(
       }
       return json({
         ok: true, saved: wentToTrash.length > 0, trashed: wentToTrash.length, missing, manifestRebuilt,
+        // The sidecars this route added on its own (S4 above), so a caller sees what `trashed` counts beyond its list.
+        ...(sidecars.length ? { sidecars } : {}),
         ...(failedInputs.length ? { failed: failedInputs } : {}),
         ...(failedInputs.length && trashResult.reason ? { failedReason: trashResult.reason } : {}),
         ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
@@ -5005,8 +5058,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // sail straight past it, since the open scene is not an asset document.
       //
       // Nothing is destroyed — the copy is simply built from stale bytes — so the hatch stays
-      // `force`, the same one `/api/reimport` takes. The DESTINATION needs no probe: it cannot
-      // exist yet (409'd above), so nothing can be keyed to it.
+      // `force`, the same one `/api/reimport` takes. The DESTINATION needs no probe: it did not
+      // exist when the 409 above was asked, so no renderer hold can be keyed to it. It CAN appear
+      // during this probe's `await`, though, so its existence is asked again below (#1648 S2).
       const dupGate = await unsavedGate(ctx, [normalizeAssetUrl(from)], {
         registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
       });
@@ -5017,6 +5071,12 @@ async function describeUnresolvedAgainstLiveWorld(
           + 'PRE-EDIT content while the editor shows the newer version.',
       });
       if (dupRefused) return json(dupRefused.body, dupRefused.status);
+      // ⚠️ Asked again after the gate's `await` (#1648 S2): a file that landed on the destination meanwhile would be
+      // silently overwritten. Synchronous from here to the copy. A plain `existsSync`, unlike move's `destinationTaken`:
+      // a copy's source and destination are never the same entry, and treating a case-only spelling as free would
+      // copy a file onto itself.
+      if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
+      if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
       // The editor's own write (#1702) — see `markWrittenFile`. The sidecars it may write never broadcast.
@@ -5060,18 +5120,12 @@ async function describeUnresolvedAgainstLiveWorld(
       const absTo = ctx.resolveAssetPath(to);
       if (!absFrom || !absTo) return outsideAssetRoots('Path outside allowed directories');
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
-      // Never clobber an existing asset on move/rename (renameSync would silently
-      // destroy it). EXCEPT a case-only rename (e.g. Sprites→sprites): on a
-      // case-insensitive FS (default macOS APFS / Windows) `fs.existsSync(absTo)` is
-      // true because it resolves to the SAME entry as the source — that's not a real
-      // collision, so allow it through (renameSync changes just the case). Detect "same
-      // entry" by inode+device rather than string compare.
-      if (fs.existsSync(absTo) && absTo !== absFrom) {
-        let sameEntry = false;
-        try { const a = fs.statSync(absFrom), b = fs.statSync(absTo); sameEntry = a.ino === b.ino && a.dev === b.dev; }
-        catch { /* stat failed → treat as a real collision */ }
-        if (!sameEntry) return json({ error: 'Destination exists' }, 409);
-      }
+      const rootRefusal = assetRootOperandRefusal(ctx, absFrom, from, 'move');
+      if (rootRefusal) return rootRefusal;
+      // Never clobber an existing asset on move/rename (renameSync would silently destroy it), except a case-only
+      // rename — see `destinationTaken`. Asked here so a collision refuses before the renderer probe below, and
+      // asked AGAIN after that probe, right before the rename.
+      if (destinationTaken(absFrom, absTo)) return json({ error: 'Destination exists' }, 409);
       // Moving a folder INTO ITSELF orphans it — `renameSync` throws EINVAL, which would surface
       // as a 500 ("something broke") rather than the 4xx this is. The drag path cannot reach it
       // (`planFilesDropMoves` skips it); the agent path can.
@@ -5084,6 +5138,10 @@ async function describeUnresolvedAgainstLiveWorld(
         const refusal = await heldAssetEditorRefusal(ctx, absFrom, 'move', { refuseOnUnknown: true });
         if (refusal) return json(refusal.body, refusal.status);
       }
+      // ⚠️ The never-clobber check AGAIN (#1648 S2), now that the probe's `await` is behind us. Everything from here to
+      // `moveAssetFile` is synchronous, so nothing can land on the destination between this answer and the rename.
+      if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
+      if (destinationTaken(absFrom, absTo)) return json({ error: 'Destination exists' }, 409);
       // Is this a FOLDER move? The route is the only place that can answer — the client passes
       // two strings, and a folder and a file look identical in them. It decides both the
       // fingerprinting below and the `prefix` on the repair (#867).
@@ -5156,9 +5214,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // ⚠️ No `?? from` fallback. Falling back to the raw string ships exactly the defect the
       // canonicalization fixes — a path the renderer cannot match — just one size smaller, and
       // reports it as a successful repair. `absToAssetUrl` returns null for a path
-      // `resolveAssetPath` accepted in one case: the asset ROOT itself via a trailing slash
-      // (`/assets/`), which `modoki_move_asset`'s bare `z.string()` does accept. Renaming a
-      // project's whole asset root is not a thing to do half-repaired.
+      // `resolveAssetPath` accepted in one case only, the asset ROOT itself, and a root is refused
+      // as the source (#1953) and is never free as a destination, so the `unrepaired` arm below is
+      // not expected to run; it stays because a null url must still never be sent.
       const outcome: RepairOutcome = canonFrom && canonTo
         ? await applyMovesInRenderer(ctx, [{ from: canonFrom, to: canonTo, ...(isDir ? { prefix: true } : {}) }])
         : { kind: 'unrepaired', reason: `not an asset-root path: ${canonFrom ? to : from}` };

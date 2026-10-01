@@ -474,7 +474,10 @@ cost.
 
 **Honest scope: this is CORRECTNESS, not security.** An attacker simply omits the header.
 A `requireToken` mode would be genuine hardening for the localhost backend, but it's a
-separate decision with real compatibility cost — track it, don't smuggle it in here.
+separate decision with real compatibility cost — track it, don't smuggle it in here. The
+browser half of that threat (a web page POSTing to the loopback port) is closed separately, by
+refusing a foreign `Origin` header (#1955, docs/architecture.md § "Editor Backend (Vite / Electron parity)"); the
+token's `'absent'` acceptance is unchanged by it.
 
 ### Should CDP be on by default? (revised: YES — opt-out)
 

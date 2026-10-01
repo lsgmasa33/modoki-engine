@@ -132,10 +132,13 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'probe asset has no way to remove it and has to shell out to `rm`.\n\n' +
       'IT IS NOT UNDOABLE (no Assets delete is), and it is NARROWER than the Assets panel\'s ' +
       'Delete. The panel sweeps a model\'s GENERATED products — the .mesh.json / .mat.json / textures ' +
-      'it produced on import, plus every .meta.json sidecar. ' +
-      'This tool trashes EXACTLY the paths you name. So deleting a .glb ' +
-      'through it ORPHANS every mesh and material generated from it, with no way back except the ' +
-      'OS trash. Name the sidecars and generated files yourself, or delete through the panel.\n\n' +
+      'it produced on import. ' +
+      'This tool trashes the paths you name PLUS each named file\'s own .meta.json / .meta.local.json ' +
+      'sidecars (listed in `sidecars`), so a later file at the same path never inherits the deleted ' +
+      'asset\'s GUID. Naming a sidecar yourself is harmless. It does NOT sweep generated products: ' +
+      'deleting a .glb through it ORPHANS every mesh and material generated from it, with no way back ' +
+      'except the OS trash. Name the generated files yourself, or delete through the panel. An asset ' +
+      'ROOT (`/assets/`, `/games/<id>/assets/`) is refused.\n\n' +
       'It also does NOT evict the renderer\'s scene-scoped caches (mesh/material/particle): ' +
       'an asset already loaded into the open scene stays live until the next scene swap, even ' +
       'though its file is gone. A prefab IS evicted: its live instances stay as they are, and the ' +
@@ -162,7 +165,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     {
       path: z.string().optional().describe('One asset-root URL to trash — the single-file form of `paths`. Not together with `paths`.'),
       paths: z.array(z.string()).min(1).optional()
-        .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Include the .meta.json sidecars yourself — nothing expands the list for you.'),
+        .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Each file\'s .meta.json sidecars are added for you.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is an unsaved asset document, import-settings or `
         + 'base-scene edit for a path being deleted: the editor drops it along with the file.',

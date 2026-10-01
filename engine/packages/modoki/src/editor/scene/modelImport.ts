@@ -1116,14 +1116,15 @@ async function importModelInner(
     const outcomes = await Promise.all([
       ...orphanMeshes.map(trashOne),
       ...orphanMaterials.map(trashOne),
-      // Textures carry a sidecar `.meta.json` with their guid — drop both.
-      ...orphanTextures.flatMap((p) => [trashOne(p), trashOne(`${p}.meta.json`)]),
+      // A texture's `.meta.json` sidecar goes with it: the route adds a named file's sidecars itself (#1956). Naming it
+      // here too raced the texture's own request, and the loser's 404 read as an unconfirmed prune.
+      ...orphanTextures.map(trashOne),
     ]);
     const total = orphanMeshes.length + orphanMaterials.length + orphanTextures.length;
     if (total > 0) {
-      // Count the ones that GENUINELY went, and say so only about those. A maybe-absent sidecar
-      // answers false too (a lone missing path is a 404), so the shortfall is reported as "not
-      // confirmed" rather than as a failure — the honest claim for a best-effort prune.
+      // Count the ones that GENUINELY went, and say so only about those. A path already gone answers
+      // false too (a lone missing path is a 404), so the shortfall is reported as "not confirmed"
+      // rather than as a failure — the honest claim for a best-effort prune.
       const stuck = outcomes.flatMap(({ path, r }) => (r.ok ? [] : [`${path}: ${r.error}`]));
       console.log(`[Import] Pruned ${total} orphan files (${orphanMeshes.length} meshes, ${orphanMaterials.length} materials, ${orphanTextures.length} textures) → OS Trash`);
       if (stuck.length > 0) {

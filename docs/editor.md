@@ -4052,6 +4052,32 @@ is therefore reachable only on Windows, pinned at the seam (`deleteAssetRouter.t
 
 ---
 
+#### What delete and move refuse, and what a delete adds on its own (#1953, #1954, #1956)
+
+Three rules from B3's review (#1648), each the backstop the route lacked:
+
+- **An asset ROOT is never an operand.** `resolveAssetPath('/assets/')` resolves to the root folder
+  itself, so `/api/delete-asset` trashed the project's whole asset tree, and `/api/move-file` moved
+  it, answering `ok:true`. Both refuse with 400 `assetRoot:true` (`assetRootOperandRefusal`). The test
+  is that `absToAssetUrl` cannot name the path, which for a path `resolveAssetPath` accepted means
+  exactly "a root". So a test fixture whose `absToAssetUrl` stub returns `null` makes EVERY delete a
+  root delete.
+- **A never-clobber check is asked again after every `await`.** move-file and duplicate-asset checked
+  that the destination was free, awaited a renderer probe, then wrote. A file landing during the probe
+  was overwritten, and two concurrent moves to one name both answered ok. Each now re-checks
+  synchronously, right before the fs call. This is the same check-then-act rule `ifMatch` already
+  documents for write-file. Move keeps its inode compare (a case-only rename is not a collision);
+  duplicate keeps a plain `existsSync` (a copy onto itself must be refused).
+- **A delete takes the named file's sidecars with it.** A binary's GUID lives in its `.meta.json`.
+  An agent that trashed the file alone left the sidecar, and the next file at that path inherited
+  the dead GUID, so every ref to the deleted asset silently showed the new one. Unity deletes the
+  `.meta` with its asset. The route adds each existing sidecar (`SIDECAR_SUFFIXES`) and lists them in
+  `sidecars`; a request that already names one adds nothing. A named file that is already gone still
+  has its orphaned sidecar taken (the file itself is reported in `missing`), as Unity removes an orphan.
+  ⚠️ **A caller must not ALSO send the sidecar as a separate, parallel delete.** modelImport's prune
+  did: whichever request ran second 404'd, and the prune logged a false "may still be on disk". One
+  request per asset, or both in one `paths` list.
+
 ### Folder-tree state lives at module scope, not in `useState` (#309)
 
 `panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at module scope,

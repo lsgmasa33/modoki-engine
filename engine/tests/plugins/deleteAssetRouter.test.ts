@@ -59,7 +59,10 @@ function makeCtx(
     projectRoot: os.tmpdir(),
     resolveAssetPath: resolve,
     rebuildManifest: rebuild,
-    absToAssetUrl: () => null,   // → the route falls back to the absolute path; not asserted here
+    // A url for every path, as the real `absToAssetUrl` gives for anything INSIDE a root. Not `() => null`: null is the
+    // answer for the asset ROOT itself, which the route refuses outright (#1648 S1), so a null stub made every delete
+    // here a root delete. What the repair SENDS is asserted in moveFileRouter.test.ts against the real resolver.
+    absToAssetUrl: (abs: string) => '/' + path.basename(abs),
     // The agent delete's unsaved-work probe (#1215) answers "nothing held"; `covers` is required or
     // the gate reads a skewed renderer. Every other op is the repair, answered as before.
     requestBrowser: async (op: string, params: unknown) => (op === 'resolve-unsaved'
@@ -315,5 +318,58 @@ describe('/api/delete-asset — an OS refusal says why, and what to do', () => {
     fs.rmSync(dir, { recursive: true, force: true });
     expect(r.body.ok).toBe(true);
     expect(r.body.failedReason).toBe('Finder got an error (-8003)');
+  });
+});
+
+/** #1648 S4: a file's sidecars go with it. An agent that trashed `a.png` alone left `a.png.meta.json` behind, and the
+ *  next file imported at that path inherited the dead asset's GUID — every ref to the deleted texture silently showed
+ *  the new one. The Assets panel always named the pair itself; the route now does, for every caller. */
+describe('/api/delete-asset trashes a file\'s sidecars with it (#1648 S4)', () => {
+  const setup = (files: string[]) => {
+    const dir = makeScratchDir('modoki-delete-router-sidecars-');
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f), '{}');
+    }
+    trashed.length = 0;
+    return { dir, ctx: makeCtx((p) => path.join(dir, p), () => ({})) };
+  };
+  const trashedRel = (dir: string) => trashed.flat().map((abs) => path.relative(dir, abs).split(path.sep).join('/')).sort();
+
+  it('adds every existing sidecar of a named binary, and says which in `sidecars`', async () => {
+    const { dir, ctx } = setup(['a.png', 'a.png.meta.json', 'a.png.meta.local.json']);
+    const r = (await del({ path: '/a.png' }, ctx)) as { body: { ok: boolean; trashed: number; sidecars?: string[] } };
+    expect(trashedRel(dir)).toEqual(['a.png', 'a.png.meta.json', 'a.png.meta.local.json']);
+    expect(r.body).toMatchObject({ ok: true, trashed: 3 });
+    expect(r.body.sidecars).toEqual(['/a.png.meta.json', '/a.png.meta.local.json']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is idempotent: a request that already names a sidecar trashes it once, and adds only the other', async () => {
+    const { dir, ctx } = setup(['a.png', 'a.png.meta.json', 'a.png.meta.local.json']);
+    const r = (await del({ paths: ['/a.png', '/a.png.meta.json'] }, ctx)) as { body: { trashed: number; sidecars?: string[] } };
+    expect(trashedRel(dir)).toEqual(['a.png', 'a.png.meta.json', 'a.png.meta.local.json']);
+    expect(r.body.trashed).toBe(3);
+    expect(r.body.sidecars).toEqual(['/a.png.meta.local.json']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a named file already GONE still has its orphaned sidecar taken, and is itself reported in `missing`', async () => {
+    const { dir, ctx } = setup(['tex/a.png.meta.json']);
+    const r = (await del({ path: '/tex/a.png' }, ctx)) as { status?: number; body: { ok: boolean; trashed: number; missing: string[]; sidecars?: string[] } };
+    expect(r.status).toBeUndefined();   // not the lone-missing-path 404: something real was trashed
+    expect(trashedRel(dir)).toEqual(['tex/a.png.meta.json']);
+    expect(r.body).toMatchObject({ ok: true, trashed: 1, missing: ['/tex/a.png'] });
+    expect(r.body.sidecars).toEqual(['/tex/a.png.meta.json']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adds nothing that is not on disk — a text asset with no sidecar trashes alone, with no `sidecars` field', async () => {
+    const { dir, ctx } = setup(['fx/spark.particle.json']);
+    const r = (await del({ path: '/fx/spark.particle.json' }, ctx)) as { body: { trashed: number; sidecars?: string[] } };
+    expect(trashedRel(dir)).toEqual(['fx/spark.particle.json']);
+    expect(r.body.trashed).toBe(1);
+    expect(r.body.sidecars).toBeUndefined();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

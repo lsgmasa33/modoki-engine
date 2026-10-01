@@ -19,6 +19,7 @@ import { handleBackendRequest, type BackendContext, type BackendResult } from '.
 import { reclaimStaleDeviceStateAtStartup } from '../plugins/backend/deviceConnection';
 import { serveProjectAsset, serveAppShell } from '../plugins/backend/staticAssets';
 import { writeBackendResult } from '../plugins/backend/writeResult';
+import { foreignRequestRefusal } from '../plugins/backend/requestOrigin';
 import { checkToken, tokenMismatchError, TOKEN_HEADER, type TokenCheck } from './instanceToken';
 
 /** The one route exempt from the C6 token gate: identity is the DIAGNOSTIC — "which editor
@@ -118,6 +119,23 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;
       res.end();
+      return;
+    }
+    // ── Cross-site gate (#1955), before the token gate and every route — the SSE build proxy included.
+    //    ACAO above only stops a foreign page READING a reply; a simple POST and a no-cors GET (`<img
+    //    src>`) are still delivered. Three checks (requestOrigin.ts): the Host must be a loopback name
+    //    (this host's only DNS-rebinding defence); a present Origin must be own (the loopback hosts on
+    //    this server's port or the Vite page's, or the Vite page origin exactly); with no Origin, a
+    //    `Sec-Fetch-Site: cross-site` is refused. curl, MCP and Node send none of these and pass. ──
+    const refusal = foreignRequestRefusal(req.headers, {
+      ports: [req.socket.localPort, viteOrigin ? Number(new URL(viteOrigin).port || 80) : null],
+      origins: [viteOrigin],
+    }, { checkHost: true });
+    if (refusal) {
+      console.warn(`[modoki-backend] refused ${req.method} ${u.pathname}: ${refusal.reason}`);
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(refusal.body));
       return;
     }
     // ── C6 token gate. Computed ONCE, here, for every request — including the privileged

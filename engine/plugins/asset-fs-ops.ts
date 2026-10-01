@@ -30,7 +30,7 @@ import { assertSceneFormatReadable, unparsableSceneError } from '../packages/mod
  *  `moveToTrash`'s refusal predicate must hold them back, and a second hand-kept copy of the list
  *  is how one of them gets stranded. (`sidecarsFor` in `editor/panels/assetOps.ts` is the editor's
  *  own copy — it lists only two, and the mismatch is noted there.) */
-const SIDECAR_SUFFIXES: readonly string[] = ['.meta.json', '.meta.local.json', '.meta.json' + CORRUPT_SIDECAR_SUFFIX];
+export const SIDECAR_SUFFIXES: readonly string[] = ['.meta.json', '.meta.local.json', '.meta.json' + CORRUPT_SIDECAR_SUFFIX];
 
 /** mkdir -p. Throws if the folder already exists (the endpoint maps this to 409). */
 export function createFolderAt(absPath: string): void {
