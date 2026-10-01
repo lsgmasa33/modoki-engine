@@ -2,6 +2,7 @@
  *  and subtracting what the enclosing chain already states.
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
+import { absenceIsRemoval } from '../../runtime/loaders/overrideFate';
 import { rowAt } from '../../runtime/core/prefabRowAt';
 import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
@@ -13,6 +14,7 @@ import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRowDiff';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { withMissingComponents } from '../../runtime/core/ecs/missingComponents';
 import { filterAuthoringVisible } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
@@ -25,8 +27,8 @@ import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceSt
 import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptUnusedRows, keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
-import { type OverrideMap, foldStructureLayers } from '../../runtime/loaders/prefabOverrides';
-import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
+import { type OverrideMap, foldStructureLayers, frameKeyIndex } from '../../runtime/loaders/prefabOverrides';
+import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
 import { parseMemberToken, memberToken, memberPathKey, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import { childrenBySibling, localToEcsGuid, type PrefabFile } from './prefab';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
@@ -505,7 +507,10 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
     if (meta.name === 'EntityAttributes') guid = durableGuid(data.guid as string);
     bag[meta.name] = copy;
   }
-  return { bag, guid };
+  // A scene-added node's component this build registers no trait for, kept by its load (#1933 N1b).
+  const eaMeta = getTraitByName('EntityAttributes');
+  const liveGuid = eaMeta && entity.has(eaMeta.trait) ? String((entity.get(eaMeta.trait) as { guid?: unknown }).guid ?? '') : '';
+  return { bag: withMissingComponents(bag, liveGuid, entity.id()), guid };
 }
 
 /** Which document a structural capture is written INTO. */
@@ -718,7 +723,8 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     if (!info) continue;
     const own = prefabTraitsByLocal.get(localId) || [];
     const layer = opts.layerTraits?.[localId]?.filter((n) => !own.includes(n)) ?? [];
-    const gone = [...own, ...layer].filter((n) => n !== 'PrefabInstance' && !info.traits.includes(n));
+    // A component this build does not register was never spawned, so its absence is no removal (#1933 N1, `overrideFate`).
+    const gone = [...own, ...layer].filter((n) => n !== 'PrefabInstance' && absenceIsRemoval(n) && !info.traits.includes(n));
     if (gone.length) removedTraits[localId] = gone;
   }
 
@@ -798,7 +804,9 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     // A SCENE node is a stored root: what the load kept of its legacy channels goes back out with it (#1780). A template
     // capture of one writes its scene statements nowhere (I8).
     const nodeGuid = opts.template ? '' : durableGuid((readTraitData(ecsId, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid);
-    const channels = withKeptLegacy(captured, nodeGuid);
+    // A reached frame's kept structure records into its live slot, which then stays whole (#1933 S4, as an entry's).
+    const slots = withKeptSlots(captured.nestedStructure, nodeGuid);
+    const channels = withKeptLegacy({ ...captured, nestedStructure: slots.nestedStructure }, nodeGuid, slots.merged);
     // A template reference node's own moves ride the scene form unchanged: they are the template's statement, and the
     // moves captured above are measured against them (`prefabMoveTargets`), so a respawn without them lost the move (#1543).
     const handle = findEntity(ecsId);
@@ -818,7 +826,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       const members = captureInstanceMembers(ecsId, childPrefab);
       return { ...node, ...(Object.keys(members).length ? { members } : {}) };
     }
-    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits });
+    const moved = moveChannelsOntoRows(ecsId, childPrefab, source, node, captureInstanceMembers(ecsId, childPrefab), channels.frames, { againstRecords: opts.againstRecords, frameEdits: opts.frameEdits, keepWholeSlots: slots.merged });
     const nonEmpty = <T,>(v: T | undefined): T | undefined =>
       v === undefined || (Array.isArray(v) ? v.length : Object.keys(v as object).length) ? v : undefined;
     // Stated against its record: what is left by localId goes into the numbering the load expands it in.
@@ -841,7 +849,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       (moved.channels.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[pi?.localId as number]?.EntityAttributes,
       readTraitData(ecsId, getTraitByName('EntityAttributes')!) as Record<string, unknown> | undefined,
     );
-    return {
+    return withMalformedBack({
       ...node,
       ...(Object.keys(placement).length ? { traits: { EntityAttributes: placement } } : {}),
       ...(lid && node.moved ? { moved: translateCarried(lid, {}, { moved: node.moved }).structure.moved } : {}),
@@ -849,7 +857,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
       removed: nonEmpty(ch.removed), removedTraits: nonEmpty(ch.removedTraits),
       nestedOverrides: nonEmpty(moved.channels.nestedOverrides), nestedStructure: nonEmpty(moved.channels.nestedStructure),
       ...(Object.keys(moved.members).length || keptUnusedRows(nodeGuid) ? { members: withKeptUnused(withoutRowParents(ecsId, moved.members, opts.dropParents), nodeGuid, ecsId) } : {}),
-    };
+    }, nodeGuid); // what the load kept as malformed (#1938 C-B step 2); a template capture has no nodeGuid
   };
 
   // Capture one non-member child as an AddedEntity (plain subtree OR nested-instance
@@ -1254,6 +1262,10 @@ export function moveChannelsOntoRows(
      *  statement at the node's root), node by node, and its root's row under {@link NODE_ROOT}. `live` is the frame's
      *  capture. Set by {@link referenceNodeRows}, whose rows reach into a template reference node. */
     asNode?: { live: InstanceStructure; base: LayerStructure };
+    /** Frames (structure path keys) whose slot carries a record the load kept as unused (#1933 S4, `withKeptSlots`): stated
+     *  whole, as the legacy slot, never on rows — a row cannot state a member the template has since deleted, and half on
+     *  rows and half in the slot would be one statement in two places. */
+    keepWholeSlots?: ReadonlySet<string>;
   } = {},
 ): { channels: InstanceChannels; members: Record<string, SceneMemberRow>; nodeUnstated?: boolean; rowFrames?: Map<string, number> } {
   const piMeta = getTraitByName('PrefabInstance');
@@ -1448,7 +1460,7 @@ export function moveChannelsOntoRows(
     for (const [path, live] of Object.entries(ch.nestedStructure)) {
       const f = frameOf(path);
       // A move no row can carry (`unrowed`) means this frame already has a member no row can key.
-      if (!f || Object.keys(live.moved ?? {}).length) { keep[path] = live; continue; }
+      if (!f || Object.keys(live.moved ?? {}).length || opts.keepWholeSlots?.has(path)) { keep[path] = live; continue; }
       if (!stateFrame(f, live, chainLayer(rootId, source, f.steps, undefined, opts.seed).structure)) keep[path] = live;
     }
     legacy.nestedStructure = Object.keys(keep).length ? keep : undefined;
@@ -1882,12 +1894,10 @@ export function subtractChainStructure(
   chain: { added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>; moved?: Record<number, string> },
   keysByGuid: Map<string, string>,
 ): { structure: InstanceStructure; replace: KeptNodeReplace[] } {
-  const byKey = new Map<string, AddedEntity>();
+  // Which chain node a key names: the frame's one index (#1937 C-A step 3) — a key two chain nodes carry names neither.
+  const byKey = frameKeyIndex(chain.added);
   const byGuid = new Map<string, AddedEntity>();
-  for (const n of chain.added ?? []) {
-    if (n.key) byKey.set(n.key, n);
-    else if (durableGuid(n.guid)) byGuid.set(n.guid, n);
-  }
+  for (const n of chain.added ?? []) if (!n.key && durableGuid(n.guid)) byGuid.set(n.guid, n);
   // #1779: a chain node with NEITHER — hand- or agent-written; no editor writer emits one — matched nothing, so its live
   // copy was re-applied as the scene's own over the fresh expansion's, and every rebuild spawned it twice. A live node
   // with no template key now pairs with an unused chain node of that kind with the same name that it EQUALS
@@ -1898,11 +1908,13 @@ export function subtractChainStructure(
   // Each chain node absorbs ONE live copy, the one its fresh expansion replaces: a scene node written with `guid: ''` is
   // captured guid-less too, and one equal to the template's was dropped with it — gone for good once saved (close-out
   // re-review). A scene duplicate holds a durable guid and equals none.
-  const unkeyedChain = (chain.added ?? []).filter((n) => !n.key && !durableGuid(n.guid) && n.name);
+  // A chain node whose key names neither (repeated in the frame) has no identity either, and is paired the same way.
+  const unkeyedChain = (chain.added ?? []).filter((n) => (n.key ? byKey.get(n.key) === null : !durableGuid(n.guid)) && n.name);
   const usedUnkeyed = new Set<AddedEntity>();
   const sameUnkeyed = (node: AddedEntity): boolean => {
-    if (node.guid && keysByGuid.get(node.guid)) return false;
-    const base = unkeyedChain.find((c) => !usedUnkeyed.has(c) && c.name === node.name && sameAddedNode(node, c));
+    // A live node with a key pairs only with a chain node carrying that key, which here is one the frame repeats.
+    const key = node.guid ? keysByGuid.get(node.guid) : undefined;
+    const base = unkeyedChain.find((c) => !usedUnkeyed.has(c) && (key ? c.key === key : !c.key) && c.name === node.name && sameAddedNode(node, c));
     if (base) usedUnkeyed.add(base);
     return !!base;
   };
@@ -1910,7 +1922,7 @@ export function subtractChainStructure(
   const replace: KeptNodeReplace[] = [];
   for (const node of full.added) {
     const key = node.guid ? keysByGuid.get(node.guid) : undefined;
-    const base = (key ? byKey.get(key) : undefined) ?? (node.guid ? byGuid.get(node.guid) : undefined);
+    const base = (key && byKey.get(key)) || (node.guid ? byGuid.get(node.guid) : undefined);
     if (!base) { if (!sameUnkeyed(node)) added.push(node); continue; }
     if (sameAddedNode(node, base)) continue;
     added.push(node);
@@ -2137,17 +2149,13 @@ export function writerFormOf(writer: readonly AddedEntity[] | undefined): (nodes
  *  key the capture stamped on it (`addedNodeIdentity`) — a template node has no guid to find it by. A node the capture
  *  did not reach (none known) is converted as promotion converts one (`toTemplateNodes`). */
 function templateFormOf(template: readonly AddedEntity[] | undefined): (nodes: readonly AddedEntity[]) => AddedEntity[] {
-  const byKey = new Map<string, AddedEntity>();
-  const index = (list: readonly AddedEntity[] | undefined) => {
-    for (const n of list ?? []) { if (n.key) byKey.set(n.key, n); index(n.children); }
-  };
-  index(template);
+  const byKey = frameKeyIndex(template); // a key two captured nodes carry names neither (#1937 C-A step 3)
   return (nodes) => nodes.map((n) => {
     const live = n.guid ? localToEcsGuid(n.guid) : 0;
     // The marker, else the key its guid recovers: a comparison's read-only capture recovers a lost key without
     // stamping it, so the marker alone would miss the node and mint a key no chain node has (#1538 close-out review).
     const key = live ? templateKeyOf(findEntity(live)) || recoverTemplateKey(live) : '';
-    const found = key ? byKey.get(key) : undefined;
+    const found = (key && byKey.get(key)) || undefined;
     return { ...(found ?? toTemplateNodes([n])![0]!), parentLocalId: 0 };
   });
 }

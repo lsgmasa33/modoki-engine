@@ -245,20 +245,26 @@ describe('diffFrameAdded', () => {
     expect(rows.pinnedOver.size).toBe(0);
   });
 
-  it('a key used twice elsewhere in the frame does not stop a re-anchored node\'s own unique key from being reported (#1872 re-review)', () => {
-    // The duplicate-key branch returned before the rule, so the save wrote no row while the rebuild's own copy of the
-    // condition fired: two copies on load. Mutation: drop `pinOver()` from the duplicate branch — k1 is not reported.
+  it('a key used twice elsewhere in the frame forces no whole list: the other nodes are stated node by node (#1937 C-A step 4)', () => {
+    // Before, any repeat put every anchor of the frame whole (and so pinned k1 over: #1872 re-review). Now the repeated
+    // nodes are stated by nothing and k1 is matched on its own key. Mutation: restore the `twice` branch — anchor 1 whole.
     const d = diffFrameAdded([live('k1', 1)], [node('k1', 1), node('kd', 1), node('kd', 1)], deps, new Set(['k1', 'kd']));
-    expect([...d.pinnedOver]).toEqual(['k1']); // kd is used twice: no row could name one of them
+    expect([...d.whole]).toEqual([]);
+    expect([...d.pinnedOver]).toEqual([]);
+    expect([...d.nodeRows]).toEqual([]); // no row names a repeated node, and k1 is unchanged
   });
 
-  it('falls back to the whole list for a key-less chain node, and for a duplicate key', () => {
+  it('falls back to the whole list for a key-less chain node; a duplicate key is stated by nothing', () => {
     // Mutation: drop the `allKeyed` test — a key-less node is diffed and, unmatched, reads as removed.
     const keyless = diffFrameAdded([live('k1', 5)], [node('k1', 1), node(undefined, 1)], deps);
     expect([...keyless.whole]).toEqual([1]);
     expect(keyless.nodeRows.size).toBe(0);
-    const dup = diffFrameAdded([live('k1', 5)], [node('k1', 1), node('k1', 1)], deps);
-    expect([...dup.whole]).toEqual([1]);
+    // Mutations: restore `twice` — anchor 1 whole; skip the live node's repeat check in `matchList` — it is written as
+    // the scene's own (a third copy on reload).
+    const dup = diffFrameAdded([live('k1', 5), live('k1', 6)], [node('k1', 1), node('k1', 1)], deps);
+    expect([...dup.whole]).toEqual([]);
+    expect(dup.nodeRows.size).toBe(0);
+    expect(dup.own.size).toBe(0);
   });
 
   it('an edited template REFERENCE node falls back; an unchanged one states nothing', () => {

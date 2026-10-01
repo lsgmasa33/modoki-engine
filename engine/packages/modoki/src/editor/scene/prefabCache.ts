@@ -3,6 +3,7 @@
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
 import { isPrefabDocument } from '../../runtime/loaders/prefabRoot';
+import { admitPrefabDocument } from '../../runtime/loaders/documentIdentity';
 import { prefabNests } from '../../runtime/loaders/prefabNesting';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, setFrameDocFallback, frameDocReader } from '../../runtime/core/ecs/identityParents';
@@ -189,6 +190,10 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
     const prefab: unknown = await res.json();
     // Not a prefab document (#1813) is a prefab that did not load — the loader's rule (`isPrefabDocument`).
     if (!isPrefabDocument(prefab)) return null;
+    // An identifier declared twice is refused as the runtime cache refuses it (#1937 C-A); a keyless template node gets
+    // the same deterministic key there and here, so both caches name it alike.
+    const admitted = admitPrefabDocument(prefab);
+    if ('refusal' in admitted) { console.error(`[prefabCache] ${source} refused: ${admitted.refusal}`); return null; }
     // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
     // nothing on the loading path inspects (#365/#379). Applying the zIndex migration
     // unconditionally here (cheap, idempotent) is the smallest thing that closes the same
@@ -196,8 +201,8 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
     // Structured walk — reaches overrides[localId][UIAnchor], added[] subtrees and
     // nestedOverrides paths too (including this prefab FILE's own nested rows), not just
     // entry.traits.
-    for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
-    return prefab as PrefabFile;
+    for (const entry of admitted.doc.entities) migrateUIAnchorZIndexStructured(entry);
+    return admitted.doc as PrefabFile;
   } catch { return null; }
 }
 
@@ -342,7 +347,10 @@ export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void
  *  leaves the key absent — a prefab that did not load, which I18 handles — rather than a shape every sync reader of this
  *  cache assumes and throws on. Every writer below goes through it, and a new one must too. */
 function seatEditorEntry(source: string, prefab: PrefabFile | null): void {
-  if (prefab && isPrefabDocument(prefab)) { prefabCache.set(source, prefab); deletedEditorKeys.delete(source); }
+  // Admitted as every seat admits (#1937 C-A): a document declaring an identifier twice leaves the key absent; one with a
+  // keyless template node is seated with its minted keys (the same object when there is nothing to mint).
+  const admitted = prefab && isPrefabDocument(prefab) ? admitPrefabDocument(prefab) : null;
+  if (admitted && 'doc' in admitted) { prefabCache.set(source, admitted.doc); deletedEditorKeys.delete(source); }
   else prefabCache.delete(source);
 }
 

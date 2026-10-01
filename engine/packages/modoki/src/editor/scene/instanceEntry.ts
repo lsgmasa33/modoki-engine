@@ -7,7 +7,7 @@ import type { PrefabFile } from './prefab';
 import { captureInstanceOverrides } from './prefabInstanceOverrides';
 import { captureInstanceMembers } from './prefabMembers';
 import { captureInstanceStructure, captureNestedChannels, moveChannelsOntoRows, withoutRowParents, type FrameEdit } from './prefabCapture';
-import { withKeptLegacy, withKeptLocalRecords, withKeptUnused } from './prefabBase';
+import { withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots } from './prefabBase';
 
 /** The instance half of a scene entry, as the loader reads it — `SceneEntityEntry`'s own fields, so the two cannot drift.
  *  Each field is absent when it states nothing, as the save writes it. */
@@ -47,13 +47,16 @@ export function captureInstanceEntry(
   // document puts the member, so a capture with no document can only carry the rows it is handed (`memberRowParents`).
   // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is left in the localId
   // channels below is the root's own edits and what no row can address.
+  // A reached frame's kept structure records go into its live slot BEFORE the move onto rows, and that frame stays a
+  // whole slot (#1933 S4, F-CB2 (a)): a bare kept slot after it would replace the frame's lists.
+  const slots = withKeptSlots(channels.nestedStructure, rootGuid);
   const moved = moveChannelsOntoRows(rootId, prefab, source, {
     overrides: local.overrides,
     added: struct?.added, removed: struct ? local.removed : undefined, removedTraits: struct ? local.removedTraits : undefined,
-    nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure,
-  }, captureInstanceMembers(rootId, prefab), channels.frames, { againstRecords: edit.againstRecords, frameEdits: edit.frames });
+    nestedOverrides: channels.nestedOverrides, nestedStructure: slots.nestedStructure,
+  }, captureInstanceMembers(rootId, prefab), channels.frames, { againstRecords: edit.againstRecords, frameEdits: edit.frames, keepWholeSlots: slots.merged });
   const members = withKeptUnused(withoutRowParents(rootId, moved.members, edit.dropParents), rootGuid, rootId);
-  const ch = withKeptLegacy(moved.channels, rootGuid);
+  const ch = withKeptLegacy(moved.channels, rootGuid, slots.merged);
   const entry: InstanceEntry = {};
   if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;
   if (ch.added?.length) entry.added = ch.added;
@@ -63,5 +66,6 @@ export function captureInstanceEntry(
   if (ch.nestedOverrides && Object.keys(ch.nestedOverrides).length) entry.nestedOverrides = ch.nestedOverrides;
   if (ch.nestedStructure && Object.keys(ch.nestedStructure).length) entry.nestedStructure = ch.nestedStructure;
   if (Object.keys(members).length) entry.members = members;
-  return { entry, consumedEcsIds: [...live.consumedEcsIds, ...channels.consumedEcsIds] };
+  // Last: what the load kept as malformed goes back where the entry states nothing (#1938 C-B step 2).
+  return { entry: withMalformedBack(entry, rootGuid), consumedEcsIds: [...live.consumedEcsIds, ...channels.consumedEcsIds] };
 }

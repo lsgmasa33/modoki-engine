@@ -230,7 +230,9 @@ export function subscribePreviewWorld(fn: () => void): () => void {
 }
 
 /** The dialog's read-only line for an instance's UNUSED overrides (#1914 R5, owner ruling F6): records whose target is
- *  gone, which every save keeps and neither Apply nor Revert touches. */
-export function unusedOverridesLine(count: number): string {
+ *  gone, which every save keeps and neither Apply nor Revert touches. Null when the instance keeps none, and the dialog
+ *  then shows no line: the decision lives here, beside its test, not in the panel (#1933). */
+export function unusedOverridesLine(count: number): string | null {
+  if (!(count > 0)) return null;
   return `${count} unused override${count === 1 ? '' : 's'} (kept)`;
 }

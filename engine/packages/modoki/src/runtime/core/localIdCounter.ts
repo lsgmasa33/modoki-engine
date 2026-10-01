@@ -28,6 +28,7 @@ export const LOCAL_ID_MARK_VERSION = 8;
 
 /** The part of a prefab document the mark reads. */
 export interface CountedDoc {
+  id?: unknown;
   nextLocalId?: unknown;
   rootLocalId?: unknown;
   entities?: ReadonlyArray<{ localId?: unknown }> | unknown;
@@ -35,9 +36,38 @@ export interface CountedDoc {
 
 const positiveInt = (v: unknown): number => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0);
 
-/** The lowest localId a NEW row of `doc` may take: its stored mark, or above its highest row and its root, whichever is
- *  higher — so a mark a hand edit left too low cannot hand out a number a row holds. 1 for no document. */
+/** localIds a loaded file still NAMES although its prefab no longer has them (#1933 S5, hub ruling A): a legacy record
+ *  of a member deleted from a document written before the mark, kept as an unused override (#1914 F5). Such a document
+ *  derives its mark from its rows, so a freed TOP number reads as free and the next new member took it — and the record
+ *  then landed on that member. Every number a kept record names is reserved here for the session, per document guid,
+ *  so every allocator mints past it, and the next write of that document states the mark past it (`advanceLocalIdCounter`
+ *  reads {@link localIdCounter}), after which the persisted mark keeps it — the commit judges "the file already holds
+ *  it" by {@link storedLocalIdCounter}, so every write of the document states it, an undo's verbatim restore included.
+ *  In memory, for the renderer's life (opening another project reloads it): a file this session never loaded reserves
+ *  nothing (the complete answer, a one-time project scan, is the owner's option, recorded on #1933). */
+const reservedLocalIds = new Map<string, number>();
+
+/** Reserve `localId` of document `docId` (a no-op for a number below what it already holds). */
+export function reserveLocalId(docId: string, localId: number): void {
+  const n = positiveInt(localId);
+  if (docId && n > (reservedLocalIds.get(docId) ?? 0)) reservedLocalIds.set(docId, n);
+}
+
+/** Forget every reservation (test isolation; the editor never forgets one within a session). */
+export function clearReservedLocalIds(): void { reservedLocalIds.clear(); }
+
+/** The lowest localId a NEW row of `doc` may take: its stored mark, or above its highest row and its root, and above
+ *  every number a loaded record still names ({@link reserveLocalId}), whichever is highest — so a mark a hand edit left
+ *  too low cannot hand out a number a row holds. 1 for no document. */
 export function localIdCounter(doc: CountedDoc | null | undefined): number {
+  const next = storedLocalIdCounter(doc);
+  return doc && typeof doc === 'object' && typeof doc.id === 'string' ? Math.max(next, (reservedLocalIds.get(doc.id) ?? 0) + 1) : next;
+}
+
+/** What `doc` ITSELF says the mark is — its stated mark, its rows and its root — with no reservation: the question "does
+ *  this file already hold the mark?" (`prefabCommit`'s `contentFor`), which {@link localIdCounter} would answer yes for a
+ *  file that holds no trace of a reserved number. Allocators read {@link localIdCounter}. */
+export function storedLocalIdCounter(doc: CountedDoc | null | undefined): number {
   if (!doc || typeof doc !== 'object') return 1;
   let next = Math.max(1, positiveInt(doc.nextLocalId), positiveInt(doc.rootLocalId) + 1);
   if (Array.isArray(doc.entities)) for (const e of doc.entities as ReadonlyArray<{ localId?: unknown }>) next = Math.max(next, positiveInt(e?.localId) + 1);

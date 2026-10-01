@@ -1743,8 +1743,9 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       // the lists pick their targets in id order (2 of 109 recorded lists drifted; neither can be re-aimed, one `u` slot
       // serves two picks). This states it without the ids: Y (an S instance the scene dropped under A, a member of O's
       // nested frame N) goes with A when P drops it, is kept in N/A's row, and a P that brings A back brings Y back once,
-      // guid intact, as a reload does. Mutation: drop the kept orphan rows from the entry (`captureInstanceEntry` without
-      // prefabCapture's kept merge) — Y does not come back.
+      // guid intact, as a reload does. Mutation (re-run #1933): drop the kept orphan rows from the scene entry
+      // (`captureInstanceMembers`' kept merge in prefabMembers.ts, `keptMemberOrphans(rootGuid) ?? {}` → `{}`) — Y does not
+      // come back.
       const S = 'cccccccc-0000-4000-8000-000000001127';
       const sDoc = { id: S, version: 6, name: 'S', rootLocalId: 1, entities: [
         { localId: 1, name: 'SR', nodeGuid: 'eeeeeeee-0000-4000-8000-000000001127', traits: { EntityAttributes: { name: 'SR', parentId: 0, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } },

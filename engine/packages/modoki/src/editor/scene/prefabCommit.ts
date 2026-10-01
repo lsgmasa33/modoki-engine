@@ -23,6 +23,8 @@
  *     `adoptionsSettled`), and rebuilds nothing when the world it began in is gone or a route is mid-adoption after the
  *     write (`pendingAdoptions`). */
 
+import { admitPrefabDocument } from '../../runtime/loaders/documentIdentity';
+import { frameRepeatRefusal } from '../../runtime/loaders/frameRepeat';
 import { type PrefabFile } from './prefab';
 import { preloadNestedPrefabs, seatEditorPrefabCache, prefabNestingReader, getCachedPrefabSync, evictDeletedEditorPrefabs } from './prefabCache';
 import { notePrefabFileChanged } from './prefabRead';
@@ -43,7 +45,7 @@ import { adoptionsSettledGate, pendingAdoptionCount, captureAdoptionGate } from 
 import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardDirtyAssets, assetWritesSettled, prefabWriteStarting, prefabWriteLanded } from './dirtyAssets';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { useEditorStore } from '../store/editorStore';
-import { localIdCounter, advanceLocalIdCounter, markUnstated, sameDocumentContent, canonicalJson, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
+import { localIdCounter, storedLocalIdCounter, advanceLocalIdCounter, markUnstated, sameDocumentContent, canonicalJson, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -379,6 +381,21 @@ export async function commitPrefabChanges(
   // scene is still loading", "the scene was replaced"), and an undo that refuses is dropped from the history for good —
   // a rig-prefab undo, which survives world swaps, was lost behind a pending hot reload with a toast saying "try again".
   if (land === 'park') return landParks(changes, opts, refuse);
+  // 0. Identity (#1937 C-A step 6, owner ruling F-D): a document declaring a localId, nodeGuid or template key twice is
+  // never WRITTEN — every seat would refuse it, and every instance of it would become a Damaged Prefab placeholder. Asked
+  // of every editor write (Apply, Create Prefab, the prefab-edit save, the agent's ops) here, in the one write path; a
+  // park restores what a file held, and an undo is not refused for the file's own past.
+  // …and one a key two files give one frame (#1933 L5), read through this step's own documents first, then the editor's
+  // cache (a nested prefab it does not hold is not checked, as the validator says).
+  const stepDocs = new Map<string, PrefabFile>();
+  for (const c of changes) if (c.doc?.id) stepDocs.set(c.doc.id, c.doc);
+  const readNested = (g: string): unknown => stepDocs.get(g) ?? getCachedPrefabSync(g) ?? null;
+  for (const c of changes) {
+    if (!c.doc) continue;
+    const admitted = admitPrefabDocument(c.doc);
+    const refusal = 'refusal' in admitted ? admitted.refusal : frameRepeatRefusal(admitted.doc, readNested);
+    if (refusal) return refuse(`${prefabLabel(prefabPathOf(c.source), c.doc).long} was not written: ${refusal}`, 'the prefab would declare an identifier twice — nothing was written');
+  }
   const release = beginWorldBoundOperation();
   let releaseWrites = () => {};
   try {
@@ -897,8 +914,14 @@ function contentFor(doc: PrefabFile, bytes: string | undefined, need: number): s
   // a row without raising it. The counter still derives past the row, but the file broke v8's contract ("the mark is
   // above every row"), and the validator's promise that the next write corrects it was false.
   const stated = (written as { nextLocalId?: unknown }).nextLocalId;
-  const stale = typeof stated === 'number' && stated < localIdCounter(written);
-  if (need <= localIdCounter(written) && !markUnstated(written) && !stale) return bytes ?? jsonFileBody(doc);
+  // What the WRITTEN document holds, not the counter: a number a loaded record reserves (#1933 S5) is in no file yet, and
+  // read through the counter a write would look as if it already stated it, and go down without it.
+  const holds = storedLocalIdCounter(written);
+  // …and the reservation itself is a source of the mark: a create that restores a trashed file (its undo) has no file,
+  // editor copy or park to name it, so only the document's own counter does.
+  need = Math.max(need, localIdCounter(written as CountedDoc));
+  const stale = typeof stated === 'number' && stated < holds;
+  if (need <= holds && !markUnstated(written) && !stale) return bytes ?? jsonFileBody(doc);
   const claims = !(written.version >= LOCAL_ID_MARK_VERSION);
   stateRaisedMark(doc, need);
   if (bytes === undefined) return jsonFileBody(doc);
@@ -1016,7 +1039,12 @@ async function post(path: string, content: string, pre: { createOnly?: boolean; 
  *  `getPrefabSource` applies (a doc seeded un-migrated poisons override detection). For an undo that restores bytes it
  *  read (`readPriorDocument` keeps the BOM so the restore is verbatim). Throws on bytes that are not JSON. */
 export function parsePrefabBytes(text: string): PrefabFile {
-  const doc = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) as PrefabFile;
+  const raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) as PrefabFile;
+  // Read as every seat reads it (#1937 C-A): admitted FIRST — a keyless template node's key is seeded from the node as the
+  // file states it, before the migration rewrites it — then migrated. A document read here (an undo's restore, a park, a
+  // precheck's file) is then the same document a cache holds, and compares equal to it. A refused one is read as it is.
+  const admitted = admitPrefabDocument(raw);
+  const doc = 'doc' in admitted ? admitted.doc : raw;
   for (const entry of doc.entities ?? []) migrateUIAnchorZIndexStructured(entry);
   return doc;
 }
@@ -1054,10 +1082,17 @@ export function prefabTextIsDocument(text: string, doc: PrefabFile): boolean {
 
 function sameDocument(text: string, expected: PrefabFile): boolean {
   try {
+    // Both sides as every seat reads a document (#1937 C-A): the file through `parsePrefabBytes` (admitted, then migrated),
+    // and `expected` admitted too — a no-op for one a cache holds, the minted keys for one read raw elsewhere. So a keyless
+    // template node's minted key is on both, and an edit opened from the admitted document is not read as a file changed
+    // under it (the prefab-edit save refused every keyless prefab before this).
     const parsed = parsePrefabBytes(text) as PrefabFile;
     if (!parsed || !Array.isArray(parsed.entities)) return false;
-    if (!parsed.id && expected.id) parsed.id = expected.id;
-    return sameDocumentContent(parsed, expected); // the one rule (#1892): the mark and the version aside
+    const exp = admitPrefabDocument(expected);
+    const want = 'doc' in exp ? exp.doc : expected;
+    // An id-less file takes the expected one AFTER its admission: the id seeds a mint, and the seat minted without it.
+    if (!parsed.id && want.id) parsed.id = want.id;
+    return sameDocumentContent(parsed, want); // the one rule (#1892): the mark and the version aside
   } catch { return false; }
 }
 

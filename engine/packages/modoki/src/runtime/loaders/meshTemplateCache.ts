@@ -43,6 +43,8 @@ import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
 import { disposeAllFontFaces } from './fontLoader';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { isPrefabDocument } from './prefabRoot';
+import { admitPrefabDocument } from './documentIdentity';
+import { noteDamagedPrefab, forgetDamagedPrefab, clearDamagedPrefabs } from '../core/damagedPrefabs';
 
 // Ensure built-in material presets (pbr/unlit/custom) are registered regardless
 // of how this module is imported (production main bundle, tests with reset
@@ -1727,6 +1729,7 @@ export function disposeAllCachedResources() {
   prefabCache.clear();
   prefabLoadPromises.clear();
   prefabFailures.clear();
+  clearDamagedPrefabs();
 
   // Particle effect defs and animation clips are plain data (no GPU resources),
   // but they accumulate across scene loads and a late fetch could re-register a
@@ -1821,6 +1824,25 @@ const prefabLoadPromises = new Map<string, Promise<void>>();
  *  replaced or its last scene lets go; an outage backs off, and {@link prefabFetchRetryAt} tells
  *  `requestPrefab` it is one. */
 const prefabFailures = createLoadFailureMemo({ label: 'MeshCache:prefab', unknownIs: 'permanent' });
+/** Forget `key`'s failure, and the refusal reason a damaged document left with it (#1937 C-A): every place a failure is
+ *  forgotten (a re-import, a fix, a release) is one where the next fetch judges the file again. */
+function forgetPrefabFailure(key: string): void {
+  prefabFailures.forget(key);
+  forgetDamagedPrefab(key);
+}
+
+/** Admit `data` at a seat (#1937 C-A, owner ruling F-A (1)): the document with a key minted for each keyless template
+ *  node, or — when it declares an identifier twice — the reason it is refused, noted for the placeholder's label. A
+ *  refused prefab is a prefab that did not load (I18), as Unity's duplicate-identifier file loads as a missing asset. */
+function admitAtSeat(prefabPath: string, data: unknown): { doc: { id?: unknown; entities: { traits?: Record<string, unknown> }[] } } | { refusal: string } {
+  const admitted = admitPrefabDocument(data as { id?: unknown; entities: { traits?: Record<string, unknown> }[] });
+  if ('refusal' in admitted) {
+    const id = (data as { id?: unknown }).id;
+    noteDamagedPrefab([prefabPath, typeof id === 'string' ? id : ''], admitted.refusal);
+    console.error(`[MeshCache:prefab] ${prefabPath} refused: ${admitted.refusal}`);
+  }
+  return admitted;
+}
 
 /** When a prefab whose fetch failed TRANSIENTLY may be fetched again (`rawNow()` ms), or undefined
  *  when its last fetch did not fail transiently (never failed, loaded, or failed for good). For
@@ -2383,7 +2405,7 @@ function releasePrefabByPath(sceneId: SceneId, prefabPath: string): void {
   const wasLast = removeOwner(prefabOwners, prefabPath, sceneId);
   if (wasLast) {
     prefabCache.delete(prefabPath);
-    prefabFailures.forget(prefabPath); // failure memory is scene-scoped, like the mesh cache's (#1371)
+    forgetPrefabFailure(prefabPath); // failure memory is scene-scoped, like the mesh cache's (#1371)
   }
 }
 
@@ -2418,7 +2440,7 @@ export function invalidatePrefab(prefabRef: string): void {
     if (!key) continue;
     prefabCache.delete(key);
     prefabLoadPromises.delete(key);
-    prefabFailures.forget(key); // an edit may have fixed the file
+    forgetPrefabFailure(key); // an edit may have fixed the file
     // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
     // re-caches the stale prefab on top of whatever refetch follows.
     cacheToken.invalidateKey(key);
@@ -2480,12 +2502,15 @@ export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
     return;
   }
   invalidatePrefab(prefabRef); // drops the pending promise + refuses an in-flight stale fetch
+  // Judged as a fetch of the written file would be: a refused document leaves the key absent, as it would after a fetch.
+  const admitted = admitAtSeat(prefabPath, data);
+  if ('refusal' in admitted) return;
   // A JSON round trip, not structuredClone: the entry must be exactly what a FETCH of the written
   // file would parse to (no `undefined`-valued keys, no non-JSON values).
-  const copy = JSON.parse(JSON.stringify(data)) as { id?: unknown; entities?: { traits?: Record<string, unknown> }[] };
+  const copy = JSON.parse(JSON.stringify(admitted.doc)) as { id?: unknown; entities?: { traits?: Record<string, unknown> }[] };
   for (const entry of copy.entities ?? []) migrateUIAnchorZIndexStructured(entry);
   prefabCache.set(prefabPath, copy);
-  prefabFailures.forget(prefabPath);
+  forgetPrefabFailure(prefabPath);
   if (typeof copy.id === 'string') registerAsset(copy.id, prefabPath, 'prefab');
 }
 
@@ -2526,7 +2551,7 @@ export function rekeyCachedPrefab(from: string, to: string, prefix = false): num
     // is left to land (close-out re-review).
     prefabLoadPromises.delete(oldKey);
     cacheToken.invalidateKey(oldKey);
-    for (const k of [oldKey, newKey]) prefabFailures.forget(k);
+    for (const k of [oldKey, newKey]) forgetPrefabFailure(k);
     prefabCache.delete(oldKey);
     if (data !== undefined) prefabCache.set(newKey, data);
     prefabRevision.set(newKey, Math.max(prefabRevision.get(oldKey) ?? 0, prefabRevision.get(newKey) ?? 0));
@@ -2568,10 +2593,16 @@ export function setPrefabReadOverride(fn: ((path: string) => unknown) | null): v
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
-  const parked = prefabReadOverride?.(prefabPath) as { id?: unknown } | undefined;
+  const parkedRaw = prefabReadOverride?.(prefabPath);
+  const parkedAdmitted = parkedRaw && isPrefabDocument(parkedRaw) ? admitAtSeat(prefabPath, parkedRaw) : undefined;
+  if (parkedAdmitted && 'refusal' in parkedAdmitted) {
+    prefabFailures.record(prefabPath, new Error(parkedAdmitted.refusal), prefabOwners.has(prefabPath));
+    return Promise.resolve();
+  }
+  const parked = parkedAdmitted?.doc ?? (parkedRaw as { id?: unknown } | undefined);
   if (parked) {
     prefabCache.set(prefabPath, parked);
-    prefabFailures.forget(prefabPath);
+    forgetPrefabFailure(prefabPath);
     if (typeof parked.id === 'string') registerAsset(parked.id, prefabPath, 'prefab');
     return Promise.resolve();
   }
@@ -2591,7 +2622,10 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       // Not a prefab document (#1813): refused like a file that does not parse — a plain Error, so a corrupt file is never
       // read as an absent one — and nothing is cached. Every reader downstream assumes the shape.
       if (!isPrefabDocument(parsed)) throw new Error(`${prefabPath} is not a prefab document (no entities array of rows)`);
-      const data = parsed as { id?: string; entities: { traits?: Record<string, unknown> }[] };
+      // An identifier declared twice refuses it the same way (#1937 C-A); a keyless template node gets its minted key.
+      const admitted = admitAtSeat(prefabPath, parsed);
+      if ('refusal' in admitted) throw new Error(`${prefabPath}: ${admitted.refusal}`);
+      const data = admitted.doc as { id?: string; entities: { traits?: Record<string, unknown> }[] };
       // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
       // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
       // migration unconditionally here (cheap, idempotent) is the smallest thing that closes
@@ -2603,7 +2637,7 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       for (const entry of data.entities) migrateUIAnchorZIndexStructured(entry);
       if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
-      prefabFailures.forget(prefabPath);
+      forgetPrefabFailure(prefabPath);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {
       prefabFailures.record(prefabPath, e, stillLive() && prefabOwners.has(prefabPath));

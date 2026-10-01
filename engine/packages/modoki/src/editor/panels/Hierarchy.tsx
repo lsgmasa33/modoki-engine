@@ -467,7 +467,9 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           <span style={{ width: 20, flexShrink: 0 }} />
         )}
         {isPrefab && <span style={{ color: '#3498db', fontSize: '10px', fontWeight: 'bold' }}>P</span>}
-        {entity.missingPrefab && <span style={{ color: '#e74c3c', fontSize: '10px', fontWeight: 'bold' }} title="Its prefab is missing. The instance's edits are kept and saved as they were read, and come back when the prefab does.">Missing Prefab</span>}
+        {entity.missingPrefab && (entity.damagedPrefab
+          ? <span style={{ color: '#e74c3c', fontSize: '10px', fontWeight: 'bold' }} title={`Its prefab file is damaged and was not loaded: ${entity.damagedPrefab}. The instance's edits are kept and saved as they were read, and come back when the file is fixed.`}>Damaged Prefab</span>
+          : <span style={{ color: '#e74c3c', fontSize: '10px', fontWeight: 'bold' }} title="Its prefab is missing. The instance's edits are kept and saved as they were read, and come back when the prefab does.">Missing Prefab</span>)}
         {layerMismatch && <span style={{ color: '#e74c3c', fontSize: '10px' }} title={`Layer mismatch: ${entity.layer} child under ${parentLayer} parent`}>⚠</span>}
         {isRenaming ? (
           <RenameInput

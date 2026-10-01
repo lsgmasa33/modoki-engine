@@ -9,6 +9,7 @@ import { worldIdentityParents, identitySubtree } from '../../runtime/core/ecs/id
 import { toLocalIdKeys, memberRef, splitNestedKey, nestedKeyRef } from './overrideKeyGrammar';
 import { memberPathRecords, type PrefabReader } from '../../runtime/loaders/memberPaths';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { absenceIsRemoval } from '../../runtime/loaders/overrideFate';
 import { getAllEntities, readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { snapshotUnkeyed, dropOnThrow } from './capturedKeys';
@@ -628,6 +629,7 @@ async function planApply(
     // Structural: remove a component from a member.
     if (key.startsWith('-trait.')) {
       const [, localIdStr, traitName] = key.split('.');
+      if (!absenceIsRemoval(traitName!)) { skipped.push({ key, reason: UNKNOWN_COMPONENT_NOT_APPLIED }); continue; }
       const prefabEntity = rowAt(newPrefab, Number(localIdStr));
       if (prefabEntity && traitName in prefabEntity.traits) {
         delete prefabEntity.traits[traitName];
@@ -897,6 +899,7 @@ async function planApply(
       claim(here(lid, tag!, '*'), true, reportAs, `${member} · ${tag}`, tName);
     } else if (key.startsWith('-trait.')) {
       const [, lidStr, t] = key.split('.');
+      if (!absenceIsRemoval(t!)) { skipped.push({ key: reportAs, reason: UNKNOWN_COMPONENT_NOT_APPLIED }); return false; }
       const lid = Number(lidStr);
       const mk = memberKeyAt(slot, ctx.frameDoc, lid);
       // Said against the chain as READ (the carrier above is this Apply's copy): this level is what adds it → it stops.
@@ -1015,6 +1018,7 @@ async function planApply(
       const lid = Number(lidStr);
       const row = rowAt(at.doc, lid);
       if (!row) { skipped.push({ key: reportAs, reason: 'its member is no longer in that prefab' }); return false; }
+      if (key.startsWith('-trait.') && !absenceIsRemoval(t!)) { skipped.push({ key: reportAs, reason: UNKNOWN_COMPONENT_NOT_APPLIED }); return false; }
       if (key.startsWith('+trait.')) row.traits[t!] = true;
       else delete row.traits[t!];
       written.push({ key: reportAs, ctx, level: ctx.n, lid, trait: t! });
@@ -1270,6 +1274,11 @@ export function innermostFirst<T extends { level: number; w: { source: string; d
 /** Why an Apply leaves a legacy move out (#1868, hub ruling B): the member keeps the move as a scene statement, and
  *  Revert is the way out of it. */
 const MOVED_MEMBER_NOT_APPLIED = 'a moved prefab object is not applied to its prefab (a prefab keeps its objects where it places them, as in Unity) — Revert the move to put it back';
+
+/** #1933 N1: a component this build registers no trait for is never spawned, so the instance cannot have removed it, and
+ *  deleting it from the prefab would destroy data this build cannot read (Unity keeps a Missing script until it is
+ *  removed on purpose). No capture lists such a key; this is the defensive half, for a key that arrives anyway. */
+const UNKNOWN_COMPONENT_NOT_APPLIED = 'its component is not registered in this build (a missing component), so the prefab keeps it — removing it would delete data this build cannot read';
 
 const MOVED_MEMBER_UNDER_REMOVAL = 'a prefab object below it was moved (a file from before prefab objects stopped moving), and removing it would re-hang that object — Revert that move first (or, for a move the prefab file itself states, remove the row in prefab edit)';
 

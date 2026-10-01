@@ -86,7 +86,7 @@
 import fs from 'node:fs';
 import { PREFAB_FORMAT_VERSION } from '../packages/modoki/src/runtime/core/version';
 import { classifyJsonFormatVersion } from '../packages/modoki/src/runtime/core/formatVersion';
-import { localIdCounter, type CountedDoc } from '../packages/modoki/src/runtime/core/localIdCounter';
+import { storedLocalIdCounter, type CountedDoc } from '../packages/modoki/src/runtime/core/localIdCounter';
 import { parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /** Is this a prefab document, by path? The gate is keyed on the suffix because `/api/write-file` is
@@ -148,7 +148,7 @@ export function classifyPrefabWrite(absPath: string): PrefabWriteRefusal | null 
 }
 
 export interface PrefabMarkRefusal {
-  /** The high-water mark the prefab on disk holds (`localIdCounter`: stored, or derived from its rows). */
+  /** The high-water mark the prefab on disk holds (`storedLocalIdCounter`: stated, or derived from its rows). */
   stored: number;
   /** The mark the incoming document would leave. */
   incoming: number;
@@ -178,8 +178,10 @@ export function classifyPrefabMarkWrite(absPath: string, incoming: string): Pref
   const was = parse(onDisk);
   const next = parse(incoming);
   if (!was || !next) return null;
-  const stored = localIdCounter(was);
-  const lands = localIdCounter(next);
+  // What each FILE states (#1933 S5): never the renderer's in-memory reservation, which the route in node never sees and
+  // the fuzz backend, running it in the renderer's process, would otherwise compare on both sides.
+  const stored = storedLocalIdCounter(was);
+  const lands = storedLocalIdCounter(next);
   if (lands >= stored) return null;
   return {
     stored, incoming: lands,

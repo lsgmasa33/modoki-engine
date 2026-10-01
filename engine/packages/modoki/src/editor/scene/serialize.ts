@@ -18,6 +18,7 @@ import { chooseNewAssetPath } from '../utils/saveDialog';
 import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { withMissingComponents } from '../../runtime/core/ecs/missingComponents';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
@@ -33,7 +34,7 @@ import { levelDoc } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { collectResourceRefsFromEntities, sceneFileResourceRefs, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, sceneFileResourceRefs, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, refusedCopyFrames, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
 import { liveFrameAddresser } from '../../runtime/loaders/frameAddress';
 import { asSceneEntry, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
@@ -555,6 +556,10 @@ async function serializeSceneScoped(opts?: {
         entry.traits[meta.name] = traitData;
       } catch { /* trait not initialized in world */ }
     }
+    // A component this build registers no trait for, which the load kept for this entity verbatim (#1933 N1b). A captured
+    // instance root's too (close-out review #10): it cannot be an override (no trait to state it on), and the load hands
+    // every other `traits` name of an entry to its spawned root, so `traits` is where the next load reads it from.
+    if (eaMeta) entry.traits = withMissingComponents(entry.traits, String((entity.get(eaMeta.trait) as { guid?: unknown } | undefined)?.guid ?? ''), entity.id());
 
     entities.push(entry);
   }
@@ -722,7 +727,8 @@ async function collectEmbeddedPrefabs(
     if (!reached.has(guid)) continue;
     // A deep copy: the file (and a Play snapshot holding it) must not alias the live record's document.
     out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
-    frames[guid] = [...(live.get(guid) ?? [])].sort();
+    // A refused copy's list as the file held it (#1937 C-A): nothing of it expands, so nothing of it is live.
+    frames[guid] = [...new Set([...(live.get(guid) ?? []), ...(refusedCopyFrames(world, scene, guid) ?? [])])].sort();
   }
   return Object.keys(out).length ? { docs: out, frames } : undefined;
 }

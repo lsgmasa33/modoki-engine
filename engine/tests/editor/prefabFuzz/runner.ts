@@ -16,7 +16,7 @@ import { prefabTextIsDocument } from '../../../packages/modoki/src/editor/scene/
 import type { PrefabFile } from '../../../packages/modoki/src/editor/scene/prefab';
 import { getDirtyAssetPaths, parkedPrefab } from '../../../packages/modoki/src/editor/scene/dirtyAssets';
 import { jsonFileBody } from '../../../packages/modoki/src/editor/backend/editorBackend';
-import { localIdCounter, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../../packages/modoki/src/runtime/core/localIdCounter';
+import { storedLocalIdCounter, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import { refreshInstances, preloadRebuildEntry } from '../../../packages/modoki/src/editor/scene/prefabRebuild';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRefRules';
@@ -329,7 +329,8 @@ export function diffFiles(a: Map<string, string>, b: Map<string, string>, create
     // Set aside, but only in the direction a restore may move them (#1880 T1): an undo or a redo that gives back a LOWER
     // mark than the side it returns to frees a number a row took, which is the whole of I4 (#1877 3b S1), and deleting
     // both fields let exactly that pass.
-    if (localIdCounter(db) < localIdCounter(da)) return `${p}: the localId mark went down (${localIdCounter(da)} → ${localIdCounter(db)})`;
+    // Compared as the files STATE them (#1933 S5): an in-memory reservation would lift both sides to the same number.
+    if (storedLocalIdCounter(db) < storedLocalIdCounter(da)) return `${p}: the localId mark went down (${storedLocalIdCounter(da)} → ${storedLocalIdCounter(db)})`;
     if ((db.version ?? 0) < (da.version ?? 0)) return `${p}: the format version went down (v${da.version} → v${db.version})`;
   }
   return null;

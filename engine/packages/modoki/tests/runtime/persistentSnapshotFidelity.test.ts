@@ -114,4 +114,26 @@ describe('persistent snapshot fidelity', () => {
     });
     expect(sets).toEqual([[{ name: 'idle' }]]);
   });
+
+  // #1933 re-review B: the carry respawns through a LOAD, which records each entity's unregistered components from its
+  // entry. The snapshot copied registered traits only, so the respawn cleared the record and the next save dropped the
+  // component. Mutation: drop the `withMissingComponents` merge in `snapshotPersistentEntities` — the record is gone.
+  it('carries a component this build does not register', async () => {
+    const G = 'aaaaaaaa-0000-4000-8000-0000000019b1';
+    fetchResponses['/sceneA.json'] = {
+      version: 8, resources: [],
+      entities: [{ id: 1, traits: { Transform: { x: 1 }, EntityAttributes: { name: 'Keeper', parentId: 0, guid: G }, Persistent: true, RetiredTraitCarry: { speed: 7 } } }],
+    };
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    sceneManager.resetForTesting();
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { withMissingComponents, clearMissingComponents } = await import('../../src/runtime/core/ecs/missingComponents');
+    clearMissingComponents();
+    await sceneManager.loadScene('/sceneA.json');
+    await sceneManager.loadScene('/sceneB.json');
+    let keeper = 0;
+    getCurrentWorld().query(EntityAttributes).updateEach(([a]: Record<string, unknown>[], e: { id(): number }) => { if (a.guid === G) keeper = e.id(); });
+    expect(keeper, 'premise: the Persistent entity was carried').toBeGreaterThan(0);
+    expect(withMissingComponents({}, G, keeper)).toEqual({ RetiredTraitCarry: { speed: 7 } });
+  });
 });

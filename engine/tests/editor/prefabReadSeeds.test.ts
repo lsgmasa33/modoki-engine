@@ -111,6 +111,7 @@ import {
 import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 import { openPrefabForEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { staleFrames } from '../../packages/modoki/src/editor/scene/prefabFrames';
 import { commitPrefabWrite, seatCaches } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { _resetSceneAdoptionForTests, beginWorldRequest } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { getPrefabRevision, invalidatePrefab } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
@@ -536,5 +537,86 @@ describe("prefab edit-open reads the file, which applies its held outside change
     heldRead!.release();
     expect(await pending).toBeUndefined();
     expect(heldOutsideChanges()).toEqual([W_PATH]);
+  });
+});
+
+/** #1937 C-A, the sweep after 500971083: placement read the file RAW (`readPrefabFile`), the one editor read that was not
+ *  a seat. A keyless template node then spawned without the minted key the caches hold, so the new frame recorded a
+ *  document other than the cached one — stale from birth (`staleFrames`), rebuilt at the next rebase — and a document
+ *  declaring an identifier twice was placed where every seat refuses it. */
+describe('placement reads the file as every seat does (#1937 C-A)', () => {
+  const loose = { parentLocalId: 2, guid: '', name: 'Loose', traits: { EntityAttributes: { name: 'Loose', parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } }, children: [] };
+  const withAdded = (added: object[]) => { const d = wDoc() as unknown as { entities: Array<Record<string, unknown>> }; d.entities[1] = { ...d.entities[1], added }; return d as unknown as PrefabFile; }; // under N's XA
+
+  // Mutation: `readPrefabFile` places the raw parse (no admit) — the frame records the keyless document: stale at birth.
+  it('a keyless template node: the placed frame is the cached document, not stale', async () => {
+    route.disk.set(W_PATH, jsonFileBody(withAdded([loose])));
+    expect(await quietly(() => placePrefabFromPath(W_PATH, { tag: 'T' }))).toBeTruthy();
+    expect(named('Loose'), 'premise: the node was spawned').toHaveLength(1);
+    expect(staleFrames({ sources: new Set([W, W_PATH]) })).toEqual([]);
+  });
+
+  // #1933 L5. Mutation: drop placement's `frameRepeatRefusal` — W is placed, its two k5 nodes on one guid.
+  it('a key two prefab files give one frame is refused, with a toast', async () => {
+    const Y = 'cccccccc-0000-4000-8000-000000019339';
+    const Y_PATH = '/assets/prefabs/Y.prefab.json';
+    const yDoc = { id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, 'eeeeeeee-0000-4000-8000-000000019331'), row(2, 'YA', 1, 'eeeeeeee-0000-4000-8000-000000019332')] };
+    const k5 = { ...loose, key: 'k5' };
+    // X: XR → XN, a Y row adding k5 under YA. W: WR → N, an X row adding k5 AT XN.
+    const x2 = { ...xDoc(), entities: [row(1, 'XR', 0, g(1)), row(2, 'XN', 1, g(2), { prefab: Y, added: [{ ...k5, name: 'FromX' }] })] };
+    registerAsset(Y, Y_PATH, 'prefab');
+    setPrefabCache(Y, null); setPrefabCache(X, null);
+    route.disk.set(Y_PATH, jsonFileBody(yDoc as never));
+    route.disk.set(X_PATH, jsonFileBody(x2 as never));
+    route.disk.set(W_PATH, jsonFileBody(withAdded([{ ...k5, name: 'FromW' }])));
+    expect(await quietly(() => placePrefabFromPath(W_PATH, { tag: 'T' }))).toBeNull();
+    expect(named('WR')).toHaveLength(0);
+    expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
+    setPrefabCache(Y, null);
+  });
+
+  // Mutation: drop the refusal in `readPrefabFile` — the document is placed.
+  it('a document giving one key to two nodes in a frame is refused, with a toast', async () => {
+    route.disk.set(W_PATH, jsonFileBody(withAdded([{ ...loose, key: 'k1' }, { ...loose, name: 'Loose2', key: 'k1' }])));
+    expect(await quietly(() => placePrefabFromPath(W_PATH, { tag: 'T' }))).toBeNull();
+    expect(named('WR')).toHaveLength(0);
+    expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
+  });
+});
+
+/** #1937 C-A step 6, T11 (owner ruling F-D): the editor's one write path (`commitPrefabChanges`, under Apply, Create
+ *  Prefab, the prefab-edit save and the agent's ops) never writes a document declaring an identifier twice, nor one whose
+ *  key two files give one frame (#1933 L5); a clean one writes. */
+describe('commitPrefabWrite refuses a document that declares an identifier twice (#1937 T11)', () => {
+  const k = (name: string, parentLocalId: number) => ({ parentLocalId, guid: '', key: 'k7', name, traits: { EntityAttributes: { name, parentId: 0 }, Transform: { x: 0, y: 0, z: 0 } }, children: [] });
+
+  // Mutation: drop the identity loop in `commitPrefabChanges` — written.
+  it('a repeated key in one document: refused, the file unchanged', async () => {
+    const before = route.disk.get(W_PATH);
+    const doc = wDoc() as unknown as { entities: Array<Record<string, unknown>> };
+    doc.entities[1] = { ...doc.entities[1], added: [k('A', 2), k('B', 2)] };
+    const res = await quietly(() => commitPrefabWrite(W, doc as unknown as PrefabFile, { expected: wDoc() }));
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/template key k7 to two nodes in one frame/);
+    expect(route.disk.get(W_PATH)).toBe(before);
+  });
+
+  // Mutation: the loop asks admission only (no `frameRepeatRefusal`) — written.
+  it('a key two files give one frame (L5): refused', async () => {
+    const Y = 'cccccccc-0000-4000-8000-000000019339';
+    const yDoc = { id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, 'eeeeeeee-0000-4000-8000-000000019331'), row(2, 'YA', 1, 'eeeeeeee-0000-4000-8000-000000019332')] };
+    const x2 = { ...xDoc(), entities: [row(1, 'XR', 0, g(1)), row(2, 'XN', 1, g(2), { prefab: Y, added: [k('FromX', 2)] })] } as unknown as PrefabFile;
+    prefabs.set(Y, yDoc); setPrefabCache(Y, yDoc as never); setPrefabCache(X, x2 as never);
+    const doc = wDoc() as unknown as { entities: Array<Record<string, unknown>> };
+    doc.entities[1] = { ...doc.entities[1], added: [k('FromW', 2)] };
+    const res = await quietly(() => commitPrefabWrite(W, doc as unknown as PrefabFile, { expected: wDoc() }));
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/template key k7 to two nodes in one frame \(in its own lists, or in its and a prefab it nests/);
+    setPrefabCache(Y, null); setPrefabCache(X, null);
+  });
+
+  // The accept side. Mutation: refuse every write — refused.
+  it('a clean document writes', async () => {
+    expect((await quietly(() => commitPrefabWrite(W, wNext(), { expected: wDoc() }))).ok).toBe(true);
   });
 });

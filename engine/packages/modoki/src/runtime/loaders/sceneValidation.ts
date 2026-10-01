@@ -12,6 +12,7 @@
  *  trait registry, structural + GUID-reference checks still run; trait/field
  *  type checks are skipped (reported once as an info note by the caller). */
 
+import { splitMalformedChannels, malformedPaths } from './malformedChannels';
 import { isGuid, isExternalUrl, isInternalAssetPath } from '../core/assetRefRules';
 import { sceneEntryGuid } from './authoredEntityGuids';
 import { declaredTemplateKeys, type TemplateKeyDoc } from './templateKeyRecovery';
@@ -847,6 +848,12 @@ export function validateSceneData(
     }
 
     warnings.push(...refFieldWarnings(entity.traits, label, assetExists));
+    // An instance's channels in a shape no reader takes (#1938 C-B step 2): the load keeps each verbatim and the save
+    // writes it back, so this is a warning, not an error — the same split the load makes.
+    if (typeof (entity as { prefab?: unknown }).prefab === 'string') {
+      const { malformed } = splitMalformedChannels(entity as object);
+      if (malformed.length) warnings.push(`${label}: ${malformed.length} value(s) in a shape no reader takes (kept as written): ${malformedPaths(malformed)}`);
+    }
   });
 
   // ── Structural / referential-integrity pass (schema-independent) — catches the

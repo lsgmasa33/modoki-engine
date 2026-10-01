@@ -23,6 +23,7 @@ import { isWorldReplacementInFlight } from '../../../packages/modoki/src/editor/
 import { _resetPrefabEditSessionRows, isEditingPrefab } from '../../../packages/modoki/src/editor/scene/prefabEdit';
 import { useEditorStore } from '../../../packages/modoki/src/editor/store/editorStore';
 import { clearKeptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { clearReservedLocalIds } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -231,6 +232,7 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
   _resetPrefabEditSessionRows();
   clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own run
   clearKeptMemberOrphans();
+  clearReservedLocalIds(); // #1933 S5: a replayed key reuses the fixture's guids
   useEditorStore.setState({ editingPrefab: null, showToast: () => {} } as never);
   be.reset();
   clearManifest();

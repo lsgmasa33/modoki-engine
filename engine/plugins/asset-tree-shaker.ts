@@ -18,6 +18,9 @@ import { REF_FIELDS_BY_TRAIT } from '../packages/modoki/src/runtime/loaders/scen
 import { MATERIAL_TEXTURE_SLOTS } from '../packages/modoki/src/runtime/assets/materialTextureSlots';
 import { resolveTextureType } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
+import { admitPrefabDocument } from '../packages/modoki/src/runtime/loaders/documentIdentity';
+import { isPrefabDocument } from '../packages/modoki/src/runtime/loaders/prefabDocumentShape';
+import { frameRepeatRefusal } from '../packages/modoki/src/runtime/loaders/frameRepeat';
 import { deriveGuid, memberRowNodes } from '../packages/modoki/src/runtime/core/assetRefRules';
 import { parseAnimClipBankResult } from '../packages/modoki/src/runtime/animation/animClipBank';
 import { parseClipBankResult } from '../packages/modoki/src/runtime/audio/clipBank';
@@ -54,6 +57,18 @@ export interface TreeShakeResult {
    *  build fails rather than shipping an asset ref that resolves to nothing on
    *  a user's device. */
   unreachableRefs: Array<{ guid: string; target: string; referencedBy: string }>;
+  /** Kept prefabs every load refuses (#1937 C-A step 7): an identifier declared twice, or a key a prefab it nests also
+   *  gives one frame (#1933 L5) — each instance ships as a Damaged Prefab placeholder. `virtual: reason`, one per
+   *  prefab. Data, as `unreachableRefs` is: the BUILD fails on it (`damagedPrefabBuildError`), the editor's own queries
+   *  (Clean Up, Find References) disclose it as a warning and still answer. */
+  damagedPrefabs: string[];
+}
+
+/** The build's refusal of `result.damagedPrefabs`, or null. Only a production build calls it (vite-asset-scanner's
+ *  build hook, beside the `unreachableRefs` guard); a player has no editor to say why its instances are placeholders. */
+export function damagedPrefabBuildError(result: Pick<TreeShakeResult, 'damagedPrefabs'>): Error | null {
+  if (!result.damagedPrefabs.length) return null;
+  return new Error(`[asset-shaker] ${result.damagedPrefabs.length} prefab(s) declare an identifier twice and would load as Damaged Prefab placeholders:\n  ${result.damagedPrefabs.join('\n  ')}`);
 }
 
 export interface OrphanDetail {
@@ -282,6 +297,8 @@ export interface RefEdge {
  *  files at the end of the walk. */
 interface WalkState {
   keep: Set<string>;
+  /** Every prefab document the walk read, by virtual path — for the identity gate after it (#1937 C-A step 7). */
+  prefabDocs: Map<string, unknown>;
   fontFamilies: Set<string>;
   /** Families reached through a GUID ref, whose file is therefore already kept — a by-name
    *  miss for one of these is not actionable, so it is not warned about (#231). */
@@ -1160,6 +1177,7 @@ export function computeKeptAssets(
   const warnings: string[] = [];
   const state: WalkState = {
     keep: new Set(),
+    prefabDocs: new Map(),
     fontFamilies: new Set(),
     guidResolvedFamilies: new Set(),
     domFontPaths: new Set(),
@@ -1239,6 +1257,7 @@ export function computeKeptAssets(
     if (type === 'scene' || type === 'prefab') {
       try {
         const json = readJsonFile(abs);
+        if (type === 'prefab') state.prefabDocs.set(virtualPath, json);
         processSceneOrPrefab(json, state, src);
       } catch (e) {
         state.warnings.push(`failed to parse ${type}: ${virtualPath} — ${(e as Error).message}`);
@@ -1508,6 +1527,31 @@ export function computeKeptAssets(
   for (const virtual of state.keep) countExtra(virtual, (size) => { keptBytes += size; });
   for (const virtual of targetDropped) countExtra(virtual, (size) => { droppedBytes += size; });
 
+  // ── The identity gate (#1937 C-A step 7) ── a shipped prefab that declares an identifier twice, or whose key a prefab
+  // it nests also gives one frame (#1933 L5), is refused by every load — each instance of it would ship as a Damaged
+  // Prefab placeholder. Collected as data and warned; the BUILD fails on it (`damagedPrefabBuildError`), never this walk,
+  // which the editor's Clean Up and reference queries also run and which must keep answering. A file that is not a
+  // prefab document is not this gate's (the walk already warned it could not parse it).
+  const prefabsByGuid = new Map<string, unknown>();
+  for (const doc of state.prefabDocs.values()) {
+    const id = (doc as { id?: unknown } | null)?.id;
+    if (typeof id === 'string') prefabsByGuid.set(id.toLowerCase(), doc);
+  }
+  const readAdmitted = (guid: string): unknown => {
+    const doc = prefabsByGuid.get(guid.toLowerCase());
+    if (!isPrefabDocument(doc)) return doc ?? null;
+    const a = admitPrefabDocument(doc);
+    return 'doc' in a ? a.doc : doc;
+  };
+  const damaged: string[] = [];
+  for (const [virtual, doc] of state.prefabDocs) {
+    if (!isPrefabDocument(doc)) continue;
+    const admitted = admitPrefabDocument(doc);
+    const reason = 'refusal' in admitted ? admitted.refusal : frameRepeatRefusal(admitted.doc, readAdmitted);
+    if (reason) damaged.push(`${virtual}: ${reason}`);
+  }
+  if (damaged.length) state.warnings.push(damagedPrefabBuildError({ damagedPrefabs: damaged })!.message.replace('[asset-shaker] ', ''));
+
   // Drop any keep-set entries that didn't match a shippable file on disk. The
   // walker may have queued references to nonexistent paths — warnings already
   // logged — so prune them so downstream copying doesn't fail.
@@ -1530,6 +1574,7 @@ export function computeKeptAssets(
     orphanDetails,
     domFontFiles,
     unreachableRefs,
+    damagedPrefabs: damaged,
   };
 }
 

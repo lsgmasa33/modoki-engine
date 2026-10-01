@@ -58,6 +58,7 @@ import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, 
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
+import { classifyPrefabIdentityWrite, admittedPrefab } from './prefabIdentityGuard';
 import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
@@ -876,7 +877,7 @@ function resolveSourcePath(ctx: BackendContext, p: string): { abs: string; writa
  *  the scene has many instances of it. Every failure — unknown guid,
  *  unresolvable path, read error, bad JSON — resolves to `undefined`; it must
  *  never throw (a bad prefab must not break scene validation). */
-function makePrefabResolver(ctx: BackendContext): PrefabResolver {
+export function makePrefabResolver(ctx: BackendContext): PrefabResolver {
   const cache = new Map<string, unknown>();
   return (sourceRef: string): unknown => {
     if (cache.has(sourceRef)) return cache.get(sourceRef);
@@ -899,8 +900,9 @@ function makePrefabResolver(ctx: BackendContext): PrefabResolver {
       const absPath = assetPath ? ctx.resolveAssetPath(assetPath) : null;
       // A leading BOM is stripped as the loader's `res.text()` strips it, so a prefab that loads in
       // the editor also resolves here (#1324 review — a duplicated scene's member refs did not follow).
+      // Admitted, as every seat reads it (#1937 C-A step 7): a keyless node's minted key is in every guid predicted here.
       result = absPath && fs.existsSync(absPath)
-        ? readJsonFile(absPath)
+        ? admittedPrefab(readJsonFile(absPath), 'none')
         : undefined;
     } catch {
       result = undefined;
@@ -2770,7 +2772,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         const abs = pathOfGuid.has(guid) ? ctx.resolveAssetPath(pathOfGuid.get(guid)!) : null;
         if (!abs || !fs.existsSync(abs)) return undefined;
         const nested = parseForValidation(abs, pathOfGuid.get(guid)!);
-        return 'data' in nested ? nested.data : undefined;
+        // As the seats read it (#1937 C-A step 7); a document they refuse is passed as it is, for the report.
+        return 'data' in nested ? admittedPrefab(nested.data, 'raw') : undefined;
       };
       const result = 'data' in parsed ? validatePrefabData(parsed.data, readPrefab) : { warnings: [parsed.warning] };
       // ── #889 phase 2: this validates the file on DISK. ──
@@ -4924,6 +4927,14 @@ async function describeUnresolvedAgainstLiveWorld(
         if (markRefusal) {
           console.error(`[Prefab] ${markRefusal.message}`);
           return json({ ok: false, conflict: true, reason: 'prefab-mark-lowered', stored: markRefusal.stored, incoming: markRefusal.incoming, error: markRefusal.message }, 409);
+        }
+      }
+      // …and it declares no identifier twice (#1937 C-A step 6, owner ruling F-D): this route is the raw one.
+      if (typeof content === 'string') {
+        const identity = classifyPrefabIdentityWrite(absPath, encoding === 'base64' ? Buffer.from(content, 'base64').toString('utf8') : content, makePrefabResolver(ctx));
+        if (identity) {
+          console.error(`[Prefab] ${identity.message}`);
+          return json({ ok: false, reason: 'prefab-identifier-repeated', error: identity.message }, 422);
         }
       }
       const refusal = ifMatchRefusal(absPath, ifMatch);

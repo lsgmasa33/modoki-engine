@@ -3,6 +3,7 @@
  *  Moved out of `prefab.ts` by the prefab.ts split (#1656 § Plan, step 5): a pure move. */
 
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
+import { frameRepeatRefusal } from '../../runtime/loaders/frameRepeat';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { relinkDetachedMembers } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -424,8 +425,8 @@ function rebuildTargetsByEntry(
     const baseline = rec && rec.source === source ? rec.doc as PrefabFile : refreshed?.from ?? now;
     if (!now || !baseline) continue;
     // Not counted as rebuilt: `rebuildFromEntry` would leave the entry standing, and say so.
-    if (!expandsToRoot(now, read as typeof getCachedPrefabSync)) {
-      console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root`);
+    if (!expandsToRoot(now, read as typeof getCachedPrefabSync) || frameRepeatRefusal(now, (g) => read(g) ?? null)) {
+      console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root, or gives one key two nodes (#1933 L5)`);
       said += group.length;
       continue;
     }
@@ -522,6 +523,13 @@ export function rebuildFromEntry(
   if (!piMeta || !eaMeta) return rootInstanceId;
   if (!expandsToRoot(prefab, read as typeof getCachedPrefabSync)) {
     console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root`);
+    return rootInstanceId;
+  }
+  // A key the expansion would give two nodes (#1933 L5, close-out review #1): left as it was, as one that expands to no
+  // root is — re-expanded, both nodes derive one guid and the next save turns one into the other. The next load refuses it.
+  const repeat = frameRepeatRefusal(prefab, (g) => read(g) ?? null);
+  if (repeat) {
+    console.warn(`[Prefab] rebuild of ${source} skipped: ${repeat}`);
     return rootInstanceId;
   }
   if (remap.size) entry = remapGuidValues(entry, remap) as InstanceEntry;

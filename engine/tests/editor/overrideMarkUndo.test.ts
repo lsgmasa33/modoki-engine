@@ -176,6 +176,39 @@ describe("Detach's undo after a rebuild keeps the instance's overrides (#1794)",
   });
 });
 
+// #1853: the override on a NESTED member's node (A, inside O's nested P) after Detach, a rebuild and the undo. The fuzzer's
+// three #1853 entries could not see this any more (#1933 K1): an outside edit before each Detach keeps the undo stack since
+// #1873 R1, so the walk's identity checks run tainted and are skipped. Mutation: in `reattachPrefabInstance`, restore the
+// marks of the outermost frame's members only (`if (root === snapshot[0]!.rootRef.resolve()) restoreMarks(…)`) — this
+// test goes red and the flat #1794 tests above stay green, so it is the nested case's only cover.
+describe("Detach's undo after a rebuild keeps a NESTED member's overrides (#1853, #1933 K1)", () => {
+  const OINST = 'dddddddd-0000-4000-8000-000000001853';
+  const oScene = (): SceneData => ({
+    id: 's1853', version: 16, name: 'S', resources: [],
+    entities: [
+      { id: 1, traits: { EntityAttributes: { name: 'Holder', parentId: 0, guid: HOLDER }, Transform: { x: 0, y: 0, z: 0 } } },
+      { id: 2, prefab: O, guid: OINST, traits: { EntityAttributes: { name: 'OInst', parentId: 0 } } },
+    ],
+  } as unknown as SceneData);
+
+  it('Detach O, a save and reopen, the undo: the next save→reload keeps A\'s overrides', async () => {
+    await load(oScene());
+    writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'x', 7);
+    writeTraitFieldWithUndo(idOf('A'), meta('Rotate3D'), 'speed', 5);
+    await rebuild();
+    clearHistory();
+    expect(marksOf(idOf('A'))).toEqual(['Rotate3D.speed', 'Transform.x']); // precondition: the file marked both
+    detachPrefabInstanceWithUndo(guidIdOf(OINST), 'Detach prefab', '[test]');
+    expect(readTraitData(idOf('A'), meta('PrefabInstance'))).toBeNull();
+    await rebuild();
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(marksOf(idOf('A'))).toEqual(['Rotate3D.speed', 'Transform.x']);
+    await rebuild();
+    expect(field(idOf('A'), 'Transform', 'x')).toBe(7);
+    expect(field(idOf('A'), 'Rotate3D', 'speed')).toBe(5);
+  });
+});
+
 describe("Remove Component's undo after a rebuild keeps a TEMPLATE-defined component's override (#1800)", () => {
   // The study marked this case INFERRED (the fuzzer's editField writes Transform only). Driven here.
   // Mutation: drop `restoreMarks(id, targets[i].marks)` from `removeTraitFromEntitiesWithUndo`'s revert — the reload

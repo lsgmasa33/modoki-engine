@@ -25,6 +25,7 @@ import { docRows, placedAnchor } from './memberTranslation';
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
 
 import { rowAt, referenceRowAt } from '../core/prefabRowAt';
+import { removalFate } from './overrideFate';
 export { rowAt, referenceRowAt };
 
 /** Deep-merge two per-localId override maps (localId → trait → field → value).
@@ -172,6 +173,27 @@ export interface KeyedNode<A> {
   children: A[];
 }
 
+/** Which node each template key names in ONE frame's node tree (#1937 C-A step 3): key → the node, or `null` for a key two
+ *  nodes carry — a key used twice names NEITHER. Every reader that asks "which node does this key name" asks this one
+ *  index, so they cannot disagree (before, five hand spellings counted over different scopes, and three readers took the
+ *  last or first node). The scope is the frame's whole tree: `children` at any depth, a reference node's included (its
+ *  own `added` is its own frame, not this one), as the expansion walks it ({@link applyNodeRows}).
+ *
+ *  Since every seat admits its document (`admitPrefabDocument`), a repeat inside one document never reaches a reader;
+ *  this branch is for a frame composed from two documents that both state a key (one copied by hand between files). */
+export function frameKeyIndex<N extends { key?: string; children?: readonly unknown[] }>(nodes: readonly N[] | undefined): Map<string, N | null> {
+  const index = new Map<string, N | null>();
+  const walk = (list: readonly N[] | undefined): void => {
+    for (const n of list ?? []) {
+      if (!n || typeof n !== 'object') continue;
+      if (n.key) index.set(n.key, index.has(n.key) ? null : n);
+      if (Array.isArray(n.children) && n.children.length) walk(n.children as readonly N[]);
+    }
+  };
+  walk(nodes);
+  return index;
+}
+
 /** Apply NODE ROWS to a frame's template-added nodes (#1516, scene v17) — the field-level twin of what a
  *  member row does for a member. `rows` maps a template key to that node's row; every node carrying a key
  *  in it, at any depth of `children`, gets:
@@ -203,13 +225,11 @@ export function applyNodeRows<A extends KeyedNode<A>>(
   if (!nodes || (!rows.size && !deep.size)) return { nodes: nodes as A[] | undefined, hit };
   // A key two nodes carry names NEITHER (#1880 F3c, as `memberPathIndex` and the fold's `replaced()` answer): a hand edit or
   // merge repeated it, the validator reports it, and a row applied to both would edit a node its writer never meant.
-  const seen = new Map<string, number>();
-  const count = (list: readonly A[]): void => { for (const n of list) { if (n.key) seen.set(n.key, (seen.get(n.key) ?? 0) + 1); if (n.children?.length) count(n.children); } };
-  count(nodes);
+  const index = frameKeyIndex(nodes);
   const walk = (list: readonly A[]): A[] => {
     const out: A[] = [];
     for (const node of list) {
-      const named = !!node.key && seen.get(node.key) === 1;
+      const named = !!node.key && index.get(node.key) === node;
       const row = named ? rows.get(node.key!) : undefined;
       const inner = named && node.prefab ? deep.get(node.key!) : undefined;
       if (row || inner) hit.add(node.key!);
@@ -324,18 +344,23 @@ type PairNode = { key?: string; guid?: string; prefab?: string; children?: unkno
  *  the template key the live node held (the writer stamps it, `stampTemplateKeys`); a template-form node carries no
  *  guid and states its values itself, so it is never paired. Paired only on a key `lower` uses once, to a node of the
  *  same kind (the same prefab, or both plain). Inputs are never mutated. */
-export function pairWithBase<A>(list: readonly A[], lower: readonly unknown[] | undefined): A[] {
+export function pairWithBase<A>(
+  list: readonly A[], lower: readonly unknown[] | undefined,
+  /** The {@link frameKeyIndex} of the whole frame `lower` is part of (default: `lower`'s own): a key the frame repeats
+   *  names neither node, wherever the other one sits. */
+  frame?: ReadonlyMap<string, unknown>,
+): A[] {
   const lows = (lower ?? []) as PairNode[];
   if (!lows.length) return list as A[];
-  const count = new Map<string, number>();
-  for (const l of lows) if (l.key) count.set(l.key, (count.get(l.key) ?? 0) + 1);
+  const index = frame ?? frameKeyIndex(lows);
+  const mine = new Set<PairNode>(lows);
   return list.map((node) => {
     const n = node as PairNode;
-    if (!n.guid || !n.key || count.get(n.key) !== 1) return node;
-    const l = lows.find((x) => x.key === n.key)!;
+    const l = n.guid && n.key ? index.get(n.key) as PairNode | null | undefined : undefined;
+    if (!l || !mine.has(l)) return node;
     if ((l.prefab ?? '') !== (n.prefab ?? '')) return node;
     const out: PairNode = n.prefab ? { ...n, [BASE_NODE]: l } : { ...n };
-    if (Array.isArray(n.children)) out.children = pairWithBase(n.children, l.children);
+    if (Array.isArray(n.children)) out.children = pairWithBase(n.children, l.children, index);
     if (n.prefab && Array.isArray(n.added)) out.added = pairWithBase(n.added, l.added);
     if (n.prefab && n.members) {
       const rows: Record<string, unknown> = emptyDocMap();
@@ -451,10 +476,10 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
     // A whole list replaces the lower layer's, so its names are measured against the base before any removal.
     const below = new Set(list ?? removedTraits?.[lid] ?? []);
     const out: Pick<MemberRowChannels<A>, 'removedTraits' | 'traitRemovals'> = {};
-    const gone = list?.filter((t) => !has(t));
+    const gone = list?.filter((t) => removalFate(has(t), t) === 'unused');
     if (gone?.length) out.removedTraits = gone;
     for (const [t, on] of Object.entries(statements ?? {})) {
-      if (on ? has(t) && !below.has(t) : below.has(t)) continue;
+      if (removalFate(on ? has(t) && !below.has(t) : below.has(t), t) === 'used') continue;
       (out.traitRemovals ??= {})[t] = on;
     }
     if (out.removedTraits || out.traitRemovals) unusedRemovals.set(src, out);
@@ -490,23 +515,15 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
       // A key the lower list uses twice names neither node (the diff never reports one, `diffFrameAdded`'s `twice`): a
       // list pinned while the anchor existed held only the copy anchored at `lid` (third review).
       const named = new Set(row.added.map((n) => (n as { key?: string }).key).filter((k): k is string => !!k));
-      const lowerKeys = new Map<string, number>();
-      const countKeys = (nodes: readonly A[] | undefined) => {
-        for (const n of nodes ?? []) {
-          const k = (n as { key?: string }).key;
-          if (k) lowerKeys.set(k, (lowerKeys.get(k) ?? 0) + 1);
-          countKeys((n as { children?: A[] }).children);
-        }
-      };
-      countKeys(added);
+      const lowerKeys = frameKeyIndex(added as readonly { key?: string; children?: unknown[] }[] | undefined);
       const replaced = (n: A) => {
         if (n.parentLocalId === lid) return true;
         const k = (n as { key?: string }).key;
-        return !!k && named.has(k) && lowerKeys.get(k) === 1 && placedAnchor(doc, n.parentLocalId) === lid;
+        return !!k && named.has(k) && lowerKeys.get(k) === (n as never) && placedAnchor(doc, n.parentLocalId) === lid;
       };
       // A scene-form copy of a node it replaces takes that node's values as base (#1914 R1, `BASE_NODE`).
       const gone = (added ?? []).filter(replaced);
-      added = [...(added ?? []).filter((n) => !replaced(n)), ...pairWithBase(row.added, gone).map((n) => tag({ ...n, parentLocalId: lid }))];
+      added = [...(added ?? []).filter((n) => !replaced(n)), ...pairWithBase(row.added, gone, lowerKeys).map((n) => tag({ ...n, parentLocalId: lid }))];
     }
     if (Array.isArray(row.own) && row.own.length) {
       added = [...(added ?? []), ...row.own.map((n) => tag({ ...n, parentLocalId: lid }))];

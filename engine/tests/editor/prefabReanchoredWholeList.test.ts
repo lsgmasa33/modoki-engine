@@ -15,14 +15,14 @@
  *  - The anchor comes BACK (an outside edit restoring the prefab): the removed rows still name the template's nodes.
  *  - A rebuild in place (another instance's Apply refreshes this frame) diffs through the same `diffFrameAdded`.
  *
- *  - A TEMPLATE-form save (H's prefab edit nests O), where the list carries the node's key, and a key used twice
- *    elsewhere in the frame (the close-out re-review's two findings).
+ *  - A TEMPLATE-form save (H's prefab edit nests O), where the list carries the node's key (the close-out re-review).
+ *  - A key used twice in O's own frame (the re-review's other finding) is refused at O's seat since #1937 C-A: its
+ *    instances are Damaged Prefab placeholders that keep their record, so the whole list can no longer come from it.
  *
  *  Each: one copy, and a second save byte-identical to the first. Mutations, each red on exactly its cases: the fold
- *  replacing everything PLACED at the anchor (the reversed order, the duplicate key); no scene-form removed rows (every
- *  scene-form case); removed rows in template form too (the template-form case); no key-named replacement in the fold
- *  (the template-form case); the duplicate-key branch not asking the rule (the duplicate key); the rebuild subtracting a
- *  pinned-over node (the rebuild, the duplicate key).
+ *  replacing everything PLACED at the anchor (the reversed order); no scene-form removed rows (every scene-form case);
+ *  removed rows in template form too (the template-form case); no key-named replacement in the fold (the template-form
+ *  case); the rebuild subtracting a pinned-over node (the rebuild).
  *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches, prefab edit and the
  *  simulated watcher. */
@@ -38,7 +38,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
     return { failed: [] };
   },
 }));
-import { getTraitByName } from '@modoki/engine/runtime';
+import { getTraitByName, getAllEntities, readTraitData } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, authored, flushWatcher, type Fixture } from './prefabFuzz/harness';
 import { deleteEntitiesWithUndo, writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
@@ -185,19 +185,11 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
   // Since #1914 R3b a delete inside the template reference node is a row reaching into it, and N's list is not written
   // at all (`rows`); a key used twice in the frame, which no node row can name, still makes H write the list whole
   // (`whole`, as the case below).
-  for (const mode of ['rows', 'whole'] as const) it(`a TEMPLATE-form save (H's prefab edit nests O and deletes inside the re-anchored node): one copy in every H instance (${mode})`, async () => {
+  it("a TEMPLATE-form save (H's prefab edit nests O and deletes inside the re-anchored node): one copy in every H instance", async () => {
     // The list a prefab's own rows pin carries each node's KEY, so a removed row on that key removed the list's copy
     // too, and every instance of H lost Extra and the nested P (#1872 re-review). Template form states it by the key.
-    const f = await startRun(be, async () => {}, `reanchored-templateForm-${mode}`);
-    if (mode === 'whole') {
-      const doc = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ localId: number; added?: unknown[] }> };
-      const dup = () => ({ parentLocalId: 1, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 } }, children: [] });
-      doc.entities.find((e) => e.localId === 2)!.added!.push(dup(), dup());
-      const before = be.snapshot();
-      be.write(f.prefabs.O.path, `${JSON.stringify(doc, null, 2)}\n`);
-      await flushWatcher(be, before);
-      await settle();
-    }
+    // (Its `whole` mode — a key O's frame used twice — is refused at O's seat since #1937 C-A: the case below.)
+    const f = await startRun(be, async () => {}, 'reanchored-templateForm-rows');
     await nestPInO(f, 'A');
     await deleteAInP(f);
     await editAndSave(f.prefabs.H.path, 'H', async () => {
@@ -211,13 +203,12 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
       await settle();
     });
     const hDoc = be.read(f.prefabs.H.path)!;
-    expect([hDoc.includes('"added"'), hDoc.includes('/a+')], 'premise: how H stated the delete').toEqual(mode === 'whole' ? [true, false] : [false, true]);
+    expect([hDoc.includes('"added"'), hDoc.includes('/a+')], 'premise: how H stated the delete').toEqual([false, true]);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const first = be.read(f.scenePath)!;
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    // The two fixture Dups share a key, so a guid; nothing else may.
-    expect(duplicateGuids().filter((g) => authored().some((e) => e.guid === g && e.name !== 'Dup'))).toEqual([]);
+    expect(duplicateGuids()).toEqual([]);
     const hr = authored().find((e) => e.name === 'HR' && e.guid?.startsWith('ffffffff-0000-4000-8003-'))!;
     const or = byName('OR', hr.id)[0]!;
     const n = byName('R', or.id)[0]!;
@@ -229,29 +220,38 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     expect(be.read(f.scenePath)).toBe(first);
   });
 
-  it('a key used twice elsewhere in the frame: the re-anchored node is still one copy, rebuilt and reloaded', async () => {
-    // Every anchor of such a frame goes whole, and the diff returned before the rule while the rebuild's own copy of it
-    // fired: two Extras live after a rebuild, three after a reload (#1872 re-review).
+  it('a key used twice in O\'s frame is refused at O\'s seat: a Damaged Prefab placeholder keeps the record, and the fixed file brings it back (#1937 C-A)', async () => {
+    // Before #1937 a merge that brought a repeated key into O wrote every anchor of the frame whole (the re-review's
+    // finding this case held). Unity refuses a file whose identifiers repeat and loads its instances as missing assets;
+    // so does every prefab seat now (owner ruling F-A (1)). Driven through the real backend, both caches and the watcher.
+    // Mutation: drop the seat refusal (`admitAtSeat` in `fetchPrefab`) — O expands: no placeholder, no label.
     const f = await startRun(be, async () => {}, 'reanchored-dupKey');
-    const doc = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ localId: number; added?: unknown[] }> };
+    expect(writeTraitFieldWithUndo(frame().n.id, getTraitByName('Transform')!, 'x', 7)).toBeFalsy();
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    const edited = be.read(f.scenePath)!;
+    const good = be.read(f.prefabs.O.path)!;
+    const doc = JSON.parse(good) as { entities: Array<{ localId: number; added?: unknown[] }> };
     const dup = (x: number) => ({ parentLocalId: 1, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 }, Transform: { x, y: 0, z: 0 } }, children: [] });
-    doc.entities.find((e) => e.localId === 2)!.added!.push(dup(1), dup(2));
-    const before = be.snapshot();
+    (doc.entities.find((e) => e.localId === 2)!.added ??= []).push(dup(1), dup(2));
+    let before = be.snapshot();
     be.write(f.prefabs.O.path, `${JSON.stringify(doc, null, 2)}\n`); // a merge that brought a repeated key in
     await flushWatcher(be, before);
     await settle();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    await deleteAInP(f);
-    expect(byName('Extra', frame().n.id).length, 'premise: Extra re-anchored to N\'s root').toBe(1);
-    await applyFromSecondO(f);
-    expect(byName('Extra', frame().n.id).length, 'one Extra after the rebuild in place').toBe(1);
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const first = be.read(f.scenePath)!;
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(byName('Extra', frame().n.id).length, 'one Extra after the reload').toBe(1);
+    const placeholder = authored().find((e) => e.guid?.startsWith('ffffffff-0000-4000-8001-'));
+    expect(placeholder?.missingPrefab, 'O\'s instance is a placeholder').toBe(true);
+    expect(placeholder?.damagedPrefab).toMatch(/template key k-dup to two nodes in one frame/);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(be.read(f.scenePath)).toBe(first);
+    expect(be.read(f.scenePath), 'the record is written back as it was read').toBe(edited);
+    before = be.snapshot();
+    be.write(f.prefabs.O.path, good); // the file is fixed
+    await flushWatcher(be, before);
+    await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    expect(getAllEntities().some((e) => e.missingPrefab), 'O expands again').toBe(false);
+    expect((readTraitData(frame().n.id, getTraitByName('Transform')!) as { x: number }).x, 'with the scene\'s edit').toBe(7);
   });
 
   it("a TEMPLATE-form DELETE of a pinned-over node holds: H's edit deletes the re-anchored Extra (third review)", async () => {
@@ -285,10 +285,12 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     expect(be.read(f.scenePath)).toBe(first);
   });
 
-  it('a key the lower list uses twice names neither copy: a template-form list pinned before the anchor went keeps both (third review)', async () => {
-    // O's N adds k-dup at P's root and at A; H pins N's lists while A exists, so its root list names k-dup for the ROOT
-    // copy only. Then A goes and its copy is re-anchored to the root: the fold's key clause dropped it. Mutation: drop
-    // the once-only test from the fold's key clause — one Dup under the H instance.
+  it('a key one frame\'s lists give two nodes is REFUSED: placing the prefab is refused with the reason (#1937 C-A, #1933 L5)', async () => {
+    // O's N adds k-dup at P's root and at A — one frame of P (I7: a keyed node derives from its frame root plus its key),
+    // so both derive one guid. Admission groups by anchor (it sees O alone, not which of P's rows are frames), so the
+    // repeat is the derive walk's to see (`frameRepeatRefusal`), which placement, the load and every write ask. This
+    // case used to place O and test the fold's key clause over the collision (third review); since owner ruling F-A (1)
+    // that prefab does not load. Mutation: drop placement's `frameRepeatRefusal` — O is placed.
     const f = await startRun(be, async () => {}, 'reanchored-templateDupKey');
     const doc = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ localId: number; added?: unknown[] }> };
     const dup = (x: number, at: number) => ({ parentLocalId: at, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 }, Transform: { x, y: 0, z: 0 } }, children: [] });
@@ -297,15 +299,10 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     be.write(f.prefabs.O.path, `${JSON.stringify(doc, null, 2)}\n`);
     await flushWatcher(be, before);
     await settle();
-    await editAndSave(f.prefabs.H.path, 'H', async () => {
-      const hr = authored().find((e) => e.name === 'HR' && !e.parentId)!;
-      expect(await placePrefabFromPath(f.prefabs.O.path, { tag: 'test', parentId: hr.id })).toBeTruthy();
-      await settle();
-    });
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    await deleteAInP(f);
-    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-    await settle();
-    expect([byName('Dup', hInstanceN().id).length, byName('Dup', frame().n.id).length], '[H instance, scene O instance]').toEqual([2, 2]);
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      expect(await placePrefabFromPath(f.prefabs.O.path, { tag: 'test' })).toBeNull();
+      expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/was not placed: prefab "O" gives template key k-dup to two nodes in one frame/);
+    } finally { warn.mockRestore(); }
   });
 });

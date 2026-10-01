@@ -1414,6 +1414,9 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   that guid as its `parentId`. Nothing in the load path catches it — `filterDuplicateChainGuids`
   compares a scene against an earlier chain scene, so a collision *inside* one file passes straight
   through and both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
+  The check itself is written (`sceneIdentityRefusal`, `runtime/loaders/documentIdentity.ts`, #1937 C-A); refusing such
+  a scene at its load is C-A step 5, PARKED with #1933 L3, so it is called by nothing yet. A PREFAB declaring an
+  identifier twice is refused at every seat (docs/prefabs.md I7).
 - **Across scene files, sharing a guid is LEGACY — and sometimes load-bearing.** A sweep of the 54
   committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
   `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
@@ -1650,8 +1653,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     the guid the node re-derives from its key on every load, not on a guid the scene stores.
   - **Rebuilds derive.** A rebuild ends with the derive pass (the load's own since #1880 F6). Before, a respawned keyed
     node was left guid-less.
-  - **Legacy.** A pre-key row node keeps loading exactly as before. A node with no guid loads
-    guid-less. A node with a durable guid still gives every instance that one guid, until its OWN
+  - **Legacy.** A pre-key row node keeps loading exactly as before. A node with neither key nor guid is given a key
+    by every seat that admits its document (#1937 C-A, `admitPrefabDocument`: seeded by the document, its list, its
+    content and its ordinal among identical siblings, so all seats agree), derives from it like any keyed node, and the
+    prefab's first editor save writes it — docs/prefabs.md I7. A node with a durable guid still gives every instance that one guid, until its OWN
     prefab is re-saved and writes the key. `sameStructure` compares node identity (`key`, `guid`)
     only when both sides key every node, so an OUTER no-op save never pins such an interior just to
     migrate it. **Committed corpus (2026-09-18): 0 of 105 prefabs carry a row `added` node with a

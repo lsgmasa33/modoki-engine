@@ -48,8 +48,11 @@ const keptUnused = new Map<string, Record<string, object>>();
 export type KeptLegacy = {
   nestedOverrides?: Record<string, object>; nestedStructure?: Record<string, object>;
   overrides?: Record<string, object>; removedTraits?: Record<string, string[]>; removed?: number[]; moved?: Record<string, string>;
+  /** The owner's values in a shape no reader takes, each at its place (#1938 C-B step 2, `malformedChannels.ts`): kept
+   *  verbatim and written back where the save states nothing there. */
+  malformed?: Array<{ path: string[]; value: unknown }>;
 };
-const LEGACY_CHANNELS = ['nestedOverrides', 'nestedStructure', 'overrides', 'removedTraits', 'removed', 'moved'] as const;
+const LEGACY_CHANNELS = ['nestedOverrides', 'nestedStructure', 'overrides', 'removedTraits', 'removed', 'moved', 'malformed'] as const;
 const keptLegacy = new Map<string, KeptLegacy>();
 
 export function keptLegacyOf(rootGuid: string): KeptLegacy | undefined {

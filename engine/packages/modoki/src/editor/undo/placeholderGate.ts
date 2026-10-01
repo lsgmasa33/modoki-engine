@@ -16,7 +16,7 @@ import { findEntity, readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { PLACEHOLDER_PLACEMENT_FIELDS } from '../../runtime/loaders/unresolvedPrefabRefs';
-import { isSuppliedByPrefab } from '../scene/restructureRefusal';
+import { isSuppliedByPrefab, repeatedTemplateKeyRefusal } from '../scene/restructureRefusal';
 
 /** True when the live entity `id` is a Missing Prefab placeholder: it carries a kept record (`UnresolvedPrefabRef`). */
 export function isMissingPrefabPlaceholder(id: number): boolean {
@@ -59,7 +59,8 @@ export function placeholderRefusalWords(name: string): string {
  *  or null when it may go ahead. Refuses on a placeholder unless the writer that saves it keeps the field
  *  ({@link placeholderSavedFields}). */
 export function placeholderWriteRefusal(id: number, traitName: string, field?: string): string | null {
-  if (!isMissingPrefabPlaceholder(id)) return null;
+  // A template node whose key its frame repeats (#1937 C-A step 4): no row can record the edit, so none is taken.
+  if (!isMissingPrefabPlaceholder(id)) return repeatedTemplateKeyRefusal(id);
   if (traitName === 'EntityAttributes' && field !== undefined && placeholderSavedFields(id).has(field)) return null;
   return placeholderRefusalWords(entityNameOf(id));
 }

@@ -59,6 +59,7 @@
  *  #1777 is not re-found (reusing a number needs a hand edit below the mark, or #1782's rebuilders); #1741 is
  *  unreachable (one scene). The weights were not tuned against these; the generator changes are in the doc. */
 
+import { reserveLocalId, clearReservedLocalIds } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { describe, it, expect, vi, afterAll } from 'vitest';
 import fs from 'fs';
 
@@ -75,8 +76,9 @@ import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
 import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
-import { KNOWN_OPEN, REGRESSIONS, type KnownOpen } from './prefabFuzz/knownOpen';
-import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks } from './prefabFuzz/checks';
+import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
+import { writeFileSync } from 'node:fs';
+import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, recordKeys } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { setRunMode } from '@modoki/engine/runtime';
 
@@ -323,12 +325,27 @@ describe('#1789 prefab fuzz', () => {
     process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}; #1880 checks run: ${tally(checksRun)}\n`);
   });
 
+  // #1933 K1: an entry must still REACH its case (`Reach`, knownOpen.ts), not just pass. Its op's outcome is read off the
+  // trace, and the checks its run skipped off the skip tally's growth.
+  const reachDump = process.env.MODOKI_PREFAB_FUZZ_REACH_DUMP;
+  const measured: Array<{ issue: number; what: string; reaches: Reach }> = [];
   for (const r of REGRESSIONS) {
     it(`regression #${r.issue}: ${r.what}`, async () => {
+      const before = new Map(skippedChecks);
       const res = await runOps(be, r.repro, OPTS);
       expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
+      const skips = [...skippedChecks].filter(([k, n]) => n > (before.get(k) ?? 0)).map(([k]) => k).sort();
+      const outcomeOf = (i: number) => res.trace.map((l) => /^(\d+): .*? → (\w+)/.exec(l)).find((m) => m && Number(m[1]) === i)?.[2];
+      if (reachDump) {
+        const op = r.reaches.op;
+        measured.push({ issue: r.issue, what: r.what.slice(0, 80), reaches: { op, outcome: outcomeOf(op) as Reach['outcome'], ...(skips.length ? { skips } : {}) } });
+        return;
+      }
+      expect(outcomeOf(r.reaches.op), `op ${r.reaches.op} of the repro no longer ends ${r.reaches.outcome}: the entry may not reach its case`).toBe(r.reaches.outcome);
+      expect(skips.filter((k) => !(r.reaches.skips ?? []).includes(k)), 'a taint now skips a check this entry may rely on').toEqual([]);
     }, 60_000);
   }
+  afterAll(() => { if (reachDump) writeFileSync(reachDump, JSON.stringify(measured, null, 1)); });
 
   // #1880 F3a's "1127 + an undo of its Apply comes back once" fuzz test retired with F6 (2026-09-30): the outermost-entry
   // rebuild renumbers the entry's runtime ids, the fuzz ops pick their targets in id order, and 1127's list diverges at
@@ -494,6 +511,10 @@ describe('#1789 prefab fuzz', () => {
     // Reject side: the same document with its mark, or its version, gone down.
     expect(diffFiles(at(doc), at({ ...doc, nextLocalId: 6 }))).toMatch(/localId mark went down \(7 → 6\)/);
     expect(diffFiles(at(doc), at({ ...doc, version: 8 }))).toMatch(/format version went down/);
+    // #1933 S5: a reservation the renderer holds for the document does not hide a lowered stated mark. Mutation: compare
+    // `localIdCounter` (counts the reservation) in `diffFiles` — both sides read 21 and the drop passes.
+    reserveLocalId(doc.id, 20);
+    try { expect(diffFiles(at(doc), at({ ...doc, nextLocalId: 6 }))).toMatch(/localId mark went down \(7 → 6\)/); } finally { clearReservedLocalIds(); }
   });
 
   // #1880 T1 (close-out re-review): the two exemptions the held checks take, pinned on their reject side. Mutation: give the
@@ -527,9 +548,31 @@ describe('#1789 prefab fuzz', () => {
     expect(down.map((f) => [f.check, f.detail])).toEqual([['I4 high-water mark went down', `${P} (parked): 9 → 6`]]);
     // A hand edit is held to nothing (the runner forgets the document's mark when an outside edit writes it).
     expect(checkMarks(new Map([[P, doc(2)]]), marks, new Set(), new Set([P]))).toEqual([]);
+    // #1933 S5: nor does a reservation hide a drop. Mutation: read `localIdCounter` in `checkMarks` — 21 both times.
+    reserveLocalId('cccccccc-0000-4000-8000-000000001880', 20);
+    try {
+      const held = new Map<string, number>();
+      checkMarks(new Map([[P, doc(9)]]), held, new Set());
+      expect(checkMarks(new Map([[P, doc(6)]]), held, new Set()).map((f) => f.check)).toEqual(['I4 high-water mark went down']);
+    } finally { clearReservedLocalIds(); }
   });
 
   // #1838: the round trip holds a rotation as ONE value, an orientation (#1490's rule), not three numbers.
+  // #1933: I23 compares these keys around a record-neutral op. Mutations: drop the component-bag key (`isComponent` →
+  // false) — the lost `{T: {}}` is not seen; key the empty `traits: {}` itself — the seed-1247 fill reads as a loss.
+  it('harness: I23\'s record keys see a component added with no fields, and an empty bag that fills is no loss (#1933)', () => {
+    const entry = (members: unknown, overrides?: unknown) => JSON.stringify({ entities: [{ guid: 'G', members, ...(overrides ? { overrides } : {}) }] });
+    const added = recordKeys(entry({ '/n': { traits: { Rotate3D: {} } } }, { 3: { Tag: {} } }));
+    for (const k of ['G members//n/traits/Rotate3D', 'G overrides/3/Tag']) expect(added.has(k)).toBe(true);
+    const gone = recordKeys(entry({ '/n': { traits: {} } }));
+    expect([...added].filter((k) => !gone.has(k)).sort()).toEqual(['G members//n/traits/Rotate3D', 'G overrides/3/Tag']);
+    const before = recordKeys(entry({ '/n': { traits: {} } }));
+    const after = recordKeys(entry({ '/n': { traits: { Transform: { x: 1 } } } }));
+    expect([...before].filter((k) => !after.has(k))).toEqual([]);
+    const filled = recordKeys(entry({ '/n': { traits: { Rotate3D: { speed: 2 } } } }));
+    expect(filled.has('G members//n/traits/Rotate3D')).toBe(true);
+  });
+
   it('harness: the round trip forgives an equal rotation spelled differently, and nothing else (#1838)', () => {
     const G = '1aaaaaaa-0000-4000-8000-000000001838';
     const at = (tf: Record<string, number>) => ({ [G]: { traits: { Transform: tf } } });

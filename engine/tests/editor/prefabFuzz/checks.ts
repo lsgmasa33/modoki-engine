@@ -15,7 +15,7 @@ import { findEntity } from '@modoki/engine/runtime';
 import { unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { piOf } from './harness';
 import { sameOrientation } from '../../../packages/modoki/src/runtime/scene/transformSpace';
-import { localIdCounter } from '../../../packages/modoki/src/runtime/core/localIdCounter';
+import { storedLocalIdCounter } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 
 /** `console`: every console.error line the end walk logged, allowlisted or not, when the walk's identity check fails —
  *  the line that names the mechanism (a refusal's full text, a "not tagging" reason) is often there, not in `detail`. */
@@ -218,7 +218,8 @@ export function checkMarks(view: ReadonlyMap<string, string>, marks: MarkHistory
     let doc: Doc;
     try { doc = JSON.parse(text) as Doc; } catch { continue; } // `checkFiles` reports an unparseable file
     if (!doc.id) continue;
-    const now = localIdCounter(doc);
+    // What the document STATES (#1933 S5): the renderer's in-memory reservation would lift a lowered mark back up.
+    const now = storedLocalIdCounter(doc);
     const was = marks.get(doc.id);
     if (was !== undefined && now < was) out.push({ check: 'I4 high-water mark went down', detail: `${path}${parked.has(path) ? ' (parked)' : ''}: ${was} → ${now}` });
     marks.set(doc.id, Math.max(was ?? 0, now));
@@ -409,7 +410,11 @@ export function recordKeys(sceneBytes: string): Set<string> {
   let scene: { entities?: Array<Record<string, unknown>> };
   try { scene = JSON.parse(sceneBytes) as typeof scene; } catch { return out; }
   const CHANNELS = ['overrides', 'members', 'removed', 'removedTraits', 'added', 'nestedOverrides', 'nestedStructure', 'moved'];
+  // A component bag IS a record, with fields or none: `{T: {}}` adds the component (F6 counts it as one, #1933). So each
+  // bag keys its own path besides its leaves; an empty bag that later fills keeps that key, and the seed-1247 case holds.
+  const isComponent = (path: string) => /\/traits\/[^/]+$/.test(path) || /^overrides\/[^/]+\/[^/]+$/.test(path) || /^nestedOverrides\/[^/]+\/[^/]+\/[^/]+$/.test(path);
   const walk = (v: unknown, path: string, guid: string) => {
+    if (v && typeof v === 'object' && !Array.isArray(v) && isComponent(path)) out.add(`${guid} ${path}`);
     if (Array.isArray(v) && v.length && v.every((x) => !x || typeof x !== 'object')) {
       for (const x of v) out.add(`${guid} ${path}[${String(x)}]`);
     } else if (v && typeof v === 'object' && Object.keys(v).length) {

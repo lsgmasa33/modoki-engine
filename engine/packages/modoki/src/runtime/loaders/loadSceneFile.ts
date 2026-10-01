@@ -12,12 +12,18 @@ import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
 import { emptyDocMap, hasDocKey } from '../core/docKeys';
-import { isPersistentTraitField } from '../core/ecs/traitSchema';
+import { reserveLocalId } from '../core/localIdCounter';
+import { setMissingComponents, beginMissingComponentsLoad } from '../core/ecs/missingComponents';
+import { admitPrefabDocument } from './documentIdentity';
+import { frameRepeatRefusal, nestedDocReader } from './frameRepeat';
+import { noteDamagedPrefab, forgetDamagedPrefab } from '../core/damagedPrefabs';
+import { splitMalformedChannels, malformedPaths, type MalformedValue } from './malformedChannels';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
   descendPathKeyed, nestedPathKey, mergeNestedStructurePaths,
   foldStructureLayers, foldRowStep, referenceRowAt, rowAt, unusedRemovalsOf, isUntargetedRow, ownNode, isOwnNode, baseNodeOf, recordedFieldsOf, overRowsOf, type OverrideMap, type StructureLayer, type FoldRow, type FoldDoc, type ForwardState,
   type NestedOverridePaths,
+  frameKeyIndex,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/version';
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
@@ -27,6 +33,7 @@ import { rowFrameAddress, nodeFrameAddress, liveFrameAddresser } from './frameAd
 import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
 import { parseMemberRowKey, parseNodeRowKey, nodeRowKey, memberRowNodes, appliedMoves } from '../core/assetRefRules';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
+import { fieldFate, removalFate } from './overrideFate';
 import { SceneFormatRefusedError, assertSceneFormatReadable } from './sceneFormatGate';
 import { parseClipBankResult } from '../audio/clipBank';
 import { parseAnimClipBankResult } from '../animation/animClipBank';
@@ -661,7 +668,7 @@ export function applyOverridesByLocalToEcs(
       const { merged, accepted, rejected } = foldTraitOverride(
         has ? entity.get(meta.trait) as Record<string, unknown> : undefined,
         fields,
-        (field) => isPersistentTraitField(meta, field),
+        (field) => fieldFate(meta, field) === 'applies',
       );
       for (const field of rejected) {
         console.debug(`[loadSceneFile] override skipped: unknown field ${traitName}.${field}`);
@@ -914,9 +921,13 @@ export function applyStructureCore(
         return;
       }
       const traitArgs: unknown[] = [];
+      let missing: Record<string, unknown> | undefined;
       for (const [traitName, data] of Object.entries(node.traits)) {
         const meta = getTraitByName(traitName);
-        if (!meta || meta.name === 'PrefabInstance') continue;
+        // A scene node's component this build does not register is kept for it, verbatim (#1933 N1b). A TEMPLATE node's
+        // (no guid of its own) is its prefab's, which keeps it.
+        if (!meta) { if (node.guid) (missing ??= {})[traitName] = data; continue; }
+        if (meta.name === 'PrefabInstance') continue;
         if (data === true) { traitArgs.push(meta.trait()); continue; }
         const d = { ...(data as Record<string, unknown>) };
         if (meta.name === 'EntityAttributes') {
@@ -933,13 +944,15 @@ export function applyStructureCore(
       // `keySceneNodes`), and dropping the key there made the next template save mint a new one (#1567).
       if (node.key) traitArgs.push(TemplateAddedKey({ key: node.key }));
       const newId = ops.spawnAdded(traitArgs);
+      if (node.guid) setMissingComponents(node.guid, missing, newId);
       // The fields the writer's own node row states are the node's record (#1914 R3a, `NODE_RECORDS`), as a member's are.
       const recorded = recordedFieldsOf(node);
       if (recorded.length) {
         const spawned = findEntityById(newId, ops.world) as Entity | undefined;
         if (spawned) for (const k of recorded) { const dot = k.indexOf('.'); markOverride(spawned, k.slice(0, dot), k.slice(dot + 1)); }
       }
-      for (const child of node.children) spawnNode(child, newId, isOwnNode(node));
+      // A node stating no `children` is a leaf (a hand or agent write omits the empty list; `isNodeList` admits it).
+      for (const child of node.children ?? []) spawnNode(child, newId, isOwnNode(node));
     };
     const rootEcs = localToEcs.get(prefab.rootLocalId ?? 1);
     for (const node of structure.added) {
@@ -1218,14 +1231,28 @@ export function spawnReferenceNode(
     spawnUnresolvedReference(world, node, parentEcsId);
     return;
   }
+  // A key the expansion gives two nodes across documents (#1933 L5) refuses a reference node as it refuses an entry (close-
+  // review #1: placed as a scene-added reference node, O expanded, and an untouched save rewrote one node as the other).
+  // The same placeholder as a missing prefab's, carrying the node verbatim; the nested documents are the reader's, which
+  // the expansion would read them from.
+  const repeat = frameRepeatRefusal(child, (g) => read(g) ?? null);
+  if (repeat) {
+    console.warn(`[loadSceneFile] added nested instance ${node.prefab} was not expanded: ${repeat}`);
+    noteDamagedPrefab([node.prefab!, typeof child.id === 'string' ? child.id : ''], repeat);
+    spawnUnresolvedReference(world, node, parentEcsId);
+    return;
+  }
+  // The node's channels split as the settle reads them (#1938 C-B step 2; close-out review #2): a malformed one crashed
+  // the spawner. What is split off is kept and written back from `settleEntryRows`.
+  const shaped = splitMalformedChannels(node).clean;
   const rootEcsId = instantiatePrefabIntoWorld(
-    world, child, parentEcsId, undefined, node.prefab, node.overrides,
+    world, child, parentEcsId, undefined, node.prefab, shaped.overrides,
     // The self-containing ancestors carried on, so a loop through two or more documents still meets its own start
     // and is refused above, instead of recursing until the stack overflows.
-    { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, stackForReferenceNode(ancestors, read), node.nestedOverrides,
+    { added: shaped.added, removed: shaped.removed, removedTraits: shaped.removedTraits, moved: shaped.moved, members: shaped.members }, stackForReferenceNode(ancestors, read), shaped.nestedOverrides,
     // A node the writer added expands as that writer's recorded overrides; a template's as base (#1914). A scene-form copy
     // of a chain node takes that node's values under its own, as base (`BASE_NODE`, #1914 R1).
-    node.nestedStructure, { read, own: isOwnNode(node), ...baseLayersOf(node), ...overLayersOf(node), frame: nodeFrame },
+    shaped.nestedStructure, { read, own: isOwnNode(node), ...baseLayersOf(node), ...overLayersOf(node), frame: nodeFrame },
   );
   // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
   // serialized with its guid right here in the `added[]` entry — the same way a
@@ -1430,9 +1457,12 @@ function templateFrameKeys(prefabRef: string, frame: readonly string[], read: Pr
 function templateFrameNodes(
   prefabRef: string, frame: readonly string[], read: PrefabDocReader = getCachedPrefab, outer?: FrameOwner,
 ): Map<string, AddedEntity> | null {
-  const keys = new Map<string, AddedEntity>();
+  // Each list the frame's layers state, through the one index (#1937 C-A step 3): a key a list repeats names neither node,
+  // so no row on it is backed — it is kept as unused and counted, as `applyNodeRows` applies it to neither. Across the
+  // layers' lists, the later list's statement of a key stands, as before.
+  const keys = new Map<string, AddedEntity | null>();
   const add = (nodes: readonly AddedEntity[] | undefined): void => {
-    for (const n of nodes ?? []) { if (n?.key) keys.set(n.key, n); if (!n?.prefab) add(n?.children); }
+    for (const [k, n] of frameKeyIndex(nodes)) keys.set(k, n);
   };
   const rows: PrefabFileEntry[] = [];
   let doc = read(prefabRef) as { entities?: PrefabFileEntry[] } | null;
@@ -1448,7 +1478,8 @@ function templateFrameNodes(
     if (i === rows.length - 1) add(row.added);
     else add(row.nestedStructure?.[nestedPathKey(rows.slice(i + 1).map((r) => r.localId!))]?.added);
   });
-  return keys;
+  for (const [k, n] of keys) if (!n) keys.delete(k);
+  return keys as Map<string, AddedEntity>;
 }
 
 // The kept-orphan store (R2) itself lives in L0, `core/ecs/keptOrphanRows.ts`, with its rationale: a guid rename (core)
@@ -1493,13 +1524,18 @@ export function legacyPathReached(
 function legacyPathDoc(
   source: string, key: string, read: PrefabDocReader, rows?: Readonly<Record<string, unknown>>, anchor?: () => string | undefined,
 ): { reached: boolean; doc: { entities?: PrefabFileEntry[] } | null } {
-  let doc = read(source) as { entities?: PrefabFileEntry[] } | null | undefined;
+  let doc = read(source) as { id?: string; entities?: PrefabFileEntry[] } | null | undefined;
   let frame = '';
   // A path key is row localIds, one per level (`nestedPathKey`), parsed by the one grammar owner.
   for (const step of parseSteps(key)) {
     const lid = typeof step === 'number' ? step : NaN;
     const row = referenceRowAt(doc, lid);
-    if (!row) return { reached: false, doc: null };
+    if (!row) {
+      // A frame row the document no longer has: the channel is kept whole, and its number reserved, so no new reference
+      // row takes it and the kept record lands on that row's frame (#1933 S5, the path-keyed channels).
+      if (doc?.id && Number.isInteger(lid) && !rowAt(doc as Parameters<typeof rowAt>[0], lid)) reserveLocalId(doc.id, lid);
+      return { reached: false, doc: null };
+    }
     frame = row.nodeGuid ? `${frame}/${row.nodeGuid}` : '';
     if (readFromCopy(read as ExpansionReader, row.prefab!)) {
       const at = frame ? anchor?.() : undefined;
@@ -1513,8 +1549,9 @@ function legacyPathDoc(
 }
 
 /** The part of a trait-override bag (trait → field → value) no live member can take (#1914 R4, owner ruling F5): a trait
- *  nothing registers, whole, and each field a registered trait's schema does not declare — what the spawner skips
- *  (`applyOverridesByLocalToEcs`), and so what no capture of the member restates. Undefined when every record lands. */
+ *  nothing registers, whole, and each field a registered trait does not persist, a tag's fields included (`fieldFate`,
+ *  #1933 L2) — what the spawner skips (`applyOverridesByLocalToEcs`), and so what no capture of the member restates.
+ *  Undefined when every record lands. */
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 function unusedTraitsPart(traits: unknown): Record<string, Record<string, unknown>> | undefined {
@@ -1523,8 +1560,9 @@ function unusedTraitsPart(traits: unknown): Record<string, Record<string, unknow
   for (const [name, fields] of Object.entries(traits)) {
     const meta = getTraitByName(name);
     if (!meta) { (out ??= {})[name] = fields as Record<string, unknown>; continue; }
-    if (meta.category === 'tag' || !isRecord(fields)) continue;
-    const gone = Object.entries(fields).filter(([f]) => !isPersistentTraitField(meta, f));
+    if (!isRecord(fields)) continue;
+    // A field on a tag (a component that became one) is kept like any field the trait does not persist (#1933 L2).
+    const gone = Object.entries(fields).filter(([f]) => fieldFate(meta, f) !== 'applies');
     if (gone.length) (out ??= {})[name] = Object.fromEntries(gone);
   }
   return out;
@@ -1535,9 +1573,14 @@ function unusedTraitsPart(traits: unknown): Record<string, Record<string, unknow
  *  the member's document row does not define. Unity's unused overrides: the load ignores them and every save writes them
  *  back (`withKeptLegacy`). Measured against the document row alone — a removal on a NESTED root, whose base the child
  *  document gives, is left as used, since keeping a used removal would outlive the Revert that takes it back. */
-function unusedLocalRecords(doc: { entities?: PrefabFileEntry[] } | null, ch: KeptLegacy): KeptLegacy {
+function unusedLocalRecords(doc: { id?: string; entities?: PrefabFileEntry[] } | null, ch: KeptLegacy): KeptLegacy {
   if (!doc?.entities) return {};
-  const has = (lid: number): boolean => !!rowAt(doc, lid);
+  // A number a record names that the document lacks is reserved, so no new member takes it (#1933 S5).
+  const has = (lid: number): boolean => {
+    if (rowAt(doc, lid)) return true;
+    if (doc.id) reserveLocalId(doc.id, lid);
+    return false;
+  };
   const out: KeptLegacy = {};
   for (const [lid, traits] of Object.entries(ch.overrides ?? {})) {
     const part = has(Number(lid)) ? unusedTraitsPart(traits) : traits;
@@ -1545,8 +1588,8 @@ function unusedLocalRecords(doc: { entities?: PrefabFileEntry[] } | null, ch: Ke
   }
   for (const [lid, names] of Object.entries(ch.removedTraits ?? {})) {
     if (!Array.isArray(names)) continue;
-    const row = rowAt(doc, Number(lid));
-    const gone = !row ? names : row.prefab ? [] : names.filter((n) => !getTraitByName(n) || !(n in (row.traits ?? {})));
+    const row = has(Number(lid)) ? rowAt(doc, Number(lid)) : undefined;
+    const gone = !row ? names : row.prefab ? [] : names.filter((n) => removalFate(n in (row.traits ?? {}), n) === 'unused');
     if (gone.length) (out.removedTraits ??= {})[lid] = gone;
   }
   const removed = (ch.removed ?? []).filter((lid) => !has(lid));
@@ -1557,7 +1600,9 @@ function unusedLocalRecords(doc: { entities?: PrefabFileEntry[] } | null, ch: Ke
 
 /** The legacy records a stored root states that nothing it expands takes (R2's legacy half, #1780, and #1914 R4): a
  *  path-keyed channel whose frame its document does not expand, whole; inside one it does, each localId override no row
- *  of that frame takes; and its own localId channels' records with no target ({@link unusedLocalRecords}). */
+ *  of that frame takes, and each structure record (`removed`, `removedTraits`, `moved`) with no target there (#1933 S4:
+ *  the reached slot's inner part was dropped by the first save, where its `nestedOverrides` twin was kept); and its own
+ *  localId channels' records with no target ({@link unusedLocalRecords}). */
 export function unusedLegacy(
   source: string, channels: KeptLegacy, read: PrefabDocReader = getCachedPrefab,
   /** The owner's own rows: where a scene's copy stands in ({@link legacyPathDoc}). */
@@ -1573,7 +1618,13 @@ export function unusedLegacy(
     if (inner) nestedOverrides[key] = inner;
   }
   const nestedStructure: Record<string, object> = {};
-  for (const [key, v] of Object.entries(channels.nestedStructure ?? {})) if (!legacyPathReached(source, key, read, rows, anchor)) nestedStructure[key] = v;
+  for (const [key, v] of Object.entries(channels.nestedStructure ?? {})) {
+    const at = legacyPathDoc(source, key, read, rows, anchor);
+    if (!at.reached) { nestedStructure[key] = v; continue; }
+    const slot = v as { removed?: number[]; removedTraits?: Record<string, string[]>; moved?: Record<string, string> };
+    const inner = unusedLocalRecords(at.doc, { removed: slot.removed, removedTraits: slot.removedTraits, moved: slot.moved });
+    if (Object.keys(inner).length) nestedStructure[key] = inner;
+  }
   const own = unusedLocalRecords(read(source) as { entities?: PrefabFileEntry[] } | null, channels);
   return { nestedOverrides, nestedStructure, ...own };
 }
@@ -1587,7 +1638,9 @@ function keepUnusedLegacy(
   // The root's frame address, built only if a copy is read: the expansion asked the scene's list with it (#1939).
   let address: string | undefined | null = null;
   const anchor = () => (address === null ? (address = liveFrameAddresser(world)(rootEcsId)) : address);
-  if (rootGuid) setKeptLegacy(rootGuid, unusedLegacy(source, channels, read, rows, anchor));
+  // The owner's malformed values (#1938 C-B step 2) ride with its unused records: kept, refreshed, renamed and snapshotted
+  // with them.
+  if (rootGuid) setKeptLegacy(rootGuid, { ...unusedLegacy(source, channels, read, rows, anchor), ...(channels.malformed?.length ? { malformed: channels.malformed } : {}) });
 }
 
 function rootGuidOf(world: World, rootEcsId: number): string {
@@ -1601,7 +1654,8 @@ export function keptLegacyChannels(rootGuid: string): KeptLegacyChannels | undef
   return keptLegacyOf(rootGuid) as KeptLegacyChannels | undefined;
 }
 /** localId-keyed channels (row numbers of a document, not entity ids): typed through the entry's own declarations. */
-export type KeptLegacyChannels = Pick<SceneEntityEntry, 'nestedOverrides' | 'nestedStructure' | 'overrides' | 'removedTraits' | 'removed' | 'moved'>;
+export type KeptLegacyChannels = Pick<SceneEntityEntry, 'nestedOverrides' | 'nestedStructure' | 'overrides' | 'removedTraits' | 'removed' | 'moved'>
+  & { malformed?: MalformedValue[] };
 
 /** The unused parts of LIVE members' rows kept for the stored root with this guid (#1914 R4), by row key, for a writer to
  *  merge under its capture (`withKeptUnused`). */
@@ -1712,6 +1766,11 @@ export function entryRowsOf(
     overrides?: unknown; removedTraits?: Record<number, string[]>; removed?: number[]; moved?: Record<number, string>;
   },
 ): EntryRows {
+  // A value of a shape no reader takes is split off before anything reads the entry (#1938 C-B step 2, S3): kept, warned
+  // about once, written back by the save.
+  const { clean: e, malformed } = splitMalformedChannels(entry);
+  warnMalformed(`instance ${source}`, malformed);
+  entry = e;
   const referenceRows: ReferenceNodeRows[] = [];
   const templateNodeRows: ReferenceNodeRows[] = [];
   collectReferenceNodeRows(entry.added, referenceRows, templateNodeRows);
@@ -1719,13 +1778,18 @@ export function entryRowsOf(
   for (const r of Object.values(entry.members ?? {})) collectReferenceNodeRows(memberRowNodes<AddedEntity>(r), referenceRows, templateNodeRows);
   return {
     root, source, members: entry.members ?? {},
-    legacy: legacyOf(entry),
+    legacy: { ...legacyOf(entry), ...(malformed.length ? { malformed } : {}) },
     referenceRows, templateNodeRows,
     ...(entry.added ? { added: entry.added } : {}),
   };
 }
 
 /** The legacy channels an entry or a reference node states, as the kept store holds them. */
+/** One warning per owner for the values {@link splitMalformedChannels} took out. */
+function warnMalformed(owner: string, malformed: readonly MalformedValue[]): void {
+  if (malformed.length) console.warn(`[loadSceneFile] ${owner} states ${malformed.length} value(s) in a shape no reader takes — kept as written and written back by the save: ${malformedPaths(malformed)}`);
+}
+
 function legacyOf(e: { nestedOverrides?: unknown; nestedStructure?: unknown; overrides?: unknown; removedTraits?: unknown; removed?: number[]; moved?: unknown }): KeptLegacy {
   return {
     nestedOverrides: e.nestedOverrides as KeptLegacy['nestedOverrides'], nestedStructure: e.nestedStructure as KeptLegacy['nestedStructure'],
@@ -1760,8 +1824,12 @@ export function settleEntryRows(
     // A placeholder for a node whose prefab is missing (#1699) carries its rows in its record. Kept here as orphans too,
     // they outlived the node's re-expansion and overwrote a later edit of its members (close-out review).
     if (!root || unresolvedRefOf(root)) continue;
-    applyStoredMemberRows(world, root.id(), members, source, pinned, false, read, node ?? undefined);
-    keepUnusedLegacy(world, root.id(), source, legacyOf(node ?? {}), read, members);
+    // The node's own malformed values, split off as an entry's are (#1938 C-B step 2).
+    const { clean, malformed } = splitMalformedChannels((node ?? {}) as AddedEntity);
+    warnMalformed(`reference node ${rootGuid}`, malformed);
+    const rows = clean === node ? members : (clean.members ?? {});
+    applyStoredMemberRows(world, root.id(), rows, source, pinned, false, read, clean);
+    keepUnusedLegacy(world, root.id(), source, { ...legacyOf(clean), ...(malformed.length ? { malformed } : {}) }, read, rows);
   }
   // …then give every remaining member a stable, addressable GUID so entities can reference into
   // instances: a pre-v16 scene, a template that predates prefab v5, and every member a row did not
@@ -2343,10 +2411,16 @@ const embeddedDocsByWorld = new WeakMap<World, Map<string, Map<string, TemplateD
  *  `SceneData.embeddedPrefabFrames`), by address (`frameAddress.ts`). A guid with no set answers by the rows rule. */
 const embeddedFramesByWorld = new WeakMap<World, Map<string, Map<string, Set<string>>>>();
 
-/** Record the copies `data` carries for `world`, under the scene `scene` — each one a document with an `entities` array;
- *  anything else is dropped with a warning, as the validator reports it, rather than handed to an expansion. `frames`: the
- *  file's "live at the save" lists (#1939), added to any the scene already holds; a list that is not an array of strings is
- *  ignored with a warning, and its copy answers by the rows rule. */
+/** A copy the load could not admit (#1937 C-A, T13): not a prefab document, or one declaring an identifier twice. Kept
+ *  per world and scene, as the good copies are, for the save alone — it is written back verbatim while its prefab is
+ *  missing (I18), and never handed to an expansion (Unity never repairs a file with a duplicate identifier). Before it,
+ *  such a copy was dropped with a warning, and the next save lost it. */
+const damagedCopiesByWorld = new WeakMap<World, Map<string, Map<string, unknown>>>();
+
+/** Record the copies `data` carries for `world`, under the scene `scene`. Each is admitted as a prefab document is at its
+ *  seat (`admitPrefabDocument`): a refused one is kept for the save only ({@link damagedCopiesByWorld}), with a warning,
+ *  as the validator reports it. `frames`: the file's "live at the save" lists (#1939), added to any the scene already
+ *  holds; a list that is not an array of strings is ignored with a warning, and its copy answers by the rows rule. */
 function noteEmbeddedPrefabs(world: World, scene: string, embedded: SceneData['embeddedPrefabs'], frames?: SceneData['embeddedPrefabFrames']): void {
   if (frames && typeof frames === 'object') {
     for (const [guid, list] of Object.entries(frames)) {
@@ -2364,27 +2438,43 @@ function noteEmbeddedPrefabs(world: World, scene: string, embedded: SceneData['e
     }
   }
   if (!embedded || typeof embedded !== 'object') return;
-  for (const [guid, doc] of Object.entries(embedded)) {
-    if (!doc || typeof doc !== 'object' || !Array.isArray((doc as { entities?: unknown }).entities)) {
-      console.warn(`[loadSceneFile] embedded prefab ${guid} is not a prefab document; ignored`);
-      continue;
-    }
-    let scenes = embeddedDocsByWorld.get(world);
-    if (!scenes) { scenes = new Map(); embeddedDocsByWorld.set(world, scenes); }
+  const into = <V>(byWorld: WeakMap<World, Map<string, Map<string, V>>>): Map<string, V> => {
+    let scenes = byWorld.get(world);
+    if (!scenes) { scenes = new Map(); byWorld.set(world, scenes); }
     let docs = scenes.get(scene);
     if (!docs) { docs = new Map(); scenes.set(scene, docs); }
-    docs.set(guid, doc as TemplateDoc);
+    return docs;
+  };
+  for (const [guid, doc] of Object.entries(embedded)) {
+    const admitted = admitPrefabDocument(doc);
+    if ('refusal' in admitted) {
+      console.warn(`[loadSceneFile] embedded prefab ${guid} refused (${admitted.refusal}); kept for the save, never expanded`);
+      into(damagedCopiesByWorld).set(guid, doc);
+      continue;
+    }
+    into(embeddedDocsByWorld).set(guid, admitted.doc as TemplateDoc);
   }
 }
 
 /** The copy of `guid`'s document the scene `scene` carried into `world` (#1867) — for that scene's save, which writes it
  *  back while the prefab is still missing (I18). `undefined` when that scene carried none. */
 export function embeddedPrefabDoc(world: World, scene: string, guid: string): TemplateDoc | undefined {
-  return embeddedDocsByWorld.get(world)?.get(scene)?.get(guid);
+  // A damaged copy is written back too, verbatim (#1937 C-A, T13): the save reads both stores, the expansion only the first.
+  return embeddedDocsByWorld.get(world)?.get(scene)?.get(guid) ?? damagedCopiesByWorld.get(world)?.get(scene)?.get(guid) as TemplateDoc | undefined;
 }
+/** The "live at the save" list the scene `scene` carried for `guid` (#1939), when its copy is one the load REFUSED
+ *  (#1937 C-A, T13): such a copy expands nothing, so no frame of it is live at a save, and a save that wrote only the live
+ *  ones turned the file's list into `[]` — a record dropped (I18), which a hand fix of the copy would then miss. The save
+ *  writes it back as the file held it. Undefined for an admitted copy (its list is the live one) or none. */
+export function refusedCopyFrames(world: World, scene: string, guid: string): readonly string[] | undefined {
+  if (!damagedCopiesByWorld.get(world)?.get(scene)?.has(guid)) return undefined;
+  const set = embeddedFramesByWorld.get(world)?.get(scene)?.get(guid);
+  return set ? [...set] : undefined;
+}
+
 /** Every guid the scene `scene` carried a copy for into `world` (#1867). */
 export function embeddedPrefabGuids(world: World, scene: string): string[] {
-  return [...(embeddedDocsByWorld.get(world)?.get(scene)?.keys() ?? [])];
+  return [...new Set([...(embeddedDocsByWorld.get(world)?.get(scene)?.keys() ?? []), ...(damagedCopiesByWorld.get(world)?.get(scene)?.keys() ?? [])])];
 }
 
 /** What a world swap carries of the copy store (#1939 item 2): per scene key, a document per missing prefab guid, and the
@@ -2434,6 +2524,11 @@ export function captureSceneCopies(world: World, scenes: SceneCopyKeys): SceneCo
   }
   for (const [scene, docs] of embeddedDocsByWorld.get(world) ?? []) {
     if (scenes.keeps(scene)) for (const [guid, doc] of docs) put(scene, guid, doc);
+  }
+  // A copy its load refused (#1937 C-A, T13) is carried too, for the save alone: restored, it is noted again, refused
+  // again, and kept out of every expansion. Left behind, a swap (an Apply's undo, Play→Stop) dropped it from the next save.
+  for (const [scene, docs] of damagedCopiesByWorld.get(world) ?? []) {
+    if (scenes.keeps(scene)) for (const [guid, doc] of docs) put(scene, guid, doc as TemplateDoc);
   }
   for (const [scene, byGuid] of embeddedFramesByWorld.get(world) ?? []) {
     if (scenes.keeps(scene)) for (const [guid, addrs] of byGuid) live(scene, guid, addrs);
@@ -3070,21 +3165,27 @@ export function collectResourceRefsFromEntities(
     pushOverrideBags(entry.overrides);
     // `nestedOverrides` is path-keyed one level deeper — `{ path: { localId: { Trait: {…} } } }`.
     for (const byLocal of Object.values(entry.nestedOverrides ?? {})) pushOverrideBags(byLocal);
+    // A list as the FILE states it: a malformed one is kept verbatim and written back (#1938 C-B step 2), so this walk —
+    // the save's and the build's — meets it too, and reads only what has a node's shape (close-out review #2).
+    const eachNode = (list: unknown): void => {
+      if (!Array.isArray(list)) return;
+      for (const n of list) if (n && typeof n === 'object' && !Array.isArray(n)) walkAdded(n as AddedEntity);
+    };
     const walkAdded = (node: AddedEntity) => {
       // A reference node carries a child prefab GUID — surface it so the prefab is
       // acquired; recurse BOTH the plain `children` and a reference node's `added`.
-      flat.push({ traits: node.traits, prefab: node.prefab });
+      flat.push({ traits: node.traits && typeof node.traits === 'object' ? node.traits : {}, prefab: node.prefab });
       // A reference-style added node is itself a nested instance, so it carries the same
       // two override shapes (F8) — the exact place assertNoPathRefs was once blind.
       pushOverrideBags(node.overrides as Record<string, unknown> | undefined);
       for (const byLocal of Object.values(node.nestedOverrides ?? {})) {
         pushOverrideBags(byLocal as Record<string, unknown>);
       }
-      node.children.forEach(walkAdded);
-      node.added?.forEach(walkAdded);
+      eachNode(node.children);
+      eachNode(node.added);
       // A reference node's own `nestedStructure` (#1369) holds added nodes too — the same build-side
       // blindness the entry-level slot below guards against.
-      for (const delta of Object.values(node.nestedStructure ?? {})) delta.added?.forEach(walkAdded);
+      for (const delta of Object.values(node.nestedStructure ?? {})) eachNode(delta?.added);
       walkRows(node.members);
     };
     /** A member row's edits (Phase 4, #1468) — the channels the rows took over from `overrides` and
@@ -3093,17 +3194,17 @@ export function collectResourceRefsFromEntities(
     const walkRows = (members: Record<string, SceneMemberRow> | undefined): void => {
       for (const r of Object.values(members ?? {})) {
         if (r?.traits && typeof r.traits === 'object') flat.push({ traits: r.traits });
-        memberRowNodes<AddedEntity>(r).forEach(walkAdded);
+        eachNode(memberRowNodes<AddedEntity>(r));
       }
     };
-    entry.added?.forEach(walkAdded);
+    eachNode(entry.added);
     walkRows(entry.members);
     // ⚠️ `nestedStructure`'s added nodes are refs the BUILD reads through this walker
     // (`asset-tree-shaker.ts`), so missing them drops the asset from the production bundle and it
     // fails only once shipped (#53's class). serializeScene has its OWN scanner for the scene's
     // `resources` manifest — both must know this slot, and extending only that one left the build
     // blind, which is the half a round-trip test cannot see.
-    for (const delta of Object.values(entry.nestedStructure ?? {})) delta.added?.forEach(walkAdded);
+    for (const delta of Object.values(entry.nestedStructure ?? {})) eachNode(delta?.added);
   }
 
   for (const entry of flat) {
@@ -3411,6 +3512,9 @@ function resolveEntityIdField(raw: unknown, idMap: Map<number, number>, world: W
 
 /** Spawn entities from scene data, remap parentIds, optionally load models and prefabs. */
 export async function loadSceneFile(data: SceneData, options: LoadSceneOptions): Promise<void> {
+  // This load's missing-component records are its own: a twin guid spawned later in it does not clear them (#1933 N1b,
+  // close-out review #4).
+  beginMissingComponentsLoad();
   // New WORLD → drop every prior override mark (ecs ids are reused across worlds).
   // Marks for this scene's instances are re-seeded below as overrides are applied.
   // Classify BEFORE anything mutates `data` — see docs/format-versioning.md § 2a/2b-bis.
@@ -3495,6 +3599,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const authoredGuids = deriveAuthoredEntityGuids(data.entities, options.scenePath, liveGuids);
 
   // First pass: spawn all entities
+  const attrsMeta = allTraits.find((m) => m.name === 'EntityAttributes');
   for (const entry of data.entities) {
     // `durableGuid`, not raw truthiness, and for the same reason as the gate below: a RUNTIME guid
     // at `entry.guid` is not an identity. Taking it here would discard the derived guid AND stamp
@@ -3503,9 +3608,12 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
     const authoredGuid = durableGuid(entry.guid) || authoredGuids.get(entry.id);
     const traitArgs: any[] = [];
     let sawEntityAttributes = false;
+    // A component this build registers no trait for is not spawned; its data is kept for the entity, verbatim, and the
+    // save writes it back (#1933 N1b, `missingComponents.ts`).
+    let missing: Record<string, unknown> | undefined;
     for (const [traitName, traitData] of Object.entries(entry.traits)) {
       const meta = allTraits.find((m) => m.name === traitName);
-      if (!meta) continue;
+      if (!meta) { (missing ??= {})[traitName] = traitData; continue; }
       if (traitName === 'EntityAttributes') sawEntityAttributes = true;
       if (traitData === true) traitArgs.push(meta.trait());
       else {
@@ -3587,6 +3695,8 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       onEntitySpawned?.(entity, entry.id);
       idMap.set(entry.id, entity.id());
       spawnedByEntryId.set(entry.id, entity);
+      // Set or cleared for every entity spawned, so a component taken out of the file outside the editor stays out.
+      if (attrsMeta && entity.has(attrsMeta.trait)) setMissingComponents(String((entity.get(attrsMeta.trait) as { guid?: unknown }).guid ?? ''), missing, entity.id());
     }
   }
 
@@ -3755,6 +3865,19 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         keepUnresolvedEntry(world, newEntityId, source, entry);
         continue;
       }
+      // A key the expansion gives two nodes across documents (#1933 L5, hub ruling): refused as a repeat inside one
+      // document is at its seat — a Damaged Prefab placeholder that keeps the entry verbatim, since expanded, an untouched
+      // save turned one node into the other. Asked here, where the nested documents are at hand; a seat sees one file.
+      const repeat = frameRepeatRefusal(prefab, await nestedDocReader(prefab, fetchNested));
+      if (repeat) {
+        console.warn(`[loadSceneFile] Prefab "${source}" was not expanded: ${repeat}`);
+        noteDamagedPrefab([source, typeof (prefab as { id?: unknown }).id === 'string' ? (prefab as { id: string }).id : ''], repeat);
+        keepUnresolvedEntry(world, newEntityId, source, entry);
+        continue;
+      }
+      // Fixed since (a nested file given its own key): the label goes. Only for a document its seat admitted — a scene
+      // copy standing in for a refused one leaves the seat's reason where it is.
+      if (fetched) forgetDamagedPrefab(source);
 
       const rootTf = entry.traits['Transform'] as Record<string, unknown> | undefined;
       const rootEa = entry.traits['EntityAttributes'] as Record<string, unknown> | undefined;
@@ -3784,6 +3907,10 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       loadsInFlight.set(world, (loadsInFlight.get(world) ?? 0) + 1);
       let rootEcsId: Awaited<ReturnType<NonNullable<LoadSceneOptions['onInstantiatePrefab']>>>;
       let usedRead: ExpansionReader | typeof DEFAULT_READ | undefined;
+      // The expansion reads the entry's channels split as `entryRowsOf` reads them (#1938 C-B step 2; close-out review
+      // #2): a value in a shape no reader takes crashed the spawner here (`added: "xy"`), or was applied although kept
+      // as malformed (`removed: [3, "x"]`). The split-off values are kept and written back by the save, from `entryRowsOf`.
+      const shaped = splitMalformedChannels(entry).clean;
       try {
         rootEcsId = await options.onInstantiatePrefab(
           source,
@@ -3791,12 +3918,12 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
           rootTf,
           newEntityId,
           rootExtraTraits,
-          entry.overrides,
-          { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved, members: entry.members },
-          entry.nestedOverrides,
+          shaped.overrides,
+          { added: shaped.added, removed: shaped.removed, removedTraits: shaped.removedTraits, moved: shaped.moved, members: shaped.members },
+          shaped.nestedOverrides,
           entry.guid,
           typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
-          entry.nestedStructure,
+          shaped.nestedStructure,
           { read, frame: entryFrame },
         );
         if (typeof rootEcsId === 'number' && rootEcsId > 0) {

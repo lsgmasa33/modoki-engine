@@ -20,8 +20,9 @@
  *  The rule is the same whether it went under a prefab member or under another template node.
  *
  *  **Falls back to the v16 whole-list statement** (`whole`) for an anchor it cannot state node by node:
- *  a chain node there with no template key (a file from before keys), a key used twice in the frame, or
- *  or an edited template REFERENCE node the caller cannot state by rows (`deps.addressable` false: a live node
+ *  a chain node there with no template key (a file from before keys: every seat mints one for a node with neither key nor
+ *  guid, #1937 C-A, but a keyless node that carries a durable GUID is left as it is — minting would move its guid — so
+ *  this is still reached for it; close-out review #5, parked: 0 such nodes in the corpus), or an edited template REFERENCE node the caller cannot state by rows (`deps.addressable` false: a live node
  *  holding instance identity a row has no place for). The fallback pins that anchor's list exactly as v16 did,
  *  and nothing more. An edited reference node that IS addressable is reported in `refs` (#1914 R3b), and the
  *  caller states it by the rows reaching into it (`<frame>/a+<key>/…`).
@@ -30,6 +31,7 @@
  *  equality) are the caller's, passed in `deps`. */
 
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { frameKeyIndex } from '../../runtime/loaders/prefabOverrides';
 
 export interface NodeDiffDeps {
   /** The template key of a LIVE node (scene form: it carries a guid, not a key), '' for the scene's own. */
@@ -79,31 +81,21 @@ export function diffFrameAdded(
   const chainNodes = chain ?? [];
   const anchors = new Set([...liveNodes, ...chainNodes].map((n) => n.parentLocalId));
 
-  // A key used twice anywhere in the frame's chain could not say which node a row is about.
-  const seen = new Set<string>();
-  const twice = new Set<string>();
-  const scan = (nodes: readonly AddedEntity[]) => {
-    for (const n of nodes) {
-      if (n.key) { if (seen.has(n.key)) twice.add(n.key); seen.add(n.key); }
-      scan(n.children ?? []);
-    }
-  };
-  scan(chainNodes);
+  // Which chain node a key names: the frame's one index (#1937 C-A step 3). A key two chain nodes carry names neither —
+  // after admission only two documents' lists can do that (one key copied by hand between files) — so a row cannot say
+  // which node it is about: the diff states NOTHING about those nodes (a live node holding it is the template's, never
+  // the scene's own) and every other node node by node, so an untouched instance writes nothing (I23). Before, every
+  // anchor of the frame fell back to the whole list, edited or not (#1933 S2). An edit to such a node is refused at the
+  // gesture (`repeatedTemplateKeyRefusal`), since no row could record it.
+  const index = frameKeyIndex(chainNodes);
+  const repeated = (key: string | undefined): boolean => !!key && index.get(key) === null;
   // A whole list holds every node live at its anchor, a template node the load RE-ANCHORED there from a lost anchor
-  // included (#1872, win's seed 6053) — asked in both branches below, since a key used twice elsewhere in the frame does
-  // not stop THIS node's key from naming it.
+  // included (#1872, win's seed 6053).
   const pinOver = () => {
     for (const c of chainNodes) {
-      if (c.key && !twice.has(c.key) && reanchored.has(c.key) && out.whole.has(c.parentLocalId)) out.pinnedOver.add(c.key);
+      if (c.key && !repeated(c.key) && reanchored.has(c.key) && out.whole.has(c.parentLocalId)) out.pinnedOver.add(c.key);
     }
   };
-  if (twice.size) {
-    for (const a of anchors) if (chainNodes.some((n) => n.parentLocalId === a)) out.whole.add(a);
-    for (const a of anchors) if (!out.whole.has(a)) out.own.set(a, ownForm(liveNodes.filter((n) => n.parentLocalId === a)));
-    for (const [a, nodes] of out.own) if (!nodes.length) out.own.delete(a);
-    pinOver();
-    return out;
-  }
 
   const allKeyed = (nodes: readonly AddedEntity[]): boolean => nodes.every((n) => !!n.key && allKeyed(n.children ?? []));
   for (const anchor of anchors) {
@@ -112,7 +104,7 @@ export function diffFrameAdded(
     if (!allKeyed(chainAt)) { out.whole.add(anchor); continue; }
     const rows = new Map<string, SceneMemberRow>();
     const refs = new Map<string, { live: AddedEntity; chain: AddedEntity }>();
-    const matched = matchList(liveAt, chainAt, rows, deps, refs);
+    const matched = matchList(liveAt, chainAt, rows, deps, refs, repeated);
     if (!matched) { out.whole.add(anchor); continue; }
     for (const [k, r] of rows) out.nodeRows.set(k, r);
     for (const [k, r] of refs) out.refs.set(k, { ...r, anchor });
@@ -127,18 +119,22 @@ export function diffFrameAdded(
 function matchList(
   live: readonly AddedEntity[], chain: readonly AddedEntity[], rows: Map<string, SceneMemberRow>, deps: NodeDiffDeps,
   refs: Map<string, { live: AddedEntity; chain: AddedEntity }>,
+  /** A key the frame's chain repeats: its nodes are stated by nothing (see `diffFrameAdded`). */
+  repeated: (key: string | undefined) => boolean,
 ): { own: AddedEntity[] } | null {
   const byKey = new Map<string, AddedEntity>();
   const own: AddedEntity[] = [];
   const chainKeys = new Set(chain.map((c) => c.key!));
   for (const l of live) {
     const k = deps.keyOf(l);
+    if (repeated(k)) continue; // the template's, and no row can name it
     // Only a key the chain adds HERE: one from elsewhere in the frame is a re-parented node, and a second
     // live node with a key already taken is a copy. Both are the scene's own.
     if (k && chainKeys.has(k) && !byKey.has(k)) byKey.set(k, l);
     else own.push(l);
   }
   for (const c of chain) {
+    if (repeated(c.key)) continue;
     const l = byKey.get(c.key!);
     if (!l) { rows.set(c.key!, { removed: true }); continue; }
     if (c.prefab || l.prefab) {
@@ -147,7 +143,7 @@ function matchList(
       if (c.prefab && l.prefab === c.prefab && deps.addressable?.(l, c)) { refs.set(c.key!, { live: l, chain: c }); continue; }
       return null;
     }
-    const row = diffNode(l, c, rows, deps, refs);
+    const row = diffNode(l, c, rows, deps, refs, repeated);
     if (!row) return null;
     if (Object.keys(row).length) rows.set(c.key!, row);
   }
@@ -158,6 +154,7 @@ function matchList(
  *  untouched; null when its children cannot be stated node by node. */
 function diffNode(
   l: AddedEntity, c: AddedEntity, rows: Map<string, SceneMemberRow>, deps: NodeDiffDeps, refs: Map<string, { live: AddedEntity; chain: AddedEntity }>,
+  repeated: (key: string | undefined) => boolean,
 ): SceneMemberRow | null {
   const row: SceneMemberRow = {};
   const traits: Record<string, Record<string, unknown>> = {};
@@ -189,7 +186,7 @@ function diffNode(
   }
   if (Object.keys(traits).length) row.traits = traits;
   if (Object.keys(removals).length) row.traitRemovals = removals;
-  const kids = matchList(l.children ?? [], c.children ?? [], rows, deps, refs);
+  const kids = matchList(l.children ?? [], c.children ?? [], rows, deps, refs, repeated);
   if (!kids) return null;
   if (kids.own.length) row.own = ownForm(kids.own);
   return row;

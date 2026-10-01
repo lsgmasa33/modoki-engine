@@ -30,7 +30,8 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { frameDocReader, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
-import { isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { isOwnedRoot, isMemberDerivation, parseSteps, type MemberPi } from '../../runtime/core/assetRefRules';
+import { deriveMemberChain, repeatedTemplateKeys } from '../../runtime/loaders/memberPaths';
 import { templateKeysOf, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 
 export const RESTRUCTURE_REFUSAL_TEXT = "Can't restructure a prefab instance: open the prefab to edit it, or unpack it first.";
@@ -126,6 +127,44 @@ export function outermostPrefabRoot(id: number): number {
     cur = next;
   }
   return 0;
+}
+
+/** The text for an edit of a template node whose key its frame gives two nodes (#1937 C-A step 4, T16). */
+export const REPEATED_KEY_REFUSAL_TEXT = (name: string, key: string) =>
+  `"${name}" can't be edited here: its prefab gives two nodes the key ${key} in one place (one copied by hand between two prefab files), so the scene has no way to say which one the edit is for — give one of them a key of its own in its prefab file, then edit it`;
+
+/** Why an edit of entity `id` is refused because its template key names no node (#1937 C-A step 4, T16), or null.
+ *  A key two of one frame's nodes carry — after admission only two DOCUMENTS can do that, one key copied by hand between
+ *  files (#1876 L5) — names neither (`frameKeyIndex`), so the save states nothing about either node and an edit to one
+ *  would be dropped by the next save without a word. The repeat is the prefab validator's (`repeatedTemplateKeys`, the
+ *  walk the derive mirrors) over the outermost instance's document, and this node is one of the two when its guid is that
+ *  path's derivation (salted or not, #1882). A copy the scene made of a template node holds a fresh guid, so it is never
+ *  refused. */
+export function repeatedTemplateKeyRefusal(id: number): string | null {
+  const e = findEntity(id);
+  const key = templateKeyOf(e);
+  if (!key) return null;
+  const root = outermostPrefabRoot(id);
+  const pi = root ? readTraitData(root, getTraitByName('PrefabInstance')!) as Pi | null : null;
+  const rootGuid = root ? (readTraitData(root, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid : '';
+  const guid = (readTraitData(id, getTraitByName('EntityAttributes')!) as { guid?: string } | null)?.guid;
+  if (!pi?.source || !rootGuid || !guid) return null;
+  // The documents the world expanded, then the caches (`frameDocReader`'s fallbacks) — no cache module imported here:
+  // this gate sits under every entity writer.
+  const read = frameDocReader(getCurrentWorld());
+  const doc = read(pi.source, root);
+  if (!doc) return null;
+  const { repeats } = repeatedTemplateKeys(doc, (g) => read(g, 0) ?? null);
+  for (const r of repeats) {
+    // `<tag>:<segments>`: `self` derives from the instance root; another anchor is not one this walk is asked about.
+    if (r.key !== key || !r.path.startsWith('self:')) continue;
+    const segs = r.path.slice('self:'.length).split('|');
+    const anchor = segs.length > 1 ? deriveMemberChain(rootGuid, segs.slice(0, -1).join('|')) : rootGuid;
+    if (isMemberDerivation(guid, anchor, parseSteps(segs[segs.length - 1]!))) {
+      return REPEATED_KEY_REFUSAL_TEXT((readTraitData(id, getTraitByName('EntityAttributes')!) as { name?: string } | null)?.name ?? '', key);
+    }
+  }
+  return null;
 }
 
 interface Query {

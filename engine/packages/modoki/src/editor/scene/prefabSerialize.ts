@@ -11,6 +11,7 @@ import { collectUnknownFields, mergeUnknownFields } from '../../runtime/core/for
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, readTraitDataFull, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { withMissingComponents } from '../../runtime/core/ecs/missingComponents';
 import { runtimeExcludedMessage } from './authoringScope';
 import { newGuid, getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
 import { mapStringValues, isStoredRoot, memberStepId, type MemberPi } from '../../runtime/core/assetRefRules';
@@ -526,6 +527,10 @@ function serializePrefabBody(
         entry.traits[meta.name] = tokens.value(traitData, tokens.root) as typeof traitData;
       }
     }
+    // A component this build registers no trait for, kept for the live entity by its load (#1933 N1b): a prefab-edit
+    // save and Create Prefab write it into the row, verbatim.
+    const attrs = getTraitByName('EntityAttributes');
+    if (attrs) entry.traits = withMissingComponents(entry.traits, String((readTraitData(entityInfo.id, attrs) as { guid?: unknown } | null)?.guid ?? ''), entityInfo.id);
 
     prefabEntities.push(entry);
   }

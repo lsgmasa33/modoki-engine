@@ -7,6 +7,7 @@ import { getAllTraits, getTraitByName, transformName, type TraitMeta } from './t
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { Transient } from '../traits/Transient';
 import { UnresolvedPrefabRef } from '../unresolvedPrefabRef';
+import { damagedPrefabReason } from '../damagedPrefabs';
 import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
@@ -394,6 +395,9 @@ export interface EntityInfo {
   /** A placeholder for a prefab reference the load could not expand (#1699): the Hierarchy marks it "Missing Prefab",
    *  as Unity does, so it does not read as an empty object to clean up. Its edits ride on it until the prefab is back. */
   missingPrefab?: boolean;
+  /** The placeholder's prefab IS there but was refused at its seat — an identifier declared twice (#1937 C-A): the
+   *  reason, which the Hierarchy shows as "Damaged Prefab" (Unity loads such a file as a missing asset too). */
+  damagedPrefab?: string;
   children?: EntityInfo[];
 }
 
@@ -468,7 +472,8 @@ export function getAllEntities(): EntityInfo[] {
 
     const name = pickEntityName(attrName, scan) ?? `Entity ${id}`;
     const missingPrefab = entityHas(UnresolvedPrefabRef);
-    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene, ...(missingPrefab ? { missingPrefab } : {}) });
+    const damagedPrefab = missingPrefab ? damagedPrefabReason((entity.get(UnresolvedPrefabRef) as { source?: string } | undefined)?.source ?? '') : undefined;
+    entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene, ...(missingPrefab ? { missingPrefab } : {}), ...(damagedPrefab ? { damagedPrefab } : {}) });
   }
   return dropParkedEntries(entities);
 }

@@ -6,19 +6,20 @@
  *  restore), a member removal, an added node, a re-parent, a legacy move. A row's `guid` and `name` are identity, not
  *  overrides (Unity's file has no such entry), so a row holding only them counts nothing.
  *
- *  What is counted is what the next save writes from the kept stores:
+ *  What is counted is what the next save writes from the kept stores, read off the save's own projection (`unusedForSave`,
+ *  #1938 C-B step 3):
  *   - each LIVE member's unused part, through the save's own predicate (`liveKeptUnused`): a removal of a component the
  *     member carries again is not written, and a member the instance deleted since takes its records with it;
  *   - each R2 orphan row (a member the template no longer declares, or one a lower layer removed: no live member holds
  *     its key, which is what makes it an orphan);
- *   - the legacy channels kept for the root (`keptLegacyChannels`): a localId record whose target is gone, and a path-keyed
- *     frame no expansion reaches. */
+ *   - the legacy channels kept for the root: a localId record whose target is gone (a removal of a component the member
+ *     carries again left out, #1933 L1), and a path-keyed frame no expansion reaches. */
 
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { durableGuid } from '../../runtime/core/assetRefRules';
-import { keptLegacyChannels, keptMemberOrphans, type SceneMemberRow, type KeptLegacyChannels } from '../../runtime/loaders/loadSceneFile';
-import { liveKeptUnused, withUnusedPart } from './prefabBase';
+import { type SceneMemberRow, type KeptLegacyChannels } from '../../runtime/loaders/loadSceneFile';
+import { unusedForSave, withUnusedPart } from './prefabBase';
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
@@ -52,6 +53,7 @@ export function legacyRecords(legacy: KeptLegacyChannels | undefined): number {
   for (const names of Object.values(legacy.removedTraits ?? {})) n += Array.isArray(names) ? names.length : 0;
   n += legacy.removed?.length ?? 0;
   n += Object.keys(legacy.moved ?? {}).length;
+  n += legacy.malformed?.length ?? 0; // each value no reader takes (#1938 C-B step 2)
   for (const frame of Object.values(legacy.nestedOverrides ?? {})) {
     if (isRecord(frame)) for (const bag of Object.values(frame)) n += traitBagRecords(bag);
   }
@@ -71,8 +73,9 @@ export function instanceUnusedOverrides(rootId: number): number {
   const ea = getTraitByName('EntityAttributes');
   const rootGuid = ea ? durableGuid((readTraitData(rootId, ea) as { guid?: string } | null)?.guid) : '';
   if (!rootGuid) return 0;
+  const kept = unusedForSave(rootGuid, rootId);
   let n = 0;
-  for (const { part, carried } of liveKeptUnused(rootGuid, rootId)) n += rowRecords(withUnusedPart(undefined, part as SceneMemberRow, carried));
-  for (const row of Object.values(keptMemberOrphans(rootGuid) ?? {})) n += rowRecords(row);
-  return n + legacyRecords(keptLegacyChannels(rootGuid));
+  for (const { part, carried } of kept.rows) n += rowRecords(withUnusedPart(undefined, part as SceneMemberRow, carried));
+  for (const row of Object.values(kept.orphans)) n += rowRecords(row);
+  return n + legacyRecords(kept.legacy);
 }

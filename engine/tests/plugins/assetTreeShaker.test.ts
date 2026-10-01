@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { computeKeptAssets, virtualToAbs } from '../../plugins/asset-tree-shaker';
+import { computeKeptAssets, damagedPrefabBuildError, virtualToAbs } from '../../plugins/asset-tree-shaker';
 import { detectType, resolveAssetPath, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { JSON_ASSET_SUFFIX_TYPE, ID_BEARING_TYPES, classifyJsonAssetSuffix } from '../../plugins/assetTypes';
 import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -2038,6 +2038,56 @@ describe('asset-tree-shaker', () => {
 
       expect(playable.kept).toContain('/games/test/assets/extras/loose.png');
     });
+  });
+});
+
+/** #1937 C-A step 7 (T12's build half): a shipped prefab every load refuses — an identifier declared twice, or a key a
+ *  prefab it nests also gives one frame (#1933 L5) — is reported by the walk (`damagedPrefabs`), and the BUILD fails on
+ *  it (`damagedPrefabBuildError`, called by the build hook only). The walk itself never throws for it: the editor's
+ *  Clean Up dialog runs it with no options and must keep answering (close-out review #3). */
+describe('the build refuses a prefab that declares an identifier twice (#1937 C-A step 7)', () => {
+  let fx: Fixture;
+  beforeEach(() => { fx = createFixture(); });
+  afterEach(() => fx.cleanup());
+  const GP = 'cccccccc-0000-4000-8000-000000019741';
+  const GPN = 'cccccccc-0000-4000-8000-000000019742';
+  const GO = 'cccccccc-0000-4000-8000-000000019743';
+  const row = (localId: number, nodeGuid: string, extra: object = {}) => ({ localId, name: `R${localId}`, nodeGuid, traits: { EntityAttributes: { name: `R${localId}`, parentId: localId === 1 ? 0 : 1, guid: '' } }, ...extra });
+  const k = (name: string) => ({ parentLocalId: 2, guid: '', key: 'k-dup', name, traits: { EntityAttributes: { name, parentId: 0 } }, children: [] });
+  const scene = (prefab: string) => fx.writeJson('/games/test/assets/scenes/main.json', { version: 6, resources: [{ type: 'prefab', path: prefab }], entities: [] });
+  /** P ← PN (a P row adding k-dup under P's R2) ← O (a PN row adding k-dup AT PN's R2, when `l5`). */
+  const chain = (l5: boolean) => {
+    fx.writeJson('/games/test/assets/prefabs/P.prefab.json', { id: GP, version: 9, name: 'P', rootLocalId: 1, entities: [row(1, 'g-p1'), row(2, 'g-p2')] });
+    fx.writeJson('/games/test/assets/prefabs/PN.prefab.json', { id: GPN, version: 9, name: 'PN', rootLocalId: 1, entities: [row(1, 'g-n1'), row(2, 'g-n2', { prefab: GP, added: [k('FromPN')] })] });
+    fx.writeJson('/games/test/assets/prefabs/O.prefab.json', { id: GO, version: 9, name: 'O', rootLocalId: 1, entities: [row(1, 'g-o1'), row(2, 'g-o2', { prefab: GPN, ...(l5 ? { added: [k('FromO')] } : {}) })] });
+    scene('/games/test/assets/prefabs/O.prefab.json');
+  };
+
+  // Mutation: drop the gate (never push to `damaged`) — nothing is reported and the build ships it.
+  it('a repeated localId is reported, and the build error names the file and the id', () => {
+    fx.writeJson('/games/test/assets/prefabs/D.prefab.json', { id: GP, version: 9, name: 'D', rootLocalId: 1, entities: [row(1, 'g-1'), row(1, 'g-2')] });
+    scene('/games/test/assets/prefabs/D.prefab.json');
+    const res = computeKeptAssets(fx.projectRoot, fx.roots);
+    expect(damagedPrefabBuildError(res)?.message).toMatch(/prefabs\/D\.prefab\.json: prefab "D" gives localId 1 to two rows/);
+  });
+
+  // Mutation: the gate asks admission only (no `frameRepeatRefusal`) — O is not reported.
+  it('a key two files give one frame (L5) is reported, naming O', () => {
+    chain(true);
+    expect(computeKeptAssets(fx.projectRoot, fx.roots).damagedPrefabs).toEqual([expect.stringMatching(/^\/games\/test\/assets\/prefabs\/O\.prefab\.json: prefab "O" gives template key k-dup/)]);
+  });
+
+  // The accept side, and the editor's call. Mutations: report every prefab — the clean chain reports three; throw from
+  // the walk — Clean Up's no-options call cannot answer.
+  it('the clean chain reports nothing; the editor\'s no-options walk warns and answers', () => {
+    chain(false);
+    const clean = computeKeptAssets(fx.projectRoot, fx.roots);
+    expect(clean.damagedPrefabs).toEqual([]);
+    expect(damagedPrefabBuildError(clean)).toBeNull();
+    chain(true);
+    const q = computeKeptAssets(fx.projectRoot, fx.roots);
+    expect(q.kept).toContain('/games/test/assets/prefabs/P.prefab.json');
+    expect(q.warnings.join('\n')).toMatch(/would load as Damaged Prefab placeholders/);
   });
 });
 

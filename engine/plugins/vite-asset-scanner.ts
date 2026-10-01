@@ -13,7 +13,7 @@ import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatche
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
 import { foreignRequestRefusal } from './backend/requestOrigin';
-import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
+import { computeKeptAssets, damagedPrefabBuildError, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
 import { stripPrivateBuildFields } from '../project-config';
@@ -3791,6 +3791,9 @@ export function assetScannerPlugin(): Plugin {
           `plugins/asset-tree-shaker.ts), remove the ref, or list the asset in this project's asset-keep.json.`,
         );
       }
+      // #1937 C-A step 7: a kept prefab every load refuses fails the build, beside the guard above (build-only, as it is).
+      const damagedError = damagedPrefabBuildError(result);
+      if (damagedError) throw damagedError;
       const CONVERTIBLE = new Set(['.png', '.jpg', '.jpeg']);
       const MODEL_EXTS = new Set(['.glb', '.gltf']);
       const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac']);

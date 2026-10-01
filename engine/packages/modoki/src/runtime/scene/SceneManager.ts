@@ -85,6 +85,7 @@
  *  it won has just been wiped by `unloadAll()`'s unconditional tail.
  */
 
+import { withMissingComponents } from '../core/ecs/missingComponents';
 import { createWorld, type World, type Entity } from 'koota';
 import { getRunMode } from '../core/playState';
 import { setCurrentWorld, getCurrentWorld, spawnEntity, destroyEntity, findEntityById } from '../core/ecs/world';
@@ -1977,6 +1978,12 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
         traitData[key] = data[key];
       }
       entry.traits[meta.name] = traitData;
+    }
+    // A component this build registers no trait for, kept for the entity by its load (#1933 N1b; re-review B): the
+    // respawn below is a LOAD, which records an entity's missing components from its entry — so an entry without them
+    // cleared the record, and a kept base's or a Persistent entity's next save dropped the component.
+    if (attrMeta && entity.has(attrMeta.trait)) {
+      entry.traits = withMissingComponents(entry.traits, String((entity.get(attrMeta.trait) as { guid?: unknown }).guid ?? ''), id);
     }
     entriesById.set(id, entry);
   }

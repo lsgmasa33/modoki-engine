@@ -27,10 +27,10 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
     if (failWrite.delete(path)) return { ok: false, status: 500, json: async () => ({ error: 'disk full' }), text: async () => '' } as Response;
     // The route's mark rule (#1774, `classifyPrefabMarkWrite`, which reads the real disk), so a write that would lower
     // the mark is refused here too.
-    const { localIdCounter } = await import('../../packages/modoki/src/runtime/core/localIdCounter');
+    const { storedLocalIdCounter } = await import('../../packages/modoki/src/runtime/core/localIdCounter');
     const was = onDisk.get(path);
     const parse = (t: string) => JSON.parse(t.replace(/^\uFEFF/, '')) as object; // the route reads a BOM as the parser does
-    if (was && path.endsWith('.prefab.json') && localIdCounter(parse(content)) < localIdCounter(parse(was))) {
+    if (was && path.endsWith('.prefab.json') && storedLocalIdCounter(parse(content)) < storedLocalIdCounter(parse(was))) {
       return { ok: false, status: 409, json: async () => ({ reason: 'prefab-mark-lowered', error: 'mark lowered' }), text: async () => '' } as Response;
     }
     onDisk.set(path, content);
@@ -50,7 +50,7 @@ import { setActionCallback, pushAction, clearHistory, createEntityWithUndo } fro
 import { PREFAB_FORMAT_VERSION, type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 // What a mark raise stamps: the version the mark ARRIVED in, not today's format (`contentFor`, #1797) — equal to
 // PREFAB_FORMAT_VERSION until v9 (#1809), which is when these expectations had to say which they meant.
-import { LOCAL_ID_MARK_VERSION } from '../../packages/modoki/src/runtime/core/localIdCounter';
+import { LOCAL_ID_MARK_VERSION, reserveLocalId, clearReservedLocalIds } from '../../packages/modoki/src/runtime/core/localIdCounter';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { mergeRiggedPrefab } from '../../packages/modoki/src/editor/scene/prefabSerialize';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
@@ -122,6 +122,7 @@ const add = (label: string, parent: number, name: string) =>
 beforeEach(() => {
   clearDirtyAssets(); // a document an undo parked (#1868) belongs to its own case
   resetPrefabMarkRecord(); // the session's mark record (#1880) belongs to its own case too
+  clearReservedLocalIds(); // a number a loaded record reserved (#1933 S5) belongs to its own case
   setRunMode('stopped');
   clearHistory();
   prefabs.clear();
@@ -379,6 +380,32 @@ describe('#1774: commitPrefabWrite keeps the mark from going down', () => {
     expect(JSON.parse(onDisk.get(PPATH)!)).toMatchObject({ nextLocalId: 7, version: LOCAL_ID_MARK_VERSION });
   });
 
+  // #1933 S5: a number a loaded record names is reserved in memory, and in no file yet. The commit judges "the file
+  // already holds the mark" by what the WRITTEN document states, so the reservation is persisted by any write — here an
+  // undo putting back a pre-v8 file verbatim. Mutation: judge by `localIdCounter(written)` in `contentFor` (it counts the
+  // reservation) — the bytes go down with no mark, and a later session that never loads the scene hands 4 out again.
+  it('a reserved number is stated by the next write, an undo\'s verbatim bytes of a pre-v8 file included', async () => {
+    const pre = p3Doc() as unknown as PrefabFile; // rows 1..3, v5, no mark
+    seatAt(pre);
+    reserveLocalId(P, 4);
+    const verbatim = jsonFileBody(pre);
+    expect((await commitPrefabWrite(P, p3Doc() as unknown as PrefabFile, { expected: verbatim, bytes: verbatim })).ok).toBe(true);
+    expect((JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId).toBe(5);
+  });
+
+  // …and when nothing else knows a mark: a trashed prefab put back by its undo is a create (no file, no editor, no park,
+  // no expected document), so the reservation is the only source of the number. Mutation: drop the written document's
+  // own counter from `contentFor`'s need — the bytes go down with no mark.
+  it('a reserved number is stated by a create that restores a pre-v8 file, where no file or editor holds a mark', async () => {
+    install(p3Doc() as unknown as PrefabFile);
+    registerAsset(P, PPATH, 'prefab');
+    onDisk.delete(PPATH); setPrefabCache(P, null); // trashed: the file and the editor's copy are gone
+    reserveLocalId(P, 4);
+    const verbatim = jsonFileBody(p3Doc() as unknown as PrefabFile);
+    expect((await commitPrefabWrite(P, p3Doc() as unknown as PrefabFile, { expected: null, bytes: verbatim })).ok).toBe(true);
+    expect((JSON.parse(onDisk.get(PPATH)!) as PrefabFile).nextLocalId).toBe(5);
+  });
+
   it('accept side: bytes that lower nothing are written verbatim, formatting and all', async () => {
     seatAt(v8(4));
     const handFormatted = `${JSON.stringify(v8(9))}\n`; // one line, as no editor writes it
@@ -449,8 +476,9 @@ describe('#1774: undoing two minting Applies in a row lands both, and Save keeps
   });
 
   // #1877 S1: a Save BETWEEN the two undos wrote the first undo's raised mark to the file; the second undo stated the
-  // mark its step recorded — lower — and the next Apply handed E2's number to a new row. Mutation: the restore's `onDisk`
-  // falls back to `r.from` over the editor's copy, and its mark drops `now` (`prefabMemoryRestore.ts`).
+  // mark its step recorded — lower — and the next Apply handed E2's number to a new row. Mutation (re-run #1933): the park
+  // landing's mark is `counterOf(p.from)` alone (prefabCommit.ts). Dropping one term is not enough: the editor's copy,
+  // the file and the session record (`recordedMark`) each carry the raised mark.
   it('Apply E1, Apply E2, undo, Save, undo, undo, Apply E3 — E3 does not take the number E2 had', async () => {
     install(p3Doc());
     onDisk.set(PPATH, JSON.stringify(p3Doc()));

@@ -6,6 +6,8 @@
  *  read), and the refusal has to reach the user as a toast from every one of them, and never escape as an unhandled
  *  rejection. One flow, so a fourth gesture cannot forget it. The agent's `prefab instantiate` reads through
  *  `getPrefabSource` and answers in its reply rather than a toast, so it stays in `agentEditorOps.ts`. */
+import { admitPrefabDocument } from '../../runtime/loaders/documentIdentity';
+import { frameRepeatRefusal, nestedDocReader } from '../../runtime/loaders/frameRepeat';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
@@ -13,7 +15,7 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
 import { type PrefabFile } from './prefab';
-import { parkedPrefabRead } from './prefabCache';
+import { parkedPrefabRead, getPrefabSource } from './prefabCache';
 import { instantiatePrefabInstance } from './prefabInstantiate';
 import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
@@ -46,10 +48,22 @@ async function readPrefabFile(path: string): Promise<PrefabFile | null> {
   const parked = parkedPrefabRead(path);
   if (parked) return parked;
   try {
-    const prefab = await parseAssetJson(await fetch(path), path) as PrefabFile;
-    // The zIndex migration every editor read runs (`fetchPrefabSource`), at this read too: the expansion no longer
-    // migrates rows itself (#1783), so a placement that skipped it would drop a legacy `UIAnchor.zIndex`.
-    for (const entry of prefab?.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+    const raw = await parseAssetJson(await fetch(path), path) as PrefabFile;
+    // Read as every seat reads it (`fetchPrefabSource`; #1937 C-A): admitted — a keyless template node spawns with the key
+    // the caches hold, so the frame's record is the cached document and a scene override on that key applies — and a
+    // document declaring an identifier twice is not placed. Then the zIndex migration every editor read runs: the
+    // expansion no longer migrates rows itself (#1783), so a placement that skipped it would drop a legacy `UIAnchor.zIndex`.
+    if (!raw) return raw;
+    const admitted = admitPrefabDocument(raw);
+    if ('refusal' in admitted) {
+      // Refused, with its own toast (as a parent that is gone is): the first placement places nothing, a redo drops its step.
+      throw new UndoRefusedError(`${path} was not placed: ${admitted.refusal}`, 'the prefab file is damaged — it was not placed');
+    }
+    const prefab = admitted.doc;
+    // …and a key two prefab files give one frame (#1933 L5), refused as the scene load refuses it.
+    const repeat = frameRepeatRefusal(prefab, await nestedDocReader(prefab, (g) => getPrefabSource(g)));
+    if (repeat) throw new UndoRefusedError(`${path} was not placed: ${repeat}`, 'the prefab file is damaged — it was not placed');
+    for (const entry of prefab.entities ?? []) migrateUIAnchorZIndexStructured(entry);
     return prefab;
   } catch (e) {
     if (isMissingAsset(e)) return null;

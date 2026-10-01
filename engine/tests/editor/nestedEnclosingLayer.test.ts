@@ -53,6 +53,7 @@ import { isMemberToken } from '../../packages/modoki/src/runtime/core/templateRe
 import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
 import { undo, redo } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { admitPrefabDocument } from '../../packages/modoki/src/runtime/loaders/documentIdentity';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -84,7 +85,14 @@ const oDoc = (slotX = 0) => ({ id: O, version: 5, name: 'O', rootLocalId: 1, ent
   row(1, 'OR', 0, gOR), row(2, 'Slot', 1, gSlot, slotX), row(3, 'Slot2', 1, gSlot2),
   { localId: 4, name: 'N', nodeGuid: gN, prefab: P, traits: { EntityAttributes: { name: 'N', parentId: 2, guid: '' } } },
 ] });
-const install = (...docs: Array<{ id?: string }>) => { for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); } };
+/** Seat each document in both caches as their seats do (#1937 C-A): admitted, so a keyless template node carries the same
+ *  minted key in the mocked runtime cache as in the editor cache. */
+/** Seat each document as an editor before #1937 did: the runtime cache unminted (no seat admitted it), so a keyless template
+ *  node spawned with no key — what made a save write its list whole. */
+const installUnminted = (...docs: Array<{ id?: string }>) => { for (const d of docs) { prefabs.set(d.id!, d); setPrefabCache(d.id!, d as never); } };
+const install = (...docs: Array<{ id?: string }>) => {
+  for (const d of docs) { const a = admitPrefabDocument(d); const seated = 'doc' in a ? a.doc : d; prefabs.set(d.id!, seated); setPrefabCache(d.id!, seated as never); }
+};
 
 /** Holder → two instances of `source`. */
 const scene = (source: string, roots = [ROOT1, ROOT2]): SceneData => ({
@@ -1881,7 +1889,9 @@ describe('#1781: a template reference node whose statement adds a component is n
     { ...ref(3, 'D', 2, 'eeeeeeee-0000-4000-8000-000000001785', S), ...(dOverrides ? { overrides: dOverrides } : {}) },
   ] });
   /** O whose row N adds T (Q, keyed `kT1781`) under A. `loose`: and a key-less plain node beside it, which no node row can
-   *  name, so a save states A's list WHOLE (`diffFrameAdded`'s `allKeyed`) — the fallback #1914 R3b keeps. */
+   *  name, so a save states A's list WHOLE (`diffFrameAdded`'s `allKeyed`) — the fallback #1914 R3b keeps. Since #1937 every
+   *  seat mints that node a key, so only an editor from BEFORE it wrote such a list: `installUnminted` seats the documents
+   *  as it did, and the case then loads that file through today's seats (`install`) — a whole list on disk is still read. */
   const withT = (node: Record<string, unknown>, loose = false) => {
     const o = oWith({});
     (o.entities[3] as Record<string, unknown>).added = [{
@@ -1942,16 +1952,17 @@ describe('#1781: a template reference node whose statement adds a component is n
   it('a scene REMOVAL of a component T\'s statement adds is saved, in the root frame and a nested one (close-out review F2)', async () => {
     // No live field shows a removal, so the value subtraction alone read T as unchanged and the save dropped it. Mutation:
     // drop the removal checks in `sameNodeValues` (`moreRemovals`) — the reload brings UIFocusable back. In `whole` mode
-    // (a key-less sibling, so A's list is written whole, #1914 R3b): drop the copy's base removals (`gone` empty in
+    // (a key-less sibling, so A's list is written whole, #1914 R3b; by an editor before #1937's mint): drop the copy's base removals (`gone` empty in
     // `stampTemplateKeys`) — the copy pairs with T's values again and UIFocusable is back.
     for (const loose of [false, true]) for (const [where, stmt] of [['M', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }], ['K', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }]] as const) {
       const at = `${where}${loose ? ' (whole)' : ''}`;
-      install(sDoc(), qDoc(), pDoc(), withT(stmt, loose));
+      (loose ? installUnminted : install)(sDoc(), qDoc(), pDoc(), withT(stmt, loose));
       await load(scene(O, [ROOT1]));
       expect(focus(where), at).toBeTruthy(); // precondition
       removeTraitFromEntitiesWithUndo([named(where)[0]!.id], meta('UIFocusable'));
       const { scene: s, entry } = await saved();
       expect(JSON.stringify(entry).includes('"key":"kT1781"'), at).toBe(loose); // which path stated it
+      if (loose) install(sDoc(), qDoc(), pDoc(), withT(stmt, loose));
       await load(s);
       expect(focus(where), at).toBeNull();
     }
@@ -1961,7 +1972,8 @@ describe('#1781: a template reference node whose statement adds a component is n
   // state by writing A's list whole, T's copy with it — left the copy stating none of it, and the reload lost it (hunt
   // seeds 1091, 1192). The copy now carries T's key, and the load takes T's values under it as base (`pairWithBase`).
   // #1914 R3b: the writer states such an edit by a row reaching into T (`rows`), and writes the list whole only where a
-  // node row cannot name a node there (`whole`, a key-less sibling); both must keep T's value as base.
+  // node row cannot name a node there (`whole`, a key-less sibling — a file an editor before #1937 wrote); both must keep
+  // T's value as base.
   const K_ROW = '/eeeeeeee-0000-4000-8000-000000001785/eeeeeeee-0000-4000-8000-000000001782';
   const baseCases = [
     ['M', 'its own overrides', (n: number) => ({ overrides: { 2: { UIFocusable: { focusOrder: n } } } })],
@@ -1973,7 +1985,7 @@ describe('#1781: a template reference node whose statement adds a component is n
       // Mutations, `whole` red: `pairWithBase` returns the list as it is; `stampTemplateKeys` stamps nothing; the spawner
       // drops the base layers (`baseLayersOf` → {}). `rows` red: the spawner drops the over layers (`overLayersOf` → {}).
       const loose = mode === 'whole';
-      install(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
+      (loose ? installUnminted : install)(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
       await load(scene(O, [ROOT1]));
       expect(focus(where)?.focusOrder, where).toBe(3); // precondition: the statement applied
       writeTraitFieldWithUndo(named(where)[0]!.id, meta('Transform'), 'x', 9);
@@ -1983,6 +1995,7 @@ describe('#1781: a template reference node whose statement adds a component is n
       if (loose) expect(text).toContain('"key":"kT1781"');
       else expect([text.includes('/a+kT1781'), text.includes('"added"')]).toEqual([true, false]);
       expect(text).not.toContain('focusOrder'); // T's value is not the scene's to state
+      if (loose) install(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
       await load(s);
       expect(focus(where)?.focusOrder, where).toBe(3);
       const marks = getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === named(where)[0]!.id)!);

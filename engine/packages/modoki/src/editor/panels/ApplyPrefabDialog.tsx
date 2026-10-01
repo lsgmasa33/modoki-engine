@@ -366,6 +366,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
 
   if (!active) return null;
   // The root's default overrides AT their current targets (#1831): what the checkboxes, their states and the badge read.
+  const unusedLine = loadState.kind === 'ready' ? unusedOverridesLine(loadState.unusedOverrides) : null;
   const defaultOverrides = loadState.kind === 'ready' ? effectiveDefaults(loadState.defaultOverrides, choice, loadState.source, noResolve) : new Set<string>();
   const renderEntityNode = (fnode: ForestNode<EntityNode>): React.ReactElement => {
     const e = fnode.node;
@@ -478,10 +479,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           {loadState.kind === 'ready'
             && buildOverrideForest(loadState.entities).map((fnode) => renderEntityNode(fnode))}
 
-          {loadState.kind === 'ready' && loadState.unusedOverrides > 0 && (
+          {unusedLine !== null && (
             // #1914 F6: read-only, as Unity's Remove is later work. Neither Apply nor Revert touches them.
             <div data-ui-id="prefab.dialog.unused" style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px' }}>
-              {unusedOverridesLine(loadState.unusedOverrides)}
+              {unusedLine}
             </div>
           )}
           {loadState.kind === 'ready' && loadState.unaddressableAdded > 0 && (

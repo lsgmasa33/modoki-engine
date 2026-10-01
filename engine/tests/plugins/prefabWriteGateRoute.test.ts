@@ -15,9 +15,11 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { relay } from './backendRelay';
 import fs from 'fs';
 import path from 'path';
-import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { handleBackendRequest, makePrefabResolver, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { admitPrefabDocument } from '../../packages/modoki/src/runtime/loaders/documentIdentity';
 import { PREFAB_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { reserveLocalId, clearReservedLocalIds } from '../../packages/modoki/src/runtime/core/localIdCounter';
 
 let projectRoot = '';
 
@@ -138,6 +140,18 @@ describe('POST /api/write-file — the prefab localId high-water mark (#1774)', 
     expect(res.body.reason).toBe('if-none-match');
   });
 
+  // #1933 S5: a renderer that loaded a scene holds an in-memory reservation for the prefab, and the fuzz backend runs this
+  // route in that process. The route compares what the two FILES state, as it does in node, where no reservation exists.
+  // Mutation: compare `localIdCounter` (counts the reservation) — both sides read 21 and the lowering write goes through.
+  it('compares what the files state, not a reservation the process holds for the prefab', async () => {
+    const id = 'aaaaaaaa-0000-4000-8000-000000193305';
+    const p = seed('assets/m.prefab.json', { ...doc(9, 1, 2, 3), id });
+    reserveLocalId(id, 20);
+    try {
+      expect((await post('/api/write-file', body(p, { ...doc(4, 1, 2, 3), id }))).body.reason).toBe('prefab-mark-lowered');
+    } finally { clearReservedLocalIds(); }
+  });
+
   it('ACCEPTS a mark that holds or rises, a file with no mark whose rows derive it, and a first write', async () => {
     const p = seed('assets/m.prefab.json', doc(9, 1, 2, 3));
     expect((await post('/api/write-file', body(p, doc(9, 1)))).body.ok).toBe(true);
@@ -145,5 +159,106 @@ describe('POST /api/write-file — the prefab localId high-water mark (#1774)', 
     const q = seed('assets/old.prefab.json', doc(undefined, 1, 2, 3));
     expect((await post('/api/write-file', body(q, doc(undefined, 1, 2, 3)))).body.ok, 'before v8: the rows derive the same mark').toBe(true);
     expect((await post('/api/write-file', body('/assets/new.prefab.json', doc(undefined, 1)))).body.ok).toBe(true);
+  });
+});
+
+/** #1937 C-A step 6, T11 (owner ruling F-D): a prefab declaring an identifier twice is never written by the raw routes —
+ *  every seat refuses such a document, so each instance of it would become a Damaged Prefab placeholder. */
+describe('the raw routes refuse a prefab that declares an identifier twice (#1937 T11)', () => {
+  const row = (localId: number, nodeGuid: string, extra: object = {}) => ({ localId, name: `R${localId}`, nodeGuid, traits: {}, ...extra });
+  const node = (key?: string) => ({ parentLocalId: 1, name: 'N', ...(key ? { key } : {}), traits: {}, children: [] });
+  const clean = () => ({ version: PREFAB_FORMAT_VERSION, name: 'd', rootLocalId: 1, nextLocalId: 3, entities: [row(1, 'g-1'), row(2, 'g-2')] });
+  const repeatedLocalId = () => ({ ...clean(), entities: [row(1, 'g-1'), row(1, 'g-3')] });
+  const repeatedKey = () => ({ ...clean(), entities: [row(1, 'g-1', { added: [node('k1'), node('k1')] }), row(2, 'g-2')] });
+  const keyless = () => ({ ...clean(), entities: [row(1, 'g-1', { added: [node()] }), row(2, 'g-2')] });
+
+  // Mutation: drop the gate in `/api/write-file` — both are written.
+  it('/api/write-file: a repeated localId and a repeated key are refused 422 with the reason; nothing reaches disk', async () => {
+    for (const [what, doc] of [['localId', repeatedLocalId()], ['template key', repeatedKey()]] as const) {
+      const res = await post('/api/write-file', body('/assets/d.prefab.json', doc));
+      expect(res.status, what).toBe(422);
+      expect(res.body.reason).toBe('prefab-identifier-repeated');
+      expect(res.body.error).toContain(what);
+      expect(fs.existsSync(path.join(projectRoot, 'assets/d.prefab.json'))).toBe(false);
+    }
+  });
+
+  // The accept side. Mutation: refuse every prefab write — these are refused.
+  it('/api/write-file: a clean document and one with keyless template nodes (the seats mint them) are written', async () => {
+    expect((await post('/api/write-file', body('/assets/c.prefab.json', clean()))).body.ok).toBe(true);
+    expect((await post('/api/write-file', body('/assets/k.prefab.json', keyless()))).body.ok).toBe(true);
+  });
+
+  // A scene is not gated (its gate is C-A step 5, parked): its damaged embedded copy is written back as the file held it.
+  it('/api/write-file: a scene holding a damaged embedded prefab copy is written', async () => {
+    const scene = { version: 19, name: 'S', entities: [], embeddedPrefabs: { 'cccccccc-0000-4000-8000-000000019311': repeatedKey() } };
+    expect((await post('/api/write-file', body('/assets/s.scene.json', scene))).body.ok).toBe(true);
+  });
+});
+
+/** #1937 C-A step 7 (I7): a Node reader that predicts derived guids reads a prefab as every seat does — admitted — so a
+ *  keyless template node carries the key the editor mints, and a guid predicted here is the one the load derives. */
+describe('the Node prefab readers admit what they read (#1937 C-A step 7)', () => {
+  const P = 'cccccccc-0000-4000-8000-000000019701';
+  const PN = 'cccccccc-0000-4000-8000-000000019702';
+  const O = 'cccccccc-0000-4000-8000-000000019703';
+  const row = (localId: number, nodeGuid: string, extra: object = {}) => ({ localId, name: `R${localId}`, nodeGuid, traits: { EntityAttributes: { name: `R${localId}`, parentId: localId === 1 ? 0 : 1, guid: '' } }, ...extra });
+  const loose = { parentLocalId: 2, guid: '', name: 'Loose', traits: { EntityAttributes: { name: 'Loose', parentId: 0 } }, children: [] };
+  const pDoc = { id: P, version: PREFAB_FORMAT_VERSION, name: 'P', rootLocalId: 1, entities: [row(1, 'eeeeeeee-0000-4000-8000-000000019711'), row(2, 'eeeeeeee-0000-4000-8000-000000019712')] };
+  /** PN: R1 → R2, a P row adding Loose (KEYLESS) under P's R2. */
+  const pnDoc = { id: PN, version: PREFAB_FORMAT_VERSION, name: 'PN', rootLocalId: 1, entities: [row(1, 'eeeeeeee-0000-4000-8000-000000019721'), row(2, 'eeeeeeee-0000-4000-8000-000000019722', { prefab: P, added: [loose] })] };
+  const minted = () => ((admitPrefabDocument(structuredClone(pnDoc)) as { doc: typeof pnDoc }).doc.entities[1] as unknown as { added: Array<{ key?: string }> }).added[0]!.key!;
+  const ctxWith = (assets: Array<{ guid: string; path: string }>) => ({ ...makeCtx(), getManifest: () => ({ version: 2, assets: assets.map((a) => ({ ...a, type: 'prefab' })) }) as unknown as Manifest });
+  const install = () => {
+    seed('assets/P.prefab.json', pDoc);
+    seed('assets/PN.prefab.json', pnDoc);
+    return [{ guid: P, path: '/assets/P.prefab.json' }, { guid: PN, path: '/assets/PN.prefab.json' }];
+  };
+
+  // Mutation: `makePrefabResolver` returns the raw parse (no `admittedPrefab`) — Loose has no key.
+  it('makePrefabResolver: the keyless node carries the key the seats mint', () => {
+    const read = makePrefabResolver(ctxWith(install()) as never);
+    const doc = read(PN) as typeof pnDoc;
+    expect((doc.entities[1] as unknown as { added: Array<{ key?: string }> }).added[0]!.key).toBe(minted());
+  });
+
+  // Mutation: `/api/validate-prefab`'s nested reader returns the raw parse — O's node keyed with the MINTED key meets no
+  // keyed node in PN, and the repeat goes unreported.
+  it('/api/validate-prefab reads the nested documents admitted: a key O repeats from a minted one is reported', async () => {
+    const assets = install();
+    const oDoc = { id: O, version: PREFAB_FORMAT_VERSION, name: 'O', rootLocalId: 1, entities: [
+      row(1, 'eeeeeeee-0000-4000-8000-000000019731'),
+      row(2, 'eeeeeeee-0000-4000-8000-000000019732', { prefab: PN, added: [{ ...loose, name: 'Copied', key: minted() }] }),
+    ] };
+    const p = seed('assets/O.prefab.json', oDoc);
+    const res = await handleBackendRequest(ctxWith([...assets, { guid: O, path: p }]) as never, { method: 'GET', urlPath: '/api/validate-prefab', query: new URLSearchParams({ path: p }), body: undefined });
+    const warnings = ((res as unknown as { body: { warnings?: string[] } }).body.warnings ?? []);
+    expect(warnings.filter((w) => w.startsWith('ERROR:')).join('\n')).toContain(minted());
+  });
+
+  // Close-out review #6 (F-D): a repeat only the derive walk sees — two of O's lists anchored at members of ONE frame of P
+  // (admission groups keys by anchor), and a key O copies from one PN's own node gives — is refused by /api/write-file,
+  // which reads the nested documents through the router's admitted resolver. Mutation: drop `frameRepeatRefusal` from
+  // `classifyPrefabIdentityWrite` — both are written.
+  it('/api/write-file refuses a repeat the derive walk sees: one file across two anchors, and a key copied from a nested file', async () => {
+    const assets = install();
+    const ctx = ctxWith(assets) as never;
+    const write = async (name: string, doc: unknown) => (await handleBackendRequest(ctx, { method: 'POST', urlPath: '/api/write-file', query: new URLSearchParams(), body: { path: name, content: JSON.stringify(doc) } })) as unknown as { status?: number; body: { reason?: string; error?: string } };
+    const kd = (parentLocalId: number) => ({ ...loose, parentLocalId, name: `K${parentLocalId}`, key: 'k-dup' });
+    const oneFile = { id: O, version: PREFAB_FORMAT_VERSION, name: 'O', rootLocalId: 1, entities: [
+      row(1, 'eeeeeeee-0000-4000-8000-000000019741'), row(2, 'eeeeeeee-0000-4000-8000-000000019742', { prefab: P, added: [kd(1), kd(2)] }),
+    ] };
+    const twoFiles = { id: O, version: PREFAB_FORMAT_VERSION, name: 'O', rootLocalId: 1, entities: [
+      row(1, 'eeeeeeee-0000-4000-8000-000000019743'), row(2, 'eeeeeeee-0000-4000-8000-000000019744', { prefab: PN, added: [{ ...loose, name: 'Copied', key: minted() }] }),
+    ] };
+    for (const [what, doc] of [['one file', oneFile], ['two files', twoFiles]] as const) {
+      const res = await write('/assets/O.prefab.json', doc);
+      expect(res.status, what).toBe(422);
+      expect(res.body.reason).toBe('prefab-identifier-repeated');
+      expect(res.body.error).toMatch(/to two nodes in one frame/);
+      expect(fs.existsSync(path.join(projectRoot, 'assets/O.prefab.json')), what).toBe(false);
+    }
+    // The accept side: the same O with its own key on the second node is written.
+    expect((await write('/assets/O.prefab.json', { ...oneFile, entities: [oneFile.entities[0], { ...oneFile.entities[1], added: [kd(1), { ...kd(2), key: 'k-own' }] }] })).body).toMatchObject({ ok: true });
   });
 });
