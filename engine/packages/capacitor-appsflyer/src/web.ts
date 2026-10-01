@@ -20,6 +20,7 @@ export class AppsFlyerWeb extends WebPlugin implements AppsFlyerPlugin {
   }
   async getConversionData(): Promise<{ data: Record<string, unknown> }> { return { data: {} }; }
   async setConsent(): Promise<{ ok: boolean }> { return { ok: false }; }
+  async anonymizeUser(): Promise<{ ok: boolean }> { return { ok: false }; }
   async stop(): Promise<{ ok: boolean }> { return { ok: false }; }
   async requestTrackingAuthorization(): Promise<{ status: 'authorized' | 'denied' | 'restricted' | 'notDetermined' | 'notSupported' }> {
     return { status: 'notSupported' };

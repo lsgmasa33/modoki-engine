@@ -39,6 +39,15 @@
  *   UNANSWERED request until the app is active (`capacitor-appsflyer/att-core`; an answered status runs
  *   at once, #1532), so this answer should not come back. If it does, iOS did not show the prompt for that request and AppsFlyer starts unanswered anyway,
  *   so `warnIfPromptNotShown` says so in the log instead of passing it off as an answer.
+ * - **An ATT answer other than `authorized` means NO TRACKING for the run** (#1920, App Store guideline
+ *   5.1.1(iv): Court 0.1.0 was rejected for tracking after "Ask App Not to Track"). Here that is
+ *   AppsFlyer's anonymous mode, `anonymizeUser` BEFORE `start()` (owner ruling on #1522): the SDK still
+ *   starts and reports installs and events in aggregate (SKAdNetwork keeps working), with the device ids
+ *   dropped and its own id and the IP hashed. Ads and analytics read the same answer from
+ *   `trackingStatus()` — each game's `ads.ts` and its `attribution.ts` wiring. `notDetermined` counts as
+ *   a denial too: Apple's rule is "ask first", and no answer is not permission. ⚠️ **A failing
+ *   `anonymizeUser` keeps AppsFlyer OFF** for the run: it throws before `start()`, and past the prompt
+ *   nothing retries. Losing one run's attribution is the price of never tracking someone who said no.
  * - **No method rejects into a caller.** Every failure is a `console.warn` and a resolved sentinel.
  */
 
@@ -60,6 +69,30 @@ function warnIfPromptNotShown(att: unknown, os: string): void {
   );
 }
 
+/**
+ * This run's ATT answer, as `capacitor-appsflyer`'s `requestTrackingAuthorization` spells it, plus
+ * `unknown`: on iOS, no answer came back (attribution is off, its init failed, or nobody asked yet).
+ * `notSupported` is every platform without ATT — Android, the editor, the web.
+ */
+export type TrackingStatus = 'authorized' | 'denied' | 'restricted' | 'notDetermined' | 'notSupported' | 'unknown';
+
+const TRACKING_STATUSES: readonly TrackingStatus[] = ['authorized', 'denied', 'restricted', 'notDetermined', 'notSupported'];
+
+/**
+ * May this run track the player — personalized ads, a consent form for them, device-level attribution?
+ * (#1920) Only on an explicit `authorized`, or where ATT does not exist. Everything else on iOS — a
+ * denial, `restricted`, `notDetermined` (no prompt was shown, #1510) and `unknown` — is a no: tracking
+ * needs the player's permission, and the absence of an answer is not one.
+ */
+export function isTrackingAllowed(status: TrackingStatus): boolean {
+  return status === 'authorized' || status === 'notSupported';
+}
+
+function statusOf(att: unknown): TrackingStatus {
+  const status = (att as { status?: unknown } | null | undefined)?.status;
+  return TRACKING_STATUSES.find((s) => s === status) ?? 'unknown';
+}
+
 /** iOS IDFA / Android GAID, with `kind` naming which — see the plugin's own doc comment. */
 export type AdvertisingId = {
   id: string;
@@ -72,6 +105,8 @@ export type AdvertisingId = {
 export interface AttributionSdk {
   initialize(options: { devKey: string; appleAppId: string; isDebug: boolean; waitForAttTimeoutSec: number }): Promise<unknown>;
   requestTrackingAuthorization(): Promise<unknown>;
+  /** AppsFlyer's anonymous mode. Must come before `start()` to cover the install itself. */
+  anonymizeUser(options: { anonymize: boolean }): Promise<unknown>;
   start(): Promise<unknown>;
   logEvent(options: { eventName: string; eventValues?: Record<string, string | number> }): Promise<unknown>;
   setCustomerUserId(options: { userId: string }): Promise<unknown>;
@@ -107,6 +142,12 @@ export interface Attribution {
   /** Initialize AppsFlyer. A no-op without a dev key or off native (no SDK in the editor/web preview). */
   initAppsFlyer(): Promise<void>;
   whenTrackingPromptSettled(): Promise<void>;
+  /**
+   * This run's ATT answer, once the prompt has settled (#1920) — what `isTrackingAllowed` judges. Waits
+   * exactly as long as `whenTrackingPromptSettled`. `notSupported` off iOS and off native; `unknown` on
+   * iOS when no answer came back.
+   */
+  trackingStatus(): Promise<TrackingStatus>;
   /** Log a custom AppsFlyer event. */
   logEvent(eventName: string, eventValues?: Record<string, string | number>): Promise<void>;
   /** Associate a customer/user id with this install. */
@@ -134,6 +175,8 @@ export function createAttribution({ config, sdk, platform, bundleId }: Attributi
   let starting = false;
   let attPrompted = false;
   let attSettled: Promise<void> = Promise.resolve();
+  /** The answer this run's ATT request returned; `null` until one has. */
+  let attStatus: TrackingStatus | null = null;
 
   async function initAppsFlyer(): Promise<void> {
     if (initialized || starting) return;
@@ -173,12 +216,17 @@ export function createAttribution({ config, sdk, platform, bundleId }: Attributi
       let att: unknown;
       try {
         att = await sdk.requestTrackingAuthorization();
+        attStatus = statusOf(att);   // before the settle, so `trackingStatus()` can never read it unset
       } finally {
         endBootSpan(attSpan);
         settleAtt();
       }
       warnIfPromptNotShown(att, platform.getPlatform());
       attPrompted = true;
+      // #1920: anonymous mode on anything but a yes, set every run where ATT exists (`false` on a yes, so a
+      // player who allows tracking later is not left anonymized). Off iOS the call is never made, which
+      // keeps Android's start-up exactly as it shipped.
+      if (attStatus !== 'notSupported') await sdk.anonymizeUser({ anonymize: !isTrackingAllowed(attStatus) });
       await sdk.start();
       initialized = true;
       console.log(`[AppsFlyer] Initialized for ${platform.getPlatform()}`);
@@ -193,6 +241,8 @@ export function createAttribution({ config, sdk, platform, bundleId }: Attributi
   return {
     initAppsFlyer,
     whenTrackingPromptSettled: () => attSettled,
+    trackingStatus: () => attSettled.then(() =>
+      attStatus ?? (platform.isNativePlatform() && platform.getPlatform() === 'ios' ? 'unknown' : 'notSupported')),
 
     async logEvent(eventName, eventValues) {
       if (!live()) return;

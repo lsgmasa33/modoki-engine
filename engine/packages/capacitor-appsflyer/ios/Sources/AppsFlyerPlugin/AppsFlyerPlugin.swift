@@ -21,6 +21,7 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         CAPPluginMethod(name: "getAdvertisingId", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getConversionData", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setConsent", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "anonymizeUser", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestTrackingAuthorization", returnType: CAPPluginReturnPromise),
     ]
@@ -319,6 +320,17 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
             AppsFlyerLib.shared().setConsentData(consent)
         }
 
+        call.resolve(["ok": true])
+    }
+
+    // MARK: - Anonymous mode (#1920)
+
+    // AppsFlyer's anonymous mode, set from the ATT answer before start() on every run (the engine's
+    // attribution.ts). A property in SDK v7 (`@property(atomic, setter=anonymizeUser:) BOOL anonymizeUser`),
+    // atomic, so setting it from Capacitor's bridge queue is safe.
+    @objc func anonymizeUser(_ call: CAPPluginCall) {
+        let anonymize = call.getBool("anonymize") ?? false
+        AppsFlyerLib.shared().anonymizeUser = anonymize
         call.resolve(["ok": true])
     }
 

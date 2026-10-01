@@ -7,8 +7,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createAttribution,
+  isTrackingAllowed,
   type AttributionConfig,
   type AttributionSdk,
+  type TrackingStatus,
 } from '../../../src/runtime/core/attribution';
 import { getBootTimeline, resetBootTimeline } from '../../../src/runtime/core/bootTimeline';
 
@@ -18,6 +20,7 @@ function fakeSdk(): SdkMock {
   return {
     initialize: vi.fn().mockResolvedValue({ ok: true }),
     requestTrackingAuthorization: vi.fn().mockResolvedValue({ status: 'notSupported' }),
+    anonymizeUser: vi.fn().mockResolvedValue({ ok: true }),
     start: vi.fn().mockResolvedValue({ ok: true }),
     logEvent: vi.fn().mockResolvedValue({ ok: true }),
     setCustomerUserId: vi.fn().mockResolvedValue({ ok: true }),
@@ -360,5 +363,102 @@ describe('attribution — an ATT answer that means no prompt was shown (#1510)',
     sdk.requestTrackingAuthorization.mockResolvedValueOnce({ status: 'notDetermined' });
     await make(CONFIGURED, { os: 'android' }).initAppsFlyer();
     expect(warned()).toBe(false);
+  });
+});
+
+/**
+ * #1920 — App Store guideline 5.1.1(iv): Court 0.1.0 was rejected for tracking after "Ask App Not to Track".
+ * Anything but an ATT yes must put AppsFlyer in anonymous mode BEFORE start() (owner ruling on #1522), and
+ * hand the same answer to ads and analytics through `trackingStatus()`.
+ */
+describe('attribution — an ATT answer other than authorized means no tracking (#1920)', () => {
+  const order = (fn: ReturnType<typeof vi.fn>) => fn.mock.invocationCallOrder[0];
+
+  it.each(['denied', 'restricted', 'notDetermined'] as const)(
+    'on iOS, `%s` anonymizes AppsFlyer BEFORE start(), and trackingStatus() reports it',
+    async (status) => {
+      sdk.requestTrackingAuthorization.mockResolvedValue({ status });
+      const a = make(CONFIGURED, { os: 'ios' });
+      await a.initAppsFlyer();
+      expect(sdk.anonymizeUser).toHaveBeenCalledExactlyOnceWith({ anonymize: true });
+      expect(sdk.start).toHaveBeenCalledTimes(1);
+      expect(order(sdk.anonymizeUser), 'anonymous mode must cover the install, so it precedes start()')
+        .toBeLessThan(order(sdk.start));
+      expect(order(sdk.requestTrackingAuthorization)).toBeLessThan(order(sdk.anonymizeUser));
+      await expect(a.trackingStatus()).resolves.toBe(status);
+    },
+  );
+
+  it('on iOS, `authorized` turns anonymous mode OFF explicitly, before start()', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValue({ status: 'authorized' });
+    const a = make(CONFIGURED, { os: 'ios' });
+    await a.initAppsFlyer();
+    expect(sdk.anonymizeUser).toHaveBeenCalledExactlyOnceWith({ anonymize: false });
+    expect(order(sdk.anonymizeUser)).toBeLessThan(order(sdk.start));
+    await expect(a.trackingStatus()).resolves.toBe('authorized');
+  });
+
+  it('off iOS (`notSupported`) the call is never made — Android starts exactly as it shipped', async () => {
+    const a = make(CONFIGURED, { os: 'android' });
+    await a.initAppsFlyer();
+    expect(sdk.anonymizeUser).not.toHaveBeenCalled();
+    expect(sdk.start).toHaveBeenCalledTimes(1);
+    await expect(a.trackingStatus()).resolves.toBe('notSupported');
+  });
+
+  it('a failing anonymizeUser keeps AppsFlyer OFF — and a second init does not ask again', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValue({ status: 'denied' });
+    sdk.anonymizeUser.mockRejectedValue(new Error('bridge failed'));
+    const a = make(CONFIGURED, { os: 'ios' });
+    await a.initAppsFlyer();
+    expect(sdk.start, 'a player who said no must never be tracked un-anonymized').not.toHaveBeenCalled();
+    await a.initAppsFlyer();
+    expect(sdk.requestTrackingAuthorization).toHaveBeenCalledTimes(1);
+    await expect(a.trackingStatus()).resolves.toBe('denied');
+  });
+
+  it('trackingStatus() waits for the prompt, armed in the same tick as init', async () => {
+    let answer!: (v: unknown) => void;
+    sdk.requestTrackingAuthorization.mockReturnValue(new Promise((r) => { answer = r; }));
+    const a = make(CONFIGURED, { os: 'ios' });
+    const init = a.initAppsFlyer();
+    let got: TrackingStatus | null = null;
+    void a.trackingStatus().then((s) => { got = s; });
+    await vi.waitFor(() => expect(sdk.requestTrackingAuthorization).toHaveBeenCalled());
+    await Promise.resolve();
+    expect(got, 'must not answer while the ATT prompt is up').toBeNull();
+    answer({ status: 'denied' });
+    await init;
+    await vi.waitFor(() => expect(got).toBe('denied'));
+  });
+
+  it('with no answer, iOS reports `unknown` (a no) and everywhere else `notSupported`', async () => {
+    await expect(make(BLANK, { os: 'ios' }).trackingStatus()).resolves.toBe('unknown');
+    await expect(make(CONFIGURED, { native: false, os: 'ios' }).trackingStatus()).resolves.toBe('notSupported');
+    await expect(make(BLANK, { os: 'android' }).trackingStatus()).resolves.toBe('notSupported');
+
+    // The consent call itself rejecting is no answer either.
+    sdk.requestTrackingAuthorization.mockRejectedValue(new Error('bridge failed'));
+    const failed = make(CONFIGURED, { os: 'ios' });
+    await failed.initAppsFlyer();
+    await expect(failed.trackingStatus()).resolves.toBe('unknown');
+  });
+
+  it('an answer the plugin does not define reads as `unknown`, and is anonymized', async () => {
+    sdk.requestTrackingAuthorization.mockResolvedValue({ status: 'maybe' });
+    const a = make(CONFIGURED, { os: 'ios' });
+    await a.initAppsFlyer();
+    await expect(a.trackingStatus()).resolves.toBe('unknown');
+    expect(sdk.anonymizeUser).toHaveBeenCalledExactlyOnceWith({ anonymize: true });
+  });
+
+  it('isTrackingAllowed: only `authorized` and `notSupported` say yes', () => {
+    const table = Object.fromEntries(
+      (['authorized', 'denied', 'restricted', 'notDetermined', 'notSupported', 'unknown'] as const)
+        .map((s) => [s, isTrackingAllowed(s)]),
+    );
+    expect(table).toEqual({
+      authorized: true, denied: false, restricted: false, notDetermined: false, notSupported: true, unknown: false,
+    });
   });
 });

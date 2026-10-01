@@ -124,6 +124,14 @@ export interface AppsFlyerPlugin {
   setConsent(options: { hasConsentForDataUsage?: boolean; hasConsentForAdsPersonalization?: boolean }): Promise<{ ok: boolean }>;
 
   /**
+   * AppsFlyer's anonymous mode (#1920): the SDK still reports installs and events, in aggregate, but drops
+   * the device ids (IDFA, IDFV, the customer user id) and hashes its own id and the IP. Call it BEFORE
+   * `start()`, every run: the engine's `attribution.ts` sets it from the ATT answer, `true` on anything but
+   * `authorized`, so an App Store build never tracks a player who said no (guideline 5.1.1(iv)).
+   */
+  anonymizeUser(options: { anonymize: boolean }): Promise<{ ok: boolean }>;
+
+  /**
    * Stop (or resume) the SDK — GDPR/CCPA opt-out.
    */
   stop(options: { stopped: boolean }): Promise<{ ok: boolean }>;

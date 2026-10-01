@@ -334,6 +334,20 @@ public class AppsFlyerPlugin extends Plugin {
         call.resolve(result);
     }
 
+    // MARK: - Anonymous mode (#1920)
+
+    // AppsFlyer's anonymous mode. The engine's attribution.ts calls it only where ATT exists (iOS), so
+    // nothing reaches this today; it is here so the plugin's surface is the same on both platforms.
+    @PluginMethod
+    public void anonymizeUser(PluginCall call) {
+        Boolean anonymize = call.getBoolean("anonymize", false);
+        AppsFlyerLib.getInstance().anonymizeUser(Boolean.TRUE.equals(anonymize));
+
+        JSObject result = new JSObject();
+        result.put("ok", true);
+        call.resolve(result);
+    }
+
     // MARK: - Stop / opt-out
 
     @PluginMethod

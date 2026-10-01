@@ -7,7 +7,10 @@
  *   - **Required-reason APIs:** UserDefaults (`CA92.1`), because `@capacitor/preferences` calls
  *     `UserDefaults.standard` and ships no manifest. Every other required-reason use in the resolved
  *     graph (FileTimestamp, SystemBootTime, more UserDefaults) is declared by the SDK that makes it.
- *   - **Tracking:** none of the app's own. AppsFlyer declares its own (Facebook did, in Court's graph, until #1062 stripped it).
+ *   - **Tracking:** only with an ATT "Allow" (#1920/#1921 — guideline 5.1.1(iv), Court 0.1.0's rejection), and
+ *     declared PER DATA TYPE with the App Store label's purposes: Device ID, Advertising Data, Product Interaction.
+ *     `NSPrivacyTracking` stays false with NO domains key: `true` with no domains is invalid (Apple TN3181), the
+ *     app's own code reaches no tracking host, and AppsFlyer declares its own `att.*` hosts.
  *   - **Collected data:** the game's OWN first-party collection, decided by the owner (2026-09-11):
  *     each game's cloud save (User ID, Gameplay Content, Purchase History) — Weaveling's since #1389.
  * Coverage table and sources: `docs/native-and-sdks.md` § "iOS privacy manifest".
@@ -25,6 +28,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT, hasInternalGames } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
 
 /** Game → the first-party `NSPrivacyCollectedDataType`s it declares. The owner's decision, pinned. */
 const SHIPPING_IOS: Readonly<Record<string, readonly string[]>> = {
@@ -38,6 +42,36 @@ const SHIPPING_IOS: Readonly<Record<string, readonly string[]>> = {
     'NSPrivacyCollectedDataTypeGameplayContent',
     'NSPrivacyCollectedDataTypePurchaseHistory',
     'NSPrivacyCollectedDataTypeUserID',
+  ],
+  // Copied from Weaveling (#1584) and Apiary-shipping; its manifest has claimed this guard since it landed.
+  'games/slime-shooter': [
+    'NSPrivacyCollectedDataTypeGameplayContent',
+    'NSPrivacyCollectedDataTypePurchaseHistory',
+    'NSPrivacyCollectedDataTypeUserID',
+  ],
+};
+
+/**
+ * The data each game uses to TRACK, with the player's ATT permission (#1920) — declared because no SDK manifest
+ * in the graph declares it as tracking. Same for every game: the ads and attribution stack is the engine's.
+ */
+const TRACKING: Readonly<Record<string, readonly string[]>> = {
+  // The App Store label's own rows and purposes (games/court/legal-drafts/store-forms.md § "App Store — privacy labels").
+  NSPrivacyCollectedDataTypeDeviceID: [
+    'NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising',
+    'NSPrivacyCollectedDataTypePurposeDeveloperAdvertising',
+    'NSPrivacyCollectedDataTypePurposeAnalytics',
+  ],
+  NSPrivacyCollectedDataTypeAdvertisingData: [
+    'NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising',
+    'NSPrivacyCollectedDataTypePurposeDeveloperAdvertising',
+    'NSPrivacyCollectedDataTypePurposeAnalytics',
+  ],
+  NSPrivacyCollectedDataTypeProductInteraction: [
+    'NSPrivacyCollectedDataTypePurposeThirdPartyAdvertising',
+    'NSPrivacyCollectedDataTypePurposeDeveloperAdvertising',
+    'NSPrivacyCollectedDataTypePurposeAnalytics',
+    'NSPrivacyCollectedDataTypePurposeAppFunctionality',
   ],
 };
 
@@ -149,20 +183,38 @@ for (const [game, collected] of Object.entries(SHIPPING_IOS)) {
       expect(manifest().NSPrivacyAccessedAPITypes).toEqual(expected);
     });
 
-    it('declares no tracking of its own; the SDKs that track declare it themselves', () => {
+    it('declares no tracking DOMAINS of its own: NSPrivacyTracking false, no NSPrivacyTrackingDomains key (TN3181)', () => {
+      // `true` with no domains is an INVALID manifest (Apple TN3181), and listing AppLovin's hosts would block
+      // the non-personalized ads on a denial. The tracking the label declares is per data type, next test.
       expect(manifest().NSPrivacyTracking).toBe(false);
-      expect(manifest().NSPrivacyTrackingDomains).toEqual([]);
+      expect(manifest(), 'TN3181: remove the key rather than leave it empty').not.toHaveProperty('NSPrivacyTrackingDomains');
     });
 
-    it('declares exactly the first-party data collection the owner decided, linked and not for tracking', () => {
+    it('declares exactly the owner\'s first-party rows (not tracking) and the #1920 tracking rows, each as decided', () => {
+      // One expected table, no filtering: every declared type must be a row here and every row declared.
+      const expected: Record<string, { tracking: boolean; purposes: readonly string[] }> = {
+        ...Object.fromEntries(collected.map((type) => [type,
+          { tracking: false, purposes: ['NSPrivacyCollectedDataTypePurposeAppFunctionality'] }])),
+        ...Object.fromEntries(Object.entries(TRACKING).map(([type, purposes]) => [type, { tracking: true, purposes }])),
+      };
       const types = manifest().NSPrivacyCollectedDataTypes as PlistDict[];
-      expect(types.map((t) => t.NSPrivacyCollectedDataType).sort()).toEqual([...collected].sort());
+      expect(types.map((t) => String(t.NSPrivacyCollectedDataType)).sort()).toEqual(Object.keys(expected).sort());
       for (const t of types) {
-        expect(t.NSPrivacyCollectedDataTypeLinked, String(t.NSPrivacyCollectedDataType)).toBe(true);
-        expect(t.NSPrivacyCollectedDataTypeTracking, String(t.NSPrivacyCollectedDataType)).toBe(false);
-        expect(t.NSPrivacyCollectedDataTypePurposes, String(t.NSPrivacyCollectedDataType))
-          .toEqual(['NSPrivacyCollectedDataTypePurposeAppFunctionality']);
+        const type = String(t.NSPrivacyCollectedDataType);
+        expect(t.NSPrivacyCollectedDataTypeLinked, type).toBe(true);
+        expect(t.NSPrivacyCollectedDataTypeTracking, type).toBe(expected[type].tracking);
+        expect(t.NSPrivacyCollectedDataTypePurposes, type).toEqual(expected[type].purposes);
       }
+    });
+
+    it('defaults Firebase\'s three ad consent signals to DENIED in Info.plist, until the ATT answer grants them (#1920)', () => {
+      // Not the plist reader above: Info.plist carries shapes it refuses on purpose.
+      const info = readScannedSource(path.join(REPO_ROOT, game, 'ios', 'App', 'App', 'Info.plist'),
+        { comments: 'include', reason: 'plist XML has no registered stripper; the keys matched are plist values' }).code;
+      for (const key of ['AD_STORAGE', 'AD_USER_DATA', 'AD_PERSONALIZATION_SIGNALS']) {
+        expect(info, key).toMatch(new RegExp(`<key>GOOGLE_ANALYTICS_DEFAULT_ALLOW_${key}</key>\\s*<false/>`));
+      }
+      expect(info, 'first-party analytics is not tracking').not.toContain('GOOGLE_ANALYTICS_DEFAULT_ALLOW_ANALYTICS_STORAGE');
     });
   });
 }

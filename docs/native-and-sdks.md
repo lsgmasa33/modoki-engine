@@ -278,7 +278,8 @@ const { heightPx } = await ApplovinMax.showBanner({ adUnitId });
   `@capacitor-community/admob`, but NOT the same types: `debugGeography` is a string (`'eea'`), and the
   result carries `privacyOptionsRequired: boolean` where AdMob's has a `privacyOptionsRequirementStatus`
   string, so an adapter's `start()` ports step for step, not line for line. **MAX learns the answer from the IAB TCF string UMP writes on the
-  device** — there is no `setHasUserConsent` call to make. ⚠️ Two things outside the plugin make it
+  device** — there is no `setHasUserConsent` call to make, **except without an ATT "Allow"**, where UMP is
+  skipped and the adapter sets it (§ "No tracking without an ATT Allow (#1920)"). ⚠️ Two things outside the plugin make it
   work: **UMP reads the AdMob app id** (`GADApplicationIdentifier` in Info.plist, the
   `com.google.android.gms.ads.APPLICATION_ID` meta-data on Android), so a game dropping AdMob must KEEP
   that key; and **the consent message published in the AdMob console must list AppLovin among its ad
@@ -1190,12 +1191,62 @@ A worked example of a game filling the slot — including the Firebase wrapper, 
 trap, the gradle/dSYM wiring and the on-device verification — is
 [games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".
 
+## No tracking without an ATT Allow (#1920)
+
+**App Review rejected Court 0.1.0 under guideline 5.1.1(iv)** for tracking after the player chose "Ask
+App Not to Track" (the "cookie prompt" Apple saw was Google UMP's consent form, shown after a denial).
+Owner ruling, option A (#1522): honour the denial in code, in every game on this stack. The rule lives
+in the engine's `runtime/core/attribution.ts`, and every game's `app-services` reads it from there:
+
+- **`trackingStatus()`** answers this run's ATT result once the prompt has settled; **`isTrackingAllowed()`**
+  says yes ONLY to `authorized` (and `notSupported`, i.e. no ATT: Android, the editor, the web).
+  `denied`, `restricted`, `notDetermined` (iOS showed no prompt, #1510) and `unknown` (no answer came
+  back: attribution off, its init failed) are all a no. Tracking needs permission; no answer is not one.
+- **AppsFlyer: anonymous mode** (`anonymizeUser`, a `capacitor-appsflyer` method since #1920) set from the
+  answer BEFORE `start()`, every run where ATT exists, `false` on a yes so a later "Allow" in Settings
+  takes effect. The SDK still starts and counts installs and events in aggregate (SKAdNetwork keeps
+  working). ⚠️ **A failing `anonymizeUser` leaves AppsFlyer off for the run** (fail closed). Off iOS the call
+  is never made, so Android's start-up is byte-for-byte what shipped. **AppsFlyer's probabilistic
+  modeling (PMOD) must be OFF for iOS in the AppsFlyer dashboard** (owner ruling): Apple counts it as
+  tracking, and no SDK flag controls it.
+- **Ads (each game's `ads.ts` `start()`): no UMP on a no.** UMP is not even asked, so no form appears and the
+  Privacy choices row stays hidden; MAX gets `setHasUserConsent(false)` and `setDoNotSell(true)` before
+  `initialize`, so ads are non-personalized. Do-not-sell is set as well because the US-states opt-out is
+  UMP's job on the allow path, and with UMP skipped nothing else would carry it. On a yes, nothing
+  changes: UMP runs where Google requires it, and MAX reads its TCF answer.
+- **Firebase Analytics: `ad_storage`, `ad_user_data`, `ad_personalization` follow the answer**
+  (`setAdConsent`, from each game's `initAttribution`), and each iOS `Info.plist` defaults all three to
+  denied (`GOOGLE_ANALYTICS_DEFAULT_ALLOW_AD_*`), which covers the launch window before the answer.
+  A yes GRANTS explicitly, because Firebase persists the last setting. `analytics_storage` is left
+  granted: first-party measurement of the game is not tracking, and the app-instance id support reads
+  depends on it. ⚠️ The Info.plist default covers a FIRST launch only: once a run has granted, the next
+  run keeps that grant until `initAttribution` re-sets it (a few bridge calls into launch).
+- ⚠️ **Known limits.** (1) A player who consented in UMP while tracking was allowed, then turned tracking
+  off in Settings, still has UMP's TCF strings on the device; MAX gets the explicit no-consent flag, but
+  networks that read TCF directly may still see the old answer. Nothing resets UMP today. (2) MAX's
+  consent flags are GDPR/US-state flags; elsewhere the protection is iOS withholding the IDFA and MAX
+  getting no consent signal, not a regional opt-out. (3) The answer is read once per launch, so a change
+  in Settings applies at the next launch — EXCEPT MAX's flags: AppLovin stores `has_user_consent` /
+  `is_do_not_sell` across launches and the allow path never resets them, so a player who denied once and
+  allows later keeps non-personalized ads. Privacy-safe, a revenue cost; raised with the hub (#1920).
+- **Observed on an iOS simulator** (iPhone 17, Court Debug build, 2026-10-01), with Court's ATT answer
+  preset in the simulator's TCC store — the state a tap leaves, not the tap. **Denied:** the bridge ran
+  `requestTrackingAuthorization` → `anonymizeUser` → `start` for AppsFlyer, `setHasUserConsent` and
+  `setDoNotSell` before MAX's `initialize`, three Firebase `setConsent` calls, NO `requestConsentInfo` or
+  `showConsentForm` at all, and logged `[MAX] Initialized for ios, no tracking (ATT not authorized)`.
+  **Allowed:** `requestConsentInfo` ran (UMP, `NOT_REQUIRED` on this Mac's network), no MAX consent flags were set,
+  and MAX logged `consent NOT_REQUIRED`. Neither run's `anonymizeUser` argument is visible in the bridge
+  log; the unit tests pin it. The ATT prompt itself and UMP's EEA form were not exercised.
+- Tests: the engine's `tests/runtime/core/attribution.test.ts` (§ #1920), each game's `ads.test.ts` and
+  `services.test.ts`. The privacy-manifest side is the section below. The App Review note and the store
+  answers are in each game's `store-listing.md` § "App Review note — tracking".
+
 ## iOS privacy manifest (#1051)
 
 Apple builds an app's privacy report from every `PrivacyInfo.xcprivacy` in the bundle: the app's
 own, plus one for each SDK that ships one. **So the app declares only what no SDK in its resolved
 package graph already declares.** A declaration the app does not need is still a false statement to
-Apple. Court and Weaveling each carry one at `ios/App/App/PrivacyInfo.xcprivacy`, in the App target's
+Apple. Court, Weaveling and Slime Shooter each carry one at `ios/App/App/PrivacyInfo.xcprivacy`, in the App target's
 Resources phase. `engine/tests/architecture/iosPrivacyManifest.test.ts` checks the file, the wiring
 and the exact declarations.
 
@@ -1208,9 +1259,19 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
 
 - **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
   target's own Swift uses none. The guard derives this from each game's `package.json`.
-- **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph
-  until #1062 stripped it) declare it in their own manifests.
-- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Both games
+- **Tracking: `NSPrivacyTracking` false, and NO `NSPrivacyTrackingDomains` key** (#1920). The games DO
+  track, but only after an ATT "Allow" (the section above), and the label's "Used to Track You" is declared
+  PER DATA TYPE instead: the app adds **Device ID**, **Advertising Data** and **Product Interaction**, each
+  linked and tracking, with the label's own purposes, because no SDK declares them that way (AppsFlyer
+  declares Device ID for third-party advertising only and Product Interaction as NOT tracking; AppLovin
+  declares no data). ⚠️ **Do not flip the flag to `true`:** with no domains that is an INVALID manifest
+  (Apple TN3181, rejected at upload), the app's own code reaches no tracking host, and listing AppLovin's
+  hosts would make iOS block them outright on a denial, ending the non-personalized ads too. AppsFlyer
+  declares tracking and its own `att.*` hosts in its manifest, the split that blocking is built for. The
+  empty domains array the file used to carry is gone too: TN3181's own fix is to remove the key, and an
+  empty array beside `false` has drawn ITMS-91064 for other apps.
+- **Collected data: the game's OWN first-party collection** (owner, 2026-09-11), plus the two tracking rows
+  above. All three games
   declare User ID, Gameplay Content and Purchase History (their Firestore cloud save), each linked,
   App Functionality, not tracking. Weaveling's were added by #1389 once sign-in (#927), purchases (#925)
   and cloud save (#679) landed, each confirmed against a sender in its own code: the save keyed by the account uid,
