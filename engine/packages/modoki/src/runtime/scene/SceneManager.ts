@@ -132,6 +132,9 @@ import {
   collectResourceRefsFromEntities,
   instantiatePrefabIntoWorld,
   assertSceneFormatReadable,
+  captureSceneCopies,
+  restoreSceneCopies,
+  type SceneCopyCarry,
   type SceneData,
   type SceneResourceRef,
   type SceneEntityEntry,
@@ -224,6 +227,14 @@ export interface LoadOptions {
    *  plan.md) — this is the escape hatch. Used by the dev-server hot-reload path
    *  when the changed file is a base, not the primary itself. */
   forceReloadBases?: string[];
+  /** The copies of missing prefabs to carry into the new world for every scene of its chain (#1939 item 2), from
+   *  {@link SceneManager.captureSceneCopies} — for a caller reloading an in-memory SNAPSHOT, which may predate a prefab
+   *  going: an Apply's undo/redo passes the world it replaces; a Play→Stop or preview restore passes the edit world's, taken
+   *  when the envelope opened, since nothing the Play world did may change which frames the edit world expands (Unity
+   *  discards Play state). Default: only the KEPT bases' copies, from the world this load replaces — a kept base is carried,
+   *  not reloaded, so its copies are carried with it; a scene loaded from its FILE reads that file's copies alone, so an
+   *  in-session reload expands what a fresh session would. */
+  sceneCopies?: SceneCopyCarry;
 }
 
 /** Derive a project id from a scene path by the `games/<id>/` or `demos/<id>/`
@@ -291,6 +302,9 @@ export interface SceneManager {
   /** Every scene currently loaded into the active world — the primary plus any
    *  base scenes in its chain. */
   getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry>;
+  /** The copies of missing prefabs `world` holds for its loaded scenes, and the documents its live frames of missing prefabs
+   *  were expanded from, per scene (#1939 item 2) — what a world swap carries ({@link LoadOptions.sceneCopies}). */
+  captureSceneCopies(world?: World): SceneCopyCarry;
   /** The `baseScene` guid ref of the currently-active scene, if any. */
   getCurrentBaseScene(): string | undefined;
   /** The scene currently preloading (if any). */
@@ -427,6 +441,27 @@ class SceneManagerImpl implements SceneManager {
    *  below only ever answers for the primary. */
   getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry> {
     return this.loadedScenes;
+  }
+
+  captureSceneCopies(world: World = getCurrentWorld()): SceneCopyCarry {
+    // A copy is keyed by its scene file's guid (`loadSceneFile`'s store); a scene without one shares the '' key with every
+    // other such scene (#1939 H2, legacy only), so it is not carried.
+    const keys = new Set<string>();
+    let primary: string | undefined;
+    for (const e of this.loadedScenes.values()) {
+      if (!isGuid(e.guid)) continue;
+      keys.add(e.guid);
+      if (e.role === 'primary') primary = e.guid;
+    }
+    const ea = getAllTraits().find((m) => m.name === 'EntityAttributes');
+    return captureSceneCopies(world, {
+      // A base's entity carries its scene's guid (`sourceScene`); the primary's carries ''.
+      of: (entity) => {
+        const src = (ea && entity.has(ea.trait) ? (entity.get(ea.trait) as { sourceScene?: string }).sourceScene : '') || primary;
+        return src && keys.has(src) ? src : undefined;
+      },
+      keeps: (scene) => keys.has(scene),
+    });
   }
 
   /** The `baseScene` guid ref of the currently-active scene, if any. */
@@ -750,6 +785,9 @@ class SceneManagerImpl implements SceneManager {
       // kept-base entities need no such re-acquire — their resources are already
       // held under their own (unchanged, untouched-by-this-swap) sceneId.
       const carriedSnapshots = snapshotPersistentEntities(getCurrentWorld(), keptBaseGuids, getRunMode() === 'playing');
+      // The copies of missing prefabs the world being replaced holds, and its live frames' documents (#1939 item 2): noted
+      // into the new world for every scene it loads again, below, before any of them expands.
+      const sceneCopies = opts.sceneCopies ?? new Map([...this.captureSceneCopies(getCurrentWorld())].filter(([scene]) => keptBaseGuids.has(scene)));
       // Capture each carried entity's override marks NOW, while the OLD world is
       // still alive and its marks intact — `clearAllOverrideMarks()` below drops
       // them, and the respawn has nothing to re-seed from (a carried snapshot is
@@ -819,6 +857,10 @@ class SceneManagerImpl implements SceneManager {
       // `onWorldSwap` subscription at entityUtils import time: a module-scope side effect there
       // breaks every test that mocks `core/ecs/world`.)
       clearAuthoredWritesWhileStopped();
+      // Only for the scenes the new chain holds: another scene's copies in this world would serve an expansion outside a
+      // load (`runtimeReaderFor` reads every scene's), and a save writes its own scene's alone.
+      const chainGuids = new Set(newChain.map((r) => r.guid));
+      restoreSceneCopies(nextWorld, new Map([...sceneCopies].filter(([scene]) => chainGuids.has(scene))));
       const stagingWorld = nextWorld; // captured for closures so TS narrows from null
       const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
 
@@ -868,7 +910,7 @@ class SceneManagerImpl implements SceneManager {
               nestedOverrides,
               nestedStructure,
               // The load's one reader, the scene's copies included — what its settle reads too (#1934 S1).
-              { read },
+              { read, frame: load?.frame },
             );
             // Re-apply the scene-authored stable guid to the instance root. The prefab
             // template clears member guids, so the freshly-spawned root has none; without

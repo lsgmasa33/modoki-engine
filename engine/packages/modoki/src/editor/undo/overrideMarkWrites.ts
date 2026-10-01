@@ -39,7 +39,7 @@ import { hasMemberToken } from '../../runtime/core/templateRefs';
 import { collectComparableTraits, getOverrideValues, recordedOverrides } from '../scene/prefabInstanceOverrides';
 import { instanceMovedMembers } from '../scene/prefabMembers';
 import { instanceBase } from '../scene/prefabChain';
-import { templatePlainNode } from '../scene/prefabBase';
+import { templatePlainNode, captureDoc } from '../scene/prefabBase';
 import { valuesEqual } from '../scene/prefab';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
@@ -314,7 +314,7 @@ export function restoreMarks(entityId: number, capture: MarkCapture): void {
  *  Which fields: exactly the ones the SAVE would drop, so the live world is what a save→reload gives. The value diff
  *  (`getOverrideValues`), less what the save writes (`recordedOverrides`): an added trait, a moved member's Transform and
  *  a recorded field all stay as restored. `EntityAttributes.editorFolder` stays too: the save writes a root's folder outside
- *  the overrides. No-op off an instance, and when the template is not cached (what the screen shows is kept). */
+ *  the overrides. No-op off an instance, and when neither the cache nor the frame's record holds the template. */
 export function takeUnmarkedFromBase(
   entityId: number, traits?: readonly TraitMeta[], fields?: readonly string[],
   /** Record every field of a trait the base does not have (#1914 R1): an undo snapshot taken while a layer gave the
@@ -326,7 +326,11 @@ export function takeUnmarkedFromBase(
   if (!m) { takeUnmarkedNodeFromBase(entityId, traits, fields); return; }
   const { source, localId, rootInstanceId: root } = m.pi;
   if (!source || !localId || !root) return;
-  const prefab = getCachedPrefabSync(source);
+  // A frame whose prefab is missing answers by the document it was built from, its record (`captureDoc`, #1738): for one a
+  // scene's copy restored, that copy (#1939; Unity's scene backup, `MergedAsMissingWithSceneBackup`). Read from the cache
+  // alone, a missing prefab's frame kept an undo's restored value against a template that had changed since, and the next
+  // rebuild or reload showed the template's.
+  const prefab = captureDoc(root, source);
   if (!prefab) return;
   const base = instanceBase(root, prefab);
   const baseEntity = rowAt(base, localId);

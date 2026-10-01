@@ -20,7 +20,7 @@
  *  Every trait field the snapshot holds is authored-only already (`serializeScene` skips
  *  `runtimeOnly`), so a replay can never regress runtime state such as `Time.elapsed`. */
 
-import type { SceneData } from '../../runtime/loaders/loadSceneFile';
+import type { SceneData, SceneCopyCarry } from '../../runtime/loaders/loadSceneFile';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX } from './prefabEditWorld';
 import { serializeScene, getCurrentScenePath, type SceneFile, type SerializedEntity } from './serialize';
@@ -39,6 +39,10 @@ export interface AuthoredSnapshot {
   key: string | null;
   /** Each base in the chain, by scene guid (A5). A base that failed to serialize is simply absent. */
   bases: Map<string, SceneFile>;
+  /** The copies of missing prefabs the edit world held, and its live frames' documents (#1939 item 2): what the restore's
+   *  swap carries, instead of the Play or preview world's, so nothing done inside the envelope changes what the edit world
+   *  expands (Unity discards Play state). Absent: the restore carries none. */
+  copies?: SceneCopyCarry;
 }
 
 /**
@@ -182,7 +186,7 @@ export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
       console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
     }
   }
-  return { primary, key, bases };
+  return { primary, key, bases, copies: sceneManager.captureSceneCopies() };
 }
 
 /** Put the authored world back: reload the primary under the snapshot's key, then replay the part
@@ -196,7 +200,7 @@ export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<v
     // The restore is the ADOPTER (#1698, hub): it reloads under the SAME key, so it writes no editor scene state, and an
     // older route whose world it replaced — a load still in its tail — adopts nothing.
     await withRestore(async (adoption) => {
-      const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData });
+      const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData, sceneCopies: snap.copies ?? new Map() });
       adoption.restored(world);
     });
     for (const base of snap.bases.values()) restoreAuthoredEntities(base.entities);

@@ -12,7 +12,7 @@
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
-import { NODE_PLACEHOLDER_WAIVER, ENTRY_EXPANDED_WAIVER, type Failure } from './checks';
+import { type Failure } from './checks';
 
 export interface KnownOpen {
   issue: number;
@@ -47,71 +47,57 @@ export interface KnownOpen {
 // Retired by #1880 F6d (drift, not a fix): #1891's seed 1233 list diverges at its 15th pick once the entry rebuild
 // renumbers ids, and no longer reaches the case. The case is stated id-free, from the run's own documents, in
 // prefabWholeListRebuild.test.ts (passing since F6e).
-// #1939 (SERIOUS, hub 2026-10-01): a TRACKED WAIVER, not a design. A scene-added REFERENCE node of a deleted prefab, live
-// at the save, reloads as its empty #1699 placeholder: no node reads the scene's copy yet, where Unity restores every
-// PrefabInstance from its own backup. `waiveNodePlaceholders` (checks.ts) collapses exactly that shape and reports it with
-// NODE_PLACEHOLDER_WAIVER; these entries tolerate that detail alone. Once #1939 builds node copies the repros stop
-// producing it, the self-test goes red, and both entries (and the waiver) go.
+/** #1951: the rebuild an outside edit makes lacks an entity the reload of the same bytes has (`<guid>: undefined vs {…}`):
+ *  a member a changed prefab gained, under its instance inside a kept frame. Only after an outside edit, never an Apply or
+ *  a reverse diff (an entity the rebuild has and the reload lacks). */
+const keptFrameStale = (f: StepFailure): boolean =>
+  f.check === 'a rebuild is not a reload' && f.op.startsWith('outsideEdit') && /^\/[0-9a-f-]{36}: undefined vs \{/.test(f.detail);
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
+    issue: 1951,
+    what: "#1951 (hunt seed 1027, pre-existing; low, parked): an instance of H placed inside a live frame of a TRASHED prefab keeps H's old members after H changes outside — the entry's rebuild keeps that frame whole (#1862), so nothing in it is re-expanded, and the reload shows H's new member",
+    repro: [
+      {kind: 'trashPrefab', u: [0.693313981872052, 0.4887022376060486, 0.2338455079589039, 0.8015267017763108, 0.9982616631314158, 0.9926003257278353, 0.17166399210691452, 0.9857021998614073]},
+      {kind: 'instantiate', u: [0.15538944560103118, 0.7801780079025775, 0.3371633195783943, 0.10732766333967447, 0.4623966992367059, 0.23334859986789525, 0.8244502916932106, 0.8450959715992212]},
+      {kind: 'instantiate', u: [0.5373735958710313, 0.4927500218618661, 0.011030459310859442, 0.30226651718840003, 0.12471751752309501, 0.7305856866296381, 0.10899202013388276, 0.4397963718511164]},
+      {kind: 'outsideEdit', u: [0.12397644645534456, 0.004915807629004121, 0.7699898227583617, 0.8006252702325583, 0.9029005409684032, 0.8947316522244364, 0.4904838753864169, 0.833778610220179], check: 'rebuild-reload'},
+    ],
+    reproduces: (f) => keptFrameStale(f),
+    stops: (f, ops) => keptFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
+  },
+];
+
+/** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
+ *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
+ *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
+export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
     issue: 1939,
-    what: "#1939 (hunt seed 1012, #1934 F4): Create Prefab on a member makes a scene-added reference node of the new prefab; the prefab trashed, the save carries its copy, and the reload gives the node its Missing Prefab placeholder, its members gone from the world (the record keeps them)",
+    what: "#1939 (hunt seed 1012, #1934 F4/M-b): Create Prefab on a member makes a scene-added reference node of the new prefab; the prefab trashed, the save carries its copy; the reload restores the node from it (its frame listed live at the save), where it gave its empty Missing Prefab placeholder",
     repro: [
       {kind: 'createPrefab', u: [0.07576225162483752, 0.4839742570184171, 0.18013141467235982, 0.984006108250469, 0.7422482529655099, 0.5091050690971315, 0.9696242799982429, 0.537708398886025]},
       {kind: 'trashPrefab', u: [0.6900484366342425, 0.5306535325944424, 0.7126782101113349, 0.8273992876056582, 0.3369053485803306, 0.45967397396452725, 0.8177091341931373, 0.2302168474998325]},
     ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && f.detail.endsWith(NODE_PLACEHOLDER_WAIVER),
-    tolerates: (f) => (f.check === 'save→reload is not the identity' || f.check === 'a rebuild is not a reload') && f.detail.endsWith(NODE_PLACEHOLDER_WAIVER),
   },
   {
     issue: 1939,
-    what: "#1939 (hunt seed 1027, #1934 F4): the same node, live after the trash, through an Apply's rebuild\u2261reload: the rebuild keeps it expanded (#1862), the reload gives its placeholder",
+    what: "#1939 (hunt seed 1027, #1934 F4/M-b): the same node, live after the trash, through an Apply's rebuild\u2261reload: the rebuild keeps it expanded (#1862), and the reload now restores it from the copy too",
     repro: [
       {kind: 'trashPrefab', u: [0.9199938054662198, 0.23703388520516455, 0.35904134321026504, 0.5552934117149562, 0.4747692556120455, 0.17824304103851318, 0.2595838194247335, 0.14314630953595042]},
       {kind: 'apply', u: [0.013209617463871837, 0.7259964346885681, 0.41166331013664603, 0.3558924614917487, 0.569496892625466, 0.45171762513928115, 0.633732000598684, 0.7274762492161244], check: 'rebuild-reload'},
     ],
-    reproduces: (f) => f.check === 'a rebuild is not a reload' && f.detail.endsWith(NODE_PLACEHOLDER_WAIVER),
-    tolerates: (f) => (f.check === 'save→reload is not the identity' || f.check === 'a rebuild is not a reload') && f.detail.endsWith(NODE_PLACEHOLDER_WAIVER),
-  },  // #1939, second shape (low): a placeholder ENTRY of a deleted prefab reloads expanded from a copy kept verbatim
-  // (`waiveExpandedEntries`, ENTRY_EXPANDED_WAIVER).
+  },
   {
     issue: 1939,
-    what: "#1939 (hunt seeds 3266, 1269, #1934 F4): a template reference node of a trashed prefab reloads as its placeholder, the copy kept verbatim (I18); a detach of the instance holding it makes the placeholder an ENTRY, and the next reload expands it from the copy (no top-level 'live at the save' signal yet, #1935)",
+    what: "#1939 (hunt seeds 3266, 1269, #1934 C1): a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload and an expanded one comes back expanded, as the copy's list says",
     repro: [
       {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
       {kind: 'trashPrefab', u: [0.21610835962928832, 0.40136740216985345, 0.25969059206545353, 0.9192028611432761, 0.3998060973826796, 0.17308109835721552, 0.8394311657175422, 0.928628564812243]},
       {kind: 'saveReload', u: [0.6892608145717531, 0.4650746730621904, 0.21657891012728214, 0.23295434354804456, 0.3015429456718266, 0.5181264781858772, 0.30148910149000585, 0.7050725878216326]},
       {kind: 'detach', u: [0.4603799900505692, 0.20984725933521986, 0.8734895254019648, 0.8137040538713336, 0.9327120224479586, 0.7904459990095347, 0.9528898776043206, 0.3289412825834006]},
     ],
-    reproduces: (f) => f.check === 'save→reload is not the identity' && f.detail.endsWith(ENTRY_EXPANDED_WAIVER),
-    tolerates: (f) => (f.check === 'save→reload is not the identity' || f.check === 'a rebuild is not a reload' || f.check === 'save→reload→save is not byte-identical') && f.detail.endsWith(ENTRY_EXPANDED_WAIVER),
   },
-  // #1939, the copy carry (SERIOUS): an Apply's undo reloads its snapshot, taken before a nested prefab was trashed, so
-  // that prefab's live frames come back unexpanded and the next save writes no copy for them. Seen as the validator's
-  // could-not-be-read on the outer copy; stopped only where an undo ran in the segment.
-  {
-    issue: 1939,
-    what: "#1939 (hunt seed 1268, #1934 F4): trash O, edit, Apply, trash Q (Q's frames kept live, its copy saved), then undo the Apply: the snapshot carries no copy of Q, so Q's frames under O come back unexpanded, and the save writes O's copy without Q's. The copy store and frame documents are not carried across the undo's world swap",
-    repro: [
-      {kind: 'trashPrefab', u: [0.4445194760337472, 0.9883558221627027, 0.4025001050904393, 0.961627432378009, 0.24146811594255269, 0.4250050305854529, 0.30443592043593526, 0.021404808154329658]},
-      {kind: 'editField', u: [0.7432112377136946, 0.014525532489642501, 0.5232227181550115, 0.9852895988151431, 0.47139196400530636, 0.45749236550182104, 0.5800378185231239, 0.7682139365933836]},
-      {kind: 'apply', u: [0.15298472344875336, 0.3395263517741114, 0.9971683120820671, 0.08669214718975127, 0.7098334503825754, 0.06645654677413404, 0.9132867825683206, 0.679376456188038]},
-      {kind: 'trashPrefab', u: [0.9980925852432847, 0.23554140678606927, 0.33927211235277355, 0.5592474001459777, 0.43799786223098636, 0.7623946040403098, 0.018773149931803346, 0.774509527022019]},
-    ],
-    reproduces: (f) => missingNestedCopy(f),
-    stops: (f, ops) => missingNestedCopy(f) && (f.op === 'undo/redo to the ends' || ops.some((o) => o.kind === 'undo' || o.kind === 'redo')),
-  },
-];
-
-/** The validator's warning on a saved copy that names a nested prefab with no copy beside it (#1939, the copy carry). */
-function missingNestedCopy(f: StepFailure): boolean {
-  return f.check === 'scene validator' && /^embeddedPrefabs\['[^']+'\]: prefab "[^"]*": its template keys were not checked below nested prefab\(s\) .+ — they could not be read$/.test(f.detail);
-}
-
-/** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
- *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
- *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
-export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
   {
     issue: 1914,
     what: "#1914 R4 (hunt seeds 3064, 1264): a prefab edit deletes a node of a NESTED frame and the scene row into it was still dropped: the fold marked the row (`isUntargetedRow`), then its descent into the removed member's frame folded the same row object, found nothing removed there and CLEARED the mark. A fold now only sets a mark (seed 3064)",

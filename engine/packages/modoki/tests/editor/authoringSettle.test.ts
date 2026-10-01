@@ -22,6 +22,8 @@ const loadScene = vi.fn(async (path: string) => {
 });
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
+    // A swap's copy carry (#1939): this fake world holds no scene copies.
+    captureSceneCopies: () => new Map(),
     getCurrent: () => (currentPath === null ? null : { path: currentPath }),
     getLoadedScenes: () => new Map(),
     getNext: () => null,

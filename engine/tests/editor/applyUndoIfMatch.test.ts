@@ -75,6 +75,8 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
   return {
     ...real,
     sceneManager: {
+      // A swap's copy carry (#1939): this fake world holds no scene copies.
+      captureSceneCopies: () => new Map(),
       getCurrent: () => (sm.path === null ? null : { path: sm.path }),
       getNext: () => null,
       getLoadedScenes: () => new Map(),

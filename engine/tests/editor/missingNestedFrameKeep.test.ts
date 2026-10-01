@@ -185,8 +185,11 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(s2.saved).toBe(true);
     // #1914 F8 = A1: the one difference is the copy of Q, its document exactly as the frames were expanded from it. The
     // records are untouched (I2/I17: the copy is base, never a record).
-    const { embeddedPrefabs, ...rest } = JSON.parse(be.read(f.scenePath)!) as { embeddedPrefabs?: Record<string, unknown> };
+    const { embeddedPrefabs, embeddedPrefabFrames, ...rest } = JSON.parse(be.read(f.scenePath)!) as { embeddedPrefabs?: Record<string, unknown>; embeddedPrefabFrames?: Record<string, string[]> };
     expect(embeddedPrefabs).toEqual({ [f.prefabs.Q.guid]: trashedQ.get(f) });
+    // …and beside it the two Q frames live at the save (#1939): P1's, and O1's through its P row.
+    expect(Object.keys(embeddedPrefabFrames ?? {})).toEqual([f.prefabs.Q.guid]);
+    expect(embeddedPrefabFrames![f.prefabs.Q.guid]).toHaveLength(2);
     expect(normalized(f, `${JSON.stringify(rest, null, 2)}\n`)).toBe(controlBytes);
   });
 
@@ -362,9 +365,9 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(be.read(f.scenePath)!).toBe(first);
   });
 
-  it('(c) F8: a SCENE-ADDED Q node reloads as its placeholder, the copy beside it notwithstanding', async () => {
-    // A copy stands in for a template row's frame only; a missing reference node keeps #1699's placeholder.
-    // Mutation: `spawnReferenceNode` reads through the copies — the node reloads expanded, not as a placeholder.
+  it('(c) F8: a SCENE-ADDED Q node live at the save reloads expanded from the copy (#1939, #1934 M-b)', async () => {
+    // Unity backs every PrefabInstance up (`MergedAsMissingWithSceneBackup`); before #1939 the node reloaded as #1699's empty
+    // placeholder. Mutation: `spawnReferenceNode` answers `copyBacksFrame` false for every node → it reloads a placeholder.
     const f = await startRun(be, noNest, 'keep-reload-added-node');
     const hr = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!.id;
     expect(await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.Q.path)!), f.prefabs.Q.path, hr)).toBeTruthy();
@@ -375,8 +378,8 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs)).toEqual([f.prefabs.Q.guid]); // P1's and O1's frames
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(placeholderGuids().has(nodeGuid)).toBe(true);
-    expect(qFrameGuids(f).length).toBe(4); // P1's and O1's rows, from the copy
+    expect(placeholderGuids().has(nodeGuid)).toBe(false);
+    expect(qFrameGuids(f).length).toBe(6); // P1's and O1's rows, and the node, from the copy
   });
 
   it('(c) F8, I3: a frame expanded from the copy is refused by Revert and Apply as a missing prefab is', async () => {

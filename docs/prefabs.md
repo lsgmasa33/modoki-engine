@@ -825,7 +825,7 @@ Unity sources: [M6] = `docs.unity3d.com/6000.0/Documentation/Manual/`, [M22] = `
 | U7 | Reparenting a member inside an instance | Not allowed: "There are some limitations with Prefab instances: you cannot reparent a GameObject that is part of a Prefab, and you cannot remove a GameObject that is part of the Prefab." [M19 `PrefabInstanceOverrides`, <https://docs.unity3d.com/2019.4/Documentation/Manual/PrefabInstanceOverrides.html>. The removal half was lifted in 2022.2 (U6); the reparent half never was.] The editor's dialog, as widely reported (no Manual page carries it): "Cannot restructure Prefab instance", offering Prefab Mode or Unpack. "Part of a Prefab" is every object the asset supplies, a nested prefab's included. Since 2022.3 even a nested child's reorder is not supported, and the documented way to move one is to unpack a copy, move it and remove the original. [M22 `UpgradeGuide2022LTS`] | The same (#1869, owner ruling "refuse, like Unity"). One predicate, `restructureRefusal` (`editor/scene/restructureRefusal.ts`), refuses moving an object the prefab supplies — a member, an owned nested root, a node the prefab added (a keyed node whose key an instance above it declares: a plain one, or a template reference node's root) — anywhere: within its own instance, out of it, or into another. Every route asks it before anything is written, so a refusal pushes no entry: the Hierarchy drag and drop, cut → paste, the folder and scene-group drops, a scene move, the agent `reparent-entity`, and a `parentId` field write (`apply-scene-ops`, `set-traits`). The words: "Can't restructure a prefab instance: open the prefab to edit it, or unpack it first." A node the SCENE added and a whole stored instance move freely, but not away with a supplied object whose instance stays behind (a pre-#1869 file's moved member under a scene-added node may still move within that instance). A member of a root that is not live, and an owned root nothing owns that hangs under no instance root, link to nothing and are refused nothing. In prefab edit, the edited prefab's own objects move, and a nested prefab's do not, as in Prefab Mode. **A file written before #1869 keeps its moves** (`moved`, a member row's `parent`): they load, save byte-identically, and can be applied or reverted, but no gesture makes a new one ([prefab-structural-overrides.md](./prefab-structural-overrides.md) § Moved members). The `moveKeys` machinery for a keyed node's key across a move (#1808, #1852) was reverted with it: a keyed node no longer moves. | match |
 | U8 | Override indicators | Instance names in blue; a blue margin line in the Hierarchy on an instance that has overrides; + on added GameObjects; +/− on components; an **Overrides** drop-down on the outermost root, with an asset-vs-instance comparison per component. [M22 `EditingPrefabViaInstance`, `PrefabInstanceOverrides`] | The Hierarchy tints and badges every `PrefabInstance` entity ("P"), and the Inspector accents overridden fields. There is no Hierarchy mark on an edited instance, no + on an added node, no marker for a removed member or component, and no Overrides drop-down: the full list exists only inside the Apply / Revert dialog. | **missing**: badges S, drop-down with comparison M |
 | U9 | Missing prefab asset | The instance stays in the scene (`PrefabInstanceStatus.MissingAsset`), and its `PrefabInstance` data stays in the scene file. [S6 `PrefabAssetType.MissingAsset`, M6 `yaml-prefab-serialization`] | An instance with no backup (Unity's `MergedAsMissing`): since #1699 a placeholder, labelled **Missing Prefab** in the Hierarchy, carries the record the file held, and every save writes it back until the prefab is back and re-expands it. A duplicate keeps the data too. § "A missing prefab keeps its record". An instance that was LIVE when the scene was saved is not one: the scene carries a backup of its prefab and the reload expands it from there, top-level as well as nested (U9b, #1935; before #1935 a top-level one reloaded as the placeholder, which is the "match" the owner's F8 ruling corrected). | match (template-form captures of one are the gap named there) |
-| U9b | A prefab goes missing while its instances are live, and comes back | An instance merged before its asset was deleted keeps its objects: `MergeStatus.MergedAsMissingWithSceneBackup`, "Prefab source was missing, but Prefab data was found in the scene file - no merging was done"; such an instance "can be correctly restored only if CorrespondingObjects info is available", which it is "when a PrefabInstance with missing asset was merged before deleting the asset (kNormalMerge) or when it has a scene backup". [CS `Editor/Mono/Prefabs/PrefabUtility.cs`] Unity reconnects it when an asset with its GUID returns: INFERRED from the same comment and from instances naming their asset by GUID, not quoted from a document. | A live frame stays expanded (#1738's evicted state), a NESTED one too across every in-place rebuild (#1862): the teardown keeps a nested frame whose prefab the respawn cannot expand, and puts it back where it hung (`rebuildTeardown`'s kept set, `seatKeptFrames`); for a scene-added reference node it also skips the node's placeholder respawn from the structure (`withoutKeptNodes`, at any depth and in every channel a node hangs in: `children`, a reference node's `added` and `nestedStructure`, and its member rows' `added`/`own`, #1877 L4). Only the rebuilt instance's OWN frames are kept: a #1484 row of another frame hanging under one of ours is parked and re-seated, whether or not its prefab can be expanded. Kept, its owner (not re-expanded) listed no unexpanded row for it, so it was deleted and the save wrote it REMOVED (#1877 S3). A Revert of the kept frame itself refuses, naming the prefab: there is no base to revert to (`revertRefusal`). On the kept frame's own root an Apply refuses in the same words, and so do the Apply dialog's and the agent `prefab` op's own load checks, which stop before either (`missingSourceRefusal`, #1831); they showed a bare guid, and Apply answered a bare `applied: false`. From an outer instance, a key reaching INTO the kept frame is skipped with that reason and the other keys still land (`missingNestedFrameKeys`); it was skipped as "the template has changed". Refusing the whole Apply instead was tried and dropped: it made the dialog's default Apply All, and the agent's `apply` with no `keys`, land nothing. A scene-added node that holds a kept frame is skipped the same way when an Apply would promote it: promoted, it wrote a reference row naming the trashed prefab, and its rebuild took the frame and its members out of the world. A node holding a Missing Prefab PLACEHOLDER is skipped the same way (#1699's refusal, which refused the whole Apply, became this per-key skip in #1831). Unity offers no Apply on a missing-asset instance. A file put back from the OS Trash is an outside write, re-imported IN PLACE (#1873 R1, `prefabReimport.ts`): an entry placeholder is loaded back as an instance where it stands (its placement and children kept), and a node placeholder or a row a frame recorded as unexpanded comes back through a rebuild of its enclosing frame — #1864's re-expansion, which ran only from the delete's undo that #1868 removed. An outside DELETE keeps the live frames, as the in-editor one does. § "A missing prefab keeps its record". | match while live, and across a reload: the scene keeps a backup of the missing prefab's document (`embeddedPrefabs`, scene v19, #1914 F8 = A1, #1867), the reload expands every instance live at the save from it, top-level (#1935) and nested, and a returned prefab wins over it. An instance that was already a placeholder at the save reloads as one, carrying its record (#1699). § "A scene backs up a missing prefab". |
+| U9b | A prefab goes missing while its instances are live, and comes back | An instance merged before its asset was deleted keeps its objects: `MergeStatus.MergedAsMissingWithSceneBackup`, "Prefab source was missing, but Prefab data was found in the scene file - no merging was done"; such an instance "can be correctly restored only if CorrespondingObjects info is available", which it is "when a PrefabInstance with missing asset was merged before deleting the asset (kNormalMerge) or when it has a scene backup". [CS `Editor/Mono/Prefabs/PrefabUtility.cs`] Unity reconnects it when an asset with its GUID returns: INFERRED from the same comment and from instances naming their asset by GUID, not quoted from a document. | A live frame stays expanded (#1738's evicted state), a NESTED one too across every in-place rebuild (#1862): the teardown keeps a nested frame whose prefab the respawn cannot expand, and puts it back where it hung (`rebuildTeardown`'s kept set, `seatKeptFrames`); for a kept reference node, scene-added or template, the respawn spawns nothing at the node's frame address (the one spawner, `spawnReferenceNode`, meets it at any depth and in every channel a node hangs in, #1877 L4; by address since #1939, which a template node's key needs: it was guid-only, `withoutKeptNodes`). Only the rebuilt instance's OWN frames are kept: a #1484 row of another frame hanging under one of ours is parked and re-seated, whether or not its prefab can be expanded. Kept, its owner (not re-expanded) listed no unexpanded row for it, so it was deleted and the save wrote it REMOVED (#1877 S3). A Revert of the kept frame itself refuses, naming the prefab: there is no base to revert to (`revertRefusal`). On the kept frame's own root an Apply refuses in the same words, and so do the Apply dialog's and the agent `prefab` op's own load checks, which stop before either (`missingSourceRefusal`, #1831); they showed a bare guid, and Apply answered a bare `applied: false`. From an outer instance, a key reaching INTO the kept frame is skipped with that reason and the other keys still land (`missingNestedFrameKeys`); it was skipped as "the template has changed". Refusing the whole Apply instead was tried and dropped: it made the dialog's default Apply All, and the agent's `apply` with no `keys`, land nothing. A scene-added node that holds a kept frame is skipped the same way when an Apply would promote it: promoted, it wrote a reference row naming the trashed prefab, and its rebuild took the frame and its members out of the world. A node holding a Missing Prefab PLACEHOLDER is skipped the same way (#1699's refusal, which refused the whole Apply, became this per-key skip in #1831). Unity offers no Apply on a missing-asset instance. A file put back from the OS Trash is an outside write, re-imported IN PLACE (#1873 R1, `prefabReimport.ts`): an entry placeholder is loaded back as an instance where it stands (its placement and children kept), and a node placeholder or a row a frame recorded as unexpanded comes back through a rebuild of its enclosing frame — #1864's re-expansion, which ran only from the delete's undo that #1868 removed. An outside DELETE keeps the live frames, as the in-editor one does. § "A missing prefab keeps its record". | match while live, and across a reload: the scene keeps a backup of the missing prefab's document (`embeddedPrefabs`, scene v19, #1914 F8 = A1, #1867), the reload expands every instance live at the save from it, top-level (#1935) and nested, and a returned prefab wins over it. An instance that was already a placeholder at the save reloads as one, carrying its record (#1699). § "A scene backs up a missing prefab". |
 
 ### Apply, Revert and their targets
 
@@ -2596,8 +2596,8 @@ its folder, because those are what the Hierarchy can change. The name is the liv
 #### A scene backs up a missing prefab (#1914 F8 = A1, #1867, scene v19; top level #1935)
 
 **A scene saved while a prefab is missing carries a copy of that prefab's document, and a reload with the prefab still
-missing expands that scene's instances from the copy, top-level and nested** (a nested frame only if it was live at
-the save; see below). This is Unity's scene
+missing expands that scene's instances from the copy, top-level, nested and reference nodes alike** (each only if it was
+live at the save; see below). This is Unity's scene
 backup: `MergeStatus.MergedAsMissingWithSceneBackup`, "Prefab source was missing, but Prefab data was found in the scene
 file - no merging was done" (U9b). Before it, a frame survived every in-place rebuild (#1862) but not a reload: a nested
 row came back unexpanded (ruling D) and a top-level instance came back a Missing Prefab placeholder (#1699), each with
@@ -2631,35 +2631,74 @@ owner's ruling names as well ("top-level and nested"), landed in #1935.
   scene's copy** (#1934 close-out F1): read across the chain, bases first, a level's instance expanded from its base's
   copy (another version of the prefab, or a copy the level never had), and the level's next save replaced its own backup
   with the base's. Unity keeps a backup in the scene file that holds the instance (`sceneCopiesPerLoad.test.ts`).
-- **Which frames it restores: only one that was LIVE at the save** (R7 fork A). That is Unity's line: a backup is of an
-  instance merged before its asset went, never one missing from the start. The test is the scene's own record: every
-  live member is recorded, so a nested frame that was live has its root's row (`/<row nodeGuid>`) or a member's below
-  it in the scene's own layer (`copyStandsIn`). An instance made AFTER its nested prefab was deleted holds that row
-  unexpanded, and it stays unexpanded across the reload (ruling D): expanding it from a copy another frame earned made the
-  reloaded world differ from the saved one, and the next save added the frame's member rows (I23; hunt seeds 351 and
-  6030). A TOP-level entry has no such test (#1935): its record was always captured from a live instance, and rows are no
-  signal there, since a ROOT-only prefab's live instance states none (asked for them, it reloaded as a placeholder beside
-  its own copy, hunt seeds 1011/3004). So a top-level entry expands whenever its prefab is missing and a copy is loaded.
-  The one divergence from Unity's per-instance backup: a top-level instance that was already a Missing Prefab placeholder
-  when the scene was saved expands at the next reload, when its scene carries the copy. Today's writer reaches it: a
-  reference node that reloaded as its placeholder (#1939), with the copy kept verbatim (I18), becomes an entry when the
-  instance holding it is detached (hunt seeds 1269 and 3266). The reload then shows the backup's entities where the save
-  showed Missing Prefab, which is what Unity's per-instance backup would have shown all along; #1939's per-frame list
-  makes it exact. ⚠️ **Open, serious (#1939): a scene-added REFERENCE node never reads a copy.** Live at the save, it reloads as
-  #1699's empty placeholder (its record and placement kept) until the prefab returns, where Unity restores it from its
-  own backup (every PrefabInstance has one). The fuzz forgives exactly that case as a tracked waiver naming #1939
-  (`knownOpen.ts`). #1939 builds one per-frame "live at the save" list for nested frames, template-node frames,
-  scene-added nodes and the exact top-level answer.
-  ⚠️ **Known limit (accepted, work-ai and hub, R7):** the signal is the scene's ROWS, and a live frame can write none. A
-  row of a template that predates prefab v5 has no `nodeGuid` to key one by, a member without a durable guid is left out
-  of the rows (`memberRowsToWrite` / `memberRowKeysIn`), and a frame inside a TEMPLATE reference node writes none either
-  (a stored root's expansion, `memberRows` exclusion 2; #1934 F3). Such a frame was live at the save, but its copy does
-  not restore it: it reloads unexpanded (ruling D, the pre-v19 behaviour), with its record kept, until the prefab
-  returns.
+- **Which frames it restores: exactly the ones that were LIVE at the save** (R7 fork A, #1939). That is Unity's line:
+  every PrefabInstance has its own backup of an instance merged before its asset went, never of one missing from the
+  start. The save states it beside each copy, in `embeddedPrefabFrames` (scene v19, an optional sibling of
+  `embeddedPrefabs`, no version bump): per prefab guid, the ADDRESS of every frame of that prefab live in this scene
+  (`frameAddress.ts`, one spelling for the save and the load). An address starts at a stored root the file states, a
+  top-level entry's guid or a scene-added reference node's guid, and adds `/<nodeGuid>` per nested row and `/+<key>` per
+  TEMPLATE reference node (from the frame its key-derived guid derives from, #1809). The load expands a frame from the copy
+  only when its address is listed: a top-level entry (`loadSceneFile`'s prefab loop), a nested row (`instantiatePrefabIntoWorld`),
+  and a reference node, template or scene-added (`spawnReferenceNode`), all through `copyBacksFrame`. So an instance that
+  was already a Missing Prefab placeholder, or a row left unexpanded (an instance made after its nested prefab was
+  deleted, ruling D), reloads as it was saved, and every live one comes back: a scene-added node too, which before #1939
+  never read a copy and reloaded as #1699's empty placeholder (#1934 M-b, hunt seeds 1012/1027), and a frame inside a
+  template reference node, where the member rows the old signal read are never written (`memberRows` exclusion 2; #1934
+  F3, T14: 6 live, 4 reloaded). A placeholder entry saved beside a live instance of its prefab stays a placeholder
+  (#1934 C1, hunt seeds 1269/3266: it used to expand). The reloaded world is the saved one, so the next save writes the
+  same bytes (I23).
+  - **When the two fields disagree.** A copy with no list (a v19 file written before #1939) answers by the old rules: a
+    nested row when the scene's own rows state its root or a member below it (`copyStandsIn`), an entry always, a
+    reference node never. A list for a guid with no copy is read by nothing, and the next save, which writes a list only
+    beside a copy it writes, drops it. A list that is not an array of strings is ignored with a warning (that copy answers
+    by the old rules) and the validator names it; an address that resolves to no frame is ignored, and the validator
+    names one whose anchor is no guid the file holds. Neither ever fails a load. A frame with no address answers by the
+    old rules too.
+  - ⚠️ **Known limit (accepted, R7, narrowed by #1939):** a frame with no ADDRESS: a row of a template that predates
+    prefab v5 has no `nodeGuid`, and a stored root with no durable guid has no anchor. Such a frame answers by the rows
+    rule, and a pre-v5 row has no row key either, so a live one reloads unexpanded (ruling D, the pre-v19 behaviour), its
+    record kept, until the prefab returns.
+  - ⚠️ **Known limit (parked, #1966):** a node a prefab anchors AT a nested row's root. The capture never walks a nested
+    row's root for added nodes, so the save restates the node (the declaring frame's node REMOVED, plus a scene copy by
+    guid) while it lives by key: the list names it `…/+<key>`, the reload asks its guid, and it reloads a placeholder.
+    Pinned `it.fails` in `copyLiveFrames.test.ts`. The same restatement severs the node from template edits with the
+    prefab present, which is pre-#1939.
+- **What a world swap carries** (#1939 item 2, H1/C2). The copy store is per world (`loadSceneFile`'s
+  `embeddedDocsByWorld`, with the lists beside it), so a swap that does not reload a scene from its file would lose it.
+  **A scene loaded from its FILE reads that file's copies alone**: a load of some bytes expands what a fresh session
+  would (I23), and an in-session reload of an edited file never takes the previous world's copy (pinned by
+  `copyReaderPerLoad.test.ts` § #1934 S1, which reloads an edited file). What carries (`captureSceneCopies` /
+  `restoreSceneCopies`, `SceneManager.loadScene`):
+  - **a KEPT base** on a level switch, a hot reload of its level, or any load that keeps it: it is carried flat, not
+    reloaded, so its copies and lists go with it (H1, low);
+  - **an Apply's undo or redo** (`applyPrefabUndo.ts`), which reloads a snapshot taken at the Apply: the copies and the
+    live frames' documents and addresses of the world it replaces (`LoadOptions.sceneCopies`). The snapshot could predate
+    the prefab going, and the frames live a moment before came back unexpanded and lost their backup at the next save
+    (C2, hunt seed 1268, serious; Unity's undo does not reload);
+  - **Stop and a timeline preview's exit**: the EDIT world's, captured when Play or the preview began
+    (`AuthoredSnapshot.copies`), never the Play world's. Unity discards Play state, so nothing done in Play may change
+    which frames the edit world expands.
+  Only a prefab the runtime cannot read is carried, and only for a scene the new world loads.
 - **What still refuses (I3).** The copy reaches only the EXPANSION. Apply and Revert still ask the editor's
   `getPrefabSource`, so a frame expanded from a copy, top-level or nested, is refused as a missing one is: "Restore the
   prefab, or Detach Prefab". The editor's own rebuild readers (`getCachedPrefabSync`) do not see the copy either, so an
   in-place rebuild KEEPS such a frame (#1862) rather than re-expanding it.
+- **How the editor meets a frame a copy restored: two rules, each in one place** (#1939, hunt seeds 1031 and 3081).
+  A copy makes live, after a reload, frames that used to come back as placeholders, and every editor path that had
+  only ever met a placeholder there now meets a frame.
+  - **Which live frame a statement means: its frame ADDRESS** (`frameAddress.ts`, the grammar the list uses). A
+    scene-added reference node is its guid; a TEMPLATE reference node is its enclosing frame's address plus `+<key>`,
+    because a document states it by key alone and its live guid is only derived. The rebuild's keep records each kept
+    node's address (`KeptFrame.address`), and the ONE reference-node spawner skips that address (`keepingFrames` →
+    `spawnReferenceNode`), so the seat then knows the node is still named. Matched by guid, a kept template node was
+    respawned as a placeholder beside itself and dropped as unnamed (1031). A node with no address is not kept: the
+    teardown takes it and the respawn rebuilds it from its statement.
+  - **The current template of a missing prefab's frame: the document that frame was built from** (its record,
+    `captureDoc`, #1738), which for a copy-restored frame IS the copy (Unity's scene backup). An undo that puts a
+    member's marks back brings each unmarked field to that document's value (`takeUnmarkedFromBase`); read from the
+    cache alone it did nothing, and an undo after the template changed left the old value showing until the next rebuild
+    or reload (3081). This also covers #1862's in-session kept frames. The other cache-only readers acting on a live
+    frame were left as they are (hub ruling: change only a reader a directed test shows wrong).
 - **When the prefab comes back.** A reload expands it from the returned file, whatever the copy says, and the next save
   writes no copy. Put back while the editor is open, it is re-imported in place (#1873 R1): a placeholder is re-expanded
   through `loadSceneFile` with the editor's cache as the load's reader, so a nested frame under it that a copy backs
@@ -2667,7 +2706,8 @@ owner's ruling names as well ("top-level and nested"), landed in #1935.
 
 A v18 file has no copies and reads unchanged: its rows stay unexpanded under ruling D until the prefab returns; a v19
 file a build before #1935 wrote has no copy of a missing TOP-level prefab, so that instance reloads as its placeholder.
-Tests: `missingNestedFrameKeep.test.ts` § (c)/(b), `copyReaderPerLoad.test.ts` (one reader per load, copies per scene),
+Tests: `missingNestedFrameKeep.test.ts` § (c)/(b), `copyReaderPerLoad.test.ts` (one reader per load, copies per scene,
+the undo carry), `copyLiveFrames.test.ts` (the list and the carry, #1939),
 the "expanded from the copy" and "as a placeholder" cases in `missingPrefabPassThrough.test.ts`, and
 `embeddedPrefabValidation.test.ts` for the validator.
 

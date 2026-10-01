@@ -33,7 +33,8 @@ import { levelDoc } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { collectResourceRefsFromEntities, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, sceneFileResourceRefs, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
+import { liveFrameAddresser } from '../../runtime/loaders/frameAddress';
 import { asSceneEntry, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
@@ -132,6 +133,9 @@ export interface SceneFile {
   /** v19+ (#1914 F8, #1867): a copy of each NESTED prefab this scene's frames expand that is missing at the save, keyed by
    *  its guid ({@link collectEmbeddedPrefabs}). Omitted when none is missing. */
   embeddedPrefabs?: Record<string, EmbeddedPrefabDoc>;
+  /** v19 (#1939): per copy in `embeddedPrefabs`, the addresses of that prefab's frames live at this save
+   *  ({@link collectEmbeddedPrefabs}). Written with every copy, sorted, `[]` when none is live. */
+  embeddedPrefabFrames?: Record<string, string[]>;
 }
 
 // ── Serialize Scene (generic) ───────────────────────────
@@ -615,11 +619,10 @@ async function serializeSceneScoped(opts?: {
       : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid()));
   // The copies THIS scene's load carried, keyed by the guid its file loaded with (#1934 L1; '' for a file without one).
   const loadedId = targetScene ? targetScene.guid : ownLoadedEntry?.guid;
-  const embeddedPrefabs = await collectEmbeddedPrefabs(entityInfos, entities, loadedId && isGuid(loadedId) ? loadedId : '');
+  const embedded = await collectEmbeddedPrefabs(entityInfos, entities, loadedId && isGuid(loadedId) ? loadedId : '');
+  const embeddedPrefabs = embedded?.docs;
   // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).
-  const resources = collectResourceRefs(embeddedPrefabs
-    ? [...entities, ...Object.values(embeddedPrefabs).flatMap((d) => d.entities as unknown as SerializedEntity[])]
-    : entities);
+  const resources = sceneFileResourceRefs(entities, embeddedPrefabs) as ResourceRef[];
   const file: SceneFile = {
     id: sceneId, version: SCENE_FORMAT_VERSION,
     createdAt: ownLoadedEntry?.createdAt ?? new Date().toISOString(),
@@ -637,7 +640,7 @@ async function serializeSceneScoped(opts?: {
   } else if (_currentBaseScene) {
     file.baseScene = _currentBaseScene;
   }
-  if (embeddedPrefabs) file.embeddedPrefabs = embeddedPrefabs;
+  if (embedded) { file.embeddedPrefabs = embedded.docs; file.embeddedPrefabFrames = embedded.frames; }
   return file;
 }
 
@@ -657,15 +660,23 @@ async function serializeSceneScoped(opts?: {
  *  PLACEHOLDER is no frame and gives none (#1699). And a copy is written only when this scene's file
  *  reaches its guid — through its entries, a prefab or copy they name, and so on — so a copy whose frames all went, or
  *  one only a top-level placeholder's record nests, is not carried. (The reach alone did not keep out another scene's copy:
- *  a base's entries reach a guid its level's copy is for. The `scene` key does.) */
+ *  a base's entries reach a guid its level's copy is for. The `scene` key does.)
+ *
+ *  Beside each copy, the frames of its prefab LIVE at this save, by address (#1939, `frameAddress.ts`): every live frame
+ *  root of this scene, top-level, nested, a template reference node's or a scene-added one's. The load expands exactly
+ *  those from the copy, so a frame that was a placeholder or unexpanded at the save stays one, and a live one comes back —
+ *  inside a stored root's expansion too, where the member rows the old signal read are not written. Except a node a
+ *  prefab anchors AT a nested row's root, which this save restates by guid while the list names it by key (#1966). */
 async function collectEmbeddedPrefabs(
   entityInfos: readonly ReturnType<typeof getAllEntities>[number][],
   entities: readonly SerializedEntity[],
   scene: string,
-): Promise<Record<string, EmbeddedPrefabDoc> | undefined> {
+): Promise<{ docs: Record<string, EmbeddedPrefabDoc>; frames: Record<string, string[]> } | undefined> {
   const world = getCurrentWorld();
   const piMeta = getTraitByName('PrefabInstance');
   const candidates = new Map<string, TemplateDocLike>();
+  const live = new Map<string, Set<string>>();
+  const addressOf = liveFrameAddresser(world);
   const missing = new Map<string, boolean>();
   const isMissing = async (guid: string): Promise<boolean> => {
     let m = missing.get(guid);
@@ -679,9 +690,11 @@ async function collectEmbeddedPrefabs(
       if (!pi?.source || pi.rootInstanceId !== info.id) continue;
       const entity = findEntity(info.id);
       if (!entity || unresolvedRefOf(entity)) continue;
+      if (!(await isMissing(pi.source))) continue;
+      const addr = addressOf(info.id);
+      if (addr) { const set = live.get(pi.source) ?? new Set<string>(); set.add(addr); live.set(pi.source, set); }
       const doc = frameRootDoc(world, entity)?.doc as TemplateDocLike | undefined;
-      if (!doc || candidates.has(pi.source)) continue;
-      if (await isMissing(pi.source)) candidates.set(pi.source, doc);
+      if (doc && !candidates.has(pi.source)) candidates.set(pi.source, doc);
     }
   }
   for (const guid of embeddedPrefabGuids(world, scene)) {
@@ -704,11 +717,14 @@ async function collectEmbeddedPrefabs(
     if (doc) collectStrings(doc, queue);
   }
   const out: Record<string, EmbeddedPrefabDoc> = {};
+  const frames: Record<string, string[]> = {};
   for (const guid of [...candidates.keys()].sort()) {
+    if (!reached.has(guid)) continue;
     // A deep copy: the file (and a Play snapshot holding it) must not alias the live record's document.
-    if (reached.has(guid)) out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
+    out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
+    frames[guid] = [...(live.get(guid) ?? [])].sort();
   }
-  return Object.keys(out).length ? out : undefined;
+  return Object.keys(out).length ? { docs: out, frames } : undefined;
 }
 type TemplateDocLike = { entities: unknown[] } & Record<string, unknown>;
 

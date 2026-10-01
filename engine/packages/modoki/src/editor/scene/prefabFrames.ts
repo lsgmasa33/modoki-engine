@@ -11,7 +11,8 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
-import { durableGuid, isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
+import { liveFrameAddresser } from '../../runtime/loaders/frameAddress';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { documentContentKey } from '../../runtime/core/localIdCounter';
 import { levelDoc, captureDoc } from './prefabBase';
@@ -22,7 +23,15 @@ import { foreignRow, type RowDoc, rowsMeanTheSame, unexpandedRowsOf } from './pr
 /** A frame {@link rebuildTeardown} KEEPS because its prefab cannot be expanded (#1862): `owned` for a template row's frame,
  *  otherwise a scene-added reference node (a stored root). `parentGuid` is where it hung, already `remap`ped. */
 /** `outside`: an owned frame moved OUT of the torn-down subtree (#1437) — it stays where it hangs, not re-seated. */
-export type KeptFrame = { id: number; parentGuid: string; owned: boolean; outside?: boolean };
+/** `address`: a kept reference node's frame address (`frameAddress.ts`, #1939), already `remap`ped — the ONE identity the
+ *  respawn skips it by and the seat finds it named by: a scene-added node's is its guid, a template node's its frame's
+ *  address and its key (whose live guid is only derived, so no statement names it by guid). */
+export type KeptFrame = { id: number; parentGuid: string; owned: boolean; outside?: boolean; address?: string };
+
+/** `address` with every guid in it put through `remap` (a key component, `+<key>`, is not a guid). */
+export function remapFrameAddress(address: string, remap: ReadonlyMap<string, string>): string {
+  return remap.size ? address.split('/').map((c) => (c.startsWith('+') ? c : remap.get(c) ?? c)).join('/') : address;
+}
 
 /** What a rebuild (`rebuildFromEntry`) destroys for instance `rootInstanceId`, and which members of OTHER instances
  *  hanging inside it it parks instead (to be put back by `parentGuid`, already `remap`ped). Its own function so
@@ -78,6 +87,8 @@ export function rebuildTeardown(
   // then leaves it out of the spawn, and `seatKeptFrames` drops it when the entry no longer names it).
   const kept: KeptFrame[] = [];
   const isKept = (id: number) => kept.some((k) => k.id === id);
+  // Read off the world before anything is torn down: an address walks the frames enclosing the node.
+  let addressOf: ((rootId: number) => string | undefined) | undefined;
   const unexpandable = (id: number, owned: boolean): boolean => {
     const pi = readTraitData(id, PrefabInstanceMeta) as (MemberPi & { source?: unknown }) | null;
     if (!pi || !(owned ? isOwnedRoot(pi, id) : isStoredRoot(pi, id)) || typeof pi.source !== 'string' || !pi.source) return false;
@@ -112,9 +123,11 @@ export function rebuildTeardown(
           continue;
         }
         // After the park: a stored root that is another frame's (moved in, foreign) is parked above, so only a node of
-        // ours reaches here. Its own durable guid is what the structure names it by.
-        if (!members.has(c) && guidById.get(id) && durableGuid(guidById.get(c)) && unexpandable(c, false)) {
-          kept.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)!, owned: false });
+        // ours reaches here. Kept by its frame ADDRESS (#1939): what the respawn's spawner meets it by — its guid for a
+        // scene-added node, its frame and key for a template node. One with no address could be matched to nothing.
+        const address = !members.has(c) && guidById.get(id) ? (addressOf ??= liveFrameAddresser(getCurrentWorld()))(c) : undefined;
+        if (address && unexpandable(c, false)) {
+          kept.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)!, owned: false, address: remapFrameAddress(address, remap) });
           continue;
         }
         toDestroy.add(c);

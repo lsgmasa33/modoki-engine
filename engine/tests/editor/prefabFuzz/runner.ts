@@ -6,8 +6,8 @@ import { serializeScene, saveScene, loadSceneReporting } from '../../../packages
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { getAllEntities, getCurrentWorld, findEntity } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
-import { execute, describe as describeOp, deletedPrefabs, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, waive1939, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
+import { execute, describe as describeOp, type Op, type RunState } from './ops';
+import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -195,15 +195,12 @@ async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Pr
   };
   dump('t2-before', sBefore); dump('t2-live', live); dump('t2-reloaded', reloaded); dump('t2-except', except ?? null);
   const [a, b] = [without(live), alignEqualOrientations(without(live), without(reloaded))];
-  // A prefab the run deleted reloads from the scene's copy, as the live instance stays expanded (#1935); a scene-added
-  // node of one, and a placeholder entry that expands, are #1939's waivers (`waive1939`).
-  const gone = new Set(deletedPrefabs(st).map(([, t]) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } }));
-  const waived = waive1939(a, b, (src) => gone.has(src));
-  const d = firstDiff(waived.before, waived.after);
+  // A prefab the run deleted reloads from the scene's copy, every frame its list names live (#1935, #1939), as the live
+  // instance stays expanded.
+  const d = firstDiff(a, b);
   ran(`rebuild≡reload after ${kind}`);
   st.note = `rebuild≡reload checked${except ? ' (the Apply\'s own instance left out)' : ''}`;
-  if (!d && waived.details.length) return { check: 'a rebuild is not a reload', detail: waived.details[0]! };
-  return d ? { check: 'a rebuild is not a reload', detail: d, moved: nodeMoved(d, waived.before, waived.after) } : null;
+  return d ? { check: 'a rebuild is not a reload', detail: d, moved: nodeMoved(d, a, b) } : null;
 }
 
 /** #1880 T4, the RESPAWN form of "fold(chain + capture(live)) ≡ live": every stored instance root, rebuilt from its own

@@ -23,6 +23,7 @@ import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/ve
 import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
 import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
+import { rowFrameAddress, nodeFrameAddress, liveFrameAddresser } from './frameAddress';
 import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
 import { parseMemberRowKey, parseNodeRowKey, nodeRowKey, memberRowNodes, appliedMoves } from '../core/assetRefRules';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
@@ -42,7 +43,7 @@ import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 import { keptOrphanRowsOf, setKeptOrphanRows, dropKeptOrphanRows, clearKeptOrphanRows, keptLegacyOf, setKeptLegacy, keptUnusedRowsOf, setKeptUnusedRows, type KeptLegacy } from '../core/ecs/keptOrphanRows';
 import { memberPathIndex, identityTree, applyGuidRemap, keyedGuidUpgrade } from '../core/ecs/memberHome';
 import { onGuidRemap } from '../core/ecs/guidRemap';
-import { resolveIdentityParents, frameDocReader, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityOptions, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
+import { resolveIdentityParents, frameDocReader, frameRootDoc, linkOwnerBeforeMove, noteFrameDoc, noteNodeMoves, noteRowsRemoved, setRuntimeFrameDocFallback, templateFrameClimber, type IdentityNode, type IdentityOptions, type IdentityPi, type TemplateDoc } from '../core/ecs/identityParents';
 export { memberPathIndex } from '../core/ecs/memberHome';
 
 /** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
@@ -279,6 +280,11 @@ export interface SceneData {
    *  the prefab's guid — Unity's scene backup. A frame of a prefab that is still missing expands from its copy; a
    *  prefab that loads is always read from its own file, never from here. Absent = nothing was missing. */
   embeddedPrefabs?: { [guid: string]: EmbeddedPrefabDoc };
+  /** v19+ (#1939): per copy in `embeddedPrefabs`, the frames of that prefab LIVE at the save, by address
+   *  (`frameAddress.ts`). A copy stands in for exactly the frames its list names; a copy with no list (a file written
+   *  before #1939) answers by the rows rule (`copyStandsIn`). A list for a guid with no copy is read by nothing and goes at
+   *  the next save. Absent = no copy. */
+  embeddedPrefabFrames?: { [guid: string]: string[] };
 }
 
 /** A prefab document a scene carries for a missing prefab (`SceneData.embeddedPrefabs`), verbatim as it was expanded. */
@@ -330,8 +336,9 @@ export interface LoadSceneOptions {
      *  `read`, the load's ONE document reader ({@link LoadSceneOptions.read}, with the scene's copies). Read the
      *  instance's document through it and expand with it — pass it as `instantiatePrefabIntoWorld`'s `expand.read`, or
      *  pass no reader at all when the load was given none. Any other reader is refused after the call: the settle reads
-     *  with this one. */
-    load?: { read: ExpansionReader },
+     *  with this one. `frame`: the instance's frame address (#1939, `frameAddress.ts`) — pass it as `expand.frame`, so a nested
+     *  frame of a missing prefab asks the scene's "live at the save" list. */
+    load?: { read: ExpansionReader; frame?: string },
   ) => Promise<number | undefined> | number | undefined | void;
   /** The documents this load expands from — the prefab cache to read (#1934 S1). Default the runtime cache; the editor's
    *  in-place re-expansion passes its own, which holds a document edited and not yet saved. The load ALWAYS adds the
@@ -1140,6 +1147,8 @@ export function applyStructureByLocalToEcs(
   stack?: ReadonlySet<string>,
   /** The cache a reference node's document is read from — the runtime's, or the editor's for its expansion (#1783). */
   read: ExpansionReader = readRuntimeTemplateDoc,
+  /** The address of the frame a reference node spawned under `parentEcsId` belongs to (#1939) — the expansion's own. */
+  frameAt?: (parentEcsId: number) => string | undefined,
 ): void {
 
   applyStructureCore(
@@ -1168,7 +1177,7 @@ export function applyStructureByLocalToEcs(
         const entity = spawnEntity(world, ...(traitArgs as Parameters<typeof world.spawn>));
         return entity.id();
       },
-      spawnNestedInstance: (node, parentEcsId, ancestors) => spawnReferenceNode(world, node, parentEcsId, ancestors, read),
+      spawnNestedInstance: (node, parentEcsId, ancestors) => spawnReferenceNode(world, node, parentEcsId, ancestors, read, frameAt?.(parentEcsId)),
     },
     localToEcs,
     prefab,
@@ -1182,11 +1191,21 @@ export function applyStructureByLocalToEcs(
  *  editor's (`applyStructureByRootInstance`) both run it (#1783), each with the cache it reads documents from. */
 export function spawnReferenceNode(
   world: World, node: AddedEntity, parentEcsId: number, ancestors: ReadonlySet<string>, read: ExpansionReader = readRuntimeTemplateDoc,
+  /** The address of the frame the node belongs to (#1939): a template node's is that frame's plus its key. */
+  frame?: string,
 ): void {
+  const nodeFrame = nodeFrameAddress(frame, node);
+  // A frame the editor's rebuild KEPT live is that node's expansion already (#1862): nothing is spawned for it, and the
+  // rebuild seats the kept one. Met by its address, the identity the keep recorded (#1939).
+  const keeping = (read as KeepingReader).keptFrames;
+  if (keeping && nodeFrame && keeping.frames.has(nodeFrame)) { keeping.met.add(nodeFrame); return; }
   // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
   if (refuseCyclicReferenceNode(ancestors, node, read, '[loadSceneFile]')) return;
-  // A scene's copy stands in for a template row's frame only (#1867): a missing reference node stays its placeholder (#1699).
-  const child = ((read as CopyingReader).withoutCopies ?? read)(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
+  // A scene's copy stands in for a node only where the scene's list names it live at the save (#1939; Unity backs every
+  // PrefabInstance up, `MergedAsMissingWithSceneBackup`). Without a list (a file written before it) it never does, and a
+  // missing reference node stays its placeholder (#1699).
+  let child = read(node.prefab!) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
+  if (child && readFromCopy(read, node.prefab!) && !copyBacksFrame(read, node.prefab!, nodeFrame, () => false)) child = undefined;
   // One that loads but expands to no root is kept the same way (#1768).
   if (!child || !expandsToRoot(child, read)) {
     console.warn(`[loadSceneFile] added nested instance not cached, or expands to no root: ${node.prefab}`);
@@ -1201,7 +1220,7 @@ export function spawnReferenceNode(
     { added: node.added, removed: node.removed, removedTraits: node.removedTraits, moved: node.moved, members: node.members }, stackForReferenceNode(ancestors, read), node.nestedOverrides,
     // A node the writer added expands as that writer's recorded overrides; a template's as base (#1914). A scene-form copy
     // of a chain node takes that node's values under its own, as base (`BASE_NODE`, #1914 R1).
-    node.nestedStructure, { read, own: isOwnNode(node), ...baseLayersOf(node), ...overLayersOf(node) },
+    node.nestedStructure, { read, own: isOwnNode(node), ...baseLayersOf(node), ...overLayersOf(node), frame: nodeFrame },
   );
   // RESTORE the node's own guid (QA-PREFAB-0004). A nested instance's root is
   // serialized with its guid right here in the `added[]` entry — the same way a
@@ -1452,19 +1471,22 @@ export function clearKeptMemberOrphans(): void {
 /** R2's LEGACY half (#1780, #1738): does the document at `source` expand the frame the path-keyed channel key `key`
  *  names — every localId on the way a reference row whose prefab can be read? Asked of the DOCUMENT, as `rowBackedTest`
  *  is, so a frame the SCENE removed still counts as reached, and its channel goes as R2 lets a removed member's row go. */
-export function legacyPathReached(source: string, key: string, read: PrefabDocReader = getCachedPrefab, rows?: Readonly<Record<string, unknown>>): boolean {
-  return legacyPathDoc(source, key, read, rows).reached;
+export function legacyPathReached(
+  source: string, key: string, read: PrefabDocReader = getCachedPrefab, rows?: Readonly<Record<string, unknown>>, anchor?: () => string | undefined,
+): boolean {
+  return legacyPathDoc(source, key, read, rows, anchor).reached;
 }
 
 /** {@link legacyPathReached}, with the document of the frame the path reaches (null when it reaches none, or when the
  *  path is empty and `source` itself is not cached).
  *
  *  A frame a scene's COPY would answer (#1867) is reached only where the copy stands in for it, by the expansion's own
- *  rule: the owner's `rows` state something under the frame ({@link statesUnder}, as {@link copyStandsIn}). Otherwise the
- *  expansion left the frame unexpanded, and a channel for it read as reached kept only its unused sliver while nothing
- *  restated the rest (#1914 close-out review 3). */
+ *  rule ({@link copyBacksFrame}): the scene's "live at the save" list for the frame's address (`anchor`, the stored root's
+ *  frame address, plus the path; #1939), else the owner's `rows` stating something under the frame ({@link statesUnder},
+ *  as {@link copyStandsIn}). Otherwise the expansion left the frame unexpanded, and a channel for it read as reached kept
+ *  only its unused sliver while nothing restated the rest (#1914 close-out review 3). */
 function legacyPathDoc(
-  source: string, key: string, read: PrefabDocReader, rows?: Readonly<Record<string, unknown>>,
+  source: string, key: string, read: PrefabDocReader, rows?: Readonly<Record<string, unknown>>, anchor?: () => string | undefined,
 ): { reached: boolean; doc: { entities?: PrefabFileEntry[] } | null } {
   let doc = read(source) as { entities?: PrefabFileEntry[] } | null | undefined;
   let frame = '';
@@ -1474,7 +1496,10 @@ function legacyPathDoc(
     const row = referenceRowAt(doc, lid);
     if (!row) return { reached: false, doc: null };
     frame = row.nodeGuid ? `${frame}/${row.nodeGuid}` : '';
-    if (readFromCopy(read as ExpansionReader, row.prefab!) && !(frame && rows && statesUnder(rows, frame))) return { reached: false, doc: null };
+    if (readFromCopy(read as ExpansionReader, row.prefab!)) {
+      const at = frame ? anchor?.() : undefined;
+      if (!copyBacksFrame(read as ExpansionReader, row.prefab!, at && `${at}${frame}`, () => !!(frame && rows && statesUnder(rows, frame)))) return { reached: false, doc: null };
+    }
     doc = read(row.prefab!) as { entities?: PrefabFileEntry[] } | null | undefined;
     // A child that loads but expands to no root reaches no frame either (#1768).
     if (!doc?.entities || !expandsToRoot(doc as Parameters<typeof expandsToRoot>[0], read as never)) return { reached: false, doc: null };
@@ -1532,16 +1557,18 @@ export function unusedLegacy(
   source: string, channels: KeptLegacy, read: PrefabDocReader = getCachedPrefab,
   /** The owner's own rows: where a scene's copy stands in ({@link legacyPathDoc}). */
   rows?: Readonly<Record<string, unknown>>,
+  /** The owner's frame address, asked only where a copy is read (#1939, {@link legacyPathDoc}). */
+  anchor?: () => string | undefined,
 ): KeptLegacy {
   const nestedOverrides: Record<string, object> = {};
   for (const [key, v] of Object.entries(channels.nestedOverrides ?? {})) {
-    const at = legacyPathDoc(source, key, read, rows);
+    const at = legacyPathDoc(source, key, read, rows, anchor);
     if (!at.reached) { nestedOverrides[key] = v; continue; }
     const inner = unusedLocalRecords(at.doc, { overrides: v as Record<string, object> }).overrides;
     if (inner) nestedOverrides[key] = inner;
   }
   const nestedStructure: Record<string, object> = {};
-  for (const [key, v] of Object.entries(channels.nestedStructure ?? {})) if (!legacyPathReached(source, key, read, rows)) nestedStructure[key] = v;
+  for (const [key, v] of Object.entries(channels.nestedStructure ?? {})) if (!legacyPathReached(source, key, read, rows, anchor)) nestedStructure[key] = v;
   const own = unusedLocalRecords(read(source) as { entities?: PrefabFileEntry[] } | null, channels);
   return { nestedOverrides, nestedStructure, ...own };
 }
@@ -1552,7 +1579,10 @@ function keepUnusedLegacy(
   world: World, rootEcsId: number, source: string, channels: KeptLegacy, read: PrefabDocReader, rows: Readonly<Record<string, unknown>>,
 ): void {
   const rootGuid = rootGuidOf(world, rootEcsId);
-  if (rootGuid) setKeptLegacy(rootGuid, unusedLegacy(source, channels, read, rows));
+  // The root's frame address, built only if a copy is read: the expansion asked the scene's list with it (#1939).
+  let address: string | undefined | null = null;
+  const anchor = () => (address === null ? (address = liveFrameAddresser(world)(rootEcsId)) : address);
+  if (rootGuid) setKeptLegacy(rootGuid, unusedLegacy(source, channels, read, rows, anchor));
 }
 
 function rootGuidOf(world: World, rootEcsId: number): string {
@@ -2304,10 +2334,30 @@ const readRuntimeTemplateDoc = (source: string) => getCachedPrefab(source) as Te
  *  its save (#1934 L1, R7 fork A). The EXPANSION still reads every scene's copy in load order (bases first): that is
  *  what the world showed, and a frame a copy expanded writes its own copy at the save, from its frame record. */
 const embeddedDocsByWorld = new WeakMap<World, Map<string, Map<string, TemplateDoc>>>();
+/** …and beside them, by the same scene and guid, the frames each copy was LIVE for at the save (#1939,
+ *  `SceneData.embeddedPrefabFrames`), by address (`frameAddress.ts`). A guid with no set answers by the rows rule. */
+const embeddedFramesByWorld = new WeakMap<World, Map<string, Map<string, Set<string>>>>();
 
 /** Record the copies `data` carries for `world`, under the scene `scene` — each one a document with an `entities` array;
- *  anything else is dropped with a warning, as the validator reports it, rather than handed to an expansion. */
-function noteEmbeddedPrefabs(world: World, scene: string, embedded: SceneData['embeddedPrefabs']): void {
+ *  anything else is dropped with a warning, as the validator reports it, rather than handed to an expansion. `frames`: the
+ *  file's "live at the save" lists (#1939), added to any the scene already holds; a list that is not an array of strings is
+ *  ignored with a warning, and its copy answers by the rows rule. */
+function noteEmbeddedPrefabs(world: World, scene: string, embedded: SceneData['embeddedPrefabs'], frames?: SceneData['embeddedPrefabFrames']): void {
+  if (frames && typeof frames === 'object') {
+    for (const [guid, list] of Object.entries(frames)) {
+      if (!Array.isArray(list) || list.some((a) => typeof a !== 'string')) {
+        console.warn(`[loadSceneFile] embeddedPrefabFrames for ${guid} is not a list of frame addresses; ignored`);
+        continue;
+      }
+      let scenes = embeddedFramesByWorld.get(world);
+      if (!scenes) { scenes = new Map(); embeddedFramesByWorld.set(world, scenes); }
+      let byGuid = scenes.get(scene);
+      if (!byGuid) { byGuid = new Map(); scenes.set(scene, byGuid); }
+      const set = byGuid.get(guid) ?? new Set<string>();
+      for (const a of list as string[]) set.add(a);
+      byGuid.set(guid, set);
+    }
+  }
   if (!embedded || typeof embedded !== 'object') return;
   for (const [guid, doc] of Object.entries(embedded)) {
     if (!doc || typeof doc !== 'object' || !Array.isArray((doc as { entities?: unknown }).entities)) {
@@ -2332,9 +2382,78 @@ export function embeddedPrefabGuids(world: World, scene: string): string[] {
   return [...(embeddedDocsByWorld.get(world)?.get(scene)?.keys() ?? [])];
 }
 
+/** What a world swap carries of the copy store (#1939 item 2): per scene key, a document per missing prefab guid, and the
+ *  addresses of that prefab's frames live in the world it was captured from (or listed by its scene's load). */
+export type SceneCopyCarry = Map<string, { docs: Map<string, TemplateDoc>; frames: Map<string, Set<string>> }>;
+
+/** The copies `world` holds for the scenes a swap keeps (#1939 item 2, H1/C2): each kept scene's own copies, and the document
+ *  of every live frame of a missing prefab, under the scene that frame belongs to (`sceneOf`, undefined for a scene the swap
+ *  does not keep). A swap reloads a scene from its file or snapshot, which can predate the prefab going: an Apply's undo
+ *  reloads a snapshot taken while a nested prefab still loaded, so the snapshot carried no copy, and the frames that were
+ *  live a moment before came back unexpanded and lost their backup at the next save (hunt seed 1268). Unity's undo does not
+ *  reload, and a kept base's level switch or Play→Stop keeps its objects: the world the user saw is what carries. Only a
+ *  prefab the runtime cannot read is carried, so a returned prefab's copy dies with the old world. */
+export function captureSceneCopies(world: World, scenes: SceneCopyKeys): SceneCopyCarry {
+  const out: SceneCopyCarry = new Map();
+  const slot = (scene: string) => {
+    let c = out.get(scene);
+    if (!c) { c = { docs: new Map(), frames: new Map() }; out.set(scene, c); }
+    return c;
+  };
+  const put = (scene: string, guid: string, doc: TemplateDoc): void => {
+    if (readRuntimeTemplateDoc(guid)) return;
+    const docs = slot(scene).docs;
+    if (!docs.has(guid)) docs.set(guid, doc);
+  };
+  const live = (scene: string, guid: string, addrs: Iterable<string>): void => {
+    if (readRuntimeTemplateDoc(guid)) return;
+    const frames = slot(scene).frames;
+    const set = frames.get(guid) ?? new Set<string>();
+    for (const a of addrs) set.add(a);
+    frames.set(guid, set);
+  };
+  const piMeta = getTraitByName('PrefabInstance');
+  if (piMeta) {
+    const addressOf = liveFrameAddresser(world);
+    for (const e of world.entities as Iterable<Entity>) {
+      if (!e.has(piMeta.trait)) continue;
+      const pi = e.get(piMeta.trait) as { source?: string; rootInstanceId?: number };
+      if (!pi.source || pi.rootInstanceId !== e.id()) continue;
+      const scene = scenes.of(e);
+      const rec = scene === undefined ? undefined : frameRootDoc(world, e);
+      if (!rec || rec.source !== pi.source) continue;
+      put(scene!, pi.source, rec.doc);
+      const addr = addressOf(e.id());
+      if (addr) live(scene!, pi.source, [addr]);
+    }
+  }
+  for (const [scene, docs] of embeddedDocsByWorld.get(world) ?? []) {
+    if (scenes.keeps(scene)) for (const [guid, doc] of docs) put(scene, guid, doc);
+  }
+  for (const [scene, byGuid] of embeddedFramesByWorld.get(world) ?? []) {
+    if (scenes.keeps(scene)) for (const [guid, addrs] of byGuid) live(scene, guid, addrs);
+  }
+  return out;
+}
+/** Which scene key a captured entity belongs to (undefined: none the capture keeps), and which store keys it keeps. */
+export interface SceneCopyKeys { of(entity: Entity): string | undefined; keeps(scene: string): boolean }
+
+/** Note a {@link captureSceneCopies} carry into the world a swap is filling, BEFORE its scenes load: a load's own copies
+ *  (`noteEmbeddedPrefabs`) then replace a carried one of the same guid, since the file is the record. */
+export function restoreSceneCopies(world: World, carry: SceneCopyCarry): void {
+  for (const [scene, { docs, frames }] of carry) {
+    noteEmbeddedPrefabs(world, scene, Object.fromEntries(docs) as SceneData['embeddedPrefabs'],
+      Object.fromEntries([...frames].map(([guid, addrs]) => [guid, [...addrs]])));
+  }
+}
+
 /** A reader that serves a scene's copies (#1867), carrying the reader without them: a copy stands in for a template ROW's
  *  frame only, and only for one the scene recorded live ({@link copyStandsIn}), so the two sites that ask need both. */
-type CopyingReader = ExpansionReader & { readonly withoutCopies?: ExpansionReader };
+type CopyingReader = ExpansionReader & {
+  readonly withoutCopies?: ExpansionReader;
+  /** The frames of `ref` its copy was live for at the save (#1939), `undefined` when that copy has no list. */
+  readonly framesOf?: (ref: string) => ReadonlySet<string> | undefined;
+};
 
 /** `base`, then the copies of missing prefabs (#1867): a prefab that loads always wins over a copy, and the copy stands
  *  in only for one that does not. With `scene`, only the copies THAT scene carried (a load reads its own file's, #1934:
@@ -2348,7 +2467,26 @@ function withSceneCopies(world: World, base: ExpansionReader, scene?: string): E
   const copyOf = own
     ? (ref: string) => own.get(ref)
     : (ref: string) => { for (const docs of scenes!.values()) { const d = docs.get(ref); if (d) return d; } return undefined; };
-  return Object.assign((ref: string) => base(ref) ?? copyOf(ref), { withoutCopies: base });
+  const lists = embeddedFramesByWorld.get(world);
+  const framesOf = scene !== undefined
+    ? (ref: string) => lists?.get(scene)?.get(ref)
+    : (ref: string) => {
+      let all: Set<string> | undefined;
+      for (const byGuid of lists?.values() ?? []) for (const a of byGuid.get(ref) ?? []) (all ??= new Set()).add(a);
+      return all;
+    };
+  return Object.assign((ref: string) => base(ref) ?? copyOf(ref), { withoutCopies: base, framesOf });
+}
+
+/** A reader that also names the reference-node frames already live, which its expansion must not spawn again (#1939): the
+ *  editor's rebuild keeps a frame whose prefab it cannot expand (`rebuildTeardown`, #1862) and seats it after the respawn.
+ *  By frame address (`frameAddress.ts`); `met` collects each one the spawner came to, so the rebuild knows which kept
+ *  frames the new expansion still names. The reader is handed down to every nested expansion, so the list reaches them. */
+type KeepingReader = ExpansionReader & { readonly keptFrames?: { readonly frames: ReadonlySet<string>; readonly met: Set<string> } };
+
+/** `read`, keeping the frames at `frames` live — its documents unchanged, and any copy it serves still told apart. */
+export function keepingFrames(read: ExpansionReader, frames: ReadonlySet<string>, met: Set<string>): ExpansionReader {
+  return Object.assign((ref: string) => read(ref), read, { keptFrames: { frames, met } });
 }
 
 /** The runtime cache, then the scene's copies — the default reader of an expansion and of a load. */
@@ -2379,6 +2517,16 @@ function readFromCopy(read: ExpansionReader, ref: string): boolean {
 function copyStandsIn(layers: readonly StructureLayer<NestedStructureDelta, SceneMemberRow>[], nodeGuid: string | undefined): boolean {
   if (!nodeGuid) return false;
   return layers.some((l) => l.own && !!l.rows && statesUnder(l.rows, `/${nodeGuid}`));
+}
+
+/** May the copy `read` serves for `ref` expand the frame at `frame` (#1939)? The scene's "live at the save" list decides
+ *  when the copy has one and the frame has an address: a top-level entry, a nested row, a template reference node and a
+ *  scene-added one alike, so the answer no longer hangs on what the member-row writer happens to write (its exclusion 2
+ *  writes none inside a stored root's expansion, #1934 F3). Otherwise `rules` answers — the rule of a file written before
+ *  the list ({@link copyStandsIn} for a nested row; an entry always, a reference node never). */
+function copyBacksFrame(read: ExpansionReader, ref: string, frame: string | undefined, rules: () => boolean): boolean {
+  const live = frame ? (read as CopyingReader).framesOf?.(ref) : undefined;
+  return live ? live.has(frame!) : rules();
 }
 
 /** Do `rows` state the frame `frame` (`/<nodeGuid>…`, a path of nested rows) or a member below it? The one test of where
@@ -2424,6 +2572,10 @@ export interface PrefabExpansion {
   /** A TOP call's layers OVER its own channels, innermost first (#1914 R3b, `overLayersOf`): what the layers above a
    *  template reference node state into it. Folded after the call's own; an own one records what it states. */
   over?: StructureLayer<NestedStructureDelta, SceneMemberRow>[];
+  /** This frame's address in its scene (#1939, `frameAddress.ts`): a top call's from its caller (a load's entry or
+   *  reference node), a nested row's from its parent. What a missing prefab's copy is asked about: it expands a frame its
+   *  scene's list names as live at the save. Absent: the frame has none, and a copy answers by the rows rule. */
+  frame?: string;
 }
 /** A document reader for the expansion: a prefab ref to its document, or nothing when it is not cached. */
 export type ExpansionReader = (ref: string) => TemplateDoc | null | undefined;
@@ -2448,7 +2600,7 @@ export function instantiatePrefabIntoWorld(
   /** How to expand — see {@link PrefabExpansion}. A load, a pool and a timeline clip pass nothing. */
   expand: PrefabExpansion = {},
 ): number {
-  const { read = runtimeReaderFor(world), segments: _segments, layers: _layers, foldFrom: _foldFrom = 0 } = expand;
+  const { read = runtimeReaderFor(world), segments: _segments, layers: _layers, foldFrom: _foldFrom = 0, frame } = expand;
   const topOwn = expand.own !== false;
   const noteTopRead = (rootId: number): void => {
     if (_segments || !rootId || !loadsInFlight.get(world)) return;
@@ -2519,13 +2671,17 @@ export function instantiatePrefabIntoWorld(
   const ownMemberIds: number[] = [];
   // Nested rows this expansion could not expand — recorded on the frame (#1812, `FrameRootRecord.unexpanded`).
   const unexpanded: number[] = [];
+  // Each nested root this expansion spawned, by the address of its frame (#1939): a template reference node anchored AT a
+  // nested row hangs at that row's root, and its key derives from that frame (`IdentityParents.derivesFrom`).
+  const childFrames = new Map<number, string>();
 
   // First pass: spawn each row (nested rows recurse into the child prefab).
   for (const entry of prefab.entities) {
     if (entry.prefab) {
       let child = read(entry.prefab) as { entities: PrefabFileEntry[]; rootLocalId?: number; id?: string } | null | undefined;
       const rowLocalId = entry.localId ?? 0;
-      if (child && readFromCopy(read, entry.prefab) && !copyStandsIn(layers, entry.nodeGuid)) child = undefined;
+      const childFrame = rowFrameAddress(frame, entry.nodeGuid);
+      if (child && readFromCopy(read, entry.prefab) && !copyBacksFrame(read, entry.prefab, childFrame, () => copyStandsIn(layers, entry.nodeGuid))) child = undefined;
       if (!child) { console.warn(`[loadSceneFile] nested prefab not cached: ${entry.prefab}`); if (rowLocalId) unexpanded.push(rowLocalId); continue; }
       // ONE step of the shared fold (#1880 F2, `foldRowStep`, the step the effective base and the validator walk): the
       // layers reaching this frame (the row's own innermost, each outer one descended), an outer slot OWNING the three
@@ -2552,8 +2708,9 @@ export function instantiatePrefabIntoWorld(
         { added: step.channels.added, removed: step.channels.removed, removedTraits: step.channels.removedTraits, ...(step.moved ? { moved: step.moved } : {}), members: childMembers },
         stack, undefined,
         structForward,
-        { read, segments: [...segments, rowPathInPrefab(prefab, rowLocalId)], layers: forward.layers, folded: { forwardRoots: forward.forwardRoots, ownOverrides: step.ownOverrides } },
+        { read, segments: [...segments, rowPathInPrefab(prefab, rowLocalId)], layers: forward.layers, folded: { forwardRoots: forward.forwardRoots, ownOverrides: step.ownOverrides }, frame: childFrame },
       );
+      if (childRoot && childFrame) childFrames.set(childRoot, childFrame);
       // Stamp parentLocalId so a later serialize knows which row produced this
       // instance (and can store/restore its scene-level overrides).
       if (childRoot && rowLocalId && piMeta) {
@@ -2676,7 +2833,8 @@ export function instantiatePrefabIntoWorld(
   // additions can resolve their anchor localId against the fully-built map and a
   // removal can't strand an override that ran before it.
   if (structure && (structure.added?.length || structure.removed?.length || structure.removedTraits || structure.moved || structure.members)) {
-    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments), stack, read);
+    applyStructureByLocalToEcs(world, localToEcs, prefab, rebaseStructureTokens(structure, segments), stack, read,
+      (parentEcsId) => childFrames.get(parentEcsId) ?? frame);
   }
 
   // Pop this prefab off the cycle stack — the guard tracks ANCESTORS in the
@@ -2822,6 +2980,18 @@ const RESOURCE_TYPE_BY_ASSET_TYPE: Partial<Record<AssetType, SceneResourceRef['t
  *  (AnimationLibrary.animSets, SkinnedMeshRenderer.materials, Renderable3DPrimitive.material,
  *  ModelSource.glbPath, structural entry.prefab) stay explicit.
  *  Anything held on a GAME-defined trait is caught by the generic sweep at the end. */
+/** A scene FILE's `resources`: its entities' refs, and those of every copy it carries of a missing prefab (#1867). The build
+ *  reaches a copy's assets by this list alone — the tree-shaker walks `entities` and `resources[]`, never `embeddedPrefabs`
+ *  (asset-tree-shaker.ts `processSceneOrPrefab`) — so the save and the build-reach test both build it here (#1939). */
+export function sceneFileResourceRefs(
+  entities: Parameters<typeof collectResourceRefsFromEntities>[0],
+  embeddedPrefabs?: Readonly<Record<string, { entities: readonly unknown[] }>>,
+): SceneResourceRef[] {
+  return collectResourceRefsFromEntities(embeddedPrefabs
+    ? [...entities, ...Object.values(embeddedPrefabs).flatMap((d) => d.entities as Parameters<typeof collectResourceRefsFromEntities>[0])]
+    : entities);
+}
+
 export function collectResourceRefsFromEntities(
   entities: ReadonlyArray<{
     traits: Record<string, unknown>;
@@ -3076,9 +3246,12 @@ export function collectResourceRefsFromEntities(
   // What that costs, stated precisely — #123 filed it as an "asset the build cannot see" (the
   // #53 class), and that is NOT the failure. Two things make the stored manifest far less
   // load-bearing than it looks:
-  //   - The BUILD never reads it. The tree-shaker walks scene ENTITIES via its own generic
-  //     sweep (asset-tree-shaker.ts). Measured: a web build of space-invader from a manifest
-  //     with both refs deleted still ships the spriteanim AND the texture.
+  //   - The BUILD does not depend on it for ENTITIES. The tree-shaker walks scene entities via its
+  //     own generic sweep (asset-tree-shaker.ts). Measured: a web build of space-invader from a
+  //     manifest with both refs deleted still ships the spriteanim AND the texture. It does read
+  //     `resources[]` too, and that is the ONLY route a scene's copies of missing prefabs reach it
+  //     by (`embeddedPrefabs`, which it does not walk; the save lists their refs, #1867, #1939). A
+  //     file missing them fails the build at the #237 guard rather than shipping without them.
   //   - The RUNTIME does not trust it either. `SceneManager.collectSceneResourceRefs` unions
   //     the stored `resources` with a FRESH call to this function, so a stale file self-heals
   //     ("`resources` is a hint, not the authority" — docs/scene-loading.md).
@@ -3279,7 +3452,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const world = options.world ?? getCurrentWorld();
   // Before any prefab spawns: a nested frame of a prefab that is still missing expands from the scene's copy (#1867).
   const sceneKey = data.id && isGuid(data.id) ? data.id : '';
-  noteEmbeddedPrefabs(world, sceneKey, data.embeddedPrefabs);
+  noteEmbeddedPrefabs(world, sceneKey, data.embeddedPrefabs, data.embeddedPrefabFrames);
   // The load's one reader (#1934 S1): every expansion below and the settle after them read the same documents — the
   // caller's cache, then the copies of the scene being loaded (or the one `copiesOf` names), never another scene's.
   const read = withSceneCopies(world, options.read ?? readRuntimeTemplateDoc, options.copiesOf ?? sceneKey);
@@ -3555,12 +3728,16 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
 
       // Verify prefab exists before instantiating. One that does not load expands from the scene's copy (#1935, F8 = A1
       // for a top-level instance; Unity's `MergedAsMissingWithSceneBackup`), and stays a placeholder without one (#1699).
-      // No "was it live at the save" test, unlike a nested frame's (`copyStandsIn`): an entry's record was always
-      // captured from a live instance, and member rows are no signal for it — a ROOT-only prefab's live instance states
-      // none, and asked for them it reloaded as a placeholder beside its own copy (#1935, hunt seeds 1011/3004).
+      // "Was it live at the save" is the scene's list (#1939). A file without one keeps #1935's rule, always: member rows
+      // are no signal for an entry — a ROOT-only prefab's live instance states none, and asked for them it reloaded as a
+      // placeholder beside its own copy (hunt seeds 1011/3004).
       // `onInstantiatePrefab` reads the document through the `read` it is handed, which serves the copy.
       const fetched = await fetchPrefab(source);
-      const prefab = fetched ?? (entry.prefab ? read(source) ?? null : null);
+      // The entry's frame address (#1939): its own guid. A copy stands in for it only when the scene's list names it live at
+      // the save — a placeholder saved beside a live instance of the same prefab stays one (#1934 C1); without a list, always.
+      const entryFrame = durableGuid(entry.guid) || undefined;
+      const copy = !fetched && entry.prefab ? read(source) ?? null : null;
+      const prefab = fetched ?? (copy && (!readFromCopy(read, source) || copyBacksFrame(read, source, entryFrame, () => true)) ? copy : null);
       const fetchNested = async (r: string) => (await fetchPrefab(r)) ?? read(r) ?? null;
       // A document that loads but expands to no root is kept exactly as one that does not load (#1768): checked
       // BEFORE `onDeletePlaceholder`, so the placeholder survives to carry the entry.
@@ -3613,7 +3790,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
           entry.guid,
           typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
           entry.nestedStructure,
-          { read },
+          { read, frame: entryFrame },
         );
         if (typeof rootEcsId === 'number' && rootEcsId > 0) {
           const reads = topReadByWorld.get(world);

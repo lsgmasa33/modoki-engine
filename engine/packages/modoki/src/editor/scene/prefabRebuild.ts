@@ -22,8 +22,9 @@ import { sameDocumentContent } from '../../runtime/core/localIdCounter';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import type { AddedEntity, ExpansionReader, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import {
-  keptMemberOrphans, mapNodeChannels, nodeChannels, instantiatePrefabIntoWorld, settleEntryRows, entryRowsOf,
+  keptMemberOrphans, mapNodeChannels, nodeChannels, instantiatePrefabIntoWorld, settleEntryRows, entryRowsOf, keepingFrames,
 } from '../../runtime/loaders/loadSceneFile';
+import { liveFrameAddresser } from '../../runtime/loaders/frameAddress';
 import { translateLocalIds, translateCarried } from '../../runtime/loaders/memberTranslation';
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { levelDoc } from './prefabBase';
@@ -35,7 +36,7 @@ import {
 import { keepsTemplateRows } from './prefabCapture';
 import { subtractFieldOverrides } from './prefabChain';
 import {
-  collectInstanceRoots, isLiveInstanceRoot, type KeptFrame, rebuildTeardown, type StaleFrame, staleFrames,
+  collectInstanceRoots, isLiveInstanceRoot, type KeptFrame, rebuildTeardown, type StaleFrame, staleFrames, remapFrameAddress,
 } from './prefabFrames';
 import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
 import type { FrameEdit } from './prefabCapture';
@@ -114,26 +115,6 @@ function destroyTornDown({ toDestroy, parked, kept }: Pick<ReturnType<typeof reb
   const keptGuids = new Set(getAllEntities().filter((e) => keptSubtree.has(e.id) && e.guid).map((e) => e.guid!));
   const detached = deleteEntities([...toDestroy]);
   if (kept.length) relinkDetachedMembers(detached.filter((d) => keptGuids.has(d.guid)));
-}
-
-/** `added` without the reference nodes {@link rebuildFromEntry} keeps live (by guid), noting in `found` each one it took
- *  out. At ANY depth, through every channel a node can hang in — the walk `collectReferenceNodeRows` makes: a plain
- *  node's `children`, a reference node's own `added` (legacy form) and `nestedStructure[*].added`, and its member rows'
- *  `added`/`own` (the rows form a respawn capture is in). Walking `children` alone missed a kept node inside another
- *  reference node: it was respawned as a placeholder beside the kept frame, which was then dropped as unnamed, and the
- *  gesture's undo could not bring it back (#1877 L4). */
-function withoutKeptNodes(added: AddedEntity[] | undefined, keep: ReadonlyMap<string, unknown>, found: Set<string>): AddedEntity[] | undefined {
-  if (!added) return added;
-  const out: AddedEntity[] = [];
-  for (const n of added) {
-    if (n.prefab && n.guid && keep.has(n.guid)) { found.add(n.guid); continue; }
-    out.push(withoutKeptNodesInside(n, keep, found));
-  }
-  return out;
-}
-
-function withoutKeptNodesInside(n: AddedEntity, keep: ReadonlyMap<string, unknown>, found: Set<string>): AddedEntity {
-  return mapNodeChannels(n, (list) => withoutKeptNodes(list, keep, found)!);
 }
 
 /** Put back the nested frames {@link rebuildTeardown} KEPT because their prefab could not be expanded (#1862), once the
@@ -512,13 +493,6 @@ export function rebuildEntrySide(side: EntrySide, frameGuid = ''): number {
   return (frameGuid && frameGuid !== side.outerGuid ? findEntityByGuid(frameGuid)?.id() : 0) || newOuter;
 }
 
-/** `entry` without the reference nodes {@link rebuildFromEntry} keeps live (by guid), in every list it holds. */
-function entryWithoutKeptNodes(entry: InstanceEntry, keep: ReadonlyMap<string, unknown>, found: Set<string>): InstanceEntry {
-  const asNode = { added: entry.added, nestedStructure: entry.nestedStructure, members: entry.members } as AddedEntity;
-  const out = mapNodeChannels(asNode, (list) => withoutKeptNodes(list, keep, found)!);
-  return { ...entry, ...(entry.added ? { added: out.added } : {}), ...(entry.nestedStructure ? { nestedStructure: out.nestedStructure } : {}), ...(entry.members ? { members: out.members as InstanceEntry['members'] } : {}) };
-}
-
 /** #1880 F6: rebuild the scene entry rooted at `rootInstanceId` (of `source`) by LOADING `entry` — the save's own
  *  statement of it (`captureInstanceEntry`) — onto `prefab`, through the loader's spawner and post-pass
  *  (`settleEntryRows`). A rebuild is then the load of what a save writes: nothing folds a capture into a fresh
@@ -557,24 +531,27 @@ export function rebuildFromEntry(
   const parentId = (oldRootEa?.parentId as number) ?? 0;
   const wasTransient = !!findEntity(rootInstanceId)?.has(Transient);
 
+  // The frame's own address, read before the teardown as the keep reads its nodes': the respawn addresses every frame it
+  // expands from this one, so a kept node and its statement meet at the same address (#1939).
+  const rootAddress = liveFrameAddresser(getCurrentWorld())(rootInstanceId);
+  const rootFrame = rootAddress ? remapFrameAddress(rootAddress, remap) : undefined;
   const { toDestroy, parked, kept } = rebuildTeardown(rootInstanceId, remap, read as typeof getCachedPrefabSync);
   const carriedKeys = templateKeysByGuid(toDestroy, remap);
   destroyTornDown({ toDestroy, parked, kept });
-  // A kept scene-added reference node IS that node's live expansion: the entry's statement of it is not respawned.
-  const keptNodes = new Map(kept.filter((k) => !k.owned).map((k) => {
-    const g = durableGuid((readTraitData(k.id, eaMeta) as { guid?: string } | null)?.guid);
-    return [remap.get(g) ?? g, k] as const;
-  }));
-  // The SPAWN skips it; the settle below reads the whole entry, so R2 keeps it in its row as a load would.
+  // A kept reference node IS that node's live expansion: the spawner meets it by its frame address and spawns nothing —
+  // a scene-added node the entry states, and a TEMPLATE node a document states by key alone (#1939: matched by guid, a kept
+  // template node was respawned as a placeholder beside itself and then dropped as unnamed). The settle below reads the
+  // whole entry, so R2 keeps a node in its row as a load would.
+  const keptNodes = new Map(kept.filter((k) => !k.owned && k.address).map((k) => [k.address!, k] as const));
   const namedNodes = new Set<string>();
-  const spawned = keptNodes.size ? entryWithoutKeptNodes(entry, keptNodes, namedNodes) : entry;
+  const spawnRead = keptNodes.size ? keepingFrames(read, new Set(keptNodes.keys()), namedNodes) : read;
 
   // The load's spawn of a scene entry (`onInstantiatePrefab`), from the editor's cache.
   const world = getCurrentWorld();
   const newRootId = instantiatePrefabIntoWorld(
-    world, prefab, parentId, undefined, source, spawned.overrides,
-    { added: spawned.added, removed: spawned.removed, removedTraits: spawned.removedTraits, moved: spawned.moved, members: spawned.members },
-    undefined, spawned.nestedOverrides, spawned.nestedStructure, { read },
+    world, prefab, parentId, undefined, source, entry.overrides,
+    { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved, members: entry.members },
+    undefined, entry.nestedOverrides, entry.nestedStructure, { read: spawnRead, frame: rootFrame },
   );
   markStructureDirty();
   markUIDirty();
@@ -638,7 +615,8 @@ function translateEntryLocalIds(entry: InstanceEntry, lid: (n: number) => number
 }
 
 /** Every node guid the kept-orphan store (R2) now holds for the stored roots `rows` settled — the entry's own root and
- *  each reference node it states — at any depth inside a kept row. */
+ *  each reference node it states — at any depth inside a kept row. Compared with the kept nodes' frame ADDRESSES (#1939):
+ *  a node the store holds is stated by guid, and a guid-stated node's address IS its guid (`nodeFrameAddress`). */
 function orphanedNodeGuids(rows: ReturnType<typeof entryRowsOf>): Set<string> {
   const eaMeta = getTraitByName('EntityAttributes');
   const out = new Set<string>();

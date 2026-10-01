@@ -9,6 +9,7 @@ import { computeKeptAssets, virtualToAbs } from '../../plugins/asset-tree-shaker
 import { detectType, resolveAssetPath, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { JSON_ASSET_SUFFIX_TYPE, ID_BEARING_TYPES, classifyJsonAssetSuffix } from '../../plugins/assetTypes';
 import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { sceneFileResourceRefs } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { MATERIAL_TEXTURE_SLOTS } from '../../packages/modoki/src/runtime/assets/materialTextureSlots';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -2037,5 +2038,47 @@ describe('asset-tree-shaker', () => {
 
       expect(playable.kept).toContain('/games/test/assets/extras/loose.png');
     });
+  });
+});
+
+// ── A scene's copy of a missing prefab reaches the build through resources[] (#1939) ──────────
+
+describe("asset-tree-shaker: a scene's copy of a missing prefab (#1939)", () => {
+  let fx: Fixture;
+  beforeEach(() => { fx = createFixture(); });
+  afterEach(() => { fx.cleanup(); });
+
+  const matGuid = '19391939-0000-4000-8000-000000000001';
+  const missingPrefab = '19391939-0000-4000-8000-000000000002';
+  const sceneEntities = [{ guid: '19391939-0000-4000-8000-000000000003', prefab: missingPrefab, traits: { EntityAttributes: { name: 'P1', parentId: 0 } } }];
+  // The copy the save carries while the prefab is missing: its own row names the material, and nothing else does.
+  const embeddedPrefabs = { [missingPrefab]: { id: missingPrefab, rootLocalId: 1, entities: [{ localId: 1, traits: { Renderable3D: { material: matGuid } } }] } };
+
+  it('keeps an asset named only inside the copy, by the resources[] the save writes for it', () => {
+    // The tree-shaker walks `entities` and `resources[]`, never `embeddedPrefabs`: the save's `sceneFileResourceRefs` is the
+    // ONLY route. Mutation: build `resources` from the entities alone (drop the copies in `sceneFileResourceRefs`) → the
+    // material is dropped from the build, and the #237 guard names it.
+    fx.writeJson('/games/test/assets/mats/only-in-copy.mat.json', { id: matGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', {
+      version: 19, resources: sceneFileResourceRefs(sceneEntities, embeddedPrefabs), entities: sceneEntities, embeddedPrefabs,
+      embeddedPrefabFrames: { [missingPrefab]: [sceneEntities[0]!.guid] },
+    });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).toContain('/games/test/assets/mats/only-in-copy.mat.json');
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
+  it('a file whose resources[] misses the copy\'s asset fails the build loudly (the #237 guard), never ships without it', () => {
+    fx.writeJson('/games/test/assets/mats/only-in-copy.mat.json', { id: matGuid, version: 1 });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', { version: 19, resources: [], entities: sceneEntities, embeddedPrefabs });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    expect(result.kept).not.toContain('/games/test/assets/mats/only-in-copy.mat.json');
+    expect(result.unreachableRefs).toEqual([
+      { guid: matGuid, target: '/games/test/assets/mats/only-in-copy.mat.json', referencedBy: '/games/test/assets/scenes/main.scene.json' },
+    ]);
   });
 });

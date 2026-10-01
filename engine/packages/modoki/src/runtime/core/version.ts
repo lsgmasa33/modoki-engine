@@ -88,7 +88,9 @@ export const ENGINE_VERSION = '0.1.0';
 // the scene was saved (#1914 F8 = A1, #1867; Unity's scene backup, `MergedAsMissingWithSceneBackup`). A reload with the
 // prefab still missing expands its frames from the copy instead of leaving their rows unexpanded; once the real prefab
 // is back it wins and the copy is no longer written. A v18 file has no such field and reads unchanged. Required for the
-// REFUSE reason: an older build would ignore the copies and drop them on its next save.
+// REFUSE reason: an older build would ignore the copies and drop them on its next save. Beside it (#1939, no bump: an
+// optional field a v19 reader without it ignores, and a copy with no list answers by the earlier rules),
+// `embeddedPrefabFrames`: per copy, the addresses of the frames live at the save, which the reload expands and no other.
 export const SCENE_FORMAT_VERSION = 19;
 /** The scene format whose keyed-node guids are frame-rooted (#1809): a file below it is renamed on load. A literal, not
  *  {@link SCENE_FORMAT_VERSION}, which moves on with every later bump while this stays the version the rule arrived in. */

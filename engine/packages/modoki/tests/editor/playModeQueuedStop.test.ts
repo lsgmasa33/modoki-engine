@@ -28,6 +28,8 @@ const loadScene = vi.fn(async (path: string, _opts?: unknown) => {
 });
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
+    // A swap's copy carry (#1939): this fake world holds no scene copies.
+    captureSceneCopies: () => new Map(),
     getCurrent: () => (currentPath === null ? null : { path: currentPath }),
     getLoadedScenes: () => new Map(),
     // enterPlay consults this to refuse Play while a swap is pre-swap in flight (#573).

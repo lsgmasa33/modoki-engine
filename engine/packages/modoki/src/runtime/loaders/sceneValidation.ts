@@ -1100,6 +1100,7 @@ export function validateSceneData(
   }
 
   warnings.push(...embeddedPrefabWarnings((data as { embeddedPrefabs?: unknown }).embeddedPrefabs, getPrefab));
+  warnings.push(...embeddedPrefabFrameWarnings(data as { embeddedPrefabs?: unknown; embeddedPrefabFrames?: unknown; entities: unknown[] }));
 
   return { warnings, schemaApplied };
 }
@@ -1130,6 +1131,45 @@ function embeddedPrefabWarnings(embedded: unknown, getPrefab?: PrefabResolver): 
       return real ?? (embedded as Record<string, unknown>)[ref];
     };
     out.push(...validatePrefabData(doc, read).warnings.map((w) => `${label}: ${w}`));
+  }
+  return out;
+}
+
+/** The copies' "live at the save" lists (`embeddedPrefabFrames`, v19, #1939): an object keyed by prefab guid, each value a
+ *  list of frame addresses (`frameAddress.ts`). Disclosed, never refused, and kept as written: the loader ignores a list it
+ *  cannot read (that copy answers by the rows rule), a list for a guid with no copy is read by nothing and goes at the next
+ *  save, and an address whose anchor names no guid this file holds matches no frame. A deeper component that names no row
+ *  or key is not checked here (it needs the documents), and the load ignores it the same way. */
+function embeddedPrefabFrameWarnings(scene: { embeddedPrefabs?: unknown; embeddedPrefabFrames?: unknown; entities: unknown[] }): string[] {
+  const lists = scene.embeddedPrefabFrames;
+  if (lists === undefined) return [];
+  if (!lists || typeof lists !== 'object' || Array.isArray(lists)) {
+    return ['embeddedPrefabFrames is not an object keyed by prefab guid — the loader ignores it'];
+  }
+  const copies = scene.embeddedPrefabs && typeof scene.embeddedPrefabs === 'object' ? scene.embeddedPrefabs as Record<string, unknown> : {};
+  let held: Set<string> | undefined;
+  const holds = (guid: string): boolean => {
+    if (!held) {
+      held = new Set();
+      const walk = (n: unknown): void => {
+        if (typeof n === 'string') { if (isGuid(n)) held!.add(n); return; }
+        if (n && typeof n === 'object') for (const v of Array.isArray(n) ? n : Object.values(n)) walk(v);
+      };
+      walk(scene.entities);
+    }
+    return held.has(guid);
+  };
+  const out: string[] = [];
+  for (const [guid, list] of Object.entries(lists)) {
+    const label = `embeddedPrefabFrames['${guid}']`;
+    if (!Array.isArray(list) || list.some((a) => typeof a !== 'string')) {
+      out.push(`${label}: not a list of frame addresses — the loader ignores it, and the copy answers by the member rows`);
+      continue;
+    }
+    if (!(guid in copies)) out.push(`${label}: no copy of this prefab in embeddedPrefabs — nothing reads the list, and the next save drops it`);
+    for (const a of list as string[]) {
+      if (!holds(a.split('/')[0]!)) out.push(`${label}: the frame '${a}' is anchored on no entity of this scene — the loader matches no frame to it`);
+    }
   }
   return out;
 }

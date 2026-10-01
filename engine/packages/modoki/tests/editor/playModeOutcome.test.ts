@@ -38,6 +38,8 @@ vi.mock('../../src/editor/scene/serialize', () => ({
 }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
+    // A swap's copy carry (#1939): this fake world holds no scene copies.
+    captureSceneCopies: () => new Map(),
     loadScene: async () => {
       if (h.failLoad) throw new Error('reload failed');
       return { world: (await import('../../src/runtime/core/ecs/world')).getCurrentWorld(), keptBaseGuids: new Set<string>() };

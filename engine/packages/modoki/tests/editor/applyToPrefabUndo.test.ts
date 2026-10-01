@@ -77,7 +77,7 @@ vi.mock('../../src/editor/scene/prefabRevert', () => ({}));
 let currentBaseScene: string | undefined;
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   // `getCurrent`: a real scene, so the Apply is not the prefab-edit world's (#1573).
-  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }), getNext: () => null },
+  sceneManager: { loadScene: (...a: any[]) => loadScene(...a), getCurrentBaseScene: () => currentBaseScene, getCurrent: () => ({ path: '/scenes/main.json' }), getNext: () => null, captureSceneCopies: () => new Map() },
 }));
 
 vi.mock('../../src/editor/store/editorStore', () => ({
@@ -142,7 +142,7 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     // In memory, from the other side (#1868), and no scene save.
     expect(restorePrefabsInMemory).toHaveBeenCalledWith([{ source: SRC, doc: prefabBefore, from: prefabAfter }], expect.anything());
     expect(saveScene).not.toHaveBeenCalled();
-    expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneBefore });
+    expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneBefore, sceneCopies: expect.any(Map) }); // with the world's copy carry (#1939)
     // selection re-anchored to the applied instance root by guid (id 1).
     expect(selectEntity).toHaveBeenLastCalledWith(1);
 
@@ -150,7 +150,7 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     restorePrefabsInMemory.mockClear(); loadScene.mockClear();
     await pushed!.redo();
     expect(restorePrefabsInMemory).toHaveBeenCalledWith([{ source: SRC, doc: prefabAfter, from: prefabBefore }], expect.anything());
-    expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneAfter });
+    expect(loadScene).toHaveBeenCalledWith('scenes/test.json', { preloaded: sceneAfter, sceneCopies: expect.any(Map) });
   });
 
   // A3 (base-scene plan, Phase 1): sceneManager.loadScene({preloaded}) records a

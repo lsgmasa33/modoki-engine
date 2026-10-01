@@ -704,7 +704,11 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     const first = await save();
     expect(addedUnderA(first).find((n) => n.guid === QINST)!.traits).toEqual({});
     await nodeUnderA({ sortOrder: 2 });
-    await load(await save());
+    // A node that was a placeholder at the save reloads as one (#1939): the list names no live frame of Q.
+    const sc = await save() as SceneData & { embeddedPrefabFrames?: Record<string, string[]> };
+    expect(sc.embeddedPrefabFrames![Q]).toEqual([QINST]);
+    sc.embeddedPrefabFrames![Q] = [];
+    await load(sc);
     // #1901 (owner ruling, shape 2): the node shape keeps both now, so the gate lets them through.
     expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'sortOrder')).toBeNull();
     expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'isActive')).toBeNull();

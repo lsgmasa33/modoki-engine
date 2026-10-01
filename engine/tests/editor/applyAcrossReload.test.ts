@@ -59,6 +59,8 @@ const smLoad = vi.hoisted(() => ({
 vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   sceneManager: {
+    // A swap's copy carry (#1939): this fake world holds no scene copies.
+    captureSceneCopies: () => new Map(),
     getCurrent: () => ({ path: 'scenes/Level.json' }),
     getNext: () => null,
     getLoadedScenes: () => new Map(),

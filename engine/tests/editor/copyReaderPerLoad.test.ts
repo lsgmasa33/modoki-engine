@@ -218,12 +218,12 @@ describe('#1934 L1: a copy belongs to the scene that carried it', () => {
   });
 });
 
-describe('#1939 (OPEN, serious): the copy store is not carried across an Apply undo\'s world swap', () => {
-  // Hunt seed 1268's route, directed. Expected to FAIL until #1939 carries the copy store and frame documents across every
-  // world swap: then `it.fails` goes red, and this becomes a plain `it`. The Apply's snapshot is taken while Q is present,
-  // so it carries no copy of Q; Q is trashed after (its live frames kept, the save carries its copy); the Apply's undo
-  // reloads the snapshot, and Q's frames come back unexpanded, the next save writing no copy for them.
-  it.fails('undoing an Apply after a nested prefab was trashed keeps that prefab\'s live frames and its copy', async () => {
+describe('#1939 item 2 (serious): the copy store is carried across an Apply undo\'s world swap', () => {
+  // Hunt seed 1268's route, directed. The Apply's snapshot is taken while Q is present, so it carries no copy of Q; Q is
+  // trashed after (its live frames kept, the save carries its copy); the Apply's undo reloads the snapshot. Without the
+  // carry, Q's frames came back unexpanded and the next save wrote no copy for them.
+  // Mutation: drop `sceneCopies` from `applyPrefabUndo.ts`' three restores → `expected 2 to be 0` (unexpanded rows).
+  it('undoing an Apply after a nested prefab was trashed keeps that prefab\'s live frames and its copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-swap');
     const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
     const p1 = p1Id(f);

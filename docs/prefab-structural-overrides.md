@@ -207,7 +207,7 @@ file carries (`embeddedPrefabs`, v19, #1867; never another scene's, #1934 F1): a
 top-level instance whenever the copy is there (#1935), a nested frame only if it was
 live at the save. The load's one reader is the caller's cache, then those copies, so a
 prefab that loads always wins, and the expansion and the settle read the same
-documents (#1934 S1). A scene-added reference node does not read a copy yet (#1939). See [prefabs.md](prefabs.md) § "A scene backs up a missing prefab".
+documents (#1934 S1). A copy restores exactly the frames its scene lists live at the save (`embeddedPrefabFrames`, #1939), a reference node's too. See [prefabs.md](prefabs.md) § "A scene backs up a missing prefab".
 
 In `loadSceneFile.ts`, after `instantiatePrefabIntoWorld` spawns the prefab and
 `applyOverridesByLocalToEcs` replays value diffs:
