@@ -63,6 +63,11 @@ The table after the list says how far each rule is built.
 **Format rule (owner, 2026-10-02):** older override forms are converted on load and never written
 again. These are the localId channels, path-keyed `nestedOverrides`/`nestedStructure`, `moved` and
 legacy pins. There is one in-memory form and one writer.
+Two exceptions are written back verbatim, because no conversion is possible (hub refinement,
+2026-10-02, from #2001's study): a value no reader can parse (the S3 / F-CB1(a) rule), and the legacy
+channels of an instance whose prefab is missing, since a localId means something only next to its
+document (rule 9 keeps that list untouched). Both are converted on the first save after they become
+readable.
 
 | Rule | Built today? |
 |---|---|
