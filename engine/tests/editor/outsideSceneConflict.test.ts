@@ -26,7 +26,20 @@
  *  count → "Cancel on the conflict"; `endOutsideChangeHold` removed → "once the release applied"; the replay's closing
  *  `notifyPending` removed → "U4/#4".
  *  #1906: the open-dialog check made unconditional again (ahead of the dirty test, as it was) → both "#1906" cases go
- *  red, the other 23 stay green. */
+ *  red, the other 23 stay green.
+ *  #1924, each measured alone against the 37 tests here and in `choiceModalSignal.test.ts`: the change-applied branch
+ *  of the moot check removed (`applied = false`) → "a load applied the change" alone (the clean branch still closes the
+ *  dialog, but logs a change waiting that is not); the clean branch removed → "the scene saved under it" alone; the
+ *  clean put-back deferred one microtask → "#1906: the scene saved" alone (`settled synchronously`); the modal's abort
+ *  listener removed → its "an abort closes the dialog" alone. The close-out review's, the same way: the saved-over
+ *  branch removed → "the scene saved under it" alone (F2: the change put back, reloaded over the editor's own save);
+ *  `answerSceneConflict`'s put-back ignoring a pending newer change → "undone back to its save point" alone, and the
+ *  release taking the hold before filling its deferred list → the same test alone (F1); each `stop()` removed — the
+ *  moot check's → the load and save cases, the answer path's → F4 (F3: a 500 ms poll left running per dialog). The
+ *  re-review's: the save point not re-read on a re-ask → "#1924 re-review" 1 alone; the open-primary qualifier removed →
+ *  its 2 alone. The
+ *  production `watch` (pending list + 500 ms poll in `agentEditorOps.ts`) is played by hand here; it is verified live
+ *  (issue #1924's close comment). */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 
@@ -46,13 +59,14 @@ import { getCachedPrefabSync, preloadNestedPrefabsForSubtree, setPrefabCache } f
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { previewApply } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { undoStep, beginWorldBoundOperation, pushAction, undo } from '../../packages/modoki/src/editor/undo/undoManager';
-import { saveAll, saveScene, loadSceneReporting, unsavedChangeCauses, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';
+import { undoStep, beginWorldBoundOperation, pushAction, undo, canRedo } from '../../packages/modoki/src/editor/undo/undoManager';
+import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { saveAll, saveScene, loadSceneReporting, unsavedChangeCauses, hasUnsavedChanges, captureWorldDirtyBaseline, getCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
 import { owedSceneFileChanges } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { markAssetDirty, peekDirtyAsset, flushDirtyAssets, discardDirtyAssets, overwriteParkedAsset, CHANGED_OUTSIDE_BASELINE } from '../../packages/modoki/src/editor/scene/dirtyAssets';
 import {
   setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, pendingOutsideChanges, _setEditorFocusedForTests,
-  _resetOutsideChangesForTests, deferredOutsideChanges, onPendingOutsideChanges, runAgentOp,
+  _resetOutsideChangesForTests, deferredOutsideChanges, onPendingOutsideChanges, runAgentOp, awaitingSceneDecisions, heldOutsideChanges,
 } from '../../app/debug/agentBridge';
 import { makeSceneConflictResolver } from '../../app/editor/outsideRefresh';
 import { readAssetDocFresh } from '../../packages/modoki/src/editor/panels/assetDocLoad';
@@ -75,27 +89,46 @@ boot(be);
 const dialog = {
   choice: 'keep' as 'reload' | 'keep' | 'later', asked: [] as string[], open: false,
   answer: null as null | ((v: 'reload' | 'keep' | 'later') => void),
+  /** The open dialog's signal: aborted = closed from code as moot (#1924), as `openChoiceModal` closes on it. */
+  signal: null as AbortSignal | null,
+  /** The production poll's tick (`agentEditorOps.ts` polls every 500 ms while a question is open), run by hand. */
+  poll: null as null | (() => void),
 };
 const realResolver = makeSceneConflictResolver({
   causes: unsavedChangeCauses,
-  ask: async (urlPath) => {
+  ask: async (urlPath, signal) => {
     dialog.asked.push(urlPath);
+    dialog.signal = signal;
     if (!dialog.open) return dialog.choice;
-    return new Promise((resolve) => { dialog.answer = resolve; });
+    return new Promise((resolve) => {
+      dialog.answer = resolve;
+      signal.addEventListener('abort', () => resolve('later'), { once: true });
+    });
   },
   answer: answerSceneConflict,
+  awaiting: awaitingSceneDecisions,
+  watch: (check) => {
+    const off = onPendingOutsideChanges(() => check());
+    dialog.poll = check;
+    return () => { off(); dialog.poll = null; };
+  },
+  savedAt: () => captureWorldDirtyBaseline().savedAt,
+  isOpenPrimary: (urlPath) => getCurrentScenePath() === urlPath,
 });
 setSceneConflictResolver(realResolver);
 
 let pGuid = '';
 const p1 = () => getAllEntities().find((x) => { const pi = piOf(x.id); return !!pi && pi.rootInstanceId === x.id && pi.source === pGuid && x.parentId === 0; })!;
 const kids = () => getAllEntities().filter((e) => e.name === 'Kid' && e.parentId === p1().id).length;
+const plainX = () => (readTraitData(getAllEntities().find((e) => e.name === 'Plain')!.id, getTraitByName('Transform')!) as { x: number }).x;
 
 beforeEach(() => {
   dialog.choice = 'keep';
   dialog.asked.length = 0;
   dialog.open = false;
   dialog.answer = null;
+  dialog.signal = null;
+  dialog.poll = null;
   _setEditorFocusedForTests(() => false);
   _resetOutsideChangesForTests();
   onFetch.fn = null;
@@ -222,13 +255,13 @@ describe('the human\'s answers (review F3, F4, and the untested Reload and later
     expect(pendingOutsideChanges()).toEqual([f.scenePath]);
     dialog.answer!('reload');
     await settle();
+    expect(dialog.poll, 'an answered question unsubscribes its watch (#1924 review F3)').toBeNull();
     expect(kids(), 'the human\'s Reload did reload').toBe(2);
     expect(pendingOutsideChanges()).toEqual([]);
   });
 
   // #1906: the dialog's question is about unsaved work. Once the scene is clean under it, a NEWER outside write reloads as
   // any write to a clean scene does, instead of parking behind the stale dialog, whose Keep mine then dropped it.
-  const plainX = () => (readTraitData(getAllEntities().find((e) => e.name === 'Plain')!.id, getTraitByName('Transform')!) as { x: number }).x;
   async function newerWriteAfterClean(f: Fixture, makeClean: () => Promise<void>): Promise<void> {
     await outsideSceneWrite(f); // Plain.x = 9 on disk
     _setEditorFocusedForTests(() => true);
@@ -242,15 +275,19 @@ describe('the human\'s answers (review F3, F4, and the untested Reload and later
     doc.entities.find((e) => e.traits?.EntityAttributes?.name === 'Plain')!.traits!.Transform!.x = 13;
     be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
     bridge.emit('scene-changed', { urlPath: f.scenePath, kind: 'scene' }); // the watcher, with no release of its own
+    // #1924: the moot question is settled inside that notify, before any release can take the newer change. A put-back
+    // a few microtasks later parked the OLDER change in the hold the release had just emptied (measured).
+    expect(awaitingSceneDecisions(), 'settled synchronously').toEqual([]);
     const r = await releaseOutsideChanges(); // the focus gain, the stale dialog still up
     await settle();
     expect(r.sceneConflicts, 'a clean scene is not a conflict').toEqual([]);
     expect(r.applied).toEqual([f.scenePath]);
     expect(plainX(), 'the newer write reloaded').toBe(13);
     expect(dialog.asked, 'asked once, for the dirty scene only').toEqual([f.scenePath]);
-    dialog.answer!('keep'); // the stale dialog, answered at last
+    expect(dialog.signal!.aborted, 'the stale dialog closed itself (#1924)').toBe(true);
+    dialog.answer!('keep'); // a click racing the close
     await settle();
-    expect(plainX(), 'its Keep mine drops nothing').toBe(13);
+    expect(plainX(), 'it drops nothing').toBe(13);
     expect(pendingOutsideChanges()).toEqual([]);
   }
 
@@ -266,6 +303,189 @@ describe('the human\'s answers (review F3, F4, and the untested Reload and later
       await settle();
       expect(pendingOutsideChanges(), 'the load covered the asked-about change').toEqual([]);
     });
+  });
+});
+
+// #1924: a dialog whose question went moot closed only when clicked. It told the human a clean scene had unsaved
+// changes, kept `modal: scene-conflict` in the editor state, and its Keep mine logged "kept mine" over nothing.
+describe('#1924: a Reload / Keep mine dialog closes itself once its question is moot', () => {
+  const answerLogs = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.map((c) => String(c[0]))
+    .filter((l) => /kept mine|reloading from disk|asked again/.test(l));
+
+  async function dialogUp(key: string): Promise<Fixture> {
+    const f = await kidApplied(key, true);
+    await outsideSceneWrite(f); // Plain.x = 9 on disk
+    _setEditorFocusedForTests(() => true);
+    dialog.open = true;
+    await releaseOutsideChanges();
+    expect(dialog.answer, 'the dialog is up').not.toBeNull();
+    expect(awaitingSceneDecisions()).toEqual([f.scenePath]);
+    return f;
+  }
+
+  it('a load applied the change (the observed repro): the dialog closes, nothing is answered, and a new conflict asks again', async () => {
+    const f = await dialogUp('c-m-load');
+    const log = vi.spyOn(console, 'log');
+    try {
+      expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+      await settle();
+      expect(dialog.signal!.aborted, 'closed by the load').toBe(true);
+      expect(dialog.poll, 'its watch unsubscribed (review F3: else a 500 ms poll per dialog, forever)').toBeNull();
+      expect(hasUnsavedChanges()).toBe(false);
+      expect(plainX(), 'the load read the disk').toBe(9);
+      expect(pendingOutsideChanges()).toEqual([]);
+      expect(answerLogs(log), 'no answer logged — in particular no false "kept mine"').toEqual([]);
+      expect(log.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('question is moot')),
+        'says what happened: applied, not "waits for the next refresh"').toEqual([
+        `[agentBridge] ${f.scenePath}: the Reload / Keep mine question is moot — the change it asked about was applied; closed it`,
+      ]);
+    } finally { log.mockRestore(); }
+    // The question is closed for good: the next outside write over new unsaved work is asked about afresh.
+    const { specs } = emptySpecs(p1().id);
+    createEntityWithUndo('Create Kid2', p1().id, specs, () => {});
+    await settle();
+    expect(hasUnsavedChanges()).toBe(true);
+    be.marked.clear();
+    const before = be.snapshot();
+    const doc = JSON.parse(be.read(f.scenePath)!) as { entities: { traits?: { EntityAttributes?: { name?: string }; Transform?: { x: number } } }[] };
+    doc.entities.find((e) => e.traits?.EntityAttributes?.name === 'Plain')!.traits!.Transform!.x = 21;
+    be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
+    expect(await flushWatcher(be, before)).toEqual([f.scenePath]);
+    await releaseOutsideChanges();
+    expect(dialog.asked, 'asked a second time').toEqual([f.scenePath, f.scenePath]);
+    expect(dialog.signal!.aborted, 'the new dialog is up').toBe(false);
+  });
+
+  it('the scene saved under it: open while dirty, closed at the next poll, and the save superseded the change (review F2)', async () => {
+    const f = await dialogUp('c-m-save');
+    const x0 = plainX();
+    dialog.poll!();
+    expect(dialog.signal!.aborted, 'still dirty: the question stands').toBe(false);
+    expect((await saveAll({ allowDialog: false })).saved).toBe(true);
+    expect(dialog.signal!.aborted, 'a save fires nothing; the poll finds it').toBe(false);
+    const log = vi.spyOn(console, 'log');
+    try {
+      dialog.poll!();
+      await settle();
+      expect(dialog.signal!.aborted, 'closed: the scene is clean').toBe(true);
+      expect(dialog.poll, 'its watch unsubscribed').toBeNull();
+      expect(answerLogs(log)).toEqual([]);
+    } finally { log.mockRestore(); }
+    // The save wrote the editor's version over the outside one: nothing is left to apply, and nothing reloads over the
+    // editor's own bytes. Put back instead, the release below reloaded the scene and dropped the undo history.
+    expect(awaitingSceneDecisions()).toEqual([]);
+    expect(pendingOutsideChanges(), 'superseded, not put back').toEqual([]);
+    const r = await releaseOutsideChanges();
+    await settle();
+    expect(r.applied, 'nothing to reload').toEqual([]);
+    expect(plainX()).toBe(x0);
+    expect(dialog.asked, 'asked once').toEqual([f.scenePath]);
+    expect((await undoStep('undo')).did, 'the undo history survives the save, as Keep mine keeps it').toBe(true);
+  });
+
+  it('undone back to its save point: the change goes back to the hold — and not behind a newer one a release took (review F1)', async () => {
+    // A plain scene edit on a freshly loaded scene, so one undo lands back on the state the file holds.
+    const f = await startRun(be, async () => {}, 'c-m-undo');
+    pGuid = f.prefabs.P.guid;
+    const { specs } = emptySpecs(p1().id);
+    createEntityWithUndo('Create Kid', p1().id, specs, () => {});
+    await settle();
+    expect(hasUnsavedChanges()).toBe(true);
+    await outsideSceneWrite(f); // Plain.x = 9 on disk
+    _setEditorFocusedForTests(() => true);
+    dialog.open = true;
+    await releaseOutsideChanges();
+    expect(dialog.answer, 'the dialog is up').not.toBeNull();
+    // A newer write lands while the scene is still dirty: held, the question stands.
+    be.marked.clear();
+    const doc = JSON.parse(be.read(f.scenePath)!) as { entities: { traits?: { EntityAttributes?: { name?: string }; Transform?: { x: number } } }[] };
+    doc.entities.find((e) => e.traits?.EntityAttributes?.name === 'Plain')!.traits!.Transform!.x = 17;
+    be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
+    bridge.emit('scene-changed', { urlPath: f.scenePath, kind: 'scene' }); // the watcher, with no release of its own
+    expect(heldOutsideChanges()).toEqual([f.scenePath]);
+    expect(dialog.signal!.aborted, 'still dirty').toBe(false);
+    expect((await undoStep('undo')).did).toBe(true); // the create undone: back at the state the file held
+    expect(hasUnsavedChanges(), 'clean without a save').toBe(false);
+    // The focus gain lands before the next poll: the question goes moot inside the release itself.
+    const r = await releaseOutsideChanges();
+    await settle();
+    expect(dialog.signal!.aborted, 'closed').toBe(true);
+    expect(r.applied).toEqual([f.scenePath]);
+    expect(plainX(), 'the newer write reloaded').toBe(17);
+    expect(pendingOutsideChanges(), 'the older change is not parked behind it').toEqual([]);
+  });
+});
+
+// The re-review of the F2 fix: "the save point moved" is not "this file was saved over" unless it moved after the
+// change now asked about arrived, and while the scene is still the open primary. Either gap dropped a change still on disk.
+describe('#1924 re-review: a moot question drops its change only when THIS file was saved over it', () => {
+  const writeX = (f: Fixture, x: number) => {
+    const doc = JSON.parse(be.read(f.scenePath)!) as { entities: { traits?: { EntityAttributes?: { name?: string }; Transform?: { x: number } } }[] };
+    doc.entities.find((e) => e.traits?.EntityAttributes?.name === 'Plain')!.traits!.Transform!.x = x;
+    be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
+  };
+
+  it('1: a save, then a newer write re-asked, then an undo to the save — the newer change, still on disk, reaches the editor', async () => {
+    const f = await kidApplied('c-r-1', true);
+    await outsideSceneWrite(f); // x = 9, asked about
+    _setEditorFocusedForTests(() => true);
+    dialog.open = true;
+    await releaseOutsideChanges();
+    expect(dialog.answer).not.toBeNull();
+    expect((await saveAll({ allowDialog: false })).saved).toBe(true); // over x = 9; no poll sees it
+    const { specs } = emptySpecs(0);
+    createEntityWithUndo('Create Late', 0, specs, () => {});
+    await settle();
+    expect(hasUnsavedChanges()).toBe(true);
+    be.marked.clear();
+    writeX(f, 17); // a NEW outside write, after the save
+    bridge.emit('scene-changed', { urlPath: f.scenePath, kind: 'scene' });
+    await releaseOutsideChanges(); // dirty, the question open: re-asked about the new change
+    await settle();
+    expect(awaitingSceneDecisions()).toEqual([f.scenePath]);
+    expect(dialog.signal!.aborted).toBe(false);
+    expect((await undoStep('undo')).did).toBe(true); // back to the save point: clean, with no save since the new change
+    expect(hasUnsavedChanges()).toBe(false);
+    dialog.poll!();
+    await settle();
+    expect(dialog.signal!.aborted).toBe(true);
+    expect(pendingOutsideChanges(), 'put back, not dropped').toEqual([f.scenePath]);
+    await releaseOutsideChanges();
+    await settle();
+    expect(plainX(), 'the outside write made after the save reaches the editor').toBe(17);
+  });
+
+  it('2: undone to clean, then another scene loaded before the poll — the change goes back, and its debt is paid on reopen', async () => {
+    const f = await startRun(be, async () => {}, 'c-r-2');
+    pGuid = f.prefabs.P.guid;
+    const yPath = f.scenePath.replace(/([^/]+)$/, 'Other.scene.json');
+    const yGuid = 'abababab-0000-4000-8000-000000000002';
+    const ydoc = JSON.parse(be.read(f.scenePath)!) as { id: string };
+    ydoc.id = yGuid;
+    be.write(yPath, `${JSON.stringify(ydoc, null, 2)}\n`);
+    registerAsset(yGuid, yPath, 'scene');
+    const { specs } = emptySpecs(p1().id);
+    createEntityWithUndo('Create Kid', p1().id, specs, () => {});
+    await settle();
+    await outsideSceneWrite(f);
+    _setEditorFocusedForTests(() => true);
+    dialog.open = true;
+    await releaseOutsideChanges();
+    expect(dialog.answer).not.toBeNull();
+    expect((await undoStep('undo')).did).toBe(true);
+    expect(hasUnsavedChanges()).toBe(false);
+    expect((await loadSceneReporting(yPath)).outcome).toBe('loaded');
+    await settle();
+    dialog.poll?.();
+    await settle();
+    expect(dialog.signal!.aborted).toBe(true);
+    expect(pendingOutsideChanges(), 'a scene switch wrote nothing: the change goes back').toEqual([f.scenePath]);
+    await releaseOutsideChanges();
+    await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    expect(plainX()).toBe(9);
+    expect(canRedo(), 'a stack recorded over the old bytes must not come back (#1744)').toBe(false);
   });
 });
 
@@ -677,8 +897,7 @@ describe('the hold (#1879 parts 1-2)', () => {
     be.write(f.scenePath, `${JSON.stringify(doc, null, 2)}\n`);
     bridge.emit('scene-changed', { urlPath: f.scenePath, kind: 'scene' }); // the watcher, with no release after it
     await settle();
-    const plainX = () => (readTraitData(getAllEntities().find((e) => e.name === 'Plain')!.id, getTraitByName('Transform')!) as { x: number }).x;
-    expect(pendingOutsideChanges()).toEqual([f.scenePath]);
+      expect(pendingOutsideChanges()).toEqual([f.scenePath]);
     expect(plainX(), 'held: the world still shows the old file').toBe(0);
     const r = await releaseOutsideChanges();
     await settle();

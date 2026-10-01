@@ -86,7 +86,7 @@ or file-direct `modoki_mutate_scene`/`modoki_write_asset`) the Unity way: noted 
   edited since. When the read covers a change, the load adopts with a fresh history itself (`freshIncoming`): the stack
   was recorded over the old bytes (#1744). One accepted over-drop: a dirty scene whose open *Reload / Keep mine*
   question is covered after its unsaved work was SAVED over the change (then loaded clean) loses the stack that Keep
-  mine would have kept — a scene file has no supersede tracking on either path. ⚠️ Not as the owner's debt (`recordSceneFileChanged`): raised inside the load's route,
+  mine would have kept — a scene file has no supersede tracking on either path (#1930). ⚠️ Not as the owner's debt (`recordSceneFileChanged`): raised inside the load's route,
   which registered first, its own adopt could not pay it, and the NEXT adopt of the scene dropped a stack recorded
   over the new bytes (close-out review F1, measured at the real seam). A load of the scene does NOT apply a held
   PREFAB or asset change it uses — it takes those from caches, which only their own refresh brings up to date. Nor does
@@ -167,7 +167,26 @@ and re-read described above are what a SCENE reload (and that clean-scene fallba
 **An outside change to a scene with unsaved edits is ASKED about, never applied silently** (owner ruling 2026-09-30,
 #1879 part 3, amending #1164's disk-wins for the dirty case): a focused human gets the `scene-conflict` dialog, *Reload*
 / *Keep mine*; nobody focused, it stays pending until `modoki_refresh {scene: 'reload' | 'keep'}`. A clean scene still
-reloads silently. A reload the human or agent CHOOSES discards the unsaved edits and drops their undo history with
+reloads silently. **The dialog closes itself once its question is moot** (#1924): when the change it asks about is
+applied without it (a load read the file fresh, #1899; a newer change to the scene, clean by then, replaced and applied
+it, #1906), it closes and nothing is answered; when the scene was SAVED since the asked-about change arrived (the
+primary's save point, `captureWorldDirtyBaseline().savedAt`, moved, and the scene is still the open primary), the save
+wrote the editor's version over the outside one, so the change is dropped as Keep mine drops it and the undo history
+stays — put back, the next release reloaded the editor's own bytes and dropped the history (close-out review F2,
+measured). Both qualifiers were measured as needed: the save point is re-read when a newer change replaces the asked-about
+one (read only at the first ask, a save BEFORE the newer change dropped that change, still on disk), and a switch to
+another scene or a Save-As moves it without writing this file (dropped, the scene's file-change debt was never raised,
+and it reopened with a stack recorded over the old bytes, #1744). When the scene went clean WITHOUT that (undone to its
+save point; a scene switch; or a loaded base, whose saves this cannot see) the outside bytes are still on disk, so it closes and the
+change goes back to the hold, as Escape puts it, for the next focus gain or refresh to apply by the clean-scene rule.
+`makeSceneConflictResolver` (`editor/outsideRefresh.ts`) re-checks an open question on every `pendingOutsideChanges`
+change and on a 500 ms poll — a scene going clean fires no event, and a save notifies nobody — and settles it
+synchronously. A put-back (that one, or Escape's) never lands behind a newer change to the file already pending replay,
+and a release fills its deferred list BEFORE it empties the hold: a question settled inside the release's own
+notification otherwise parked the older change in the emptied hold, reloading the scene a second time at the next
+release (review F1, measured). Left up,
+the dialog told the human a clean scene had unsaved changes, held `modal: scene-conflict` in the editor state, and its
+Keep mine logged "kept mine" over nothing (observed live). A reload the human or agent CHOOSES discards the unsaved edits and drops their undo history with
 them, then makes the reloaded world the clean baseline (#1409). The exception is a base scene the reload KEEPS:
 its edits survive live and so does its dirty flag (#1417). The rule and why:
 [scene-loading.md § Per-scene undo history](scene-loading.md#per-scene-undo-history).

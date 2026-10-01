@@ -1,10 +1,14 @@
-/** Guard: the `uuid`/`nanoid` transitive-dep pins documented in docs/native-and-sdks.md §
- *  "Pinned transitive deps" actually hold across the tree.
+/** Guard: the `uuid`/`nanoid`/`@grpc/grpc-js` transitive-dep pins documented in
+ *  docs/native-and-sdks.md § "Pinned transitive deps" actually hold across the tree.
  *
  *  `@capacitor/cli` -> `xcode` -> `uuid@^7.0.3` is vulnerable and upstream will not fix it
  *  (`xcode@latest` still pins `uuid ^7`), so every project that depends on `@capacitor/cli` must
  *  carry an `overrides.uuid` pin to `^11.1.1`. `postcss` -> `nanoid@^3.3.16` is the sibling case
- *  (vulnerable, fixed in 3.3.17), pinned at the repo root and in `site/`.
+ *  (vulnerable, fixed in 3.3.17), pinned at the repo root and in `site/`. `firebase` ->
+ *  `@firebase/firestore` -> `@grpc/grpc-js@~1.9.0` is the third (fixed in 1.13.6 / 1.14.5, #1927),
+ *  pinned to `^1.14.5` in each firebase-using game. It is checked by (a) only: unlike the `uuid` pin,
+ *  which sits inert until a lockfile floats to `@capacitor/cli` 8.5, every firebase project resolves
+ *  grpc-js as soon as it has a lockfile, so (a) fires on the first install of a new one.
  *
  *  This test exists because the doc's own postmortem says the drift was invisible the first time:
  *  "the drift was invisible because the doc asserted the invariant instead of the re-check command
@@ -105,7 +109,7 @@ function versionBelow(version: string, floor: string): boolean {
   return false;
 }
 
-describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "Pinned transitive deps" (#177)', () => {
+describe('pinned transitive deps (uuid/nanoid/grpc-js) — docs/native-and-sdks.md § "Pinned transitive deps" (#177)', () => {
   describe('(a) resolution floor — no tracked lockfile resolves a known-vulnerable pinned version', () => {
     const lockfiles = trackedMatching(/(^|\/)package-lock\.json$/);
 
@@ -131,7 +135,7 @@ describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "P
       expect(uuidLockfileCount).toBeGreaterThanOrEqual(UUID_LOCKFILE_DETECTION_FLOOR);
     });
 
-    it('every tracked package-lock.json resolves uuid >= 11 and nanoid >= 3.3.17', () => {
+    it('every tracked package-lock.json resolves uuid >= 11, nanoid >= 3.3.17 and a patched @grpc/grpc-js', () => {
       const offenders: string[] = [];
       for (const rel of lockfiles) {
         // Read + JSON.parse rather than require(): keeps this fast on large lockfiles and avoids
@@ -156,6 +160,17 @@ describe('pinned transitive deps (uuid/nanoid) — docs/native-and-sdks.md § "P
               `"Pinned transitive deps") and re-run \`npm install --package-lock-only --ignore-scripts\`. ` +
               `Run a plain \`npm install\` there FIRST — on a stale node_modules it poisons ` +
               `vendored plugins (docs/build.md, #685).`);
+          }
+          // Two advisories (GHSA-f596-whhp-79r4, GHSA-m9gg-hp2v-232j) cover BOTH lines below 1.13.6
+          // and 1.14.0-1.14.4, so 1.14.0 is not safe merely for being newer than 1.13.6 (#1927).
+          if (
+            name === '@grpc/grpc-js' &&
+            (versionBelow(version, '1.13.6') || (version.startsWith('1.14.') && versionBelow(version, '1.14.5')))
+          ) {
+            offenders.push(`${rel}: ${key} resolves @grpc/grpc-js@${version} (vulnerable, fixed in ` +
+              `1.13.6 / 1.14.5) — "@firebase/firestore" pins "~1.9.0", so pin "overrides": ` +
+              `{ "@grpc/grpc-js": "^1.14.5" } (see docs/native-and-sdks.md § "Pinned transitive deps") ` +
+              `and re-run a plain \`npm install\` there.`);
           }
         }
       }

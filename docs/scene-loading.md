@@ -2707,7 +2707,7 @@ Where it applies:
   Cmd+S overwrites the file. Dismissing the dialog (Escape) puts the change back in the hold, asked again at the next
   focus gain or refresh. **An open question holds only while its scene is dirty** (#1906): a newer change to a scene
   that went CLEAN under the open dialog (saved, or reloaded by a load, #1899) reloads as any change to a clean scene
-  does, and the stale dialog's answer then finds nothing. Parked behind the dialog instead, its Keep mine dropped the
+  does, and the stale dialog closes itself (#1924, [editor-hmr.md](editor-hmr.md#outside-changes-wait-for-a-focus-gain-or-modoki_refresh-1879)). Parked behind the dialog instead, its Keep mine dropped the
   newer change with no unsaved work kept, and the editor showed the old file with nothing pending (measured live on
   `8b8c6649c`). While the scene is still dirty the question stays the human's: an unfocused release or an agent's
   `scene` answer does not take the change from under the dialog (review F4). #1878's two Apply splits (an outside scene write between an Apply and Cmd+S duplicating or

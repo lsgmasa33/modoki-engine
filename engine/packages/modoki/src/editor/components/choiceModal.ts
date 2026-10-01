@@ -8,7 +8,8 @@
  *
  *  Resolves the chosen `value`; Escape and a backdrop click resolve `cancelValue`. The button named
  *  by `focus` takes focus on open, so Enter answers with THAT choice — a caller whose choices include
- *  a destructive one focuses the safe one, so destroying work takes a deliberate click. */
+ *  a destructive one focuses the safe one, so destroying work takes a deliberate click. An aborted
+ *  `signal` closes it the same way, for a question that went moot while it was up. */
 
 import { openDomModalShell } from './modalBackdrop';
 
@@ -30,6 +31,9 @@ export interface ChoiceModalOptions<T extends string> {
   choices: ModalChoice<T>[];
   cancelValue: T;
   focus: T;
+  /** Closes the dialog from code, resolving `cancelValue`, once its question is moot (#1924: a load already applied
+   *  the change a "Reload / Keep mine" dialog asks about). The caller reads `signal.aborted` to tell this from Escape. */
+  signal?: AbortSignal;
 }
 
 const TONE_STYLE: Record<NonNullable<ModalChoice<string>['tone']>, string> = {
@@ -89,6 +93,8 @@ export function openChoiceModal<T extends string>(opts: ChoiceModalOptions<T>): 
     overlay.onkeydown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { e.preventDefault(); done(opts.cancelValue); }
     };
+    if (opts.signal?.aborted) done(opts.cancelValue);
+    else opts.signal?.addEventListener('abort', () => done(opts.cancelValue), { once: true });
     setTimeout(() => buttons.get(opts.focus)?.focus(), 0);
   });
 }

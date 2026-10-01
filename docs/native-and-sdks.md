@@ -1463,12 +1463,13 @@ It is called explicitly on open — **not** buried inside `ensureProjectDeps` �
 ### Pinned transitive deps — `overrides` for a vulnerability upstream won't fix
 
 When a security alert lands on a **transitive** dep that no upstream release will clear, the fix is
-an npm `overrides` entry in the owning project's `package.json`. Two live cases:
+an npm `overrides` entry in the owning project's `package.json`. Three live cases:
 
 | Pin | Where | Pulled in by |
 |---|---|---|
 | `"uuid": "^11.1.1"` | every manifest that declares `@capacitor/cli` — 23 today: most of `games/*`, all of `demos/*`, and the repo root | `@capacitor/cli` → `xcode` → `uuid@^7.0.3` |
 | `"nanoid": "^3.3.17"` | the repo root and `site/` | `vite`/`vitest`/`@vitejs/plugin-react`/`@vitest/coverage-v8` (root) and `vitepress` (site), each → `postcss` → `nanoid@^3.3.16` |
+| `"@grpc/grpc-js": "^1.14.5"` | every project that depends on `firebase` — `games/{court,wordweave,slime-shooter,3d-test}` | `firebase` → `@firebase/firestore` → `@grpc/grpc-js@~1.9.0` |
 
 ⚠️ **"Most of `games/*`" is correct, not drift.** A project with no `@capacitor/cli` — `anim-bug`,
 `video-test`, `ota-subgame-test`, and `engine/templates/starter` today — needs no pin and must not be
@@ -1524,6 +1525,30 @@ loop forever when `size` is 0; fixed in 3.3.17). `^3.3.17` satisfies postcss's o
 is a straight resolution bump with no peer risk. Dependabot could not do it itself: at the root the
 only top-level owners are the test/build toolchain, and in `site/` the sole path npm found was
 **downgrading vitepress 1.6.4 → 0.22.4**, which it correctly refused.
+
+#### `@grpc/grpc-js`
+
+`@firebase/firestore` pins `@grpc/grpc-js` at `~1.9.0` (still true of firestore 4.17.2, 2026-10-01), and
+both advisories against it (GHSA-f596-whhp-79r4, GHSA-m9gg-hp2v-232j) were fixed only in 1.13.6 and
+1.14.5. No 1.9.x carries the fix, so `npm update` cannot clear it; the pin is the only route (#1927).
+
+Neither advisory is reachable in a shipped game, which is why the jump across four minors is safe
+here. Both are SERVER-side (a method handler's error text sent to the client; `getAuthContext` on
+a server's TLS peer), and firestore is a client. More to the point, grpc-js is firestore's NODE
+transport: the browser build uses WebChannel, and a built Court web bundle contains no grpc-js at
+all (checked 2026-10-01 for #1927). Firestore itself IS in the bundle, so this is not an empty
+search: `firestore.googleapis.com` and `WebChannel` match, while grpc-js's own marker strings, which
+its package source does contain, match nothing:
+
+```bash
+MODOKI_PROJECT=games/court npm run build -- --target web
+for n in GRPC_TRACE grpc-node-js grpc.max_receive_message_length WebChannel; do
+  echo "$n dist:$(grep -rlF -- "$n" games/court/dist | wc -l) pkg:$(grep -rlF -- "$n" games/court/node_modules/@grpc/grpc-js/build/src | wc -l)"
+done   # expect dist:0 for the three grpc markers, dist:1+ for WebChannel
+```
+
+So the pin changes only a Node code path none of these games run. Add it to any new project that
+depends on `firebase` or `@capacitor-firebase/*`.
 
 #### Re-checking the set
 

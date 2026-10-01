@@ -3327,13 +3327,18 @@ let _releaseChain: Promise<unknown> = Promise.resolve();
  *  for it. `decision` answers a scene-over-unsaved-work question when no human has the editor focused. */
 export function releaseOutsideChanges(opts: { decision?: 'reload' | 'keep' } = {}): Promise<OutsideReleaseReport> {
   const run = async (): Promise<OutsideReleaseReport> => {
-    const msgs = _outsideHold.take();
+    // Into the deferred list BEFORE the hold is emptied: `take` tells its listeners, and an open question settled there
+    // (Escape, or one gone moot, #1924) puts its change back unless a newer one for the file is pending. Taken first,
+    // the batch was in neither list at that instant, and the older change landed in the emptied hold behind it — to be
+    // reloaded a second time at the next release (#1924 close-out review F1, measured).
+    const msgs = _outsideHold.peek();
     if (!msgs.length) return { applied: [], deferred: [], sceneConflicts: [] };
     for (const m of msgs) {
       _suppressedReloads.delete(m.urlPath);
       // THIS release's answer, or none: a change put back ("later", `held`) must not keep an older one (review 2, #1).
       _suppressedReloads.set(m.urlPath, { ...m, decision: opts.decision });
     }
+    _outsideHold.take();
     notifyPending();
     const state: ReleaseState = { conflicts: [] };
     _release = state;
@@ -3350,12 +3355,14 @@ export function releaseOutsideChanges(opts: { decision?: 'reload' | 'keep' } = {
 
 /** The human's answer to an open "Reload / Keep mine" question. `reload` reloads the scene from disk now; `keep` only
  *  closes the question (the unsaved work stays, and the next save overwrites the file); `later` (the dialog dismissed)
- *  puts the change back in the hold, so the next focus gain or refresh asks again. */
+ *  puts the change back in the hold, so the next focus gain or refresh asks again — unless a newer change to the file
+ *  is already pending replay (a release in flight, a Play deferral): that one re-reads the whole file, so the older one
+ *  would only reload it a second time (#1924 close-out review F1). */
 export async function answerSceneConflict(urlPath: string, answer: 'reload' | 'keep' | 'later'): Promise<void> {
   const msg = _awaitingDecision.get(urlPath);
   if (!msg) return;
   _awaitingDecision.delete(urlPath);
-  if (answer === 'later') _outsideHold.putBack([{ ...msg, decision: undefined }]);
+  if (answer === 'later' && !_suppressedReloads.has(urlPath)) _outsideHold.putBack([{ ...msg, decision: undefined }]);
   notifyPending();
   if (answer === 'reload') await handleSceneChanged({ ...msg, reload: true });
 }
@@ -3386,7 +3393,7 @@ export function outsideFileReadBegins(urlPath: string): number[] {
 }
 
 /** The read {@link outsideFileReadBegins} announced was applied: the held, deferred or asked-about changes it covered are
- *  dropped. An open question's dialog stays on screen until answered; its answer then finds nothing to apply.
+ *  dropped. An open question's dialog closes once it hears this (`makeSceneConflictResolver`, #1924).
  *  An ASSET document's read was the panel's own, so the release's other half runs here: its runtime cache is dropped
  *  (entities playing the clip, the material on screen, pick up the file the panel now shows) and every surface is woken.
  *  Its park is NOT touched — the reader read because there was none, and one made since was made on these bytes.

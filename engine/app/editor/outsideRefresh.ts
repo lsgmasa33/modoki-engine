@@ -32,33 +32,101 @@ const ASKING = 'A scene with unsaved edits changed on disk; the human is asked "
  *  question put to the human — once per scene while it is open. Unsaved = that scene's OWN edits: the primary's
  *  `sceneDirty` (the world's edit version against its save), a loaded base's dirty flag. Not the scene-guid registry for
  *  the primary: right after an Apply it reads clean while `sceneDirty` does not (#1878 re-verify). "Keep mine" writes
- *  nothing: a scene save sends no if-match, so the next Cmd+S overwrites the file. `ask` is the dialog; `answer` hands
- *  its choice back to the bridge (`answerSceneConflict`). */
+ *  nothing: a scene save sends no if-match, so the next Cmd+S overwrites the file. `ask` is the dialog, closed through
+ *  its `signal` once the question goes moot; `answer` hands its choice back to the bridge (`answerSceneConflict`).
+ *
+ *  An open question is re-checked whenever `watch` calls back, and closed when it went MOOT (#1924):
+ *  - the change it asks about is no longer awaiting (`awaiting`) — a load read the file fresh and applied it (#1899), or
+ *    a newer change to the scene, clean by then, replaced and applied it (#1906): the dialog closes and nothing is
+ *    answered;
+ *  - the scene was SAVED since the change it asks about arrived (the primary's save point, `savedAt`, moved while the
+ *    scene is still the open primary): the save wrote the editor's version over the outside one, which is gone from
+ *    disk, so the change is dropped as Keep mine drops it, and the undo history stays. Put back instead, the next
+ *    release reloaded the editor's own bytes and dropped the history (close-out review F2, measured). The save point
+ *    is re-read when a newer change replaces the asked-about one — read at the first ask, a save before the newer
+ *    change dropped that change, still on disk (re-review 1, measured) — and a switch to another scene or a Save-As
+ *    moves it too, without writing this file, so then the change goes back (re-review 2: dropped, its file-change
+ *    debt was never raised, and the scene reopened with a stack recorded over the old bytes);
+ *  - the scene has no unsaved edits any more without a save (undone back to its save point, or a loaded base, whose
+ *    saves this cannot see): the dialog closes and the change goes back to the hold, as Escape puts it, so the next
+ *    focus gain or refresh decides it by the clean-scene rule — what a change held over a clean scene gets with no
+ *    dialog ever shown.
+ *  Left up, the dialog told the human a clean scene had unsaved changes, kept `modal: scene-conflict` in the editor
+ *  state, and its Keep mine logged "kept mine" over nothing (measured live). */
 export function makeSceneConflictResolver(deps: {
   causes: () => { sceneDirty: boolean; dirtyScenes: string[] };
-  ask: (urlPath: string) => Promise<'reload' | 'keep' | 'later'>;
+  ask: (urlPath: string, signal: AbortSignal) => Promise<'reload' | 'keep' | 'later'>;
   answer: (urlPath: string, choice: 'reload' | 'keep' | 'later') => Promise<void>;
+  /** The scene changes whose question is open (`awaitingSceneDecisions`). */
+  awaiting: () => string[];
+  /** Calls `check` whenever an open question may have gone moot; returns the unsubscribe. */
+  watch: (check: () => void) => () => void;
+  /** The primary scene's save point (`captureWorldDirtyBaseline().savedAt`): it moves on a save, a load or a new scene,
+   *  never on an undo back to the saved state. */
+  savedAt: () => number;
+  /** Is `urlPath` the open primary scene's file? */
+  isOpenPrimary: (urlPath: string) => boolean;
 }): (c: SceneConflict) => Promise<SceneConflictAnswer> {
   const asking = new Set<string>();
-  return async ({ urlPath, baseGuid, decision, focused }) => {
+  /** Per open question: the save point when the change it now asks about arrived. */
+  const savedAtArrival = new Map<string, number>();
+  const isDirty = (baseGuid: string | undefined) => {
     const causes = deps.causes();
-    const dirty = baseGuid ? causes.dirtyScenes.includes(baseGuid) : causes.sceneDirty;
+    return baseGuid ? causes.dirtyScenes.includes(baseGuid) : causes.sceneDirty;
+  };
+  return async ({ urlPath, baseGuid, decision, focused }) => {
+    const dirty = isDirty(baseGuid);
     // A question already open in front of the human stays theirs while there is unsaved work to decide about: an
     // unfocused release or an agent's answer must not take the change from under the dialog, whose Reload would then do
     // nothing (review F4). Once the scene is CLEAN (saved, or reloaded by a load) the dialog's question is moot, and a
-    // newer change reloads as any change to a clean scene does; the stale dialog's answer then finds nothing. Parked
-    // behind it instead, its Keep mine dropped that change with no unsaved work kept (#1906, measured live).
-    if (dirty && asking.has(urlPath)) return 'asking';
+    // newer change reloads as any change to a clean scene does; the stale dialog closes once that change is applied.
+    // Parked behind it instead, its Keep mine dropped that change with no unsaved work kept (#1906, measured live).
+    if (dirty && asking.has(urlPath)) {
+      savedAtArrival.set(urlPath, deps.savedAt()); // the question now asks about THIS change
+      return 'asking';
+    }
     const answer = decideSceneConflict({ dirty, focused, decision });
     if (answer === 'kept') console.log(`[agentBridge] ${urlPath} changed on disk — kept the unsaved edits (the next save overwrites the file)`);
     if (answer === 'held') console.warn(`[agentBridge] ${urlPath} changed on disk under unsaved edits — pending until someone chooses Reload or Keep mine`);
     if (answer === 'asking' && !asking.has(urlPath)) {
       asking.add(urlPath);
-      void deps.ask(urlPath).then(async (choice) => {
+      const moot = new AbortController();
+      savedAtArrival.set(urlPath, deps.savedAt());
+      let stop: () => void = () => {};
+      // Settled HERE, synchronously, not after the dialog's promise: a put-back that waited a microtask could land after
+      // a release had taken a newer held change for the scene, and park the older one in the empty hold behind it.
+      const check = () => {
+        if (moot.signal.aborted) return;
+        const applied = !deps.awaiting().includes(urlPath);
+        if (!applied && isDirty(baseGuid)) return;
+        moot.abort();
+        stop();
         asking.delete(urlPath);
+        const savedAtThen = savedAtArrival.get(urlPath);
+        savedAtArrival.delete(urlPath);
+        if (applied) {
+          console.log(`[agentBridge] ${urlPath}: the Reload / Keep mine question is moot — the change it asked about was applied; closed it`);
+          return;
+        }
+        if (!baseGuid && deps.savedAt() !== savedAtThen && deps.isOpenPrimary(urlPath)) {
+          console.log(`[agentBridge] ${urlPath}: the Reload / Keep mine question is moot — the scene was saved over the outside change; closed it`);
+          void deps.answer(urlPath, 'keep');
+          return;
+        }
+        console.log(`[agentBridge] ${urlPath}: the Reload / Keep mine question is moot — the scene has no unsaved edits now; closed it, and the change waits for the next focus gain or refresh`);
+        void deps.answer(urlPath, 'later');
+      };
+      stop = deps.watch(check);
+      if (moot.signal.aborted) stop(); // `watch` checked at once, and it was moot already
+      void deps.ask(urlPath, moot.signal).then(async (choice) => {
+        if (moot.signal.aborted) return; // closed as moot: `check` settled it
+        moot.abort();
+        stop();
+        asking.delete(urlPath);
+        savedAtArrival.delete(urlPath);
         console.log(`[agentBridge] ${urlPath} changed on disk under unsaved edits — ${choice === 'later' ? 'asked again at the next refresh' : choice === 'keep' ? 'kept mine' : 'reloading from disk'}`);
         await deps.answer(urlPath, choice);
-      }, (e) => { asking.delete(urlPath); console.error(`[agentBridge] asking about ${urlPath} failed:`, e); void deps.answer(urlPath, 'later'); });
+      }, (e) => { if (moot.signal.aborted) return; moot.abort(); stop(); asking.delete(urlPath); savedAtArrival.delete(urlPath); console.error(`[agentBridge] asking about ${urlPath} failed:`, e); void deps.answer(urlPath, 'later'); });
     }
     return answer;
   };

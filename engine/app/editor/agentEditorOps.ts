@@ -27,7 +27,7 @@ import {
   type EntityAddress, type EntityAddressKey,
 } from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, deferredOutsideChanges, editorWindowFocused, outsideFileReadBegins, outsideFileReadLanded } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, setAgentOpGate, agentOpHandler, sceneReloadSuppressedReason, deferPrefabReimport, setPrefabReimporter, setOutsidePrefabReimporter, type AgentOpHandler, setSceneReloadSuppressor, setWorldReloadedFromDiskHook, setSceneAdoptionHooks, applySetTraits, replaySuppressedSceneReloads, setPrefabSourceRefresher, setParkedPrefabKeeper, setHeldPrefabSuperseded, resolveAssetDefKind, runtimeWaitReaders, runWaitFor, setSceneConflictResolver, answerSceneConflict, releaseOutsideChanges, enableOutsideChangeHold, heldOutsideChanges, awaitingSceneDecisions, onPendingOutsideChanges, deferredOutsideChanges, editorWindowFocused, outsideFileReadBegins, outsideFileReadLanded } from '../debug/agentBridge';
 import { startCountdown } from '../debug/countdownBanner';
 import { makeSceneConflictResolver, refreshOutsideChanges } from './outsideRefresh';
 import type { WaitReaders } from '../debug/waitFor';
@@ -41,7 +41,7 @@ import {
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
   undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
-  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, adoptWorldReloadedFromDisk, openChoiceModal,
+  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, captureWorldDirtyBaseline, adoptWorldReloadedFromDisk, openChoiceModal,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
@@ -91,7 +91,7 @@ import {
   getAllTraits, readTraitData, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, setEditorScenePathReader, assetUrl, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
+  sceneManager, setEditorScenePathReader, assetUrl, normScenePath, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -1497,7 +1497,7 @@ export function registerEditorAgentOps(): void {
   enableOutsideChangeHold(true);
   setSceneConflictResolver(makeSceneConflictResolver({
     causes: unsavedChangeCauses,
-    ask: (urlPath) => openChoiceModal<'reload' | 'keep' | 'later'>({
+    ask: (urlPath, signal) => openChoiceModal<'reload' | 'keep' | 'later'>({
       kind: 'scene-conflict',
       title: `${urlPath.split('/').pop() ?? urlPath} changed on disk`,
       message: 'The scene file was changed outside the editor, and this scene has unsaved changes. Reload it from disk '
@@ -1508,8 +1508,22 @@ export function registerEditorAgentOps(): void {
       ],
       cancelValue: 'later',
       focus: 'keep',
+      signal,
     }),
     answer: answerSceneConflict,
+    awaiting: awaitingSceneDecisions,
+    // #1924: a load that applies the change says so through the pending list; a scene going clean fires nothing (a save
+    // notifies no one), so it is polled while the dialog is up, as FindReferencesDialog polls `hasUnsavedChanges`.
+    watch: (check) => {
+      const off = onPendingOutsideChanges(() => check());
+      const poll = setInterval(check, 500);
+      return () => { off(); clearInterval(poll); };
+    },
+    savedAt: () => captureWorldDirtyBaseline().savedAt,
+    isOpenPrimary: (urlPath) => {
+      const open = getCurrentScenePath();
+      return !!open && normScenePath(open) === normScenePath(urlPath);
+    },
   }));
   // set-traits is the device's raw op; the editor replaces it (#1816), as it replaces create/duplicate/delete, so an
   // agent's write lands the way a human's Inspector edit does (`editorTraitWriter`). The whole call is ONE undo entry.
