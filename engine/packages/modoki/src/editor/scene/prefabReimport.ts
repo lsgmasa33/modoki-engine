@@ -33,6 +33,8 @@ import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../runtime/loaders/loadSceneFile';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { openScenePath } from '../../runtime/scene/openScenePath';
+import { sceneManager } from '../../runtime/scene/SceneManager';
+import { isGuid } from '../../runtime/core/assetRefRules';
 import { markUIDirty } from '../../runtime/core/uiDirty';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -160,15 +162,21 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
   const children = all.filter((e) => e.parentId === id).map((e) => e.id);
   // Its guid is the new root's: the placeholder goes first, or the load's own pass-1 entity collides with it.
   destroyEntity(handle, world);
-  const read = getCachedPrefabSync as ExpansionReader;
   await loadSceneFile({ id: 'reimport', version: SCENE_FORMAT_VERSION, name: '', resources: [], entities: [entry] } as unknown as SceneData, {
     world,
     clearMarks: false,
     scenePath: live.sourceScene || openScenePath() || undefined,
     loadModels: false,
-    fetchPrefab: async (r: string) => (getCachedPrefab(r) as object | undefined) ?? (read(r) as object | null) ?? null,
-    onInstantiatePrefab: async (source, parentId, rootTf, _old, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure) => {
-      const cached = read(source);
+    // The editor's cache, which holds a document edited and not yet saved. The load adds the world's copies of missing
+    // prefabs to it and expands AND settles with that one reader (#1934 S1): expanded without the copies, a nested frame
+    // a copy backs stayed unexpanded while the settle called its rows backed, and the next save dropped them.
+    read: getCachedPrefabSync as ExpansionReader,
+    // The copies of the scene that holds the placeholder (a base's own guid, or the primary's), as its reload reads them.
+    copiesOf: copiesKeyOf(live.sourceScene),
+    fetchPrefab: async (r: string) => (getCachedPrefab(r) as object | undefined) ?? (getCachedPrefabSync(r) as object | null) ?? null,
+    onInstantiatePrefab: async (source, parentId, rootTf, _old, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure, load) => {
+      const read = load?.read;
+      const cached = read?.(source);
       if (!cached) return undefined;
       const rootId = instantiatePrefabIntoWorld(world, cached as never, parentId, rootTf, source, overrides, structure, undefined, nestedOverrides, nestedStructure, { read });
       const root = rootId ? findEntity(rootId) : undefined;
@@ -196,6 +204,14 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
   }
   markStructureDirty();
   markUIDirty();
+}
+
+/** The key a scene's copies are held under (`loadSceneFile`'s `copiesOf`): a base scene's guid (its entities carry it as
+ *  `sourceScene`), else the primary's loaded guid; '' for a file without one. */
+function copiesKeyOf(sourceScene: string | undefined): string {
+  if (sourceScene) return isGuid(sourceScene) ? sourceScene : '';
+  for (const e of sceneManager.getLoadedScenes().values()) if (e.role === 'primary') return isGuid(e.guid) ? e.guid : '';
+  return '';
 }
 
 /** What an OUTSIDE change to prefabs the open scene uses does (#1873 R1, owner ruling 2026-09-30: the Unity way, reversing

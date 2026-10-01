@@ -40,8 +40,7 @@ import { answerParkedConflicts } from '../../../packages/modoki/src/editor/scene
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
-import { getCachedPrefab, invalidatePrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
-import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, unexpandedRows, getCurrentWorld, type Fixture } from './harness';
+import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, getCurrentWorld, type Fixture } from './harness';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { canonicalJson } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import type { FuzzBackend } from './backend';
@@ -71,8 +70,11 @@ export interface Op {
    *    now agrees with the override (it must stay recorded, #1914 § 4 row 8ii);
    *  - `removeLeaf` / `restoreLeaf` (an `outsideEdit`): a plain leaf row is taken out of a template, as a merge of another
    *    clone's prefab-edit delete writes it, and later put back as a revert of that merge would; the instances' records of
-   *    it must survive in between as unused overrides (#1914 F5, I18). */
-  variant?: 'toBase' | 'toOverride' | 'removeLeaf' | 'restoreLeaf';
+   *    it must survive in between as unused overrides (#1914 F5, I18);
+   *  - `restorePrefab` (an `outsideEdit`): a prefab the run trashed comes back, as its last text, while the editor is open
+   *    (an OS-Trash restore, a pull), and the watcher re-imports it in place (#1934 F5). That is the in-place return of a
+   *    placeholder over a world holding the scene's copies, which nothing drove before (#1934 S1 lived there). */
+  variant?: 'toBase' | 'toOverride' | 'removeLeaf' | 'restoreLeaf' | 'restorePrefab';
 }
 
 /** Relative weights. Structure-changing ops and the three that CHECK (save→reload, undo, apply) are weighted up. */
@@ -115,7 +117,7 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
       if (op.kind === 'saveReload' && op.u[1]! >= 0.65) op.save = op.u[3]! < 0.5 ? 'all-no-reload' : 'all';
       if ((op.kind === 'apply' || op.kind === 'outsideEdit') && op.u[7]! >= 0.7) op.check = 'rebuild-reload';
       if (op.kind === 'editField' && op.u[4]! >= 0.75) op.variant = 'toBase';
-      if (op.kind === 'outsideEdit') op.variant = op.u[4]! < 0.25 ? 'toOverride' : op.u[4]! < 0.45 ? 'removeLeaf' : op.u[4]! < 0.6 ? 'restoreLeaf' : undefined;
+      if (op.kind === 'outsideEdit') op.variant = op.u[4]! < 0.25 ? 'toOverride' : op.u[4]! < 0.45 ? 'removeLeaf' : op.u[4]! < 0.6 ? 'restoreLeaf' : op.u[4]! < 0.75 ? 'restorePrefab' : undefined;
       if (op.variant === undefined) delete op.variant;
       ops.push(op);
     }
@@ -138,9 +140,8 @@ export interface RunState {
   be: FuzzBackend;
   f: Fixture;
   clip: EntityClipboard | null;
-  /** What the round trip inside a save→reload op measured; the checks read it. `restored`: the same saved file reloaded
-   *  with every deleted prefab put back, when the run deleted one (#1805). */
-  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> };
+  /** What the round trip inside a save→reload op measured; the checks read it. */
+  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string };
   /** Every prefab DOCUMENT the run has seen, by id: the last path it had and the text the editor last held for it — the
    *  file, or the document an undo parked for Save (#1868). The runner records them after each step. What a deleted
    *  prefab's restore puts back: the document the live world was built on (hunt seed 7023: an Apply's undo is memory-only,
@@ -150,6 +151,10 @@ export interface RunState {
   note?: string;
   /** Set by a prefab edit: whether it wrote the prefab (a discard changes no file the scene's undo cannot see). */
   prefabEditSaved?: boolean;
+  /** Set by a prefab edit: each inner op's outcome and note, in order (#1934, for #1933's `reaches`). The trace line
+   *  carries them too (`inner[…]` in `note`): before, an inner op's refusal or noop reached no trace, so a recorded list
+   *  could stop reaching its mechanism inside a prefab edit with nothing to show it. */
+  innerOutcomes?: Array<{ op: string; outcome: Outcome; note?: string }>;
   /** Every guid a drop or a paste introduced, and every guid a detach or a Create Prefab covered, this run (a failure
    *  carries them). */
   touched: { drop: Set<string>; paste: Set<string>; detach: Set<string>; create: Set<string> };
@@ -519,12 +524,19 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       const refusal = await openPrefabForEditing({ path, name }, { confirmDiscard: async () => true });
       if (refusal) { st.note = refusal.refused; return 'refused'; }
       if (!editing()) { st.note = 'prefab edit did not open'; return 'refused'; }
-      for (const inner of op.inner ?? []) await execute(inner, st);
+      const inners: NonNullable<RunState['innerOutcomes']> = [];
+      for (const inner of op.inner ?? []) {
+        st.note = undefined;
+        const outcome = await execute(inner, st);
+        inners.push({ op: describe(inner), outcome, ...(st.note ? { note: st.note } : {}) });
+      }
+      st.innerOutcomes = inners;
+      st.note = inners.length ? `inner[${inners.map((x) => `${x.op} → ${x.outcome}${x.note ? ` (${x.note})` : ''}`).join('; ')}]` : undefined;
       let saved = false;
       if (u[1] < 0.65) {
         const r = await savePrefabEditReport({});
         saved = r.saved;
-        if (!r.saved) st.note = `prefab edit save: ${r.conflict ? 'conflict' : r.warnings.join('; ') || 'not saved'}`;
+        if (!r.saved) st.note = [st.note, `prefab edit save: ${r.conflict ? 'conflict' : r.warnings.join('; ') || 'not saved'}`].filter(Boolean).join(' ');
       }
       await exitPrefabEditing();
       st.prefabEditSaved = saved;
@@ -562,44 +574,19 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         }
       }
       const before = worldTree();
-      const unexpanded = unexpandedRows(); // the frames the live world could not expand (#1831 G1 M1, `forgiveExpandedFrames`)
       const s1 = await saveScene({ allowDialog: false });
       if (!s1.saved) { st.note = `save: ${s1.reason}`; return 'refused'; }
       const firstBytes = st.be.read(st.f.scenePath) ?? '';
-      // A prefab the run DELETED (#1805): its live instances stay expanded — Unity keeps an instance's objects when its
-      // asset is deleted — while a reload gives the Missing Prefab placeholder, so the live world cannot equal the reload.
-      // What must hold instead is that the save LOST nothing: the same file, reloaded with the deleted prefabs put back,
-      // is the live world. So: put them back, reload, measure, take them away again through the real delete repair, and
-      // then do the ordinary reload. A deleted prefab is one whose DOCUMENT is in no file now (by id: a rename is not a
-      // delete), put back at the last path it had.
-      const gone = deletedPrefabs(st);
-      let restored: unknown;
-      if (gone.length) {
-        // The loader's entry for each, as the dance found it: the restored reload fetches and OWNS it, and a production
-        // reload never would for one the loader did not hold (a prefab created and deleted in the session), so the entry
-        // the dance seeded goes again — or the ordinary reload below expands the deleted prefab from it (close-out review).
-        const idOf = (t: string) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } };
-        const heldBefore = new Set(gone.filter(([, t]) => { const id = idOf(t); return !!id && getCachedPrefab(id) !== undefined; }).map(([p]) => p));
-        for (const [p, t] of gone) st.be.write(p, t);
-        // The renderer's manifest learns of them, as the watcher's push would (#1835).
-        st.be.pushManifest();
-        const back = await loadSceneReporting(st.f.scenePath);
-        if (back.outcome !== 'loaded') throw new Error(`reload with the deleted prefabs restored: ${back.outcome}`);
-        restored = worldTree();
-        for (const [p] of gone) st.be.remove(p);
-        st.be.pushManifest();
-        applyAssetPathMoves(gone.map(([from]) => ({ from, to: null })));
-        for (const [p] of gone) if (!heldBefore.has(p)) invalidatePrefab(p);
-      }
+      // A prefab the run DELETED (#1805) keeps its live instances expanded, as Unity does, and the reload expands them
+      // from the scene's copy (F8 = A1, #1935), so the plain reload is measured, not one with the prefab put back.
       const loaded = await loadSceneReporting(st.f.scenePath);
       if (loaded.outcome !== 'loaded') throw new Error(`reload: ${loaded.outcome}`);
       const after = worldTree();
-      // Said in the trace, so a test can see the plain reload really gave placeholders (production's shape), not an
-      // expansion from an entry the dance left behind.
-      if (gone.length) st.note = `${st.note ? `${st.note}; ` : ''}${gone.length} deleted prefab(s) restored for the comparison; ${placeholderGuids().size} placeholder(s) on the plain reload`;
+      const gone = deletedPrefabs(st).length;
+      if (gone) st.note = `${st.note ? `${st.note}; ` : ''}${gone} deleted prefab(s); ${placeholderGuids().size} placeholder(s) on the reload`;
       const s2 = await saveScene({ allowDialog: false });
       if (!s2.saved) throw new Error(`second save: ${s2.reason}`);
-      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '', ...(gone.length ? { restored, unexpanded } : {}) };
+      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '' };
       return 'done';
     }
     case 'trashPrefab': {
@@ -641,6 +628,14 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       // and the loader derives such a row's guid from the nested frame's member with the same localId: a false I7 (win's
       // hunt seed 3130). Whether the loader should refuse that hand-edited shape is a separate, unfiled question.
       if (op.variant === 'toOverride' || op.variant === 'restoreLeaf') return outsideVariant(op, st);
+      if (op.variant === 'restorePrefab') {
+        // Its last text at its last path; the runner's watcher flush after the op is the focus / `modoki_refresh`.
+        const back = pick(u[0], deletedPrefabs(st));
+        if (!back) return 'noop';
+        st.be.write(back[0], back[1]);
+        st.note = `restored ${back[0]}`;
+        return 'done';
+      }
       const path = pick(u[0], prefabFiles(st));
       if (!path) return 'noop';
       const doc = JSON.parse(st.be.read(path)!) as PrefabFile & { nextLocalId?: number };

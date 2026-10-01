@@ -263,6 +263,9 @@ export interface SceneResourceRef {
 
 export interface SceneData {
   version: number;
+  /** The scene's own guid (the file's top-level `id`). Read only to key the scene's copies of missing prefabs (#1934
+   *  L1), which its save writes back; never a derived-guid seed (that is the caller's `scenePath`, #1268). */
+  id?: string;
   /** v6+: explicit list of resources the scene needs. v5 and below: derived
    *  by walking entities at load time. SceneManager preloads these in parallel
    *  before instantiating any entities. */
@@ -323,7 +326,24 @@ export interface LoadSceneOptions {
      *  would silently shift `rootGuid` and `rootEditorFolder` in any implementor not updated in the
      *  same change. */
     nestedStructure?: NestedStructurePaths,
+    /** What the load hands its expansion (#1934 S1), an object so later fields join without moving positions:
+     *  `read`, the load's ONE document reader ({@link LoadSceneOptions.read}, with the scene's copies). Read the
+     *  instance's document through it and expand with it — pass it as `instantiatePrefabIntoWorld`'s `expand.read`, or
+     *  pass no reader at all when the load was given none. Any other reader is refused after the call: the settle reads
+     *  with this one. */
+    load?: { read: ExpansionReader },
   ) => Promise<number | undefined> | number | undefined | void;
+  /** The documents this load expands from — the prefab cache to read (#1934 S1). Default the runtime cache; the editor's
+   *  in-place re-expansion passes its own, which holds a document edited and not yet saved. The load ALWAYS adds the
+   *  scene's copies of missing prefabs to it (#1867), and the ONE reader that results is what `onInstantiatePrefab`
+   *  expands with AND what the settle's orphan test reads (`settleEntryRows`): two readers in one load disagree on
+   *  which frames a copy backs, and the rows under such a frame were neither applied nor kept (hunt seed 1212 one way,
+   *  #1934 S1 the other). */
+  read?: ExpansionReader;
+  /** The scene whose copies of missing prefabs this load reads, by its file `id` ('' for a file without one). Default:
+   *  the loaded file's own. The editor's in-place re-expansion loads one entry under a synthetic id, so it names the
+   *  scene the placeholder belongs to (#1934). */
+  copiesOf?: string;
   /** Called before deleting a placeholder entity during prefab re-instantiation */
   onDeletePlaceholder?: (entityId: number) => void;
   /** Target world for entity spawning. Defaults to getCurrentWorld(). SceneManager
@@ -349,8 +369,8 @@ export interface LoadSceneOptions {
   /** Project-relative path of the scene file being loaded (e.g. `/assets/scenes/Lvl-0002.scene.json`).
    *
    *  Used as the scene half of the seed when an entry with no durable guid needs one derived
-   *  (#1268 — see `deriveAuthoredEntityGuids`). `SceneData` carries no `id` and this loader never
-   *  reads the file's top-level one, so the caller's path is the only scene identity available here.
+   *  (#1268 — see `deriveAuthoredEntityGuids`). The derive never seeds on the file's top-level `id` (read only to key
+   *  the scene's copies, `SceneData.id`), so the caller's path is the only identity it uses.
    *
    *  ⚠️ OPTIONAL on purpose, and absent means "derive nothing". `SceneManager`'s carried-snapshot
    *  respawn synthesises its `SceneData` from live entities drawn from SEVERAL scenes, so it has no
@@ -2274,46 +2294,75 @@ function resolveTemplateFrames(world: World): void {
 const readRuntimeTemplateDoc = (source: string) => getCachedPrefab(source) as TemplateDoc | undefined;
 
 /** Per world, the prefab documents the scenes loaded into it carried for prefabs that were missing when they were saved
- *  (`SceneData.embeddedPrefabs`, #1914 F8, #1867). A `WeakMap<World, …>` like the loader's other per-world state, so a
- *  swapped-out world takes its copies with it. A chain (base + level) loads into one world, so each load ADDS its copies. */
-const embeddedDocsByWorld = new WeakMap<World, Map<string, TemplateDoc>>();
+ *  (`SceneData.embeddedPrefabs`, #1914 F8, #1867), keyed by the SCENE that carried them (its file `id`, '' for a file with
+ *  none) and then by prefab guid. A `WeakMap<World, …>` like the loader's other per-world state, so a swapped-out world
+ *  takes its copies with it. A chain (base + level) loads into one world, so each load adds its own scene's copies.
+ *
+ *  Keyed by scene because a copy is a fact about one FILE (Unity's backup lives in the scene file that holds the
+ *  instance): a save carries only its own scene's copies ({@link embeddedPrefabGuids}). Kept per world, a level's copy was
+ *  written into its base's file at the base's next save, and the base's reload then expanded frames that were not live at
+ *  its save (#1934 L1, R7 fork A). The EXPANSION still reads every scene's copy in load order (bases first): that is
+ *  what the world showed, and a frame a copy expanded writes its own copy at the save, from its frame record. */
+const embeddedDocsByWorld = new WeakMap<World, Map<string, Map<string, TemplateDoc>>>();
 
-/** Record the copies `data` carries for `world` — each one a document with an `entities` array; anything else is dropped
- *  with a warning, as the validator reports it, rather than handed to an expansion. */
-function noteEmbeddedPrefabs(world: World, embedded: SceneData['embeddedPrefabs']): void {
+/** Record the copies `data` carries for `world`, under the scene `scene` — each one a document with an `entities` array;
+ *  anything else is dropped with a warning, as the validator reports it, rather than handed to an expansion. */
+function noteEmbeddedPrefabs(world: World, scene: string, embedded: SceneData['embeddedPrefabs']): void {
   if (!embedded || typeof embedded !== 'object') return;
   for (const [guid, doc] of Object.entries(embedded)) {
     if (!doc || typeof doc !== 'object' || !Array.isArray((doc as { entities?: unknown }).entities)) {
       console.warn(`[loadSceneFile] embedded prefab ${guid} is not a prefab document; ignored`);
       continue;
     }
-    let docs = embeddedDocsByWorld.get(world);
-    if (!docs) { docs = new Map(); embeddedDocsByWorld.set(world, docs); }
+    let scenes = embeddedDocsByWorld.get(world);
+    if (!scenes) { scenes = new Map(); embeddedDocsByWorld.set(world, scenes); }
+    let docs = scenes.get(scene);
+    if (!docs) { docs = new Map(); scenes.set(scene, docs); }
     docs.set(guid, doc as TemplateDoc);
   }
 }
 
-/** The copy of `guid`'s document a scene loaded into `world` carried (#1867) — for the save, which writes it back while
- *  the prefab is still missing (I18). `undefined` when no loaded scene carried one. */
-export function embeddedPrefabDoc(world: World, guid: string): TemplateDoc | undefined {
-  return embeddedDocsByWorld.get(world)?.get(guid);
+/** The copy of `guid`'s document the scene `scene` carried into `world` (#1867) — for that scene's save, which writes it
+ *  back while the prefab is still missing (I18). `undefined` when that scene carried none. */
+export function embeddedPrefabDoc(world: World, scene: string, guid: string): TemplateDoc | undefined {
+  return embeddedDocsByWorld.get(world)?.get(scene)?.get(guid);
 }
-/** Every guid `world`'s loaded scenes carried a copy for (#1867). */
-export function embeddedPrefabGuids(world: World): string[] {
-  return [...(embeddedDocsByWorld.get(world)?.keys() ?? [])];
+/** Every guid the scene `scene` carried a copy for into `world` (#1867). */
+export function embeddedPrefabGuids(world: World, scene: string): string[] {
+  return [...(embeddedDocsByWorld.get(world)?.get(scene)?.keys() ?? [])];
 }
 
 /** A reader that serves a scene's copies (#1867), carrying the reader without them: a copy stands in for a template ROW's
  *  frame only, and only for one the scene recorded live ({@link copyStandsIn}), so the two sites that ask need both. */
 type CopyingReader = ExpansionReader & { readonly withoutCopies?: ExpansionReader };
 
-/** The runtime cache, then the scene's copy (#1867): a prefab that loads always wins over a copy, and the copy stands in
- *  only for one that does not. The default reader of a load's expansion — what `SceneManager` spawns through. */
-function runtimeReaderFor(world: World): ExpansionReader {
-  const docs = embeddedDocsByWorld.get(world);
-  if (!docs?.size) return readRuntimeTemplateDoc;
-  return Object.assign((ref: string) => readRuntimeTemplateDoc(ref) ?? docs.get(ref), { withoutCopies: readRuntimeTemplateDoc });
+/** `base`, then the copies of missing prefabs (#1867): a prefab that loads always wins over a copy, and the copy stands
+ *  in only for one that does not. With `scene`, only the copies THAT scene carried (a load reads its own file's, #1934:
+ *  a backup belongs to the scene file that holds the instance, as Unity's does, so a level never expands from its
+ *  base's copy, which may be another version of the prefab); without it, every loaded scene's, in load order (an
+ *  expansion outside a load). The copies are the ones noted when this is called; plain `base` when there are none. */
+function withSceneCopies(world: World, base: ExpansionReader, scene?: string): ExpansionReader {
+  const scenes = embeddedDocsByWorld.get(world);
+  const own = scene === undefined ? undefined : scenes?.get(scene);
+  if (scene === undefined ? !scenes?.size : !own?.size) return base;
+  const copyOf = own
+    ? (ref: string) => own.get(ref)
+    : (ref: string) => { for (const docs of scenes!.values()) { const d = docs.get(ref); if (d) return d; } return undefined; };
+  return Object.assign((ref: string) => base(ref) ?? copyOf(ref), { withoutCopies: base });
 }
+
+/** The runtime cache, then the scene's copies — the default reader of an expansion and of a load. */
+function runtimeReaderFor(world: World): ExpansionReader {
+  return withSceneCopies(world, readRuntimeTemplateDoc);
+}
+
+/** Per world, while a load runs (#1934 S1): the reader each TOP `instantiatePrefabIntoWorld` call expanded with, keyed by
+ *  the root it returned — {@link DEFAULT_READ} for a call that passed none. `loadSceneFile` takes its own instance's entry
+ *  after `onInstantiatePrefab` and refuses a reader that is not the load's, so an expansion and the settle after it can
+ *  never read two different sets of documents again. Recorded only while a load is in flight (`loadsInFlight`). */
+const topReadByWorld = new WeakMap<World, Map<number, ExpansionReader | typeof DEFAULT_READ>>();
+const loadsInFlight = new WeakMap<World, number>();
+const DEFAULT_READ = Symbol('default reader');
 
 /** Did `read` answer `ref` from a scene's copy, not from the prefab itself? */
 function readFromCopy(read: ExpansionReader, ref: string): boolean {
@@ -2401,6 +2450,12 @@ export function instantiatePrefabIntoWorld(
 ): number {
   const { read = runtimeReaderFor(world), segments: _segments, layers: _layers, foldFrom: _foldFrom = 0 } = expand;
   const topOwn = expand.own !== false;
+  const noteTopRead = (rootId: number): void => {
+    if (_segments || !rootId || !loadsInFlight.get(world)) return;
+    let reads = topReadByWorld.get(world);
+    if (!reads) { reads = new Map(); topReadByWorld.set(world, reads); }
+    reads.set(rootId, expand.read ?? DEFAULT_READ);
+  };
   // A document with no root to expand spawns NOTHING (#1768): its rows used to spawn parentless, under no instance,
   // and the next save wrote them as unrelated entities. Every caller already reads 0 as "nothing spawned".
   if (!expandsToRoot(prefab, read, _stack)) {
@@ -2634,6 +2689,7 @@ export function instantiatePrefabIntoWorld(
   // A TOP call's tree is one member-token frame: resolved after the derive pass (#1352).
   if (outerScope && closeTokenScope(outerScope) && rootEcsId) registerTemplateFrame(world, rootEcsId);
 
+  noteTopRead(rootEcsId);
   return rootEcsId;
 }
 
@@ -3222,7 +3278,11 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
   const world = options.world ?? getCurrentWorld();
   // Before any prefab spawns: a nested frame of a prefab that is still missing expands from the scene's copy (#1867).
-  noteEmbeddedPrefabs(world, data.embeddedPrefabs);
+  const sceneKey = data.id && isGuid(data.id) ? data.id : '';
+  noteEmbeddedPrefabs(world, sceneKey, data.embeddedPrefabs);
+  // The load's one reader (#1934 S1): every expansion below and the settle after them read the same documents — the
+  // caller's cache, then the copies of the scene being loaded (or the one `copiesOf` names), never another scene's.
+  const read = withSceneCopies(world, options.read ?? readRuntimeTemplateDoc, options.copiesOf ?? sceneKey);
   const allTraits = getAllTraits();
   const idMap = new Map<number, number>();
   // Every `entityId` field this load resolved, keyed by the koota id it now holds. A reference to a
@@ -3493,11 +3553,18 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       const newEntityId = idMap.get(entry.id);
       if (!newEntityId) continue;
 
-      // Verify prefab exists before instantiating
-      const prefab = await fetchPrefab(source);
+      // Verify prefab exists before instantiating. One that does not load expands from the scene's copy (#1935, F8 = A1
+      // for a top-level instance; Unity's `MergedAsMissingWithSceneBackup`), and stays a placeholder without one (#1699).
+      // No "was it live at the save" test, unlike a nested frame's (`copyStandsIn`): an entry's record was always
+      // captured from a live instance, and member rows are no signal for it — a ROOT-only prefab's live instance states
+      // none, and asked for them it reloaded as a placeholder beside its own copy (#1935, hunt seeds 1011/3004).
+      // `onInstantiatePrefab` reads the document through the `read` it is handed, which serves the copy.
+      const fetched = await fetchPrefab(source);
+      const prefab = fetched ?? (entry.prefab ? read(source) ?? null : null);
+      const fetchNested = async (r: string) => (await fetchPrefab(r)) ?? read(r) ?? null;
       // A document that loads but expands to no root is kept exactly as one that does not load (#1768): checked
       // BEFORE `onDeletePlaceholder`, so the placeholder survives to carry the entry.
-      const expandable = !!prefab && await fetchedExpandsToRoot(prefab as Parameters<typeof fetchedExpandsToRoot>[0], fetchPrefab as never);
+      const expandable = !!prefab && await fetchedExpandsToRoot(prefab as Parameters<typeof fetchedExpandsToRoot>[0], (fetched ? fetchPrefab : fetchNested) as never);
       if (!expandable) {
         console.warn(prefab ? `[loadSceneFile] Prefab "${source}" expands to no root` : `[loadSceneFile] Could not find prefab "${source}"`);
         // The placeholder stays and carries the entry, so the next save writes it back verbatim (#1699).
@@ -3530,19 +3597,45 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       const detached = detachEntityIdRefs(refsTo, newEntityId);
       options.onDeletePlaceholder?.(newEntityId);
 
-      const rootEcsId = await options.onInstantiatePrefab(
-        source,
-        ecsParent,
-        rootTf,
-        newEntityId,
-        rootExtraTraits,
-        entry.overrides,
-        { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved, members: entry.members },
-        entry.nestedOverrides,
-        entry.guid,
-        typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
-        entry.nestedStructure,
-      );
+      loadsInFlight.set(world, (loadsInFlight.get(world) ?? 0) + 1);
+      let rootEcsId: Awaited<ReturnType<NonNullable<LoadSceneOptions['onInstantiatePrefab']>>>;
+      let usedRead: ExpansionReader | typeof DEFAULT_READ | undefined;
+      try {
+        rootEcsId = await options.onInstantiatePrefab(
+          source,
+          ecsParent,
+          rootTf,
+          newEntityId,
+          rootExtraTraits,
+          entry.overrides,
+          { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved, members: entry.members },
+          entry.nestedOverrides,
+          entry.guid,
+          typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
+          entry.nestedStructure,
+          { read },
+        );
+        if (typeof rootEcsId === 'number' && rootEcsId > 0) {
+          const reads = topReadByWorld.get(world);
+          usedRead = reads?.get(rootEcsId);
+          reads?.delete(rootEcsId);
+        }
+      } finally {
+        const n = (loadsInFlight.get(world) ?? 1) - 1;
+        if (n > 0) loadsInFlight.set(world, n);
+        else { loadsInFlight.delete(world); topReadByWorld.delete(world); }
+      }
+      // One reader per load (#1934 S1): an instance expanded with another reader than the one the settle below reads
+      // with is a caller defect, refused here rather than left to drop the rows under a copy-backed frame. A caller
+      // that passed no reader expanded with the default, which is the load's own unless the load was handed one.
+      // A bookkeeping assert must not fail a player's scene load: it throws in a dev build (the editor, every test) and
+      // only reports in a release one, where the one shipped caller (`SceneManager`) expands with the handed reader.
+      if (usedRead !== undefined && usedRead !== read && !(usedRead === DEFAULT_READ && !options.read)) {
+        const msg = `[loadSceneFile] prefab "${source}" was expanded with a different document reader than its load's (#1934 S1): `
+          + 'onInstantiatePrefab must expand with the `read` it is handed';
+        if (import.meta.env?.DEV) throw new Error(msg);
+        console.error(msg);
+      }
       if (typeof rootEcsId === 'number' && rootEcsId > 0) {
         // Everything that was resolved to the placeholder now names the root. Without this the stored
         // id stayed the placeholder's, and a child landed on whichever entity koota recycled that id
@@ -3585,11 +3678,12 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   }
 
   // All prefab instances are now expanded with correct parentIds: their rows settle (`settleEntryRows`). R2's orphan test
-  // reads the documents the expansion read, the scene's copies included (#1867): a frame a copy expanded backs its rows, as
+  // reads the documents the expansion read — the load's one `read`, refused above for an instance expanded with another
+  // (#1934 S1) — the scene's copies included (#1867): a frame a copy expanded backs its rows, as
   // the rebuild's frame records say. Read without them, every row of that frame was kept as an orphan too, and once its
   // mark was undone the save wrote the stale row back under the capture (hunt seed 1212). A row is asked about only where
   // the scene states it, which is where a copy stands in (`copyStandsIn`).
-  settleEntryRows(world, spawnedEntries, { fromSceneVersion: sourceVersion, read: runtimeReaderFor(world) });
+  settleEntryRows(world, spawnedEntries, { fromSceneVersion: sourceVersion, read });
   retryGuidParents(world, guidParentMisses);
 }
 

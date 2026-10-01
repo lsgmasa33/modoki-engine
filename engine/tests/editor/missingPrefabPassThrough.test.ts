@@ -119,9 +119,11 @@ async function loadInto(data: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure) => {
+    // The load's reader serves the scene's copy of a missing prefab (#1935): a top-level instance live at the save expands
+    // from it, so this harness reads its own map first and the handed reader after it, as `SceneManager` reads its cache.
+    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure, load) => {
       const id = instantiatePrefabIntoWorld(
-        getCurrentWorld(), prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
+        getCurrentWorld(), (prefabs.get(source) ?? load?.read(source)) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
       );
       if (id && rootGuid) {
         for (const e of getCurrentWorld().entities) {
@@ -514,30 +516,46 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     uninstall(P); // the Assets trash, mid-session: the instance stays live (#1738)
   }
   const entitiesText = (s: SceneData) => JSON.stringify(s.entities);
+  /** `s` as a build before #1935 wrote it: no copy of a missing TOP-level prefab, so the instance reloads as its Missing
+   *  Prefab placeholder and `placementForMissing` seats it. Since #1935 the live instance's save carries the copy and
+   *  the reload expands it instead; the placeholder path stays for such a file, and for an instance that was already a
+   *  placeholder at its save. */
+  const beforeTopCopies = (s: SceneData): SceneData => {
+    const c = JSON.parse(JSON.stringify(s)) as SceneData;
+    delete c.embeddedPrefabs;
+    return c;
+  };
 
-  it('a root at its template\'s sortOrder reloads there, and save → reload → save writes the same bytes', async () => {
-    // Since F7 (#1914 R6) the order is the root override every scene instance records, not the traits #1895 wrote; before
-    // F7, mutation: drop `unresolvedRoots.add` in `serializeScene` — the placeholder reloaded at 0, before Sib, and the
-    // second save reordered /entities (hunt seed 3129's failure). The inactive twin below still reaches the traits path.
-    await liveThenTrashed({ sortOrder: 3 });
-    expect(ea(rootOf(INST)).sortOrder).toBe(3); // precondition: from the template
-    const first = await save();
-    expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
-    expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
-    await load(first);
-    expect(ea(rootOf(INST)).sortOrder).toBe(3);
-    expect(entitiesText(await save())).toBe(entitiesText(first));
-  });
+  /** Is the instance's member A live (expanded), rather than the instance a Missing Prefab placeholder? */
+  const expanded = () => getAllEntities().some((e) => e.name === 'A');
+  for (const [how, asLoaded, isExpanded] of [['expanded from the copy (#1935)', (s: SceneData) => s, true], ['as a placeholder (no copy)', beforeTopCopies, false]] as const) {
+    it(`a root at its template's sortOrder reloads there, and save → reload → save writes the same bytes: ${how}`, async () => {
+      // Since F7 (#1914 R6) the order is the root override every scene instance records, not the traits #1895 wrote; before
+      // F7, mutation: drop `unresolvedRoots.add` in `serializeScene` — the placeholder reloaded at 0, before Sib, and the
+      // second save reordered /entities (hunt seed 3129's failure). The inactive twin below still reaches the traits path.
+      await liveThenTrashed({ sortOrder: 3 });
+      expect(ea(rootOf(INST)).sortOrder).toBe(3); // precondition: from the template
+      const first = await save();
+      expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
+      expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
+      await load(asLoaded(first));
+      expect(expanded()).toBe(isExpanded);
+      expect(ea(rootOf(INST)).sortOrder).toBe(3);
+      expect(entitiesText(await save())).toBe(entitiesText(first));
+    });
 
-  it('an inactive root the same way', async () => {
-    // Mutation: `PLACEHOLDER_ORDER_FIELDS` loop in `placementForMissing` skips isActive — the placeholder reloads active.
-    await liveThenTrashed({ isActive: false });
-    const first = await save();
-    expect(traitsEa(entryOf(first, INST)!)).toEqual({ isActive: false, parentId: HOLDER });
-    await load(first);
-    expect(ea(rootOf(INST)).isActive).toBe(false);
-    expect(entitiesText(await save())).toBe(entitiesText(first));
-  });
+    it(`an inactive root the same way: ${how}`, async () => {
+      // Mutation (the placeholder): `PLACEHOLDER_ORDER_FIELDS` loop in `placementForMissing` skips isActive — the
+      // placeholder reloads active.
+      await liveThenTrashed({ isActive: false });
+      const first = await save();
+      expect(traitsEa(entryOf(first, INST)!)).toEqual({ isActive: false, parentId: HOLDER });
+      await load(asLoaded(first));
+      expect(expanded()).toBe(isExpanded);
+      expect(ea(rootOf(INST)).isActive).toBe(false);
+      expect(entitiesText(await save())).toBe(entitiesText(first));
+    });
+  }
 
   it('the prefab\'s return seeds no mark: the root takes the template\'s value, as it did before the trash', async () => {
     // Mutation: state the fields as a ROOT OVERRIDE (#1850's channel) instead — the reload marks
@@ -562,7 +580,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     const first = await save();
     expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
     expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
-    await load(first);
+    await load(beforeTopCopies(first)); // the placeholder's placement is what is asked
     expect(entitiesText(await save())).toBe(entitiesText(first));
   });
 
@@ -581,7 +599,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   // (`asSceneEntry`, #1850), where the return reads it. Not falsifiable alone: F7's falsifier is recordedOverrideList's.
   it('a reorder made while the prefab is missing survives the prefab\'s return (F7)', async () => {
     await liveThenTrashed({ sortOrder: 3 });
-    await load(await save());
+    await load(beforeTopCopies(await save())); // a reorder of the PLACEHOLDER (`asSceneEntry`)
     writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 5);
     const reordered = await save();
     expect(rootOverrideEa(entryOf(reordered, INST)!)?.sortOrder).toBe(5);
@@ -2177,8 +2195,10 @@ describe('Create Prefab from an instance ROOT drops the old prefab\'s kept rows 
 describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the explicit choice)', () => {
   // The delete now evicts the editor cache (`applyAssetPathMoves`' delete branch). The live instance is left EXPANDED —
   // #1738's evicted state — and every writer captures it from its frame record, so the save writes what it wrote before
-  // the delete and what the reload's Missing Prefab placeholder reads back. Mutation: drop `evictDeletedEditorPrefabs` from
-  // the delete branch — the editor cache still answers for the deleted prefab.
+  // the delete, plus the copy of P (F8 = A1, top level since #1935), and the reload expands the instance from that copy
+  // with its edit, as Unity restores an instance from its scene backup (`MergedAsMissingWithSceneBackup`). Mutation: drop
+  // `evictDeletedEditorPrefabs` from the delete branch — the editor cache still answers for the deleted prefab. Mutation
+  // (#1935): leave top-level frames out of `collectEmbeddedPrefabs` again — no copy, and the reload is a placeholder.
   const P_PATH = '/assets/p1805.prefab.json';
   it('the editor cache forgets it, the live instance stays, and the save writes the entry byte for byte', async () => {
     registerAsset(P, P_PATH, 'prefab');
@@ -2192,11 +2212,15 @@ describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the e
     expect(x(inside(INST, 'A'))).toBe(6); // still expanded
     const saved = await save();
     expectSameBytes(entryOf(saved, INST), before);
+    expect(Object.keys(saved.embeddedPrefabs ?? {})).toEqual([P]); // the scene's backup of P
     await load(saved);
-    expect(getAllEntities().some((e) => e.name === 'A')).toBe(false); // the reload: a placeholder, nothing expanded
+    expect(x(inside(INST, 'A'))).toBe(6); // the reload: expanded from the copy, the edit with it
+    const body = (sc: SceneData) => JSON.stringify([sc.entities, sc.embeddedPrefabs]); // this harness mints the scene id per save
+    expect(body(await save())).toBe(body(saved)); // I23
     install(pDoc());
     await load(saved);
-    expect(x(inside(INST, 'A'))).toBe(6); // and the edit comes back with the prefab
+    expect(x(inside(INST, 'A'))).toBe(6); // and the edit stays with the returned prefab
+    expect((await save()).embeddedPrefabs).toBeUndefined(); // which wins: the copy goes
   });
 });
 

@@ -318,13 +318,6 @@ export function canonScene(scene: unknown, placeholders: ReadonlySet<string>): u
   return walk(scene);
 }
 
-/** Save → reload is the identity, and save → reload → save writes the same bytes.
- *
- *  When the run deleted a prefab (`restored` is set, #1805), the identity is measured against the save reloaded WITH the
- *  deleted prefabs put back: the live instance of a deleted prefab stays expanded while a plain reload gives its Missing
- *  Prefab placeholder (Unity does the same), so the two cannot be equal, and what must hold is that the save lost nothing
- *  the live world holds. The byte check still runs on the plain reload's save, so the placeholder must write its record
- *  back byte for byte. */
 /** `after`, with each entity's rotation spelled as in `before` wherever the two are the SAME orientation (#1838). A
  *  rotation is one value, not three fields (#1490's `sameOrientation`): the save drops a member's rotation whose
  *  orientation equals the chain's, and the reload gives the chain's spelling (`rx: 0.283…` comes back `-6`, the same turn
@@ -353,69 +346,128 @@ export function alignEqualOrientations(before: unknown, after: unknown): unknown
   return out ?? after;
 }
 
-/** `restored` made comparable with a live world that holds UNEXPANDED frames of a deleted prefab beside kept ones
- *  (#1831 G1 M1). The restored reload expands every frame, and it is what the editor itself shows once the file is back
- *  (an OS-Trash restore reloads the open scene; an asset delete has no undo since #1868). So a frame the
- *  live world could not expand may come back expanded, and only that frame:
- *  - an unexpanded row (`unexpanded`, keyed `<frame root guid>:<localId>`, read before the save): a gained frame root of a
- *    deleted prefab whose outer frame recorded its row as unexpanded, with everything gained under it, is dropped;
- *  - a Missing Prefab placeholder of a deleted prefab: it comes back an instance root of that prefab under the same guid,
- *    its gained members are dropped, and it is compared by its placement (name, parent, order, active) as the live
- *    placeholder shows it. The record's CONTENT is held by the second save's byte identity.
- *  Everything else must still be identical. */
-export function forgiveExpandedFrames(
-  before: unknown, restored: unknown, unexpanded: ReadonlySet<string>, prefabGone: (source: string) => boolean,
-): unknown {
-  type Node = { traits?: { EntityAttributes?: Record<string, unknown>; PrefabInstance?: { source?: string; rootInstanceId?: unknown; parentLocalId?: number } }; unresolved?: string };
+/** The detail a waived node placeholder is reported with; `knownOpen.ts`'s #1939 entry tolerates exactly it. */
+export const NODE_PLACEHOLDER_WAIVER = 'a scene-added reference node of a deleted prefab, live at the save, reloaded as its Missing Prefab placeholder (#1939)';
+
+/** #1939, a TRACKED WAIVER (hub, 2026-10-01), not a design: a scene-added REFERENCE node of a deleted prefab, live and
+ *  expanded at the save, reloads as its #1699 Missing Prefab placeholder, because no node reads the scene's copy yet
+ *  (Unity restores it from its own backup). Exactly that shape is collapsed in `before`: the node's root becomes the
+ *  placeholder `after` holds, and the members it lost leave. The caller compares the rest and reports the node with
+ *  `NODE_PLACEHOLDER_WAIVER`. It is not applied to a top-level instance, which reads the copy (#1935), or to an instance
+ *  hung under a plain entity, which is an entry too. It is not applied to a nested template row's frame, which never
+ *  becomes a placeholder, or to a node whose placement (name, parent, order, active) changed. */
+export function waiveNodePlaceholders(before: unknown, after: unknown, prefabGone: (source: string) => boolean): { before: unknown; keys: string[] } {
+  type Node = { traits?: { EntityAttributes?: Record<string, unknown>; PrefabInstance?: { source?: string; rootInstanceId?: unknown } }; unresolved?: string };
   const b = before as Record<string, Node>;
-  const r = restored as Record<string, Node>;
-  if (!b || !r || typeof b !== 'object' || typeof r !== 'object') return restored;
-  const parentOf = (k: string) => { const p = r[k]?.traits?.EntityAttributes?.parentId; return typeof p === 'string' ? p : undefined; };
-  const placeholderOfGone = (k: string) => !!b[k]?.unresolved && prefabGone(b[k].unresolved!);
-  const expandedRoot = (k: string): boolean => {
-    const pi = r[k]?.traits?.PrefabInstance;
-    if (!pi?.source || pi.rootInstanceId !== k || !prefabGone(pi.source)) return false;
-    if (k in b) return placeholderOfGone(k) && b[k].unresolved === pi.source;
-    const parent = parentOf(k);
-    const outer = parent ? r[parent]?.traits?.PrefabInstance?.rootInstanceId : undefined;
-    return typeof outer === 'string' && unexpanded.has(`${outer}:${pi.parentLocalId}`);
-  };
-  const out: Record<string, Node> = { ...r };
-  for (const k of Object.keys(r)) {
-    if (k in b) continue;
-    // Up through the gained entities to the first one whose parent the live world holds.
-    let top = k;
-    for (let hops = 0, p = parentOf(top); p && !(p in b) && p in r && hops < 256; hops++, p = parentOf(top)) top = p;
-    const boundary = parentOf(top);
-    if (expandedRoot(top) || (boundary && expandedRoot(boundary))) delete out[k];
-  }
+  const a = after as Record<string, Node>;
+  if (!b || !a || typeof b !== 'object' || typeof a !== 'object') return { before, keys: [] };
+  const parentOf = (k: string): string | undefined => { const p = b[k]?.traits?.EntityAttributes?.parentId; return typeof p === 'string' ? p : undefined; };
+  const ea = (n: Node | undefined) => n?.traits?.EntityAttributes ?? {};
   const PLACEMENT = ['name', 'parentId', 'sortOrder', 'isActive'] as const;
-  for (const k of Object.keys(b)) {
-    if (!placeholderOfGone(k) || !expandedRoot(k)) continue;
-    const ea = (n: Node) => n.traits?.EntityAttributes ?? {};
-    if (PLACEMENT.every((f) => JSON.stringify(ea(b[k])[f]) === JSON.stringify(ea(r[k])[f]))) out[k] = b[k];
+  const keys = Object.keys(a).filter((k) => {
+    const src = a[k]!.unresolved;
+    if (!src || !prefabGone(src) || b[k]?.unresolved) return false;
+    const pi = b[k]?.traits?.PrefabInstance;
+    if (pi?.source !== src || pi.rootInstanceId !== k) return false;
+    // A node hangs INSIDE an instance (under a member, or under a node another layer added to one); an entry does not.
+    let inside = false;
+    for (let cur = parentOf(k), i = 0; cur && i < 256 && !inside; i++, cur = parentOf(cur)) inside = !!b[cur]?.traits?.PrefabInstance;
+    if (!inside) return false;
+    return PLACEMENT.every((f) => JSON.stringify(ea(b[k])[f]) === JSON.stringify(ea(a[k])[f]));
+  }).sort();
+  if (!keys.length) return { before, keys };
+  const under = (k: string, root: string) => { for (let cur: string | undefined = k, i = 0; cur && i < 256; i++, cur = parentOf(cur)) if (cur === root) return true; return false; };
+  const out: Record<string, Node> = { ...b };
+  for (const root of keys) {
+    for (const k of Object.keys(b)) if (k !== root && !(k in a) && under(k, root)) delete out[k];
+    out[root] = a[root]!;
   }
-  return out;
+  return { before: out, keys };
 }
 
+/** The detail a waived expanded entry is reported with; `knownOpen.ts`'s second #1939 shape tolerates exactly it. */
+export const ENTRY_EXPANDED_WAIVER = 'a Missing Prefab placeholder entry of a deleted prefab reloaded expanded from the scene\'s copy (#1939)';
+
+/** #1939's second TRACKED WAIVER (hub, 2026-10-01; low): a placeholder ENTRY of a deleted prefab reloads as an instance
+ *  expanded from its scene's copy (a top-level entry has no "live at the save" signal yet, #1935). Today's writer reaches
+ *  it: a node placeholder (the waiver above) whose copy was kept verbatim becomes an entry when the instance holding it
+ *  is detached (hunt seeds 1269, 3266). Exactly that shape is collapsed in `after`: the expanded root goes back to the
+ *  placeholder `before` held, and what the expansion gained under it leaves. Not applied when the placeholder sat inside
+ *  an instance (a node), when the root is of another prefab, when its placement (name, parent, order, active) changed,
+ *  or to anything gained outside that root. */
+export function waiveExpandedEntries(before: unknown, after: unknown, prefabGone: (source: string) => boolean): { after: unknown; keys: string[] } {
+  type Node = { traits?: { EntityAttributes?: Record<string, unknown>; PrefabInstance?: { source?: string; rootInstanceId?: unknown } }; unresolved?: string };
+  const b = before as Record<string, Node>;
+  const a = after as Record<string, Node>;
+  if (!b || !a || typeof b !== 'object' || typeof a !== 'object') return { after, keys: [] };
+  const parentIn = (t: Record<string, Node>, k: string): string | undefined => { const p = t[k]?.traits?.EntityAttributes?.parentId; return typeof p === 'string' ? p : undefined; };
+  const ea = (n: Node | undefined) => n?.traits?.EntityAttributes ?? {};
+  const PLACEMENT = ['name', 'parentId', 'sortOrder', 'isActive'] as const;
+  const keys = Object.keys(b).filter((k) => {
+    const src = b[k]!.unresolved;
+    if (!src || !prefabGone(src) || !a[k] || a[k].unresolved) return false;
+    const pi = a[k].traits?.PrefabInstance;
+    if (pi?.source !== src || pi.rootInstanceId !== k) return false;
+    for (let cur = parentIn(b, k), i = 0; cur && i < 256; i++, cur = parentIn(b, cur)) if (b[cur]?.traits?.PrefabInstance) return false;
+    return PLACEMENT.every((f) => JSON.stringify(ea(b[k])[f]) === JSON.stringify(ea(a[k])[f]));
+  }).sort();
+  if (!keys.length) return { after, keys };
+  const under = (k: string, root: string) => { for (let cur: string | undefined = k, i = 0; cur && i < 256; i++, cur = parentIn(a, cur)) if (cur === root) return true; return false; };
+  const out: Record<string, Node> = { ...a };
+  for (const root of keys) {
+    for (const k of Object.keys(a)) if (k !== root && !(k in b) && under(k, root)) delete out[k];
+    out[root] = b[root]!;
+  }
+  return { after: out, keys };
+}
+
+/** A saved scene without the entities `roots` names and everything parented under them. */
+function withoutEntries(scene: unknown, roots: readonly string[]): unknown {
+  type E = { guid?: string; traits?: { EntityAttributes?: { parentId?: unknown } } };
+  const s = scene as { entities?: E[] };
+  if (!s || !Array.isArray(s.entities)) return scene;
+  const byGuid = new Map(s.entities.map((e) => [e.guid, e] as const));
+  const gone = (e: E): boolean => {
+    for (let cur: E | undefined = e, i = 0; cur && i < 256; i++) {
+      if (cur.guid && roots.includes(cur.guid)) return true;
+      const p: unknown = cur.traits?.EntityAttributes?.parentId;
+      cur = typeof p === 'string' ? byGuid.get(p) : undefined;
+    }
+    return false;
+  };
+  return { ...s, entities: s.entities.filter((e) => !gone(e)) };
+}
+
+/** Both #1939 waivers, for a comparison of `before` with `after`: the two sides with each waived shape collapsed, and the
+ *  details to report when nothing else differs. */
+export function waive1939(before: unknown, after: unknown, prefabGone: (source: string) => boolean): { before: unknown; after: unknown; details: string[]; entryKeys: string[] } {
+  const nodes = waiveNodePlaceholders(before, after, prefabGone);
+  const entries = waiveExpandedEntries(nodes.before, after, prefabGone);
+  return {
+    before: nodes.before, after: entries.after, entryKeys: entries.keys,
+    details: [...nodes.keys.map((k) => `/${k}: ${NODE_PLACEHOLDER_WAIVER}`), ...entries.keys.map((k) => `/${k}: ${ENTRY_EXPANDED_WAIVER}`)],
+  };
+}
+
+/** Save → reload is the identity, and save → reload → save writes the same bytes. The live instance of a deleted prefab
+ *  stays expanded, and the reload expands it from the scene's copy (F8 = A1, #1867, #1935), so the plain reload must give
+ *  the live world back. A run that leaves a frame unexpanded still holds it unexpanded after the reload. One exception
+ *  is #1939's waiver above. (Until #1934 F4 this compared against a reload with the deleted prefabs put back, and forgave
+ *  frames that came back expanded, which hid every instance the copy failed to restore: hunt seeds 1011 and 3004.) */
 export function checkRoundTrip(
-  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; restored?: unknown; unexpanded?: ReadonlySet<string> },
+  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string },
   prefabGone: (source: string) => boolean = () => false,
 ): Failure[] {
   const out: Failure[] = [];
-  // Either comparison may hold, and the run fails only when NEITHER does. The plain one holds when the live world already
-  // shows the deleted prefab's instances as the reload does (a world swap after the delete made them placeholders, or they
-  // never expanded); the restored one holds when the live instance is still expanded and the save carried all of it. The
-  // restored one alone would fail a correct run whose live world holds a frame the delete left unexpanded: restored, it
-  // expands. Reported through the restored comparison, the stricter one for the case it exists for.
-  const restoring = rt.restored !== undefined && firstDiff(rt.before, alignEqualOrientations(rt.before, rt.after)) !== null;
-  const reloaded = alignEqualOrientations(rt.before, restoring ? forgiveExpandedFrames(rt.before, rt.restored, rt.unexpanded ?? new Set(), prefabGone) : rt.after);
-  const d = firstDiff(rt.before, reloaded);
+  const reloaded = alignEqualOrientations(rt.before, rt.after);
+  const waived = waive1939(rt.before, reloaded, prefabGone);
+  const d = firstDiff(waived.before, waived.after);
+  if (!d) for (const detail of waived.details) out.push({ check: 'save→reload is not the identity', detail });
   if (d) {
     // Whether a whole entity went missing, and if so whether one with its name took a NEW guid on the other side (a guid
     // that changed across the reload) or nothing did (lost, or gained): the KNOWN_OPEN predicates key on it.
-    const before = rt.before as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
-    const after = reloaded as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
+    const before = waived.before as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
+    const after = waived.after as Record<string, { traits?: { EntityAttributes?: { name?: string } } }>;
     const nameOf = (e: { traits?: { EntityAttributes?: { name?: string } } } | undefined) => e?.traits?.EntityAttributes?.name;
     const onlyIn = (a: typeof before, b: typeof before) => Object.keys(a).filter((k) => !(k in b));
     const lost = onlyIn(before, after); const gained = onlyIn(after, before);
@@ -439,11 +491,16 @@ export function checkRoundTrip(
     const lostKind = lost.some(ofGonePrefab) ? ' (an entity of a deleted prefab was lost)' : ' (an entity was lost)';
     const kind = lost.length || gained.length ? (renamed ? ' (an entity changed guid)' : lost.length ? lostKind : ' (an entity was gained)')
       : becamePlaceholder ? (prefabGone(placeholderSource!) ? ' (it came back a Missing Prefab placeholder of a deleted prefab)' : ' (it came back a Missing Prefab placeholder)') : '';
-    out.push({ check: 'save→reload is not the identity', detail: `${d}${kind}${restoring ? ' (with the deleted prefab restored)' : ''}` });
+    out.push({ check: 'save→reload is not the identity', detail: `${d}${kind}` });
   }
   if (rt.firstBytes !== rt.secondBytes) {
     const a = JSON.parse(rt.firstBytes); const b = JSON.parse(rt.secondBytes);
-    out.push({ check: 'save→reload→save is not byte-identical', detail: firstDiff(a, b) ?? 'formatting or key order only' });
+    const d2 = firstDiff(a, b);
+    // #1939's second shape, through I23: an entry waived above saved its placeholder record, then (expanded) its instance
+    // record. Only when the identity held but for the waiver, and only when the two saves differ in nothing BUT those
+    // entries' own records and what hangs under them.
+    const rest = !d && waived.entryKeys.length && firstDiff(withoutEntries(a, waived.entryKeys), withoutEntries(b, waived.entryKeys)) === null;
+    out.push({ check: 'save→reload→save is not byte-identical', detail: rest ? `${d2 ?? ''} — ${ENTRY_EXPANDED_WAIVER}` : d2 ?? 'formatting or key order only' });
   }
   return out;
 }

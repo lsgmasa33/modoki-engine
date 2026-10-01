@@ -194,18 +194,20 @@ nothing. The editor `collectResourceRefs` (serialize.ts) **delegates** to the
 runtime `collectResourceRefsFromEntities` (loadSceneFile.ts) — one shared
 implementation rather than two that can drift.
 
-A NESTED prefab that is missing at the save is copied into the file's top-level
-`embeddedPrefabs` (scene v19, #1867), and the copies' own refs join `resources`, so
-the load acquires what a frame expanded from a copy draws. What is copied, what reads
-it, and why Apply/Revert still refuse such a frame: [prefabs.md](prefabs.md)
-§ "A scene backs up a missing nested prefab".
+A prefab that is missing at the save, top-level or nested, is copied into the file's
+top-level `embeddedPrefabs` (scene v19, #1867, top level #1935), and the copies' own
+refs join `resources`, so the load acquires what a frame expanded from a copy draws.
+What is copied, what reads it, and why Apply/Revert still refuse such a frame:
+[prefabs.md](prefabs.md) § "A scene backs up a missing prefab".
 
 ## Load / re-expand
 
-A nested row whose prefab is missing expands from the scene's copy of it when the
-file carries one (`embeddedPrefabs`, v19, #1867): the load's default reader is the
-runtime cache, then the copy, so a prefab that loads always wins. See
-[prefabs.md](prefabs.md) § "A scene backs up a missing nested prefab".
+An instance whose prefab is missing expands from the copy of it that ITS OWN scene
+file carries (`embeddedPrefabs`, v19, #1867; never another scene's, #1934 F1): a
+top-level instance whenever the copy is there (#1935), a nested frame only if it was
+live at the save. The load's one reader is the caller's cache, then those copies, so a
+prefab that loads always wins, and the expansion and the settle read the same
+documents (#1934 S1). A scene-added reference node does not read a copy yet (#1939). See [prefabs.md](prefabs.md) § "A scene backs up a missing prefab".
 
 In `loadSceneFile.ts`, after `instantiatePrefabIntoWorld` spawns the prefab and
 `applyOverridesByLocalToEcs` replays value diffs:
@@ -688,8 +690,8 @@ channels for all three carriers. It descends top-down through the row partition 
 resolved each owned instance UP to a top-level root, which was why a chain through a reference node
 resolved to nothing. Paths are written sorted, so key order does not depend on ECS ids.
 
-⚠️ **`onInstantiatePrefab` carries it as its LAST argument**, not beside `nestedOverrides` where it
-belongs logically. Those arguments are positional and five implementors read them by position
+⚠️ **`onInstantiatePrefab` carries it after `rootEditorFolder`**, not beside `nestedOverrides` where it
+belongs logically (the load's context object `{ read }`, #1934, now comes after it). Those arguments are positional and five implementors read them by position
 (`SceneManager` plus four test harnesses), so inserting would silently shift `rootGuid` and
 `rootEditorFolder` in any implementor not updated in the same change. Threading the recursion alone
 is not enough — the save looks correct while nothing applies it.

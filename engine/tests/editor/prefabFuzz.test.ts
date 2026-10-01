@@ -76,7 +76,7 @@ import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness'
 import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
 import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen } from './prefabFuzz/knownOpen';
-import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks } from './prefabFuzz/checks';
+import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, NODE_PLACEHOLDER_WAIVER, ENTRY_EXPANDED_WAIVER } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { setRunMode } from '@modoki/engine/runtime';
 
@@ -349,7 +349,11 @@ describe('#1789 prefab fuzz', () => {
 
   for (const k of KNOWN_OPEN) {
     it(`KNOWN_OPEN #${k.issue} still reproduces — remove its entry once it is fixed (${k.what})`, async () => {
-      const r = await runOps(be, k.repro, STRICT);
+      // Strict, except for what ANOTHER entry of the same issue tolerates: one issue's shapes can lie on one route (#1939:
+      // the expanded-entry and copy-carry repros pass a node placeholder first). Never a failure this entry reproduces.
+      const siblings = KNOWN_OPEN.filter((o) => o !== k && o.issue === k.issue && o.tolerates);
+      const tolerate = (f: StepFailure) => !k.reproduces(f) && siblings.some((o) => o.tolerates!(f));
+      const r = await runOps(be, k.repro, siblings.length ? { ...STRICT, tolerate: (f) => tolerate({ ...f, step: -1, op: '' }) } : STRICT);
       expect(r.failure, `#${k.issue} no longer reproduces: if it is fixed, delete its KNOWN_OPEN entry`).toBeDefined();
       expect(k.reproduces(r.failure!), `#${k.issue}'s repro now fails differently: ${r.failure!.check} — ${r.failure!.detail}`).toBe(true);
       if (k.stops) expect(knownStop(r.failure!, k.repro)?.issue, `#${k.issue}'s stop predicate does not claim its own repro`).toBe(k.issue);
@@ -644,62 +648,99 @@ describe('#1789 prefab fuzz', () => {
     expect(nodeMoved(lost, withChild, childOnly)).toBe(false);
   });
 
-  // #1805: a live instance of a DELETED prefab stays expanded while a reload gives its Missing Prefab placeholder (Unity does
-  // the same), so a round trip is judged against the save reloaded with the deleted prefab put back (`saveReload`), and a
-  // run fails only when neither comparison holds (`checkRoundTrip`). Loss stays visible: with #1812's record read taken
-  // out, the #1812 regressions go red through the restored comparison.
-  it('harness: the round trip of a deleted prefab — plain or restored identity passes, neither fails (#1805)', () => {
-    const live = { a: { traits: { X: 1 } }, m: { traits: { Y: 2 } } };
-    const placeholder = { a: { traits: { X: 1 } }, unresolvedEntry: { unresolved: 'p' } };
-    const same = { firstBytes: '{}', secondBytes: '{}' };
-    expect(checkRoundTrip({ before: live, after: placeholder, restored: live, ...same })).toEqual([]); // restored holds
-    expect(checkRoundTrip({ before: placeholder, after: placeholder, restored: live, ...same })).toEqual([]); // plain holds
-    const lost = checkRoundTrip({ before: live, after: placeholder, restored: { a: live.a }, ...same });
-    expect(lost.map((f) => f.check)).toEqual(['save→reload is not the identity']);
-    expect(lost[0]!.detail).toMatch(/\(with the deleted prefab restored\)$/);
-    // No deletion: the plain comparison, as before.
-    expect(checkRoundTrip({ before: live, after: placeholder, ...same }).map((f) => f.check)).toEqual(['save→reload is not the identity']);
-  });
-
-  // #1831 G1 M1: a live world can hold a KEPT frame of a deleted prefab beside one it could not expand (an unexpanded row,
-  // or a placeholder). The plain reload loses the kept frame, and the restored reload expands the other, so neither
-  // comparison held. The restored comparison now lets exactly that frame come back expanded. Mutation: in `checkRoundTrip`,
-  // compare against `rt.restored` raw — the first expectation goes red.
-  it('harness: the restored comparison lets an unexpanded row or a placeholder of a deleted prefab come back expanded, and nothing else (#1831)', () => {
+  // #1934 F4: a live instance of a DELETED prefab stays expanded, and the reload expands it from the scene's copy (#1935),
+  // so the round trip is the plain one. The one shape it forgives is #1939's waiver, a scene-added reference node that
+  // reloads as its placeholder: reported with a fixed detail that KNOWN_OPEN tolerates, and nothing else. Mutations in
+  // `waiveNodePlaceholders`: drop the "parent is an instance" test → the top-level and plain-parent rejects go
+  // red; drop the placement test → the moved reject goes red; drop the members' removal → the accept goes red.
+  it('harness: the round trip waives exactly a scene-added node placeholder of a deleted prefab, by placement (#1939 waiver)', () => {
     const same = { firstBytes: '{}', secondBytes: '{}' };
     const gone = (src: string) => src === 'P';
     const ea = (name: string, parentId: string | number = 0) => ({ EntityAttributes: { name, parentId } });
-    const pi = (source: string, rootInstanceId: string, extra: Record<string, unknown> = {}) => ({ PrefabInstance: { source, rootInstanceId, ...extra } });
-    // Live: a kept P frame K (root k, member km), and O's instance o whose P row (localId 2) is unexpanded.
-    const live = {
-      k: { traits: { ...ea('R'), ...pi('P', 'k') } }, km: { traits: { ...ea('A', 'k'), ...pi('P', 'k') } },
-      o: { traits: { ...ea('OR'), ...pi('O', 'o') } },
-    };
-    const plain = { o: live.o, kp: { traits: ea('R'), unresolved: 'P' } }; // the plain reload: K a placeholder
-    const expandedRow = { n: { traits: { ...ea('R', 'o'), ...pi('P', 'n', { parentLocalId: 2 }) } }, nm: { traits: { ...ea('A', 'n'), ...pi('P', 'n') } }, extra: { traits: ea('Extra', 'nm') } };
-    const restored = { ...live, ...expandedRow };
-    const unexpanded = new Set(['o:2']);
-    expect(checkRoundTrip({ before: live, after: plain, restored, unexpanded, ...same }, gone)).toEqual([]);
-    // Reject: the row was NOT recorded unexpanded, so a gained frame is a gained frame.
-    expect(checkRoundTrip({ before: live, after: plain, restored, unexpanded: new Set(), ...same }, gone)[0]?.detail).toMatch(/an entity was gained/);
-    // Reject: a gained frame of a prefab that is NOT deleted.
-    const notGone = { ...live, n: { traits: { ...ea('R', 'o'), ...pi('Q', 'n', { parentLocalId: 2 }) } } };
-    expect(checkRoundTrip({ before: live, after: plain, restored: notGone, unexpanded, ...same }, gone)).toHaveLength(1);
-    // Reject: the expansion forgiven, but a kept entity changed.
-    const changed = { ...restored, km: { traits: { ...ea('A2', 'k'), ...pi('P', 'k') } } };
-    expect(checkRoundTrip({ before: live, after: plain, restored: changed, unexpanded, ...same }, gone)[0]?.detail).toMatch(/^\/km\//);
-    // A live placeholder of the deleted prefab comes back an instance root of it, with members: compared by placement.
-    const livePh = { ...live, ph: { traits: ea('H'), unresolved: 'P' } };
-    const back = { ...live, ph: { traits: { ...ea('H'), ...pi('P', 'ph') } }, phm: { traits: { ...ea('A', 'ph'), ...pi('P', 'ph') } } };
-    expect(checkRoundTrip({ before: livePh, after: plain, restored: back, unexpanded: new Set(), ...same }, gone)).toEqual([]);
+    const pi = (source: string, rootInstanceId: string) => ({ PrefabInstance: { source, rootInstanceId } });
+    // O's instance o holds a scene-added P node n (member nm, and a scene child c under nm).
+    const o = { traits: { ...ea('OR'), ...pi('O', 'o') } };
+    const live = { o, n: { traits: { ...ea('N', 'o'), ...pi('P', 'n') } }, nm: { traits: { ...ea('A', 'n'), ...pi('P', 'n') } }, c: { traits: ea('C', 'nm') } };
+    const reloaded = { o, n: { traits: ea('N', 'o'), unresolved: 'P' } };
+    const waived = checkRoundTrip({ before: live, after: reloaded, ...same }, gone);
+    expect(waived).toEqual([{ check: 'save→reload is not the identity', detail: `/n: ${NODE_PLACEHOLDER_WAIVER}` }]);
+    expect(KNOWN_OPEN.some((k) => k.tolerates?.(waived[0]!))).toBe(true);
+    // Accept: a node under a node O's template added (no PrefabInstance of its own; hunt seed 5104's QR under Extra).
+    const viaAdded = { o, x: { traits: ea('Extra', 'o') }, n: { traits: { ...ea('N', 'x'), ...pi('P', 'n') } } };
+    expect(checkRoundTrip({ before: viaAdded, after: { o, x: viaAdded.x, n: { traits: ea('N', 'x'), unresolved: 'P' } }, ...same }, gone)[0]?.detail).toBe(`/n: ${NODE_PLACEHOLDER_WAIVER}`);
+    // Reject: a prefab that is not deleted.
+    expect(checkRoundTrip({ before: live, after: { o, n: { traits: ea('N', 'o'), unresolved: 'Q' } }, ...same }, gone)[0]?.detail).not.toContain('#1939');
+    expect(checkRoundTrip({ before: live, after: reloaded, ...same })[0]?.detail).not.toContain('#1939');
     // Reject: it came back somewhere else (its placement differs).
-    const moved = { ...back, ph: { traits: { ...ea('H', 'o'), ...pi('P', 'ph') } } };
-    expect(checkRoundTrip({ before: livePh, after: plain, restored: moved, unexpanded: new Set(), ...same }, gone)).toHaveLength(1);
+    expect(checkRoundTrip({ before: live, after: { o, n: { traits: ea('N2', 'o'), unresolved: 'P' } }, ...same }, gone)[0]?.detail).not.toContain('#1939');
+    // Reject: a TOP-level instance that came back a placeholder (it reads the copy, #1935).
+    const top = { t: { traits: { ...ea('T'), ...pi('P', 't') } }, tm: { traits: { ...ea('A', 't'), ...pi('P', 't') } } };
+    const topBack = checkRoundTrip({ before: top, after: { t: { traits: ea('T'), unresolved: 'P' } }, ...same }, gone);
+    expect(topBack).toHaveLength(1);
+    expect(topBack[0]!.detail).not.toContain('#1939');
+    // Reject: an entry hung under a PLAIN entity is an entry too.
+    const plainParent = { g: { traits: ea('G') }, t: { traits: { ...ea('T', 'g'), ...pi('P', 't') } } };
+    expect(checkRoundTrip({ before: plainParent, after: { g: plainParent.g, t: { traits: ea('T', 'g'), unresolved: 'P' } }, ...same }, gone)[0]?.detail).not.toContain('#1939');
+    // Reject: a nested frame LOST (no placeholder: a template row's frame that did not come back) is a loss.
+    const nested = { o, f: { traits: { ...ea('F', 'o'), ...pi('P', 'f') } } };
+    expect(checkRoundTrip({ before: nested, after: { o }, ...same }, gone)[0]?.detail).toMatch(/^\/f: .*\(an entity of a deleted prefab was lost\)$/);
+    // The waived node beside a REAL difference: the real one is reported, and nothing is tolerated.
+    const alsoChanged = checkRoundTrip({ before: live, after: { ...reloaded, o: { traits: { ...ea('OR2'), ...pi('O', 'o') } } }, ...same }, gone);
+    expect(alsoChanged.map((f) => f.detail)).toEqual([expect.stringMatching(/^\/o\//)]);
+    expect(KNOWN_OPEN.some((k) => k.tolerates?.(alsoChanged[0]!))).toBe(false);
+  });
+
+  // #1939's second shape (low): a placeholder ENTRY of a deleted prefab reloads expanded from the scene's copy (hunt seeds
+  // 3266, 1269). Mutations in `waiveExpandedEntries`: drop the "under the root" test → the gain-outside reject goes red;
+  // drop the source test → the other-prefab reject goes red; drop the "not inside an instance" test → the node reject goes
+  // red; drop the placement test → the moved reject goes red.
+  it('harness: the round trip waives exactly a placeholder entry of a deleted prefab that reloads expanded under itself (#1939 waiver 2)', () => {
+    const same = { firstBytes: '{}', secondBytes: '{}' };
+    const gone = (src: string) => src === 'P' || src === 'R';
+    const ea = (name: string, parentId: string | number = 0) => ({ EntityAttributes: { name, parentId } });
+    const pi = (source: string, rootInstanceId: string) => ({ PrefabInstance: { source, rootInstanceId } });
+    const g = { traits: ea('G') }; // a plain entity the entry hangs under (a detached instance's root)
+    const live = { g, e: { traits: ea('E', 'g'), unresolved: 'P' } };
+    const expanded = { g, e: { traits: { ...ea('E', 'g'), ...pi('P', 'e') } }, em: { traits: { ...ea('A', 'e'), ...pi('P', 'e') } } };
+    const waived = checkRoundTrip({ before: live, after: expanded, ...same }, gone);
+    expect(waived).toEqual([{ check: 'save→reload is not the identity', detail: `/e: ${ENTRY_EXPANDED_WAIVER}` }]);
+    expect(KNOWN_OPEN.some((k) => k.tolerates?.(waived[0]!))).toBe(true);
+    const notWaived = (after: object, before: object = live) => {
+      const r = checkRoundTrip({ before, after, ...same }, gone);
+      expect(r).toHaveLength(1);
+      expect(r[0]!.detail).not.toContain('#1939');
+      expect(KNOWN_OPEN.some((k) => k.tolerates?.(r[0]!))).toBe(false);
+    };
+    // Through I23: the second save differs only on the waived entry's record → waived; anywhere else as well → not.
+    const file = (eRec: object, extra: object[] = []) => JSON.stringify({ entities: [{ guid: 'g', traits: ea('G') }, { guid: 'e', ...eRec }, ...extra] });
+    const twice = (second: string) => checkRoundTrip({ before: live, after: expanded, firstBytes: file({ prefab: 'P' }), secondBytes: second }, gone);
+    const bytes = twice(file({ prefab: 'P', traits: { PrefabInstance: { localId: 1 } } }));
+    expect(bytes.map((f) => f.check)).toEqual(['save→reload is not the identity', 'save→reload→save is not byte-identical']);
+    expect(bytes.every((f) => KNOWN_OPEN.some((k) => k.tolerates?.(f)))).toBe(true);
+    const elsewhere = twice(file({ prefab: 'P', traits: { PrefabInstance: { localId: 1 } } }, [{ guid: 'z', traits: ea('Z') }]))[1]!;
+    expect(elsewhere.detail).not.toContain('#1939');
+    notWaived({ ...expanded, x: { traits: ea('X', 'g') } }); // a gain outside the root
+    notWaived({ g, e: { traits: { ...ea('E', 'g'), ...pi('R', 'e') } }, em: { traits: { ...ea('A', 'e'), ...pi('R', 'e') } } }); // another prefab
+    notWaived({ ...expanded, e: { traits: { ...ea('E2', 'g'), ...pi('P', 'e') } } }); // moved / renamed
+    const o = { traits: { ...ea('OR'), ...pi('O', 'o') } }; // inside an instance: a node, not an entry
+    notWaived({ o, e: { traits: { ...ea('E', 'o'), ...pi('P', 'e') } }, em: { traits: { ...ea('A', 'e'), ...pi('P', 'e') } } }, { o, e: { traits: ea('E', 'o'), unresolved: 'P' } });
+  });
+
+  // #1939, the copy carry: the KNOWN_OPEN `stops` claims the validator's could-not-be-read on a copy only after an undo.
+  // Mutation: drop its undo condition — the no-undo expectation goes red.
+  it('harness: the copy-carry stop claims a missing nested copy only where an undo ran (#1939)', () => {
+    const f = { check: 'scene validator', detail: "embeddedPrefabs['g1']: prefab \"O\": its template keys were not checked below nested prefab(s) g2 — they could not be read", step: 3, op: 'saveReload(0.1,0.2,0.3,0.4)' };
+    const u = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    const noUndo: Op[] = [{ kind: 'trashPrefab', u }, { kind: 'apply', u }, { kind: 'trashPrefab', u }, { kind: 'saveReload', u }];
+    expect(knownStop(f, noUndo)).toBeUndefined();
+    expect(knownStop(f, [...noUndo.slice(0, 3), { kind: 'undo', u }])?.issue).toBe(1939);
+    expect(knownStop({ ...f, step: 4, op: 'undo/redo to the ends' }, noUndo)?.issue).toBe(1939);
+    expect(knownStop({ ...f, detail: f.detail.replace('could not be read', 'differ') }, [{ kind: 'undo', u }])).toBeUndefined();
   });
 
   it('harness: a prefab created and then deleted in one run passes the final round trip (#1805 route 2, allowed)', async () => {
-    // Mutation: in `saveReload`, skip the restore (no `restored`) — the plain comparison fails: the live instance is
-    // expanded, the reload gives its placeholder.
+    // The created prefab's top-level instance stays expanded, and the reload expands it from the scene's copy (#1935).
+    // Mutation: drop the loader's top-level copy fallback — the reload gives its placeholder and the round trip fails.
     const ops: Op[] = [
       { kind: 'instantiate', u: [0.5075831420253962, 0.8186536263674498, 0.4673538957722485, 0.9546289832796901, 0.39170667389407754, 0.5493532461114228, 0.4505586097948253, 0.8853592379018664] },
       { kind: 'duplicate', u: [0.39032594044692814, 0.04696453106589615, 0.3570088869892061, 0.40155923343263566, 0.5113228356931359, 0.29383464995771646, 0.025902038207277656, 0.7472156076692045] },
@@ -708,9 +749,7 @@ describe('#1789 prefab fuzz', () => {
     ];
     const r = await runOps(be, ops, OPTS);
     expect(r.trace.slice(0, 4).every((l) => l.includes('→ done')), r.trace.join('\n')).toBe(true); // precondition: all ran
-    // …with the created prefab's instance a placeholder on the plain reload, as production's reload gives: the loader never
-    // held it. Mutation: drop the dance's loader restore (`invalidatePrefab` of an entry it seeded) — 0 placeholders.
-    expect(r.trace[4], r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toMatch(/^4: final save→reload → done \(1 deleted prefab\(s\) restored for the comparison; [1-9]\d* placeholder\(s\) on the plain reload\)$/);
+    expect(r.trace[4], r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toBe('4: final save→reload → done (1 deleted prefab(s); 0 placeholder(s) on the reload)');
     // The round trip passed. The walk after it runs undo against the placeholder the reload made — #1819's class (group 1
     // of #1789: the owner ruled such an undo refuses and drops its step; not built yet), which this test does not judge.
     expect(r.failure === undefined || r.failure.op === 'undo/redo to the ends', r.failure ? `${r.failure.op} — ${r.failure.check}: ${r.failure.detail}` : '').toBe(true);

@@ -7,7 +7,7 @@ import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/s
 import { getAllEntities, getCurrentWorld, findEntity } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
 import { execute, describe as describeOp, deletedPrefabs, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
+import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, waive1939, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -170,7 +170,7 @@ const parkedPaths = (): Set<string> => new Set(getDirtyAssetPaths().filter((p) =
  *  from it, with the undo stack reset as a save→reload leaves it. */
 async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Promise<Failure | null> {
   // Every skip is COUNTED by its reason (close-out review): a check whose guards quietly return reads as coverage it is not.
-  const skip = editing() ? 'prefab edit open' : deletedPrefabs(st).length ? 'a deleted prefab' : placeholderGuids().size ? 'a placeholder live' : null;
+  const skip = editing() ? 'prefab edit open' : placeholderGuids().size ? 'a placeholder live' : null;
   if (skip) { ran(`rebuild≡reload after ${kind}: skipped (${skip})`); return null; }
   const except = st.appliedTop;
   const live = worldTree();
@@ -194,11 +194,16 @@ async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Pr
     return Object.fromEntries(Object.entries(tree).filter(([k]) => top(k) !== except));
   };
   dump('t2-before', sBefore); dump('t2-live', live); dump('t2-reloaded', reloaded); dump('t2-except', except ?? null);
-  const [a, b] = [without(live), without(reloaded)];
-  const d = firstDiff(a, alignEqualOrientations(a, b));
+  const [a, b] = [without(live), alignEqualOrientations(without(live), without(reloaded))];
+  // A prefab the run deleted reloads from the scene's copy, as the live instance stays expanded (#1935); a scene-added
+  // node of one, and a placeholder entry that expands, are #1939's waivers (`waive1939`).
+  const gone = new Set(deletedPrefabs(st).map(([, t]) => { try { return (JSON.parse(t) as { id?: string }).id; } catch { return undefined; } }));
+  const waived = waive1939(a, b, (src) => gone.has(src));
+  const d = firstDiff(waived.before, waived.after);
   ran(`rebuild≡reload after ${kind}`);
   st.note = `rebuild≡reload checked${except ? ' (the Apply\'s own instance left out)' : ''}`;
-  return d ? { check: 'a rebuild is not a reload', detail: d, moved: nodeMoved(d, a, b) } : null;
+  if (!d && waived.details.length) return { check: 'a rebuild is not a reload', detail: waived.details[0]! };
+  return d ? { check: 'a rebuild is not a reload', detail: d, moved: nodeMoved(d, waived.before, waived.after) } : null;
 }
 
 /** #1880 T4, the RESPAWN form of "fold(chain + capture(live)) ≡ live": every stored instance root, rebuilt from its own
@@ -423,6 +428,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     st.note = undefined;
     st.roundTrip = undefined;
     st.prefabEditSaved = undefined;
+    st.innerOutcomes = undefined;
     st.fileOp = undefined;
     st.appliedTop = undefined;
     // I23 (#1914): the scene's record keys before an op that does not act on its instances (a template change underneath,
@@ -466,6 +472,9 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
       // Read back through the declared type, as `roundTrip` below: the reset above narrows `st.note` to undefined.
       const t2Note = (st as RunState).note;
       if (t2Note?.startsWith('rebuild≡reload')) trace[trace.length - 1] += ` [${t2Note}]`;
+      // Tolerated as a step's own failures are (#1934 F4: the check no longer skips a run that deleted a prefab, so #1939's
+      // waived node reaches it too).
+      if (t2Failure && opts.tolerate?.(t2Failure)) { ran(`tolerated (KNOWN_OPEN): ${t2Failure.check}`); t2Failure = null; }
       if (t2Failure) return fail(i, label, t2Failure);
       const t2Errors = consoleErrors.splice(0).filter((m, k, all) => !opts.expectedError(m, all[k - 1]));
       if (t2Errors.length) return fail(i, label, { check: 'console.error', detail: t2Errors[0].slice(0, 300) });
@@ -481,7 +490,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     }
     // Read back through the declared type: the reset above narrows `st.roundTrip` to undefined, and `execute` sets it.
     const rt = st.roundTrip as RunState['roundTrip'];
-    if (rt) { dump(`step${i}-rt-before`, rt.before); dump(`step${i}-rt-after`, rt.after); dump(`step${i}-rt-bytes1`, rt.firstBytes); dump(`step${i}-rt-bytes2`, rt.secondBytes); if (rt.restored !== undefined) dump(`step${i}-rt-restored`, rt.restored); }
+    if (rt) { dump(`step${i}-rt-before`, rt.before); dump(`step${i}-rt-after`, rt.after); dump(`step${i}-rt-bytes1`, rt.firstBytes); dump(`step${i}-rt-bytes2`, rt.secondBytes); }
     if (process.env.MODOKI_PREFAB_FUZZ_DUMP && !editing()) dump(`step${i}-scene`, await serializeScene());
     if (process.env.MODOKI_PREFAB_FUZZ_DUMP) dump(`step${i}-prefabs`, Object.fromEntries([...after].filter(([p]) => p.endsWith('.prefab.json')).map(([p, t]) => [p, JSON.parse(t) as unknown])));
     if (process.env.MODOKI_PREFAB_FUZZ_DUMP && !editing()) dump(`step${i}-world`, worldTree());

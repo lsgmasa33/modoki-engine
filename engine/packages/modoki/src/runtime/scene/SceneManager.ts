@@ -846,13 +846,15 @@ class SceneManagerImpl implements SceneManager {
             await acquirePrefab(sid, prefabPath);
             return (getCachedPrefab(prefabPath) as object) ?? null;
           },
-          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure) => {
+          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure, load) => {
+            const read = load?.read;
             // The prefab was already fetched + cached by fetchPrefab; spawn it
             // into the staging world (not the active world). Pass source so the
             // spawned entities get PrefabInstance traits for editor identification.
             // `overrides` carries per-localId field-level edits captured at save time;
             // `nestedOverrides` carries scene-level edits on the prefab's own nested instances.
-            const cached = getCachedPrefab(source);
+            // Through the load's reader: a top-level instance whose prefab is missing expands from the scene's copy (#1935).
+            const cached = (read ?? getCachedPrefab)(source);
             if (!cached) { console.warn(`[SceneManager] Prefab not in cache: ${source}`); return undefined; }
             const rootEcsId = instantiatePrefabIntoWorld(
               stagingWorld,
@@ -865,6 +867,8 @@ class SceneManagerImpl implements SceneManager {
               undefined,
               nestedOverrides,
               nestedStructure,
+              // The load's one reader, the scene's copies included — what its settle reads too (#1934 S1).
+              { read },
             );
             // Re-apply the scene-authored stable guid to the instance root. The prefab
             // template clears member guids, so the freshly-spawned root has none; without

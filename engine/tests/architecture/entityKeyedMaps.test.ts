@@ -734,6 +734,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'owner-checked: Sticky failure read only inside the reconcile after the owner check forgets a reused id (an ABSENT owner stamp forgets too, so the owner map cannot be the shorter lifetime); video/videoSystem.ts:228' },
   { item: 'video/videoSystem.ts::owner',
     reason: 'gen-in-value: Stores each id\'s owning packed entity; a mismatch runs forget(id) before any other map is read; video/videoSystem.ts:228' },
+  { item: 'loaders/loadSceneFile.ts::topReadByWorld',
+    reason: 'scratch: Lives only while a scene load is in flight (#1934 S1): the top instantiatePrefabIntoWorld inside onInstantiatePrefab writes the reader under the root id it returns, the load consumes that entry (get + delete) the moment the callback returns that id, and the whole map is dropped when the world\'s last load ends (loadsInFlight); a recycled id is overwritten by the newer instantiate before its read; loaders/loadSceneFile.ts noteTopRead + the loader\'s finally' },
   { item: 'loaders/audioBufferCache.ts::audioOwners',
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/audioBufferCache.ts:29' },
   { item: 'loaders/fontAtlasLoader.ts::owners',

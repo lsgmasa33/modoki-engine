@@ -581,12 +581,6 @@ async function serializeSceneScoped(opts?: {
   for (const entry of entities) rewriteRuntimeGuidStrings(entry, durableForRuntime);
   assertNoRuntimeGuids(entities, 'a serialized scene');
 
-  const embeddedPrefabs = await collectEmbeddedPrefabs(entityInfos, prefabRootInfo, entities);
-  // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).
-  const resources = collectResourceRefs(embeddedPrefabs
-    ? [...entities, ...Object.values(embeddedPrefabs).flatMap((d) => d.entities as unknown as SerializedEntity[])]
-    : entities);
-
   // This scene's own `loadedScenes` bookkeeping — the one lookup backs the scene's
   // `id`, its `createdAt` preservation (Phase 1, scene-loading.md: reuse the FILE's
   // original stamp instead of unconditionally minting a fresh one on every save)
@@ -619,6 +613,13 @@ async function serializeSceneScoped(opts?: {
     ? targetScene.guid
     : (ownLoadedEntry && isGuid(ownLoadedEntry.guid) ? ownLoadedEntry.guid
       : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid()));
+  // The copies THIS scene's load carried, keyed by the guid its file loaded with (#1934 L1; '' for a file without one).
+  const loadedId = targetScene ? targetScene.guid : ownLoadedEntry?.guid;
+  const embeddedPrefabs = await collectEmbeddedPrefabs(entityInfos, entities, loadedId && isGuid(loadedId) ? loadedId : '');
+  // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).
+  const resources = collectResourceRefs(embeddedPrefabs
+    ? [...entities, ...Object.values(embeddedPrefabs).flatMap((d) => d.entities as unknown as SerializedEntity[])]
+    : entities);
   const file: SceneFile = {
     id: sceneId, version: SCENE_FORMAT_VERSION,
     createdAt: ownLoadedEntry?.createdAt ?? new Date().toISOString(),
@@ -640,23 +641,27 @@ async function serializeSceneScoped(opts?: {
   return file;
 }
 
-/** The copies this save writes for NESTED prefabs that are missing (#1914 F8 = A1, #1867; Unity's scene backup,
+/** The copies this save writes for prefabs that are missing (#1914 F8 = A1, #1867, top level #1935; Unity's scene backup,
  *  `MergedAsMissingWithSceneBackup`), keyed by guid, sorted — or `undefined` when none is missing.
  *
  *  A copy is the document a frame was EXPANDED from (I3): a live nested frame's own record, which a frame the load
- *  expanded from a copy holds too — or, for a prefab no live frame expands (a row left unexpanded), the copy a loaded
- *  scene carried, written back verbatim (I18) until the prefab is back. Only a prefab that does NOT load is copied: once it
+ *  expanded from a copy holds too — or, for a prefab no live frame expands (a row left unexpanded), the copy THIS scene's
+ *  load carried (`scene`, its loaded guid), written back verbatim (I18) until the prefab is back. Never another scene's:
+ *  the world holds every scene of a chain, and a level's copy written into its base made the base's reload expand frames
+ *  that were not live at its save (#1934 L1, R7 fork A). Only a prefab that does NOT load is copied: once it
  *  is back it wins, and the copy goes at the next save. A copy is only ever BASE (I2/I17): it is the frame's template, and
  *  the writer's own edits stay in the scene's records, measured against it, exactly as they were against the prefab.
  *
- *  Top-level instances are not copied: the loader reads those through `fetchPrefab`, and a missing one stays a
- *  placeholder (#1699), so a copy would be bytes nothing reads. And a copy is written only when this scene's file
- *  reaches its guid — through its entries, a prefab or copy they name, and so on — so a copy whose frames all went, one
- *  that belongs to another scene of the chain, or one only a missing top-level instance nests, is not carried. */
+ *  A top-level instance is copied as a nested frame is (#1935: the owner's ruling covers both, and R7 had built only the
+ *  nested half): its live frame's record is the copy, and the reload expands it from there. A top-level Missing Prefab
+ *  PLACEHOLDER is no frame and gives none (#1699). And a copy is written only when this scene's file
+ *  reaches its guid — through its entries, a prefab or copy they name, and so on — so a copy whose frames all went, or
+ *  one only a top-level placeholder's record nests, is not carried. (The reach alone did not keep out another scene's copy:
+ *  a base's entries reach a guid its level's copy is for. The `scene` key does.) */
 async function collectEmbeddedPrefabs(
   entityInfos: readonly ReturnType<typeof getAllEntities>[number][],
-  topLevelRoots: ReadonlyMap<number, unknown>,
   entities: readonly SerializedEntity[],
+  scene: string,
 ): Promise<Record<string, EmbeddedPrefabDoc> | undefined> {
   const world = getCurrentWorld();
   const piMeta = getTraitByName('PrefabInstance');
@@ -675,17 +680,17 @@ async function collectEmbeddedPrefabs(
       const entity = findEntity(info.id);
       if (!entity || unresolvedRefOf(entity)) continue;
       const doc = frameRootDoc(world, entity)?.doc as TemplateDocLike | undefined;
-      if (!doc || topLevelRoots.has(info.id) || candidates.has(pi.source)) continue;
+      if (!doc || candidates.has(pi.source)) continue;
       if (await isMissing(pi.source)) candidates.set(pi.source, doc);
     }
   }
-  for (const guid of embeddedPrefabGuids(world)) {
+  for (const guid of embeddedPrefabGuids(world, scene)) {
     if (candidates.has(guid) || !(await isMissing(guid))) continue;
-    candidates.set(guid, embeddedPrefabDoc(world, guid) as TemplateDocLike);
+    candidates.set(guid, embeddedPrefabDoc(world, scene, guid) as TemplateDocLike);
   }
   if (!candidates.size) return undefined;
   // The reach: every guid string the file holds, then every one inside a document a reached guid names that a LOAD would
-  // expand — a prefab that loads, or a copy. Not a missing top-level instance's record (#1738): it reloads as its
+  // expand — a prefab that loads, or a copy. Not a top-level PLACEHOLDER's record (#1738): it reloads as its
   // placeholder (#1699) and expands no row, so a copy reached only through it is one no load reads, and the save after
   // that reload, which cannot reach it, dropped it (hunt seed 1031, I23).
   const reached = new Set<string>();
