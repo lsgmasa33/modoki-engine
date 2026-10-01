@@ -7,7 +7,9 @@
  *  is a recorded no-op, not an error. A prefab-edit op carries its own inner list, which the shrinker also trims. */
 
 import { createWorld } from 'koota';
-import { getTraitByName, seedRng, rngNext, findEntity } from '@modoki/engine/runtime';
+import { getTraitByName, seedRng, rngNext, findEntity, readTraitData } from '@modoki/engine/runtime';
+import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { instanceBase } from '../../../packages/modoki/src/editor/scene/prefabChain';
 import { pushAction } from '@modoki/engine/editor';
 import { createPrefabFromEntity, deleteAssetFiles, deletionPathsFor, moveAsset, planDeleteOutcome, planRename } from '../../../packages/modoki/src/editor/panels/assetOps';
 import { applyAssetPathMoves, unbindDeletedAssetEditors } from '../../../packages/modoki/src/editor/panels/assetEditorBindings';
@@ -62,6 +64,15 @@ export interface Op {
   /** An Apply or outside edit the runner checks rebuild ≡ reload after (#1880 T2) — written by the generator, for the same
    *  reason: the check reloads the scene and drops the undo stack, so a recorded list must never gain it unasked. */
   check?: 'rebuild-reload';
+  /** A variant the generator wrote (#1914 R0), read off draws the op already makes, for the same reason as `save`:
+   *  - `toBase` (an `editField`): the field is set to the value the instance's effective base gives it, a deliberate edit
+   *    equal to the prefab's value (Unity keeps a recorded one, #1914 F1/F2);
+   *  - `toOverride` (an `outsideEdit`): a template field is set to the value an instance records for it, so the template
+   *    now agrees with the override (it must stay recorded, #1914 § 4 row 8ii);
+   *  - `removeLeaf` / `restoreLeaf` (an `outsideEdit`): a plain leaf row is taken out of a template, as a merge of another
+   *    clone's prefab-edit delete writes it, and later put back as a revert of that merge would; the instances' records of
+   *    it must survive in between as unused overrides (#1914 F5, I18). */
+  variant?: 'toBase' | 'toOverride' | 'removeLeaf' | 'restoreLeaf';
 }
 
 /** Relative weights. Structure-changing ops and the three that CHECK (save→reload, undo, apply) are weighted up. */
@@ -103,6 +114,9 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
       // are what they were), and WRITTEN into the op, which a replay or a recorded repro then carries as it is.
       if (op.kind === 'saveReload' && op.u[1]! >= 0.65) op.save = op.u[3]! < 0.5 ? 'all-no-reload' : 'all';
       if ((op.kind === 'apply' || op.kind === 'outsideEdit') && op.u[7]! >= 0.7) op.check = 'rebuild-reload';
+      if (op.kind === 'editField' && op.u[4]! >= 0.75) op.variant = 'toBase';
+      if (op.kind === 'outsideEdit') op.variant = op.u[4]! < 0.25 ? 'toOverride' : op.u[4]! < 0.45 ? 'removeLeaf' : op.u[4]! < 0.6 ? 'restoreLeaf' : undefined;
+      if (op.variant === undefined) delete op.variant;
       ops.push(op);
     }
     return ops;
@@ -114,7 +128,7 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
 /** A short, stable spelling of an op for reports. */
 export function describe(op: Op): string {
   const u = op.u.slice(0, 4).map((x) => x.toFixed(3)).join(',');
-  const tag = op.save ? `{${op.save}}` : op.check ? `{${op.check}}` : '';
+  const tag = [op.save, op.check, op.variant].filter(Boolean).map((t) => `{${t}}`).join('');
   return op.inner ? `${op.kind}${tag}(${u})[${op.inner.map(describe).join('; ')}]` : `${op.kind}${tag}(${u})`;
 }
 
@@ -146,6 +160,8 @@ export interface RunState {
   /** Set by an Apply that landed: the guid of the TOP-LEVEL entity its instance hangs under. The rebuild ≡ reload check
    *  (#1880 T2) leaves that subtree out, since an Apply rewrites its own instance's statements, not only the template. */
   appliedTop?: string;
+  /** The leaf rows `removeLeaf` took out, newest last, for `restoreLeaf` to put back: the document's id and the row. */
+  removedRows?: Array<{ docId: string; row: Record<string, unknown> }>;
   /** Set by an Assets file op that landed (a trash: `to` null; a rename): it is not undoable (#1868, owner ruling D2), so
    *  the runner carries it into the segment's baseline rather than expecting the walk to put it back. */
   fileOp?: { from: string; to: string | null };
@@ -264,6 +280,58 @@ const ADDABLE = ['Rotate3D', 'Renderable3DPrimitive'];
 /** Transform is a core trait: the Inspector offers no Remove for it (`traitRemoveRefusal`). */
 const REMOVABLE = ['Rotate3D', 'Renderable3DPrimitive'];
 
+/** The value the member's effective base gives `field` of its Transform (`instanceBase`: the frame's document under
+ *  every enclosing row), or undefined when the member's row is not found. An absent field is the schema default. */
+function baseTransformValue(id: number, field: string): number | undefined {
+  const pi = piOf(id);
+  if (!pi) return undefined;
+  const doc = frameRootDoc(getCurrentWorld(), findEntity(pi.rootInstanceId) as never)?.doc ?? getCachedPrefabSync(pi.source);
+  if (!doc) return undefined;
+  const row = instanceBase(pi.rootInstanceId, doc as PrefabFile).entities.find((r) => r.localId === pi.localId);
+  if (!row) return undefined;
+  const tf = (row.traits as { Transform?: Record<string, number> }).Transform ?? {};
+  return typeof tf[field] === 'number' ? tf[field] : field.startsWith('s') ? 1 : 0;
+}
+
+/** `outsideEdit`'s `toOverride` and `restoreLeaf` (see `Op.variant`). */
+function outsideVariant(op: Op, st: RunState): Outcome {
+  const u = op.u;
+  if (op.variant === 'restoreLeaf') {
+    const last = st.removedRows?.at(-1);
+    const path = last ? st.lastPrefabs?.get(last.docId)?.[0] : undefined;
+    const text = path ? st.be.read(path) : undefined;
+    if (!last || !path || !text) return 'noop';
+    const doc = JSON.parse(text) as PrefabFile;
+    const parent = (last.row.traits as { EntityAttributes?: { parentId?: number } })?.EntityAttributes?.parentId;
+    if (doc.entities.some((r) => r.localId === last.row.localId) || !doc.entities.some((r) => r.localId === parent)) return 'noop';
+    doc.entities.push(last.row as never);
+    st.removedRows!.pop();
+    st.be.write(path, `${JSON.stringify(doc, null, 2)}\n`);
+    st.note = `restored ${String(last.row.name)} (${String(last.row.localId)}) to ${path}`;
+    return 'done';
+  }
+  // toOverride: a member with a recorded Transform field, whose frame's template row is in a file the run knows.
+  const cands = authored().flatMap((e) => {
+    const pi = piOf(e.id);
+    const ent = findEntity(e.id);
+    if (!pi || !ent || !e.traits.includes('Transform')) return [];
+    const path = st.lastPrefabs?.get(pi.source)?.[0];
+    if (!path || !st.be.read(path)) return [];
+    const fields = [...(getOverrideMarkSet(ent) ?? [])].filter((m) => m.startsWith('Transform.')).map((m) => m.slice(10)).sort();
+    return fields.map((f) => ({ id: e.id, pi, path, f }));
+  });
+  const c = pick(u[1], cands);
+  if (!c) return 'noop';
+  const doc = JSON.parse(st.be.read(c.path)!) as PrefabFile;
+  const row = doc.entities.find((r) => r.localId === c.pi.localId && (!c.pi.nodeGuid || r.nodeGuid === c.pi.nodeGuid));
+  if (!row) return 'noop';
+  const tf = ((row.traits as Record<string, unknown>).Transform ??= {}) as Record<string, unknown>;
+  tf[c.f] = (readTraitData(c.id, meta('Transform')) as Record<string, unknown>)[c.f];
+  st.be.write(c.path, `${JSON.stringify(doc, null, 2)}\n`);
+  st.note = `template ${c.path} row ${row.localId} Transform.${c.f} := the instance's override`;
+  return 'done';
+}
+
 /** Run one op. Throws only on a real failure (an exception from the editor); a refusal or a no-op returns. */
 export async function execute(op: Op, st: RunState): Promise<Outcome> {
   const u = op.u;
@@ -356,10 +424,11 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       return editRefusable(() => { deleteEntitiesWithUndo([e.id]); return 'done'; }, st);
     }
     case 'editField': {
-      const e = pick(u[0], ents.filter((x) => x.traits.includes('Transform')));
+      const e = pick(u[0], ents.filter((x) => x.traits.includes('Transform') && (op.variant !== 'toBase' || !!piOf(x.id))));
       if (!e) return 'noop';
       const field = pick(u[1], TRANSFORM_FIELDS)!;
-      const value = Math.round(u[2] * 20 - 10);
+      const value = op.variant === 'toBase' ? baseTransformValue(e.id, field) : Math.round(u[2] * 20 - 10);
+      if (value === undefined) { st.note = 'no base for the field'; return 'noop'; }
       // A refusal is the placeholder gate's (#1818): the save would drop the edit.
       return writeTraitFieldWithUndo(e.id, meta('Transform'), field, value) ? 'refused' : 'done';
     }
@@ -571,10 +640,22 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       // instance as a keyed `added` node on the reference row (docs/prefabs.md § reference row), never as a plain row,
       // and the loader derives such a row's guid from the nested frame's member with the same localId: a false I7 (win's
       // hunt seed 3130). Whether the loader should refuse that hand-edited shape is a separate, unfiled question.
+      if (op.variant === 'toOverride' || op.variant === 'restoreLeaf') return outsideVariant(op, st);
       const path = pick(u[0], prefabFiles(st));
       if (!path) return 'noop';
       const doc = JSON.parse(st.be.read(path)!) as PrefabFile & { nextLocalId?: number };
-      if (u[3] < 0.5) {
+      if (op.variant === 'removeLeaf') {
+        // A plain row with no child row, not the root, named by no move and no member token (a hand-maintained ref to it
+        // would dangle: that is a different finding).
+        const text = JSON.stringify(doc);
+        const leaf = pick(u[1], doc.entities.filter((r) => !(r as { prefab?: unknown }).prefab && r.localId !== doc.rootLocalId
+          && !doc.entities.some((c) => (c.traits as { EntityAttributes?: { parentId?: number } })?.EntityAttributes?.parentId === r.localId)
+          && !text.includes('@member') && !(doc as { moved?: object }).moved));
+        if (!leaf || !doc.id) return 'noop';
+        doc.entities = doc.entities.filter((r) => r !== leaf);
+        (st.removedRows ??= []).push({ docId: doc.id, row: leaf as unknown as Record<string, unknown> });
+        st.note = `removed ${leaf.name} (${leaf.localId}) from ${path}`;
+      } else if (u[3] < 0.5) {
         const row = pick(u[1], doc.entities.filter((r) => (r.traits as Record<string, unknown>)?.Transform));
         if (!row) return 'noop';
         const tf = (row.traits as Record<string, Record<string, number>>).Transform;

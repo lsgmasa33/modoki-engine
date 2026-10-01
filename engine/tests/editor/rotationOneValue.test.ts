@@ -9,7 +9,7 @@ import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/edito
 import { instantiatePrefab } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { captureInstanceOverrides } from '../../packages/modoki/src/editor/scene/prefabInstanceOverrides';
 import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
-import { reconcileOverrideMarks } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
+import { recordOverridesByDiff } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -63,26 +63,27 @@ describe('rotation is ONE override (#1880 F5)', () => {
     expect(marksOf(byName('A'))).toEqual(['Transform.x']);
   });
 
-  // Mutation: decide each rotation axis on its own in `reconcileOverrideMarks` (drop `rotationOff`) — ry, equal to its
-  // base, unmarks the rotation rx just marked: nothing is marked and the edit is not saved.
-  it('reconcile: rx off its base and ry equal to it still marks the whole rotation', () => {
+  // Mutation: decide each rotation axis on its own in `recordOverridesByDiff` AND record one key, not its group
+  // (`groupOf` returning `[key]`) — only rx is recorded, and the save writes rx without ry/rz. Either half alone stays
+  // green: R2's recorder never unmarks, so the group `markOverride` takes for rx is the whole rotation.
+  it('the recorder: rx off its base and ry equal to it records the whole rotation', () => {
     const root = instance();
     const a = byName('A');
     writeTraitField(a, T(), 'rx', 0.5);
-    reconcileOverrideMarks(a, T(), ['rx', 'ry', 'rz']);
+    recordOverridesByDiff(a, T(), ['rx', 'ry', 'rz']);
     expect(marksOf(a)).toEqual(['Transform.rx', 'Transform.ry', 'Transform.rz']);
     expect(captureInstanceOverrides(root, pDoc as never)[2]!.Transform).toEqual({ rx: 0.5, ry: 0.25, rz: 0 });
-    // (accept) the rotation put back on its base unmarks all three.
+    // The rotation put back on its base keeps all three (#1914 F3: a write removes no record).
     writeTraitField(a, T(), 'rx', 0);
-    reconcileOverrideMarks(a, T(), ['rx', 'ry', 'rz']);
-    expect(marksOf(a)).toEqual([]);
+    recordOverridesByDiff(a, T(), ['rx', 'ry', 'rz']);
+    expect(marksOf(a)).toEqual(['Transform.rx', 'Transform.ry', 'Transform.rz']);
   });
 
   it('(accept) a position-only change marks no rotation', () => {
     instance();
     const a = byName('A');
     writeTraitField(a, T(), 'x', 3);
-    reconcileOverrideMarks(a, T(), ['x', 'rx', 'ry', 'rz']);
+    recordOverridesByDiff(a, T(), ['x', 'rx', 'ry', 'rz']);
     expect(marksOf(a)).toEqual(['Transform.x']);
   });
 });

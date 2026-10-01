@@ -48,6 +48,8 @@ export function tokenizeRowMembers(
   rowRoot: number,
   frameOf: (pathKey: string) => number,
   tokens: ReturnType<typeof templateTokenizer>,
+  /** The frame of each row reaching into a template reference node (#1914 R3b), which `frames` cannot place. */
+  rowFrames?: ReadonlyMap<string, number>,
 ): Record<string, SceneMemberRow> {
   const keyOf = memberRowKeysIn(rowRoot);
   const pathByKey = new Map<string, string>();
@@ -55,7 +57,7 @@ export function tokenizeRowMembers(
   const out: Record<string, SceneMemberRow> = {};
   for (const [key, row] of Object.entries(members)) {
     const path = pathByKey.get(key) ?? pathByKey.get(key.slice(0, key.lastIndexOf('/')));
-    const frame = path ? frameOf(path) : rowRoot;
+    const frame = rowFrames?.get(key) ?? (path ? frameOf(path) : rowRoot);
     const r: SceneMemberRow = { ...row };
     if (r.traits) r.traits = tokens.value(r.traits, frame) as SceneMemberRow['traits'];
     if (r.added) r.added = tokens.added(r.added, frame);

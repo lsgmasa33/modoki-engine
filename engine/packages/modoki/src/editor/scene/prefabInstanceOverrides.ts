@@ -5,9 +5,9 @@
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { readTraitDataFull, writeTraitField, findEntity } from '../../runtime/core/ecs/entityUtils';
-import { markOverride, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
-import { isPersistentTraitField, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
+import { readTraitDataFull } from '../../runtime/core/ecs/entityUtils';
+import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchema';
 import { type PrefabFile, valuesEqual } from './prefab';
 import { baseTokenResolver } from './prefabTokens';
 import { instanceMovedMembers } from './prefabMembers';
@@ -120,8 +120,8 @@ export function collectComparableTraits(
 }
 
 /** The RAW by-value diff as "traitName.fieldName" strings: every field that differs from `prefab`, marked or not. Not
- *  what any surface shows — the Inspector highlight and the override list pass the save's mark gate (#1717,
- *  {@link memberOverrideKeys}, `gateOnMarks`); this stays as the unit under `getOverrideValues`' own tests. */
+ *  what any surface shows — the Inspector highlight and the override list show the record (#1717, #1914 R3c,
+ *  {@link memberOverrideKeys}, {@link recordedOverrides}); this stays as the unit under `getOverrideValues`' own tests. */
 export function getOverrides(
   entityLocalId: number,
   currentTraits: Record<string, Record<string, unknown>>,
@@ -138,55 +138,42 @@ export function getOverrides(
   return overrides;
 }
 
-/** The MARK GATE: of a member's value diffs (`getOverrideValues`), drop every prefab-DEFINED field that carries no
- *  override mark. In place. The ONE rule the scene save and every override surface share — the Apply/Revert list, the
- *  agent `overrides`, the Inspector's highlight (#1717: those diffed by value alone, so a value that differs with no mark
- *  was listed and highlighted, and the file never held it). Unity's model: only a RECORDED modification is an override.
+/** A member's RECORDED overrides (#1914 R3c): what the scene save writes, the Apply/Revert listing and the agent
+ *  `overrides` list, and the Inspector highlights — one rule for all of them (#1717: they once diffed by value alone, so
+ *  a value that differed with no record was listed and highlighted, and the file never held it).
  *
- *  getOverrideValues reports every field whose live value differs from the prefab base — but a divergence alone is NOT
- *  an override: when a prefab is RE-IMPORTED and its base changes under an un-edited instance (e.g. the FBX-wrapper bake
- *  rewriting root-bone scale/rot), the instance's still-old values diverge from the new base and would be frozen as
- *  spurious overrides, breaking the instance (mesh collapses) while a fresh instance renders. A real override is one the
- *  user explicitly made, which is recorded as a mark (every editor instance write marks, #1709; scene load re-seeds marks
- *  from stored overrides). Two kinds are kept whatever the marks say:
- *  - an ADDED trait or tag (the base does not define it at this member): structural, captured whole;
+ *  The record is the member's marks, each field with its LIVE value whatever it equals (owner rulings F1, F3: Unity
+ *  keeps an override "also if the value in the Prefab Asset changes"). A mark is the instance's OWN record at every
+ *  depth: a load marks only what the writer states, never an enclosing layer's value (#1914 R1, § I2), and an editor
+ *  write records what it made differ (`recordOverridesByDiff`, R2). No value decides a record here. Before R3c the save
+ *  derived the same set from the value diff — a mark gate over it, then a fold of the marked fields equal to the base —
+ *  and a re-imported template whose base moved under an unedited instance stays out for the same reason it did then:
+ *  nothing recorded it.
+ *
+ *  Two things no record names, read from `diffs` (`getOverrideValues`), the only use left of the value diff:
+ *  - a component the base does not define at this member (an ADDED trait or tag): structural, captured whole;
  *  - the Transform of a member `moved` inside its instance (#1437): its local pose is relative to a parent the prefab
- *    never gave it, so every field that differs from the base is part of the move, and none of it needs a mark. Moved
- *    back home, the gate applies again, so a round trip pins nothing. */
-export function gateOnMarks(
+ *    never gave it, so every field that differs from the base is part of the move. Moved back home, only the record
+ *    applies again, so a round trip pins nothing.
+ *
+ *  Returned in the one key order a save writes ({@link inCanonicalOrder}). */
+export function recordedOverrides(
   diffs: Record<string, Record<string, unknown>>,
   markSet: ReadonlySet<string> | null | undefined,
   baseEntity: { traits: Record<string, unknown> } | undefined,
-  /** Whether the member is moved inside its instance — asked only when a Transform field differs with no mark. */
+  /** Whether the member is moved inside its instance — asked only when a Transform field differs with no record. */
   moved: () => boolean,
-): void {
+  currentTraits: Record<string, Record<string, unknown>>,
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
   for (const [traitName, fields] of Object.entries(diffs)) {
     const prefabData = baseEntity?.traits[traitName];
-    if (prefabData === undefined || prefabData === true) continue; // added trait/tag — keep
-    if (traitName === 'Transform' && Object.keys(fields).some((f) => !markSet?.has(`Transform.${f}`)) && moved()) continue;
-    for (const field of Object.keys(fields)) {
-      if (!markSet?.has(`${traitName}.${field}`)) delete fields[field];
+    const added = prefabData === undefined || prefabData === true;
+    if (added || (traitName === 'Transform' && Object.keys(fields).some((f) => !markSet?.has(`Transform.${f}`)) && moved())) {
+      out[traitName] = { ...fields };
     }
-    if (Object.keys(fields).length === 0) delete diffs[traitName];
   }
-}
-
-/** Fold into `diffs` every MARKED field whose value COINCIDES with the base, so the value diff did not report it (e.g.
- *  after the base was edited to match): a marked field is a recorded override, whatever its value (#1709), and it is
- *  given its current value. In place. The save's rule, and the listing's (#1717) — except, under an enclosing row, a
- *  field that row states: the layer's values arrive marked as well (docs/prefabs.md I2), and would read as this
- *  instance's own. */
-export function foldMarkedEqual(
-  diffs: Record<string, Record<string, unknown>>,
-  markSet: ReadonlySet<string> | null | undefined,
-  currentTraits: Record<string, Record<string, unknown>>,
-  /** What the layers enclosing the instance state on this member (`enclosingRowOverrides(root)[localId]`): a mark on a
-   *  field they state is theirs, not the instance's own, so it is not folded in. Per FIELD, as the save's subtraction
-   *  is (`subtractChainOverrides`) — a layer stating one field does not hide the instance's own mark on another. */
-  layerStates?: Record<string, Record<string, unknown>>,
-): void {
-  if (!markSet) return;
-  for (const markKey of markSet) {
+  for (const markKey of markSet ?? []) {
     const dot = markKey.indexOf('.');
     const traitName = markKey.slice(0, dot);
     const field = markKey.slice(dot + 1);
@@ -194,24 +181,44 @@ export function foldMarkedEqual(
     // A member's guid is per-instance identity, and since v16 it is a ROW (`captureInstanceMembers`)
     // — so it must be written in exactly one place. Emitting it here too would put the same value
     // in two channels with no rule for which wins, and an edit to one would be silently discarded
-    // by the other on the next load. #1468 asked for this line to be reconciled; the reconciliation
-    // is that it stays, with the reason upgraded from "it is nothing" to "it is a row".
+    // by the other on the next load.
     if (traitName === 'EntityAttributes' && field === 'guid') continue;
-    if (diffs[traitName] && field in diffs[traitName]) continue; // already captured
-    const stated = layerStates?.[traitName];
-    if (stated && typeof stated === 'object' && field in stated) continue; // the enclosing layer's value (a tag's may be `true`)
+    // A tag's record (`Tag.`): the tag itself while the member has it, whatever the base gives (#1914: a tag the scene
+    // recorded stays the scene's when a row adds it too).
+    if (!field) { if (currentTraits[traitName] && getTraitByName(traitName)?.category === 'tag') out[traitName] ??= {}; continue; }
     const cur = currentTraits[traitName]?.[field];
-    if (cur === undefined) continue;
-    (diffs[traitName] ??= {})[field] = cur;
+    if (cur === undefined) continue; // a field of a trait the member no longer has
+    (out[traitName] ??= {})[field] = cur;
   }
+  return inCanonicalOrder(out, currentTraits);
+}
+
+/** `prefab` with `overrides` (a chain's per-localId statements, tokens resolved) folded into its rows: a tag set, every
+ *  other trait's fields laid over the row's own. What a nested instance shows with no record of its own. */
+export function withOverridesFolded(prefab: PrefabFile, overrides: Record<number, Record<string, Record<string, unknown>>> | undefined): PrefabFile {
+  if (!overrides || !Object.keys(overrides).length) return prefab;
+  return {
+    ...prefab,
+    entities: prefab.entities.map((e) => {
+      const over = overrides[e.localId];
+      if (!over) return e;
+      const traits: Record<string, unknown> = { ...e.traits };
+      for (const [trait, fields] of Object.entries(over)) {
+        const own = traits[trait];
+        traits[trait] = getTraitByName(trait)?.category === 'tag' ? true
+          : { ...(own && typeof own === 'object' ? own as Record<string, unknown> : {}), ...fields };
+      }
+      return { ...e, traits } as typeof e;
+    }),
+  };
 }
 
 /** `diffs` in the ONE key order a save writes (#1896): traits in the order {@link collectComparableTraits} reads them
  *  (the registry's), each trait's fields in the order it read them (the schema's — `writtenTraitKeys`' order for a
- *  plain entity; an AoS trait's live order). The two passes above build the object in HISTORY order: the value diff in
- *  schema order, then `foldMarkedEqual` appending in mark-set insertion order. That order is what the session happened
- *  to mark first, and a reload re-seeds marks in file order with a rotation mark pulling in its whole group
- *  (`markOverride`), so a save → reload → save rewrote `{rx,x,ry,rz}` as `{rx,ry,rz,x}` with no value changed. */
+ *  plain entity; an AoS trait's live order). {@link recordedOverrides} builds the object in HISTORY order (the record's
+ *  insertion order). That order is what the session happened to mark first, and a reload re-seeds marks in file order
+ *  with a rotation mark pulling in its whole group (`markOverride`), so a save → reload → save rewrote `{rx,x,ry,rz}` as
+ *  `{rx,ry,rz,x}` with no value changed. */
 function inCanonicalOrder(
   diffs: Record<string, Record<string, unknown>>,
   currentTraits: Record<string, Record<string, unknown>>,
@@ -230,6 +237,9 @@ function inCanonicalOrder(
 export function captureInstanceOverrides(
   rootInstanceId: number,
   prefab: PrefabFile,
+  /** What the instance shows with no record of its own, when that is more than `prefab`: a nested instance's template
+   *  under the chain enclosing it (`withOverridesFolded`), so a component or value the chain gives is base, not added. */
+  base: PrefabFile = prefab,
 ): Record<number, Record<string, Record<string, unknown>>> {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return {};
@@ -263,91 +273,12 @@ export function captureInstanceOverrides(
     // as `{name: {}}`. See runtime/core/ecs/traitSchema.ts.
     const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
-    const diffs = getOverrideValues(localId, currentTraits, prefab, resolveBase);
-    const markSet = getOverrideMarkSet(entity);
-
-    // The MARK GATE (`gateOnMarks`): a divergence alone is not an override, only a recorded (marked) one is.
-    gateOnMarks(diffs, markSet, rowAt(prefab, localId), () => movedOf(entity.id(), !!diffs['Transform']));
-
-    // A MARKED value equal to its base is a recorded override too (`foldMarkedEqual`).
-    foldMarkedEqual(diffs, markSet, currentTraits);
-
-    if (Object.keys(diffs).length > 0) {
-      result[localId] = inCanonicalOrder(diffs, currentTraits);
-    }
+    // The member's record (`recordedOverrides`): only a recorded field is an override, with its live value.
+    const diffs = getOverrideValues(localId, currentTraits, base, resolveBase);
+    const recorded = recordedOverrides(diffs, getOverrideMarkSet(entity), rowAt(base, localId), () => movedOf(entity.id(), !!diffs['Transform']), currentTraits);
+    if (Object.keys(recorded).length > 0) result[localId] = recorded;
   });
 
   return result;
 }
 
-/** Apply a captured override map to a prefab instance, locating entities by
- *  matching `PrefabInstance.localId` within the same `rootInstanceId`. Silently
- *  skips entries whose localId/trait/field no longer exists in the live world. */
-export function applyOverridesByRootInstance(
-  rootInstanceId: number,
-  overrides: Record<number, Record<string, Record<string, unknown>>>,
-): void {
-  if (!overrides || Object.keys(overrides).length === 0) return;
-  const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta) return;
-
-  // Build localId → ecsId map for this instance
-  const localToEcs = new Map<number, number>();
-  getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
-    const piData = pi as Record<string, unknown>;
-    if (piData.rootInstanceId !== rootInstanceId) return;
-    const localId = piData.localId as number;
-    if (localId) localToEcs.set(localId, entity.id());
-  });
-
-  for (const [localIdStr, traitMap] of Object.entries(overrides)) {
-    const localId = Number(localIdStr);
-    const ecsId = localToEcs.get(localId);
-    if (!ecsId) {
-      console.debug(`[Prefab] override skipped: no entity for localId ${localId} in instance ${rootInstanceId}`);
-      continue;
-    }
-    const member = findEntity(ecsId);
-    if (!member) continue;
-    for (const [traitName, fields] of Object.entries(traitMap)) {
-      const meta = getTraitByName(traitName);
-      if (!meta) {
-        console.debug(`[Prefab] override skipped: unknown trait ${traitName}`);
-        continue;
-      }
-      if (meta.category === 'tag') {
-        // Added-tag override: ensure the tag is present on the instance. writeTraitField
-        // adds the tag for a truthy value (field name is ignored for tags).
-        writeTraitField(ecsId, meta, '', true);
-        markOverride(member, traitName, '');
-        continue;
-      }
-      // Accept any field the trait PERSISTS (its koota schema), so a re-apply keeps
-      // an AoS trait's non-scalar fields AND a SoA field that has no Inspector row
-      // (Animator.clips/clip, EntityAttributes.editorFolder). A field the schema does
-      // not declare is still skipped — that's the stale/renamed case the old guard
-      // wanted. See runtime/core/ecs/traitSchema.ts.
-      const known: Record<string, unknown> = {};
-      for (const [field, value] of Object.entries(fields)) {
-        if (!isPersistentTraitField(meta, field)) {
-          console.debug(`[Prefab] override skipped: unknown field ${traitName}.${field}`);
-          continue;
-        }
-        known[field] = value;
-      }
-      const entity = member;
-      if (!entity.has(meta.trait)) {
-        // Added-trait override (root or child): the instance carries a trait the
-        // prefab lacks at this localId. Add it whole so prefab refresh preserves it.
-        entity.add(meta.trait(known));
-      } else {
-        for (const [field, value] of Object.entries(known)) {
-          writeTraitField(ecsId, meta, field, value);
-        }
-      }
-      // Seed explicit marks from the override map so these fields survive a later
-      // serialize even if the prefab base is edited to coincide with them.
-      for (const field of Object.keys(known)) markOverride(member, traitName, field);
-    }
-  }
-}

@@ -1,4 +1,4 @@
-/** captureInstanceOverrides + applyOverridesByRootInstance — round-trip in a
+/** captureInstanceOverrides + the load's apply (`applyOverridesByLocalToEcs`) — round-trip in a
  *  hand-built world. */
 
 import { describe, it, expect } from 'vitest';
@@ -8,11 +8,24 @@ import { getTraitByName } from '@modoki/engine/runtime';
 import {
   instantiatePrefab,
   captureInstanceOverrides,
-  applyOverridesByRootInstance,
   type PrefabFile,
 } from '@modoki/engine/editor';
+import { applyOverridesByLocalToEcs } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
 registerAllTraits();
+
+/** A recorded override map applied to instance `rootId` as a LOAD applies its scene entry's (`applyOverridesByLocalToEcs`,
+ *  every value the writer's own, so recorded): the editor's twin of it, `applyOverridesByRootInstance`, had no caller
+ *  left and was deleted in #1914 R8, so these cases run the path a load takes. */
+function applyAsLoad(rootId: number, overrides: Record<number, Record<string, Record<string, unknown>>>): void {
+  const pi = getTraitByName('PrefabInstance')!;
+  const localToEcs = new Map<number, number>();
+  getCurrentWorld().query(pi.trait).updateEach(([d], e) => {
+    const data = d as { rootInstanceId?: number; localId?: number };
+    if (data.rootInstanceId === rootId && data.localId) localToEcs.set(data.localId, e.id());
+  });
+  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides, overrides);
+}
 
 function makePrefab(): PrefabFile {
   return {
@@ -80,7 +93,7 @@ describe('captureInstanceOverrides', () => {
   });
 });
 
-describe('applyOverridesByRootInstance', () => {
+describe('the load\'s apply of a captured map', () => {
   it('writes captured overrides back onto a freshly-instantiated tree', () => {
     const prefab = makePrefab();
 
@@ -104,7 +117,7 @@ describe('applyOverridesByRootInstance', () => {
     expect(childBPreX).toBe(5); // prefab base
 
     // Apply captured overrides to instance B
-    applyOverridesByRootInstance(rootB, captured);
+    applyAsLoad(rootB, captured);
 
     let childBPostX = -1;
     getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => {
@@ -118,7 +131,7 @@ describe('applyOverridesByRootInstance', () => {
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
     const childId = findChildEcsId(rootId);
-    expect(() => applyOverridesByRootInstance(rootId, { 99: { Transform: { x: 1 } } }))
+    expect(() => applyAsLoad(rootId, { 99: { Transform: { x: 1 } } }))
       .not.toThrow();
     const tfMeta = getTraitByName('Transform')!;
     const xs = new Map<number, number>();

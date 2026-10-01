@@ -3,7 +3,7 @@
  *  (`diffFrameAdded`). The round trip through a real save and load is `nestedRowFieldSave.test.ts`. */
 import { describe, it, expect } from 'vitest';
 import { formatNodeRowKey, parseNodeRowKey, nodeRowKey, parseMemberRowKey, formatMemberRowKey } from '../../packages/modoki/src/runtime/core/assetRefRules';
-import { foldMemberRowChannels, applyNodeRows } from '../../packages/modoki/src/runtime/loaders/prefabOverrides';
+import { foldMemberRowChannels, applyNodeRows, overRowsOf } from '../../packages/modoki/src/runtime/loaders/prefabOverrides';
 import { diffFrameAdded, type NodeDiffDeps } from '../../packages/modoki/src/editor/scene/nodeRowDiff';
 import type { AddedEntity } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 
@@ -61,10 +61,23 @@ describe('applyNodeRows', () => {
     expect(Object.keys(kids[0]!.traits).sort()).toEqual(['Transform', 'UIFocusable']);
   });
 
-  it('a REFERENCE node takes only removed', () => {
+  // #1914 R3b (the hub's end state B): a reference node's interior is a frame of its own, so its row's other statements
+  // are not merged into the node: they ride on it as a layer OVER its own channels (`OVER_ROWS`), which its expansion
+  // folds. Mutation: push the node unchanged for a reference node again — no over layer, and the edit never lands.
+  it('a REFERENCE node takes removed itself, and carries its row\'s other statements as a layer over its own', () => {
     const ref = node('kr', 0, { prefab: G1 });
-    const { nodes } = applyNodeRows([ref], new Map([['kr', { traits: { Transform: { x: 5 } } }]]));
-    expect(nodes![0]).toBe(ref);
+    const { nodes } = applyNodeRows([ref], new Map([['kr', { traits: { Transform: { x: 5 } } }]]), undefined, true);
+    expect(nodes![0]!.traits).toBe(ref.traits); // nothing merged into the node itself
+    expect(overRowsOf(nodes![0]!)).toEqual([{ rootRow: { traits: { Transform: { x: 5 } } }, own: true }]);
+    expect(applyNodeRows([ref], new Map([['kr', { removed: true }]])).nodes).toEqual([]);
+  });
+
+  it('the rows reaching INTO a reference node ride on it keyed from its root (#1914 R3b)', () => {
+    // Mutation: skip a key with a second `/` in `foldMemberRowChannels` again — the inner row reaches nothing.
+    const doc = { rootLocalId: 1, entities: [{ localId: 1, nodeGuid: G1 }] };
+    const ref = { ...node('kr', 1, { prefab: G2 }) };
+    const folded = foldMemberRowChannels(doc, { [`/a+kr/${G1}`]: { traits: { Transform: { y: 2 } } } }, { added: [ref] }, undefined, true);
+    expect(overRowsOf(folded.added![0]!)).toEqual([{ rows: { [`/${G1}`]: { traits: { Transform: { y: 2 } } } }, own: true }]);
   });
 
   it('never mutates its input', () => {
@@ -145,15 +158,20 @@ describe('foldMemberRowChannels — v17 channels', () => {
 });
 
 describe('diffFrameAdded', () => {
-  /** A live node in scene form: its guid stands for the key the fake `keyOf` reads back. */
-  const live = (key: string | undefined, x: number, extra: Partial<AddedEntity> = {}): AddedEntity => ({
-    ...node(key, x), key: undefined, guid: key ? `live-${key}` : G2, ...extra,
-  });
+  /** Each live node's own record (`recordedOf`, #1914 R3a). */
+  const records = new WeakMap<AddedEntity, readonly string[]>();
+  /** A live node in scene form: its guid stands for the key the fake `keyOf` reads back. `record` is its own record; by
+   *  default the fixture's convention — every chain node here has x 1, so a live x off it is a field the user typed. */
+  const live = (key: string | undefined, x: number, extra: Partial<AddedEntity> = {}, record: readonly string[] = x !== 1 ? ['Transform.x'] : []): AddedEntity => {
+    const n = { ...node(key, x), key: undefined, guid: key ? `live-${key}` : G2, ...extra };
+    records.set(n, record);
+    return n;
+  };
   const deps: NodeDiffDeps = {
     keyOf: (n) => (n.guid.startsWith('live-') ? n.guid.slice(5) : ''),
     defaultOf: (_t, f) => (f === 'x' || f === 'y' ? 0 : undefined),
     sameReference: (a, b) => JSON.stringify(a.overrides) === JSON.stringify(b.overrides),
-    equal: (a, b) => a === b,
+    recordedOf: (n) => new Set(records.get(n) ?? []),
   };
 
   it('an untouched frame states nothing', () => {
@@ -161,12 +179,19 @@ describe('diffFrameAdded', () => {
     // Mutation: read a field one side omits as undefined (drop `defaultOf`) — y reads as an edit.
     const chain = [node('k1', 1, { traits: { EntityAttributes: { name: 'k1', parentId: 0, guid: '' }, Transform: { x: 1, y: 0 } } }), node('k2', 1)];
     const d = diffFrameAdded([live('k1', 1, { traits: { EntityAttributes: { name: 'k1' }, Transform: { x: 1 } } }), live('k2', 1)], chain, deps);
-    expect(d).toEqual({ nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() });
+    expect(d).toEqual({ nodeRows: new Map(), own: new Map(), whole: new Set(), refs: new Map(), pinnedOver: new Set() });
   });
 
   it('an edit to ONE node is that node\'s field, and its sibling states nothing (#1516)', () => {
     const d = diffFrameAdded([live('k1', 5), live('k2', 1)], [node('k1', 1), node('k2', 1)], deps);
     expect([...d.nodeRows]).toEqual([['k1', { traits: { Transform: { x: 5 } } }]]);
+  });
+
+  // #1914 R3c: the record decides, never the value. Mutation: compare the values where a field has no record (the
+  // pre-R3c fallback, `!equal(a, b)`) — y, which differs with no record, is written and pins the chain's later change.
+  it('a recorded field equal to the chain is written; a differing one with no record is the chain\'s', () => {
+    const l = live('k1', 1, { traits: { EntityAttributes: { name: 'k1' }, Transform: { x: 1, y: 4 } } }, ['Transform.x']);
+    expect(diffFrameAdded([l], [node('k1', 1)], deps).nodeRows.get('k1')).toEqual({ traits: { Transform: { x: 1 } } });
   });
 
   it('a field set BACK to its default is stated as the default', () => {
@@ -241,6 +266,18 @@ describe('diffFrameAdded', () => {
     const lref = (x: number) => ({ ...ref(x), guid: 'live-kr' });
     expect([...diffFrameAdded([lref(3)], [ref(3)], deps).whole]).toEqual([]);
     expect([...diffFrameAdded([lref(4), live('k2', 1)], [ref(3), node('k2', 1)], deps).whole]).toEqual([1]);
+  });
+
+  // #1914 R3b: one the caller can state by the rows reaching into it is reported in `refs`, and its sibling stays the
+  // chain's. Mutation: drop the `addressable` branch in `matchList` — the anchor falls back whole.
+  it('an edited template REFERENCE node the caller can address is reported, and its anchor stays node by node', () => {
+    const ref = (x: number) => node('kr', 0, { prefab: G1, overrides: { 2: { Transform: { x } } } });
+    const lref = { ...ref(4), guid: 'live-kr' };
+    const d = diffFrameAdded([lref, live('k2', 1)], [ref(3), node('k2', 1)], { ...deps, addressable: () => true });
+    expect([...d.whole]).toEqual([]);
+    expect([...d.refs.keys()]).toEqual(['kr']);
+    expect(d.refs.get('kr')!.live).toBe(lref);
+    expect(d.nodeRows.size).toBe(0);
   });
 
   it('a second live copy of a template node is the scene\'s own', () => {

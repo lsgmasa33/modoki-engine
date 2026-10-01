@@ -7,7 +7,7 @@ import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/s
 import { getAllEntities, getCurrentWorld, findEntity } from '@modoki/engine/runtime';
 import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
 import { execute, describe as describeOp, deletedPrefabs, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
+import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -37,6 +37,9 @@ export interface StepFailure extends Failure { step: number; op: string }
 export interface RunOpts {
   /** A console.error the editor is expected to print; `prev` is the error logged just before it in the same step. */
   expectedError: (msg: string, prev?: string) => boolean;
+  /** A step failure a KNOWN_OPEN entry TOLERATES (`KnownOpen.tolerates`): counted and set aside, so the run goes on
+   *  checking everything after it. The self-test runs without it, which is how an entry that stops reproducing is found. */
+  tolerate?: (f: Failure) => boolean;
 }
 export interface RunResult { failure?: StepFailure; trace: string[] }
 
@@ -422,6 +425,10 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     st.prefabEditSaved = undefined;
     st.fileOp = undefined;
     st.appliedTop = undefined;
+    // I23 (#1914): the scene's record keys before an op that does not act on its instances (a template change underneath,
+    // a member taken out of its template, a trashed or renamed prefab). None is an explicit act on an instance, so the
+    // scene must state every record afterwards too (Unity's unused overrides; docs/prefabs.md § I18, I23).
+    const recordsBefore = RECORD_NEUTRAL.has(op.kind) && !editing() ? recordKeys(JSON.stringify(await serializeScene())) : undefined;
     // Taken before the op, for the rebuild ≡ reload check the generator wrote into it (#1880 T2).
     const sBefore = op.check === 'rebuild-reload' && !editing() ? await serializeScene() : undefined;
     let outcome: string;
@@ -443,7 +450,8 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (unexpected.length) {
       return fail(i, label, { check: 'unexpected outside write', detail: `${unexpected[0]} after op ${i} (${label}): the watcher raised a write that no outside edit made${unexpected.length > 1 ? ` (+${unexpected.length - 1} more)` : ''}` });
     }
-    opOutcomes.set(`${op.kind}:${outcome}`, (opOutcomes.get(`${op.kind}:${outcome}`) ?? 0) + 1);
+    const tallyKey = `${op.kind}${op.variant ? `{${op.variant}}` : ''}:${outcome}`;
+    opOutcomes.set(tallyKey, (opOutcomes.get(tallyKey) ?? 0) + 1);
     trace.push(`${i}: ${label} → ${outcome}${st.note ? ` (${st.note})` : ''}${raised.length ? ` [watcher: ${raised.join(', ')}]` : ''}`);
 
     const logged = consoleErrors.splice(0);
@@ -486,6 +494,12 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
       ...checkHeld(be, history, marks, written, handTexts),
       ...(rt ? checkRoundTrip(rt, (src) => { const p = resolveGuidToPath(src); return !p || !after.has(p); }) : []),
     ];
+    if (recordsBefore && outcome === 'done' && !editing()) {
+      const now = recordKeys(JSON.stringify(await serializeScene()));
+      ran(`I23 around ${op.kind}${op.variant ? `{${op.variant}}` : ''}`);
+      const lost = [...recordsBefore].filter((k) => !now.has(k));
+      if (lost.length) failures.push({ check: 'I23 a record no act removed was dropped', detail: `${lost[0]}${lost.length > 1 ? ` (+${lost.length - 1} more)` : ''}` });
+    }
     if (!editing()) {
       try { failures.push(...checkScene(await serializeScene())); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
     }
@@ -508,6 +522,13 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {
       if (seg.tainted) skipped(seg, `${op.kind} op refusal forgiven`);
       else failures.push({ check: `${op.kind} refused in a clean segment`, detail: st.note ?? '' });
+    }
+    if (opts.tolerate) {
+      for (let k = failures.length - 1; k >= 0; k--) {
+        if (!opts.tolerate(failures[k]!)) continue;
+        ran(`tolerated (KNOWN_OPEN): ${failures[k]!.check}`);
+        failures.splice(k, 1);
+      }
     }
     if (failures.length) return fail(i, label, failures[0]);
 

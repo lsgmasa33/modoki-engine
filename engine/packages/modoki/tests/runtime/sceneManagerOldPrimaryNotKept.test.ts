@@ -61,6 +61,7 @@ vi.mock('../../src/runtime/loaders/overrideMarks', () => {
     markOverride: (e: { valueOf(): number }, t: string, f: string) => { setFor(e).add(`${t}.${f}`); },
     restoreOverrideMarks: (e: { valueOf(): number }, keys: Iterable<string>) => { const s = setFor(e); for (const k of keys) s.add(k); },
     getOverrideMarkSet: (e: { valueOf(): number }) => marks.get(e.valueOf()),
+    getCarriedOverrideMarks: (e: { valueOf(): number }) => marks.get(e.valueOf()),
     clearOverrideMarks: (e: { valueOf(): number }) => { marks.delete(e.valueOf()); },
     clearAllOverrideMarks: () => { markCounters.clearAllCalls++; marks.clear(); },
   };

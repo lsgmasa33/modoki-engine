@@ -177,7 +177,8 @@ describe('a row-authored added node is not spawned twice by a rebuild (#1386)', 
     const doc = outerDoc({ added: [extra(2, 'k-extra')] });
     install(doc);
     await load(sceneWith());
-    writeTraitField(byName('Extra'), getTraitByName('Transform')!, 'x', 7);
+    // An editor write, so it is recorded (#1914 R3a): a raw write is no edit, and the refresh shows the template's x.
+    writeTraitFieldWithUndo(byName('Extra'), getTraitByName('Transform')!, 'x', 7);
     refresh(byName('OuterRoot'), doc, doc);
     expect(count('Extra')).toBe(1);
     expect(xOf(byName('Extra'))).toBe(7);

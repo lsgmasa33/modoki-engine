@@ -14,16 +14,20 @@
  *  down from one (the save, the rebuild). */
 
 import { rowAt } from '../../runtime/core/prefabRowAt';
+import { hasDocKey } from '../../runtime/core/docKeys';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { readTraitData, findEntity, getAllEntities } from '../../runtime/core/ecs/entityUtils';
+import { memberRowKeysIn } from '../../runtime/core/ecs/memberRows';
+import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import type { Entity } from 'koota';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import { foldStructureLayers, foldPath as sharedFoldPath, type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState, referenceRowAt } from '../../runtime/loaders/prefabOverrides';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { keptLegacyChannels } from '../../runtime/loaders/loadSceneFile';
-import { type PrefabFile } from './prefab';
+import { keptLegacyChannels, keptUnusedRows } from '../../runtime/loaders/loadSceneFile';
+import { type PrefabFile, valuesEqual } from './prefab';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
 
 /** A layer's structural lists, as the fold leaves them for the frame it reaches. `moved` only when an outer layer's
@@ -223,6 +227,93 @@ export function frameBase(frame: number, depth = 0): FrameBase | null {
   return { frame, levels, doc, node, layer };
 }
 
+/** The field values the layers enclosing frame `frame` give its members that a copy of a subtree leaves BEHIND: those a
+ *  level whose frame root is outside the subtree (`inside` answers false) states, and no level inside restates equal. A
+ *  copy that makes the frame (or one above it inside the subtree) a stored root shows them with no layer to give them,
+ *  so it records them (#1914 — a paste or duplicate records the copy's values off its own base, Unity's rule), where the
+ *  old loader's marks carried every layer's value along. By localId, as the layer states them (tokens unresolved: the
+ *  copy compares nothing, it only records). Null when nothing is left behind. */
+export function layerFieldsLeftBehind(frame: number, inside: (root: number) => boolean): OverrideMap | null {
+  const climbed = climbFrame(frame, 0);
+  if (!climbed) return null;
+  const { chain, levels } = climbed;
+  const k = levels.findIndex((l) => inside(l.root));
+  // Every level inside (or the frame itself outside, which a copy of it never promotes): nothing is left behind. A
+  // template reference node's own channels (`node`) are its layer's too, and are left behind with the level above.
+  if (k <= 0 && !climbed.node) return null;
+  if (k < 0) return null;
+  const full = frameBase(frame)?.layer?.overrides;
+  if (!full || !Object.keys(full).length) return null;
+  const kept = k === levels.length - 1 ? {} : foldPath(levels.slice(k).map((l) => l.doc), chain.slice(k)).overrides;
+  const out: OverrideMap = {};
+  for (const [lid, traits] of Object.entries(full)) {
+    for (const [trait, fields] of Object.entries(traits)) {
+      const inner = kept[Number(lid)]?.[trait];
+      for (const [f, v] of Object.entries(fields ?? {})) {
+        if (inner && hasDocKey(inner, f) && valuesEqual(inner[f], v)) continue;
+        ((out[Number(lid)] ??= {})[trait] ??= {})[f] = v;
+      }
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** For a subtree rooted at `rootId`, what each member of it would lose as "Trait.field" keys ({@link
+ *  layerFieldsLeftBehind}), asked once per frame. The ONE reader for the two writes that take a subtree out of its
+ *  layers: a copy (`snapshotEntity` → `copySnapshot`) and Create Prefab (`serializePrefab`, {@link withLeftBehindRecorded}). */
+export function leftBehindReader(
+  rootId: number,
+  /** The subtree's root frame is UNPACKED, not kept (Create Prefab bakes the selected instance into the new template's
+   *  own rows): its document's rows are left behind too. A copy keeps it — the copy is another instance of it. */
+  unpackRoot = false,
+): (pi: { rootInstanceId?: number; localId?: number } | null | undefined) => string[] {
+  let inside: Set<number> | undefined;
+  const lost = new Map<number, OverrideMap | null>();
+  return (pi) => {
+    if (!pi?.rootInstanceId || !pi.localId) return [];
+    const frame = pi.rootInstanceId;
+    if (!lost.has(frame)) {
+      if (!inside) {
+        const set = new Set([rootId]);
+        const all = getAllEntities();
+        for (let grew = true; grew;) {
+          grew = false;
+          for (const e of all) if (!set.has(e.id) && set.has(e.parentId)) { set.add(e.id); grew = true; }
+        }
+        if (unpackRoot) set.delete(rootId);
+        inside = set;
+      }
+      const set = inside;
+      lost.set(frame, layerFieldsLeftBehind(frame, (r) => set.has(r)));
+    }
+    const fields = lost.get(frame)?.[pi.localId];
+    return fields ? Object.entries(fields).flatMap(([t, fs]) => Object.keys(fs ?? {}).map((f) => `${t}.${f}`)) : [];
+  };
+}
+
+/** Run `fn` (a capture of the subtree at `rootId` into a NEW template: Create Prefab) with every field the subtree's
+ *  members would lose to the layers outside it marked, then take exactly those marks off again. The new template's rows
+ *  state what the tree showed (#1914: a layer's value is base, and so unmarked, and the mark-gated capture skipped it). */
+export function withLeftBehindRecorded<T>(rootId: number, fn: () => T): T {
+  const piMeta = getTraitByName('PrefabInstance');
+  const read = leftBehindReader(rootId, true);
+  const added: [Entity, string, string][] = [];
+  if (piMeta) {
+    for (const e of getAllEntities()) {
+      const keys = read(readTraitData(e.id, piMeta) as { rootInstanceId?: number; localId?: number } | null);
+      const ent = keys.length ? findEntity(e.id) : undefined;
+      if (!ent) continue;
+      for (const k of keys) {
+        if (getOverrideMarkSet(ent)?.has(k)) continue;
+        const dot = k.indexOf('.');
+        markOverride(ent, k.slice(0, dot), k.slice(dot + 1));
+        added.push([ent, k.slice(0, dot), k.slice(dot + 1)]);
+      }
+    }
+  }
+  try { return fn(); } finally { for (const [ent, t, f] of added) unmarkOverride(ent, t, f); }
+}
+
 /** What the layers ENCLOSING frame `frame` forward into its expansion from `doc` (#1737), and the cycle stack that
  *  expansion runs under: the state a load hands the frame when it expands the row above it. `doc` is the document the
  *  expansion is FROM — a rebuild's new one, or the one the live tree was built from when a capture subtracts it —
@@ -249,15 +340,119 @@ export function frameForward(frame: number, doc: PrefabFile): (ForwardState & { 
 
 /** A stored root's captured channels with the LEGACY path-keyed ones the load kept for it put back (R2's legacy half,
  *  #1780, #1738): a channel addressing a frame no live expansion reaches is regenerated by no capture, so the save
- *  writes it as the file held it. A live capture wins each path key. */
+ *  writes it as the file held it. A live capture wins each structure path key, and each field of an override, under
+ *  which an UNUSED override the load kept inside a reached frame goes back (#1914 R4). */
 export function withKeptLegacy<C extends { nestedOverrides?: NestedOverridePaths; nestedStructure?: NestedStructurePaths }>(channels: C, rootGuid: string): C {
   const kept = rootGuid ? keptLegacyChannels(rootGuid) : undefined;
   if (!kept) return channels;
   return {
     ...channels,
-    ...(kept.nestedOverrides ? { nestedOverrides: { ...kept.nestedOverrides, ...channels.nestedOverrides } } : {}),
+    ...(kept.nestedOverrides ? { nestedOverrides: underLive(kept.nestedOverrides, channels.nestedOverrides) as NestedOverridePaths } : {}),
     ...(kept.nestedStructure ? { nestedStructure: { ...kept.nestedStructure, ...channels.nestedStructure } } : {}),
   };
+}
+
+/** `kept` with `live` laid over it, leaf by leaf: the live value wins every field it states. */
+function underLive(kept: unknown, live: unknown): unknown {
+  if (live === undefined) return structuredClone(kept);
+  if (!isPlain(kept) || !isPlain(live)) return live;
+  const out: Record<string, unknown> = { ...live };
+  for (const [k, v] of Object.entries(kept)) out[k] = underLive(v, live[k]);
+  return out;
+}
+const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** A stored root's localId channels with the records the load kept as UNUSED put back (#1914 R4, owner ruling F5,
+ *  docs/prefabs.md § I18): a record of a localId the template dropped, of a trait nothing registers or a field no schema
+ *  declares, a removal of a component the member's document row does not define (`unusedLegacy`). No capture of the
+ *  live frame can restate one, so the save writes it as the file held it. The capture wins each field, and a kept removal
+ *  stays out once the member of `rootId`'s own frame carries that component again — the store is refreshed by a load, and
+ *  an undo that hands the component back is not one. `template`: the channels go into a prefab file, which holds no `moved`
+ *  (its values are scene guids). */
+export function withKeptLocalRecords<C extends {
+  overrides?: OverrideMap; removedTraits?: Record<number, string[]>; removed?: number[]; moved?: Record<number, string>;
+}>(channels: C, rootGuid: string, rootId: number, template = false): C {
+  const kept = rootGuid ? keptLegacyChannels(rootGuid) : undefined;
+  if (!kept || !(kept.overrides || kept.removedTraits || kept.removed || kept.moved)) return channels;
+  const out: C = { ...channels };
+  if (kept.overrides) out.overrides = underLive(kept.overrides, channels.overrides) as OverrideMap;
+  if (kept.removedTraits) {
+    const lists: Record<number, string[]> = { ...channels.removedTraits };
+    const piMeta = getTraitByName('PrefabInstance');
+    const byLocal = new Map<number, number>();
+    if (piMeta) {
+      for (const e of getAllEntities()) {
+        const pi = readTraitData(e.id, piMeta) as { rootInstanceId?: number; localId?: number } | null;
+        if (pi?.rootInstanceId === rootId && pi.localId) byLocal.set(pi.localId, e.id);
+      }
+    }
+    for (const [lidStr, names] of Object.entries(kept.removedTraits)) {
+      const lid = Number(lidStr);
+      const ecs = byLocal.get(lid);
+      const add = names.filter((n) => !(ecs && carries(ecs, n)) && !lists[lid]?.includes(n));
+      if (add.length) lists[lid] = [...(lists[lid] ?? []), ...add];
+    }
+    out.removedTraits = lists;
+  }
+  if (kept.removed) out.removed = [...new Set([...(channels.removed ?? []), ...kept.removed])].sort((a, b) => a - b);
+  if (kept.moved && !template) out.moved = { ...kept.moved, ...channels.moved };
+  return out;
+}
+
+/** A stored root's member rows with the UNUSED part of each live member's row the load kept put back (#1914 R4, owner
+ *  ruling F5): an override no schema takes, and a removal (or restore) statement whose component the member's base does
+ *  not have (`unusedRowPart`). Merged leaf by leaf UNDER the capture, after every channel is on its row. Only for a
+ *  member still live, measured as the load measured it (`memberRowKeysIn`): one the instance has deleted since takes its
+ *  records with it, as the load keeps none for it — written once, the next save→reload→save dropped it (hunt seeds 3121,
+ *  3256). */
+export function withKeptUnused(members: Record<string, SceneMemberRow>, rootGuid: string, rootId: number): Record<string, SceneMemberRow> {
+  const parts = liveKeptUnused(rootGuid, rootId);
+  if (!parts.length) return members;
+  const out = { ...members };
+  for (const { key, part, carried } of parts) out[key] = withUnusedPart(out[key], part, carried);
+  return out;
+}
+
+/** The kept unused parts {@link withKeptUnused} writes, each with its live member's carried-component test: only a member
+ *  still live. The one predicate the save and the Apply/Revert dialog's count (`instanceUnusedOverrides`) share. */
+export function liveKeptUnused(rootGuid: string, rootId: number): { key: string; part: SceneMemberRow; carried: (name: string) => boolean }[] {
+  const kept = rootGuid ? keptUnusedRows(rootGuid) : undefined;
+  if (!kept) return [];
+  const ecsOf = new Map([...memberRowKeysIn(rootId)].map(([ecs, key]) => [key, ecs]));
+  const out: { key: string; part: SceneMemberRow; carried: (name: string) => boolean }[] = [];
+  for (const [key, part] of Object.entries(kept)) {
+    const ecs = ecsOf.get(key);
+    if (ecs) out.push({ key, part, carried: (t) => carries(ecs, t) });
+  }
+  return out;
+}
+
+/** Does live entity `ecs` carry the component named `name`? */
+function carries(ecs: number, name: string): boolean {
+  const meta = getTraitByName(name);
+  return !!meta && !!findEntity(ecs)?.has(meta.trait);
+}
+
+/** One row with an unused part put back under it. A removal goes in the form the row already states removals in — a
+ *  whole `removedTraits` list takes a name, `traitRemovals` a statement — or, when it states none, in the part's own. A
+ *  removal of a component the member carries live (`carried`; the store is refreshed by a load, and an undo that hands
+ *  the component back is not one) is left out. */
+export function withUnusedPart(row: SceneMemberRow | undefined, part: SceneMemberRow, carried: (name: string) => boolean): SceneMemberRow {
+  const out: SceneMemberRow = { ...(row ?? {}) };
+  if (part.traits) out.traits = underLive(part.traits, out.traits) as SceneMemberRow['traits'];
+  // [name, removes, stated as a list entry]
+  const removals: [string, boolean, boolean][] = [
+    ...(part.removedTraits ?? []).map((t): [string, boolean, boolean] => [t, true, true]),
+    ...Object.entries(part.traitRemovals ?? {}).map(([t, on]): [string, boolean, boolean] => [t, on, false]),
+  ];
+  for (const [t, on, fromList] of removals) {
+    if (on && carried(t)) continue;
+    if ((out.traitRemovals && t in out.traitRemovals) || out.removedTraits?.includes(t)) continue;
+    if (Array.isArray(out.removedTraits)) { if (on) out.removedTraits = [...out.removedTraits, t]; continue; }
+    if (out.traitRemovals || !fromList) out.traitRemovals = { ...out.traitRemovals, [t]: on };
+    else out.removedTraits = [t];
+  }
+  return out;
 }
 
 
@@ -295,16 +490,7 @@ export function templateReferenceNode(refRoot: number, depth: number): AddedEnti
   const eaMeta = getTraitByName('EntityAttributes');
   const pi = piMeta ? readTraitData(refRoot, piMeta) : null;
   if (!eaMeta || !isStoredRoot(pi as MemberPi, refRoot)) return null; // a root no row expanded; a template's node is one
-  // The LIVE parents: a root no row expanded has no frame of its own, so its identity parent is exactly its live one
-  // (`identityParents.ts`), and so is a plain added node's. Read directly, not through a world identity walk, which an
-  // Inspector recompute of every scene-level instance paid for (close-out review: 0.004 → 0.63 ms at 3000 entities).
-  // Climbed past plain entities to the first instance entity: a template's plain node carries no PrefabInstance.
-  const parentOf = (id: number) => (readTraitData(id, eaMeta)?.parentId as number) || 0;
-  let frame = 0;
-  for (let at = parentOf(refRoot), hops = 0; at && hops < 64; at = parentOf(at), hops++) {
-    frame = (readTraitData(at, piMeta!)?.rootInstanceId as number) || 0;
-    if (frame) break;
-  }
+  const frame = enclosingFrameOf(refRoot);
   if (!frame || frame === refRoot) return null;
   const candidates: AddedEntity[] = [];
   const collect = (nodes: readonly AddedEntity[] | undefined) => {
@@ -316,6 +502,48 @@ export function templateReferenceNode(refRoot: number, depth: number): AddedEnti
   if (!candidates.length) return null;
   const key = templateKeyOf(findEntity(refRoot)) || recoverTemplateKey(refRoot);
   return key ? candidates.find((n) => n.key === key) ?? null : null;
+}
+
+/** The frame an added node `id` hangs in: the instance root of the first instance entity above it, or 0. The LIVE parents:
+ *  a root no row expanded has no frame of its own, so its identity parent is exactly its live one (`identityParents.ts`),
+ *  and so is a plain added node's. Read directly, not through a world identity walk, which an Inspector recompute of every
+ *  scene-level instance paid for (close-out review: 0.004 → 0.63 ms at 3000 entities). Climbed past plain entities to the
+ *  first instance entity: a template's plain node carries no PrefabInstance. */
+function enclosingFrameOf(id: number): number {
+  const piMeta = getTraitByName('PrefabInstance');
+  const eaMeta = getTraitByName('EntityAttributes');
+  if (!piMeta || !eaMeta) return 0;
+  const parentOf = (e: number) => (readTraitData(e, eaMeta)?.parentId as number) || 0;
+  for (let at = parentOf(id), hops = 0; at && hops < 64; at = parentOf(at), hops++) {
+    const frame = (readTraitData(at, piMeta)?.rootInstanceId as number) || 0;
+    if (frame) return frame;
+  }
+  return 0;
+}
+
+/** The template node that spawned PLAIN added node `nodeId` (#1914 R3a) — a keyed node without `prefab` that the layer
+ *  enclosing its frame authored, at any depth of that layer's `children` — with the frame it hangs in, or null when
+ *  `nodeId` is not one (a member, a reference node's root, a node the WRITER added: the scene's, or in prefab edit the
+ *  edited document's, which no enclosing layer states). Its values are the node's BASE: what it shows with no record of
+ *  its own. Matched by template key, as {@link templateReferenceNode} matches. */
+export function templatePlainNode(nodeId: number): { node: AddedEntity; frame: number } | null {
+  const piMeta = getTraitByName('PrefabInstance');
+  const e = findEntity(nodeId);
+  if (!piMeta || !e || e.has(piMeta.trait)) return null;
+  const key = templateKeyOf(e) || recoverTemplateKey(nodeId);
+  const frame = key ? enclosingFrameOf(nodeId) : 0;
+  if (!frame) return null;
+  const find = (nodes: readonly AddedEntity[] | undefined): AddedEntity | null => {
+    for (const n of nodes ?? []) {
+      if (n.prefab) continue;
+      if (n.key === key) return n;
+      const hit = find(n.children);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const node = find(frameBase(frame)?.layer?.structure.added);
+  return node ? { node, frame } : null;
 }
 
 /** Every frame an OWNED nested root of `root` is, at any depth, with the chain of row localIds that reaches it from

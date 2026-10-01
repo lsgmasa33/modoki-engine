@@ -1552,7 +1552,8 @@ describe('a nested row under a nested row is supported everywhere (#1484, #1481)
     await loadO();
     const changed = JSON.parse(JSON.stringify(docs[O7])) as PrefabFile;
     for (const e of changed.entities) if (e.localId === 4 || e.localId === 5) (e.traits.Transform as { x: number }).x = 5;
-    expect(captureInstanceOverrides(idAt('ORoot'), changed)).toEqual({});
+    // Only the root's sibling order, which every scene instance records (F7, #1914 R6).
+    expect(captureInstanceOverrides(idAt('ORoot'), changed)).toEqual({ 1: { EntityAttributes: { sortOrder: 0 } } });
   });
 
   // The known limit, closed: Q ALSO nests Z at row 3 under its own root. Both roots hang under QRoot at row 3, and the

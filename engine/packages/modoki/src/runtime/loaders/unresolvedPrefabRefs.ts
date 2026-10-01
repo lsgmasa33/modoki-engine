@@ -156,9 +156,15 @@ export function asSceneEntry(
     ? { ...(record.traits as Record<string, unknown>) }
     : { PrefabInstance: { source, rootInstanceId: live.guid ?? '' } };
   // An entry record keeps the `PrefabInstance` it was read with: the placeholder dropped its live copy, not the file's.
-  const ea = { ...((traits.EntityAttributes as Record<string, unknown> | undefined) ?? {}) };
-  delete ea.parentId;
-  delete ea.editorFolder;
+  // Rebuilt in the record's own key order, the live placement in place of its `parentId` / `editorFolder`, so an unedited
+  // save writes the bytes it read, whichever writer wrote them (hunt seed 1130: a live save's {parentId, sortOrder} came
+  // back {sortOrder, parentId}).
+  const read = (traits.EntityAttributes as Record<string, unknown> | undefined) ?? {};
+  const ea: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(read)) {
+    if (k in live.placement) ea[k] = live.placement[k];
+    else if (k !== 'parentId' && k !== 'editorFolder') ea[k] = v;
+  }
   Object.assign(ea, live.placement);
   const base: Record<string, unknown> = kind === 'entry' ? { ...record } : { prefab: source, ...channelsOf(record) };
   if (live.order) {

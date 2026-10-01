@@ -15,15 +15,16 @@ import { frameBase, layerAddedTraits, type FrameLayer } from './prefabBase';
 import { type PrefabFile } from './prefab';
 import { getCachedPrefabSync } from './prefabCache';
 import { baseTokenResolver } from './prefabTokens';
-import { foldMarkedEqual, gateOnMarks, getOverrideValues } from './prefabInstanceOverrides';
+import { recordedOverrides, getOverrideValues, withOverridesFolded } from './prefabInstanceOverrides';
 import { instanceMovedMembers, prefabMoveTargets } from './prefabMembers';
 import {
   captureInstanceStructure, type InstanceStructure, liveTemplateKeys, resolveAddedNodeTokens, type StructureCaptureOpts,
   subtractChainStructure,
 } from './prefabCapture';
 
-/** The overrides the Inspector highlights on member `entityId` (`"Trait.field"`): its value diffs against the instance's
- *  base (a nested instance's template under the rows enclosing it, #1492), through the save's mark gate (#1717). */
+/** The overrides the Inspector highlights on member `entityId` (`"Trait.field"`): its record (#1717, #1914 R3c,
+ *  `recordedOverrides`), with an added component and a moved pose read against the instance's base (a nested instance's
+ *  template under the rows enclosing it, #1492). */
 export function memberOverrideKeys(
   entityId: number, localId: number, currentTraits: Record<string, Record<string, unknown>>, prefab: PrefabFile, rootInstanceId: number,
 ): Set<string> {
@@ -32,10 +33,10 @@ export function memberOverrideKeys(
   const moved = () => !!rootInstanceId && instanceMovedMembers(rootInstanceId, prefab)(entityId, !!diffs['Transform']);
   const entity = findEntity(entityId);
   const marks = entity ? getOverrideMarkSet(entity) : null;
-  gateOnMarks(diffs, marks, rowAt(base, localId), moved);
-  foldMarkedEqual(diffs, marks, currentTraits, rootInstanceId ? enclosingRowOverrides(rootInstanceId)?.[localId] : undefined);
   const out = new Set<string>();
-  for (const [traitName, fields] of Object.entries(diffs)) for (const field of Object.keys(fields)) out.add(`${traitName}.${field}`);
+  for (const [traitName, fields] of Object.entries(recordedOverrides(diffs, marks, rowAt(base, localId), moved, currentTraits))) {
+    for (const field of Object.keys(fields)) out.add(`${traitName}.${field}`);
+  }
   return out;
 }
 
@@ -171,22 +172,7 @@ export function layerAuthoredStructureKeys(rootInstanceId: number, prefab: Prefa
  *  enclosing it ({@link enclosingRowOverrides}). `prefab` itself for a stored root. What every "is this field an
  *  override?" reader diffs a live member against — the override list and the Inspector's highlight (#1492). */
 export function instanceBase(rootInstanceId: number, prefab: PrefabFile): PrefabFile {
-  const rows = enclosingRowOverrides(rootInstanceId);
-  if (!rows || !Object.keys(rows).length) return prefab;
-  return {
-    ...prefab,
-    entities: prefab.entities.map((e) => {
-      const over = rows[e.localId];
-      if (!over) return e;
-      const traits: Record<string, unknown> = { ...e.traits };
-      for (const [trait, fields] of Object.entries(over)) {
-        const own = traits[trait];
-        traits[trait] = getTraitByName(trait)?.category === 'tag' ? true
-          : { ...(own && typeof own === 'object' ? own as Record<string, unknown> : {}), ...fields };
-      }
-      return { ...e, traits } as typeof e;
-    }),
-  };
+  return withOverridesFolded(prefab, enclosingRowOverrides(rootInstanceId) ?? undefined);
 }
 
 /** Return a copy of `full` with the selected per-field override keys

@@ -33,16 +33,29 @@
 
 import { describe, it, expect } from 'vitest';
 import { getCurrentWorld, getTraitByName } from '@modoki/engine/runtime';
+import { applyOverridesByLocalToEcs } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import {
   instantiatePrefab,
   captureInstanceOverrides,
-  applyOverridesByRootInstance,
   serializePrefab,
   type PrefabFile,
 } from '@modoki/engine/editor';
 
 registerAllTraits();
+
+/** A recorded override map applied to instance `rootId` as a LOAD applies its scene entry's (`applyOverridesByLocalToEcs`,
+ *  every value the writer's own, so recorded): the editor's twin of it, `applyOverridesByRootInstance`, had no caller
+ *  left and was deleted in #1914 R8, so these cases run the path a load takes. */
+function applyAsLoad(rootId: number, overrides: Record<number, Record<string, Record<string, unknown>>>): void {
+  const pi = getTraitByName('PrefabInstance')!;
+  const localToEcs = new Map<number, number>();
+  getCurrentWorld().query(pi.trait).updateEach(([d], e) => {
+    const data = d as { rootInstanceId?: number; localId?: number };
+    if (data.rootInstanceId === rootId && data.localId) localToEcs.set(data.localId, e.id());
+  });
+  applyOverridesByLocalToEcs(getCurrentWorld(), localToEcs, overrides, overrides);
+}
 
 const BANK = '[{"name":"skin","clip":"f1cc3b85-2c23-457b-938a-3470ada21b36"}]';
 
@@ -91,14 +104,14 @@ describe('non-Inspector SoA fields survive prefab persistence', () => {
     expect(captured[1].Animator.fadeFrom).toBeUndefined();
   });
 
-  it('applyOverridesByRootInstance writes Animator.clips/clip back onto the instance', () => {
+  it('the load\'s apply writes Animator.clips/clip back onto the instance', () => {
     // The READ side of the same bug, and the one the live run exposed after the write
     // side was fixed: the stored fields round-tripped through save but came back
     // EMPTY, because apply gated on `meta.fields` and dropped them on load.
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
 
-    applyOverridesByRootInstance(rootId, { 1: { Animator: { clips: BANK, clip: 'skin' } } });
+    applyAsLoad(rootId, { 1: { Animator: { clips: BANK, clip: 'skin' } } });
 
     const meta = getTraitByName('Animator')!;
     const entity = [...getCurrentWorld().entities].find((e) => (e as { id(): number }).id() === rootId)!;
@@ -107,12 +120,12 @@ describe('non-Inspector SoA fields survive prefab persistence', () => {
     expect(live.clip).toBe('skin');
 
     // …and a genuinely unknown key from an older file is still dropped.
-    applyOverridesByRootInstance(rootId, { 1: { Animator: { notAField: 7 } } });
+    applyAsLoad(rootId, { 1: { Animator: { notAField: 7 } } });
     const after = (entity as { get(t: unknown): unknown }).get(meta.trait) as Record<string, unknown>;
     expect(after.notAField).toBeUndefined();
   });
 
-  it('applyOverridesByRootInstance keeps EntityAttributes.editorFolder', () => {
+  it('the load\'s apply keeps EntityAttributes.editorFolder', () => {
     // Before the schema rule, this field needed a hand-written escape hatch in BOTH
     // apply paths (`|| (meta.name === 'EntityAttributes' && field === 'editorFolder')`)
     // because it is a real per-instance field with no Inspector metadata. The schema
@@ -122,7 +135,7 @@ describe('non-Inspector SoA fields survive prefab persistence', () => {
     const prefab = makePrefab();
     const rootId = instantiatePrefab(prefab);
 
-    applyOverridesByRootInstance(rootId, { 1: { EntityAttributes: { editorFolder: 'Props/Rocks' } } });
+    applyAsLoad(rootId, { 1: { EntityAttributes: { editorFolder: 'Props/Rocks' } } });
 
     const meta = getTraitByName('EntityAttributes')!;
     const entity = [...getCurrentWorld().entities].find((e) => (e as { id(): number }).id() === rootId)!;

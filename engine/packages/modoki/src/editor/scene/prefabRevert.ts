@@ -22,7 +22,8 @@ import {
   framesBuiltFromOtherRows, missingSourceRefusal, staleFramesRefusal, staleInstanceRefusal,
 } from './prefabFrames';
 import { isOutermostEntry, captureEntrySide, rebuildEntrySide, preloadRebuildEntry, keptEnclosingSource, type EntrySide } from './prefabRebuild';
-import { getAllEntities, readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { unmarkOverride } from '../../runtime/loaders/overrideMarks';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
  *  not load (#1862). That is a live frame kept across a rebuild after its prefab was trashed, a nested one or #1738's
@@ -182,10 +183,33 @@ export interface RevertResult {
    *  own statement to get the reduced side; nothing rebuilds from them. */
   fullSide: EntrySide;
   reducedSide: EntrySide;
+  /** The reverted field keys, in their localId form: the redo takes their records off again ({@link unrecordReverted}). */
+  reverted: string[];
   /** The BASE scene(s) that own the instance — pass as the undo action's `affectedScenes`. A base's
    *  file is written by Save All only when it is dirty, and nothing else marks it: without this a
    *  revert on a base's instance reads saved and is lost on reload (#1431). [] for a primary one. */
   affectedScenes: string[];
+}
+
+/** A Revert REMOVES the record of each reverted field (#1914, docs/prefabs.md § I2; Unity: Revert is one of the three acts
+ *  that take a record off). The rebuild's statement of a frame that states its fields whole — a template's reference
+ *  node — puts the enclosing layer's value back as a statement (#1506), which the load records like any other; taken
+ *  off here, so the field reads as the layer's again, and a later change to that layer reaches it. `keys` are
+ *  `<localId>.<Trait>.<field>` of the frame rooted at `frameId`. */
+export function unrecordReverted(frameId: number, keys: readonly string[]): void {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta || !keys.length) return;
+  const byLid = new Map<number, [string, string][]>();
+  for (const k of keys) {
+    const [lid, trait, field] = k.split('.');
+    if (trait && field !== undefined) byLid.set(Number(lid), [...(byLid.get(Number(lid)) ?? []), [trait, field]]);
+  }
+  for (const e of getAllEntities()) {
+    const pi = readTraitData(e.id, piMeta) as { rootInstanceId?: number; localId?: number } | null;
+    const fields = pi?.rootInstanceId === frameId ? byLid.get(pi.localId ?? 0) : undefined;
+    const ent = fields && findEntity(e.id);
+    if (ent) for (const [trait, field] of fields!) unmarkOverride(ent, trait, field);
+  }
 }
 
 /** Revert selected overrides on a SINGLE prefab instance back to the prefab base
@@ -330,8 +354,10 @@ export async function revertOverridesSelective(
     })!;
     const guid = eaMeta ? ((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid ?? '') : '';
     const newRootId = rebuildEntrySide(reducedSide, guid);
+    const reverted = [...selectedKeys].filter((k) => /^\d+\./.test(k));
+    unrecordReverted(newRootId, reverted);
     return {
-      newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, fullSide, reducedSide,
+      newRootId, source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure, fullSide, reducedSide, reverted,
       affectedScenes: resolveAffectedScenes([newRootId]),
     };
   }

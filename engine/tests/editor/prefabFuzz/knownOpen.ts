@@ -12,6 +12,7 @@
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
+import type { Failure } from './checks';
 
 export interface KnownOpen {
   issue: number;
@@ -20,6 +21,10 @@ export interface KnownOpen {
   /** The failure the repro must still produce (with this entry's tolerance off). */
   reproduces: (f: StepFailure) => boolean;
   stops?: (f: StepFailure, ops: readonly Op[]) => boolean;
+  /** A failure this predicate matches is TOLERATED (the runner's `tolerate`): set aside, and the run goes on. For a check
+   *  that fires at a step in the middle of lists that test something else (REGRESSIONS included), where stopping there
+   *  would stop them testing it. */
+  tolerates?: (f: Failure) => boolean;
 }
 
 
@@ -43,13 +48,80 @@ export interface KnownOpen {
 // renumbers ids, and no longer reaches the case. The case is stated id-free, from the run's own documents, in
 // prefabWholeListRebuild.test.ts (passing since F6e).
 export const KNOWN_OPEN: KnownOpen[] = [
-
 ];
 
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
  *  Also a harness gap closed: a by-design refusal whose console line the allow-list lacked (#1738's entry, seed 6136). */
 export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
+  {
+    issue: 1914,
+    what: "#1914 R4 (hunt seeds 3064, 1264): a prefab edit deletes a node of a NESTED frame and the scene row into it was still dropped: the fold marked the row (`isUntargetedRow`), then its descent into the removed member's frame folded the same row object, found nothing removed there and CLEARED the mark. A fold now only sets a mark (seed 3064)",
+    repro: [
+      {kind: 'prefabEdit', u: [0.29432611004449427, 0.031063986709341407, 0.2494483154732734, 0.24975245539098978, 0.5106361019425094, 0.8061630304437131, 0.9653874023351818, 0.001554569462314248], inner: [{kind: 'delete', u: [0.6875782522838563, 0.06673813634552062, 0.14483149349689484, 0.3717561939265579, 0.9077709359116852, 0.727183788549155, 0.6393199590966105, 0.2742575346492231]}]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (hunt seeds 3064, 1264): a prefab edit deletes a node of a NESTED frame and the scene row into it was still dropped: the fold marked the row (`isUntargetedRow`), then its descent into the removed member's frame folded the same row object, found nothing removed there and CLEARED the mark. A fold now only sets a mark (seed 1264)",
+    repro: [
+      {kind: 'prefabEdit', u: [0.6179743281099945, 0.0004878533072769642, 0.59079449926503, 0.07714249030686915, 0.8441942906938493, 0.5158490885514766, 0.35551391285844147, 0.07251628977246583], inner: []},
+      {kind: 'prefabEdit', u: [0.3843952363822609, 0.009538050275295973, 0.3598720761947334, 0.5283824163489044, 0.8296141603495926, 0.15444855275563896, 0.546853695763275, 0.09496363182552159], inner: [{kind: 'delete', u: [0.6082228999584913, 0.43535389844328165, 0.5193573050200939, 0.8788518323563039, 0.05521734454669058, 0.888298267731443, 0.03155454574152827, 0.14485785155557096]}]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3121)",
+    repro: [
+      {kind: 'removeComponent', u: [0.8717832013498992, 0.4098781473003328, 0.35788252600468695, 0.36732389219105244, 0.5757638479117304, 0.2722287985961884, 0.7606130202766508, 0.5879398272372782]},
+      {kind: 'apply', u: [0.12957373447716236, 0.9488546960055828, 0.2579235783778131, 0.11606695386581123, 0.33177433838136494, 0.4228519485332072, 0.8507518453989178, 0.9463782901875675], check: 'rebuild-reload'},
+      {kind: 'duplicate', u: [0.36783416103571653, 0.010957932332530618, 0.2110859325621277, 0.8144237170927227, 0.790566390613094, 0.7907619748730212, 0.14855014812201262, 0.6125487142708153]},
+      {kind: 'instantiate', u: [0.3521233794745058, 0.2691156845539808, 0.018800137797370553, 0.3352938797324896, 0.34232723666355014, 0.43310883757658303, 0.4790084436535835, 0.9312082757242024]},
+      {kind: 'delete', u: [0.22344316472299397, 0.36142275016754866, 0.2664233713876456, 0.838094659615308, 0.7899125413969159, 0.4119450675789267, 0.338629053439945, 0.27819647127762437]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3256)",
+    repro: [
+      {kind: 'reparent', u: [0.9342352186795324, 0.11151574295945466, 0.07972302683629096, 0.08700698404572904, 0.7305098192300647, 0.7869342488702387, 0.9138896428048611, 0.2776011188980192]},
+      {kind: 'prefabEdit', u: [0.08834935235790908, 0.09308103565126657, 0.4133092381525785, 0.3553751688450575, 0.24236628646031022, 0.903978100977838, 0.9964446187950671, 0.5883963548112661], inner: []},
+      {kind: 'removeComponent', u: [0.7504100219812244, 0.28676798823289573, 0.2697774099651724, 0.8844480465631932, 0.3383792843669653, 0.3801882080733776, 0.9408184948842973, 0.7043623812496662]},
+      {kind: 'apply', u: [0.5786718802992254, 0.4298649502452463, 0.3088082866743207, 0.5883651657495648, 0.36159273446537554, 0.5484274630434811, 0.34868973633274436, 0.253928188001737]},
+      {kind: 'delete', u: [0.4189444489311427, 0.1839420038741082, 0.231367806205526, 0.3093746695667505, 0.29710966954007745, 0.3075379265937954, 0.06625717645511031, 0.7331758630461991]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (hunt seeds 3121, 3189, 3256): a removal record an Apply made unused (the template stopped adding the component), then the member, or the nested frame root above it, deleted by the instance. The save after the delete put the load's kept unused part back for the gone member and the reload kept none, so save→reload→save differed. `withKeptUnused` now writes a kept part only for a member still live: the instance's delete takes the records with it (seed 3189)",
+    repro: [
+      {kind: 'removeComponent', u: [0.4861626385245472, 0.6464858329854906, 0.34910731529816985, 0.42416101857088506, 0.08656954485923052, 0.35927806072868407, 0.05044971057213843, 0.6291338850278407]},
+      {kind: 'instantiate', u: [0.3123783548362553, 0.6733002103865147, 0.7999966023489833, 0.743864813586697, 0.6836235476657748, 0.3055039597675204, 0.6400983028579503, 0.19995113159529865]},
+      {kind: 'delete', u: [0.6171004557982087, 0.11244413629174232, 0.7994146842975169, 0.7786812505219132, 0.8358998373150826, 0.4654822468291968, 0.831301347585395, 0.775125412736088]},
+      {kind: 'reparent', u: [0.6612211077008396, 0.36423021648079157, 0.8306678279768676, 0.9014782046433538, 0.5403791549615562, 0.9499576559755951, 0.07358550862409174, 0.8051375725772232]},
+      {kind: 'prefabEdit', u: [0.720051659969613, 0.7637799391523004, 0.3195983173791319, 0.30892571224831045, 0.7253201364073902, 0.8296465713065118, 0.864294558763504, 0.7305023816879839], inner: []},
+      {kind: 'apply', u: [0.3384947697632015, 0.21068303030915558, 0.03546632663346827, 0.13016873761080205, 0.7914254546631128, 0.47165850386954844, 0.7441818702500314, 0.5235970462672412]},
+      {kind: 'delete', u: [0.18507975689135492, 0.9658291882369667, 0.215555232251063, 0.969783240230754, 0.9964298885315657, 0.3786157723516226, 0.16863925498910248, 0.8317088421899825]},
+      {kind: 'prefabEdit', u: [0.3679075175896287, 0.6148035586811602, 0.14671684545464814, 0.18833275302313268, 0.9373481653165072, 0.4391358729917556, 0.8935777256265283, 0.8203818462789059], inner: []},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (F5, hunt seeds 1093, 1137, 3064): a prefab edit deletes a node of a NESTED frame, and the scene's member row for it was dropped by the next save — the node is still in its document, so R2's document test called the row backed, yet nothing spawned it. The fold now marks a writer's row whose member a lower layer removed (`isUntargetedRow`), and the load keeps it whole as R2 keeps an orphan",
+    repro: [
+      {kind: 'createPrefab', u: [0.435588832013309, 0.2762597321998328, 0.12515294109471142, 0.245185089064762, 0.4700245594140142, 0.8224645780865103, 0.13726249430328608, 0.7340349089354277]},
+      {kind: 'prefabEdit', u: [0.3278416288085282, 0.609664051560685, 0.5566149714868516, 0.1540981107391417, 0.44334901473484933, 0.8064463592600077, 0.8669428001157939, 0.22461966588161886], inner: [{kind: 'delete', u: [0.9654197648633271, 0.7895073282998055, 0.51585115166381, 0.16490537859499454, 0.42432313086465, 0.23471593647263944, 0.1432494781911373, 0.6390993660315871]}]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R4 (F5, hunt seeds 1163, 1288, 3217, 3275): a prefab edit removes a component from a template member, and the scene's removal record for it (`traitRemovals`) was dropped by the next save. The fold now records a writer's removal statement whose component the member's base lacks (`unusedRemovalsOf`), the load keeps it as an unused override, and every save writes it back (`withKeptUnused`)",
+    repro: [
+      {kind: 'createPrefab', u: [0.05658840108662844, 0.4995983433909714, 0.7227386357262731, 0.09445394272916019, 0.47334896260872483, 0.47485498804599047, 0.9995071166194975, 0.4058611218351871]},
+      {kind: 'removeComponent', u: [0.5755348766688257, 0.7295827695634216, 0.8786985180340707, 0.9863484944216907, 0.35958082042634487, 0.7607480988372117, 0.46375742135569453, 0.2527841767296195]},
+      {kind: 'prefabEdit', u: [0.5113919565919787, 0.12006665416993201, 0.3376664996612817, 0.49116666661575437, 0.8020475080702454, 0.09260820224881172, 0.9066430435050279, 0.08031481644138694], inner: [{kind: 'removeComponent', u: [0.0923295000102371, 0.8708034825976938, 0.36576784984208643, 0.4654491492547095, 0.9902781879063696, 0.11898729344829917, 0.34272964112460613, 0.18487766687758267]}]},
+    ],
+  },
   {
     issue: 1913,
     what: "hunt seed 3066: a Paste of a copy taken before an Apply, after that Apply was undone. The undo keeps the #1774 mark it raised (version 8, nextLocalId) on the same rows, so the pasted frame is current under #1892's one \"same document\" rule and nothing rebases it. The #1820 paste check compared raw JSON and read it as stale; it now compares content without the mark and the version",
@@ -1267,5 +1339,43 @@ export const REGRESSIONS: { issue: number; what: string; repro: Op[] }[] = [
       { kind: 'trashPrefab', u: [0.317435038741678, 0.30858678580261767, 0.5941915709991008, 0.2919786865822971, 0.29372866079211235, 0.6846848397981375, 0.6610678271390498, 0.7737833959981799] },
     ],
   },
+  {
+    issue: 1914,
+    what: "#1914 R6 (F7, hunt seed 3297): a scene-added reference node under a nested instance, its root's sibling order recorded (F7) and STORED by the load, then Create Prefab of the tree around it: the capture writes the node as the new template's added node, so its place is the template's, but the stored mark stayed, and a reload read no record of it — save→reload not the identity on its marks. `clearLinkedMarks` takes the order mark off every node the create makes a row of the new template (a stamped nested root, a node the capture keyed)",
+    repro: [
+      {kind: 'createPrefab', u: [0.5647250155452639, 0.7322422140277922, 0.5925946598872542, 0.9539343614596874, 0.8941584592685103, 0.13060407782904804, 0.2914976538158953, 0.5755810237023979]},
+      {kind: 'reparent', u: [0.559150512330234, 0.9203874953091145, 0.7028837632387877, 0.27266549435444176, 0.33850584807805717, 0.1155760451219976, 0.8029564535245299, 0.5240372212138027]},
+      {kind: 'delete', u: [0.947865794878453, 0.8264669892378151, 0.04216664214618504, 0.13456679321825504, 0.16424766671843827, 0.5911478030029684, 0.25022500078193843, 0.2244842287618667]},
+      {kind: 'prefabEdit', u: [0.8511868303176016, 0.7825485856737942, 0.8417859778273851, 0.016778396675363183, 0.3947117901407182, 0.7655478697270155, 0.0176009947899729, 0.9518902481067926], inner: []},
+      {kind: 'createPrefab', u: [0.20812105340883136, 0.2722668503411114, 0.8273136392235756, 0.6546014659106731, 0.5901248534210026, 0.5198992555961013, 0.2167833847925067, 0.6119422912597656]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R6 (hunt seed 1130, found by R7): a top-level instance whose prefab is missing, made by a detach after a copy-restored reload, its root sortOrder in both `overrides` and `traits.EntityAttributes`. The live save wrote EntityAttributes {parentId, sortOrder}; the placeholder's save (`asSceneEntry`: delete parentId, then assign the placement) wrote {sortOrder, parentId}, so save→reload→save differed in key order only. `asSceneEntry` now rebuilds the attributes in the order the record was read",
+    repro: [
+      {kind: 'trashPrefab', u: [0.7666114093735814, 0.472519604023546, 0.07488158065825701, 0.6996986435260624, 0.9371706352103502, 0.32567527424544096, 0.610981714213267, 0.6603487117681652]},
+      {kind: 'saveReload', u: [0.3863253442104906, 0.46820511482656, 0.873514065053314, 0.4368473864160478, 0.12880094349384308, 0.6978627098724246, 0.4603831691201776, 0.37973754992708564]},
+      {kind: 'delete', u: [0.40811298973858356, 0.8343129050917923, 0.4778442697133869, 0.7833234032150358, 0.9427052445244044, 0.6505767519120127, 0.1900414323899895, 0.48937250091694295]},
+      {kind: 'prefabEdit', u: [0.3213348041754216, 0.33489613607525826, 0.5814856521319598, 0.3717763789463788, 0.6585922543890774, 0.4757909474428743, 0.688395669683814, 0.7225606176070869], inner: []},
+      {kind: 'duplicate', u: [0.656027221120894, 0.09189945342950523, 0.5954421046189964, 0.8142631119117141, 0.24448653892613947, 0.03998970263637602, 0.8112325128167868, 0.7392266013193876]},
+      {kind: 'trashPrefab', u: [0.8447021951433271, 0.6163068830501288, 0.43396420287899673, 0.4315458170603961, 0.6991244701202959, 0.5703514523338526, 0.2954710773192346, 0.5064308326691389]},
+      {kind: 'saveReload', u: [0.27336938586086035, 0.11184713058173656, 0.08590331650339067, 0.7244886038824916, 0.7911488167010248, 0.6832870058715343, 0.10035089682787657, 0.08540555369108915]},
+      {kind: 'detach', u: [0.843608878320083, 0.7100989113096148, 0.05380742368288338, 0.3025078058708459, 0.24595744046382606, 0.05102222436107695, 0.5646660507190973, 0.8500855907332152]},
+    ],
+  },
+  {
+    issue: 1914,
+    what: "#1914 R7 merge (hunt seed 1212): P trashed, so a reload expands O's nested P frame from the scene's copy (#1867), and an edit of O's added node Extra (Transform.sx) recorded on O's row. The load's R2 orphan test read the runtime cache alone, so that row was kept as an orphan as well as applied; once the edit was undone the save wrote the stale row back under the capture, and a rebuild (a load of the entry) restored the undone value. The load's `settleEntryRows` now reads `runtimeReaderFor(world)`, as its expansion did",
+    repro: [
+      {kind: 'addChild', u: [0.18742664926685393, 0.30426382343284786, 0.4212738615460694, 0.6239593659993261, 0.2947947233915329, 0.010036298539489508, 0.41152178030461073, 0.17663234402425587]},
+      {kind: 'addChild', u: [0.3059104988351464, 0.22330826637335122, 0.022554441587999463, 0.36423116619698703, 0.8034015789162368, 0.7359053157269955, 0.2862185603007674, 0.30399635271169245]},
+      {kind: 'instantiate', u: [0.41425019851885736, 0.41949908528476954, 0.8198150887619704, 0.5009014976676553, 0.7101776718627661, 0.24246580502949655, 0.6293186328839511, 0.6637837775051594]},
+      {kind: 'instantiate', u: [0.682760683586821, 0.23417703504674137, 0.23791141714900732, 0.8996143848635256, 0.7226784345693886, 0.9287783119361848, 0.18742431001737714, 0.9367894739843905]},
+      {kind: 'prefabEdit', u: [0.7446035209577531, 0.3859414167236537, 0.6997692608274519, 0.0950489912647754, 0.9314346078317612, 0.9088398423045874, 0.8197905987035483, 0.18571023805998266], inner: []},
+      {kind: 'trashPrefab', u: [0.5404355542268604, 0.5151440387126058, 0.6613279248122126, 0.05741006275638938, 0.4387426197063178, 0.6551276780664921, 0.207692809170112, 0.2339963351842016]},
+      {kind: 'duplicate', u: [0.6788823308888823, 0.11165008111856878, 0.26789365289732814, 0.974938336526975, 0.9443847392685711, 0.6941596660763025, 0.6266552766319364, 0.5655335278715938]},
+      {kind: 'editField', u: [0.9644791164901108, 0.8071997140068561, 0.42465037712827325, 0.19177420157939196, 0.11331431730650365, 0.5367793280165642, 0.6067988821305335, 0.31811966467648745]},
+    ],
+  },
 ];
-

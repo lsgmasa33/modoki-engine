@@ -69,11 +69,11 @@ const baseDoc = () => {
 const install = (d: { id: string }) => { prefabs.set(d.id, d); setPrefabCache(d.id, d as never); };
 
 /** One top-level instance of P beside a plain entity at sortOrder 3. */
-const scene = (): SceneData => ({
+const scene = (extra: Record<string, unknown> = {}): SceneData => ({
   id: 's1709', version: 14, name: 'S', resources: [],
   entities: [
     { id: 1, traits: { EntityAttributes: { name: 'Other', parentId: 0, guid: OTHER, sortOrder: 3 } } },
-    { id: 2, prefab: P, guid: ROOT1, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } } },
+    { id: 2, prefab: P, guid: ROOT1, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } }, ...extra },
   ],
 } as unknown as SceneData);
 
@@ -137,7 +137,7 @@ describe('the UI resize/move handles on an instance member (#1709)', () => {
     commitUIHandleDrag(u, trait, before, { ...(readTraitData(u, meta(trait)) as Record<string, unknown>) }, 'drag');
   };
 
-  // Mutation: drop the `reconcileOverrideMarks` call in commitUIHandleDrag — both reload at the template's values.
+  // Mutation: drop the `recordOverridesByDiff` call in commitUIHandleDrag — both reload at the template's values.
   it('a resize survives save + reload', async () => {
     dragUI('UIElement', { width: 200 });
     await saveAndReload();
@@ -161,15 +161,16 @@ describe('the UI resize/move handles on an instance member (#1709)', () => {
     expect(field(member('U'), 'UIElement', 'width')).toBe(120);
   });
 
-  // Mutation: make reconcileOverrideMarks mark unconditionally, or drop its unmark branch — the second drag, back onto
-  // the base, leaves the width marked at 100.
-  it('a drag that ends back on the base pins nothing', async () => {
+  // #1914 F3 (owner, 2026-10-01; Unity keeps a record whose value comes back to the base): this pinned the opposite
+  // until R2. Mutation: give recordOverridesByDiff back its unmark branch — the second drag, back onto the base 100,
+  // takes the first drag's record off and the reload shows the template's 120.
+  it('a drag that ends back on the base keeps the record the first drag made', async () => {
     dragUI('UIElement', { width: 200 });
     dragUI('UIElement', { width: 100 });
     const s = await saved();
     install(pDoc((d) => { (d.entities[5]!.traits as Record<string, Record<string, unknown>>).UIElement!.width = 120; }));
     await load(s);
-    expect(field(member('U'), 'UIElement', 'width')).toBe(120);
+    expect(field(member('U'), 'UIElement', 'width')).toBe(100);
   });
 });
 
@@ -179,8 +180,12 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
   // row is its base. `rootSort` reads it; `rootRow` patches the template's.
   const rootSort = () => field(rootId(), 'EntityAttributes', 'sortOrder');
   const rootRow = (sortOrder: number) => (d: ReturnType<typeof baseDoc>) => { (d.entities[0]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = sortOrder; };
+  // ⚠️ Since F7 (#1914 R6, Unity's rootOrder) a scene instance ROOT records its sibling order whatever its writes mark
+  // (`recordsRootOrder`, overrideMarks.ts), so the ROOT tests below hold by that record, and each mutation marked "before
+  // F7" no longer turns them red. They stay as the outcome the ruling asks for; F7's own falsifier is
+  // recordedOverrideList.test.ts's "an untouched instance keeps its place". The member renumber test still reaches marks.
 
-  // Mutation A: make `writeTraitFieldMarked` a raw write (drop its reconcile) — the root reloads at the template's 20.
+  // Before F7, mutation A: make `writeTraitFieldMarked` a raw write (drop its reconcile) — the root reloads at the template's 20.
   it('a reordered instance root keeps its place over a later template change', async () => {
     reparentEntity(rootId(), 0, 5);
     const s = await saved();
@@ -189,28 +194,29 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
     expect(rootSort()).toBe(5);
   });
 
-  // Mutation: drop the `unmarkOverride` branch of reconcileOverrideMarks — the root, reordered back onto its base 0,
-  // stays marked and ignores the template's later 40.
-  it('a reorder that puts the root back on its base unmarks it', async () => {
+  // #1914 F3, as the drag above: this pinned the opposite until R2. Before F7, mutation: give recordOverridesByDiff back its unmark
+  // branch — the root, reordered back onto its base 0, loses the record the first reorder made and follows the 40.
+  it('a reorder that puts the root back on its base keeps its record', async () => {
     reparentEntity(rootId(), 0, 7);
     reparentEntity(rootId(), 0, 0);
     const s = await saved();
     install(pDoc(rootRow(40)));
     await load(s);
-    expect(rootSort()).toBe(40);
+    expect(rootSort()).toBe(0);
   });
 
-  // #1709 close-out review: reparentEntity took its undo's mark snapshot AFTER its own marked sortOrder write, so the
-  // undo put the new mark back and the old order was saved pinned. Mutation: move `const oldMarks = captureMarks(entityId)`
-  // in reparentEntity back below the writes — the root stays marked at 0 and ignores the template's 40.
-  it('an undone reorder is not saved as an override', async () => {
+  // F7 (#1914 R6, owner ruling: Unity's rootOrder): a scene instance's root ALWAYS records its sibling order, so an undone
+  // reorder saves the order the undo put back, and the template's later 40 does not move it. #1709's snapshot ordering
+  // (the undo's mark capture BEFORE reparentEntity's marked write) no longer shows on a root, whose order is recorded either
+  // way, and a member is not reparented (#1869).
+  it('an undone reorder saves the order the undo put back, which a template change does not move (F7)', async () => {
     reparentEntity(rootId(), 0, 5);
     await undo();
     expect(rootSort()).toBe(0);
     const s = await saved();
     install(pDoc(rootRow(40)));
     await load(s);
-    expect(rootSort()).toBe(40);
+    expect(rootSort()).toBe(0);
   });
 
   // The renumber's undo puts back the marks it found, snapshotted before it ran (`makeSortOrderRenumberAction`, the
@@ -219,10 +225,12 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
   // C follows.
   // Mutation A: drop `putMarkState` in restorableSortOrderWrite — C stays marked at 20 and ignores the template's 25.
   // Mutation B: snapshot after the renumber (build restorableSortOrderWrite at undo time) — the same.
-  // Mutation C: pass no revert (the undo re-reconciles) — B is unmarked and follows the template's 15.
+  // Mutation C: pass no revert (the undo re-records by diff) — C, written back onto its base 20, keeps the record the
+  // renumber made (#1914 R2: a write removes no record) and ignores the template's 25.
   it('an undone renumber restores every sibling\'s mark as it was', async () => {
-    writeTraitFieldWithUndo(member('B'), meta('EntityAttributes'), 'sortOrder', 10); // marked, equal to the base
-    await load(await saved());
+    // Recorded, equal to the base: the file states it (#1914 F2: typing the base's value records nothing, and a member's
+    // sortOrder cannot be typed off its base at all, #1869).
+    await load(scene({ overrides: { 3: { EntityAttributes: { sortOrder: 10 } } } }));
     clearHistory();
     const renumber = makeSortOrderRenumberAction([
       { id: member('B'), oldSort: 10, newSort: 1 }, { id: member('C'), oldSort: 20, newSort: 5 },
@@ -240,9 +248,13 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
 
   // A reparent that sets no sortOrder must not touch the mark on redo either (close-out re-review: the redo wrote the
   // unchanged value through the marking writer, re-reconciling a stored override away). The root, moved under Other.
-  // Mutation: make the redo call `writeTraitFieldMarked(..., 'sortOrder', ...)` unconditionally with the old value.
+  // Since #1914 R2 no write removes a record, so the mutation this was written against (the redo calling
+  // `writeTraitFieldMarked(..., 'sortOrder', ...)` unconditionally with the old value) stays green: the test now guards
+  // the ABSENCE of a by-value un-record on this path. Since F7 not even that: an `unmarkOverride` of the root's
+  // `EntityAttributes.sortOrder` cannot take back the implicit record.
   it('an undone + redone reparent with no sortOrder keeps a stored override', async () => {
-    writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 0); // marked, equal to the base
+    writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 1); // recorded, then back on the base 0 (F3)
+    writeTraitFieldWithUndo(rootId(), meta('EntityAttributes'), 'sortOrder', 0);
     await load(await saved());
     clearHistory();
     const other = getAllEntities().find((e) => e.guid === OTHER)!.id;
@@ -255,7 +267,7 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
     expect(rootSort()).toBe(0);
   });
 
-  // Mutation: make `assignFreshSortOrder` write raw (`writeTraitField`) — the copy's root reloads at the template's 0.
+  // Before F7, mutation: make `assignFreshSortOrder` write raw (`writeTraitField`) — the copy's root reloads at the template's 0.
   // (Paste Entity calls the same function.)
   it('a duplicated instance root keeps its place after a save + reload', async () => {
     duplicateEntity(rootId(), () => {});
@@ -267,7 +279,7 @@ describe('sortOrder rewrites on an instance (#1709)', () => {
 });
 
 describe('re-adding a component the template defines (#1677)', () => {
-  // Mutation: drop the `reconcileOverrideMarks(id, meta)` call in addTraitToEntitiesWithUndo — the reload shows the
+  // Mutation: drop the `recordOverridesByDiff(id, meta)` call in addTraitToEntitiesWithUndo — the reload shows the
   // template's {x, 3} instead of the defaults on screen.
   it('Add Component after a Remove saves what the screen shows', async () => {
     removeTraitFromEntitiesWithUndo([member('A')], meta('Rotate3D'));

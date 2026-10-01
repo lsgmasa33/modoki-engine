@@ -8,7 +8,7 @@ import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRo
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
-import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, type MemberPi } from '../../runtime/core/assetRefRules';
+import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, appliedMoves, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { keptMemberOrphans, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { levelDoc } from './prefabBase';
@@ -52,7 +52,7 @@ import { type PrefabFile } from './prefab';
  *  that differed from a re-imported base. And the frame root itself is judged in its OWNER's frame, where its row
  *  is: a moved owned root's compensated pose is unmarked (`markCompensatedTransform`), and the gate dropped it. */
 export function instanceMovedMembers(rootInstanceId: number, prefab: PrefabFile): (entityId: number, transformDiffers: boolean) => boolean {
-  // Built on the FIRST question, not up front: it walks the world's identity, and `gateOnMarks` asks only for a member
+  // Built on the FIRST question, not up front: it walks the world's identity, and `recordedOverrides` asks only for a member
   // with an UNMARKED Transform diff — rare, whereas the Inspector recomputes on every dirty frame of a drag (close-out
   // review: 10 ms a frame at 5k entities when it was eager).
   let identity: ReturnType<typeof worldIdentityParents> | undefined;
@@ -93,9 +93,10 @@ function expandedDocOf(root: number, piMeta: TraitMeta): PrefabFile | null {
  *  subtracts them. */
 export function frameMovesOf(root: number, doc: { moved?: Record<string, string> } | null | undefined): Record<string, string> | undefined {
   const handle = findEntity(root);
-  const node = handle ? frameRootDoc(getCurrentWorld(), handle)?.nodeMoved : undefined;
-  if (!node) return doc?.moved;
-  return { ...doc?.moved, ...node };
+  // The keyed ones apply nowhere (#1883 ruling C): the load ignored them, so the template's place is where they are.
+  const node = appliedMoves(handle ? frameRootDoc(getCurrentWorld(), handle)?.nodeMoved : undefined);
+  if (!node) return appliedMoves(doc?.moved);
+  return { ...appliedMoves(doc?.moved), ...node };
 }
 
 export function enclosingFrames(rootInstanceId: number): { root: number; doc: PrefabFile | null }[] {
@@ -488,27 +489,6 @@ export function unexpandedRowsOf(rootId: number, doc: PrefabFile): ReadonlySet<n
   // answered nothing after any prefab write and reload, and Revert and Apply's key list still read the row as removed.
   if (!rec?.unexpanded || !(rec.doc === doc || rowsMeanTheSame(rec.doc as RowDoc, doc as RowDoc))) return undefined;
   return new Set(rec.unexpanded);
-}
-
-/** The live Transform of each member of the instance rooted at `rootInstanceId` (the root included), by localId. */
-export function memberTransforms(rootInstanceId: number): (lid: number) => Record<string, unknown> | undefined {
-  let byLid: Map<number, Record<string, unknown>> | undefined;
-  return (lid) => {
-    if (!byLid) {
-      byLid = new Map();
-      const piMeta = getTraitByName('PrefabInstance');
-      const tfMeta = getTraitByName('Transform');
-      if (piMeta && tfMeta) {
-        getCurrentWorld().query(piMeta.trait).updateEach(([pi], entity) => {
-          const d = pi as { rootInstanceId?: number; localId?: number };
-          if (d.rootInstanceId !== rootInstanceId || !d.localId) return;
-          const tf = readTraitData(entity.id(), tfMeta);
-          if (tf) byLid!.set(d.localId, tf);
-        });
-      }
-    }
-    return byLid.get(lid);
-  };
 }
 
 export type RowDoc = { entities?: readonly { localId: number; nodeGuid?: string }[] };

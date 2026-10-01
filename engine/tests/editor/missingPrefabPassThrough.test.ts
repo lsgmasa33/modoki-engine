@@ -346,7 +346,9 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
     const saved = await save();
     expect(entryOf(saved, INST)).toEqual(entry);
     const copy = entryOf(saved, copyGuid)!;
-    expect(copy.overrides).toEqual(entry.overrides);
+    // The same overrides but the copy's own place: F7's root order (#1914 R6), which the duplicate's position sets.
+    const sansOrder = (ov: unknown) => JSON.parse(JSON.stringify(ov ?? {}), (k, v) => (k === 'sortOrder' ? undefined : v)) as unknown;
+    expect(sansOrder(copy.overrides)).toEqual(sansOrder(entry.overrides));
     const pinOf = (e: Record<string, unknown>) => Object.values(e.members as Record<string, { guid?: string; traits?: unknown }>)[0]!;
     expect(pinOf(copy).traits).toEqual(pinOf(entry).traits);
     expect(pinOf(copy).guid).toBeTruthy();
@@ -514,12 +516,14 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   const entitiesText = (s: SceneData) => JSON.stringify(s.entities);
 
   it('a root at its template\'s sortOrder reloads there, and save → reload → save writes the same bytes', async () => {
-    // Mutation: drop `unresolvedRoots.add` in `serializeScene` — the placeholder reloads at 0, before Sib, and the
-    // second save reorders /entities (hunt seed 3129's failure).
+    // Since F7 (#1914 R6) the order is the root override every scene instance records, not the traits #1895 wrote; before
+    // F7, mutation: drop `unresolvedRoots.add` in `serializeScene` — the placeholder reloaded at 0, before Sib, and the
+    // second save reordered /entities (hunt seed 3129's failure). The inactive twin below still reaches the traits path.
     await liveThenTrashed({ sortOrder: 3 });
-    expect(ea(rootOf(INST)).sortOrder).toBe(3); // precondition: from the template, with no mark
+    expect(ea(rootOf(INST)).sortOrder).toBe(3); // precondition: from the template
     const first = await save();
-    expect(traitsEa(entryOf(first, INST)!)).toEqual({ sortOrder: 3, parentId: HOLDER });
+    expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
+    expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
     await load(first);
     expect(ea(rootOf(INST)).sortOrder).toBe(3);
     expect(entitiesText(await save())).toBe(entitiesText(first));
@@ -537,14 +541,15 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
 
   it('the prefab\'s return seeds no mark: the root takes the template\'s value, as it did before the trash', async () => {
     // Mutation: state the fields as a ROOT OVERRIDE (#1850's channel) instead — the reload marks
-    // EntityAttributes.sortOrder, which the live instance never had (the fuzz's restored-prefab identity check).
-    await liveThenTrashed({ sortOrder: 3 });
+    // EntityAttributes.isActive, which the live instance never had (the fuzz's restored-prefab identity check). The
+    // root's sortOrder is recorded on every scene instance (F7, #1914 R6), so isActive carries this now.
+    await liveThenTrashed({ isActive: false });
     const first = await save();
-    install(pWith({ sortOrder: 3 }));
+    install(pWith({ isActive: false }));
     await load(first);
-    expect(ea(rootOf(INST)).sortOrder).toBe(3);
+    expect(ea(rootOf(INST)).isActive).toBe(false);
     const marks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(INST))!) ?? [])];
-    expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual([]);
+    expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual(['EntityAttributes.sortOrder']);
   });
 
   it('a field the entry already states as a root override is not stated twice', async () => {
@@ -570,19 +575,19 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     expectSameBytes(entryOf(await save(), INST), entryOf(control, INST));
   });
 
-  // NOT RULED (#1818's channel, recorded here as observed, not fixed): a placeholder reordered while its prefab is
-  // missing states the new order in the entry's own traits, which a resolving root's load reads nothing of but
-  // `parentId`. So the prefab's return drops the reorder, and the root takes its template's value. The NODE shape does the
-  // same since #1901 (owner ruling, shape 2: the placeholder keeps what it shows while the prefab is missing).
-  it('OBSERVED: a reorder made while the prefab is missing does not survive the prefab\'s return', async () => {
+  // Was OBSERVED (#1818's channel): a placeholder reordered while its prefab was missing stated the new order in the
+  // entry's own traits, which a resolving root's load reads nothing of but `parentId`, so the prefab's return dropped it.
+  // F7 (#1914 R6) fixes it for the entry: the order is the root override the live save wrote, and the reorder lands there
+  // (`asSceneEntry`, #1850), where the return reads it. Not falsifiable alone: F7's falsifier is recordedOverrideList's.
+  it('a reorder made while the prefab is missing survives the prefab\'s return (F7)', async () => {
     await liveThenTrashed({ sortOrder: 3 });
     await load(await save());
     writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 5);
     const reordered = await save();
-    expect(traitsEa(entryOf(reordered, INST)!)?.sortOrder).toBe(5);
+    expect(rootOverrideEa(entryOf(reordered, INST)!)?.sortOrder).toBe(5);
     install(pWith({ sortOrder: 3 }));
     await load(reordered);
-    expect(ea(rootOf(INST)).sortOrder).toBe(3);
+    expect(ea(rootOf(INST)).sortOrder).toBe(5);
   });
 
   // #1897 (owner ruling A, 2026-09-30), #1895's nested twin: a scene-added reference NODE whose prefab is trashed states
@@ -629,15 +634,16 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
 
   it('the node\'s prefab returning seeds no mark: the root takes the template\'s value (#1897)', async () => {
     // Mutation: a resolving reference node's load applying its own traits' EntityAttributes as overrides would mark it.
-    await nodeUnderA({ sortOrder: 2 });
+    // isActive: the sortOrder of a node the scene added is recorded on every one (F7, #1914 R6).
+    await nodeUnderA({ isActive: false });
     const first = await save();
     const q = qDoc();
-    Object.assign(q.entities[0]!.traits.EntityAttributes, { sortOrder: 2 });
+    Object.assign(q.entities[0]!.traits.EntityAttributes, { isActive: false });
     install(q);
     await load(first);
-    expect(ea(rootOf(QINST)).sortOrder).toBe(2);
+    expect(ea(rootOf(QINST)).isActive).toBe(false);
     const marks = [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === rootOf(QINST))!) ?? [])];
-    expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual([]);
+    expect(marks.filter((k) => k.startsWith('EntityAttributes.'))).toEqual(['EntityAttributes.sortOrder']);
   });
 
   it('a node reordered while its prefab was live keeps that order once it is trashed; the override still applies on return (#1897 review F2)', async () => {
@@ -861,10 +867,11 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     expect(nodePlacement(false, undefined, { sortOrder: 0, isActive: true })).toEqual({});
   });
 
-  // NOT FIXED (a follow-up, recorded as observed): a value the TEMPLATE gives a live root carries no mark and no
-  // override, so a save while the prefab resolves states it nowhere, for either shape. A prefab deleted outside the
-  // editor then loads the placeholder at the defaults. docs/prefabs.md I21 names it.
-  it('OBSERVED: a root placed by its TEMPLATE, its prefab deleted outside the editor, loads cold at the defaults', async () => {
+  // F7 (#1914 R6, seed 7078's cold route) closes it for the ORDER, in both shapes: a scene instance's root records its
+  // sortOrder, so the save states it while the prefab resolves and the cold placeholder spawns there. Still OBSERVED for
+  // the ACTIVE flag, which is not one of Unity's default overrides: a value the template gives it carries no record, and
+  // the placeholder loads active. docs/prefabs.md I21 names it.
+  it('OBSERVED: a root placed by its TEMPLATE, its prefab deleted outside the editor, loads cold at its order but active', async () => {
     const q = qDoc();
     Object.assign(q.entities[0]!.traits.EntityAttributes, { sortOrder: 2, isActive: false });
     install(pDoc(), q);
@@ -874,7 +881,7 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     const live = await save();
     uninstall(Q);
     await load(live);
-    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 0, isActive: true });
+    expect(placement(rootOf(QINST))).toEqual({ sortOrder: 2, isActive: true });
   });
   it('OBSERVED: the same for a top-level ENTRY placed by its template', async () => {
     const p = pDoc();
@@ -885,7 +892,7 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     const live = await save();
     uninstall(P);
     await load(live);
-    expect(placement(rootOf(INST))).toEqual({ sortOrder: 0, isActive: true });
+    expect(placement(rootOf(INST))).toEqual({ sortOrder: 2, isActive: true });
   });
 });
 
@@ -1024,7 +1031,7 @@ describe('a placeholder is not an instance of the prefab once it resolves (#1699
     uninstall(Q);
     await load(control);
     const keys = collectInstanceOverrideKeys(rootOf(INST), prefabs.get(P) as PrefabFile);
-    const all = keys.all;
+    const all = keys.all.filter((k) => !keys.defaultOverrides.includes(k)); // Apply All: F7's root order left
     expect(all.some((k) => k.includes(QINST))).toBe(true); // precondition: the listing names the node
     const res = await applyToPrefabSelective(rootOf(INST), new Set(all));
     expect(res.applied).toBe(false); // the node was the only key: nothing is left to apply
@@ -2191,4 +2198,35 @@ describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the e
     await load(saved);
     expect(x(inside(INST, 'A'))).toBe(6); // and the edit comes back with the prefab
   });
+});
+
+// #1914 close-out review: F7 implies a scene instance root's order record from its ROLE; a copy carried that view as a
+// STORED mark, so an unedited instance of Q pasted into P's prefab edit wrote `sortOrder: 0` as a nested row's override
+// — a record nobody made, in a world F7 says records nothing. Two sources: a fresh instance (the order only implied), and
+// one reopened from a save, whose file states the order its root records (the load marks what the file states).
+// Mutations: capture `getOverrideMarkSet` in `snapshotEntity` — both red; let `getCarriedOverrideMarks` return the stored
+// set whole — the reopened one red.
+describe("a scene instance copied into prefab edit carries no implied root order (#1914 close-out review)", () => {
+  for (const reopened of [false, true]) {
+    it(`an unedited instance${reopened ? ', reopened from its save,' : ''} pasted into P's edit writes no override`, async () => {
+      install(pDoc(), qDoc());
+      await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 0 } } }]));
+      if (reopened) await load(await save());
+      const snap = snapshotEntity(rootOf(QINST))!;
+      await load(buildPrefabEditScene(pDoc() as unknown as PrefabFile) as SceneData);
+      // Under A, which has no children, so the paste's place is the template root's own (0) and records nothing.
+      const a = getAllEntities().find((e) => e.name === 'A')!;
+      const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${P}` } as never);
+      try {
+        expect(pasteEntityCopy(snap, a.id, () => {})).toBeGreaterThan(0);
+        const out = serializePrefabEditWorld(P);
+        if ('error' in out) throw new Error(out.error);
+        const nested = out.prefab.entities.find((e) => e.prefab === Q)!;
+        expect(nested).toBeDefined();
+        expect((nested as { overrides?: unknown }).overrides).toBeUndefined();
+      } finally {
+        editWorld.mockRestore();
+      }
+    });
+  }
 });

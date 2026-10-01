@@ -43,6 +43,10 @@ import { findEntityByGuid } from '../../packages/modoki/src/runtime/core/ecs/wor
 import { captureMarks } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { piOf } from './prefabFuzz/harness';
+import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { findEntityById as findEntity } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -174,5 +178,40 @@ describe("Create Prefab's tag and its undo (#1830)", () => {
     await settle();
     const mBack = authored().find((e) => e.name === 'M' && e.parentId === qId)!;
     expect(captureMarks(mBack.id).keys).toContain('Transform.x');
+  });
+
+  // Hunt seed 3297 (#1914 R6): a scene-added reference node's root records its sibling order (F7), and a load STORES that
+  // record (the root's guid is not durable yet when the overrides apply). Create Prefab then makes the node a row of the
+  // new template — a nested row (P, stamped) or that row's added node (Q, keyed by the capture) — which states its place,
+  // so a reload reads no record of it; the stored mark stayed, and save → reload was not the identity. Mutation: drop the
+  // `unmarkOverride(…, 'sortOrder')` loop in `clearLinkedMarks` — both roots keep the mark, and the reload disagrees.
+  it('Create Prefab takes the sibling-order record off the nodes it makes rows of the new template', async () => {
+    const f = await startRun(be, async (fx) => {
+      const plain = authored().find((e) => e.name === 'Plain')!;
+      const pId = await placePrefabFromPath(fx.prefabs.P.path, { tag: 'test', parentId: plain.id });
+      await settle();
+      const a = authored().find((e) => e.name === 'A' && piOf(e.id)?.rootInstanceId === pId)!;
+      await placePrefabFromPath(fx.prefabs.Q.path, { tag: 'test', parentId: a.id });
+      await settle();
+    }, 'tagWrites-rootOrder');
+    const plain = authored().find((e) => e.name === 'Plain')!;
+    // By where they sit: the fixture's other instances hold an R and a QR too. Read afresh, as a reload re-spawns them.
+    const child = (parentId: number | undefined, name: string) => authored().find((e) => e.parentId === parentId && e.name === name);
+    const rootOf = (name: 'R' | 'QR') => {
+      const r = child(authored().find((e) => e.name === 'Plain')!.id, 'R')!;
+      return name === 'R' ? r : child(child(r.id, 'A')?.id, 'QR')!;
+    };
+    const ordered = (name: 'R' | 'QR') => [...(getOverrideMarkSet(findEntity(rootOf(name).id)!) ?? [])].includes('EntityAttributes.sortOrder');
+    expect([ordered('R'), ordered('QR')], 'premise: both scene-placed roots record their order').toEqual([true, true]);
+    const r = await createPrefabFromEntity(plain.id, `${f.root}/prefabs/NewPlain.prefab.json`, 'Save prefab "Plain"', async () => false);
+    if (!r || r === 'declined' || 'refused' in r) throw new Error(`create: ${r && r !== 'declined' ? r.refused : r}`);
+    pushAction(r.action);
+    await settle();
+    expect(templateKeyOf(findEntity(rootOf('QR').id)), 'premise: the capture keyed the scene-added Q').toBeTruthy();
+    expect([ordered('R'), ordered('QR')]).toEqual([false, false]);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    expect([ordered('R'), ordered('QR')]).toEqual([false, false]);
   });
 });

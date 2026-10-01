@@ -411,6 +411,9 @@ function rebuildTargetsByEntry(
    *  F7d), and an outer entry of it is captured against `from` where it has no record of its own — the documents
    *  `refreshInstances` was handed, not the cache's. */
   refresh?: { source: string; from: PrefabFile; to: PrefabFile },
+  /** Edits to frames that are not targets but lie inside a target's entry, by frame root id: made in that entry's load
+   *  when it runs (an Apply into an ENCLOSING prefab takes the fields out of the nested frame they came from, #1914). */
+  frameEdits: ReadonlyMap<number, FrameEdit> = new Map(),
 ): Map<number, number> & { said: number } {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
@@ -447,6 +450,7 @@ function rebuildTargetsByEntry(
     }
     const guids = new Map(group.map((t) => [t.root, guidOfId(t.root)] as const));
     const frames = new Map(group.filter((t) => t.edit).map((t) => [t.root, t.edit!] as const));
+    for (const [frame, e] of frameEdits) if (!frames.has(frame) && outermostEntryOf(frame) === outer) frames.set(frame, e);
     const entry = captureRebuildEntry(outer, source, baseline, guidOfId(outer), { frames, dropParents });
     const newOuter = rebuildFromEntry(outer, source, now, entry, remap, baseline, read, keptLive);
     for (const t of group) {
@@ -697,6 +701,14 @@ export function refreshInstances(
     // Every applied field leaves the source (#1469, U15): U13 reverted the enclosing overrides that could shadow one.
     targets.push({ root, ...(from ? { edit: { overrides: (o) => subtractFieldOverrides(o, from.fields) } } : {}) });
   }
+  // An applied-from frame that is not itself refreshed — a nested frame whose edit an Apply wrote into an ENCLOSING
+  // prefab (#1658 ruling (a), U14) — lies inside a target's entry, and its fields leave it in that entry's load: an Apply
+  // takes the record off (#1914, docs/prefabs.md § I2), where before its capture dropped them for equalling the row now.
+  const frameEdits = new Map<number, FrameEdit>();
+  for (const a of Array.isArray(appliedFrom) ? appliedFrom : appliedFrom ? [appliedFrom] : []) {
+    const id = a.rootGuid ? findEntityByGuid(a.rootGuid)?.id() ?? 0 : a.rootId;
+    if (id && !targets.some((t) => t.root === id)) frameEdits.set(id, { overrides: (o) => subtractFieldOverrides(o, a.fields) });
+  }
   // A frame is rebuilt as the LOAD of its outermost scene entry (#1880 F6-U, hub ruling (i)): every target in one entry by
   // the same load, each with the Apply's subtraction made in its own statement, every frame against its own record
   // (`againstRecords`) and every frame of `source` expanded from `newPrefab`. So a target holding a frame built from
@@ -704,7 +716,7 @@ export function refreshInstances(
   // refused while a sibling target in its entry was not, it was rebuilt by that sibling's load all the same, under a
   // "not refreshing" warning and uncounted). What it does not rebuild — an entry with no document to load it from — is
   // said, and not counted.
-  const done = rebuildTargetsByEntry(targets, remap, undefined, { source, from: oldPrefab, to: newPrefab });
+  const done = rebuildTargetsByEntry(targets, remap, undefined, { source, from: oldPrefab, to: newPrefab }, frameEdits);
   if (done.size + done.said < targets.length) {
     console.warn(`[Prefab] not refreshing ${targets.length - done.size - done.said} instance(s) of "${source}": no scene entry holding them could be loaded — reload its scene to update it`);
   }

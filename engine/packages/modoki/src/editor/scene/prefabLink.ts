@@ -13,7 +13,7 @@ import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runti
 import { UndoRefusedError } from '../undo/undoFailure';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
-import { clearOverrideMarks, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { clearOverrideMarks, restoreOverrideMarks, unmarkOverride, getStoredOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from '../undo/overrideMarkWrites';
 import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
 import { settleSwallowedKeptState } from './prefabTokens';
@@ -291,7 +291,10 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
 /** What a detach undoes: the links it stripped off the tree, the members OUTSIDE the tree it promoted or unlinked
  *  because their frame ended with it (#1453), and the template keys it stripped (#1874) — each by the node's guid, as
  *  the links are. */
-export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string }[]; }
+/** `keys`: each template-keyed node the detach unkeyed, with its RECORD (#1914 R3a: a template's plain node records its own
+ *  edits, as a member does, and the undo that makes it the template's node again must make them its own again — after a
+ *  reload in between, the plain node it became holds none). */
+export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string; marks?: MarkCapture }[]; }
 
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
  *  root and EVERY descendant in its identity subtree (nested instances included), turning
@@ -358,7 +361,7 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
     });
   }
   let orphans: DetachedMember[] = [];
-  const keys: { ref: EntityRef; key: string }[] = [];
+  const keys: { ref: EntityRef; key: string; marks?: MarkCapture }[] = [];
   if (strip) {
     orphans = recordDetachedMarks(endFrames(new Set(snapshot.map((s) => s.id)))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
@@ -374,7 +377,7 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
       const e = findEntity(info.id);
       const key = templateKeyOf(e);
       if (!e || !key) continue;
-      keys.push({ ref: entityRef(info.id), key });
+      keys.push({ ref: entityRef(info.id), key, marks: captureMarks(info.id) });
       e.remove(TemplateAddedKey);
     }
   }
@@ -397,10 +400,12 @@ export function reattachPrefabInstance(
   // The template keys the detach stripped (#1874), before the links: a rebase after this reads a node's key to know it for
   // the template's. One whose node no longer resolves counts with the links below.
   let missedKeys = 0;
-  for (const { ref, key } of keys) {
+  for (const { ref, key, marks } of keys) {
     const live = ref.resolve();
     const entity = live == null ? undefined : findEntity(live);
-    if (entity) setTemplateKey(entity, key); else missedKeys++;
+    if (!entity) { missedKeys++; continue; }
+    setTemplateKey(entity, key);
+    if (marks) restoreMarks(entity.id(), marks);
   }
   // Orphans first: relinking reverses a promotion's member rename, and the refs below resolve by guid.
   relinkDetachedMembersMarked(orphans);
@@ -550,7 +555,7 @@ export function tagCreatedPrefab(
     links: snapshot.links.filter((l) => writes.has(l.id)).map(({ frame, ...l }) => (writes.get(l.id) === 'link' && frame ? { ...l, frame } : l)),
     orphans: snapshot.orphans,
   };
-  const undoMarks = clearLinkedMarks(writes);
+  const undoMarks = clearLinkedMarks(writes, [...unkeyed].filter((id) => templateKeyOf(findEntity(id))));
   const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
   const undoSettle = settleSwallowedKeptState(rootEcsId);
   const undoKeys = stripCreatedKeys(unkeyed);
@@ -563,13 +568,26 @@ export function tagCreatedPrefab(
 /** Clear the override marks of every entity the tag linked, and return their undo. Addressed by the guid each holds AFTER
  *  the stamp, which is the one it holds when the undo runs: `undoKept` runs before the rename is reversed. The marks
  *  alone, not `restoreMarks`: that one also brings the unmarked fields onto the template (#1800), and neither half of
- *  the tag changes a value. */
-function clearLinkedMarks(writes: TagWrites): () => void {
+ *  the tag changes a value.
+ *
+ *  A STAMPED nested reference root, and a node the create KEYED (a scene-added node under a nested instance, which the
+ *  capture wrote as that row's added node: `keyed`), keep their marks, all but the sibling order: the new template states
+ *  the node's place now, so a reload reads no record of it. A scene-added reference node's root records that order
+ *  always (F7, #1914 R6), so every one carried the mark into the copy (hunt seed 3297); a reorder made before the create
+ *  did the same before F7. */
+function clearLinkedMarks(writes: TagWrites, keyed: readonly number[]): () => void {
   const held = [...writes].filter(([, w]) => w === 'link').map(([id]) => ({ id, marks: captureMarks(id).keys }))
     .filter((h) => h.marks.length).map(({ id, marks }) => ({ ref: entityRef(id), marks }));
   const handle = (ref: EntityRef) => { const id = ref.resolve(); return id == null ? null : findEntity(id); };
+  const ordered = [...new Set([...[...writes].filter(([, w]) => w === 'stamp').map(([id]) => id), ...keyed])]
+    .filter((id) => { const e = findEntity(id); return !!e && !!getStoredOverrideMarks(e)?.has('EntityAttributes.sortOrder'); })
+    .map((id) => entityRef(id));
   for (const h of held) { const e = handle(h.ref); if (e) clearOverrideMarks(e); }
-  return () => { for (const h of held) { const e = handle(h.ref); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, h.marks); } } };
+  for (const ref of ordered) { const e = handle(ref); if (e) unmarkOverride(e, 'EntityAttributes', 'sortOrder'); }
+  return () => {
+    for (const h of held) { const e = handle(h.ref); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, h.marks); } }
+    for (const ref of ordered) { const e = handle(ref); if (e) restoreOverrideMarks(e, ['EntityAttributes.sortOrder']); }
+  };
 }
 
 /** The template key on each node of the tagged tree that the written document declares, by the node's guid BEFORE the

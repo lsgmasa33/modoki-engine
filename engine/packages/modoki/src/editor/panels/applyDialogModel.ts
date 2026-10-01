@@ -228,3 +228,9 @@ export function subscribePreviewWorld(fn: () => void): () => void {
   const offMode = onRunModeChange(fn);
   return () => { offUndo(); offMode(); };
 }
+
+/** The dialog's read-only line for an instance's UNUSED overrides (#1914 R5, owner ruling F6): records whose target is
+ *  gone, which every save keeps and neither Apply nor Revert touches. */
+export function unusedOverridesLine(count: number): string {
+  return `${count} unused override${count === 1 ? '' : 's'} (kept)`;
+}

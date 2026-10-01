@@ -6,8 +6,9 @@
  *  wrote them all, and every untouched sibling was pinned: a later template change to it never reached
  *  the scene. This computes the statement that pins nothing it does not have to:
  *
- *  - a template node the scene EDITED → a node row holding only the fields that differ, the traits it
- *    added (`traits`), the ones it removed (`traitRemovals`) and its own children (`own`);
+ *  - a template node the scene EDITED → a node row holding only the fields it RECORDED (#1914 R3a: written
+ *    whatever their value, Unity's recorded list), the traits it added (`traits`), the ones it removed
+ *    (`traitRemovals`) and its own children (`own`);
  *  - a template node the scene DELETED → a node row `{ removed: true }`;
  *  - a node the scene ADDED → `own` under its anchor member (appended on load, where `added` replaces);
  *  - an untouched template node → nothing, so the template keeps owning it.
@@ -20,9 +21,10 @@
  *
  *  **Falls back to the v16 whole-list statement** (`whole`) for an anchor it cannot state node by node:
  *  a chain node there with no template key (a file from before keys), a key used twice in the frame, or
- *  an edited template REFERENCE node (a nested instance a template row added), whose interior is a frame
- *  of its own and has no node-row address yet. The fallback pins that anchor's list exactly as v16 did,
- *  and nothing more.
+ *  or an edited template REFERENCE node the caller cannot state by rows (`deps.addressable` false: a live node
+ *  holding instance identity a row has no place for). The fallback pins that anchor's list exactly as v16 did,
+ *  and nothing more. An edited reference node that IS addressable is reported in `refs` (#1914 R3b), and the
+ *  caller states it by the rows reaching into it (`<frame>/a+<key>/…`).
  *
  *  Pure: the live-world questions (a node's template key, a field's schema default, reference node
  *  equality) are the caller's, passed in `deps`. */
@@ -37,8 +39,13 @@ export interface NodeDiffDeps {
   defaultOf(trait: string, field: string): unknown;
   /** Do a live and a chain REFERENCE node state the same thing? */
   sameReference(live: AddedEntity, chain: AddedEntity): boolean;
-  /** Field-value equality (the save's float tolerance). */
-  equal(a: unknown, b: unknown): boolean;
+  /** Can an EDITED reference node be stated by rows reaching into it (#1914 R3b, `refs`)? When absent or false the
+   *  anchor falls back to the whole list. */
+  addressable?(live: AddedEntity, chain: AddedEntity): boolean;
+  /** The fields the LIVE node's own record holds (`Trait.field`, #1914 R3a). A recorded field is written whatever its
+   *  value; one not recorded is the chain's, however its live value reads (a template change not yet shown). No value is
+   *  compared to decide (#1914 R3c): a node the capture names no live entity for holds no record. */
+  recordedOf(live: AddedEntity): ReadonlySet<string>;
 }
 
 export interface FrameAddedDiff {
@@ -48,6 +55,9 @@ export interface FrameAddedDiff {
   own: Map<number, AddedEntity[]>;
   /** Anchors whose whole live list must be written as v16 `added` instead. */
   whole: Set<number>;
+  /** The EDITED template reference nodes stated by rows reaching into them (#1914 R3b): template key → the live and the
+   *  chain node, and the anchor whose list falls back to whole if the caller cannot state them after all. */
+  refs: Map<string, { live: AddedEntity; chain: AddedEntity; anchor: number }>;
   /** Template keys of the chain nodes the load RE-ANCHORED into a whole-list anchor (#1872): the pinned list holds each
    *  one, and the load's fold replaces only what the template anchors at the list's member, so its template copy must
    *  go some other way — a `removed` node row in scene form, the list's own key in template form (the writer's call),
@@ -64,7 +74,7 @@ export function diffFrameAdded(
   deps: NodeDiffDeps,
   reanchored: ReadonlySet<string> = new Set(),
 ): FrameAddedDiff {
-  const out: FrameAddedDiff = { nodeRows: new Map(), own: new Map(), whole: new Set(), pinnedOver: new Set() };
+  const out: FrameAddedDiff = { nodeRows: new Map(), own: new Map(), whole: new Set(), refs: new Map(), pinnedOver: new Set() };
   const liveNodes = live ?? [];
   const chainNodes = chain ?? [];
   const anchors = new Set([...liveNodes, ...chainNodes].map((n) => n.parentLocalId));
@@ -101,9 +111,11 @@ export function diffFrameAdded(
     const liveAt = liveNodes.filter((n) => n.parentLocalId === anchor);
     if (!allKeyed(chainAt)) { out.whole.add(anchor); continue; }
     const rows = new Map<string, SceneMemberRow>();
-    const matched = matchList(liveAt, chainAt, rows, deps);
+    const refs = new Map<string, { live: AddedEntity; chain: AddedEntity }>();
+    const matched = matchList(liveAt, chainAt, rows, deps, refs);
     if (!matched) { out.whole.add(anchor); continue; }
     for (const [k, r] of rows) out.nodeRows.set(k, r);
+    for (const [k, r] of refs) out.refs.set(k, { ...r, anchor });
     if (matched.own.length) out.own.set(anchor, ownForm(matched.own));
   }
   pinOver();
@@ -114,6 +126,7 @@ export function diffFrameAdded(
  *  unmatched live nodes are the scene's own there; null when the list cannot be stated node by node. */
 function matchList(
   live: readonly AddedEntity[], chain: readonly AddedEntity[], rows: Map<string, SceneMemberRow>, deps: NodeDiffDeps,
+  refs: Map<string, { live: AddedEntity; chain: AddedEntity }>,
 ): { own: AddedEntity[] } | null {
   const byKey = new Map<string, AddedEntity>();
   const own: AddedEntity[] = [];
@@ -130,9 +143,11 @@ function matchList(
     if (!l) { rows.set(c.key!, { removed: true }); continue; }
     if (c.prefab || l.prefab) {
       if (c.prefab && l.prefab && deps.sameReference(l, c)) continue;
+      // Edited: stated by the rows reaching into it (#1914 R3b), which the caller writes — its siblings stay the chain's.
+      if (c.prefab && l.prefab === c.prefab && deps.addressable?.(l, c)) { refs.set(c.key!, { live: l, chain: c }); continue; }
       return null;
     }
-    const row = diffNode(l, c, rows, deps);
+    const row = diffNode(l, c, rows, deps, refs);
     if (!row) return null;
     if (Object.keys(row).length) rows.set(c.key!, row);
   }
@@ -141,7 +156,9 @@ function matchList(
 
 /** One template node's row: its field edits, trait additions and removals, and its children. `{}` when
  *  untouched; null when its children cannot be stated node by node. */
-function diffNode(l: AddedEntity, c: AddedEntity, rows: Map<string, SceneMemberRow>, deps: NodeDiffDeps): SceneMemberRow | null {
+function diffNode(
+  l: AddedEntity, c: AddedEntity, rows: Map<string, SceneMemberRow>, deps: NodeDiffDeps, refs: Map<string, { live: AddedEntity; chain: AddedEntity }>,
+): SceneMemberRow | null {
   const row: SceneMemberRow = {};
   const traits: Record<string, Record<string, unknown>> = {};
   const removals: Record<string, boolean> = {};
@@ -151,6 +168,7 @@ function diffNode(l: AddedEntity, c: AddedEntity, rows: Map<string, SceneMemberR
     return bag;
   };
   const names = new Set([...Object.keys(l.traits ?? {}), ...Object.keys(c.traits ?? {})]);
+  const recorded = deps.recordedOf(l);
   for (const t of names) {
     const lv = l.traits?.[t];
     const cv = c.traits?.[t];
@@ -158,18 +176,20 @@ function diffNode(l: AddedEntity, c: AddedEntity, rows: Map<string, SceneMemberR
     if (cv === undefined || cv === false) { traits[t] = bagOf(t, lv); continue; }
     if (lv === true && cv === true) continue;
     const lo = bagOf(t, lv);
-    const co = bagOf(t, cv);
     const delta: Record<string, unknown> = {};
-    for (const f of new Set([...Object.keys(lo), ...Object.keys(co)])) {
+    const identity = IDENTITY_FIELDS[t] ?? [];
+    for (const k of recorded) {
+      if (!k.startsWith(`${t}.`)) continue;
+      const f = k.slice(t.length + 1);
+      if (!f || identity.includes(f)) continue;
       const a = f in lo ? lo[f] : deps.defaultOf(t, f);
-      const b = f in co ? co[f] : deps.defaultOf(t, f);
-      if (a !== undefined && !deps.equal(a, b)) delta[f] = a;
+      if (a !== undefined) delta[f] = a;
     }
     if (Object.keys(delta).length) traits[t] = delta;
   }
   if (Object.keys(traits).length) row.traits = traits;
   if (Object.keys(removals).length) row.traitRemovals = removals;
-  const kids = matchList(l.children ?? [], c.children ?? [], rows, deps);
+  const kids = matchList(l.children ?? [], c.children ?? [], rows, deps, refs);
   if (!kids) return null;
   if (kids.own.length) row.own = ownForm(kids.own);
   return row;

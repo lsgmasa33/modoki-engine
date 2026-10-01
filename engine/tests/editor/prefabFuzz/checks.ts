@@ -447,3 +447,30 @@ export function checkRoundTrip(
   }
   return out;
 }
+
+/** The ops that never act on a scene instance's own records (#1914 I23): they change templates or files. (A save→reload
+ *  is held by the round trip's own identity checks.) */
+export const RECORD_NEUTRAL: ReadonlySet<string> = new Set(['outsideEdit', 'prefabEdit', 'trashPrefab', 'renamePrefab']);
+
+/** Every override record a saved scene states, as `<entry guid> <channel path>` leaf keys (values left out: a record is
+ *  its key, #1914 I23). An instance entry and a Missing Prefab placeholder's kept record alike; the entry's own `traits`
+ *  (its name, parent, placement) are not records. */
+export function recordKeys(sceneBytes: string): Set<string> {
+  // ⚠️ Leaves only: an empty `traits: {}` that later holds a placement is not a record lost (hunt seed 1247).
+  const out = new Set<string>();
+  let scene: { entities?: Array<Record<string, unknown>> };
+  try { scene = JSON.parse(sceneBytes) as typeof scene; } catch { return out; }
+  const CHANNELS = ['overrides', 'members', 'removed', 'removedTraits', 'added', 'nestedOverrides', 'nestedStructure', 'moved'];
+  const walk = (v: unknown, path: string, guid: string) => {
+    if (Array.isArray(v) && v.length && v.every((x) => !x || typeof x !== 'object')) {
+      for (const x of v) out.add(`${guid} ${path}[${String(x)}]`);
+    } else if (v && typeof v === 'object' && Object.keys(v).length) {
+      for (const [k, x] of Object.entries(v)) walk(x, `${path}/${k}`, guid);
+    } else if (!v || typeof v !== 'object') out.add(`${guid} ${path}`); // an EMPTY object or list is no record (it may fill)
+  };
+  for (const e of scene.entities ?? []) {
+    const guid = typeof e.guid === 'string' ? e.guid : '?';
+    for (const c of CHANNELS) if (e[c] !== undefined) walk(e[c], c, guid);
+  }
+  return out;
+}

@@ -486,6 +486,49 @@ describe('a member token through nested prefabs (#1352)', () => {
   });
 });
 
+// #1914 R3b: a template's row states an edit INSIDE one of its reference nodes by a row reaching into it
+// (`/a+<key>/<member>`). Its key names no frame the row's own frames do, so the writer hands its frame along (`rowFrames`).
+describe('a ref in a row reaching into a template reference node is a token of the NODE\'s frame (#1914 R3b)', () => {
+  // TOP → HostRow (HOST) → SpotRow (SPOT), whose HOST-authored `added` holds a keyed reference node of INN. TOP's prefab
+  // edit retargets the node's Leaf: a chain node, so TOP's row states it by `/<SpotRow>/a+<key>/<Leaf>`.
+  const SPOT = 'aaaaaaaa-0000-4000-8000-0000000019b0';
+  const HOST = 'aaaaaaaa-0000-4000-8000-0000000019b1';
+  const INN = 'aaaaaaaa-0000-4000-8000-0000000019b2';
+  const TOP = 'aaaaaaaa-0000-4000-8000-0000000019b3';
+  const ng = (n: number) => `eeeeeeee-0000-4000-8000-0000000019b${n}`;
+  const inn = { id: INN, version: 5, name: 'Inn', rootLocalId: 1, entities: [
+    row(1, 'InnRoot', 0, { nodeGuid: ng(1) }),
+    { ...row(2, 'Leaf', 1, { nodeGuid: ng(2) }), traits: { ...row(2, 'Leaf', 1).traits, ...bind('@member:') } },
+  ] };
+  const spot = { id: SPOT, version: 5, name: 'Spot', rootLocalId: 1, entities: [row(1, 'SpotRoot', 0, { nodeGuid: ng(3) })] };
+  const host = { id: HOST, version: 5, name: 'Host', rootLocalId: 1, entities: [
+    row(1, 'HostRoot', 0, { nodeGuid: ng(4) }),
+    row(2, 'SpotRow', 1, { nodeGuid: ng(5), prefab: SPOT, added: [{ parentLocalId: 1, guid: '', key: REF_KEY, name: 'InnRoot', prefab: INN, traits: {}, children: [] }] }),
+  ] };
+  const top = { id: TOP, version: 5, name: 'Top', rootLocalId: 1, entities: [
+    row(1, 'TopRoot', 0, { nodeGuid: ng(6) }), row(2, 'HostRow', 1, { nodeGuid: ng(7), prefab: HOST }),
+  ] };
+
+  // Mutation: drop `rowFrames` in `tokenizeRowMembers` — the ref is tokenized in the row's own frame, where Leaf is no
+  // member, and is not `@member:2`.
+  it('the prefab editor\'s save writes the Leaf\'s ref to itself as `@member:2`, and each instance resolves its own', async () => {
+    install(inn); install(spot); install(host);
+    const root = await openInEditor(top as PrefabFile);
+    const leaf = getAllEntities().find((e) => e.name === 'Leaf')!;
+    writeTraitFieldWithUndo(leaf.id, getTraitByName('UIAction')!, 'bindings', [{ event: 'click', kind: 'call', action: 'noop', target: leaf.guid }]);
+    const saved = serializePrefab(root, TOP)!;
+    const hostRow = saved.entities.find((e) => e.prefab === HOST)! as { nestedStructure?: unknown; members?: Record<string, { traits?: Record<string, { bindings?: { target: string }[] }> }> };
+    expect(hostRow.nestedStructure).toBeUndefined(); // SpotRow's list is not restated
+    expect(Object.keys(hostRow.members ?? {})).toEqual([`/${ng(5)}/a+${REF_KEY}/${ng(2)}`]);
+    expect(hostRow.members![`/${ng(5)}/a+${REF_KEY}/${ng(2)}`]!.traits?.UIAction?.bindings?.[0]?.target).toBe('@member:2');
+    install(saved);
+    await load(twoInstances(TOP, 'TopRoot'));
+    const leaves = getAllEntities().filter((e) => e.name === 'Leaf');
+    expect(leaves).toHaveLength(2);
+    for (const l of leaves) expect(targetOf(l.id)).toBe(l.guid);
+  });
+});
+
 describe('close-out review findings (#1352)', () => {
   // A scene instance placed UNDER another instance is its own frame. The host's resolve pass named the
   // child instance's root as a target and also rewrote its bag, so its `@member:2` resolved to the

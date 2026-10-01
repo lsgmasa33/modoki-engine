@@ -97,7 +97,7 @@ import { emit } from '../core/journal';
 import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { ensurePhysicsReady } from '../physics/physicsReady';
-import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
+import { clearAllOverrideMarks, getCarriedOverrideMarks, restoreOverrideMarks } from '../loaders/overrideMarks';
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
 import { frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../core/ecs/identityParents';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
@@ -775,7 +775,7 @@ class SceneManagerImpl implements SceneManager {
       const carryWorld = getCurrentWorld();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
-        const set = old ? getOverrideMarkSet(old) : undefined;
+        const set = old ? getCarriedOverrideMarks(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
         const markers = captureMarkers(old as Parameters<typeof captureMarkers>[0]);
         if (markers) carriedMarkers.set(entry.id, markers);

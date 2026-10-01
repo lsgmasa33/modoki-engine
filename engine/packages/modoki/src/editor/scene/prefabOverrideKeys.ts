@@ -35,12 +35,13 @@ import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { isTemplateExcludedField, type PrefabFile } from './prefab';
 import { getCachedPrefabSync } from './prefabCache';
 import { baseTokenResolver } from './prefabTokens';
-import { collectComparableTraits, getOverrideValues, gateOnMarks, foldMarkedEqual } from './prefabInstanceOverrides';
+import { collectComparableTraits, getOverrideValues, recordedOverrides } from './prefabInstanceOverrides';
 import { instanceMovedMembers } from './prefabMembers';
-import { ownInstanceStructure, instanceBase, enclosingRowOverrides, nestedFrameMoves } from './prefabChain';
+import { ownInstanceStructure, instanceBase, nestedFrameMoves } from './prefabChain';
 import { type ApplyResult } from './prefabApply';
 import { memberRef, toLocalIdKey, nestedKeyRef } from './overrideKeyGrammar';
 import { ownedFrames, levelDoc } from './prefabBase';
+import { instanceUnusedOverrides } from './unusedOverrides';
 
 // ── Key-format helpers — the ONE place these four string shapes are written ──
 
@@ -145,7 +146,6 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
   // value Apply kept because a row shadows it (equal to the template now) was not listed at all.
   const base = instanceBase(rootInstanceId, prefab);
   const movedOf = instanceMovedMembers(rootInstanceId, prefab);
-  const layerRows = enclosingRowOverrides(rootInstanceId);
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
     if (piData.rootInstanceId !== rootInstanceId) return;
@@ -160,13 +160,10 @@ export function collectInstanceOverrideTree(rootInstanceId: number, prefab: Pref
     // comparison: the dialog reported it as un-overridden and the user could not apply it,
     // while the scene serializer stored it correctly. QA-CTX-0003 close-out sweep.
     const currentTraits = collectComparableTraits(ecsId, allTraits);
-    const diffs = getOverrideValues(localId, currentTraits, base, resolveBase);
-    // Only what the save keeps (#1717): the save's mark gate, so a value that differs with no mark is neither listed nor
-    // applied, and a MARKED value equal to its base is listed, as the save keeps it — except a field an enclosing row
-    // states, whose value arrives marked too and would be listed as this instance's own.
-    const marks = getOverrideMarkSet(entity);
-    gateOnMarks(diffs, marks, rowAt(base, localId), () => movedOf(ecsId, !!diffs['Transform']));
-    foldMarkedEqual(diffs, marks, currentTraits, layerRows?.[localId]);
+    // Only what the save writes (#1717): the member's record (`recordedOverrides`), so a value that differs with no record
+    // is neither listed nor applied, and a recorded value equal to its base is listed, as the save keeps it (#1914).
+    const valueDiffs = getOverrideValues(localId, currentTraits, base, resolveBase);
+    const diffs = recordedOverrides(valueDiffs, getOverrideMarkSet(entity), rowAt(base, localId), () => movedOf(ecsId, !!valueDiffs['Transform']), currentTraits);
     if (Object.keys(diffs).length === 0) return;
 
     // Entity display name: prefer live EntityAttributes.name; fall back to prefab name.
@@ -257,6 +254,10 @@ export interface InstanceOverrideListing {
    *  matches BOTH, so selecting the single key would tear down two subtrees the caller could
    *  never have distinguished. A key that cannot name one thing is worse than no key. */
   unaddressableAdded: number;
+  /** The UNUSED overrides the instance keeps (#1914 R5, owner ruling F6, `instanceUnusedOverrides`): records whose target
+   *  is gone, written back by every save. Counted, not keyed: neither Apply nor Revert acts on them (Unity's Remove is
+   *  later work). */
+  unusedOverrides: number;
 }
 
 /** Unity's default overrides, as Modoki's fields (#1831). Unity: the root GameObject's name, and the root Transform's
@@ -349,7 +350,7 @@ export function collectInstanceOverrideListing(rootInstanceId: number, prefab: P
     for (const k of own) nested.push(nestedKeyRef(prefab, chain, k, getCachedPrefabSync));
   }
 
-  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, defaultOverrides, unaddressableAdded };
+  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, defaultOverrides, unaddressableAdded, unusedOverrides: instanceUnusedOverrides(rootInstanceId) };
 }
 
 /** What a surface offering `mode` lists: Apply leaves out the fields it cannot write (#1661) — listed, they were
@@ -434,6 +435,8 @@ export interface InstanceOverrideKeys {
   defaultOverrides: string[];
   /** {@link InstanceOverrideListing.unaddressableAdded}. */
   unaddressableAdded: number;
+  /** {@link InstanceOverrideListing.unusedOverrides}. */
+  unusedOverrides: number;
 }
 
 export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideKeys {
@@ -447,7 +450,7 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   return {
     fields, added, removedEntities, removedTraits, addedTags, moved,
     all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
-    nested: l.nested, applyExcluded: l.applyExcluded, defaultOverrides: l.defaultOverrides, unaddressableAdded: l.unaddressableAdded,
+    nested: l.nested, applyExcluded: l.applyExcluded, defaultOverrides: l.defaultOverrides, unaddressableAdded: l.unaddressableAdded, unusedOverrides: l.unusedOverrides,
   };
 }
 

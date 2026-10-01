@@ -558,7 +558,7 @@ describe('a live frame built from another version of its template (#1483)', () =
     expect([tf('A')?.x, tf('B')?.x, tf('C')?.x]).toEqual([5, 0, 0]);
     expect(framesBuiltFromOtherRows(one('R').id)).toEqual([]);
     const keys = collectInstanceOverrideKeys(one('R').id, prefabs.get(P) as PrefabFile);
-    expect(keys.fields).toEqual([`${gA}.Transform.x`]);    // no false override on any other member
+    expect(keys.fields.filter((k) => !keys.defaultOverrides.includes(k))).toEqual([`${gA}.Transform.x`]); // no false override on any other member
   });
 
   it('a hot reload rebuilds a carried stale instance WHATEVER scene owns it — a kept base`s, or a Persistent root`s', async () => {

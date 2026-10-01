@@ -7,7 +7,7 @@
  *  nested frames as `nestedOverrides` and whole-frame `nestedStructure` slots, where the save writes member rows. Respawned
  *  through the loader's one expansion, that form folds differently from the rows:
  *  - a second copy pasted under the first copy's M gives the node a slot for M's frame; a slot owns its frame, so the
- *    fold skipped O's member row there, and M showed y = 0 with no mark until a reload brought 8 back (win's seed 6068,
+ *    fold skipped O's member row there, and M showed y = 0 until a reload brought 8 back (win's seed 6068,
  *    in `prefabFuzz/knownOpen.ts` REGRESSIONS);
  *  - a scene edit of that M (y = 3) rode `nestedOverrides`, which merge UNDER every layer's rows, so O's row beat it: 8
  *    live, and the next save wrote 8. The edit was lost.
@@ -121,12 +121,17 @@ async function applyP1(f: Fixture): Promise<void> {
   await settle();
 }
 
-/** M (by guid) shows `y` with its `Transform.y` mark live, and a save → reload shows the same value and marks. */
+/** O's member row's value for M: the copy's BASE, so unrecorded (#1914); the scene's own edit (3) is recorded. */
+const ROW_Y = 8;
+
+/** M (by guid) shows `y` live — recorded when it is the scene's own edit, not when it is O's row's (`ROW_Y`) — and a
+ *  save → reload shows the same value and marks. */
 async function holdsLiveAndSaved(f: Fixture, mGuid: string, y: number): Promise<void> {
   const live = authored().find((e) => e.guid === mGuid)!;
   const before = { y: transformY(live.id), marks: marks(live.id) };
   expect(before.y, 'live').toBe(y);
-  expect(before.marks, 'live marks').toContain('Transform.y');
+  if (y === ROW_Y) expect(before.marks, 'live marks').not.toContain('Transform.y');
+  else expect(before.marks, 'live marks').toContain('Transform.y');
   const where = placedAt.get(mGuid);
   if (where) expect(ancestry(mGuid), 'live: respawned where it sat').toEqual(where);
   expect((await saveScene({ allowDialog: false })).saved).toBe(true);
@@ -161,12 +166,12 @@ const h1A = () => kid('A', kid('R', h1().id).id);
 const revertLeafOnH1 = (f: Fixture) => revert(h1().id, f.prefabs.H.guid, (keys) => keys.filter((k) => k.startsWith('+added.') && k.includes(fixture('Leaf', 5).guid!)));
 
 describe('a rebuild respawns a pasted reference node as the save writes it (#1826)', () => {
-  it("the hub's user path: Revert All on P1 keeps the copy's M at O's row value, marked (seed 6068)", async () => {
+  it("the hub's user path: Revert All on P1 keeps the copy's M at O's row value, unrecorded (seed 6068)", async () => {
     const f = await startRun(be, async () => {}, 'pasted-ref-revert');
     await moveLeafUnderP1();
     const m = await pasteCopy(kid('QR', p1().id).id, { second: true });
     await revert(p1().id, f.prefabs.P.guid);
-    await holdsLiveAndSaved(f, m, 8);
+    await holdsLiveAndSaved(f, m, ROW_Y);
   });
 
   it("the data-loss sibling: Revert All on P1 keeps the scene's own edit of the copy's M (no second paste)", async () => {
@@ -182,7 +187,7 @@ describe('a rebuild respawns a pasted reference node as the save writes it (#182
     await moveLeafUnderP1();
     const m = await pasteCopy(kid('QR', p1().id).id, { second: true });
     await applyP1(f);
-    await holdsLiveAndSaved(f, m, 8);
+    await holdsLiveAndSaved(f, m, ROW_Y);
   });
 
   it("Revert All's undo rebuilds P1 from its capture", async () => {
@@ -192,7 +197,7 @@ describe('a rebuild respawns a pasted reference node as the save writes it (#182
     await revert(p1().id, f.prefabs.P.guid);
     expect((await undoStep('undo')).did, 'the undo ran').toBe(true);
     await settle();
-    await holdsLiveAndSaved(f, m, 8);
+    await holdsLiveAndSaved(f, m, ROW_Y);
   });
 
   it("P1's Apply refreshes another frame holding the copy: O1's N (a P frame), the copy under its A", async () => {
@@ -200,7 +205,7 @@ describe('a rebuild respawns a pasted reference node as the save writes it (#182
     await moveLeafUnderP1();
     const m = await pasteCopy(kid('A', kid('R', o1().id).id).id, { second: true });
     await applyP1(f);
-    await holdsLiveAndSaved(f, m, 8);
+    await holdsLiveAndSaved(f, m, ROW_Y);
   });
 
   it("Apply promotes a pasted reference node into O with its members' edits (the close-out review's F1)", async () => {
@@ -236,7 +241,7 @@ describe('a rebuild respawns a pasted reference node as the save writes it (#182
       await settle();
       const m = await pasteCopy(kid('T', h1A().id).id, shape === 'edit' ? { edit: true } : { second: true });
       await revertLeafOnH1(f);
-      await holdsLiveAndSaved(f, m, shape === 'edit' ? 3 : 8);
+      await holdsLiveAndSaved(f, m, shape === 'edit' ? 3 : ROW_Y);
     });
   }
 

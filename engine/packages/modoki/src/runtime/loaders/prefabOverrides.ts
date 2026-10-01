@@ -181,8 +181,11 @@ export interface KeyedNode<A> {
  *  - `traitRemovals` — a `true` name is deleted from the bag. `false` has nothing to restore on a plain
  *    node (its bag IS its traits) and is ignored;
  *  - `own` — the scene's own children, appended after the template's.
- *  A REFERENCE node (`prefab`) takes only `removed`: its interior is a frame of its own, and the writer
- *  never states field edits against one (it falls back to restating the member's list).
+ *  A REFERENCE node (`prefab`) takes `removed` here, and its other statements are a layer OVER its own (#1914 R3b, the
+ *  hub's end state B): its interior is a frame of its own, so its row (`/a+<key>`, the root's: `traits`, `traitRemovals`,
+ *  `own`) and the rows reaching into it (`/a+<key>/<member>…`, `deep`) ride on it as {@link OVER_ROWS}, which its
+ *  expansion folds after the node's own channels (`spawnReferenceNode`). An edit inside a template's reference node is
+ *  then stated field by field, as one in a template's plain node is, instead of restating the member's list.
  *
  *  Returns the new list and the keys that found a node, so a caller can report the rest as orphans — a
  *  row the template no longer backs (#1516 fork 2: the node vanishes, the row is kept and warned, and a
@@ -191,8 +194,13 @@ export function applyNodeRows<A extends KeyedNode<A>>(
   nodes: readonly A[] | undefined,
   rows: ReadonlyMap<string, MemberRowChannels<A>>,
   hit: Set<string> = new Set(),
+  /** The rows are the WRITER's own layer (#1914 R3a): each node they edit carries the fields its row states as its
+   *  record ({@link NODE_RECORDS}), which the spawner seeds. A template's rows are the node's base, and record nothing. */
+  own = false,
+  /** Template key → the rows reaching INTO that reference node (`/a+<key>/…`, descended to `/…`), #1914 R3b. */
+  deep: ReadonlyMap<string, Record<string, MemberRowChannels<A>>> = new Map(),
 ): { nodes: A[] | undefined; hit: Set<string> } {
-  if (!nodes || !rows.size) return { nodes: nodes as A[] | undefined, hit };
+  if (!nodes || (!rows.size && !deep.size)) return { nodes: nodes as A[] | undefined, hit };
   // A key two nodes carry names NEITHER (#1880 F3c, as `memberPathIndex` and the fold's `replaced()` answer): a hand edit or
   // merge repeated it, the validator reports it, and a row applied to both would edit a node its writer never meant.
   const seen = new Map<string, number>();
@@ -201,10 +209,17 @@ export function applyNodeRows<A extends KeyedNode<A>>(
   const walk = (list: readonly A[]): A[] => {
     const out: A[] = [];
     for (const node of list) {
-      const row = node.key && seen.get(node.key) === 1 ? rows.get(node.key) : undefined;
-      if (row) hit.add(node.key!);
+      const named = !!node.key && seen.get(node.key) === 1;
+      const row = named ? rows.get(node.key!) : undefined;
+      const inner = named && node.prefab ? deep.get(node.key!) : undefined;
+      if (row || inner) hit.add(node.key!);
       if (row?.removed === true) continue;
       const children = node.children?.length ? walk(node.children) : node.children;
+      if (node.prefab && (inner || (row && overRootRow(row)))) {
+        const over: OverRows<A> = { ...(inner ? { rows: inner } : {}), ...(row && overRootRow(row) ? { rootRow: overRootRow(row) } : {}), ...(own ? { own: true } : {}) };
+        out.push({ ...node, children, [OVER_ROWS]: [...overRowsOf(node), over] } as A);
+        continue;
+      }
       if (!row || node.prefab) { out.push(children === node.children ? node : { ...node, children }); continue; }
       const traits: Record<string, Record<string, unknown> | boolean> = emptyDocMap();
       for (const [t, v] of Object.entries(node.traits ?? {})) traits[t] = v;
@@ -216,12 +231,52 @@ export function applyNodeRows<A extends KeyedNode<A>>(
         }
       }
       if (isRecord(row.traitRemovals)) for (const [t, v] of Object.entries(row.traitRemovals)) if (v === true) delete traits[t];
-      const own = Array.isArray(row.own) ? row.own : [];
-      out.push({ ...node, traits, children: [...(children ?? []), ...own] });
+      const ownNodes = Array.isArray(row.own) ? row.own : [];
+      const recorded = own && isRecord(row.traits) ? nodeRecordKeys(row.traits) : [];
+      const prior = recordedFieldsOf(node);
+      out.push({
+        ...node, traits, children: [...(children ?? []), ...ownNodes],
+        ...(recorded.length ? { [NODE_RECORDS]: [...new Set([...prior, ...recorded])] } : {}),
+      });
     }
     return out;
   };
   return { nodes: walk(nodes), hit };
+}
+
+/** The statements a layer makes OVER a template REFERENCE node (#1914 R3b, {@link applyNodeRows}): its root row (the
+ *  node row's `traits`, `traitRemovals`, `own`), the rows reaching into its frame (keyed from the node's root, as its own
+ *  `members` are), and whether that layer is the writer's own. Not serialized (a symbol key), like {@link OWN_NODE}; the
+ *  spawner folds each as a layer after the node's own (`spawnReferenceNode`), outermost last. */
+export const OVER_ROWS: unique symbol = Symbol.for('modoki.prefab.overRows');
+export interface OverRows<A> { rows?: Record<string, MemberRowChannels<A>>; rootRow?: MemberRowChannels<A>; own?: boolean }
+
+/** The over layers {@link applyNodeRows} gave reference node `node`, innermost first, or `[]`. */
+export function overRowsOf<A>(node: object): readonly OverRows<A>[] {
+  return ((node as Record<symbol, unknown>)[OVER_ROWS] as OverRows<A>[] | undefined) ?? [];
+}
+
+/** A reference node's row minus `removed` (which the walk applies to the node itself), or undefined when nothing is left. */
+function overRootRow<A>(row: MemberRowChannels<A>): MemberRowChannels<A> | undefined {
+  const { removed: _removed, ...rest } = row;
+  return Object.keys(rest).length ? rest : undefined;
+}
+
+/** The fields a template-added node's own record holds (#1914 R3a): `Trait.field` keys, set by {@link applyNodeRows} from
+ *  the writer's own node row and recorded on the spawned entity by the spawner (`applyStructureCore`). Not serialized
+ *  (a symbol key), like {@link OWN_NODE}. */
+export const NODE_RECORDS: unique symbol = Symbol.for('modoki.prefab.nodeRecords');
+
+/** The `Trait.field` keys a node row's `traits` state. */
+function nodeRecordKeys(traits: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const [t, fields] of Object.entries(traits)) if (isRecord(fields)) for (const f of Object.keys(fields)) out.push(`${t}.${f}`);
+  return out;
+}
+
+/** The record {@link applyNodeRows} gave `node` ({@link NODE_RECORDS}), or `[]`. */
+export function recordedFieldsOf(node: object): readonly string[] {
+  return ((node as Record<symbol, unknown>)[NODE_RECORDS] as string[] | undefined) ?? [];
 }
 
 /** Merge per-trait removal statements (`traitRemovals`) over a removal list. */
@@ -235,6 +290,71 @@ export function mergeTraitRemovals(list: readonly string[] | undefined, statemen
 }
 
 /** The localId-keyed channels of ONE instance frame, as the spawner applies them. */
+/** Marks a node the WRITER's own layer put in a frame's `added` list (#1914): a scene entry's (or the edited document's
+ *  in prefab edit), never a template's. Not serialized (a symbol key is invisible to `JSON.stringify`); it rides the
+ *  folded list only, so the spawner can expand a reference node's channels as that writer's recorded overrides
+ *  (`spawnReferenceNode`) and a template's as base. A node's subtree inherits it. */
+export const OWN_NODE: unique symbol = Symbol.for('modoki.prefab.ownNode');
+
+/** `node` marked as the writer's own ({@link OWN_NODE}); a new object, the input is never mutated. */
+export function ownNode<N extends object>(node: N): N {
+  return (node as Record<symbol, unknown>)[OWN_NODE] ? node : { ...node, [OWN_NODE]: true };
+}
+
+/** Whether `node` is the writer's own ({@link OWN_NODE}). */
+export function isOwnNode(node: object): boolean {
+  return (node as Record<symbol, unknown>)[OWN_NODE] === true;
+}
+
+/** The chain node a SCENE-form whole list's copy replaced (#1914 R1): the template node the load would have spawned there,
+ *  which gave the frame the values the copy does not state. A scene-form list states a copy's RECORDED values only — the
+ *  rest were the chain's, unrecorded — so the load takes those from this node, as base (`spawnReferenceNode`'s base
+ *  layer). Not serialized; set by {@link pairWithBase} on the folded list only. */
+export const BASE_NODE: unique symbol = Symbol.for('modoki.prefab.baseNode');
+
+/** The chain node `node` stands in for ({@link BASE_NODE}), if any. */
+export function baseNodeOf<N extends object>(node: N): N | undefined {
+  return (node as Record<symbol, unknown>)[BASE_NODE] as N | undefined;
+}
+
+type PairNode = { key?: string; guid?: string; prefab?: string; children?: unknown[]; added?: unknown[]; members?: Record<string, unknown>; [BASE_NODE]?: PairNode };
+
+/** `list` (a whole list the writer states) with each SCENE-form copy of a node in `lower` (the chain nodes it replaces)
+ *  paired with that node ({@link BASE_NODE}), through every channel of a pair. A scene-form copy carries its guid AND
+ *  the template key the live node held (the writer stamps it, `stampTemplateKeys`); a template-form node carries no
+ *  guid and states its values itself, so it is never paired. Paired only on a key `lower` uses once, to a node of the
+ *  same kind (the same prefab, or both plain). Inputs are never mutated. */
+export function pairWithBase<A>(list: readonly A[], lower: readonly unknown[] | undefined): A[] {
+  const lows = (lower ?? []) as PairNode[];
+  if (!lows.length) return list as A[];
+  const count = new Map<string, number>();
+  for (const l of lows) if (l.key) count.set(l.key, (count.get(l.key) ?? 0) + 1);
+  return list.map((node) => {
+    const n = node as PairNode;
+    if (!n.guid || !n.key || count.get(n.key) !== 1) return node;
+    const l = lows.find((x) => x.key === n.key)!;
+    if ((l.prefab ?? '') !== (n.prefab ?? '')) return node;
+    const out: PairNode = n.prefab ? { ...n, [BASE_NODE]: l } : { ...n };
+    if (Array.isArray(n.children)) out.children = pairWithBase(n.children, l.children);
+    if (n.prefab && Array.isArray(n.added)) out.added = pairWithBase(n.added, l.added);
+    if (n.prefab && n.members) {
+      const rows: Record<string, unknown> = emptyDocMap();
+      for (const [k, r] of Object.entries(n.members)) {
+        const row = r as { added?: unknown[]; own?: unknown[] } | null;
+        const lr = l.members?.[k] as { added?: unknown[]; own?: unknown[] } | undefined;
+        const lowNodes = [...(lr?.added ?? []), ...(lr?.own ?? [])];
+        rows[k] = row && lowNodes.length && (Array.isArray(row.added) || Array.isArray(row.own)) ? {
+          ...row,
+          ...(Array.isArray(row.added) ? { added: pairWithBase(row.added, lowNodes) } : {}),
+          ...(Array.isArray(row.own) ? { own: pairWithBase(row.own, lowNodes) } : {}),
+        } : r;
+      }
+      out.members = rows;
+    }
+    return out as A;
+  });
+}
+
 export interface FrameChannels<A> {
   overrides?: OverrideMap;
   added?: A[];
@@ -276,18 +396,39 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   rows: Record<string, MemberRowChannels<A>> | undefined,
   lower: FrameChannels<A>,
   rootRow?: MemberRowChannels<A>,
+  /** The rows are the WRITER's own layer (#1914): the nodes they add are marked {@link OWN_NODE}. */
+  own = false,
+  /** With `own`: the members the layers UNDER the writer's removed (`lower.removed` when absent) — what makes a row of the
+   *  writer's {@link untargetedRows}. `lower` can hold the writer's own legacy removals too, which do not. */
+  under?: readonly number[],
 ): FrameChannels<A> & { forwardRoot?: Map<number, MemberRowChannels<A>> } {
+  const tag = <N extends object>(n: N): N => (own ? ownNode(n) : n);
   const direct: [string, MemberRowChannels<A>][] = [];
   const nodeRows = new Map<string, MemberRowChannels<A>>();
+  // Rows reaching INTO a template reference node (`/a+<key>/…`, #1914 R3b), by its key, keyed from the node's root.
+  const deep = new Map<string, Record<string, MemberRowChannels<A>>>();
   for (const [key, row] of Object.entries(rows ?? {})) {
-    // One component: `/<nodeGuid>`, or `/a+<key>` for a template-added node (#1516). Neither holds a `/`,
-    // so a second one means a deeper frame.
-    if (!(key.length > 1 && key[0] === '/' && key.indexOf('/', 1) < 0 && isRecord(row))) continue;
+    if (!(key.length > 1 && key[0] === '/' && isRecord(row))) continue;
+    const slash = key.indexOf('/', 1);
+    if (slash > 0) {
+      const into = nodeRowKey(key.slice(1, slash));
+      if (into) {
+        const m = deep.get(into) ?? (emptyDocMap() as Record<string, MemberRowChannels<A>>);
+        m[key.slice(slash)] = own && Array.isArray(row.own) ? { ...row, own: row.own.map(tag) } : row;
+        deep.set(into, m);
+      }
+      continue; // a deeper frame: a nested row's, which the descent hands down, or a reference node's, above
+    }
+    // One component: `/<nodeGuid>`, or `/a+<key>` for a template-added node (#1516).
     const nodeKey = nodeRowKey(key.slice(1));
-    if (nodeKey) nodeRows.set(nodeKey, row);
+    if (nodeKey) nodeRows.set(nodeKey, own && Array.isArray(row.own) ? { ...row, own: row.own.map(tag) } : row);
     else direct.push([key.slice(1), row]);
   }
-  if (!direct.length && !rootRow && !nodeRows.size) return lower;
+  if (!direct.length && !rootRow && !nodeRows.size && !deep.size) {
+    // Rows reaching only into nested frames: none applies here, but a frame a lower layer removed is never expanded.
+    if (own && rows) noteUntargeted(doc, rows, under ?? lower.removed, new Set(lower.removed ?? []), docRows(doc));
+    return lower;
+  }
 
   const rootLocalId = doc.rootLocalId ?? 1;
   // The frame's CURRENT document answers which row each component names (#1771, `memberTranslation.ts`).
@@ -299,7 +440,28 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   let removedTraits = lower.removedTraits;
   let forwardRoot: Map<number, MemberRowChannels<A>> | undefined;
 
-  const apply = (lid: number, row: MemberRowChannels<A>, nested: boolean): void => {
+  /** Record which of `row`'s removal statements member `lid`'s base does not take (`unusedRemovals`), against the
+   *  channels the layers under this one left — so read BEFORE the row's own traits merge in. */
+  const noteUnusedRemovals = (src: object, lid: number, row: MemberRowChannels<A>): void => {
+    const list = Array.isArray(row.removedTraits) ? row.removedTraits : undefined;
+    const statements = isRecord(row.traitRemovals) ? row.traitRemovals as Record<string, boolean> : undefined;
+    if (!list && !statements) { unusedRemovals.delete(src); return; }
+    const docRow = rowAt(doc as { entities?: readonly { localId?: number; traits?: Record<string, unknown> }[] }, lid);
+    const has = (t: string): boolean => (!!docRow?.traits && t in docRow.traits) || (!!overrides?.[lid] && t in overrides[lid]!);
+    // A whole list replaces the lower layer's, so its names are measured against the base before any removal.
+    const below = new Set(list ?? removedTraits?.[lid] ?? []);
+    const out: Pick<MemberRowChannels<A>, 'removedTraits' | 'traitRemovals'> = {};
+    const gone = list?.filter((t) => !has(t));
+    if (gone?.length) out.removedTraits = gone;
+    for (const [t, on] of Object.entries(statements ?? {})) {
+      if (on ? has(t) && !below.has(t) : below.has(t)) continue;
+      (out.traitRemovals ??= {})[t] = on;
+    }
+    if (out.removedTraits || out.traitRemovals) unusedRemovals.set(src, out);
+    else unusedRemovals.delete(src);
+  };
+
+  const apply = (lid: number, row: MemberRowChannels<A>, nested: boolean, src: object = row): void => {
     if (typeof row.removed === 'boolean') {
       if (row.removed) removed.add(lid);
       else removed.delete(lid);
@@ -308,6 +470,7 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
       if (row.traits || row.removedTraits || row.added || row.own || row.traitRemovals) (forwardRoot ??= new Map()).set(lid, row);
       return;
     }
+    if (own) noteUnusedRemovals(src, lid, row);
     if (isRecord(row.traits)) overrides = mergeOverrideMaps(overrides, { [lid]: row.traits });
     const statements = isRecord(row.traitRemovals) ? row.traitRemovals as Record<string, boolean> : undefined;
     if (Array.isArray(row.removedTraits) || statements) {
@@ -341,10 +504,12 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
         const k = (n as { key?: string }).key;
         return !!k && named.has(k) && lowerKeys.get(k) === 1 && placedAnchor(doc, n.parentLocalId) === lid;
       };
-      added = [...(added ?? []).filter((n) => !replaced(n)), ...row.added.map((n) => ({ ...n, parentLocalId: lid }))];
+      // A scene-form copy of a node it replaces takes that node's values as base (#1914 R1, `BASE_NODE`).
+      const gone = (added ?? []).filter(replaced);
+      added = [...(added ?? []).filter((n) => !replaced(n)), ...pairWithBase(row.added, gone).map((n) => tag({ ...n, parentLocalId: lid }))];
     }
     if (Array.isArray(row.own) && row.own.length) {
-      added = [...(added ?? []), ...row.own.map((n) => ({ ...n, parentLocalId: lid }))];
+      added = [...(added ?? []), ...row.own.map((n) => tag({ ...n, parentLocalId: lid }))];
     }
   };
 
@@ -352,21 +517,80 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
   // so only its interior channels land at this frame's root. ⚠️ NOT a falsifiable guard (close-out
   // review): applied here too, the recursion deletes its own root and the outer frame deletes it again,
   // with no observable difference. Kept because it states where each half of the row belongs.
-  if (rootRow) apply(rootLocalId, { ...rootRow, removed: undefined }, false);
+  if (rootRow) apply(rootLocalId, { ...rootRow, removed: undefined }, false, rootRow);
   for (const [component, row] of direct) {
     const at = byGuid.get(component);
     if (at) apply(at.localId, row, at.nested);
   }
+  if (own) noteUntargeted(doc, rows, under ?? lower.removed, removed, byGuid);
   // Node rows LAST, over whatever the member rows left: a member's `added: []` (v16) or removal takes its
   // template nodes with it. A row naming no node applies nowhere; R2 reports and keeps it
   // (`applyStoredMemberRows`), since only the whole template can say the node is gone — for a stored
   // root by its guid, for a template reference node by the guid its root derives (`keepTemplateNodeOrphans`, #1542).
-  if (nodeRows.size) added = applyNodeRows(added as unknown as KeyedNode<never>[] | undefined, nodeRows as never).nodes as unknown as A[] | undefined;
+  if (nodeRows.size || deep.size) added = applyNodeRows(added as unknown as KeyedNode<never>[] | undefined, nodeRows as never, undefined, own, deep as never).nodes as unknown as A[] | undefined;
   return {
     overrides, added, removedTraits,
     removed: [...removed].sort((a, b) => a - b),
     ...(forwardRoot ? { forwardRoot } : {}),
   };
+}
+
+/** #1914 R4 (owner ruling F5, docs/prefabs.md § I18): the removal statements a WRITER's own member row makes that its
+ *  target does not take — a removal of a component the member's base (its document row, with every layer under the
+ *  writer's folded in) does not have, or a restore of one no layer under it removed. Unity's unused override. The fold
+ *  that applies the row records them by the row OBJECT (rows pass through every descent by reference), and the load's
+ *  settle keeps them for the next save (`applyStoredMemberRows`): no capture of the live member can restate them, since
+ *  the save states a removal as "the base has it, the member does not". Set or cleared each time an own row is applied. */
+const unusedRemovals = new WeakMap<object, Pick<MemberRowChannels<unknown>, 'removedTraits' | 'traitRemovals'>>();
+
+/** What {@link unusedRemovals} recorded for the stored row `row`, when its last fold applied it. */
+export function unusedRemovalsOf(row: object): Pick<MemberRowChannels<unknown>, 'removedTraits' | 'traitRemovals'> | undefined {
+  return unusedRemovals.get(row);
+}
+
+/** #1914 R4 (owner ruling F5): a WRITER's own member row whose member a layer UNDER the writer's removed — a prefab edit
+ *  deleted a node of a nested frame, which its reference row states as a removal, so the node is still in its document
+ *  and R2's document test calls the row backed (`rowBackedTest`), yet nothing spawns the member and no capture restates
+ *  the row. Unity's unused override (its target object is gone). Recorded by the fold that reaches the row, by row object;
+ *  the load keeps such a row whole, as R2 keeps an orphan, and a template that brings the member back applies it again. */
+const untargetedRows = new WeakSet<object>();
+
+/** Did the last fold that reached stored row `row` find its member removed by a layer under the writer's? */
+export function isUntargetedRow(row: object): boolean {
+  return untargetedRows.has(row);
+}
+
+/** Mark each of a writer's own `rows` at one frame ({@link untargetedRows}) whose member — itself, or a member above it in
+ *  the frame, since a removal cascades — a lower layer removed (`lowerRemoved`) and the writer's did not put back (it is
+ *  still in `removed`, the fold's set after the writer's rows); a row reaching into a nested frame whose root is so
+ *  removed too, since that frame is never expanded. A removal the WRITER states marks none: the instance's own delete
+ *  takes the records on and under the member with it (`withKeptUnused`). Only ever SETS a mark: the descent into
+ *  a removed member's frame folds the same row objects again and finds nothing removed there, so a clear here undid
+ *  the outer fold's (hunt seeds 3064, 1264). A load parses fresh rows; a mark left on a row a rebuild re-folds after its
+ *  member came back only adds it to the orphan store, where every writer lets the live member's row win. */
+function noteUntargeted(
+  doc: { entities?: readonly { localId?: number }[] }, rows: Record<string, unknown> | undefined,
+  lowerRemoved: readonly number[] | undefined, removed: ReadonlySet<number>, byGuid: ReadonlyMap<string, { localId: number }>,
+): void {
+  const lower = new Set(lowerRemoved ?? []);
+  const parentOf = new Map<number, number>();
+  if (lower.size) {
+    for (const e of doc.entities ?? []) {
+      const ea = (e as { traits?: { EntityAttributes?: { parentId?: number } } }).traits?.EntityAttributes;
+      if (e.localId) parentOf.set(e.localId, ea?.parentId ?? 0);
+    }
+  }
+  const gone = (lid: number): boolean => {
+    for (let p = lid, hops = 0; p && hops < 10000; p = parentOf.get(p) ?? 0, hops++) if (removed.has(p)) return lower.has(p);
+    return false;
+  };
+  for (const [key, row] of Object.entries(rows ?? {})) {
+    if (!(key.length > 1 && key[0] === '/' && isRecord(row))) continue;
+    const slash = key.indexOf('/', 1);
+    const component = key.slice(1, slash > 0 ? slash : undefined);
+    const at = lower.size && !nodeRowKey(component) ? byGuid.get(component) : undefined;
+    if (at && gone(at.localId)) untargetedRows.add(row);
+  }
 }
 
 /** One frame down a member-row map (`/<component>/…` → `/…`): the rows the nested row whose identity
@@ -412,6 +636,10 @@ export interface StructureLayer<D, R> {
   rows?: Record<string, R>;
   /** What this layer's row in the frame ABOVE says about this frame's root (`forwardRoot`). */
   rootRow?: R;
+  /** This layer is the WRITER's own (#1914): a scene entry's (or, in prefab edit, the edited document's) statements, as
+   *  against a template row's. Only its field values are the instance's RECORDED overrides (docs/prefabs.md § I2); the
+   *  other layers are the instance's base. Carried down as the layer descends. */
+  own?: boolean;
 }
 
 /** The layers reaching the expansion of nested row `row`, innermost first — the row's own layer (its
@@ -429,18 +657,20 @@ export function descendStructureLayers<D, R>(
   layers: readonly StructureLayer<D, R>[],
   row: { localId?: number; nodeGuid?: string; nestedStructure?: Record<string, D>; members?: Record<string, R>; overrides?: OverrideMap; nestedOverrides?: NestedOverridePaths },
   forwardRoots: readonly (ReadonlyMap<number, R> | undefined)[] = [],
-): { layers: StructureLayer<D, R>[]; direct?: D; foldFrom: number } {
+): { layers: StructureLayer<D, R>[]; direct?: D; directOwn?: boolean; foldFrom: number } {
   const lid = row.localId ?? 0;
+  // The row's own layer is its TEMPLATE's statement: never the writer's own (#1914).
   const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members, values: row.overrides, valuePaths: row.nestedOverrides }];
   let direct: D | undefined;
+  let directOwn: boolean | undefined;
   let foldFrom = 0;
   layers.forEach((layer, i) => {
     const { direct: d, forward } = descendPathKeyed(layer.slots, lid);
-    if (d) { direct = d; foldFrom = i + 1; }
+    if (d) { direct = d; directOwn = layer.own; foldFrom = i + 1; }
     const v = descendNestedOverrides(layer.valuePaths, lid);
-    out.push({ slots: forward, rows: descendMemberRowKeys(layer.rows, row.nodeGuid ?? ''), rootRow: forwardRoots[i]?.get(lid), values: v.direct, valuePaths: v.forward });
+    out.push({ slots: forward, rows: descendMemberRowKeys(layer.rows, row.nodeGuid ?? ''), rootRow: forwardRoots[i]?.get(lid), values: v.direct, valuePaths: v.forward, ...(layer.own ? { own: true } : {}) });
   });
-  return { layers: out, direct, foldFrom };
+  return { layers: out, direct, directOwn, foldFrom };
 }
 
 /** Fold the direct rows of `layers[foldFrom..]` over a frame's lists, one layer after another
@@ -452,11 +682,26 @@ export function foldStructureLayers<A extends { parentLocalId: number }>(
   layers: readonly StructureLayer<unknown, MemberRowChannels<A>>[],
   foldFrom: number,
   lower: FrameChannels<A>,
-): { channels: FrameChannels<A>; forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[] } {
+  /** What `lower.overrides` holds that is the writer's own (#1914): a top call's legacy values, when the call is own. */
+  lowerOwn?: OverrideMap,
+  /** `lower`'s lists are the writer's own (a top call's channels, a slot an own layer states): its removals are not ones
+   *  a layer under the writer made (`foldMemberRowChannels`' `under`). */
+  ownLower = false,
+): { channels: FrameChannels<A>; forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[]; ownOverrides?: OverrideMap } {
   let channels: FrameChannels<A> = lower;
+  // The field values the WRITER's own layers state at this frame (#1914, `StructureLayer.own`): its recorded overrides,
+  // which the spawner marks. Folded by the same rules as `channels`, from the own layers alone.
+  let ownOverrides = lowerOwn;
   const forwardRoots: (Map<number, MemberRowChannels<A>> | undefined)[] = [];
+  // The members the layers under the writer's removed, for an own layer's untargeted rows.
+  const under: number[] = ownLower ? [] : [...(lower.removed ?? [])];
   for (let i = 0; i < layers.length; i++) {
     const layer = layers[i]!;
+    if (layer.own && layer.values) ownOverrides = mergeOverrideMaps(ownOverrides, layer.values);
+    if (layer.own && i >= foldFrom && (layer.rows || layer.rootRow)) {
+      const stated = foldMemberRowChannels(doc, layer.rows, {}, layer.rootRow).overrides;
+      if (stated) ownOverrides = mergeOverrideMaps(ownOverrides, stated);
+    }
     // This layer's legacy values at its own depth (`StructureLayer.values`), over every layer inside it. A slot owns the
     // structural lists only, so a layer inside one still states its values. The layer is their ONE carrier (#1880 F1): no
     // caller pre-merges them into `lower` any more, so this line is the only place a nested frame's legacy values land.
@@ -469,11 +714,12 @@ export function foldStructureLayers<A extends { parentLocalId: number }>(
       continue;
     }
     if (!layer.rows && !layer.rootRow) continue;
-    const r = foldMemberRowChannels(doc, layer.rows, channels, layer.rootRow);
+    const r = foldMemberRowChannels(doc, layer.rows, channels, layer.rootRow, layer.own, layer.own ? under : undefined);
+    if (!layer.own) for (const lid of r.removed ?? []) if (!(channels.removed ?? []).includes(lid) && !under.includes(lid)) under.push(lid);
     forwardRoots[i] = r.forwardRoot;
     if (r !== channels) channels = { overrides: r.overrides, added: r.added, removed: r.removed, removedTraits: r.removedTraits };
   }
-  return { channels, forwardRoots };
+  return { channels, forwardRoots, ...(ownOverrides ? { ownOverrides } : {}) };
 }
 
 /** The lists a whole-frame slot (`nestedStructure[path]`) states — the part the fold reads. */
@@ -542,20 +788,25 @@ export function foldRowStep<A extends { parentLocalId: number }, D extends SlotL
   row: FoldRow<A, D, R>,
   state: ForwardState<D, R>,
   child: FoldDoc<A, D, R> | null,
-): { channels: FrameChannels<A>; moved?: Record<number, string>; forward: ForwardState<D, R> | null } {
+): { channels: FrameChannels<A>; ownOverrides?: OverrideMap; moved?: Record<number, string>; forward: ForwardState<D, R> | null } {
   const d = descendStructureLayers(state.layers, row, state.forwardRoots);
   // The row's own legacy values and the outer layers' reach the frame through the LAYERS only (#1880 F1): the row's as
   // the innermost layer's `values`, each outer one's at its depth (`foldStructureLayers`). No pre-merge under the rows —
   // that put every layer's legacy values under every layer's rows (#1877 S4).
   // An outer layer addressing this path OWNS the interior — all three lists, absent read as empty (`structDirect`).
+  // A slot's nodes are its layer's: the writer's own when that layer is (#1914).
   const lower: FrameChannels<A> = d.direct
-    ? { overrides: undefined, added: d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
+    ? { overrides: undefined, added: d.directOwn ? (d.direct.added ?? []).map((n) => ownNode(n)) : d.direct.added ?? [], removed: d.direct.removed ?? [], removedTraits: d.direct.removedTraits ?? {} }
     : { overrides: undefined, added: row.added, removed: row.removed, removedTraits: row.removedTraits };
   // No document to fold rows over: the layers' values still reach its members, in their order.
-  if (!child) return { channels: { ...lower, overrides: layerValues(d.layers) }, ...(d.direct ? { moved: d.direct.moved ?? {} } : {}), forward: null };
-  const folded = foldStructureLayers(child, d.layers as StructureLayer<unknown, MemberRowChannels<A>>[], d.foldFrom, lower);
+  if (!child) {
+    const own = layerValues(d.layers.filter((l) => l.own));
+    return { channels: { ...lower, overrides: layerValues(d.layers) }, ...(own ? { ownOverrides: own } : {}), ...(d.direct ? { moved: d.direct.moved ?? {} } : {}), forward: null };
+  }
+  const folded = foldStructureLayers(child, d.layers as StructureLayer<unknown, MemberRowChannels<A>>[], d.foldFrom, lower, undefined, !!d.directOwn);
   return {
     channels: folded.channels,
+    ...(folded.ownOverrides ? { ownOverrides: folded.ownOverrides } : {}),
     ...(d.direct ? { moved: d.direct.moved ?? {} } : {}),
     forward: { layers: d.layers, forwardRoots: folded.forwardRoots as ForwardState<D, R>['forwardRoots'] },
   };

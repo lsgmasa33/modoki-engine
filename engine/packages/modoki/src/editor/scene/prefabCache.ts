@@ -21,6 +21,7 @@ import { capturePrefabRead, notePrefabFileChanged } from './prefabRead';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { collectTree, type PrefabFile } from './prefab';
+import { setTemplateCopyTest } from '../../runtime/loaders/overrideMarks';
 
 /** Resolve the stable id a (re)written prefab at `prefabPath` must keep, so a
  *  model re-import never mints a fresh guid that orphans scenes whose
@@ -473,6 +474,9 @@ export function recoverTemplateKey(ecsId: number, memo = new Map<number, string>
   };
   return recoverKeyFrom(ecsId, nodeOf, keys, memo, undefined, (id) => (identity ??= worldIdentityParents(getCurrentWorld())).derivesFromAsKeyed(id));
 }
+
+// F7's root order (`overrideMarks.ts`): a reference node that lost its key marker is a template's copy, not the scene's.
+setTemplateCopyTest((e) => !!recoverTemplateKey(e.id()));
 
 /** Seed (or evict) both prefab caches with a document READ from disk — `openPrefabForEditing`'s read (`fetchPrefabSource`).
  *  ⚠️ NOT for a write: a prefab write is `commitPrefabWrite` (prefabCommit.ts, #1692), which seats both caches under

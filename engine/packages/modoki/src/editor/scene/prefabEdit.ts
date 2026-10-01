@@ -37,7 +37,7 @@ import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
-import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps } from '../../runtime/core/assetRefRules';
+import { deriveMemberGuid, durableGuid, mapStringValues, memberPathSteps, appliedMoves, keyedMoves } from '../../runtime/core/assetRefRules';
 import { flatKeyedSteps, walkFramePath, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
 import { isMemberToken, parseMemberToken, type MemberStep } from '../../runtime/core/templateRefs';
 
@@ -323,7 +323,10 @@ function byRowDepth<T>(rows: Record<string, T> | undefined, rowPrefab: string | 
  *  owned nested root's owner linked first; a flat row is plain here, and the save puts it back under its
  *  original row parent (`serializePrefab`'s `rowParents`). A move naming nothing is reported and left out. */
 export function applyEditWorldMoves(prefab: PrefabFile): void {
-  if (!prefab.moved) return;
+  // A legacy move of a KEYED node is not shown (#1883 ruling C): the node sits at its template place, and the save puts
+  // the record back (`keptMoves`).
+  const moved = appliedMoves(prefab.moved);
+  if (!moved) return;
   const eaMeta = getTraitByName('EntityAttributes');
   const piMeta = getTraitByName('PrefabInstance');
   if (!eaMeta) return;
@@ -332,7 +335,7 @@ export function applyEditWorldMoves(prefab: PrefabFile): void {
     const g = e.has(eaMeta.trait) ? (e.get(eaMeta.trait) as { guid?: string }).guid : '';
     if (g) byGuid.set(g, e);
   }
-  for (const [key, token] of Object.entries(prefab.moved)) {
+  for (const [key, token] of Object.entries(moved)) {
     const t = parseMemberToken(token);
     const memberGuid = editGuidAt(prefab, memberPathSteps(key));
     const targetGuid = t && !t.up ? editGuidAt(prefab, t.path) : null;
@@ -1011,6 +1014,7 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     onRuntimeExcluded: (n) => { runtimeExcluded = n; },
     onRows: (r) => { rowsById = r; },
     localIdFloor: session.floor,
+    keptMoves: keyedMoves(previous.moved),
   });
   // By guid, read NOW: the save records it only after its write's await, when an ecs id may name another entity.
   const rows = new Map<string, number>();

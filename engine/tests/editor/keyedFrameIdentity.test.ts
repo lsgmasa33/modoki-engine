@@ -276,15 +276,18 @@ describe('a prefab member token in the spelling before #1809 still reads (prefab
     expect((readTraitData(panel.id, getTraitByName('UIFocusable')!) as { navUp: string }).navUp).toBe(extra.guid);
   });
 
-  // A `moved` KEY names a member by the same path a token does, so it reads through the same lookup (close-out review:
-  // the fallback was on token values only). Mutation: the loader's move drain looks the key up exactly — Ref stays at B.
-  it('a `moved` key in the old spelling still moves the keyed reference root', async () => {
+  // #1883 ruling C (owner 2026-10-01, #1914 R4): a legacy move of a KEYED node is an unused record, ignored at load in
+  // either spelling — the node stays at its template place — and kept by the writers (keyedLegacyMove.test.ts). This
+  // case pinned the opposite until R4: the drain then moved the keyed reference root, and every identity reader met it
+  // out of its frame (#1883's N2). Mutation: `appliedMoves(moved)` → `moved` in `queuePrefabMoves` — Ref goes under Panel.
+  it('a legacy `moved` of the keyed reference root is ignored, in the old spelling and the flat one', async () => {
     install(pDoc(), qDoc(), oDoc(undefined, { [`2.2.3.+${KR}`]: '@member:3' }));
     await load(scene(SCENE_FORMAT_VERSION));
-    expect(named('QR').parentId).toBe(named('Panel').id);
+    expect(named('QR').parentId).not.toBe(named('Panel').id);
+    expect(named('QR').parentId).toBe(named('B').id);
     install(oDoc(undefined, { [`2.+${KR}`]: '@member:3' }));
     await load(scene(SCENE_FORMAT_VERSION));
-    expect(named('QR').parentId).toBe(named('Panel').id); // control: the flat spelling
+    expect(named('QR').parentId).toBe(named('B').id);
   });
 
   // Apply's filter of the prefab's own `moved` drops an entry whose key or target names nothing, and deletes it from the

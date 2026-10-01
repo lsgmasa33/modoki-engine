@@ -13,7 +13,7 @@ import { entityRef } from '../undo/entityRef';
 import { placeholderGestureRefusal } from '../undo/entityActions';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes } from './sceneDirty';
-import { reconcileOverrideMarks, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
+import { recordOverridesByDiff, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
 
 export type UIHandleTrait = 'UIElement' | 'UIAnchor';
 
@@ -36,8 +36,8 @@ export function writeUIHandleValues(entityId: number, trait: UIHandleTrait, valu
 
 /** Commit a finished handle drag as one undo step: `before` is the trait's values when the drag started, `after`
  *  the live values now (the drag already wrote them). On a prefab-instance member, the fields the drag changed are
- *  marked where they differ from the instance's base and unmarked where the drag put them back on it (the save's
- *  by-value rule, `reconcileOverrideMarks`). The mark gate would otherwise drop the drag on save. Undo and redo put
+ *  recorded where they differ from the instance's base, and a record an earlier write made is kept even where the drag
+ *  put the value back on it (#1914 F3, `recordOverridesByDiff`). The mark gate would otherwise drop the drag on save. Undo and redo put
  *  back each side's marks. */
 export function commitUIHandleDrag(
   entityId: number, trait: UIHandleTrait,
@@ -50,7 +50,7 @@ export function commitUIHandleDrag(
   if (placeholderGestureRefusal([entityId], trait)) { writeUIHandleValues(entityId, trait, { ...before }); return; }
   // Marks are untouched since the drag started (its live writes are raw), so this is the state the undo restores.
   const oldMarks = markStateOf(entityId, trait, changed);
-  reconcileOverrideMarks(entityId, meta, changed);
+  recordOverridesByDiff(entityId, meta, changed);
   const newMarks = markStateOf(entityId, trait, changed);
   const ref = entityRef(entityId);
   const b = { ...before }, a = { ...after };

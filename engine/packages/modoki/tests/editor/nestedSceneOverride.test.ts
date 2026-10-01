@@ -96,8 +96,8 @@ const flamePrefab = {
 };
 
 describe('captureNestedSceneDelta', () => {
-  it('returns only the scene-changed field; row-owned fields are subtracted', async () => {
-    const { instantiatePrefab, setPrefabCache, setPrefabSource, applyOverridesByRootInstance } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
+  it('returns only the scene-changed field; the row\'s value, unrecorded, is not written', async () => {
+    const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabCapture'), import('../../src/editor/scene/prefabInstanceOverrides'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1, m2, m3]) => ({ ...m0, ...m1, ...m2, ...m3 }));
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
     const { captureNestedSceneDelta } = await import('../../src/editor/scene/serialize');
 
@@ -105,8 +105,9 @@ describe('captureNestedSceneDelta', () => {
     const root = instantiatePrefab(flamePrefab as any);
     setPrefabSource(root, { id: FLAME });
 
-    // Parent prefab's row override on this flame: position x=4.1 (marks it).
-    applyOverridesByRootInstance(root, { 1: { Transform: { x: 4.1 } } });
+    // Parent prefab's row override on this flame: position x=4.1, as the load applies it — the base, UNRECORDED (#1914
+    // R1: a load records only the scene's own statements).
+    writeTraitFieldImpl(root, TRAITS[0], 'x', 4.1);
     // User's SCENE edit: idleScale 0.1 -> 0.5 (set live + mark, as entityActions does).
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
     markOverride(index.get(root), 'EngineFlame', 'idleScale');

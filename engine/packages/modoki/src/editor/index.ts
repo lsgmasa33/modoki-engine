@@ -84,7 +84,7 @@ export {
   classifyExistingPrefabId, parkedPrefabRead,
 } from './scene/prefabCache';
 export {
-  getOverrides, getOverrideValues, captureInstanceOverrides, applyOverridesByRootInstance,
+  getOverrides, getOverrideValues, captureInstanceOverrides,
 } from './scene/prefabInstanceOverrides';
 export { captureInstanceStructure } from './scene/prefabCapture';
 export {

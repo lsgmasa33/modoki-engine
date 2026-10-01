@@ -16,7 +16,7 @@ import { useEditorStore } from '../store/editorStore';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { rebuildFrameFromSide, preloadRebuildEntry } from '../scene/prefabRebuild';
-import { revertOverridesSelective, type RevertResult } from '../scene/prefabRevert';
+import { revertOverridesSelective, unrecordReverted, type RevertResult } from '../scene/prefabRevert';
 
 /** Revert the selected overrides on instance `rootInstanceId` AND record one undo entry. Resolves the Revert's result,
  *  or null when nothing was reverted (see `revertOverridesSelective`). Selects the rebuilt root. The caller gives a
@@ -28,7 +28,7 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
   // guid-based ref re-finds the live root across each rebuild AND across a world rebuild (Play→Stop).
   const ref = entityRef(result.newRootId);
   useEditorStore.getState().selectEntity(result.newRootId);
-  const { source, fullSide, reducedSide, affectedScenes } = result;
+  const { source, fullSide, reducedSide, reverted, affectedScenes } = result;
   // Both directions rebuild an instance ROOT of `source` (I20). After a world swap its guid can name a Missing Prefab
   // placeholder (the prefab was deleted), and rebuilding from the capture expanded a second instance on the
   // placeholder's guid beside it (#1819, I7). `require` refuses that, and a root that is gone, before anything changes.
@@ -39,7 +39,7 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
       return pi && pi.rootInstanceId === id && pi.source === source ? null : `is no longer an instance of ${source}`;
     },
   };
-  const rebuildTo = async (side: RevertResult['fullSide']) => {
+  const rebuildTo = async (side: RevertResult['fullSide'], unrecord: readonly string[] = []) => {
     const cur = ref.require(expect);
     // The rebuild is a sync load of the instance's whole scene entry, and a prefab missing from the cache reads as one it
     // cannot expand (#1284, #1880 F7a). undoManager awaits undo/redo under its own mutex, so awaiting here is supported
@@ -47,6 +47,7 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
     await preloadRebuildEntry(cur);
     const after = ref.require(expect); // asked again: the await above can span a world swap
     const id = rebuildFrameFromSide(after, side);
+    if (id != null) unrecordReverted(id, unrecord);
     // Refused BEFORE anything was rebuilt, as Apply's undo refuses (#1664): `runStep` drops the entry (#310) and, since
     // nothing changed, dirties nothing and toasts the reason rather than a bare "FAILED".
     if (id == null) {
@@ -62,7 +63,7 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
     label: 'Revert prefab overrides',
     affectedScenes,
     undo: () => rebuildTo(fullSide),
-    redo: () => rebuildTo(reducedSide),
+    redo: () => rebuildTo(reducedSide, reverted),
   });
   return result;
 }

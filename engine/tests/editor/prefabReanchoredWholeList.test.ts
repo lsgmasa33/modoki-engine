@@ -182,10 +182,22 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     await roundTripsAsOne(f, qr);
   });
 
-  it("a TEMPLATE-form save (H's prefab edit nests O and deletes inside the re-anchored node): one copy in every H instance", async () => {
+  // Since #1914 R3b a delete inside the template reference node is a row reaching into it, and N's list is not written
+  // at all (`rows`); a key used twice in the frame, which no node row can name, still makes H write the list whole
+  // (`whole`, as the case below).
+  for (const mode of ['rows', 'whole'] as const) it(`a TEMPLATE-form save (H's prefab edit nests O and deletes inside the re-anchored node): one copy in every H instance (${mode})`, async () => {
     // The list a prefab's own rows pin carries each node's KEY, so a removed row on that key removed the list's copy
     // too, and every instance of H lost Extra and the nested P (#1872 re-review). Template form states it by the key.
-    const f = await startRun(be, async () => {}, 'reanchored-templateForm');
+    const f = await startRun(be, async () => {}, `reanchored-templateForm-${mode}`);
+    if (mode === 'whole') {
+      const doc = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ localId: number; added?: unknown[] }> };
+      const dup = () => ({ parentLocalId: 1, guid: '', key: 'k-dup', name: 'Dup', traits: { EntityAttributes: { name: 'Dup', parentId: 0 } }, children: [] });
+      doc.entities.find((e) => e.localId === 2)!.added!.push(dup(), dup());
+      const before = be.snapshot();
+      be.write(f.prefabs.O.path, `${JSON.stringify(doc, null, 2)}\n`);
+      await flushWatcher(be, before);
+      await settle();
+    }
     await nestPInO(f, 'A');
     await deleteAInP(f);
     await editAndSave(f.prefabs.H.path, 'H', async () => {
@@ -198,12 +210,14 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
       deleteEntitiesWithUndo([byName('QR', nested.id)[0]!.id]);
       await settle();
     });
-    expect(be.read(f.prefabs.H.path), 'premise: H pinned N\'s whole list').toContain('"added"');
+    const hDoc = be.read(f.prefabs.H.path)!;
+    expect([hDoc.includes('"added"'), hDoc.includes('/a+')], 'premise: how H stated the delete').toEqual(mode === 'whole' ? [true, false] : [false, true]);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const first = be.read(f.scenePath)!;
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(duplicateGuids()).toEqual([]);
+    // The two fixture Dups share a key, so a guid; nothing else may.
+    expect(duplicateGuids().filter((g) => authored().some((e) => e.guid === g && e.name !== 'Dup'))).toEqual([]);
     const hr = authored().find((e) => e.name === 'HR' && e.guid?.startsWith('ffffffff-0000-4000-8003-'))!;
     const or = byName('OR', hr.id)[0]!;
     const n = byName('R', or.id)[0]!;

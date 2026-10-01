@@ -1585,7 +1585,7 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     - **Upgrading what the old rule wrote.** Scene v18: a load of a file below 18 re-heals keys under
       `legacyKeyedParent` (a node the file pinned at an old-rule guid), then renames every old guid to today's
       (`keyedGuidUpgrade`: the reload walk under both rules, rowed members included, applied with
-      `applyGuidRemap`) before pins are checked and tokens settle; the next save writes 18. The rename also reaches the
+      `applyGuidRemap`) before pins are checked and tokens settle; the next save writes the current version (18 then, 19 since #1867). The rename also reaches the
       FILE guids the load still holds for later (`holdFileGuid` in `loadSceneFile.ts`: a queued move's new parent, a
       pass-2 parent retried after the expansions), through one `onGuidRemap` listener; before it, a v17 move under a
       keyed node, and a child of a missing keyed reference node, still named the old guid and were lost (#1876 S2). ⚠️ Only the LOADER can take a file

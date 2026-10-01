@@ -98,6 +98,11 @@ const idOf = (guid: string) => byGuid(guid)!.id;
 const named = (name: string) => getAllEntities().filter((e) => e.name === name);
 const x = (id: number) => (readTraitData(id, meta('Transform')) as { x: number }).x;
 const save = async () => JSON.parse(JSON.stringify(await serializeScene())) as SceneData;
+/** The entry's ROOT override of EntityAttributes (`overrides[<its PrefabInstance.localId>]`), where F7 states the order. */
+const rootOverrideEa = (entry: Record<string, unknown>): Record<string, unknown> | undefined => {
+  const lid = ((entry.traits as Record<string, { localId?: number }> | undefined)?.PrefabInstance)?.localId;
+  return lid ? (entry.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[lid]?.EntityAttributes : undefined;
+};
 const entryOf = (s: SceneData, guid: string) => (s.entities as unknown as Array<Record<string, unknown>>).find((e) => e.guid === guid);
 
 /** Holder, and a scene instance of P (guid INST) at the root. */
@@ -408,8 +413,12 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     expect(writeTraitFieldWithUndo(id, meta('EntityAttributes'), 'name', 'Renamed')).toBeNull();
     expect(writeTraitFieldWithUndo(id, meta('EntityAttributes'), 'isActive', false)).toBeNull();
     expect(reparentEntity(id, 0, 7)).toBe(true);
-    const ea = (entryOf(await save(), INST)!.traits as Record<string, Record<string, unknown>>).EntityAttributes;
-    expect(ea).toMatchObject({ isActive: false, sortOrder: 7 });
+    const entry = entryOf(await save(), INST)!;
+    const ea = (entry.traits as Record<string, Record<string, unknown>>).EntityAttributes;
+    expect(ea).toMatchObject({ isActive: false });
+    // The order goes where the record states it: the root override every scene instance writes (F7, #1914 R6), which the
+    // prefab's return reads (#1850).
+    expect(rootOverrideEa(entry)?.sortOrder).toBe(7);
   });
 
   // Mutation: write `order` unconditionally in asSceneEntry — the untouched save gains sortOrder 0 / isActive true.
@@ -417,7 +426,11 @@ describe('the placeholder gate: an edit the save would drop is refused where it 
     const first = JSON.stringify(entryOf(await save(), INST));
     await load(await save());
     expect(JSON.stringify(entryOf(await save(), INST))).toBe(first);
-    expect(first).not.toMatch(/"sortOrder"|"isActive"/);
+    // Nothing beyond what the record holds: its traits state no placement, and the order is the record's own F7 root
+    // override (#1914 R6), written while the prefab was live.
+    const entry = JSON.parse(first) as Record<string, unknown>;
+    expect(JSON.stringify(entry.traits)).not.toMatch(/"sortOrder"|"isActive"/);
+    expect(rootOverrideEa(entry)).toEqual({ sortOrder: 0 });
   });
 
   // Mutation: remove the placeholder ask from BOTH layers of the editor's trait writer (`editorTraitWriter.refusal` and

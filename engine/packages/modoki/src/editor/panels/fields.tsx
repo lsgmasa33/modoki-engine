@@ -5,6 +5,7 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from 'react';
 import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
+import { inFieldGesture } from '../undo/fieldGesture';
 import { resyncBuffered, shownTextIsStale, roundedTo, ECHO_WINDOW_MS, IDLE_EDIT, nextBufferedEdit, holdsBufferedText, type BufferedEdit, type PendingCommit, type EchoMatch } from './bufferedEcho';
 import { subscribeUndoRedoStep } from '../undo/undoRedoStep';
 
@@ -120,6 +121,8 @@ export function useUndoRedoStep(onStep: () => void): void {
  *  When `mixed` is true (multi-select with differing values), the input shows
  *  empty (so the MIXED_PLACEHOLDER placeholder is visible) until the user types;
  *  whatever they commit then broadcasts to every selected entity. */
+let fieldInstances = 0;
+
 export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, parse: (raw: string) => T, mixed = false, validate?: (raw: string) => boolean, match?: EchoMatch<T>) {
   // How this field recognises its own echo and formats a re-synced value — see `EchoMatch` (#1407).
   // Read through a ref for the same reason as `parse` below: it must not be an effect dep.
@@ -128,6 +131,9 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
   const [localValue, setLocalValue] = useState<string>(mixed ? '' : (match?.format ?? String)(externalValue));
   // Holding the text against the store (focused, and no undo since the last keystroke) — #1905.
   const editRef = useRef<BufferedEdit>(IDLE_EDIT);
+  // This field's identity for its edit sessions' gesture token (`fieldGesture.ts`).
+  const fieldIdRef = useRef(0);
+  if (!fieldIdRef.current) fieldIdRef.current = ++fieldInstances;
   // `parse` is an inline arrow at most call sites, so its identity changes every render and it
   // CANNOT be an effect dep — the re-sync would then run on every render and overwrite the buffer
   // any time the displayed text has not yet round-tripped through the store (an edit the `validate`
@@ -215,7 +221,9 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
     // (like "1") being committed into a GUID-only reference.
     if (validate && !validate(raw)) return;
     const value = parse(raw);
-    onChange(value);
+    // The keystrokes of one edit session are one recording gesture (#1914): the record is what the session's FINAL value
+    // differs in, as Unity's commit-on-Enter/blur records it.
+    inFieldGesture(`${fieldIdRef.current}:${editRef.current.session}`, () => onChange(value));
     // Stamped AFTER the write: a slow `onChange` (a heavy re-render) must not eat into the window
     // in which its own echo is expected back.
     const now = performance.now();

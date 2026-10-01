@@ -84,7 +84,12 @@ export const ENGINE_VERSION = '0.1.0';
 // the legacy rule's answers to today's (`keyedGuidUpgrade`, `memberHome.ts`); the next save writes 18. The rung itself
 // only stamps: rungs see raw data, and the old guids need the expanded world. Required for the REFUSE reason too: an
 // older build would read a v18 scene's refs with the old rule and name nothing.
-export const SCENE_FORMAT_VERSION = 18;
+// v19: optional top-level `embeddedPrefabs` — a guid-keyed copy of each NESTED prefab document that was missing when
+// the scene was saved (#1914 F8 = A1, #1867; Unity's scene backup, `MergedAsMissingWithSceneBackup`). A reload with the
+// prefab still missing expands its frames from the copy instead of leaving their rows unexpanded; once the real prefab
+// is back it wins and the copy is no longer written. A v18 file has no such field and reads unchanged. Required for the
+// REFUSE reason: an older build would ignore the copies and drop them on its next save.
+export const SCENE_FORMAT_VERSION = 19;
 /** The scene format whose keyed-node guids are frame-rooted (#1809): a file below it is renamed on load. A literal, not
  *  {@link SCENE_FORMAT_VERSION}, which moves on with every later bump while this stays the version the rule arrived in. */
 export const FLAT_KEYED_GUIDS_SCENE_VERSION = 18;

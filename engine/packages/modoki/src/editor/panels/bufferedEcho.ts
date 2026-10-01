@@ -134,18 +134,27 @@ export function shownTextIsStale(rescoped: boolean, leftMixed: boolean, placehol
  *  `<body>`, measured on #1907), so blur covered that path. A selection change that leaves DOM focus
  *  in the field did not: the hold kept the previous owner's text on screen, and the next keystroke
  *  edited the new owner from it. An agent's `modoki_set_selection` is one such change. */
-export interface BufferedEdit { focused: boolean; ended: boolean }
+export interface BufferedEdit {
+  focused: boolean;
+  ended: boolean;
+  /** Which edit SESSION the field is in: bumped by every event that begins or ends one (focus, blur, an undo/redo step, a
+   *  new owner), never by a keystroke. The keystrokes of one session are one recording gesture (#1914, Unity's
+   *  commit-on-Enter/blur: `fieldGesture.ts`). Unlike `focused` it needs no focus event to END a session — any other
+   *  edit in between ends the gesture too (`entityActions`' `resumeGesture`), so a missed blur only joins two typings of
+   *  the same field with nothing between them. */
+  session: number;
+}
 export type BufferedEditEvent = 'focus' | 'blur' | 'input' | 'undoRedo' | 'rescope';
 
-export const IDLE_EDIT: BufferedEdit = { focused: false, ended: false };
+export const IDLE_EDIT: BufferedEdit = { focused: false, ended: false, session: 0 };
 
 export function nextBufferedEdit(s: BufferedEdit, event: BufferedEditEvent): BufferedEdit {
   switch (event) {
-    case 'focus': return { focused: true, ended: false };
-    case 'blur': return { focused: false, ended: false };
-    case 'input': return { focused: s.focused, ended: false };
+    case 'focus': return { focused: true, ended: false, session: s.session + 1 };
+    case 'blur': return { focused: false, ended: false, session: s.session + 1 };
+    case 'input': return { focused: s.focused, ended: false, session: s.session };
     case 'undoRedo':
-    case 'rescope': return { focused: s.focused, ended: true };
+    case 'rescope': return { focused: s.focused, ended: true, session: s.session + 1 };
   }
 }
 

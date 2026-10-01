@@ -13,7 +13,7 @@ import { getAllEntities, readTraitData, readTraitDataFull, findEntity } from '..
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { snapshotUnkeyed, dropOnThrow } from './capturedKeys';
 import { newGuid, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { memberPathSteps, addedKeyStep } from '../../runtime/core/assetRefRules';
+import { memberPathSteps, addedKeyStep, isKeyedMoveKey } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { commitPrefabWrites } from './prefabCommit';
@@ -155,6 +155,9 @@ export interface ApplyPlan {
     rootInstanceId: number;
     /** `localId.Trait.field` the Apply copied from the source instance into its template: subtracted from its capture. */
     appliedFields: Set<string>;
+    /** The same for OTHER frames of this Apply whose edits it wrote into the source's document — a nested frame's own edit
+     *  written on the row this document holds for it (U14, #1914) — by that frame's root guid. */
+    nestedApplied: { rootId: number; rootGuid: string; fields: ReadonlySet<string> }[];
     /** Live roots of the promoted added nodes, deleted before the refresh re-expands them as members. */
     liveAddedRootsToDelete: number[];
     promotedRows: Map<string, number>;
@@ -734,8 +737,17 @@ async function planApply(
   /** A pooled document: `pristine` is it as read (what an effect is decided against, #1727), `doc` what this Apply
    *  writes. `took`/`kept` add and take back a frame's own edit the refresh subtracts (U15; #1731 keeps one). */
   interface PoolDoc { doc: PrefabFile; pristine: PrefabFile; mark: () => void; took: (frame: number, key: string) => void; kept: (frame: number, key: string) => void }
+  const nestedTook = new Map<number, Set<string>>();
   const docFor = async (src: string, level: number, root: number): Promise<PoolDoc | null> => {
-    if (sameSource(src, source)) return { doc: newPrefab, pristine: oldPrefab, mark: () => { writtenCount++; }, took: () => {}, kept: () => {} };
+    // The source's own document: the opened frame's edits leave it through `appliedFields`; a NESTED frame's, written on
+    // the row this document holds for it (U14), through `nestedApplied` (#1914).
+    if (sameSource(src, source)) {
+      return {
+        doc: newPrefab, pristine: oldPrefab, mark: () => { writtenCount++; },
+        took: (frame, key) => { if (frame !== rootInstanceId) nestedTook.set(frame, (nestedTook.get(frame) ?? new Set()).add(key)); },
+        kept: (frame, key) => { nestedTook.get(frame)?.delete(key); },
+      };
+    }
     let e = pool.get(src);
     if (!e) {
       const expected = await getPrefabSource(src);
@@ -916,7 +928,10 @@ async function planApply(
         ? { [f!]: levelWriter.value(live[f!], ctx.frameRoot) }
         : levelWriter.bag(meta, live, ctx.frameRoot);
       writeStated(carrier, slot.path, memberKeyAt(slot, ctx.frameDoc, lid), lid, t!, fields);
-      written.push({ key: reportAs, ctx, level, lid, trait: t!, fields: Object.keys(fields) });
+      // The source frame's own edit leaves it (#1469, U15), as a write to its own template's does: an Apply takes the
+      // record off (#1914) — it no longer drops out of the frame's capture for equalling the row now.
+      for (const k of Object.keys(fields)) at.took(ctx.frameRoot, `${lid}.${t}.${k}`);
+      written.push({ key: reportAs, ctx, level, lid, trait: t!, fields: Object.keys(fields), keep: (k) => at.kept(ctx.frameRoot, k) });
       const member = memberNameIn(ctx.frameRoot, ctx.frameDoc, lid);
       setEffect(reportAs, slot.source, tName, true, edits
         ? { op: 'setField', member, trait: t!, field: f!, to: live[f!] }
@@ -1185,6 +1200,8 @@ async function planApply(
   if (newPrefab.moved && prefabId) {
     const paths = new Set(['', ...memberPathRecords({ prefab: prefabId }, readNew).self.keys()]);
     const live = Object.entries(newPrefab.moved).filter(([k, v]) => {
+      // A legacy move of a keyed node applies nowhere and is kept as the file holds it (#1883 ruling C).
+      if (isKeyedMoveKey(k)) return true;
       const t = parseMemberToken(v);
       const has = (p: string) => (paths.has(p) ? true : undefined);
       const respell = (p: readonly MemberStep[]) => flatKeyedSteps(p, newPrefab as TemplateKeyDoc, readNew as (g: string) => TemplateKeyDoc | null);
@@ -1209,7 +1226,10 @@ async function planApply(
         ...(e.appliedFrom.size ? { appliedFrom: [...e.appliedFrom].map(([rootId, fields]) => ({ rootId, rootGuid: rootGuidOf(rootId), fields })) } : {}),
       } })),
     ], sameSource).map((x) => x.w),
-    rebuild: { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions },
+    rebuild: {
+      rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions,
+      nestedApplied: [...nestedTook].map(([rootId, fields]) => ({ rootId, rootGuid: rootGuidOf(rootId), fields })),
+    },
     skipped,
     applied,
     alsoReverted: [...alsoReverted].map(([src, keys]) => ({ source: src, keys })),
@@ -1259,7 +1279,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // single-file fields of the result.
   const frameWrite = plan.writes.find((w) => w.role === 'frame');
   const { source, expected: oldPrefab, before: prefabBefore, doc: newPrefab } = frameWrite ?? plan.writes[0]!;
-  const { rootInstanceId, appliedFields, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions } = plan.rebuild;
+  const { rootInstanceId, appliedFields, nestedApplied, liveAddedRootsToDelete, promotedRows, promotedRefRows, keyedPromotions } = plan.rebuild;
   const { skipped } = plan;
 
   const warnings = plan.writes.flatMap((w) => warnInertPrefabSizes(w.doc, w.source, getCachedPrefabSync));
@@ -1301,7 +1321,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
       // it rebuilds through (#1880 F7a) — beside what the commit warmed (the new file's own reference rows). A user-added
       // nested instance is not a row of newPrefab, so the file walk never reaches it (#1284).
       for (const rootId of rootsToRefresh) await preloadRebuildEntry(rootId);
-      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), { rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields });
+      refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab, new Map(), [{ rootId: rootInstanceId, rootGuid: durableGuid(rootGuid), fields: appliedFields }, ...nestedApplied]);
       for (const [from, to] of carryPromotedGuids(rootGuid, promotedGuids)) follow.set(from, to);
       rehangPromotionSurvivors(survivors, follow);
       // A promoted REFERENCE node's kept state went into its row (`insertAddedSubtree`'s bake); its identity stays in the

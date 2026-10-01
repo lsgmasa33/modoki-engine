@@ -30,7 +30,7 @@ import { ModalShell } from '../components/ModalShell';
 import { applyTargetOptions, type KeyTargets } from '../scene/prefabApplyOptions';
 import {
   initialTargets, setTarget, setAllTargets, chosenOption, hasChoice, groupToggle, groupState, retargetChecks, filesWritten, toApplyTargets, rowView, applyBlocked,
-  applyPress, queuedPress, shownPlan, type KeptPress, previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice,
+  applyPress, queuedPress, shownPlan, type KeptPress, previewRequestKey, staysOpen, previewWorldKey, subscribePreviewWorld, type TargetChoice, unusedOverridesLine,
 } from './applyDialogModel';
 
 /** The dialog's targets are prefab guids, as is the instance's source: no path to resolve. */
@@ -478,6 +478,12 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           {loadState.kind === 'ready'
             && buildOverrideForest(loadState.entities).map((fnode) => renderEntityNode(fnode))}
 
+          {loadState.kind === 'ready' && loadState.unusedOverrides > 0 && (
+            // #1914 F6: read-only, as Unity's Remove is later work. Neither Apply nor Revert touches them.
+            <div data-ui-id="prefab.dialog.unused" style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px' }}>
+              {unusedOverridesLine(loadState.unusedOverrides)}
+            </div>
+          )}
           {loadState.kind === 'ready' && loadState.unaddressableAdded > 0 && (
             <div style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px' }}>
               {loadState.unaddressableAdded} added {loadState.unaddressableAdded === 1 ? 'entity is' : 'entities are'} not listed: {loadState.unaddressableAdded === 1 ? 'it has' : 'they have'} no id until the scene is saved.

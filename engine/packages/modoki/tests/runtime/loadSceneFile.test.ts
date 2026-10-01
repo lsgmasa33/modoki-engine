@@ -1817,7 +1817,7 @@ describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
   // that only touches UIAnchor (`captureInstanceOverrides` never writes a field an author never
   // changed), so there is no sibling UIElement bag to fall back on. Unlike the trait-bag case
   // above (skip — no rendered value to lose), an override CAN legitimately add a trait a member
-  // never had (`applyOverridesByRootInstance`'s added-trait branch), so the value must be carried
+  // never had (`applyOverridesByLocalToEcs`' added-trait branch), so the value must be carried
   // by CREATING the UIElement bag, in every one of the three per-field-diff locations.
   it('creates the UIElement bag when an override/added/nestedOverride diff has no UIElement sibling', async () => {
     const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
@@ -1893,7 +1893,8 @@ describe('overrides over persistent fields absent from meta.fields', () => {
     const { clearAllOverrideMarks, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
     clearAllOverrideMarks();
     const entity = testWorld.spawn(Animator({ clips: '[]', clip: '', speed: 1 }));
-    applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } });
+    // Stated by the writer's own layer (#1914 R1: only those are recorded).
+    applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } }, { 1: { Animator: fields } });
     return { live: entity.get(Animator) as Record<string, unknown>, marks: getOverrideMarkSet(entity) };
   }
 

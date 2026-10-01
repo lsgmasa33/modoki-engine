@@ -201,7 +201,10 @@ const expectedError = (m: string, prev?: string) => EXPECTED_ERRORS.some((e) => 
 const VERIFY_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
 const VERIFY_LEN = 25;
 
-const OPTS = { expectedError };
+/** Hunts and REGRESSIONS tolerate what a KNOWN_OPEN entry tolerates; the self-test runs STRICT, so an entry whose repro
+ *  stops reproducing goes red there. */
+const OPTS = { expectedError, tolerate: (f: { check: string; detail: string }) => KNOWN_OPEN.some((k) => k.tolerates?.(f)) };
+const STRICT = { expectedError };
 
 /** Every KNOWN_OPEN entry whose `stops` predicate claims this failure; an entry without one claims nothing. A predicate
  *  sees only the ops that ran up to the failing step: judged on the whole list, an op AFTER the failure satisfied an
@@ -293,7 +296,8 @@ describe('#1789 prefab fuzz', () => {
         realError(`\n${s1.text}\n`);
       }
       const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ');
-      realError(`\ncoverage — ops: ${tally(opOutcomes)}\nroutes: ${tally(be.routeCounts)}\n`);
+      // On stderr beside the taints: `realError` is not shown by every reporter, and a hunt must show what it covered.
+      process.stderr.write(`coverage — ops: ${tally(opOutcomes)}\nroutes: ${tally(be.routeCounts)}\nchecks run: ${tally(checksRun)}\n`);
       // Per cause (#1845), for comparing one platform's hunt with another's: a platform whose taints or skips run far
       // above another's on the same seeds is turning the undo checks off for a reason the other does not have.
       process.stderr.write(`taints (ops that tainted a segment, by cause): ${tally(taintCounts) || 'none'}\nchecks skipped by a taint (<cause>: <check>): ${tally(skippedChecks) || 'none'}\n`);
@@ -345,7 +349,7 @@ describe('#1789 prefab fuzz', () => {
 
   for (const k of KNOWN_OPEN) {
     it(`KNOWN_OPEN #${k.issue} still reproduces — remove its entry once it is fixed (${k.what})`, async () => {
-      const r = await runOps(be, k.repro, OPTS);
+      const r = await runOps(be, k.repro, STRICT);
       expect(r.failure, `#${k.issue} no longer reproduces: if it is fixed, delete its KNOWN_OPEN entry`).toBeDefined();
       expect(k.reproduces(r.failure!), `#${k.issue}'s repro now fails differently: ${r.failure!.check} — ${r.failure!.detail}`).toBe(true);
       if (k.stops) expect(knownStop(r.failure!, k.repro)?.issue, `#${k.issue}'s stop predicate does not claim its own repro`).toBe(k.issue);
@@ -387,11 +391,14 @@ describe('#1789 prefab fuzz', () => {
     expect(r.failure?.check).toBe('unexpected outside write');
     expect(r.failure?.detail).toMatch(/after op \d+ \(.*\): the watcher raised a write that no outside edit made/);
 
-    const outside = ops.find((o) => o.kind === 'outsideEdit') ?? { kind: 'outsideEdit', u: [0.1, 0.2, 0.3, 0.2, 0.5, 0.5, 0.5, 0.5] } as Op;
+    // A PLAIN outside edit: a variant needs state a fresh fixture may not have (`toOverride` a recorded field, #1914), and
+    // would be a noop that taints nothing.
+    const { variant: _v, ...outside } = ops.find((o) => o.kind === 'outsideEdit') ?? { kind: 'outsideEdit', u: [0.1, 0.2, 0.3, 0.2, 0.5, 0.5, 0.5, 0.5] } as Op;
     const before = taintCounts.get('outsideEdit') ?? 0;
     const ok = await runOps(be, [outside], OPTS);
     expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
-    expect(ok.trace.join(' '), 'premise: the outside edit wrote a file').toMatch(/outsideEdit.* → done/);
+    // The op's own trace line: a pattern across the joined trace matched the final round trip's "→ done" after a noop.
+    expect(ok.trace[0], 'premise: the outside edit wrote a file').toMatch(/^0: outsideEdit[^→]* → done/);
     expect(taintCounts.get('outsideEdit') ?? 0).toBe(before + 1);
   });
 

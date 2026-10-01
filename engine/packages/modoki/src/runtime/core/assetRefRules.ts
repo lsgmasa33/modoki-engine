@@ -329,6 +329,32 @@ export function memberPathSteps(key: string): MemberStep[] {
   return key ? parseSteps(key) : [];
 }
 
+/** Is the prefab-level move key `key` a LEGACY move of a KEYED node — its path ends in a `'+key'` step? #1883 ruling C
+ *  (owner 2026-10-01, built in #1914 R4): a move written before #1869 that takes a template-added node out of its frame
+ *  is an UNUSED record, as Unity has no override that moves a prefab's child out of its instance. Every reader ignores it
+ *  ({@link appliedMoves}: the node sits at its template place, so no identity reader meets a keyed node out of its frame),
+ *  and every writer of the document carries it verbatim ({@link keyedMoves}). */
+export function isKeyedMoveKey(key: string): boolean {
+  const steps = memberPathSteps(key);
+  const last = steps[steps.length - 1];
+  return typeof last === 'string' && last.startsWith('+');
+}
+
+/** A document's (or a reference node's) moves as every reader applies them: without the keyed ones ({@link isKeyedMoveKey}). */
+export function appliedMoves(moved: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!moved) return moved;
+  const keys = Object.keys(moved);
+  if (!keys.some(isKeyedMoveKey)) return moved;
+  const out = Object.fromEntries(keys.filter((k) => !isKeyedMoveKey(k)).map((k) => [k, moved[k]!]));
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** The keyed moves of `moved` ({@link isKeyedMoveKey}), which a writer of the document puts back as it found them. */
+export function keyedMoves(moved: Record<string, string> | undefined): Record<string, string> | undefined {
+  const out = Object.fromEntries(Object.entries(moved ?? {}).filter(([k]) => isKeyedMoveKey(k)));
+  return Object.keys(out).length ? out : undefined;
+}
+
 /** The `PrefabInstance` fields every identity walk classifies a node by. Structural, so the
  *  loader's, the editor's and `planCopyGuids`' own handle types all fit. */
 export type MemberPi = { localId?: number; parentLocalId?: number; rootInstanceId?: number } | null | undefined;

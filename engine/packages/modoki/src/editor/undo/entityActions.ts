@@ -13,8 +13,8 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { planCopyGuids } from '../../runtime/core/copyIdentity';
-import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { markOverrideIfInstance, reconcileOverrideMarks, writeTraitFieldMarked, markStateOf, putMarkState, captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, takeUnmarkedFromBase, type MarkCapture } from './overrideMarkWrites';
+import { markOverride, getCarriedOverrideMarks, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
+import { markOverrideIfInstance, recordOverridesByDiff, writeTraitFieldMarked, markStateOf, putMarkState, captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, takeUnmarkedFromBase, type MarkCapture, type MarkState } from './overrideMarkWrites';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 import { endFrames, captureRootLinks, restoreRootLinks, promoteOwnedRoots, applyGuidRemap, type DetachedMember } from '../../runtime/core/ecs/memberHome';
@@ -24,7 +24,9 @@ import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../../runti
 import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedRefCopy';
 import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { reparentSuffixes, reparentWrite, mergeTrs, IDENTITY_TRS, type PoseHierarchy } from '../../runtime/scene/transformSpace';
-import { pushAction, type EditDetail } from './undoManager';
+import { pushAction, peekUndo, type EditDetail } from './undoManager';
+import { packedOf, type PackedEntity } from '../../runtime/core/ecs/entityTable';
+import { currentFieldGesture } from './fieldGesture';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
@@ -39,6 +41,7 @@ import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT } from '../scene/restructureRefusal';
 import { prefabNestingReader, getCachedPrefabSync } from '../scene/prefabCache';
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
+import { leftBehindReader } from '../scene/prefabBase';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
@@ -111,6 +114,44 @@ export function placeholderGestureRefusal(ids: readonly number[], trait: string)
   return refused ? reportWriteRefusal(refused) : null;
 }
 
+/** The open field GESTURE: the record each entity's field held when it began, its coalesce key, the Inspector field
+ *  session it belongs to (`fieldGesture.ts`), and the undo entry its last write left on top. Keyed by the PACKED entity:
+ *  a gesture outlives the frame, and a recycled index must not inherit another entity's record (#868). */
+let gesture: { key: string; session: string; marks: Map<PackedEntity, MarkState>; top: unknown } | null = null;
+
+/** Put back the record `field` held on each of `ids` when the gesture this write CONTINUES began (#1914, the hub's
+ *  #1922 finding), so the write then records over it (`markFieldOverrideIfInstance`). An Inspector number field commits
+ *  on every keystroke, so retyping 200 over a base of 200 wrote 2 and 20 first, each different from the base, and the
+ *  recorder (which never takes a record off, F3) kept the record. Unity commits a typed field once, at Enter/blur, so a
+ *  retype records nothing. Here every keystroke still writes live; the record a gesture leaves is what it started with
+ *  plus what its FINAL value differs in.
+ *
+ *  What one gesture is: an Inspector field's edit SESSION (`BufferedEdit.session`) while nothing else was pushed in
+ *  between — no clock, so a slow typist is one gesture, and a missed blur (#242: focus events need not fire) only joins
+ *  two typings with no other edit between them. Outside a field session every write is its own gesture, as each scripted
+ *  write is in Unity: an agent's two `setTrait`s, a scrub's frames (owner ruling F3 for each). Not the undo's coalesce
+ *  chain: two discrete writes inside its window would be one gesture, and the second, landing on the base, would drop
+ *  the first's record. Call it AFTER reading the undo's mark state: the undo restores what the entity held before THIS
+ *  write (a merged chain keeps its first entry's anyway). `endGestureWrite` closes the write. */
+function resumeGesture(key: string | undefined, ids: readonly number[], trait: string, field: string): void {
+  const session = currentFieldGesture();
+  if (key === undefined || session === null) { gesture = null; return; } // a write no gesture continues
+  const continues = !!gesture && gesture.key === key && gesture.session === session && gesture.top === peekUndo();
+  const packed = (id: number) => { const e = findEntity(id); return e ? packedOf(e) : undefined; };
+  if (continues) {
+    for (const id of ids) { const p = packed(id); const m = p === undefined ? undefined : gesture!.marks.get(p); if (m) putMarkState(id, trait, m); }
+    return;
+  }
+  const marks = new Map<PackedEntity, MarkState>();
+  for (const id of ids) { const p = packed(id); if (p !== undefined) marks.set(p, markStateOf(id, trait, [field])); }
+  gesture = { key, session, marks, top: undefined };
+}
+
+/** After a gesture's write is pushed: the entry it left on top, which only a continuing write may find there. */
+function endGestureWrite(): void {
+  if (gesture) gesture.top = peekUndo();
+}
+
 /** Write a field with undo tracking. Returns the refusal's words when the placeholder gate refuses it (#1818), else
  *  null. */
 export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field: string, value: unknown): string | null {
@@ -131,21 +172,29 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
   // the uniform "resolve before mutation" convention (Phase 12, M2) every affected-
   // scene call in this file follows.
   const affectedScenes = resolveAffectedScenes([entityId]);
-  // The undo puts the mark back as it was, or an undone edit is saved as an override at the old value (#1709).
+  // The undo puts the mark back as it was, or an undone edit is saved as an override at the old value (#1709): as it was
+  // before the GESTURE, which is also the state the write records over.
+  const coalesceKey = fieldCoalesceKey(meta, field, [entityId]);
   const oldMarks = markStateOf(entityId, meta.name, [field]);
+  resumeGesture(coalesceKey, [entityId], meta.name, field);
   writeTraitField(entityId, meta, field, value);
   markFieldOverrideIfInstance(entityId, meta, field);
+  // The redo puts back the record THIS write left, not a fresh diff (#1914, work-qa's finding A): inside a field session the
+  // write records over the gesture's start (`resumeGesture`), so a redo that re-recorded by diff gave 2 and 20 their
+  // records back and left 200 — the base — recorded after undo×3, redo×3.
+  const newMarks = markStateOf(entityId, meta.name, [field]);
   // Capture a guid-based ref so undo/redo survive a world rebuild (Play→Stop).
   const ref = entityRef(entityId);
   _pushAction({
     label: `Edit ${meta.name}.${field || 'toggle'}`,
     // `require` (I19): a target a world swap removed, or turned into a placeholder, refuses rather than reading as done.
     undo: () => { const id = ref.require(); writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); },
-    redo: () => { const id = ref.require(); writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); },
-    coalesceKey: fieldCoalesceKey(meta, field, [entityId]),
+    redo: () => { const id = ref.require(); writeTraitField(id, meta, field, value); putMarkState(id, meta.name, newMarks); },
+    coalesceKey,
     detail: editDetail([ref], meta, field, [oldValue], [value]),
     affectedScenes,
   });
+  endGestureWrite();
   // Animation record mode: key this field at the playhead (no-op unless recording).
   notifyFieldEdited(entityId, meta.name, field, value);
   return null;
@@ -172,8 +221,11 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     return data ? data[field] : undefined;
   });
   const affectedScenes = resolveAffectedScenes(entityIds);
+  const coalesceKey = fieldCoalesceKey(meta, field, entityIds);
   const oldMarks = entityIds.map((id) => markStateOf(id, meta.name, [field])); // put back by the undo (#1709)
+  resumeGesture(coalesceKey, entityIds, meta.name, field);
   entityIds.forEach((id) => { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); });
+  const newMarks = entityIds.map((id) => markStateOf(id, meta.name, [field])); // put back by the redo (finding A, above)
   // Guid refs (positionally aligned with oldValues) so undo/redo survive a rebuild.
   const refs = entityIds.map((id) => entityRef(id));
   const suffix = entityIds.length > 1 ? ` (${entityIds.length})` : '';
@@ -181,11 +233,12 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     label: `Edit ${meta.name}.${field || 'toggle'}${suffix}`,
     // Every ref required before the first write (I19): one missing entity refuses the whole entry, never half of it.
     undo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, oldValues[i]); putMarkState(id, meta.name, oldMarks[i]!); }); },
-    redo: () => { const ids = requireAll(refs); ids.forEach((id) => { writeTraitField(id, meta, field, value); markFieldOverrideIfInstance(id, meta, field); }); },
-    coalesceKey: fieldCoalesceKey(meta, field, entityIds),
+    redo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, value); putMarkState(id, meta.name, newMarks[i]!); }); },
+    coalesceKey,
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
     affectedScenes,
   });
+  endGestureWrite();
   // Animation record mode: key each edited entity's field at the playhead.
   entityIds.forEach((id) => notifyFieldEdited(id, meta.name, field, value));
   return null;
@@ -343,7 +396,7 @@ export function addTraitToEntitiesWithUndo(
       // A trait the TEMPLATE defines here, added back after the instance removed it, is value-diffed by the save,
       // which keeps only marked fields: unmarked, the re-added values were dropped and the reload showed the
       // template's (#1677). Every field that differs from the base is the instance's own now.
-      reconcileOverrideMarks(id, meta);
+      recordOverridesByDiff(id, meta);
     });
     markUIDirty(); markStructureDirty();
   };
@@ -505,6 +558,10 @@ export interface EntitySnapshot {
    *  by the root's guid beside the tree, so a respawn or a copy got none of it: a duplicated instance saved without
    *  either, and only the original took the scene's edit once the template brought the member or frame back. */
   kept?: KeptState;
+  /** The fields ("Trait.field") the layers enclosing its frame give it from OUTSIDE the snapshotted subtree
+   *  (`layerFieldsLeftBehind`, #1914): a copy that makes its frame a stored root shows them with no layer to give them,
+   *  so it records them (`copySnapshot`). An undo's respawn, which puts the entity back where it was, ignores them. */
+  layerMarks?: string[];
 }
 
 /** Is this a copy of the prefab-edit world's scaffolding (a `SCAFFOLD_PREFIX` entity)? */
@@ -529,9 +586,10 @@ function snapshotPrefabs(snapshot: EntitySnapshot): string[] {
   return out;
 }
 
-export function snapshotEntity(entityId: number): EntitySnapshot | null {
+export function snapshotEntity(entityId: number, scope?: SnapshotScope): EntitySnapshot | null {
   const entity = findEntity(entityId);
   if (!entity) return null;
+  scope ??= snapshotScope(entityId);
   const traits: EntitySnapshot['traits'] = [];
   for (const meta of getAllTraits()) {
     if (!entity.has(meta.trait)) continue;
@@ -546,17 +604,32 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
     else { const data = readTraitDataFull(entityId, meta); if (data) traits.push({ meta, data: cloneTraitValues(data) }); }
   }
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
-  const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
-  const marks = getOverrideMarkSet(entity);
+  const children = childEntities.map(c => snapshotEntity(c.id, scope)).filter((s): s is EntitySnapshot => s !== null);
+  const marks = getCarriedOverrideMarks(entity);
+  const layerMarks = scope.layerMarksOf(traits);
   const markers = captureMarkers(entity);
   const frameDoc = frameRootDoc(getCurrentWorld(), entity);
   const kept = keptStateOf(durableGuidOf(traits));
   return {
     id: entityId, traits, children,
     ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
+    ...(layerMarks.length ? { layerMarks } : {}),
     ...(markers ? { markers } : {}),
     ...(frameDoc ? { frameDoc } : {}),
     ...(kept ? { kept } : {}),
+  };
+}
+
+/** One snapshot's view of the subtree it captures: what the layers outside it give each member (`leftBehindReader`). */
+interface SnapshotScope { layerMarksOf: (traits: EntitySnapshot['traits']) => string[] }
+
+function snapshotScope(rootId: number): SnapshotScope {
+  const read = leftBehindReader(rootId);
+  return {
+    layerMarksOf: (traits) => {
+      const pi = traits.find((t) => t.meta.name === 'PrefabInstance')?.data;
+      return pi && pi !== true ? read(pi as MemberPi) : [];
+    },
   };
 }
 
@@ -654,13 +727,15 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
       else if (t.meta.name === 'PrefabInstance' && link === 'promote') traits.push({ meta: t.meta, data: { ...data, parentLocalId: 0, parentNodeGuid: '', ownerGuid: '' } });
       else traits.push({ meta: t.meta, data });
     }
-    const { marks, kept, ...rest } = s;
+    const { marks, layerMarks, kept, ...rest } = s;
+    // What the layers the copy leaves behind gave a member becomes its own record (#1914, `EntitySnapshot.layerMarks`).
+    const recorded = [...new Set([...(marks ?? []), ...(layerMarks ?? [])])];
     return {
       ...rest,
       // A stripped node is no instance any more, so it has no rows to keep.
       ...(kept && link !== 'strip' ? { kept: remapGuidValues(kept, fullRemap) as KeptState } : {}),
       // An override mark means something only on a member of an instance: a stripped node is an added node.
-      ...(marks && link !== 'strip' ? { marks } : {}),
+      ...(recorded.length && link !== 'strip' ? { marks: recorded } : {}),
       markers: markersOf(s),
       traits,
       children: s.children.map(copy),
@@ -1637,8 +1712,8 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     redo: () => {
       const id = ref.require();
       writeTraitField(id, attrMeta!, 'parentId', newParentRef ? newParentRef.require() : 0);
-      // As the original action: only a move that SET a sortOrder writes it. Re-writing the unchanged value marked
-      // would re-reconcile a mark the move never touched and drop a stored override equal to the base.
+      // As the original action: only a move that SET a sortOrder writes it. (Before #1914 R2 re-writing the unchanged
+      // value un-recorded a stored override equal to the base; no write removes a record now.)
       if (newSortOrder !== undefined) writeTraitFieldMarked(id, attrMeta!, 'sortOrder', newSortOrder);
       if (clearFolder) writeTraitField(id, attrMeta!, 'editorFolder', '');
       if (savedNewLocal && transformMeta) { for (const [f, v] of Object.entries(savedNewLocal)) writeTraitField(id, transformMeta, f, v); }

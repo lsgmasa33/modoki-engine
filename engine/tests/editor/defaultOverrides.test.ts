@@ -187,7 +187,8 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     writeTraitField(root, getTraitByName('EntityAttributes')!, 'guid', 'g-p-root');
     edit(root, 'Transform', 'x', 5);
     await expect(runAgentOp('prefab', { action: 'apply', entityGuid: 'g-p-root' }))
-      .rejects.toMatchObject({ code: 'REFUSED_BY_OP', options: [`${G(1)}.Transform.x`] });
+      // …and the root's sibling order, which every scene instance records (F7, #1914 R6: Unity's rootOrder).
+      .rejects.toMatchObject({ code: 'REFUSED_BY_OP', options: [`${G(1)}.Transform.x`, `${G(1)}.EntityAttributes.sortOrder`] });
     expect(writes).toEqual([]);
   });
 
@@ -204,6 +205,7 @@ describe('default overrides (#1831, Unity IsDefaultOverride)', () => {
     edit(byName('Label'), 'UIElement', 'width', 80);
     const res = await runAgentOp('prefab', { action: 'apply', entityGuid: 'g-u-root' }) as { appliedKeys: string[]; defaultOverridesLeft: string[] };
     expect([...res.defaultOverridesLeft].sort()).toEqual([
+      `${G(11)}.EntityAttributes.sortOrder`, // F7: recorded on every scene instance root
       `${G(11)}.UIAnchor.pivotX`, `${G(11)}.UIAnchor.top`, `${G(11)}.UIElement.rotation`, `${G(11)}.UIElement.width`,
     ]);
     expect([...res.appliedKeys].sort()).toEqual([`${G(11)}.UIElement.scale`, `${G(12)}.UIElement.width`]);

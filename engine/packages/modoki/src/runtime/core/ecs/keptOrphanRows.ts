@@ -28,14 +28,28 @@
  *  the writers put them back (a live capture wins each key), and a rebuild that makes the frame live hands them to its
  *  expansion. A legacy file's first save after that migrates what it applied onto member rows.
  *
+ *  ⚠️ **The UNUSED half (#1914 R4, owner ruling F5, docs/prefabs.md § I18).** A writer's record whose target does not
+ *  take it — a field the schema no longer declares, a trait nothing registers, a removal of a component the base no longer
+ *  has, a legacy localId the template dropped — is Unity's unused override: ignored at load, written back by every save
+ *  until an explicit Remove, and applied again once its target returns. Kept here under the same root guid, as the part
+ *  of a LIVE member's row (`unused`, by row key) or of the legacy localId channels (`KeptLegacy`) that the load could not
+ *  apply; the writers merge it under what the live capture states (`withKeptUnused`, `withKeptLegacy`).
+ *
  *  Typed loosely here (L0 knows no scene row shape); `loadSceneFile.ts` owns the typed API over it. */
 import { remapGuidValues } from '../assetRefRules';
 import { onGuidRemap } from './guidRemap';
 
 const keptRows = new Map<string, Record<string, object>>();
+/** Per root: by row key, the part of a LIVE member's row its target does not take (#1914 R4). */
+const keptUnused = new Map<string, Record<string, object>>();
 
-/** A root's kept legacy channels: each is path key → what the channel states at that path. */
-export type KeptLegacy = { nestedOverrides?: Record<string, object>; nestedStructure?: Record<string, object> };
+/** A root's kept legacy channels: the path-keyed ones by path key (R2: a frame no expansion reaches), and the localId-keyed
+ *  ones by localId (#1914 R4: the records whose target is gone or unknown) — each what the file stated there. */
+export type KeptLegacy = {
+  nestedOverrides?: Record<string, object>; nestedStructure?: Record<string, object>;
+  overrides?: Record<string, object>; removedTraits?: Record<string, string[]>; removed?: number[]; moved?: Record<string, string>;
+};
+const LEGACY_CHANNELS = ['nestedOverrides', 'nestedStructure', 'overrides', 'removedTraits', 'removed', 'moved'] as const;
 const keptLegacy = new Map<string, KeptLegacy>();
 
 export function keptLegacyOf(rootGuid: string): KeptLegacy | undefined {
@@ -45,11 +59,24 @@ export function keptLegacyOf(rootGuid: string): KeptLegacy | undefined {
 /** Replace the legacy channels kept for `rootGuid`; nothing left drops the entry. */
 export function setKeptLegacy(rootGuid: string, channels: KeptLegacy): void {
   if (!rootGuid) return;
-  const out: KeptLegacy = {};
-  if (channels.nestedOverrides && Object.keys(channels.nestedOverrides).length) out.nestedOverrides = channels.nestedOverrides;
-  if (channels.nestedStructure && Object.keys(channels.nestedStructure).length) out.nestedStructure = channels.nestedStructure;
-  if (out.nestedOverrides || out.nestedStructure) keptLegacy.set(rootGuid, out);
+  const out: Record<string, unknown> = {};
+  for (const c of LEGACY_CHANNELS) {
+    const v = channels[c];
+    if (v && Object.keys(v).length) out[c] = v;
+  }
+  if (Object.keys(out).length) keptLegacy.set(rootGuid, out as KeptLegacy);
   else keptLegacy.delete(rootGuid);
+}
+
+export function keptUnusedRowsOf(rootGuid: string): Record<string, object> | undefined {
+  return keptUnused.get(rootGuid);
+}
+
+/** Replace the unused row parts kept for `rootGuid`; an empty set drops the entry. */
+export function setKeptUnusedRows(rootGuid: string, rows: Record<string, object>): void {
+  if (!rootGuid) return;
+  if (Object.keys(rows).length) keptUnused.set(rootGuid, rows);
+  else keptUnused.delete(rootGuid);
 }
 
 export function keptOrphanRowsOf(rootGuid: string): Record<string, object> | undefined {
@@ -67,8 +94,8 @@ export function dropKeptOrphanRows(rootGuid: string): void {
   keptRows.delete(rootGuid);
 }
 
-/** Everything R2 keeps for one root: its orphan rows and its legacy channels. */
-export type KeptState = { rows?: Record<string, object>; legacy?: KeptLegacy };
+/** Everything R2 keeps for one root: its orphan rows, its legacy channels, and its live members' unused row parts. */
+export type KeptState = { rows?: Record<string, object>; legacy?: KeptLegacy; unused?: Record<string, object> };
 
 /** A deep copy of what is kept for `rootGuid`, for an entity snapshot to carry (#1788): the store sits beside the tree,
  *  keyed by the root's guid, so a respawn (undo) or a copy (duplicate, paste) got none of it — the copy's save wrote no
@@ -77,8 +104,9 @@ export type KeptState = { rows?: Record<string, object>; legacy?: KeptLegacy };
 export function keptStateOf(rootGuid: string): KeptState | undefined {
   const rows = rootGuid ? keptRows.get(rootGuid) : undefined;
   const legacy = rootGuid ? keptLegacy.get(rootGuid) : undefined;
-  if (!rows && !legacy) return undefined;
-  return structuredClone({ ...(rows ? { rows } : {}), ...(legacy ? { legacy } : {}) });
+  const unused = rootGuid ? keptUnused.get(rootGuid) : undefined;
+  if (!rows && !legacy && !unused) return undefined;
+  return structuredClone({ ...(rows ? { rows } : {}), ...(legacy ? { legacy } : {}), ...(unused ? { unused } : {}) });
 }
 
 /** Put a snapshot's kept state back under `rootGuid` — the respawn half of {@link keptStateOf}. */
@@ -86,11 +114,13 @@ export function restoreKeptState(rootGuid: string, state: KeptState): void {
   if (!rootGuid) return;
   setKeptOrphanRows(rootGuid, structuredClone(state.rows ?? {}));
   setKeptLegacy(rootGuid, structuredClone(state.legacy ?? {}));
+  setKeptUnusedRows(rootGuid, structuredClone(state.unused ?? {}));
 }
 
 export function clearKeptOrphanRows(): void {
   keptRows.clear();
   keptLegacy.clear();
+  keptUnused.clear();
 }
 
 /** Move every renamed root's kept rows to its new guid, and rename the guids the rows themselves name (a row's `parent`,
@@ -101,11 +131,16 @@ export function clearKeptOrphanRows(): void {
 export function rekeyKeptOrphanRows(remap: ReadonlyMap<string, string>): void {
   if (!remap.size) return;
   rekey(keptRows, remap, (a, b) => ({ ...a, ...b }));
+  rekey(keptUnused, remap, (a, b) => ({ ...a, ...b }));
   // The legacy half follows the same rename (#1780): its channels name guids too, in a restated trait's refs.
-  rekey(keptLegacy, remap, (a, b) => ({
-    nestedOverrides: { ...a.nestedOverrides, ...b.nestedOverrides },
-    nestedStructure: { ...a.nestedStructure, ...b.nestedStructure },
-  }));
+  rekey(keptLegacy, remap, (a, b) => {
+    const out: Record<string, unknown> = {};
+    for (const c of LEGACY_CHANNELS) {
+      const x = a[c], y = b[c];
+      if (x || y) out[c] = Array.isArray(x) || Array.isArray(y) ? [...new Set([...(x as number[] ?? []), ...(y as number[] ?? [])])] : { ...x, ...y };
+    }
+    return out as KeptLegacy;
+  });
 }
 
 onGuidRemap('keptOrphanRows', (remap) => rekeyKeptOrphanRows(remap));

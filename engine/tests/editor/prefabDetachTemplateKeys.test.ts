@@ -189,6 +189,29 @@ describe('Detach strips the template keys of the nodes it unpacks (#1874)', () =
     expect(keyOf(extra), 'the redo stripped it again').toBe('');
   });
 
+  // #1914 R3a: a template's plain node records its own edits, and the save writes only what it records. Detach's undo must
+  // give the record back with the key: after a reload in between, the plain node it became holds none, so the node came
+  // back the template's with z 2 unrecorded and the next save dropped it (hunt seed 1032). Mutation: drop the
+  // `restoreMarks` in `reattachPrefabInstance`'s key loop — the reload shows the template's z 0.
+  it("Detach's undo across a reload gives the node its record back with its key", async () => {
+    const f = await startRun(be, async () => {}, 'detach-keys-record');
+    const o1 = fixture('OR', 1);
+    const extra = extraOf(o1.id).guid!;
+    const z = () => (readTraitData(byGuid(extra)!.id, getTraitByName('Transform')!) as { z: number }).z;
+    expect(z(), 'precondition: the template gives it z 0').toBe(0);
+    expect(writeTraitFieldWithUndo(byGuid(extra)!.id, getTraitByName('Transform')!, 'z', 2)).toBeFalsy();
+    await settle();
+    detachPrefabInstanceWithUndo(o1.id, 'Detach prefab', '[test]');
+    await settle();
+    await saveAndReload(f);
+    expect((await undoStep('undo')).did, 'the undo ran').toBe(true);
+    await settle();
+    expect(keyOf(extra)).toBe('k-extra');
+    await saveAndReload(f);
+    expect(checkWorld()).toEqual([]);
+    expect(z()).toBe(2);
+  });
+
   it('nothing recovers the key after a reload: the detached tree at scene level, and inside another instance', async () => {
     for (const where of ['scene', 'inside P1'] as const) {
       const f = await startRun(be, async () => {}, `detach-keys-recover-${where}`);

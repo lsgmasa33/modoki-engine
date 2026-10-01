@@ -972,7 +972,8 @@ export function validateSceneData(
         // member through the documents, one component per frame, as the spawner resolves it (`docRows`):
         // a direct row (`/<nodeGuid>`) names a member of this prefab, a deeper one a member of a nested
         // frame, composed through the nested rows on the way (#1707 — before that it got the ref check
-        // only). A node row (`a+<key>`) names an added node, which has no member to compose.
+        // only). A node row (`a+<key>`) names an added node, which has no member to compose, and neither does a row
+        // reaching INTO a reference node through one (`…/a+<key>/<member>`, #1914 R3b): both get the ref check only.
         const groups: { where: string; path: readonly number[]; localId: number; raw: unknown }[] = [];
         for (const [k, raw] of Object.entries((overrides ?? {}) as Record<string, unknown>)) {
           groups.push({ where: `overrides[${k}]`, path: [], localId: Number(k), raw });
@@ -1098,7 +1099,39 @@ export function validateSceneData(
     }
   }
 
+  warnings.push(...embeddedPrefabWarnings((data as { embeddedPrefabs?: unknown }).embeddedPrefabs, getPrefab));
+
   return { warnings, schemaApplied };
+}
+
+/** The scene's copies of missing prefabs (`embeddedPrefabs`, v19, #1914 F8 / #1867): an object keyed by prefab guid, each
+ *  value a prefab document — checked as one ({@link validatePrefabData}). The loader drops a copy with no `entities` array
+ *  rather than expand it, so that one is named here; a copy whose `id` names another prefab would stand in for the wrong
+ *  one, so that is too. A copy's own nested prefabs are read as the load reads them: the project's file first, then the
+ *  scene's copy. */
+function embeddedPrefabWarnings(embedded: unknown, getPrefab?: PrefabResolver): string[] {
+  if (embedded === undefined) return [];
+  if (!embedded || typeof embedded !== 'object' || Array.isArray(embedded)) {
+    return ['embeddedPrefabs is not an object keyed by prefab guid — the loader ignores it'];
+  }
+  const out: string[] = [];
+  for (const [guid, doc] of Object.entries(embedded)) {
+    const label = `embeddedPrefabs['${guid}']`;
+    if (!isGuid(guid)) out.push(`${label}: the key is not a prefab guid, so no reference can name this copy`);
+    if (!doc || typeof doc !== 'object' || !Array.isArray((doc as { entities?: unknown }).entities)) {
+      out.push(`${label}: not a prefab document (no \`entities\` array) — the loader ignores it`);
+      continue;
+    }
+    const id = (doc as { id?: unknown }).id;
+    if (id !== undefined && id !== guid) out.push(`${label}: the copy's id is ${JSON.stringify(id)}, not its key`);
+    const read = (ref: string) => {
+      let real: unknown;
+      try { real = getPrefab?.(ref); } catch { real = undefined; }
+      return real ?? (embedded as Record<string, unknown>)[ref];
+    };
+    out.push(...validatePrefabData(doc, read).warnings.map((w) => `${label}: ${w}`));
+  }
+  return out;
 }
 
 /** The traits bag a spawned instance of `prefab` would carry on its ROOT entity, or undefined when

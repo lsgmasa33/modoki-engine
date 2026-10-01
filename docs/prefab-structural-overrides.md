@@ -194,7 +194,18 @@ nothing. The editor `collectResourceRefs` (serialize.ts) **delegates** to the
 runtime `collectResourceRefsFromEntities` (loadSceneFile.ts) — one shared
 implementation rather than two that can drift.
 
+A NESTED prefab that is missing at the save is copied into the file's top-level
+`embeddedPrefabs` (scene v19, #1867), and the copies' own refs join `resources`, so
+the load acquires what a frame expanded from a copy draws. What is copied, what reads
+it, and why Apply/Revert still refuse such a frame: [prefabs.md](prefabs.md)
+§ "A scene backs up a missing nested prefab".
+
 ## Load / re-expand
+
+A nested row whose prefab is missing expands from the scene's copy of it when the
+file carries one (`embeddedPrefabs`, v19, #1867): the load's default reader is the
+runtime cache, then the copy, so a prefab that loads always wins. See
+[prefabs.md](prefabs.md) § "A scene backs up a missing nested prefab".
 
 In `loadSceneFile.ts`, after `instantiatePrefabIntoWorld` spawns the prefab and
 `applyOverridesByLocalToEcs` replays value diffs:
@@ -318,24 +329,18 @@ Operate on the deep-cloned `newPrefab`:
   from a row that turned its instance around, which let a later child edit turn it. `layerPose`
   writes all three components or none. The removal branch keeps the row's own spelling when the carry
   did not change the orientation. A root with no Transform on either side (a UI root) gets none.
-  So a row that rotates its member at all holds all three components. The save reads that the same way
-  (`subtractChainOverrides`, #1498). The scene's rotation comes off only when its orientation EQUALS the
-  row's, and is otherwise written as all three; scale is compared per field.
-  **One exception, for a RE-SPELLED pose** (`sameRotationScale`, the linear part as one matrix). A mirror's
-  sign is coupled to rotation too, so a decomposition (a move out and back) returns `sz: -1` as `sx: -1`
-  turned π about y. The capture holds only the MARKED components, so the marked fields over the row no
-  longer rebuild the pose on screen. Then, and only then, all six are decided together: dropped if the pose
-  equals the row's, written whole from the live Transform if not. (Close-out review: per component, a
-  mirrored member moved out and back saved `sz: 1` alone and lost its mirror. Second review: widening
-  EVERY time pinned axes the scene never touched, such as the row's own turn or mirror, and on a rebuild
-  an old row's scale over a refreshed one.) `sameRotationScale` judges each column at its own scale, so a
-  large scale on one axis does not hide a change on another.
-  (Before #1498 the save subtracted by key, and an edit to ANY rotation component of such a member was
-  dropped.)
+  So a row that rotates its member at all holds all three components. The save writes the scene's
+  side the same way since #1914: an edit records the rotation as one group (R2), and the save writes the
+  record whatever it equals (R3c), so the three components over the row rebuild the orientation shown, and
+  scale is recorded per field. (#1498 to R3c, the save instead took the rotation off when its orientation
+  EQUALLED the row's and widened a RE-SPELLED pose — a mirror's sign moved by a decomposition, `sz: -1`
+  returned as `sx: -1` turned π about y — to all six fields. With the rotation recorded as a group and no
+  gesture moving a member since #1869, nothing reached that settle, and it went in R3c. Before #1498 the
+  save subtracted by key, and an edit to ANY rotation component of such a member was dropped.)
   **Rotation is ONE override, at every depth and in the marks** (#1880 F5, owner-approved with the #1880 plan, the
   Unity way; it closes #1877 L3, hunt seed 6141). A mark on any of `Transform.rx/ry/rz` is a mark on all three
   (`ROTATION_MARKS` in `runtime/loaders/overrideMarks.ts`, the one store every mark goes through: an edit, the
-  reparent's compensation, the load's seeding, a restore), and `reconcileOverrideMarks` decides the three as one.
+  reparent's compensation, the load's seeding, a restore), and `recordOverridesByDiff` records the three as one.
   The top-level and nested captures save what is marked, so both save the rotation whole. Unity:
   `TransformRotationGUI` writes `m_Rotation.quaternionValue = Quaternion.Euler(x, y, z)` even when only X changed
   (UnityCsReference, `Editor/Mono/Inspector/TransformRotationGUI.cs`), and the manual's prefab YAML example lists
@@ -410,10 +415,12 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   already applies everything the outer prefab's row chain authors, so the capture is the live instance
   **minus that chain**. The chain comes from the document the live tree was expanded FROM, which is
   `rebuildInstance`'s `baseline` (a refresh passes its old file). Only the scene's own edit is left:
-  - **values** are dropped when they EQUAL the chain's value (`subtractChainOverrides`), rotation as one
-    orientation and a re-spelled pose as one linear part (above). A scene that changed a row-set field keeps its change. Since #1498 the
-    save (`captureNestedSceneDelta`) makes the SAME subtraction: it used to drop every field the row sets
-    by KEY, so a scene edit to a row-set field read as the row's own and was lost on save.
+  - **values** are the member's RECORD (`recordedOverrides`), captured over the template with the chain
+    folded in (`withOverridesFolded`), so what the chain gives is base and only what the scene recorded is
+    stated, whatever it equals (#1914 R3c; F1). A scene that changed a row-set field keeps its change. The
+    save (`captureNestedSceneDelta`) is the same capture. Before #1498 it dropped every field the row sets by
+    KEY, so a scene edit to a row-set field read as the row's own and was lost on save; #1498 to R3c both
+    subtracted by VALUE what equalled the chain.
     ⚠️ **The save compares against the CACHED chain, not `baseline`, and that is sound only because of
     the refresh ORDER.** A rebuild reaches the save's capture through one path, a user-added reference node
     inside the rebuilt instance (`captureNestedRef` → `captureNestedChannels`). That node's frames are
@@ -905,7 +912,8 @@ handed every edit to whichever member inherited the number, with nothing to say 
   still in the template.
 - **The localId channels are LEGACY, not gone** — the same shape as `moved` in Phase 3. Always read,
   and written for what no row can key: the instance ROOT's own edits (it has no row; it IS the entry),
-  a pre-v5 template's members (every prefab the released editor wrote), and a member with no durable
+  a pre-v5 template's members (a file from an editor older than v0.7.3, which ships prefab v7; such files still
+  load), and a member with no durable
   guid. A nested frame's STRUCTURE moves all-or-nothing: the legacy slot is a replace statement, and
   half of it on rows would be one statement in two places.
 - **Rows are written in the scene FILE form** (`StructureCaptureOpts.rows`, set by `serializeScene`) — **and so is
@@ -925,9 +933,10 @@ handed every edit to whichever member inherited the number, with nothing to say 
   edit against an inner row without carrying them per layer.
   **Residual, recorded:** a scene FILE whose reference node still carries legacy `nestedOverrides` /
   `nestedStructure` over a template with a member row folds the same way on LOAD — the v16 → v17 rung is a no-op and
-  converts nothing. Measured 2026-09-30 in this repo's corpus: 0 — no reference node in the 59 git-tracked scenes (57
-  of them below v17) carries either channel, and none of the 125 prefabs has a member row at all. The repo corpus is
-  not the user population; the hub holds whether that is worth more.
+  converts nothing. Re-measured 2026-10-01 (#1914 R8) in this repo's corpus: 0 — no reference node in the 57
+  git-tracked scenes under `games/` and `demos/` (56 of them below v17) carries either channel, and none of the 108
+  prefabs (all v5) has a member row at all. (The 2026-09-30 count read 59 and 125; the difference was not traced.)
+  The repo corpus is not the user population; the hub holds whether that is worth more.
 - **Every reader of a scene's channels reads the rows too** — the resource preload, the save-time path
   guard, the build's tree-shaker, a duplicate's guid remint, validation, the member-path walk, and the
   loader's collection of a reference node's rows (a node hanging under a member now rides on that
@@ -1132,12 +1141,19 @@ all, and every untouched sibling was pinned: a later template change to it never
 - **The shapes.** A template-added plain node inside a nested frame gets a NODE row keyed
   `<frame chain>/a+<key>` — the frame's member-row key plus the node's template key LAST
   (`formatNodeRowKey`; `a+` is told from a guid by the `+`, never by the leading `a`). It carries
-  `traits` (only the differing fields, merged over the node's; a trait the node lacks is added),
+  `traits` (the fields the node RECORDED, merged over the node's; a trait the node lacks is added),
   `traitRemovals` (`true` drops a trait), `own` (the scene's children of that node, appended) and
   `removed: true`. A member row gains `own` — the scene's nodes under the member, APPENDED where `added`
   replaces — and `traitRemovals`, per-trait statements over the chain's list (`false` restores a trait
   the chain removed, the trait twin of `removed: false`). `added` and `removedTraits` keep their exact v16
   meaning: always read, written only as the fallback below.
+- **A template node's field edits are its RECORD (#1914 R3a), as a member's are.** It is no instance member (no
+  `PrefabInstance`), so before R3a it held no record and the save stated every field that differed by VALUE: a value
+  typed back onto the template's was dropped (against F3), and so was one a template change made equal (against F1).
+  Now the editor's write records it against the template node that spawned it (`recordOverridesByDiff` →
+  `templatePlainNode`, `editor/scene/prefabBase.ts`), the load records what the writer's own node row states
+  (`applyNodeRows`' `NODE_RECORDS`, seeded at the spawn in `applyStructureCore`), and the diff below writes the recorded
+  fields whatever their value (`NodeDiffDeps.recordedOf`), and no unrecorded one.
 - **Save: `diffFrameAdded` (`nodeRowDiff.ts`), live capture against the chain's nodes.** Matched by
   template key, children included (`liveTemplateKeys(…, deep)`). A field one side omits reads as its
   schema default — the live capture drops default-valued fields, a template bag may state them. That
@@ -1151,10 +1167,34 @@ all, and every untouched sibling was pinned: a later template change to it never
   node belongs to the OUTER prefab, and a drag under an inner prefab's member moves it into another
   prefab. The same holds under a sibling template node — there is deliberately no `parent` channel on a
   node row.
+- **An edited template REFERENCE node is stated by rows reaching INTO it (#1914 R3b, the hub's end state B).** Its
+  interior is a frame of its own, so a node row extends into it: `<frame chain>/a+<key>` for its root (`traits`,
+  `traitRemovals`, `own`, `added`, `removed` as on any row there), `<frame chain>/a+<key>/<member>…` for a member of
+  it, and so on through nested frames and nodes inside it (`a+` may appear mid-key since R3b; the scene format is
+  unchanged otherwise, so no bump). Each holds only what the scene RECORDED or changed against the chain node: the
+  node's frame is stated like a nested frame (`referenceNodeRows` → `moveChannelsOntoRows`' `asNode` mode, against
+  the chain node's lists at its root), each nested frame inside it seeded with the node (`nodeForward`). So a template
+  change to the node's statement, to any part of it the scene did not touch, and to its siblings still arrives —
+  before R3b its anchor's whole list was written and pinned all three. The load folds the rows onto the node as a
+  layer OVER its own channels (`OVER_ROWS`, `overRowsOf`; `spawnReferenceNode` passes them as the expansion's
+  `over` layers), and a row inside it is backed while the node is, and, where the rest of the key is a plain member
+  path, while the node's document still has that member (`rowBackedTest`, asking the document by the same test). In a
+  rest naming a NODE, the node component itself is not asked (its document must still load, and the guid path before
+  it must still be there, since those are exact): the walk does not read every channel a frame's nodes come from (a member
+  row's `own`, an owning slot), and read as gone such rows were applied AND kept, warned and counted unused (the
+  close-out's reviews; the class is #1931). A row's owner hands its own `added` in as the root frame (`EntryRows.added`),
+  so a template's own row reaching its node, opened in its edit, is not kept beside the edit (F2). A
+  node document it cannot read is "cannot tell", with no loss warning. Backed by the node alone, a row whose member the
+  node's document dropped, or whose document went missing, was neither kept nor restated, and the next save dropped
+  the edit (#1914 close-out review 1). The TEMPLATE form is the same
+  rows in a prefab row's `members`, keyed in the row's frame; each one's frame is handed to the token pass
+  (`rowFrames` → `tokenizeRowMembers`), since its key names no frame the row's own frames do. A node in the WRITER's
+  own list is its own statement and is written whole, as before. A node whose interior holds what the template form
+  has no place for (a stored member guid, a move: `holdsInstanceIdentity`), or any statement no row can carry, falls
+  back as below.
 - **Fallback to the v16 whole list** for a member whose list cannot be stated node by node: a chain node
-  there with no key (a file from before keys), a key used twice in the frame, or an EDITED template
-  REFERENCE node — its interior is a frame of its own and has no node-row address yet. That member's
-  list is pinned exactly as in v16, and nothing else is.
+  there with no key (a file from before keys), a key used twice in the frame, or a reference node the
+  rows above cannot state. That member's list is pinned exactly as in v16, and nothing else is.
 - **Where the loader places a chain node is where the diff looks for it.** A node whose anchor row the
   inner document no longer has is re-anchored to the frame root, as `applyStructureCore` does; a node
   whose anchor is not LIVE (the scene deleted that member, or any member above it — `removed` lists only
@@ -1187,7 +1227,7 @@ all, and every untouched sibling was pinned: a later template change to it never
 
   The orders it has to hold in (`prefabReanchoredWholeList.test.ts`):
   - **6053's order** (win's hunt seed): the anchor goes, then the scene edits inside a re-anchored template REFERENCE
-    node, which falls back to the whole list above. Without the statement, the pinned copy and the template's (still
+    node, which fell back to the whole list above until #1914 R3b (rows into it now, where they can state it). Without the statement, the pinned copy and the template's (still
     anchored to the deleted row) both spawned on one guid, the template's showing what the scene deleted inside it.
   - **The reversed order** (the close-out review's): the scene pins the root's list while the anchor still exists,
     then a prefab edit deletes the anchor, with no save between. The first fix made the FOLD replace every node PLACED
@@ -1216,8 +1256,7 @@ all, and every untouched sibling was pinned: a later template change to it never
   tree-shaker (a miss drops the asset from the build, #53), a duplicate's remint, the serializer's path
   flags. Node rows ride the same loops. `sceneMemberRowReaders.test.ts` puts the only copy of a ref on
   each channel.
-- **Not covered:** field-level edits inside a template
-  reference node; per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
+- **Not covered:** per-field Apply/Revert of a node row; a template node anchored at an owned NESTED
   row's localId (the loader puts it under that row's root, the capture attributes it to the inner frame, so
   the diff reads it as re-parented — seen only in a hand-authored fixture, no writer known to produce it). **A scene saved before v17 is not un-pinned by
   resaving it:** the v16 list is read as the scene's state, so every field of a pinned node that has since

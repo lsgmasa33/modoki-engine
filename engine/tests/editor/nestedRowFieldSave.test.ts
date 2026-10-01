@@ -1,7 +1,9 @@
 /** A nested instance's fields, where the enclosing prefab's ROW also sets them — the save and the rebuild.
  *
  *  #1498 — the save subtracted what the row sets by KEY, so a scene edit to a row-set field read as the row's own
- *  and was dropped. Both captures now subtract by VALUE (`subtractChainOverrides`), rotation as one orientation.
+ *  and was dropped. Since #1914 R3c both captures write the member's RECORD over the template under the chain
+ *  (`recordedOverrides`, `withOverridesFolded`): a row-set field the scene edited is written, one it never touched is
+ *  not, and no value is compared to decide which.
  *
  *  #1492 — Apply from the NESTED instance of a field the row also sets. Since #1693 (U13, superseding owner ruling
  *  (b)): the row's override of it is REVERTED with the Apply, so every instance of the outer prefab shows the applied
@@ -43,7 +45,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans, keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
-  setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo,
+  setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo, duplicateEntity,
 } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import {
@@ -57,6 +59,7 @@ import { _setUndoClock, undoDepth, undo, redo } from '../../packages/modoki/src/
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
+import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/revertPrefabUndo';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { sameRotationScale } from '../../packages/modoki/src/runtime/scene/transformSpace';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
@@ -64,6 +67,8 @@ import { TemplateAddedKey } from '../../packages/modoki/src/runtime/core/templat
 import { buildPrefabEditScene, serializePrefabEditWorld } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -183,7 +188,7 @@ const rowOf = (entry: Record<string, unknown>, nodeGuid: string) =>
 
 describe('a scene edit to a field the row also sets is saved (#1498)', () => {
   it('on the nested root and on a member, beside a field the row does not set', async () => {
-    // Mutation: subtract by KEY in `subtractChainOverrides` (drop its `valuesEqual`) — both x edits reload at 2.
+    // Mutation: drop the record loop in `recordedOverrides` — both x edits reload at 2.
     install(pDoc(), oWith({ 1: { Transform: { x: 2 } }, 2: { Transform: { x: 2 } } }));
     await load(scene(O, [ROOT1]));
     expect([x(inInstance(ROOT1, 'R')), x(inInstance(ROOT1, 'A'))]).toEqual([2, 2]); // precondition: the row applies
@@ -194,17 +199,36 @@ describe('a scene edit to a field the row also sets is saved (#1498)', () => {
     expect([x(inInstance(ROOT1, 'R')), x(inInstance(ROOT1, 'A')), tfOf(inInstance(ROOT1, 'A')).y]).toEqual([5, 5, 5]);
   });
 
-  it('a value EQUAL to the row\'s is not restated', async () => {
-    // Mutation: drop the `valuesEqual` delete in `subtractChainOverrides` (keep every row-set field) — x is pinned.
+  it('a RECORDED value equal to the row\'s is written; a field the row sets and the scene never touched is not', async () => {
+    // #1914 F1 (owner, 2026-10-01): the record decides, not the value. Mutation: write a recorded field only where its
+    // value differs from the base (the gate without its fold, in `recordedOverrides`) — the recorded x is taken off as the
+    // row's. Accept side: the row's y is not restated.
+    install(pDoc(), oWith({ 2: { Transform: { x: 2, y: 4 } } }));
+    await load(scene(O, [ROOT1]));
+    // Recorded, and equal to what the row gives it: typed off it, then back (F3 keeps the record; F2: typing 2 alone,
+    // the value the instance already resolves to, records nothing).
+    setTf(inInstance(ROOT1, 'A'), 'x', 7);
+    setTf(inInstance(ROOT1, 'A'), 'x', 2);
+    expect(rowOf((await saved()).entry, gA)?.traits).toEqual({ Transform: { x: 2 } });
+  });
+
+  // #1914 F1 (owner, 2026-10-01; Unity: an override keeps its value "also if the value in the Prefab Asset changes"):
+  // the deliberate edit is the instance's own even though it equals the row's value, so the row's later change does not
+  // reach it. Mutation: as the case above — it reloads at the row's 30.
+  it('F1: a deliberate edit EQUAL to the row\'s value stays the instance\'s own when the row later changes', async () => {
     install(pDoc(), oWith({ 2: { Transform: { x: 2 } } }));
     await load(scene(O, [ROOT1]));
-    setTf(inInstance(ROOT1, 'A'), 'x', 2); // marked, and equal to what the row gives it
-    expect(rowOf((await saved()).entry, gA)?.traits).toBeUndefined();
+    setTf(inInstance(ROOT1, 'A'), 'x', 7); // recorded, then typed back onto the row's value (F3), as above
+    setTf(inInstance(ROOT1, 'A'), 'x', 2);
+    const { scene: s } = await saved();
+    install(pDoc(), oWith({ 2: { Transform: { x: 30 } } }));
+    await load(s);
+    expect(x(inInstance(ROOT1, 'A'))).toBe(2);
   });
 
   it('ROTATION: one component edited on a row-rotated member reloads as the orientation the scene showed', async () => {
-    // Mutation: subtract by KEY in `subtractChainOverrides` for rotation (delete rx/ry/rz whenever the chain sets
-    // one) — the edit is dropped and reloads at rz 0.
+    // The rotation is recorded as one group (R2), and the record is written whatever it equals. Mutation: write a
+    // recorded field only where it differs (as above) — only rz is written, and the row's turn is no longer the scene's.
     install(pDoc(), oWith({ 2: { Transform: { rx: 0, ry: Math.PI, rz: 0 } } }));
     await load(scene(O, [ROOT1]));
     setTf(inInstance(ROOT1, 'A'), 'rz', 0.5);
@@ -215,14 +239,15 @@ describe('a scene edit to a field the row also sets is saved (#1498)', () => {
     expect([t.rx, t.ry, t.rz].map((v) => +v.toFixed(6))).toEqual([0, +Math.PI.toFixed(6), 0.5]);
   });
 
-  it('ROTATION: a re-spelled rotation EQUAL to the row\'s writes nothing; a re-spelled different one reloads as shown', async () => {
-    // `ry: π` held as `(-π, 0, -π)`. Mutation: compare rotation per field (drop the `chainTurns` block) — all three
-    // differ from the row's spelling, so the equal case pins them.
+  it('ROTATION: a re-spelled rotation EQUAL to the row\'s is the scene\'s record; a re-spelled different one reloads as shown', async () => {
+    // `ry: π` held as `(-π, 0, -π)`: typed, so recorded (#1914 F1), and written as typed though the orientation is the
+    // row's — no orientation is compared (the pose settle that once could take it off went in R3c). Mutation: drop the
+    // record loop in `recordedOverrides` — nothing is written.
     install(pDoc(), oWith({ 2: { Transform: { rx: 0, ry: Math.PI, rz: 0 } } }));
     await load(scene(O, [ROOT1]));
     const a = inInstance(ROOT1, 'A');
     for (const [k, v] of [['rx', -Math.PI], ['ry', 0], ['rz', -Math.PI]] as const) setTf(a, k, v);
-    expect(rowOf((await saved()).entry, gA)?.traits).toBeUndefined();
+    expect(rowOf((await saved()).entry, gA)?.traits).toEqual({ Transform: { rx: -Math.PI, ry: 0, rz: -Math.PI } });
     // …and the same spelling turned a little further about z: kept whole, so it reloads as the scene held it.
     setTf(a, 'rz', -Math.PI + 0.25);
     await load((await saved()).scene);
@@ -230,22 +255,41 @@ describe('a scene edit to a field the row also sets is saved (#1498)', () => {
     expect([t.rx, t.ry, t.rz].map((v) => +v.toFixed(6))).toEqual([-Math.PI, 0, -Math.PI + 0.25].map((v) => +v.toFixed(6)));
   });
 
-  it('a row\'s member TOKEN is compared as the guid it names: an unchanged ref is not restated, a changed one is kept', async () => {
-    // Mutation: drop the `baseTokenResolver` step in `captureNestedSceneDelta` — the unchanged ref never equals the
-    // token and is pinned as a guid.
+  it('a row\'s member TOKEN is compared as the guid it names: an untouched ref is not restated, a changed one is kept', async () => {
+    // Mutation: drop the `baseTokenResolver` step in `captureNestedSceneDelta` — the untouched ref (captured, since
+    // UIAction is a component the ROW adds and the capture takes it whole) never equals the token and is pinned as a guid.
     install(pDoc(), oWith({ 1: { UIAction: { bindings: [{ target: '@member:2' }] } } }));
     await load(scene(O, [ROOT1]));
     const r = inInstance(ROOT1, 'R');
     const bindings = (readTraitData(r, meta('UIAction')) as { bindings: Array<Record<string, unknown>> }).bindings;
     const aGuid = getAllEntities().find((e) => e.id === inInstance(ROOT1, 'A'))!.guid;
     expect(bindings[0]!.target).toBe(aGuid); // precondition: the loader resolved the token to A
-    writeTraitFieldWithUndo(r, meta('UIAction'), 'bindings', bindings.map((b) => ({ ...b })));
     expect(rowOf((await saved()).entry, gR)?.traits).toBeUndefined();
     const rGuid = getAllEntities().find((e) => e.id === r)!.guid;
     writeTraitFieldWithUndo(r, meta('UIAction'), 'bindings', bindings.map((b) => ({ ...b, target: rGuid })));
     await load((await saved()).scene);
     const after = (readTraitData(inInstance(ROOT1, 'R'), meta('UIAction')) as { bindings: Array<Record<string, unknown>> }).bindings;
     expect(after[0]!.target).toBe(getAllEntities().find((e) => e.id === inInstance(ROOT1, 'R'))!.guid);
+  });
+});
+
+describe('a copy taken OUT of the row records what the row gave it (#1914 R1)', () => {
+  // The row's value is the nested frame's base, not a record. A Duplicate of the nested root makes the copy an instance of
+  // its own (#1354), which the row does not reach: it shows the row's value only if it records it, and a save must then
+  // write it. Mutation: drop `layerMarks` from `copySnapshot`'s recorded list — the copy reloads at P's own 0.
+  it('Duplicate of the nested root: the copy keeps the row\'s value, recorded, live and after a save', async () => {
+    install(pDoc(), oWith({ 2: { Transform: { x: 2 } } }));
+    await load(scene(O, [ROOT1]));
+    const sourceA = getAllEntities().find((e) => e.id === inInstance(ROOT1, 'A'))!.guid!;
+    const copy = duplicateEntity(inInstance(ROOT1, 'R'), () => {})!;
+    const aCopy = getAllEntities().find((e) => e.name === 'A' && e.parentId === copy)!;
+    expect(x(aCopy.id)).toBe(2);
+    const marksOf = (guid: string) => [...(getOverrideMarkSet(findEntity(getAllEntities().find((e) => e.guid === guid)!.id)!) ?? [])];
+    expect(marksOf(aCopy.guid!)).toContain('Transform.x');
+    expect(marksOf(sourceA)).not.toContain('Transform.x'); // the source: the row's value is its base
+    await load((await saved()).scene);
+    expect(x(getAllEntities().find((e) => e.guid === aCopy.guid)!.id)).toBe(2);
+    expect(marksOf(aCopy.guid!)).toContain('Transform.x');
   });
 });
 
@@ -348,7 +392,8 @@ describe('rotation and scale widen to ONE value only for a re-spelled pose (#149
   const pWithA = (aTf: Record<string, number>) => { const d = pDoc(); d.entities[1]!.traits.Transform = { ...d.entities[1]!.traits.Transform, ...aTf } as never; return d; };
   const aTf = () => tfOf(inInstance(ROOT1, 'A'));
   const loadWith = async (ov: Record<string, number>) => { install(pDoc(), oWith({ 2: { Transform: ov } })); await load(scene(O, [ROOT1])); };
-  // Mutation for A–D and F: widen every time (make the re-spelled test `if (true)`).
+  // Since #1914 R3c the save writes only the record, so nothing widens. Mutation for A–D and F: widen a recorded
+  // Transform to all six rotation/scale fields in `recordedOverrides` — each goes red.
 
   it('A: the row turns, the scene turns further — a later TEMPLATE scale edit still reaches the instance', async () => {
     await loadWith({ ry: 0.5 });
@@ -542,6 +587,20 @@ describe('a nested instance\'s base is its enclosing layer WHOLE: structure, and
       expect(x(xa())).toBe(8);
     });
 
+    // #1914 R1: a Revert takes the record off, and its REDO — a rebuild from the reduced side, which states the node's value
+    // back — takes it off again. Mutation: drop the unrecord from the redo's `rebuildTo` — the value is listed after the redo.
+    it('the Revert\'s undo lists the scene edit again, and its redo takes the record off again', async () => {
+      install(pDoc(), p2Doc(), withRefNode());
+      await load(scene(O, [ROOT1]));
+      setTf(xa(), 'x', 5);
+      expect(await revertOverridesWithUndo(refRoot(), new Set([xaKey]))).toBeTruthy();
+      expect([x(xa()), keys(refRoot(), P2)]).toEqual([3, []]);
+      await undo();
+      expect([x(xa()), keys(refRoot(), P2)]).toEqual([5, [xaKey]]);
+      await redo();
+      expect([x(xa()), keys(refRoot(), P2)]).toEqual([3, []]);
+    });
+
     /** O's row N adds a plain Holder2 whose child is the reference node (#1513). */
     const withHeldRefNode = (node: Record<string, unknown> = refNode()) => oRow({ added: [{
       parentLocalId: 1, guid: '', key: 'k-holder', name: 'Holder2', children: [node],
@@ -725,6 +784,48 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
     const again = await reloadUnder(oRow({ removed: [2] }));
     expect(rows(again)[aRow]?.removed).toBe(false);
     inInstance(ROOT1, 'A');
+  });
+
+  // #1914 R3a: a template-added PLAIN node is no instance member, so before R3a it held no record and the save stated its
+  // fields by value — a value typed back onto the template's was dropped (against F3), and one a template change made equal
+  // was too (against F1). Its record is now made by the editor's write (`recordOverridesByDiff` → its template node) and by
+  // the load (the writer's own node row, `NODE_RECORDS`), and the save's node diff writes it (`recordedOf`).
+  describe('a template node\'s own record (#1914 R3a)', () => {
+    const nodeRow = `/${gN}/a+k-extra`;
+    // Mutation: make `diffNode` decide by value again (ignore `recordedOf`) — the type-back to 1 is dropped and the reload
+    // shows the template's 8.
+    it('F3: typed off the template\'s value and back, the node keeps its record', async () => {
+      install(pDoc(), oRow({ added: [extra(1)] }));
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'Extra'), 'x', 5);
+      setTf(inInstance(ROOT1, 'Extra'), 'x', 1);
+      const entry = await reloadUnder(oRow({ added: [extra(8)] }));
+      expect(rows(entry)[nodeRow]).toEqual({ traits: { Transform: { x: 1 } } });
+      expect(x(inInstance(ROOT1, 'Extra'))).toBe(1);
+    });
+
+    // Mutation: make `recordNodeByDiff` record every field it is given — x is recorded at 1 and the reload keeps it.
+    it('F2: typing the template\'s own value records nothing', async () => {
+      install(pDoc(), oRow({ added: [extra(1)] }));
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'Extra'), 'x', 1);
+      const entry = await reloadUnder(oRow({ added: [extra(8)] }));
+      expect(rows(entry)[nodeRow]).toBeUndefined();
+      expect(x(inInstance(ROOT1, 'Extra'))).toBe(8);
+    });
+
+    // Mutation: drop the record `applyStructureCore`'s spawn seeds from `recordedFieldsOf` — the loaded row is no record,
+    // the save drops it, and the reload shows the template's 8.
+    it('a loaded node row equal to the template\'s value is the node\'s record', async () => {
+      install(pDoc(), oRow({ added: [extra(1)] }));
+      await load(scene(O, [ROOT1]));
+      const { scene: sc, entry } = await saved();
+      (entry.members as Record<string, unknown>)[nodeRow] = { traits: { Transform: { x: 1 } } };
+      await load(sc);
+      const again = await reloadUnder(oRow({ added: [extra(8)] }));
+      expect(rows(again)[nodeRow]).toEqual({ traits: { Transform: { x: 1 } } });
+      expect(x(inInstance(ROOT1, 'Extra'))).toBe(1);
+    });
   });
 
   it('a template REFERENCE node: a refresh delivers the template\'s change to it, and so does a saved scene', async () => {
@@ -1157,13 +1258,216 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8);
     });
 
-    it('ACCEPT side: a scene edit inside the node still restates it, and reloads', async () => {
+    // ACCEPT side. Since #1914 R3b (the hub's end state B) the edit is a row reaching into the node, not a restated list,
+    // so the sibling the row also adds still follows it. Mutation: report no reference node `addressable` in
+    // `frameAddedDiff` — `/gN` restates the whole list and Extra2 stays at 1.
+    it('ACCEPT side: a scene edit inside the node is a row reaching into it, and reloads; the sibling stays the row\'s', async () => {
       install(pDoc(), p2, oRow({ added: [ref, extra2(1)] }));
       await load(scene(O, [ROOT1]));
       setTf(inInstance(ROOT1, 'XA'), 'x', 5);
-      const entry = await reloadUnder(oRow({ added: [ref, extra2(1)] }));
-      expect(rows(entry)[`/${gN}`]?.added).toBeDefined();
+      const entry = await reloadUnder(oRow({ added: [ref, extra2(8)] }));
+      expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+      expect(rows(entry)[`/${gN}/a+k-ref/eeeeeeee-0000-4000-8000-000000001538`]).toEqual({ traits: { Transform: { x: 5 } } });
       expect(x(inInstance(ROOT1, 'XA'))).toBe(5);
+      expect(x(inInstance(ROOT1, 'Extra2'))).toBe(8);
+    });
+  });
+
+  // #1914 R3b (the hub's end state B): a scene edit INSIDE a template reference node is stated by the rows reaching into
+  // it — `/<frame>/a+<key>` for its root, `/<frame>/a+<key>/<member>` for its interior — holding only what the scene
+  // changed, so every other part of the node, and its siblings, stay the template's.
+  describe('rows reaching into a template reference node (#1914 R3b)', () => {
+    const P2 = 'cccccccc-0000-4000-8000-000000001914';
+    const gXA = 'eeeeeeee-0000-4000-8000-000000001915';
+    const gXB = 'eeeeeeee-0000-4000-8000-000000001916';
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001917'), row(2, 'XA', 1, gXA), row(3, 'XB', 1, gXB)] };
+    /** The row's node: an instance of P2 whose statement sets XA.x and XB.x, and adds UIFocusable to XB. */
+    const withRef = (xa: number, xb: number) => oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [],
+      overrides: { 2: { Transform: { x: xa } }, 3: { Transform: { x: xb }, UIFocusable: { focusOrder: 2 } } } }] });
+    const refRow = `/${gN}/a+k-ref`;
+
+    // Mutation: drop the root row (`NODE_ROOT` → '' in `referenceNodeRows`, keep it out of the result) — R2's y is lost.
+    it('an edit to the node\'s ROOT is its own row; the template\'s later change to a member still reaches it', async () => {
+      install(pDoc(), p2, withRef(3, 4));
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'R2'), 'y', 6);
+      const entry = await reloadUnder(withRef(8, 4));
+      expect(rows(entry)[refRow]).toEqual({ traits: { Transform: { y: 6 } } });
+      expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+      expect(tfOf(inInstance(ROOT1, 'R2')).y).toBe(6);
+      expect(x(inInstance(ROOT1, 'XA'))).toBe(8);
+    });
+
+    // Mutation: drop `asNode` from `moveChannelsOntoRows`' call in `referenceNodeRows` — the node's own frame is never
+    // stated, the removal with it, and XB is back.
+    it('a member the scene deleted inside the node is a removed row; the template\'s change to another member reaches it', async () => {
+      install(pDoc(), p2, withRef(3, 4));
+      await load(scene(O, [ROOT1]));
+      deleteEntitiesWithUndo([inInstance(ROOT1, 'XB')]);
+      const entry = await reloadUnder(withRef(8, 4));
+      expect(rows(entry)[`${refRow}/${gXB}`]).toEqual({ removed: true });
+      expect(rows(entry)[`/${gN}`]?.added).toBeUndefined();
+      expect(getAllEntities().filter((e) => e.name === 'XB')).toEqual([]);
+      expect(x(inInstance(ROOT1, 'XA'))).toBe(8);
+    });
+
+    // What the node's statement gives is base, a component it ADDS included (captured whole against the bare document).
+    // Mutation: measure the node's values against the bare document (`captureNestedSceneDelta(ecs, doc, undefined)`) —
+    // XB's UIFocusable is written as the scene's, a row for XB appears.
+    it('a member edit states only what the scene recorded, not the node\'s own values', async () => {
+      install(pDoc(), p2, withRef(3, 4));
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'XA'), 'y', 2);
+      const entry = await reloadUnder(withRef(3, 9));
+      expect(Object.keys(rows(entry)).filter((k) => k.startsWith(refRow))).toEqual([`${refRow}/${gXA}`]);
+      expect(rows(entry)[`${refRow}/${gXA}`]).toEqual({ traits: { Transform: { y: 2 } } });
+      expect([x(inInstance(ROOT1, 'XA')), tfOf(inInstance(ROOT1, 'XA')).y, x(inInstance(ROOT1, 'XB'))]).toEqual([3, 2, 9]);
+    });
+
+    // #1914 close-out review 1: a row reaching INTO the node counted as backed whenever the frame declares the node's
+    // key, which says nothing about whether the node's document still expands to that member. So with the node's prefab
+    // missing, or the member gone from it, the row was neither an R2 orphan nor an R4 unused record (that one is a live
+    // member's), no live member restated it, and the next save dropped it: the edit was lost when the member came back.
+    // The load warns of a row it can call lost (the member gone from a document it read), not of one behind a missing
+    // document, which is "cannot tell". Mutations: back the row by the node alone again (`rowBackedTest`) — both red;
+    // drop `nodeUnread` — the missing one warns.
+    for (const [label, drop, warns] of [
+      ['its prefab is missing', () => { prefabs.delete(P2); setPrefabCache(P2, null); }, false],
+      ['its prefab drops the member', () => install({ ...p2, entities: p2.entities.filter((e) => e.nodeGuid !== gXA) } as typeof p2), true],
+    ] as const) {
+      it(`a member edit inside the node is kept while ${label}, and applies again once the member is back`, async () => {
+        install(pDoc(), p2, withRef(3, 4));
+        await load(scene(O, [ROOT1]));
+        setTf(inInstance(ROOT1, 'XA'), 'y', 2);
+        const first = await saved();
+        expect(rows(first.entry)[`${refRow}/${gXA}`]).toEqual({ traits: { Transform: { y: 2 } } }); // precondition
+        drop();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          await load(first.scene);
+          expect(warn.mock.calls.some((c) => String(c[0]).includes(`${refRow}/${gXA}`))).toBe(warns);
+        } finally {
+          warn.mockRestore();
+        }
+        const second = await saved();
+        expect(rows(second.entry)[`${refRow}/${gXA}`]).toEqual({ traits: { Transform: { y: 2 } } });
+        install(p2);
+        await load(second.scene);
+        expect(tfOf(inInstance(ROOT1, 'XA')).y).toBe(2);
+      });
+    }
+  });
+
+  // #1914 close-out re-review: the reference node's OWN additions are part of its interior too — a node in its `added`
+  // (the frame of its root) and one its `nestedStructure` slot adds inside a nested frame of P2. Asked of P2's bare
+  // document, the rows reaching them (`…/a+k-ref/a+k-in`, `…/a+k-ref/<gN3>/a+k-z`) read as unbacked: applied, and also kept
+  // as orphans, warned as lost, and counted as unused overrides. A rest naming a node stays backed by the node (the walk
+  // does not read every channel a frame adds by; #1931). Mutation: ask the walk about a node component too
+  // (`firstNode = -1` in `rowBackedTest`) — both forms red.
+  describe('rows reaching a node the reference node itself adds (#1914 close-out re-review)', () => {
+    const P2 = 'cccccccc-0000-4000-8000-000000001934';
+    const P3 = 'cccccccc-0000-4000-8000-000000001935';
+    const gN3 = 'eeeeeeee-0000-4000-8000-000000001936';
+    const p3 = { id: P3, version: 5, name: 'P3', rootLocalId: 1, entities: [row(1, 'R3', 0, 'eeeeeeee-0000-4000-8000-000000001937'), row(2, 'Y', 1, 'eeeeeeee-0000-4000-8000-000000001938')] };
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001939'),
+      { localId: 3, name: 'N3', nodeGuid: gN3, prefab: P3, traits: { EntityAttributes: { name: 'N3', parentId: 1, guid: '' } } }] };
+    const plain = (key: string, name: string) => ({ parentLocalId: 1, guid: '', key, name, children: [],
+      traits: { EntityAttributes: { name, parentId: 0, guid: '' }, Transform: { x: 1, y: 0, z: 0 } } });
+    // Deep is declared in a legacy `nestedStructure` slot, or (what the writer emits since v6) in the node's member row's
+    // `own` list (the third review's F1: a frame walker that read only the slot missed it).
+    const forms = {
+      slot: { nestedStructure: { 3: { added: [plain('k-z', 'Deep')] } } },
+      'member row': { members: { [`/${gN3}`]: { own: [plain('k-z', 'Deep')] } } },
+    };
+
+    for (const [form, deep] of Object.entries(forms)) it(`an edit to each is applied, and neither row is kept as an orphan or warned as lost (${form})`, async () => {
+      const withRef = () => oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [],
+        added: [plain('k-in', 'Inner')], ...deep }] });
+      install(pDoc(), p2, p3, withRef());
+      await load(scene(O, [ROOT1]));
+      setTf(inInstance(ROOT1, 'Inner'), 'y', 5);
+      setTf(inInstance(ROOT1, 'Deep'), 'y', 6);
+      const first = await saved();
+      expect(Object.keys(rows(first.entry)).filter((k) => k.includes('a+k-ref/'))).toEqual(
+        expect.arrayContaining([`/${gN}/a+k-ref/a+k-in`, `/${gN}/a+k-ref/${gN3}/a+k-z`])); // precondition: the rows' shape
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await load(first.scene);
+        expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('a+k-ref/'))).toEqual([]);
+      } finally {
+        warn.mockRestore();
+      }
+      expect(keptMemberOrphans(ROOT1)).toBeUndefined();
+      expect([tfOf(inInstance(ROOT1, 'Inner')).y, tfOf(inInstance(ROOT1, 'Deep')).y]).toEqual([5, 6]);
+    });
+
+    // …and where Deep's way in IS gone (P2 missing, or P2 dropping N3), its row is kept until it comes back: the document
+    // and the guid path before the node component are exact, so they are asked even though the node itself is not.
+    // Mutation: return `true` for any rest naming a node, before those checks (the fourth review) — all four red.
+    for (const [form, deep] of Object.entries(forms)) {
+      for (const [label, drop] of [
+        ['P2 missing', () => { prefabs.delete(P2); setPrefabCache(P2, null); }],
+        ['P2 dropping N3', () => install({ ...p2, entities: p2.entities.filter((e) => e.nodeGuid !== gN3) } as typeof p2)],
+      ] as const) {
+        it(`${label}: the edit to Deep is kept, and back once its way in is (${form})`, async () => {
+          install(pDoc(), p2, p3, oRow({ added: [{ parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [], ...deep }] }));
+          await load(scene(O, [ROOT1]));
+          setTf(inInstance(ROOT1, 'Deep'), 'y', 6);
+          const first = await saved();
+          drop();
+          await load(first.scene);
+          const second = await saved();
+          install(p2);
+          await load(second.scene);
+          expect(tfOf(inInstance(ROOT1, 'Deep')).y).toBe(6);
+        });
+      }
+    }
+  });
+
+  // The TEMPLATE form: O's row N itself states a row reaching into its node, keyed in N's frame (`/a+<key>/<member>`).
+  describe('rows reaching into a template reference node, in the TEMPLATE (#1914 R3b)', () => {
+    const P2 = 'cccccccc-0000-4000-8000-000000001924';
+    const gXA = 'eeeeeeee-0000-4000-8000-000000001925';
+    const p2 = { id: P2, version: 5, name: 'P2', rootLocalId: 1, entities: [row(1, 'R2', 0, 'eeeeeeee-0000-4000-8000-000000001926'), row(2, 'XA', 1, gXA)] };
+    const withDeep = (y: number) => oRow({
+      added: [{ parentLocalId: 1, guid: '', key: 'k-ref', name: 'Ref', prefab: P2, traits: {}, children: [] }],
+      members: { [`/a+k-ref/${gXA}`]: { traits: { Transform: { y } } } },
+    });
+
+    it('the template\'s row reaches the node\'s member; an untouched save states nothing; a scene edit beside it is its own row', async () => {
+      install(pDoc(), p2, withDeep(5));
+      await load(scene(O, [ROOT1]));
+      expect(tfOf(inInstance(ROOT1, 'XA')).y).toBe(5);
+      expect(Object.keys(rows((await saved()).entry) ?? {}).filter((k) => k.includes('a+k-ref'))).toEqual([]);
+      setTf(inInstance(ROOT1, 'XA'), 'z', 3);
+      const entry = await reloadUnder(withDeep(6));
+      expect(rows(entry)[`/${gN}/a+k-ref/${gXA}`]).toEqual({ traits: { Transform: { z: 3 } } });
+      expect([tfOf(inInstance(ROOT1, 'XA')).y, tfOf(inInstance(ROOT1, 'XA')).z]).toEqual([6, 3]);
+    });
+
+    // The third close-out review's F2: opened in its OWN edit, O's row N is an entry, and its row reaching the node
+    // (`/a+k-ref/<gXA>`) was judged against P's bare document. Unbacked, it was kept as an orphan while also applied, so
+    // an edit of XA there was saved beside the stale kept row, and the reopen showed the old value. The entry's own `added`
+    // is its root frame now (`EntryRows.added`). Mutation: don't hand it to the settle — red (warned, then y 5).
+    it("in O's own edit the row is applied, not kept: an edit of XA survives the save and reopen", async () => {
+      install(pDoc(), p2, withDeep(5));
+      const editWorld = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: `/__prefab-edit__/${O}` } as never);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await load(buildPrefabEditScene(withDeep(5) as unknown as PrefabFile) as SceneData);
+        const xa = () => getAllEntities().find((e) => e.name === 'XA')!.id;
+        expect(tfOf(xa()).y).toBe(5); // precondition: the row applies
+        expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('a+k-ref'))).toEqual([]);
+        setTf(xa(), 'y', 7);
+        const out = serializePrefabEditWorld(O);
+        if ('error' in out) throw new Error(out.error);
+        await load(buildPrefabEditScene(out.prefab) as SceneData);
+        expect(tfOf(xa()).y).toBe(7);
+      } finally {
+        warn.mockRestore();
+        editWorld.mockRestore();
+      }
     });
   });
 
@@ -1248,7 +1552,9 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       expect(shown()).toEqual([7, 6, 5]);
     });
 
-    it('a replayed row leaves the store: an edit back to the template value after the Refresh is saved as no edit', async () => {
+    // The replayed row is the scene's record again (#1914 R3a: a node's own row records its fields), so an edit back onto
+    // the template's value keeps it (F3) and is saved as that value — not as the old 5 the kept store held.
+    it('a replayed row leaves the store: an edit back to the template value after the Refresh is saved as that edit', async () => {
       // Mutation: keep the replayed rows in the store — the save re-emits `/gN/a+k-extra: {x: 5}`, and the reload shows 5.
       install(pDoc(), withN());
       await load(scene(O, [ROOT1]));
@@ -1258,7 +1564,7 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       await rebaseStaleInstances();
       setTf(inInstance(ROOT1, 'Extra'), 'x', 1);
       const entry = await reloadUnder(withN());
-      expect(rows(entry)[`/${gN}/a+k-extra`]).toBeUndefined();
+      expect(rows(entry)[`/${gN}/a+k-extra`]).toEqual({ traits: { Transform: { x: 1 } } });
       expect(x(inInstance(ROOT1, 'Extra'))).toBe(1);
     });
 
@@ -1875,11 +2181,10 @@ describe('#1771: a saved member reference is read against the document its frame
 
 // ── #1717 close-out review: the fold-in is excluded PER FIELD under an enclosing row ─────────────────────────────────
 describe("a nested member's marked value equal to its base is listed unless the enclosing row states that field (#1717)", () => {
-  // The save folds a marked value in and subtracts a field the chain states, per field (`captureNestedSceneDelta` →
-  // `subtractChainOverrides`). The list skipped the whole fold-in whenever the row stated ANY field, so a pinned
-  // override on another field was saved and listed nowhere: it could be neither reverted nor applied.
-  // Mutation: skip the fold-in for the whole instance when the row states anything (the `base === prefab` rule) — A's x
-  // is not listed. Always fold (drop `layerStates`) — R's y, the row's own marked value, is listed as the instance's.
+  // The save writes the record per field (`recordedOverrides`, over the chain-folded base since #1914 R3c). The list once
+  // skipped the marked-equal fields whenever the row stated ANY field, so a pinned override on another field was saved
+  // and listed nowhere: it could be neither reverted nor applied. Mutation: write a recorded field only where it differs
+  // from the base — A's x is not listed. R's y is the row's value, unrecorded since R1, so nothing lists it.
   it('A.x (marked, equal to P) is listed and highlighted; R.y (the row states it) is not', async () => {
     install(pDoc(), oWith({ 1: { Transform: { y: 4 } } }));
     await load(scene(O, [ROOT1]));

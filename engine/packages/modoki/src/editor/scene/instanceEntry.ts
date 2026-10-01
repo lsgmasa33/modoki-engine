@@ -7,7 +7,7 @@ import type { PrefabFile } from './prefab';
 import { captureInstanceOverrides } from './prefabInstanceOverrides';
 import { captureInstanceMembers } from './prefabMembers';
 import { captureInstanceStructure, captureNestedChannels, moveChannelsOntoRows, withoutRowParents, type FrameEdit } from './prefabCapture';
-import { withKeptLegacy } from './prefabBase';
+import { withKeptLegacy, withKeptLocalRecords, withKeptUnused } from './prefabBase';
 
 /** The instance half of a scene entry, as the loader reads it — `SceneEntityEntry`'s own fields, so the two cannot drift.
  *  Each field is absent when it states nothing, as the save writes it. */
@@ -31,10 +31,15 @@ export function captureInstanceEntry(
   const live = captureInstanceStructure(rootId, prefab, { rows: true, frameEdits: edit.frames, dropParents: edit.dropParents, againstRecords: edit.againstRecords });
   const s = own?.structure ? own.structure(live) : live;
   const channels = captureNestedChannels(rootId, source, live.ownedNested, { rows: true, frameEdits: edit.frames, againstRecords: edit.againstRecords });
-  const unrowed = s.unrowed ?? {};
+  // The records the load kept as UNUSED go back first (#1914 R4): a localId the template has goes onto its row with the rest.
+  const local = withKeptLocalRecords({
+    overrides: own?.overrides ? own.overrides(captureInstanceOverrides(rootId, prefab)) : captureInstanceOverrides(rootId, prefab),
+    removedTraits: s.removedTraits, removed: s.removed, moved: s.unrowed ?? {},
+  }, rootGuid, rootId);
+  const unrowed = local.moved ?? {};
   // A structure that states nothing is handed on as none at all, as the save always has: `[]` is not "nothing" to every
   // reader of a channel.
-  const struct = s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(unrowed).length ? s : undefined;
+  const struct = s.added.length || local.removed?.length || Object.keys(local.removedTraits ?? {}).length || Object.keys(unrowed).length ? s : undefined;
   // v16 (#1468): each member's guid, STORED under its minted identity instead of re-derived from its position on the next
   // load — plus, since Phase 3, `parent` for a member that has been moved inside the instance. Absent when the template
   // predates prefab v5; see `memberRowKeysIn` for the full exclusion list.
@@ -43,11 +48,11 @@ export function captureInstanceEntry(
   // Since Phase 4 the rows also carry every EDIT they can key (`moveChannelsOntoRows`): what is left in the localId
   // channels below is the root's own edits and what no row can address.
   const moved = moveChannelsOntoRows(rootId, prefab, source, {
-    overrides: own?.overrides ? own.overrides(captureInstanceOverrides(rootId, prefab)) : captureInstanceOverrides(rootId, prefab),
-    added: struct?.added, removed: struct?.removed, removedTraits: struct?.removedTraits,
+    overrides: local.overrides,
+    added: struct?.added, removed: struct ? local.removed : undefined, removedTraits: struct ? local.removedTraits : undefined,
     nestedOverrides: channels.nestedOverrides, nestedStructure: channels.nestedStructure,
   }, captureInstanceMembers(rootId, prefab), channels.frames, { againstRecords: edit.againstRecords, frameEdits: edit.frames });
-  const members = withoutRowParents(rootId, moved.members, edit.dropParents);
+  const members = withKeptUnused(withoutRowParents(rootId, moved.members, edit.dropParents), rootGuid, rootId);
   const ch = withKeptLegacy(moved.channels, rootGuid);
   const entry: InstanceEntry = {};
   if (ch.overrides && Object.keys(ch.overrides).length) entry.overrides = ch.overrides;

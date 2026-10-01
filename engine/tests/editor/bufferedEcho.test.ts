@@ -113,6 +113,16 @@ describe('nextBufferedEdit / holdsBufferedText', () => {
     expect(holdsBufferedText(run('focus', 'input', 'input'))).toBe(true);
   });
 
+  // #1914 (#1922): a session's keystrokes are one recording gesture (`fieldGesture.ts`). Mutation: bump `session` on
+  // 'input' — every keystroke is its own gesture, and a retype of the base records again.
+  it('a keystroke stays in its session; focus, blur, an undo/redo step and a new owner each begin another', () => {
+    const typed = run('focus', 'input', 'input', 'input');
+    expect(typed.session).toBe(run('focus').session);
+    for (const e of ['focus', 'blur', 'undoRedo', 'rescope'] as const) {
+      expect(nextBufferedEdit(typed, e).session, e).not.toBe(typed.session);
+    }
+  });
+
   it('#1905: an undo or redo while focused ends the hold, and the field stays focused', () => {
     const s = run('focus', 'input', 'undoRedo');
     expect(holdsBufferedText(s)).toBe(false);

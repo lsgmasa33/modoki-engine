@@ -1,5 +1,5 @@
 /** #1717: the Apply/Revert override list and the Inspector's highlight show what the scene SAVE keeps — Unity's
- *  recorded-modification model — through the one mark gate the save uses (`gateOnMarks`, `foldMarkedEqual`).
+ *  recorded-modification model — through the one rule the save uses (`recordedOverrides`, #1914 R3c).
  *
  *  They used to diff a member against its base by VALUE, with no mark gate, while the save captured only override-MARKED
  *  fields. So a value that differed with no mark (a re-import moving the base under an un-edited instance) was listed and
@@ -65,8 +65,8 @@ function getAllTraitsList() {
 }
 
 describe('the override list and the Inspector highlight show exactly what the save keeps (#1717)', () => {
-  // Mutation: drop `gateOnMarks` from `collectInstanceOverrideTree` — `listed` gains Transform.x; from
-  // `memberOverrideKeys` — `highlighted` does.
+  // Mutation: list the value diff instead of the record in `collectInstanceOverrideTree` — `listed` gains Transform.x;
+  // in `memberOverrideKeys` — `highlighted` does.
   it('a value that differs from its base with NO mark is not an override: not listed, not highlighted, not saved', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);
@@ -88,8 +88,9 @@ describe('the override list and the Inspector highlight show exactly what the sa
     expect([s.saved.has('Transform.x'), s.listed.has('Transform.x'), s.highlighted.has('Transform.x')]).toEqual([true, true, true]);
   });
 
-  // Mutation: drop `foldMarkedEqual` from the list (or the highlight) — the recorded override the save keeps is listed
-  // nowhere, so it can be neither applied nor reverted.
+  // Mutation: write a recorded field only where it differs from the base (in `recordedOverrides`), or list the value diff
+  // instead of the record — the recorded override the save keeps is listed nowhere, so it can be neither applied nor
+  // reverted.
   it('a MARKED value equal to its base is a recorded override: listed and highlighted, as the save keeps it (#1709)', () => {
     const prefab = makePrefab();
     const root = instantiatePrefab(prefab);

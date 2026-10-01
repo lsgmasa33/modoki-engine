@@ -17,7 +17,7 @@ import { mapStringValues, isStoredRoot, memberStepId, type MemberPi } from '../.
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
-import { captureDoc } from './prefabBase';
+import { captureDoc, withLeftBehindRecorded } from './prefabBase';
 import {
   authoringEntitiesFor, collectTree, isTemplateExcludedField, type PrefabEntity, type PrefabFile,
 } from './prefab';
@@ -74,10 +74,10 @@ export function planPrefabRows(
       // Each frame's structure per member and per node where it can be (#1533) — the scene writer's own split, so
       // an edit to one thing in a nested frame does not restate, and pin, what the inner prefabs put there. A frame
       // it cannot state that way stays whole in `nestedStructure`, compared by the no-op rule once tokenized.
-      const { channels, structureBaselines, nestedStructure, members } = captureRowChannels(e.id, source, childPrefab, ref, true);
+      const { channels, structureBaselines, nestedStructure, members, rowFrames } = captureRowChannels(e.id, source, childPrefab, ref, true);
       nestedRefs.set(e.id, {
         ref, childPrefab, structureBaselines, nestedOverrides: channels.nestedOverrides,
-        nestedStructure, ...(members ? { members } : {}), frames: channels.frames,
+        nestedStructure, ...(members ? { members } : {}), frames: channels.frames, ...(rowFrames ? { rowFrames } : {}),
       });
       // Exclude the nested instance's members (except the root, which becomes a
       // reference row) and any added subtrees it folded in.
@@ -308,8 +308,10 @@ export function serializePrefab(
   existingId?: string,
   opts?: Parameters<typeof serializePrefabBody>[2],
 ): PrefabFile | null {
-  return withRewritingPrefab(existingId, () =>
-    withKeptStateBake(!!opts?.bakeKeptState, () => serializePrefabBody(selectedEntityId, existingId, opts)));
+  // What the layers OUTSIDE the tree give its members is written into the new template's rows, as the tree showed it
+  // (#1914): a layer's value is base, unmarked, and the capture reads marks. No-op in prefab edit (nothing encloses it).
+  return withRewritingPrefab(existingId, () => withKeptStateBake(!!opts?.bakeKeptState, () =>
+    withLeftBehindRecorded(selectedEntityId, () => serializePrefabBody(selectedEntityId, existingId, opts))));
 }
 
 function serializePrefabBody(
@@ -339,6 +341,9 @@ function serializePrefabBody(
      *  Rows with no entry here are minted (a member the user added during the edit; a row of a
      *  pre-v5 document, which has no identity to keep). */
     preserveNodeGuids?: Map<number, string>;
+    /** The document's legacy KEYED moves (#1883 ruling C, `keyedMoves`): no load applied them, so no capture sees them, and
+     *  the save writes them back as the file held them. A prefab-edit save's, of the document it re-saves. */
+    keptMoves?: Record<string, string>;
     /** Keep this as the prefab's `name` instead of taking the ROOT ENTITY's name.
      *
      *  The two are independent: the asset is named by its file, the root entity by the
@@ -563,7 +568,8 @@ function serializePrefabBody(
     }
   }
 
-  const moved = templateMoves(selectedEntityId, tree, ecsToLocal, tokens.pathOf, rowParent);
+  const captured = templateMoves(selectedEntityId, tree, ecsToLocal, tokens.pathOf, rowParent);
+  const moved = opts?.keptMoves ? { ...opts.keptMoves, ...captured } : captured;
 
   // I16 over the WHOLE document (#1817): `planPrefabRows` asks only of a self-rooted instance root, and an instance the
   // plan folds into a nested row (under one of its members, or under a node a layer added) is written as a reference

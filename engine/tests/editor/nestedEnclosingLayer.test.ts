@@ -599,7 +599,8 @@ describe('U14 (owner, 2026-09-28): Apply on the OUTER instance offers its nested
     // Mutation: default a nested key to its frame's OWN prefab (\`idx\` → the frame's level) — P is written instead.
     await editNested();
     const keys = outerKeys();
-    const res = await applyToPrefabSelective(rootOf(ROOT1), new Set([...keys.all, ...keys.nested]));
+    // Apply All: the root's default overrides left out (F7's sibling order among them).
+    const res = await applyToPrefabSelective(rootOf(ROOT1), new Set([...keys.all.filter((k) => !keys.defaultOverrides.includes(k)), ...keys.nested]));
     expect(res.targets).toEqual([{ key: nestedKey, target: O }]);
     expect(written(P)).toBeUndefined();
     expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Transform).toEqual({ x: 5 });
@@ -1354,7 +1355,8 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       // The packed entity, generation and all: the respawned root can reuse the old index.
       const handle = () => Number(getCurrentWorld().entities.find((e) => e.id() === rootOf(ROOT1)));
       const oldHandle = handle();
-      const keys = collectInstanceOverrideKeys(root, getCachedPrefabSync(O) as PrefabFile).all;
+      const listed = collectInstanceOverrideKeys(root, getCachedPrefabSync(O) as PrefabFile);
+      const keys = listed.all.filter((k) => !listed.defaultOverrides.includes(k)); // F7's root order left, as Revert All does
       expect(keys).toEqual([`${gSlot}.Transform.x`]); // precondition: Slot's x is the stored root's only own edit
       await revertOverridesSelective(root, new Set(keys));
       expect(handle()).not.toBe(oldHandle); // the Revert did rebuild the stored root
@@ -1878,11 +1880,13 @@ describe('#1781: a template reference node whose statement adds a component is n
     row(1, 'QR', 0, 'eeeeeeee-0000-4000-8000-000000001783'), row(2, 'M', 1, 'eeeeeeee-0000-4000-8000-000000001784'),
     { ...ref(3, 'D', 2, 'eeeeeeee-0000-4000-8000-000000001785', S), ...(dOverrides ? { overrides: dOverrides } : {}) },
   ] });
-  const withT = (node: Record<string, unknown>) => {
+  /** O whose row N adds T (Q, keyed `kT1781`) under A. `loose`: and a key-less plain node beside it, which no node row can
+   *  name, so a save states A's list WHOLE (`diffFrameAdded`'s `allKeyed`) — the fallback #1914 R3b keeps. */
+  const withT = (node: Record<string, unknown>, loose = false) => {
     const o = oWith({});
     (o.entities[3] as Record<string, unknown>).added = [{
       parentLocalId: 2, guid: '', key: 'kT1781', name: 'T', prefab: Q, traits: { EntityAttributes: { name: 'T', parentId: 0 } }, children: [], ...node,
-    }];
+    }, ...(loose ? [{ parentLocalId: 2, guid: '', name: 'Loose', traits: { EntityAttributes: { name: 'Loose', parentId: 0 } }, children: [] }] : [])];
     return o;
   };
   const named = (name: string) => getAllEntities().filter((e) => e.name === name);
@@ -1937,16 +1941,78 @@ describe('#1781: a template reference node whose statement adds a component is n
 
   it('a scene REMOVAL of a component T\'s statement adds is saved, in the root frame and a nested one (close-out review F2)', async () => {
     // No live field shows a removal, so the value subtraction alone read T as unchanged and the save dropped it. Mutation:
-    // drop the removal checks in `sameNodeValues` (`moreRemovals`) — the reload brings UIFocusable back.
-    for (const [where, stmt] of [['M', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }], ['K', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }]] as const) {
-      install(sDoc(), qDoc(), pDoc(), withT(stmt));
+    // drop the removal checks in `sameNodeValues` (`moreRemovals`) — the reload brings UIFocusable back. In `whole` mode
+    // (a key-less sibling, so A's list is written whole, #1914 R3b): drop the copy's base removals (`gone` empty in
+    // `stampTemplateKeys`) — the copy pairs with T's values again and UIFocusable is back.
+    for (const loose of [false, true]) for (const [where, stmt] of [['M', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }], ['K', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }]] as const) {
+      const at = `${where}${loose ? ' (whole)' : ''}`;
+      install(sDoc(), qDoc(), pDoc(), withT(stmt, loose));
       await load(scene(O, [ROOT1]));
-      expect(focus(where), where).toBeTruthy(); // precondition
+      expect(focus(where), at).toBeTruthy(); // precondition
       removeTraitFromEntitiesWithUndo([named(where)[0]!.id], meta('UIFocusable'));
-      const { scene: s } = await saved();
+      const { scene: s, entry } = await saved();
+      expect(JSON.stringify(entry).includes('"key":"kT1781"'), at).toBe(loose); // which path stated it
       await load(s);
-      expect(focus(where), where).toBeNull();
+      expect(focus(where), at).toBeNull();
     }
+  });
+
+  // #1914 R1: T's statement is a LAYER's value, base and unrecorded, so a scene edit inside T — which the writer could only
+  // state by writing A's list whole, T's copy with it — left the copy stating none of it, and the reload lost it (hunt
+  // seeds 1091, 1192). The copy now carries T's key, and the load takes T's values under it as base (`pairWithBase`).
+  // #1914 R3b: the writer states such an edit by a row reaching into T (`rows`), and writes the list whole only where a
+  // node row cannot name a node there (`whole`, a key-less sibling); both must keep T's value as base.
+  const K_ROW = '/eeeeeeee-0000-4000-8000-000000001785/eeeeeeee-0000-4000-8000-000000001782';
+  const baseCases = [
+    ['M', 'its own overrides', (n: number) => ({ overrides: { 2: { UIFocusable: { focusOrder: n } } } })],
+    ['K', 'its nestedOverrides', (n: number) => ({ nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: n } } } } })],
+    ['K', 'a member row', (n: number) => ({ members: { [K_ROW]: { traits: { UIFocusable: { focusOrder: n } } } } })],
+  ] as const;
+  for (const mode of ['rows', 'whole'] as const) for (const [where, label, stmt] of baseCases) {
+    it(`#1914 R1/R3b (${mode}): an edit inside T keeps what ${label} gives ${where} on reload, unrecorded and not pinned`, async () => {
+      // Mutations, `whole` red: `pairWithBase` returns the list as it is; `stampTemplateKeys` stamps nothing; the spawner
+      // drops the base layers (`baseLayersOf` → {}). `rows` red: the spawner drops the over layers (`overLayersOf` → {}).
+      const loose = mode === 'whole';
+      install(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
+      await load(scene(O, [ROOT1]));
+      expect(focus(where)?.focusOrder, where).toBe(3); // precondition: the statement applied
+      writeTraitFieldWithUndo(named(where)[0]!.id, meta('Transform'), 'x', 9);
+      const { scene: s, entry } = await saved();
+      const text = JSON.stringify(entry);
+      // `whole`: A's list, T's copy in it carrying T's key. `rows`: a row reaching into T, and no list.
+      if (loose) expect(text).toContain('"key":"kT1781"');
+      else expect([text.includes('/a+kT1781'), text.includes('"added"')]).toEqual([true, false]);
+      expect(text).not.toContain('focusOrder'); // T's value is not the scene's to state
+      await load(s);
+      expect(focus(where)?.focusOrder, where).toBe(3);
+      const marks = getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === named(where)[0]!.id)!);
+      expect(marks?.has('Transform.x')).toBe(true);
+      expect(marks?.has('UIFocusable.focusOrder')).toBeFalsy();
+      // Not pinned: a change to T's statement reaches it, the scene's own edit kept beside it.
+      install(withT(stmt(5), loose));
+      await load(s);
+      expect(focus(where)?.focusOrder, where).toBe(5);
+      expect((readTraitData(named(where)[0]!.id, meta('Transform')) as { x: number }).x).toBe(9);
+    });
+  }
+
+  it('#1914 R1: undoing a removal of a component T no longer adds restores it RECORDED, as a reload shows it', async () => {
+    // The removal's snapshot holds T's value unrecorded; once T drops the component the save writes it whole as an added
+    // component, which a reload records. Mutation: `restoreMarks` passes `recordAdded` false — the undo leaves it unmarked.
+    install(sDoc(), qDoc(), pDoc(), withT({ overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }));
+    await load(scene(O, [ROOT1]));
+    removeTraitFromEntitiesWithUndo([named('M')[0]!.id], meta('UIFocusable'));
+    install(withT({}));
+    await rebaseStaleInstances();
+    expect(focus('M')).toBeNull(); // precondition: T no longer adds it, and the scene removed it
+    await undo();
+    const markOf = () => getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === named('M')[0]!.id)!);
+    expect(focus('M')?.focusOrder).toBe(3);
+    expect(markOf()?.has('UIFocusable.focusOrder')).toBe(true);
+    const { scene: s } = await saved();
+    await load(s);
+    expect(focus('M')?.focusOrder).toBe(3);
+    expect(markOf()?.has('UIFocusable.focusOrder')).toBe(true);
   });
 
   // #1804, the WRITER twin: a prefab-edit save of O measured T's frames against the bare documents too, so a no-edit save

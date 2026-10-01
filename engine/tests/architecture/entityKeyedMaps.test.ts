@@ -746,6 +746,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:53' },
   { item: 'loaders/loadSceneFile.ts::AddedEntity.nestedOverrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:55' },
+  { item: 'loaders/loadSceneFile.ts::FoldedFrame.ownOverrides',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId in the frame\'s own document — the writer\'s own values the parent\'s fold hands a nested expansion (#1914), per call; loaders/loadSceneFile.ts:2053' },
   { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.overrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:69' },
   { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.moved',

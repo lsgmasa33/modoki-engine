@@ -151,11 +151,12 @@ describe('an added TAG is an override with a key (#1491)', () => {
     const keys = collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
     expect(keys.addedTags).toEqual([`+trait.${gA}.Paused`]);
     expect(keys.all).toContain(`+trait.${gA}.Paused`);
-    expect(keys.fields).toEqual([]);
+    expect(keys.fields).toEqual(keys.defaultOverrides); // only the root's sibling order, which F7 always records
     const tree = collectInstanceOverrideTree(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
     expect(tree.addedTags.map((t) => [t.tag, t.entityName])).toEqual([['Paused', 'A']]);
-    // The other instance has no such override.
-    expect(collectInstanceOverrideKeys(rootOf(ROOT2), prefabs.get(P) as PrefabFile).all).toEqual([]);
+    // The other instance has no such override: only F7's root order.
+    const other = collectInstanceOverrideKeys(rootOf(ROOT2), prefabs.get(P) as PrefabFile);
+    expect(other.all).toEqual(other.defaultOverrides);
   });
 
   it('Apply writes it into the row, and the OTHER instance gains it', async () => {
@@ -239,6 +240,23 @@ describe('an added TAG on a NESTED instance\'s member is kept (#1491 sibling)', 
     const { entry } = await saved();
     expect(JSON.stringify(entry)).not.toContain('Paused');
   });
+  // #1914 R1: a tag the SCENE records is its own statement, written whatever the row adds (a record is taken off only by
+  // Revert, Apply or Remove Unused). Since R3c the row's tag is base (the capture folds the chain in), so only the tag's
+  // record writes it. Mutation: drop the tag record in `recordedOverrides` (`if (!field) continue;`) — the row's tag
+  // takes the scene's record with it.
+  it('IS kept when the scene records it, though the row adds the same tag', async () => {
+    const doc = oDoc();
+    (doc.entities[3] as Record<string, unknown>).overrides = { 2: { Paused: {} } };
+    install(pDoc(), doc);
+    const sc = scene(O, [ROOT1]);
+    (sc.entities[1] as unknown as Record<string, unknown>).members = { [`/${gN}/${gA}`]: { traits: { Paused: {} } } };
+    await load(sc);
+    expect(hasTag(inInstance(ROOT1, 'A'), 'Paused')).toBe(true);
+    const { scene: s1, entry } = await saved();
+    expect(JSON.stringify(entry)).toContain('Paused');
+    await load(s1);
+    expect(JSON.stringify((await saved()).entry)).toContain('Paused');
+  });
 });
 
 /** #1663 — an ADDED component was listed as field overrides whose base is ∅, and a field's Revert reset it to the schema
@@ -272,7 +290,8 @@ describe('an ADDED component is one row (#1663)', () => {
     const a1 = inInstance(ROOT1, 'A');
     expect(hasTag(a1, 'UIFocusable')).toBe(false);
     expect([...(getOverrideMarkSet(findEntityById(a1)! as never) ?? [])].filter((m) => m.startsWith('UIFocusable.'))).toEqual([]);
-    expect(collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile).all).toEqual([]);
+    const after = collectInstanceOverrideKeys(rootOf(ROOT1), prefabs.get(P) as PrefabFile);
+    expect(after.all).toEqual(after.defaultOverrides); // only F7's root order
     expect(hasTag(inInstance(ROOT2, 'A'), 'UIFocusable')).toBe(true); // the other instance is untouched
     expect(writes).toEqual([]); // a revert never touches the prefab
   });

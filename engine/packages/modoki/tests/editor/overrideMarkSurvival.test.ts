@@ -102,14 +102,15 @@ describe('override mark survival across a base edit', () => {
   it('keeps a position override even after the prefab base is edited to match it', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource, captureInstanceOverrides } = await getModule();
 
-    // Child base at x=0. Instantiate, then apply a recorded override x=-4.1 (as
-    // loading from a parent file would, via applyOverridesByRootInstance).
+    // Child base at x=0. Instantiate, then hold a recorded override x=-4.1 as a load from a parent file leaves it
+    // (`applyOverridesByLocalToEcs`): the value written, and recorded.
     const oldChild = childAtX(0);
     setPrefabCache(CHILD, oldChild as any);
     const root = instantiatePrefab(oldChild as any);
     setPrefabSource(root, { id: CHILD });
-    const { applyOverridesByRootInstance } = await getModule();
-    applyOverridesByRootInstance(root, { 1: { Transform: { x: -4.1 } } });
+    const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
+    index.get(root).set(Transform, { ...index.get(root).get(Transform), x: -4.1 });
+    markOverride(index.get(root), 'Transform', 'x');
 
     // Sanity: with the OLD base (x=0), the override is captured (value != base).
     expect(captureInstanceOverrides(root, oldChild as any)[1]?.Transform?.x).toBe(-4.1);

@@ -2,7 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { openIdentityScope, closeIdentityScope, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
+import { openIdentityScope, closeIdentityScope, worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
@@ -26,14 +26,14 @@ import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled, worldStateToken, beginFreshWorldState, captureSavePoint, captureSceneSavePoint, settleSavePoint, settleSceneSavePoint, restoreWorldStateToken, type SavePoint } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
+import { getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './prefabCache';
 import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
 import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
 import { levelDoc } from './prefabBase';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
 import { asSceneEntry, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
@@ -129,6 +129,9 @@ export interface SceneFile {
   /** v10+: guid of a base scene this scene extends (base-scene persistence).
    *  Omitted when the scene has no base. */
   baseScene?: string;
+  /** v19+ (#1914 F8, #1867): a copy of each NESTED prefab this scene's frames expand that is missing at the save, keyed by
+   *  its guid ({@link collectEmbeddedPrefabs}). Omitted when none is missing. */
+  embeddedPrefabs?: Record<string, EmbeddedPrefabDoc>;
 }
 
 // ── Serialize Scene (generic) ───────────────────────────
@@ -578,7 +581,11 @@ async function serializeSceneScoped(opts?: {
   for (const entry of entities) rewriteRuntimeGuidStrings(entry, durableForRuntime);
   assertNoRuntimeGuids(entities, 'a serialized scene');
 
-  const resources = collectResourceRefs(entities);
+  const embeddedPrefabs = await collectEmbeddedPrefabs(entityInfos, prefabRootInfo, entities);
+  // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).
+  const resources = collectResourceRefs(embeddedPrefabs
+    ? [...entities, ...Object.values(embeddedPrefabs).flatMap((d) => d.entities as unknown as SerializedEntity[])]
+    : entities);
 
   // This scene's own `loadedScenes` bookkeeping — the one lookup backs the scene's
   // `id`, its `createdAt` preservation (Phase 1, scene-loading.md: reuse the FILE's
@@ -629,7 +636,82 @@ async function serializeSceneScoped(opts?: {
   } else if (_currentBaseScene) {
     file.baseScene = _currentBaseScene;
   }
+  if (embeddedPrefabs) file.embeddedPrefabs = embeddedPrefabs;
   return file;
+}
+
+/** The copies this save writes for NESTED prefabs that are missing (#1914 F8 = A1, #1867; Unity's scene backup,
+ *  `MergedAsMissingWithSceneBackup`), keyed by guid, sorted — or `undefined` when none is missing.
+ *
+ *  A copy is the document a frame was EXPANDED from (I3): a live nested frame's own record, which a frame the load
+ *  expanded from a copy holds too — or, for a prefab no live frame expands (a row left unexpanded), the copy a loaded
+ *  scene carried, written back verbatim (I18) until the prefab is back. Only a prefab that does NOT load is copied: once it
+ *  is back it wins, and the copy goes at the next save. A copy is only ever BASE (I2/I17): it is the frame's template, and
+ *  the writer's own edits stay in the scene's records, measured against it, exactly as they were against the prefab.
+ *
+ *  Top-level instances are not copied: the loader reads those through `fetchPrefab`, and a missing one stays a
+ *  placeholder (#1699), so a copy would be bytes nothing reads. And a copy is written only when this scene's file
+ *  reaches its guid — through its entries, a prefab or copy they name, and so on — so a copy whose frames all went, one
+ *  that belongs to another scene of the chain, or one only a missing top-level instance nests, is not carried. */
+async function collectEmbeddedPrefabs(
+  entityInfos: readonly ReturnType<typeof getAllEntities>[number][],
+  topLevelRoots: ReadonlyMap<number, unknown>,
+  entities: readonly SerializedEntity[],
+): Promise<Record<string, EmbeddedPrefabDoc> | undefined> {
+  const world = getCurrentWorld();
+  const piMeta = getTraitByName('PrefabInstance');
+  const candidates = new Map<string, TemplateDocLike>();
+  const missing = new Map<string, boolean>();
+  const isMissing = async (guid: string): Promise<boolean> => {
+    let m = missing.get(guid);
+    if (m === undefined) { m = !(await getPrefabSource(guid)); missing.set(guid, m); }
+    return m;
+  };
+  if (piMeta) {
+    for (const info of entityInfos) {
+      if (!info.traits.includes('PrefabInstance')) continue;
+      const pi = readTraitData(info.id, piMeta) as { source?: string; rootInstanceId?: number } | null;
+      if (!pi?.source || pi.rootInstanceId !== info.id) continue;
+      const entity = findEntity(info.id);
+      if (!entity || unresolvedRefOf(entity)) continue;
+      const doc = frameRootDoc(world, entity)?.doc as TemplateDocLike | undefined;
+      if (!doc || topLevelRoots.has(info.id) || candidates.has(pi.source)) continue;
+      if (await isMissing(pi.source)) candidates.set(pi.source, doc);
+    }
+  }
+  for (const guid of embeddedPrefabGuids(world)) {
+    if (candidates.has(guid) || !(await isMissing(guid))) continue;
+    candidates.set(guid, embeddedPrefabDoc(world, guid) as TemplateDocLike);
+  }
+  if (!candidates.size) return undefined;
+  // The reach: every guid string the file holds, then every one inside a document a reached guid names that a LOAD would
+  // expand — a prefab that loads, or a copy. Not a missing top-level instance's record (#1738): it reloads as its
+  // placeholder (#1699) and expands no row, so a copy reached only through it is one no load reads, and the save after
+  // that reload, which cannot reach it, dropped it (hunt seed 1031, I23).
+  const reached = new Set<string>();
+  const queue: string[] = [];
+  collectStrings(entities, queue);
+  while (queue.length) {
+    const s = queue.pop()!;
+    if (reached.has(s) || !isGuid(s)) continue;
+    reached.add(s);
+    const doc = candidates.get(s) ?? getCachedPrefabSync(s);
+    if (doc) collectStrings(doc, queue);
+  }
+  const out: Record<string, EmbeddedPrefabDoc> = {};
+  for (const guid of [...candidates.keys()].sort()) {
+    // A deep copy: the file (and a Play snapshot holding it) must not alias the live record's document.
+    if (reached.has(guid)) out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+type TemplateDocLike = { entities: unknown[] } & Record<string, unknown>;
+
+/** Every string value anywhere in `node`, pushed onto `out`. */
+function collectStrings(node: unknown, out: string[]): void {
+  if (typeof node === 'string') { out.push(node); return; }
+  if (!node || typeof node !== 'object') return;
+  for (const v of Array.isArray(node) ? node : Object.values(node)) collectStrings(v, out);
 }
 
 /** Replace every runtime guid inside string VALUES of `node` (in place) with `resolve(guid)`, when that

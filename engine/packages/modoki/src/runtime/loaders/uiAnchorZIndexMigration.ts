@@ -24,7 +24,7 @@
  *  `UIAnchor`/`UIElement` as a trait bag has two real defects: it cannot tell an ENTITY's own
  *  `traits` (a full trait bag — every field a trait can have) from an OVERRIDE bag
  *  (`overrides[localId][TraitName]`/`nestedOverrides[path][localId][TraitName]` — a per-FIELD
- *  DIFF, `prefab.ts`'s `applyOverridesByRootInstance`), and the two need OPPOSITE carrier
+ *  DIFF, `applyOverridesByLocalToEcs`'s input), and the two need OPPOSITE carrier
  *  policies (see `migrateUIAnchorZIndexInOverrideBag` below) — and it will throw a `RangeError`
  *  on a self-referencing node and walk large `points`/tilemap payloads element-by-element for
  *  no reason, since nothing in them can carry a `UIAnchor` key.
@@ -87,7 +87,7 @@ export function migrateUIAnchorZIndexInTraits(traits: Record<string, unknown> | 
  *
  *  Why the opposite policy from the trait-bag case: an override/added bag is a per-FIELD DIFF,
  *  not a full trait bag, so "no sibling `UIElement` key" here means "this override doesn't touch
- *  `UIElement` YET", not "this entity has no `UIElement` trait." `applyOverridesByRootInstance`
+ *  `UIElement` YET", not "this entity has no `UIElement` trait." `applyOverridesByLocalToEcs`
  *  has an added-trait branch — an override can legitimately ADD a trait to a member that had
  *  none — so the entity this bag applies to may well have (or gain) a `UIElement` trait the bag
  *  simply hasn't mentioned. Dropping the value here (the generic walker's bug, #762 follow-up)

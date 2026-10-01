@@ -392,8 +392,8 @@ describe("an undo after a SAVED prefab edit takes UNMARKED fields from the CURRE
 });
 
 describe("a relink after a SAVED prefab edit takes UNMARKED fields from the CURRENT template (#1800 owner ruling)", () => {
-  // A here is a legacy member moved OUTSIDE its instance, so its whole Transform is part of the move (the save's gate
-  // exempts it, `gateOnMarks`) and a template Transform change does not reach it. `Rotate3D.axis` is an unmarked field
+  // A here is a legacy member moved OUTSIDE its instance, so its whole Transform is part of the move (the save writes a
+  // moved member's whole Transform diff, `recordedOverrides`) and a template Transform change does not reach it. `Rotate3D.axis` is an unmarked field
   // the template does reach, so it is the one each case moves.
   const edit = (d: ReturnType<typeof pDoc>) => { tplA(d).Rotate3D.axis = 'x'; tplA(d).Transform.y = 4; };
   const fields: [string, string][] = [['Rotate3D', 'axis'], ['Transform', 'y'], ['Transform', 'x'], ['Rotate3D', 'speed']];
@@ -453,34 +453,35 @@ describe("an undo after a SAVED edit of an ENCLOSING row leaves the nested insta
     expect(live).toEqual(reloaded);
   }
 
-  // The nested A's y = 9 (its own), then O's row states A.y = 4, then undo: A shows the row's 4, MARKED, as a load marks a
-  // layer's value (docs/prefabs.md I2). Mutation: drop the layer-mark loop from `takeUnmarkedFromBase` — y 4 unmarked.
-  it("field write: the undo takes the enclosing row's value, marked", async () => {
+  // The nested A's y = 9 (its own), then O's row states A.y = 4, then undo: A shows the row's 4, UNRECORDED — a layer's
+  // value is the instance's base, and a load records only the scene's own statements (#1914, docs/prefabs.md I2).
+  // Mutation: drop the base-value write from `takeUnmarkedFromBase` — y stays 9.
+  it("field write: the undo takes the enclosing row's value, unrecorded", async () => {
     await load(oScene());
     clearHistory();
     writeTraitFieldWithUndo(idOf('A'), meta('Transform'), 'y', 9);
     await savedRowEdit({ 2: { Transform: { y: 4 } } });
     expect(field(idOf('A'), 'Transform', 'y')).toBe(9);
     expect((await undoStep('undo')).did).toBe(true);
-    await liveEqualsReload('A', 'Transform', 'y', { value: 4, marked: true });
+    await liveEqualsReload('A', 'Transform', 'y', { value: 4, marked: false });
   });
 
   // Delete the nested root R (its frame, O's instance, survives), then O's row states R.y = 4, then undo: R comes back
-  // with the row's 4, marked. Held by #1820's rebase: R's own frame (O) is the one whose document changed.
-  it("delete the nested root: the undo's respawn takes the enclosing row's value, marked", async () => {
+  // with the row's 4, unrecorded. Held by #1820's rebase: R's own frame (O) is the one whose document changed.
+  it("delete the nested root: the undo's respawn takes the enclosing row's value, unrecorded", async () => {
     await load(oScene());
     clearHistory();
     deleteEntitiesWithUndo([idOf('R')]);
     await savedRowEdit({ 1: { Transform: { y: 4 } } });
     expect((await undoStep('undo')).did).toBe(true);
-    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: true });
+    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: false });
   });
 
   // One level deeper (#1831 seed 6246's shape): X = XR → a nested O, whose row 3 is the nested P's root R. Delete R (its
   // frame, the nested O, survives), then X's row states R.y = 4 through O's row 3 (`nestedOverrides`), then undo. The document that changed
   // is X's, not that of R's frame, so #1820's rebase never sees a stale frame. Mutation: drop the resync loop from the
-  // delete's undo (`deleteEntitiesWithUndo`) — y 0 unmarked.
-  it("delete a root two levels down: the undo's respawn takes the grand-outer row's value, marked", async () => {
+  // delete's undo (`deleteEntitiesWithUndo`) — y 0.
+  it("delete a root two levels down: the undo's respawn takes the grand-outer row's value, unrecorded", async () => {
     const X = 'cccccccc-0000-4000-8000-000000001800';
     const xDoc = {
       id: X, version: 5, name: 'X', rootLocalId: 1, entities: [
@@ -500,11 +501,11 @@ describe("an undo after a SAVED edit of an ENCLOSING row leaves the nested insta
     setPrefabCache(X, doc as never);
     await load(data);
     expect((await undoStep('undo')).did).toBe(true);
-    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: true });
+    await liveEqualsReload('R', 'Transform', 'y', { value: 4, marked: false });
   });
 });
 
-describe("a component re-added where an ENCLOSING row states it is marked, as a load marks it (#1893)", () => {
+describe("a component re-added where an ENCLOSING row states it is unrecorded, as a load leaves it (#1893, #1914)", () => {
   const OI = 'dddddddd-0000-4000-8000-000000001893';
   // O's row 3 (the nested P) states a Rotate3D on P's row 1 (R), which P's template does not define: what a Create
   // Prefab writes when it wraps an instance whose member had an added component (seed 1294's HR row for QR). The values
@@ -520,31 +521,31 @@ describe("a component re-added where an ENCLOSING row states it is marked, as a 
     const d = statedDoc(); prefabs.set(O, d); setPrefabCache(O, d as never);
     await load({ id: 's1893', version: 16, name: 'S', resources: [], entities: [{ id: 1, prefab: O, guid: OI, traits: { EntityAttributes: { name: 'OI', parentId: 0 } } }] } as unknown as SceneData);
     clearHistory();
-    expect(rotMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']); // precondition: the load marks what the row states
+    expect(rotMarks()).toEqual([]); // precondition: what the row states is base, not a record (#1914)
   });
   /** The marks now, then after a save + reopen: they must match. */
   async function marksAsReload(): Promise<string[]> {
     const live = rotMarks();
     await rebuild();
-    expect(rotMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+    expect(rotMarks()).toEqual([]);
     return live;
   }
 
-  // Mutation: drop the `markEnclosingStated` call from `reconcileOverrideMarks` — the re-add leaves both unmarked. And drop
-  // its `isPersistentTraitField` filter — the stale `oldField` the row names is marked live and not on a reload.
-  it('Remove Component, then Add Component: the re-added fields are marked', async () => {
+  // Mutation: have Add Component's reconcile mark every field it adds (`recordOverridesByDiff` marking unconditionally)
+  // — both are recorded live and not on a reload.
+  it('Remove Component, then Add Component: the re-added fields are unrecorded', async () => {
     removeTraitFromEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
     addTraitToEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
-    expect(await marksAsReload()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+    expect(await marksAsReload()).toEqual([]);
   });
 
   // The walk's shape (seed 1294): the add's REDO runs the same reconcile. Same mutation.
-  it("Add Component's redo marks them too", async () => {
+  it("Add Component's redo leaves them unrecorded too", async () => {
     removeTraitFromEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
     addTraitToEntitiesWithUndo([idOf('R')], meta('Rotate3D'));
     expect((await undoStep('undo')).did).toBe(true);
     expect((await undoStep('redo')).did).toBe(true);
-    expect(await marksAsReload()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+    expect(await marksAsReload()).toEqual([]);
   });
 });
 
@@ -595,8 +596,8 @@ describe('a legacy member moved out of its frame, relinked two levels down (#180
   // X = XR → OR (O), O = OR → B, R (nested P), P = R → A, with A a legacy member moved under B. Delete R: A is unlinked
   // where it stands. A saved edit of X states A's axis through O's row 3 (`nestedOverrides`); the undo relinks A. The
   // document that changed is X's, the one above A's frame, so no frame reads as stale and #1820's rebase never reaches A;
-  // it is not respawned either. Mutation: drop the detached members from the delete undo's pass — axis 'y' unmarked,
-  // the reload 'x' marked.
+  // it is not respawned either. Mutation: drop the detached members from the delete undo's pass — axis 'y' live, the
+  // reload 'x' (both unrecorded: a layer's value is base, #1914).
   it('delete R, a saved edit of X, undo: the relinked A matches the reload', async () => {
     const X = 'cccccccc-0000-4000-8000-000000001800';
     const gXO = 'eeeeeeee-0000-4000-8000-000000001801';
@@ -632,7 +633,49 @@ describe('a legacy member moved out of its frame, relinked two levels down (#180
     const state = () => ({ axis: field(idOf('A'), 'Rotate3D', 'axis'), marked: marksOf(idOf('A')).includes('Rotate3D.axis') });
     const live = state();
     await rebuild();
-    expect(state()).toEqual({ axis: 'x', marked: true });
+    expect(state()).toEqual({ axis: 'x', marked: false });
     expect(live).toEqual(state());
   });
+});
+
+// #1914 close-out review: F7's root order is IMPLIED by a role (`recordsRootOrder`), read through `getOverrideMarkSet`, so
+// a carrier that captured that view put it back as a STORED mark, and the mark outlived the role. A legacy file moved
+// R (the nested frame's root, owned by OR's frame) under Holder: R records nothing. Deleting or detaching OR ends R's
+// frame and makes R a scene root for the step, whose implied order the frame-ending captured; the undo relinked R with
+// it stored, and the save pinned R's order against the template. Mutation: capture `getOverrideMarkSet` instead of the
+// stored set in `recordDetachedMarks` — both red: R's marks gain `EntityAttributes.sortOrder` and its row a
+// `sortOrder: 0`.
+describe("an undo's carried marks are the STORED set, never F7's implied root order (#1914 close-out review)", () => {
+  const rRow = (data: SceneData) => (data.entities[0] as unknown as { members: Record<string, unknown> }).members[`/${gPN}`];
+  for (const [label, step] of [
+    ['delete OR', () => deleteEntitiesWithUndo([guidIdOf(INST)])],
+    ['detach OR', () => detachPrefabInstanceWithUndo(guidIdOf(INST), 'Detach prefab', '[test]')],
+  ] as const) {
+    it(`${label}, the undo: R's marks and its saved row are what they were`, async () => {
+      await load(movedScene(undefined, HOLDER));
+      clearHistory();
+      const before = { marks: marksOf(idOf('R')), row: rRow(await save()) };
+      expect(before.marks).toEqual([]); // precondition: a moved nested root records nothing
+      step();
+      expect((await undoStep('undo')).did).toBe(true);
+      expect({ marks: marksOf(idOf('R')), row: rRow(await save()) }).toEqual(before);
+    });
+
+    // …and an order R DID record in its owned role (the file states it) survives: the relink's record is taken after the
+    // frame-ending made R a scene root for the step, so a capture less the order that role records dropped it (re-review).
+    // Mutation: `getCarriedOverrideMarks` in `recordDetachedMarks` — R's marks lose the order, its row the `sortOrder: 3`.
+    it(`${label}, the undo: an order R's file states stays recorded`, async () => {
+      const s = movedScene(undefined, HOLDER) as unknown as { entities: Array<{ members: Record<string, Record<string, unknown>> }> };
+      s.entities[0]!.members[`/${gPN}`] = { ...s.entities[0]!.members[`/${gPN}`], traits: { EntityAttributes: { sortOrder: 3 } } };
+      await load(s as unknown as SceneData);
+      clearHistory();
+      const state = async () => ({ marks: marksOf(idOf('R')), row: rRow(await save()), order: field(idOf('R'), 'EntityAttributes', 'sortOrder') });
+      const before = await state();
+      expect(before.marks).toContain('EntityAttributes.sortOrder'); // precondition
+      expect(before.order).toBe(3);
+      step();
+      expect((await undoStep('undo')).did).toBe(true);
+      expect(await state()).toEqual(before);
+    });
+  }
 });
