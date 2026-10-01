@@ -5161,7 +5161,7 @@ and is how this stayed invisible. Check the default, not the grep.
 
 ### Paint order
 
-`paintOrder.ts` `computePaintOrder` is the single stacking source shared with the editor SceneView: a depth-first walk of the hierarchy by `EntityAttributes.sortOrder` (lower = painted first / furthest back; last-visited on top), assigned to each object's Pixi `zIndex` (slot containers are `sortableChildren`, set ONCE at slot creation). `Renderable2D.orderInLayer` / `Text2D.orderInLayer` (Unity "Order in Layer") RE-RANKS globally — higher = on top, independent of tree position, with the hierarchy DFS index as the stable tiebreak — so a cut-out character's parts parented to scattered bones can stack by an explicit layer order.
+`paintOrder.ts` `computePaintOrder` is the single stacking source shared with the editor SceneView: a depth-first walk of the hierarchy by `EntityAttributes.sortOrder` (lower = painted first / furthest back; last-visited on top), assigned to each object's Pixi `zIndex` (slot containers are `sortableChildren`, set ONCE at slot creation). `Renderable2D.orderInLayer` / `Text2D.orderInLayer` / `SkinnedSprite2D.orderInLayer` (Unity "Order in Layer"; the list is `ORDERED_2D_TRAITS` in `orderInLayer.ts`) RE-RANKS globally — higher = on top, independent of tree position, with the hierarchy DFS index as the stable tiebreak — so a cut-out character's parts parented to scattered bones can stack by an explicit layer order.
 
 ### Per-viewport instancing
 
@@ -5298,6 +5298,73 @@ The rule now has its first 3D instance too (#477): `scene3DSync.ts`'s `syncMater
 The same rebuild path had a second, sharper instance of the ordering error (#482): an unknown `Renderable3DPrimitive.mesh` name (a hand-edited scene, or a primitive kind renamed since the scene was authored — `modoki_create_entity` refuses an unknown name outright, so this only arrives via `modoki_mutate_scene` `setTrait` or a hand-edited `.scene.json`) used to `scene.remove` the old mesh, dispose its geometry, and clear the tracking maps, and only THEN call `createPrimitiveMesh`, discover it returned `null`, and throw inside the render pass on the bare `!`. Fixed by gating the entire rebuild — the free included — on the name being one `isPrimitive` recognizes. The first attempt at that fix still had the bug: it gated only the kind-change half, so a `sizeChanged` edit could tear the entity down regardless of whether the kind was known; and because `ecsSprites` is deliberately never updated for an unknown name, `kindChanged` stays `true` forever once it happens, so the entity was armed for every LATER size edit too and eventually vanished — geometry disposed, nothing logged (the warn-once had already fired on the earlier frame). Gating the whole condition (`sizeChanged || kindChanged`) on `meshKnown` closes every route at once.
 
 **The corpus was swept exhaustively in 2026-08 — don't redo it, extend it.** Every free-shaped call (`.dispose()` / `.destroy(` / `Assets.unload` / `release*Texture`) under `runtime/**`, `engine/app/**`, `games/**`, `demos/**`: 237 sites across 44 files, each asked *what is freed, what still binds it, which pass renders it*. Beyond the two fixed above, **no confirmed violation exists**. What makes the rest safe is worth knowing, because it is mostly structural rather than careful: THREE's `dispose()` is a re-upload, not a death (which is why the 3D video twin needs no deferral queue and why #477's symptom was a stutter, not a blank frame), whereas Pixi's `destroy(true)` is fatal; owned geometry is always a fresh per-call object with no second binder; and every `.then()`-shaped rebuild is a microtask, so it cannot land inside a synchronous render pass. One residual remains filed, not lurking: #481 (a font atlas texture that a disposed provider would hand back already destroyed — latent, no reaching chain found, and a destroyed `Texture` is truthy so the existing guard misses it); #482 above is now fixed. The deferral machinery a new site should reuse rather than reinvent: `pendingMaskDestroy`, `pendingDestroy`, `releaseSpriteTexture`'s macrotask defer, `retireDerivedMaterial`, `retiredMaterials3D`/`retiredEnvironments`, and `textureResolver`'s refcounted `retired` map.
+
+### Frame2D — fit a subtree to what is on screen of its canvas (the 2D CameraFrame)
+
+`Frame2D` (`traits/Frame2D.ts`; applied by `rendering/frame2D.ts` through the L0 seam `core/ecs/localFit2D.ts`) is
+for art that must fill "the screen" on every phone shape: a full-bleed backdrop, a parallax scene. Put it on the
+entity holding that art, **directly under the canvas host**: the fit is made in the canvas's design space and
+applied in the parent's, so a Frame2D anywhere deeper is not fitted, and it says so once in the console. Author the
+subtree inside a `width` x `height` box whose
+top-left is the entity's origin, then pick `fit` (`cover` fills and crops, `contain` fits and bands, `stretch`
+matches non-uniformly) and `alignX`/`alignY` (which part stays: 0 = left/top, 1 = right/bottom).
+- **The fit is applied, never authored.** `transformPropagationSystem` composes the entity as `fit · local` at its
+  snapshot, so every world-pose reader agrees: the renderer, picking, physics, particles and sprite batches. The
+  on-demand composer (`getWorldTransform3D`) applies the same fit. The Transform keeps its authored values and
+  nothing dirties the scene.
+- **Writing a world pose back into a fitted entity's Transform** inverts through `localFrame2D(parentWorld, fit)`
+  (`core/ecs/localFit2D.ts`): the parent with the entity's OWN fit composed in, the frame its Transform actually lives
+  in. Inverting the bare parent writes the fitted pose into the Transform and the next pass fits it again (a +10 px
+  drag under a 4x fit drew at -2460). The SceneView 2D gizmo and 2D physics write-back (a body on a fitted host) go
+  through `localFrame2D`. The live `space:'world'` write (`modoki_set_transform`, `modoki_mutate_scene` with an editor
+  open; `agentEditorOps.ts`) works on full 3D TRS, so it inverts the bare parent and then undoes the fit PER AXIS
+  (`(x − fit.x)/kx`, `sx/kx`), as propagation applied it; a fit folded into the parent matrix decomposes a `stretch`
+  fit to the wrong angle. A new writer must do one or the other.
+- ⚠️ **Re-parenting and file-space world math do not see the fit.** A keep-world re-parent into or out of a Frame2D
+  subtree (the Hierarchy drag, `editor/undo/entityActions.ts`) composes world poses from the authored local Transforms,
+  and `modoki_mutate_scene` with no editor open computes from the scene FILE (`runtime/scene/transformSpace.ts`).
+  Neither includes a fit, which depends on the screen. Under a Frame2D, write local values or drag in the SceneView.
+- **"On screen" is the primary Scene2D's** (the Game view in the editor), which publishes each canvas's visible
+  design rect every frame (`publishCanvasView2D`, from `computeCanvasScale`). With no renderer (headless, tests)
+  it is the canvas's reference rect. A resize changes the fit, which fails the pass's unchanged check like a
+  moved Transform. The fit lands in the NEXT frame's propagation and writes no trait, so a pass whose fits differ
+  from the last pass's bumps `frame2DFitEpoch()`, and every Scene2D (the Game view's and the editor SceneView's)
+  draws the frame it sees a new epoch, or a stopped editor's idle skip would keep showing the old fit. The editor's
+  SceneView draws with the Game view's fit.
+- **Placing things at the screen's edges:** `frame2DVisibleLocal(entity)` is the visible rect in the frame's own
+  space, and `designToFrame2D(entity, x, y)` maps a canvas design point into it.
+- All of its maps are keyed by the packed entity, so an index recycled between passes never inherits a fit.
+- Tests (from `engine/`): `packages/modoki/tests/runtime/frame2D.test.ts`; the redraw in
+  `packages/modoki/tests/runtime/Scene2D.test.ts`; the write-backs in `packages/modoki/tests/editor/gizmoFrame2D.test.ts`,
+  `tests/editor/applySceneOpsLive.test.ts` and `packages/modoki/tests/runtime/physics2DParented.test.ts`. The
+  SceneView wiring of `localFrame2D` (a `.tsx`) has no unit test.
+
+### Sprite batches — many short-lived sprites with no entity each
+
+`registerSpriteBatch2D(key, { anchor, sprites })` (`rendering/spriteBatchRegistry.ts`, exported from
+`@modoki/engine/runtime`; drawn by `spriteBatch2D.ts`) is for effects with hundreds of pieces that live a second:
+debris, sparks, confetti. The game hands over plain data each frame. The primary `Scene2D` writes it into Pixi
+`ParticleContainer`s after the particle pass: one per texture SOURCE, because a ParticleContainer draws every
+particle from one source. **Pack the batch's art into one atlas and the whole batch is one draw.** A trimmed atlas
+also cuts the fill (docs/textures.md § Trim).
+- **Where it draws** comes from the `anchor` entity: its Canvas2D ancestor is the canvas, and its paint rank is the
+  container's `zIndex`. Author the anchor in the scene as an invisible `Renderable2D` carrying the `orderInLayer` the
+  batch should take. A missing anchor means the batch is simply not drawn. The anchor's mask group (`Mask2D`), its
+  ancestry's `GroupAlpha` and its `isActive` apply to the whole batch, as they would to a sprite in its place.
+- **Fields mean what they mean on `Renderable2D`**: half extents, pivot 0..1, radians, tint. A ref is a texture
+  GUID/frame, `square` or `circle`, and one that has not loaded yet is skipped until it has.
+- **An item with `opacity` 0 is not drawn at all** (no quad, no fill), and transparent items do not keep the canvas
+  redrawing: it redraws on a frame that draws something, and on the frame after the last one goes. Draw order is
+  by source group (first seen first), then item order.
+- **Not tested at the renderer seam:** `Scene2D.batchTexture`/`releaseBatchTextures` (retain/release, the
+  `whenResident` cancel) have no unit test; the sync step does (`tests/runtime/spriteBatch2D.test.ts`).
+- Textures are retained by the renderer for as long as its batches live and released on a world swap or stop. The
+  editor SceneView does not draw batches; they are a play-time effect, like particles.
+
+**Why it exists** (#1926, measured on an iPhone Air): Ice Reef's clear debris was one pooled ECS sprite per piece,
+and a long cascade cost 25-30 ms of CPU a frame. The game wrote two traits per piece, transform propagation walked
+them, and Scene2D synced each one. On the desktop editor, 1,000-3,000 pieces through a batch cost the presenter
+0.6 ms and the batch pass 0.4 ms a frame.
 
 ### Canvas2D Application pool + GPU-context budget
 

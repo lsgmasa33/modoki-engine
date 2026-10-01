@@ -53,8 +53,8 @@ const BOOLEAN_DESTROY = /\.destroy\s*\(\s*(?:true|false)\s*\)/g;
 const NON_APPLICATION_DESTROYS: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::g.destroy(true)',
     reason: '`releaseGeometry(g: Geometry)` — `destroyBuffers`, not an Application' },
-  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::tex.destroy(false)', count: 2,
-    reason: 'Texture wrappers over a kept source — `destroySource: false`' },
+  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::tex.destroy(false)', count: 3,
+    reason: 'Texture wrappers over a kept source — `destroySource: false` (the third: the sprite batches\' framed wrappers, `releaseBatchTextures`)' },
   { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::p.tex.destroy(true)',
     reason: '`flushPendingMaskDestroy` — the mask RenderTexture queued in `pendingMaskDestroy` (#455)' },
   { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::oldTex.destroy(false)', count: 2,

@@ -30,6 +30,7 @@ import { getSimDelta } from '../core/getTime';
 import { findEntityByGuid, getCurrentWorld } from '../core/ecs/world';
 import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D } from '../core/ecs/worldTransform';
+import { localFit2DOf, localFrame2D } from '../core/ecs/localFit2D';
 import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { physics2DEvents } from './Physics2DEvents';
 import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, makeColliderInfo, type ColliderInfo, type ColliderMap, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
@@ -776,12 +777,15 @@ function worldScaleOf(entity: Entity): { sx: number; sy: number } {
   return _ws2;
 }
 const _lc2: TfData = { x: 0, y: 0, rz: 0 };
-/** Convert an ECS-space WORLD 2D pose → LOCAL by inverting the PARENT's world 2D transform:
- *  local = S⁻¹ · R(−RZ) · (world − P). Uses the cached parent world (O(1)), composing it
- *  on-demand only on a cache miss (headless without the pre-pass) so it stays symmetric with
- *  the seed. Callers guard `parentId !== 0`, so the parent is always a real entity here. */
-function worldToLocal2D(parentId: number, wx: number, wy: number, wrz: number): TfData {
-  const p = worldTransforms.get(parentId) ?? getWorldTransform3D(parentId, getCurrentWorld());
+/** Convert an ECS-space WORLD 2D pose → LOCAL by inverting the frame the body's Transform lives in: its PARENT's
+ *  world 2D transform, with the body's own Frame2D fit composed in when it has one (`localFrame2D`; without it a body
+ *  ON a fitted host would get its fitted pose written back and fitted again). local = S⁻¹ · R(−RZ) · (world − P).
+ *  Uses the cached parent world (O(1)), composing it on-demand only on a cache miss (headless without the pre-pass)
+ *  so it stays symmetric with the seed. Callers guard `parentId !== 0`, so the parent is always a real entity. */
+function worldToLocal2D(entity: Entity, parentId: number, wx: number, wy: number, wrz: number): TfData {
+  const pw = worldTransforms.get(parentId) ?? getWorldTransform3D(parentId, getCurrentWorld());
+  const fit = localFit2DOf(entity.valueOf() as number);
+  const p = fit ? localFrame2D(pw, fit)! : pw;
   const dx = wx - p.x, dy = wy - p.y;
   const c = Math.cos(-p.rz), s = Math.sin(-p.rz);
   const sx = p.sx || 1, sy = p.sy || 1;
@@ -1063,7 +1067,7 @@ export function physics2DSystem(world: World): void {
     // the LOCAL Transform stays correct. Root bodies keep the fast path (world === local). (P2)
     const parentId = parentIdOf(entity);
     if (parentId) {
-      const local = worldToLocal2D(parentId, _v.x, _v.y, wrz);
+      const local = worldToLocal2D(entity, parentId, _v.x, _v.y, wrz);
       tf.x = local.x; tf.y = local.y; tf.rz = local.rz;
     } else {
       tf.x = _v.x; tf.y = _v.y; tf.rz = wrz;
@@ -1086,7 +1090,7 @@ export function physics2DSystem(world: World): void {
     // Character body is posed in WORLD space; write back into LOCAL for a parented character. (P2)
     const parentId = parentIdOf(entity);
     if (parentId) {
-      const local = worldToLocal2D(parentId, _v.x, _v.y, tf.rz);
+      const local = worldToLocal2D(entity, parentId, _v.x, _v.y, tf.rz);
       tf.x = local.x; tf.y = local.y;
     } else {
       tf.x = _v.x; tf.y = _v.y;

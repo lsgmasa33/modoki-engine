@@ -25,6 +25,7 @@ import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { getCurrentWorld } from './worldRegistry';
 import { decomposeTrs } from './decomposeTrs';
+import { localFit2DOf } from './localFit2D';
 
 export interface WorldTransform3D { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }
 
@@ -53,7 +54,12 @@ function buildTransformMaps(world: World): void {
   _tfById.clear();
   _parentById.clear();
   world.query(Transform).updateEach(([tf], entity) => {
-    _tfById.set(entity.id(), { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz });
+    // A local fit (`Frame2D`) composes into the local exactly as transformPropagationSystem applies it, so this
+    // on-demand pose agrees with the cache (the fit is the last pass's: core/ecs/localFit2D.ts).
+    const fit = localFit2DOf(entity.valueOf() as number);
+    _tfById.set(entity.id(), fit
+      ? { x: fit.x + fit.kx * tf.x, y: fit.y + fit.ky * tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: fit.kx * tf.sx, sy: fit.ky * tf.sy, sz: tf.sz }
+      : { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz });
   });
   world.query(EntityAttributes).updateEach(([ea], entity) => {
     const p = (ea as { parentId?: number }).parentId || 0;

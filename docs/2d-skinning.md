@@ -14,7 +14,7 @@ name-path with no new timeline machinery.
 ## Vocabulary
 
 - **`SkinnedSprite2D`** (trait) — the renderable root. References a `.rig2d.json` asset
-  by GUID (`rig`) + `color`/`opacity`/`flipX`/`flipY`/`isVisible`. It is its OWN
+  by GUID (`rig`) + `color`/`opacity`/`flipX`/`flipY`/`isVisible`/`orderInLayer` (the same draw-order re-rank as `Renderable2D.orderInLayer`, docs/rendering.md). It is its OWN
   renderable — it does NOT carry `Renderable2D`. Fully scalar (satisfies the
   `traitScalarFields` guard); all structured rig data lives in the asset.
 - **`Bone2D`** (trait) — marks an entity as a bone; carries only `name` (must match a

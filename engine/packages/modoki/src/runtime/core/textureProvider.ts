@@ -23,6 +23,11 @@ export interface ResolvedSprite {
    *  downscaled, multiply frame coords by `loadedTexW / sheetW`. Null ⇒ no scaling. */
   sheetW: number | null;
   sheetH: number | null;
+  /** A trimmed atlas member: `frame` holds only its visible pixels, which sit at `trim` inside the member's full
+   *  `orig` size (source px). A consumer that honours it draws at the full size with the pivot in the full frame
+   *  (Pixi's Texture `orig`/`trim`); one that ignores it draws the crop stretched to the frame. */
+  orig?: { w: number; h: number };
+  trim?: { x: number; y: number; w: number; h: number };
   /** 9-slice border insets (source px), for UI `border-image`. Absent ⇒ plain image.
    *  `scale` = CSS px drawn per source px of border (Unity PPU-style); absent ⇒ 1. */
   border?: { l: number; r: number; t: number; b: number; scale?: number };
@@ -36,7 +41,8 @@ export interface TextureProvider {
   releaseTexture3D(tex: THREE.Texture | null | undefined): void;
   getSpriteEpoch(ref: string): number;
   /** Loosely typed (not `AssetType`, which lives in loaders/assetManifest.ts, L3) — callers
-   *  only ever compare the result against a couple of literal strings. */
+   *  only ever compare the result against a couple of literal strings. A member of a built atlas answers
+   *  'sprite' even when the manifest has no entry for it (a shipped build folds members into their atlas). */
   getAssetType(guid: string): string | undefined;
   ensurePixiKtxTranscoder(): void;
 }

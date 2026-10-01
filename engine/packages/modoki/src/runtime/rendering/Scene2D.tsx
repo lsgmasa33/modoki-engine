@@ -29,7 +29,7 @@
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
 import type { Entity, World } from 'koota';
-import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
+import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
 import { onAssetInvalidated } from '../core/assetInvalidation';
@@ -38,6 +38,7 @@ import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, Flat
 import { MaterialInstance } from '../traits/MaterialInstance';
 import { applyTextAnimation, isTextAnimating, isColorEffect, textAnimElapsed, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
+import { beginProfilerSample, endProfilerSample } from '../core/profilerMarkers';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
@@ -78,6 +79,11 @@ import {
   createParticleSync2DState, syncParticles2D, releaseCanvas2DEmitters, disposeParticleSync2DState,
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
+import { frameTexture } from './frameTexture';
+import { forgetCanvasView2D, frame2DFitEpoch, publishCanvasView2D, visibleDesignRect } from './frame2D';
+import { createSpriteBatchState, disposeSpriteBatchState, syncSpriteBatches2D, type SpriteBatchCtx, type SpriteBatchState } from './spriteBatch2D';
+import { hasSpriteBatches2D } from './spriteBatchRegistry';
+import { getDefaultParticleTexture } from '../particles/pixiParticleObject';
 import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
 import { getRunMode, isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
@@ -523,24 +529,6 @@ export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: 
   geo.getBuffer('aPosition').update();
 }
 
-/** Build the per-slot texture for a sprite: the base texture for a whole image, or a
- *  framed WRAPPER (sub-rect) for a sliced sprite / atlas frame. Source-px frames are
- *  scaled to the actually-loaded variant (which `maxSize` may have downscaled). */
-function frameTexture(base: Texture, r: ResolvedSprite): Texture {
-  if (!r.frame) return base;
-  let { x, y, w, h } = r.frame;
-  if (r.sheetW && r.sheetH && base.width > 0 && base.height > 0) {
-    const sx = base.width / r.sheetW, sy = base.height / r.sheetH;
-    x *= sx; y *= sy; w *= sx; h *= sy;
-  }
-  // Clamp into the base texture so a slightly-off rect never throws on upload.
-  x = Math.max(0, Math.min(x, base.width));
-  y = Math.max(0, Math.min(y, base.height));
-  w = Math.max(1, Math.min(w, base.width - x));
-  h = Math.max(1, Math.min(h, base.height - y));
-  return new Texture({ source: base.source, frame: new Rectangle(x, y, w, h) });
-}
-
 /** Mint what a material Mesh samples, from an already-resolved ref: the base texture for a whole
  *  image, a framed WRAPPER for an atlas slice.
  *
@@ -915,6 +903,8 @@ export class Scene2DRenderer {
   //  2. Per-entity change detection (while the sim runs we must scan). Only canvases
   //     with a changed entity are GPU-rendered (`dirtyCanvases` → pool.renderAll).
   private _externalDirty = true; // start dirty so the first frame always draws
+  /** The Frame2D fit epoch this renderer last drew (rendering/frame2D.ts `frame2DFitEpoch`). */
+  private _fitEpoch = frame2DFitEpoch();
 
   private readonly lastRender = new Map<number, RenderSnap>();
   private readonly lastMeshRender = new Map<number, MeshSnap>();
@@ -988,6 +978,15 @@ export class Scene2DRenderer {
   // `Orphan2DTracker` in canvas2DRouting.ts for what it guarantees and why it is not inline here.
   private readonly orphan2D = new Orphan2DTracker();
 
+  // ── Sprite batches (spriteBatch2D.ts): game-fed sprites with no entity each; primary renderer only ──
+  private readonly batchState: SpriteBatchState = createSpriteBatchState();
+  private readonly batchCtx: SpriteBatchCtx;
+  /** Each batch ref's texture (null while it loads, or for a ref that resolves to nothing). */
+  private batchTextures = new Map<string, Texture | null>();
+  /** The urls the batches hold (`retainSpriteTexture`), and the framed wrappers they own. */
+  private readonly batchUrls = new Set<string>();
+  private readonly batchWrappers: Texture[] = [];
+
   // ── 2D particle emitters ──
   private particleState2D: ParticleSync2DState | null = null;
   private readonly _oneComp = { x: 1, y: 1, scale: 1 };
@@ -1035,6 +1034,59 @@ export class Scene2DRenderer {
       compensate: (cid) => this.canvasCompensate.get(cid) ?? this._oneComp,
       groupAlphaOf: (id) => this.groupAlphaOf.get(id) ?? 1,
     };
+    this.batchCtx = {
+      canvasIdOf: (id) => this.findCanvasAncestor(id),
+      parentContainer: (cid, id) => { const slot = this.pool.getSlot(cid); return slot ? this.containerFor(slot, id) : null; },
+      isActive: (id) => !deactivatedEntities.has(id),
+      groupAlphaOf: (id) => this.groupAlphaOf.get(id) ?? 1,
+      markDirty: (cid) => { this.dirtyCanvases.add(cid); },
+      compensate: (cid) => this.canvasCompensate.get(cid) ?? this._oneComp,
+      paintOf: (id) => this.paintOrderOf.get(id),
+      textureOf: (ref) => this.batchTexture(ref),
+    };
+  }
+
+  /** A sprite batch's texture for `ref`: held for as long as the batches live (`releaseBatchTextures`), loaded
+   *  through the same retrier as the sprite pass, and null until it is resident. */
+  private batchTexture(ref: string): Texture | null {
+    // Keyed by the ref's re-slice epoch too, as the sprite pass is: a sheet re-sliced (or a texture reimported)
+    // during Play re-resolves instead of drawing the old frame for the rest of the world.
+    const key = `${ref}|${getSpriteEpoch(ref)}`;
+    const have = this.batchTextures.get(key);
+    if (have !== undefined) return have;
+    if (ref === 'square') { this.batchTextures.set(key, Texture.WHITE); return Texture.WHITE; }
+    if (ref === 'circle') { const t = getDefaultParticleTexture(); this.batchTextures.set(key, t); return t; }
+    // An unknown guid warns through resolveSprite, as the sprite pass does (#1408), instead of vanishing quietly.
+    if (isUnknownAssetGuid(ref)) resolveSprite(ref);
+    const resolved = isImagePath(ref) ? resolveSprite(ref) : undefined;
+    this.batchTextures.set(key, null);
+    if (!resolved) return null;
+    const url = resolved.url;
+    if (!this.batchUrls.has(url)) { retainSpriteTexture(url); this.batchUrls.add(url); }
+    const table = this.batchTextures;
+    const bind = (base: Texture) => {
+      const t = frameTexture(base, resolved);
+      if (t !== base) this.batchWrappers.push(t);
+      table.set(key, t);
+    };
+    const cached = Assets.cache.has(url) ? (Assets.get(url) as Texture | undefined) : undefined;
+    if (cached?.source) bind(cached);
+    else {
+      if (cached) Assets.cache.remove(url);
+      // Cancelled once the table is replaced (`releaseBatchTextures`: a world swap, the renderer stopping).
+      this._materialTex.whenResident(url, () => this.batchTextures !== table, () => { bind(Assets.get(url) as Texture); this.markDirty(); });
+    }
+    return table.get(key) ?? null;
+  }
+
+  /** Drop the batches' containers and textures (a world swap, the renderer stopping). */
+  private releaseBatchTextures(): void {
+    disposeSpriteBatchState(this.batchState, this.batchCtx);
+    for (const tex of this.batchWrappers) tex.destroy(false);
+    this.batchWrappers.length = 0;
+    for (const url of this.batchUrls) releaseSpriteTexture(url);
+    this.batchUrls.clear();
+    this.batchTextures = new Map();
   }
 
   /** Mark the 2D layer as needing a redraw next frame. Fired on editor ECS writes
@@ -1560,6 +1612,10 @@ export class Scene2DRenderer {
     // `renderAll` is reached, so while the sim is stopped/paused nothing would ever deliver it and
     // the blank frame the aborted render presented would stand (#455).
     if (this.pool.hasRedrawOwed()) this._externalDirty = true;
+    // A Frame2D fit that changed in this frame's propagation (a resize, the view forgotten) moved world poses without
+    // writing a trait, so nothing else would wake an idle renderer: the Game view's or the editor SceneView's.
+    const fitEpoch = frame2DFitEpoch();
+    if (fitEpoch !== this._fitEpoch) { this._fitEpoch = fitEpoch; this._externalDirty = true; }
 
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
@@ -1572,6 +1628,10 @@ export class Scene2DRenderer {
     let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
+    // Sub-spans of this canvas pass, so a phone's profiler can name a slow frame (#1926: a 55 ms
+    // render2d frame on the iPhone Air had no finer marker). One open at a time; a throw mid-pass
+    // leaves one unbalanced, which the next frame's begin resets.
+    beginProfilerSample('2d:prep');
     this.activeIds.clear();
     this.activeMaskIds.clear();
     this.parentOfEntity.clear();
@@ -1694,6 +1754,10 @@ export class Scene2DRenderer {
           computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW, maxRefH);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
+        // What of this canvas is on screen, for Frame2D (rendering/frame2D.ts). The primary renderer's only: the
+        // editor's SceneView draws the same world at another size, and one world has one fit. The fit it implies lands
+        // in the next frame's propagation, and every renderer is woken by the fit epoch (see the idle gate).
+        if (this.primary) publishCanvasView2D(entity, visibleDesignRect({ scaleX, scaleY, offsetX, offsetY }, actualW, actualH));
         // `scale` (min(scaleX, scaleY)) rides along with the shape compensation (#752) — it's
         // the canvas's own uniform on-screen factor, needed by the Text2D pass's effScale.
         this.canvasCompensate.set(canvasEntityId, { x: compensateX, y: compensateY, scale });
@@ -1715,6 +1779,8 @@ export class Scene2DRenderer {
 
     // Step 3: Query all Renderable2D entities, find their Canvas2D ancestor, and —
     // when their render inputs changed since last frame — redraw.
+    endProfilerSample();
+    beginProfilerSample('2d:sprites');
     world.query(Transform, Renderable2D).updateEach(
       ([tf, rend]: [any, any], entity: any) => {
         if (!rend.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
@@ -1949,6 +2015,8 @@ export class Scene2DRenderer {
     // Texture.WHITE when it has no image sprite). A MaterialInstance drives the shader's
     // uniforms. The Shader is registered in entityShaders for the driver; a per-frame purge
     // drops entries for entities that left.
+    endProfilerSample();
+    beginProfilerSample('2d:materials');
     const materialIds = this._materialIdsScratch;
     materialIds.clear();
     world.query(Transform, Renderable2D).updateEach(
@@ -2252,6 +2320,8 @@ export class Scene2DRenderer {
     // skin2DSystem wrote into skin2DBuffers and uploads them to PixiJS Meshes — ONE Mesh per
     // rig part, held in a per-entity Container. Positions re-upload only when the deform
     // version advanced (idle rig ⇒ no GPU churn).
+    endProfilerSample();
+    beginProfilerSample('2d:skinned');
     world.query(Transform, SkinnedSprite2D).updateEach(
       ([tf, ss]: [any, any], entity: any) => {
         if (!ss.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
@@ -2390,6 +2460,8 @@ export class Scene2DRenderer {
     // transform moves. The atlas texture loads async (font-owned lifetime, freed on
     // scene teardown). Anchor is applied via the mesh pivot; paint order via zIndex.
     const fontSceneId = getCurrentSceneId();
+    endProfilerSample();
+    beginProfilerSample('2d:text');
     world.query(Transform, Text2D).updateEach(
       ([tf, t]: [any, any], entity: any) => {
        try {
@@ -2743,6 +2815,8 @@ export class Scene2DRenderer {
     );
 
     // Release pool slots for Canvas2D entities that disappeared
+    endProfilerSample();
+    beginProfilerSample('2d:slot-cleanup');
     for (const id of this.prevCanvasIds) {
       if (!this.currentCanvasIds.has(id)) {
         this.destroyColliderOverlay(id); // drop the canvas's overlay before its slot is released
@@ -2785,6 +2859,8 @@ export class Scene2DRenderer {
     // slots + routing maps are built) and before the GPU render. Runtime → engine time. Editor →
     // the preview provider: a wall-clock dt while previewing, else DISPOSE the emitters so toggling
     // the FX button off clears them (mirrors the 3D preview), marking their canvases to redraw clean.
+    endProfilerSample();
+    beginProfilerSample('2d:particles+overlays');
     if (this.particleState2D) {
       if (this.particleDt !== undefined && previewDt === undefined) {
         if (this.particleState2D.recs.size) {
@@ -2795,6 +2871,8 @@ export class Scene2DRenderer {
         syncParticles2D(world, this.particleCtx, this.particleState2D, previewDt);
       }
     }
+    // Sprite batches: the game's entity-free sprites, into their anchors' canvases (runtime only).
+    if (this.primary && (hasSpriteBatches2D() || this.batchState.batches.size)) syncSpriteBatches2D(world, this.batchCtx, this.batchState);
 
     // Video sprites: adopt each playing entity's HTMLVideoElement onto its Sprite. Runs
     // after the sprite pass (it needs the slots) and before renderAll.
@@ -2820,7 +2898,10 @@ export class Scene2DRenderer {
     this.drawColliderOverlays(world);
 
     // Render only the canvases whose content changed this frame (F1).
+    endProfilerSample();
+    beginProfilerSample('2d:gpu-submit');
     this.pool.renderAll(this.dirtyCanvases);
+    endProfilerSample();
   }
 
   /** Which on-screen surface THIS instance speaks for — `'game-2d'` for the primary
@@ -2943,6 +3024,7 @@ export class Scene2DRenderer {
       // Dispose emitter handles + clear recs (the state object stays reusable for the new scene) —
       // recycled ids must not alias stale emitters.
       if (this.particleState2D) disposeParticleSync2DState(this.particleState2D);
+      this.releaseBatchTextures();
       // Orphan-warn bookkeeping is WORLD-lifecycle (#700). `prune()` bounds it WITHIN a world, but
       // across a swap koota recycles ids as the norm rather than the exception, so a surviving
       // `id:` key would silence the new world's occupant of that id on its very first orphaning —
@@ -3040,6 +3122,9 @@ export class Scene2DRenderer {
     this.dirtyCanvases.clear();
     this.clearAllColliderOverlays();
     if (this.particleState2D) { disposeParticleSync2DState(this.particleState2D); this.particleState2D = null; }
+    this.releaseBatchTextures();
+    // Nothing draws now: Frame2D falls back to each canvas's reference rect, not this renderer's last size.
+    if (this.primary) forgetCanvasView2D();
     this.orphan2D.reset();   // world-lifecycle, same reason as the onWorldSwap handler (#700)
     // Drop this renderer's sim claim on every pool slot (#718) — same call, same position as the
     // `onWorldSwap` handler above, and for the same reason: it must run AFTER the `disposeSlot`

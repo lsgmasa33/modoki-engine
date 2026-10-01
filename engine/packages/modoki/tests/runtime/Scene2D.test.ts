@@ -2362,6 +2362,48 @@ describe('Scene2D.renderFrame', () => {
       expect(render).toHaveBeenCalledTimes(1);
       broker.clearEntity2DMaterialDirty();
     });
+
+    // Frame2D (#1926 close-out reviews): a resize publishes the canvas's new visible rect, and the fit it implies lands
+    // in the next frame's transform propagation, which writes no trait. Every renderer — the Game view's AND the
+    // editor SceneView's (not primary) — is woken by the fit epoch, or a stopped editor keeps drawing the old fit.
+    it('draws, in every renderer, the frame a Frame2D fit changed, even while stopped and nothing else is dirty', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const { setPlayState } = await import('../../src/runtime/core/playState');
+      const { takeLocalFits2D } = await import('../../src/runtime/core/ecs/localFit2D');
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+      const fitted = world.spawn(traits.Transform({}), traits.Frame2D({}), traits.EntityAttributes({ name: 'fitted', parentId: canvas.id(), sortOrder: 1, layer: '2d' }));
+      const parentOf = new Map([[fitted.id(), canvas.id()]]);
+      const propagate = () => { takeLocalFits2D(world, parentOf); }; // what transformPropagationSystem asks, each pass
+      const editorPool = new pool.Canvas2DPool();
+      const editor = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+      const frame = () => { propagate(); scene2d.renderFrame(); editor.renderFrame(); };
+
+      frame(); // frame 1: allocates the slots
+      const slot = pool.getSlot(canvas.id())!;
+      const eslot = editorPool.getSlot(canvas.id())!;
+      await slot.ready; await eslot.ready;
+      for (const s2 of [slot, eslot]) { s2.canvas.width = 320; s2.canvas.height = 480; } // renderAll skips a 1x1 slot
+      const render = (slot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+      const erender = (eslot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+      scene2d.markScene2DDirty(); editor.markDirty();
+      frame(); // frame 2: draws at 320x480 and publishes that view
+      frame(); // frame 3: the fit for it lands
+      setPlayState('stopped');
+      render.mockClear(); erender.mockClear();
+      frame(); // frame 4: stopped, clean, same fit — both skip
+      expect([render.mock.calls.length, erender.mock.calls.length]).toEqual([0, 0]);
+
+      slot.canvas.width = 480; // the Game view resized (a device preset, the dock splitter)…
+      scene2d.markScene2DDirty(); // …whose own wake draws it and publishes the new view
+      frame(); // frame 5
+      expect([render.mock.calls.length, erender.mock.calls.length]).toEqual([1, 0]);
+      frame(); // frame 6: the new fit landed in this frame's propagation — both owe a draw, though nothing marked them
+      expect([render.mock.calls.length, erender.mock.calls.length]).toEqual([2, 1]);
+      frame(); // frame 7: settled — the skip is allowed again
+      expect([render.mock.calls.length, erender.mock.calls.length]).toEqual([2, 1]);
+      editor.stop();
+    });
   });
 });
 

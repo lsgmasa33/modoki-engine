@@ -303,8 +303,10 @@ export interface SceneManager {
    *  base scenes in its chain. */
   getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry>;
   /** The copies of missing prefabs `world` holds for its loaded scenes, and the documents its live frames of missing prefabs
-   *  were expanded from, per scene (#1939 item 2) — what a world swap carries ({@link LoadOptions.sceneCopies}). */
-  captureSceneCopies(world?: World): SceneCopyCarry;
+   *  were expanded from, per scene (#1939 item 2) — what a world swap carries ({@link LoadOptions.sceneCopies}). With
+   *  `primaryAs`, the primary's are keyed by that guid: the id of the snapshot the swap reloads, which the load gives its
+   *  primary, and which an untitled world's serialize mints fresh, matching no loaded scene (#1948 S2). */
+  captureSceneCopies(world?: World, primaryAs?: string): SceneCopyCarry;
   /** The `baseScene` guid ref of the currently-active scene, if any. */
   getCurrentBaseScene(): string | undefined;
   /** The scene currently preloading (if any). */
@@ -443,7 +445,7 @@ class SceneManagerImpl implements SceneManager {
     return this.loadedScenes;
   }
 
-  captureSceneCopies(world: World = getCurrentWorld()): SceneCopyCarry {
+  captureSceneCopies(world: World = getCurrentWorld(), primaryAs?: string): SceneCopyCarry {
     // A copy is keyed by its scene file's guid (`loadSceneFile`'s store); a scene without one shares the '' key with every
     // other such scene (#1939 H2, legacy only), so it is not carried.
     const keys = new Set<string>();
@@ -453,8 +455,13 @@ class SceneManagerImpl implements SceneManager {
       keys.add(e.guid);
       if (e.role === 'primary') primary = e.guid;
     }
+    // A snapshot reload loads its primary under the snapshot's own id. An untitled world's is minted at each serialize, and
+    // a New Scene world has no loaded scene at all, so the primary's copies are re-keyed to it: keyed by the world they
+    // came from, the swap's chain filter drops every one (#1948 S2).
+    const to = primaryAs && isGuid(primaryAs) ? primaryAs : undefined;
+    if (to && primary === undefined) { primary = to; keys.add(to); }
     const ea = getAllTraits().find((m) => m.name === 'EntityAttributes');
-    return captureSceneCopies(world, {
+    const carry = captureSceneCopies(world, {
       // A base's entity carries its scene's guid (`sourceScene`); the primary's carries ''.
       of: (entity) => {
         const src = (ea && entity.has(ea.trait) ? (entity.get(ea.trait) as { sourceScene?: string }).sourceScene : '') || primary;
@@ -462,6 +469,9 @@ class SceneManagerImpl implements SceneManager {
       },
       keeps: (scene) => keys.has(scene),
     });
+    const own = to && primary !== to ? carry.get(primary!) : undefined;
+    if (own) { carry.delete(primary!); carry.set(to!, own); }
+    return carry;
   }
 
   /** The `baseScene` guid ref of the currently-active scene, if any. */

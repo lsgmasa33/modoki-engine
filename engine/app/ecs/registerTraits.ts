@@ -3,7 +3,7 @@
 
 import { registerTrait, UI_LENGTH_UNITS, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Input, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, Frame2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Input, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -160,6 +160,7 @@ export function registerAllTraits() {
       flipX: { type: 'boolean', tooltip: 'Mirror horizontally about the rig origin (render-only; does not touch the transform)' },
       flipY: { type: 'boolean', tooltip: 'Mirror vertically about the rig origin (render-only)' },
       isVisible: { type: 'boolean', tooltip: 'Show this renderer. Independent of the entity on/off (EntityAttributes.isActive, which also cascades to children).' },
+      orderInLayer: { type: 'number', step: 1, tooltip: 'Draw order within the 2D layer (higher = in front), the same ranking as Renderable2D.orderInLayer.' },
     },
   });
 
@@ -186,6 +187,18 @@ export function registerAllTraits() {
       sprite: { type: 'string', accept: ['sprite'], tooltip: 'Alpha mask sprite (texture mode only). GUID-only — never a literal path.' },
       offsetX: { type: 'number', step: 1, group: 'Offset', tooltip: "Clip rect centre relative to this entity's own origin, in its local space (design px). Keep the entity's Transform at identity and use this to place the rect instead — moving the entity would displace every descendant it clips." },
       offsetY: { type: 'number', step: 1, group: 'Offset', tooltip: 'See offsetX — same local-space offset, Y axis.' },
+    },
+  });
+
+  registerTrait({
+    name: 'Frame2D', trait: Frame2D, category: 'component', componentCategory: 'Rendering',
+    priority: 33.46,
+    fields: {
+      width: { type: 'number', min: 1, step: 10, group: 'Box', tooltip: 'The box the subtree is authored in, design px: its top-left is this entity\'s origin. The engine fits it to what is on screen of the canvas.' },
+      height: { type: 'number', min: 1, step: 10, group: 'Box', tooltip: 'See width.' },
+      fit: { type: 'enum', options: ['cover', 'contain', 'stretch'], tooltip: 'cover: fill the screen, cropping the longer axis (never a gap). contain: fit wholly inside, leaving bands. stretch: match exactly, non-uniformly.' },
+      alignX: { type: 'number', min: 0, max: 1, step: 0.05, group: 'Align', tooltip: 'Which part stays when the width is cropped or banded: 0 = left, 0.5 = centre, 1 = right.' },
+      alignY: { type: 'number', min: 0, max: 1, step: 0.05, group: 'Align', tooltip: 'Which part stays when the height is cropped or banded: 0 = top, 0.5 = centre, 1 = bottom.' },
     },
   });
 

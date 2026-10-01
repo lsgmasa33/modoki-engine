@@ -16,6 +16,7 @@ import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
+import { localFit2DOf } from '../../runtime/core/ecs/localFit2D';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
@@ -101,7 +102,7 @@ import { isColliderEditable } from '../scene/colliderEditable';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { descendantUnionGizmoBox2D, type GizmoBoundsEntity } from './gizmoBounds';
 import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
-import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
+import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, localFrame2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
 import { getLoadedFont } from '../../runtime/loaders/fontAtlasLoader';
 import { onTextDirty } from '../../runtime/rendering/text/textDirty';
@@ -1074,7 +1075,8 @@ function computeGroup2DGizmo(allTraits: ReturnType<typeof getAllTraits>, ownedBy
       id, world: { x: box.wx, y: box.wy, rz: box.wrz, sx: box.wsx, sy: box.wsy },
       halfW: box.halfW, halfH: box.halfH,
       local: { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy },
-      parentWorld: pwt ? { x: pwt.x, y: pwt.y, rz: pwt.rz, sx: pwt.sx, sy: pwt.sy } : null,
+      // The frame its local Transform lives in: the parent, with the member's own Frame2D fit (localFrame2D).
+      parentWorld: localFrame2D(pwt ? { x: pwt.x, y: pwt.y, rz: pwt.rz, sx: pwt.sx, sy: pwt.sy } : null, localFit2DOf(e.valueOf() as number)),
     });
   }
   if (members.length < 2) return null;
@@ -1518,7 +1520,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
                 // WORLD start (gizmo math runs in world space); LOCAL start for undo.
                 startTransform: { x: wx, y: wy, rz: wrz, sx: wsx, sy: wsy },
                 localStart: { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy },
-                parentWorld: pwt ? { x: pwt.x, y: pwt.y, rz: pwt.rz, sx: pwt.sx, sy: pwt.sy } : null,
+                // With the entity's own Frame2D fit composed in (localFrame2D), or the drag writes the fitted pose.
+                parentWorld: localFrame2D(pwt ? { x: pwt.x, y: pwt.y, rz: pwt.rz, sx: pwt.sx, sy: pwt.sy } : null, localFit2DOf(entity.valueOf() as number)),
                 entityCenter: { x: wx, y: wy },
               };
               e.stopPropagation();

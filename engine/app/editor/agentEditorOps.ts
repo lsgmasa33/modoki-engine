@@ -89,7 +89,7 @@ import {
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid, resolveRef,
   getAllTraits, readTraitData, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal, type MutateOp, type MutateEntityRef,
-  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
+  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, localFit2DOf, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, setEditorScenePathReader, assetUrl, normScenePath, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
@@ -1048,7 +1048,17 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
       + 'collapses every descendant onto its origin, so no local transform can place this entity at the '
       + "requested world point. Give the ancestor a non-zero scale, or write space:'local'." };
   }
-  const next = worldToLocalTrs(wantWorld, parentTrs);
+  let next = worldToLocalTrs(wantWorld, parentTrs);
+  // A Frame2D entity's world pose is FITTED: propagation composes its snapshot as `fit · local` per axis
+  // (x' = fit.x + kx·x, sx' = kx·sx, rotation untouched; core/ecs/localFit2D.ts). What the inversion above found is
+  // that snapshot, so undo the fit the same way — writing it as-is would put the fitted pose in the Transform, fitted
+  // again next pass. Per axis, not as a matrix: a non-uniform (`stretch`) fit sits inside the rotation, and a
+  // `P·T·S` matrix inverse decomposes to the wrong angle (rz 1.0 asked, 0.914 written).
+  const fit = entity ? localFit2DOf(entity.valueOf() as number) : undefined;
+  if (fit) {
+    const kx = fit.kx || 1, ky = fit.ky || 1;
+    next = { ...next, x: (next.x - fit.x) / kx, y: (next.y - fit.y) / ky, sx: next.sx / kx, sy: next.sy / ky };
+  }
   const all: Record<string, number> = {
     x: next.x, y: next.y, z: next.z, rx: next.rx, ry: next.ry, rz: next.rz, sx: next.sx, sy: next.sy, sz: next.sz,
   };

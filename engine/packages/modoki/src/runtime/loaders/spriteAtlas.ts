@@ -44,6 +44,13 @@ export interface AtlasSource {
   extrude: number;
   /** Cap on generated pages; members that don't fit are reported as overflow. */
   maxPages?: number;
+  /** Crop each member to its non-transparent pixels before packing, recording where the crop sat in the
+   *  member's own frame (`AtlasPackedFrame.trim`/`orig`), so a sprite drawn from it keeps the size, pivot and
+   *  placement of the uncropped one. A page holds more, and the GPU shades only the visible pixels: a mostly
+   *  transparent sprite (a shard cut out of a whole block) costs its full quad otherwise. Honoured by the 2D
+   *  sprite path and sprite batches; do NOT trim an atlas whose members feed a skinned rig or a 2D material
+   *  (they read the page rect as the whole frame). */
+  trim?: boolean;
   /** Optional per-atlas page encoding override. Defaults to WebP (the 2D variant the
    *  PixiJS path can decode — KTX2 produces no 2D variant). */
   texture?: TextureImportSettings;
@@ -95,6 +102,28 @@ export interface AtlasPackedFrame {
   page: number;
   rect: SpriteRect;
   pivot: { x: number; y: number };
+  /** Only in a trimmed atlas (`AtlasSource.trim`): the member's full size (`orig`), and where `rect`'s content
+   *  sits inside it (`trim`, source px). Absent when nothing was cropped. */
+  orig?: { w: number; h: number };
+  trim?: SpriteRect;
+}
+
+/** The smallest rect holding every pixel with alpha above `threshold` in an RGBA (or any `channels`, alpha
+ *  last) buffer of `w` x `h`; null when the image is fully transparent. Pure: the atlas compositor's trim. */
+export function alphaBounds(data: Uint8Array, w: number, h: number, channels: number, threshold = 0): SpriteRect | null {
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w * channels;
+    for (let x = 0; x < w; x++) {
+      if (data[row + x * channels + channels - 1] > threshold) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
 /** Derived bookkeeping for a built atlas (regenerated on every re-pack). Lives in the

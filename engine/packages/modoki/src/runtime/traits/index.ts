@@ -16,6 +16,7 @@ export { Bone2D } from './Bone2D';
 export { Billboard3D } from './Billboard3D';
 export { GroupAlpha } from './GroupAlpha';
 export { Mask2D } from './Mask2D';
+export { Frame2D, FRAME_2D_FITS, type Frame2DFit } from './Frame2D';
 export { FlatSprite3D } from './FlatSprite3D';
 export { Zone3D } from './Zone3D';
 export { Zone2D } from './Zone2D';

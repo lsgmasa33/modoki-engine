@@ -319,7 +319,10 @@ export function resolveSprite(ref: string): ResolvedSprite | undefined {
     const url = resolveAtlasPageUrl(af, '2d');
     if (url) {
       forgetUnresolvedSprite(ref);
-      return { url, frame: { ...af.rect }, pivot: { ...af.pivot }, sheetW: af.pageW, sheetH: af.pageH };
+      return {
+        url, frame: { ...af.rect }, pivot: { ...af.pivot }, sheetW: af.pageW, sheetH: af.pageH,
+        ...(af.orig && af.trim ? { orig: { ...af.orig }, trim: { ...af.trim } } : {}),
+      };
     }
     // No 2D page variant (mis-set atlas format) — fall through to the source sprite.
   }

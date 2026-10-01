@@ -17,6 +17,9 @@ import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/phy
 import { transformPropagationSystem } from '../../src/runtime/core/ecs/transformPropagationSystem';
 import { getWorldTransform3D } from '../../src/runtime/core/ecs/worldTransform';
 import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
+import { Canvas2D } from '../../src/runtime/traits/Canvas2D';
+import { Frame2D } from '../../src/runtime/traits/Frame2D';
+import { forgetCanvasView2D } from '../../src/runtime/rendering/frame2D'; // registers the Frame2D fit provider
 
 beforeAll(async () => { await initRapier2D(); });
 
@@ -86,6 +89,30 @@ describe('physics2D — parented bodies respect world transforms (P2)', () => {
     const wt = getWorldTransform3D(box.id(), tw.world);
     expect(wt.x).toBeCloseTo(200, 0);
     expect(wt.y).toBeCloseTo(-15, 0);
+  });
+
+  // A body ON a Frame2D host: its world pose is fitted (`fit · local`), so its write-back inverts the parent with the
+  // host's own fit composed in. Inverting the bare parent wrote the fitted pose back, fitted again next pass
+  // (#1926 close-out review). Zero gravity: nothing moves it, so its Transform must not move either.
+  it('a body on a Frame2D host writes back the local it has, not its fitted world pose', () => {
+    forgetCanvasView2D();
+    tw = createTestWorld({ systems: [PRE, PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 0, pixelsPerMeter: 100 }));
+    const canvas = tw.spawn(Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', parentId: 0 }));
+    // 500 x 500 covering 1000 x 2000: k = 4, x -500.
+    const host = tw.spawn(
+      Transform({ x: 10, y: 20, sx: 1, sy: 1 }),
+      Frame2D({ width: 500, height: 500, fit: 'cover' }),
+      EntityAttributes({ name: 'Host', parentId: canvas.id() }),
+      RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'box', halfW: 5, halfH: 5 }),
+    );
+    tw.step(10);
+    const tf = tw.trait<{ x: number; y: number }>(Transform, host);
+    expect(tf.x).toBeCloseTo(10, 3);
+    expect(tf.y).toBeCloseTo(20, 3);
+    const wt = getWorldTransform3D(host.id(), tw.world);
+    expect(wt.x).toBeCloseTo(-500 + 4 * 10, 3);
   });
 
   it('a collider under a SCALED parent gets scaled EXTENTS (collides at the scaled size)', () => {

@@ -186,7 +186,7 @@ export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
       console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
     }
   }
-  return { primary, key, bases, copies: sceneManager.captureSceneCopies() };
+  return { primary, key, bases, copies: sceneManager.captureSceneCopies(undefined, primary.id) };
 }
 
 /** Put the authored world back: reload the primary under the snapshot's key, then replay the part

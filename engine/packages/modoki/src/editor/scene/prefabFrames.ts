@@ -25,8 +25,9 @@ import { foreignRow, type RowDoc, rowsMeanTheSame, unexpandedRowsOf } from './pr
 /** `outside`: an owned frame moved OUT of the torn-down subtree (#1437) — it stays where it hangs, not re-seated. */
 /** `address`: a kept reference node's frame address (`frameAddress.ts`, #1939), already `remap`ped — the ONE identity the
  *  respawn skips it by and the seat finds it named by: a scene-added node's is its guid, a template node's its frame's
- *  address and its key (whose live guid is only derived, so no statement names it by guid). */
-export type KeptFrame = { id: number; parentGuid: string; owned: boolean; outside?: boolean; address?: string };
+ *  address and its key (whose live guid is only derived, so no statement names it by guid). `source`, with it: the prefab
+ *  the node was kept for, which the statement must still name to be met (#1948 S1). */
+export type KeptFrame = { id: number; parentGuid: string; owned: boolean; outside?: boolean; address?: string; source?: string };
 
 /** `address` with every guid in it put through `remap` (a key component, `+<key>`, is not a guid). */
 export function remapFrameAddress(address: string, remap: ReadonlyMap<string, string>): string {
@@ -127,7 +128,8 @@ export function rebuildTeardown(
         // scene-added node, its frame and key for a template node. One with no address could be matched to nothing.
         const address = !members.has(c) && guidById.get(id) ? (addressOf ??= liveFrameAddresser(getCurrentWorld()))(c) : undefined;
         if (address && unexpandable(c, false)) {
-          kept.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)!, owned: false, address: remapFrameAddress(address, remap) });
+          const source = (readTraitData(c, PrefabInstanceMeta) as { source: string }).source;
+          kept.push({ id: c, parentGuid: remap.get(guidById.get(id)!) ?? guidById.get(id)!, owned: false, address: remapFrameAddress(address, remap), source });
           continue;
         }
         toDestroy.add(c);

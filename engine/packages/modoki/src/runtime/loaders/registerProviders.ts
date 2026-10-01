@@ -16,7 +16,7 @@ import { textureProvider } from '../core/textureProvider';
 import {
   resolveSprite, resolveTextureVariantUrl, resolveBrowserImageUrl, loadTexture3D, releaseTexture3D,
 } from './textureResolver';
-import { getSpriteEpoch, getAssetType } from './assetManifest';
+import { getSpriteEpoch, getAssetType, getAtlasFrame } from './assetManifest';
 import { ensurePixiKtxTranscoder } from './pixiKtxTranscoder';
 
 import { assetPlumbing } from '../core/assetPlumbing';
@@ -53,7 +53,13 @@ import { spawnPrefabInstance } from './loadSceneFile';
 
 textureProvider.provide({
   resolveSprite, resolveTextureVariantUrl, resolveBrowserImageUrl, loadTexture3D, releaseTexture3D,
-  getSpriteEpoch, getAssetType, ensurePixiKtxTranscoder,
+  getSpriteEpoch,
+  // A member of a built atlas is a sprite even where the manifest has no entry for it: a shipped build folds
+  // each member into its atlas (asset-tree-shaker's atlas-member redirect), and only the atlas's frame index
+  // knows the guid. Without this, isImagePath said "not an image" for every packed member in a build, and the
+  // 2D sprite paths drew nothing (#1926: Ice Reef's debris vanished on the phone, fine in the editor).
+  getAssetType: (guid) => getAssetType(guid) ?? (getAtlasFrame(guid) ? 'sprite' : undefined),
+  ensurePixiKtxTranscoder,
 });
 
 assetPlumbing.provide({ assetUrl, fetchInit: ASSET_FETCH_INIT, fetchShaderManifest: fetchShaderManifestClassified });

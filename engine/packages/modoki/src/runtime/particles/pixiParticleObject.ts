@@ -56,7 +56,7 @@ function pixiBlend(blend: BlendMode): 'normal' | 'add' | 'multiply' | 'screen' {
  *  of the 3D backend's `radialAlpha()`. Needs a canvas, so headless (no `document`) falls back to
  *  `Texture.EMPTY`; the mapping still runs, there's just nothing to see (Phase 1 is data-only). */
 let defaultParticleTex: Texture | null = null;
-function getDefaultParticleTexture(): Texture {
+export function getDefaultParticleTexture(): Texture {
   if (defaultParticleTex) return defaultParticleTex;
   if (typeof document === 'undefined') return Texture.EMPTY;
   const size = 64;

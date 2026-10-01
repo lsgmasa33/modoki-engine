@@ -31,7 +31,9 @@ import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/ed
 import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { writeTraitFieldWithUndo, deleteEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
-import { saveScene, saveAll, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
+import { saveScene, saveAll, loadSceneReporting, newScene } from '../../packages/modoki/src/editor/scene/serialize';
+import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
+import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManager';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
@@ -245,5 +247,45 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(qCount()).toBe(live);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+  });
+
+  // #1948 S2: the same route in an UNTITLED world (New Scene, P placed). Its snapshot's id is minted at the Apply's
+  // serialize, and a New Scene world has no loaded scene, so a carry keyed by the world it came from matched nothing the
+  // reload loads and the swap's chain filter dropped all of it.
+  // Mutation: `SceneManager.captureSceneCopies` ignores `primaryAs` → `expected 1 to be +0` (unexpanded rows); the re-key alone a no-op → `redo: expected 1 to be +0`; the titled case above stays green.
+  it('an untitled world: the undo keeps the live frames, and Save As writes the copy', async () => {
+    const f = await startRun(be, noNest, 'c2-undo-untitled');
+    await newScene();
+    await settle();
+    expect(await placePrefabFromPath(f.prefabs.P.path, { tag: 'test', parentId: 0 }), 'premise: P placed').toBeTruthy();
+    await settle();
+    expect(sceneManager.getLoadedScenes().size, 'premise: no scene loaded (untitled)').toBe(0);
+    const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
+    const p1 = p1Id(f);
+    expect(writeTraitFieldWithUndo(p1, TF(), 'x', 5)).toBeFalsy();
+    await settle();
+    const keys = collectInstanceOverrideKeys(p1, getCachedPrefabSync(f.prefabs.P.guid)!);
+    expect((await applyToPrefabWithUndo(p1, new Set(keys.all.filter((k) => k.includes('Transform'))))).applied).toBe(true);
+    await settle();
+    await trash(f, 'Q');
+    const live = qCount();
+    expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    expect((await undoStep('undo')).did).toBe(true); // the Apply
+    await settle();
+    expect(unexpandedRows().size).toBe(0);
+    expect(qCount()).toBe(live);
+    // The redo reloads the OTHER side's snapshot, under another minted id, from a world that now has a loaded primary:
+    // the re-key branch (close-out review). Then the undo again.
+    expect((await undoStep('redo')).did).toBe(true);
+    await settle();
+    expect(unexpandedRows().size, 'redo').toBe(0);
+    expect(qCount(), 'redo').toBe(live);
+    expect((await undoStep('undo')).did).toBe(true);
+    await settle();
+    expect(unexpandedRows().size, 'second undo').toBe(0);
+    expect(qCount(), 'second undo').toBe(live);
+    const asPath = f.scenePath.replace(/[^/]+$/, 'untitled-c2.json');
+    expect((await saveScene({ path: asPath, allowDialog: false })).saved).toBe(true);
+    expect(Object.keys(JSON.parse(be.read(asPath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
 });

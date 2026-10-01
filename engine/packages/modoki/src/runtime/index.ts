@@ -33,6 +33,11 @@ export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
 // the game can only compute from that scale. Court re-derived it by hand and shipped a constant
 // that was 25% short on a wide host — exactly the drift `clientToDesign2D` exists to prevent.
 export { clientToDesign2D, designToClient2D, computeCanvasScale } from './rendering/canvas2DScaler';
+// Frame2D (the 2D CameraFrame): the provider registers itself on this import.
+// `publishCanvasView2D`/`forgetCanvasView2D` are the primary renderer's; exported for a test standing in for it.
+export { frame2DFit, frame2DVisibleLocal, designToFrame2D, visibleDesignRect, publishCanvasView2D, forgetCanvasView2D, type DesignRect } from './rendering/frame2D';
+export { localFit2DOf, localFrame2D, type LocalFit2D, type Pose2D } from './core/ecs/localFit2D';
+export { registerSpriteBatch2D, spriteBatches2D, unregisterSpriteBatch2D, type BatchSprite2D, type SpriteBatch2D } from './rendering/spriteBatchRegistry';
 export type { World } from 'koota';
 export {
   registerTrait, getAllTraits, getTraitByName, getTraitMeta, inferFields,
@@ -181,7 +186,7 @@ export {
 // by the renderer's quality tier AND by on-screen touch controls.
 export { isTouchDevice, readFormFactor, readPlatform } from './core/formFactor';
 export {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, Frame2D, FRAME_2D_FITS, type Frame2DFit, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, EntityAttributes, Camera, CameraFrame,
   PrefabInstance, ModelSource, Paused, Persistent, markPersistent, Transient, Time, Input,
   UIElement, type UILengthUnit, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, NO_SCROLL_REQUEST, NO_BEHAVIOR_REQUEST,
   type UIEntryPrefab, type UIEntryLengthUnit,

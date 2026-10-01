@@ -192,6 +192,23 @@ describe('resolveSprite', () => {
     expect(r?.sheetH).toBe(64);
   });
 
+  it('carries a trimmed member\'s crop (orig + trim) through to the resolved sprite, and nothing for an untrimmed one', () => {
+    const ATLAS = '44444444-3333-4333-8333-333333333333';
+    registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'webp' });
+    registerSprite(SPRITE, GUID, PATH, { texture: GUID, rect: { x: 0, y: 0, w: 32, h: 32 }, pivot: { x: 0.5, y: 0.5 } });
+    const page = { hash: 'abc', pages: [{ hash: 'p0', variants: ['webp'], w: 64, h: 64 }], texture: { ...DEFAULT_TEXTURE_SETTINGS, format: 'webp' as const } };
+    registerAsset(ATLAS, '/games/g/assets/sprites/t.atlas.json', 'atlas', undefined, {
+      atlas: { ...page, frames: { [SPRITE]: { page: 0, rect: { x: 2, y: 2, w: 10, h: 6 }, pivot: { x: 0.5, y: 0.5 }, orig: { w: 32, h: 32 }, trim: { x: 5, y: 20, w: 10, h: 6 } } } },
+    });
+    const r = resolveSprite(SPRITE);
+    expect(r?.orig).toEqual({ w: 32, h: 32 });
+    expect(r?.trim).toEqual({ x: 5, y: 20, w: 10, h: 6 });
+    registerAsset(ATLAS, '/games/g/assets/sprites/t.atlas.json', 'atlas', undefined, {
+      atlas: { ...page, hash: 'abd', frames: { [SPRITE]: { page: 0, rect: { x: 2, y: 2, w: 32, h: 32 }, pivot: { x: 0.5, y: 0.5 } } } },
+    });
+    expect(resolveSprite(SPRITE)?.trim).toBeUndefined();
+  });
+
   it('redirects a member to a KTX2 atlas page (~page0~uastc.ktx2)', () => {
     const ATLAS = '44444444-4444-4444-8444-444444444444';
     const ATLAS_PATH = '/games/g/assets/sprites/k.atlas.json';

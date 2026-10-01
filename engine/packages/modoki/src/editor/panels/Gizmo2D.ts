@@ -510,6 +510,10 @@ export function applyGizmoDrag2D(
  *  `Transform` fields. */
 export interface Transform2D { x: number; y: number; rz: number; sx: number; sy: number }
 
+/** The frame an entity's LOCAL Transform lives in (parent ∘ its own Frame2D fit). Lives with the fit seam, since
+ *  runtime writers (2D physics) need it too; see core/ecs/localFit2D.ts. */
+export { localFrame2D } from '../../runtime/core/ecs/localFit2D';
+
 /** Convert a WORLD-space 2D transform into LOCAL space relative to `parentWorld`
  *  (the inverse of the 2D parent→child composition `worldPos = parentPos +
  *  R(parentRz)·(parentScale ⊙ localPos)`, `worldRz = parentRz + localRz`,

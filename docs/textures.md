@@ -580,6 +580,29 @@ agree today are indistinguishable to a runtime assertion.
   w, h}`, the page `texture` settings, and a `frames` map (member GUID → `{page,
   rect, pivot}`) the runtime resolver indexes.
 
+### Trim (`"trim": true`)
+
+A trimmed atlas crops each member to its non-transparent pixels before packing (`alphaBounds`, a pure scan in
+`spriteAtlas.ts`; a fully transparent member keeps a 1 px crop). Each frame then records `orig` (the member's full
+size) and `trim` (where the crop sat inside it), and `resolveSprite` passes both on. `frameTexture`
+(`rendering/frameTexture.ts`) builds a Pixi Texture with `orig`/`trim`, so a sprite drawn from it has the full
+size and its pivot in the full frame. It looks exactly like the uncropped sprite, but the GPU shades only the
+visible pixels.
+- **Use it for mostly transparent art.** Ice Reef's debris shards are each cut out of a whole 256 px block, about
+  74% border; uncropped, every one cost its full quad of fill.
+- **Honoured by the 2D sprite path and sprite batches only.** A skinned rig and a 2D material read the page rect
+  as the whole frame, so do not trim an atlas they draw from.
+- The option joins the cache key only when set, so turning it on re-packs that atlas and no other.
+- Tests: `tests/plugins/atlasTrim.test.ts` (real packer + sharp), `packages/modoki/tests/runtime/frameTexture.test.ts`.
+
+⚠️ **In a shipped build an atlas MEMBER has no manifest entry of its own.** The build folds each member into its
+atlas (asset-tree-shaker's atlas-member redirect), so only the atlas's frame index knows the guid. The editor
+keeps every member's own entry, so a check that asks the manifest "is this a sprite?" passes in the editor and
+fails on the phone. The texture provider's `getAssetType` therefore answers `'sprite'` for a packed member
+(`loaders/registerProviders.ts`); before that fix, `isImagePath` said "not an image" and the 2D sprite paths drew
+nothing, which is how Ice Reef's atlas debris vanished on the phone only (#1926). Pinned by
+`packages/modoki/tests/runtime/atlasMemberShipped.test.ts`.
+
 ## Runtime resolution
 
 `runtime/loaders/textureResolver.ts` picks the best variant for the call site +

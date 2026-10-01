@@ -21,12 +21,13 @@
  *  purpose. Folding it in here would merge two orderings that are meant to differ. */
 
 import type { World } from 'koota';
-import { Renderable2D, Text2D } from '../traits';
+import { Renderable2D, SkinnedSprite2D, Text2D } from '../traits';
 
 /** Every 2D trait carrying an `orderInLayer` field, in PRECEDENCE ORDER: a later trait wins for an
- *  entity that carries more than one. `Text2D` last preserves the runtime's pre-#1228 behaviour,
+ *  entity that carries more than one. `SkinnedSprite2D` first: it is its own renderable and does not share an
+ *  entity with the other two in practice, so its place only matters for an odd hand-built one. `Text2D` last preserves the runtime's pre-#1228 behaviour,
  *  where the `Text2D` pass ran after the `Renderable2D` pass and overwrote it. */
-const ORDERED_2D_TRAITS = [Renderable2D, Text2D];
+const ORDERED_2D_TRAITS = [SkinnedSprite2D, Renderable2D, Text2D];
 
 /** Build `entityId → orderInLayer` for every entity in `world` that sets a non-zero one.
  *

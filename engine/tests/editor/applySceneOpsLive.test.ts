@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, getPlayState, findEntityByGuid, Transform,
-  EntityAttributes, spawnEntity, getCurrentWorld,
+  EntityAttributes, spawnEntity, getCurrentWorld, Canvas2D, Frame2D, newGuid, transformPropagationSystem, worldTransforms,
   applyOps, parentWorldTrs, worldToLocalTrs, mergeTrs, type MutableScene,
 } from '@modoki/engine/runtime';
 import {
@@ -406,6 +406,48 @@ describe("setTrait {space:'world'} on the LIVE path — the branch most agent ed
     const t = await localOf(child.guid);
     expect(t.x).toBeCloseTo(623, 4);
     expect(t.y).toBeCloseTo(679, 4);
+  });
+
+  // A Frame2D host's world pose is FITTED (`fit · local`, docs/rendering.md § Frame2D), so the frame its Transform lives
+  // in is the parent with the host's own fit composed in. Inverting the bare parent wrote the fitted pose into the
+  // Transform: world x -490 asked for, local -490 written, drawn at -2460 (#1926 close-out review).
+  it("space:'world' on a Frame2D host writes the local that lands there, through its own fit", async () => {
+    const w = getCurrentWorld();
+    const canvas = spawnEntity(w, Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', parentId: 0, guid: newGuid() }));
+    const hostGuid = newGuid();
+    const host = spawnEntity(w, Transform({ x: 0, y: 0, sx: 1, sy: 1 }), Frame2D({ width: 500, height: 500, fit: 'cover' }), EntityAttributes({ name: 'Host', parentId: canvas.id(), guid: hostGuid }));
+    transformPropagationSystem(w);
+    expect([worldTransforms.get(host.id())!.x, worldTransforms.get(host.id())!.sx]).toEqual([-500, 4]); // k = 4, x -500
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'setTrait', entity: { guid: hostGuid }, trait: 'Transform', space: 'world', fields: { x: -490, sx: 8 } }],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    const t = await localOf(hostGuid);
+    expect(t.x).toBeCloseTo(2.5, 4);
+    expect(t.sx).toBeCloseTo(2, 4);
+    transformPropagationSystem(w);
+    expect(worldTransforms.get(host.id())!.x).toBeCloseTo(-490, 4); // and it is drawn where it was asked to be
+  });
+
+  // A `stretch` fit scales x and y differently, INSIDE the rotation (the snapshot is T(fit + k·x)·R(rz)·S(k·sx)). A
+  // matrix inverse of P·T(fit)·S(k) is sheared there and decomposed to the wrong angle (rz 1.0 asked, 0.914 written,
+  // third close-out review); the fit is undone per axis instead.
+  it("space:'world' rotation on a stretch-fitted host lands at the angle asked for", async () => {
+    const w = getCurrentWorld();
+    const canvas = spawnEntity(w, Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', parentId: 0, guid: newGuid() }));
+    const hostGuid = newGuid();
+    const host = spawnEntity(w, Transform({ x: 0, y: 0, rz: 0.5, sx: 1, sy: 1 }), Frame2D({ width: 500, height: 500, fit: 'stretch' }), EntityAttributes({ name: 'Host', parentId: canvas.id(), guid: hostGuid }));
+    transformPropagationSystem(w);
+    expect([worldTransforms.get(host.id())!.sx, worldTransforms.get(host.id())!.sy]).toEqual([2, 4]); // kx 2, ky 4
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'setTrait', entity: { guid: hostGuid }, trait: 'Transform', space: 'world', fields: { rz: 1, sx: 6 } }],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    transformPropagationSystem(w);
+    const wt = worldTransforms.get(host.id())!;
+    expect(wt.rz).toBeCloseTo(1, 6);
+    expect(wt.sx).toBeCloseTo(6, 6);
+    expect(wt.sy).toBeCloseTo(4, 6); // the untouched axis keeps its fitted scale
   });
 
   it("space:'world' places the child at the world point asked for", async () => {

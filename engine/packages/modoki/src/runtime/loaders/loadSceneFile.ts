@@ -1196,9 +1196,14 @@ export function spawnReferenceNode(
 ): void {
   const nodeFrame = nodeFrameAddress(frame, node);
   // A frame the editor's rebuild KEPT live is that node's expansion already (#1862): nothing is spawned for it, and the
-  // rebuild seats the kept one. Met by its address, the identity the keep recorded (#1939).
+  // rebuild seats the kept one. Met by its address, the identity the keep recorded (#1939), and only while the statement
+  // still names the prefab it was kept for. A node the document re-points is the new prefab's (Unity's nested instance
+  // follows its asset, #1948 S1): the kept frame is released first, so the spawn below derives the guids it held.
   const keeping = (read as KeepingReader).keptFrames;
-  if (keeping && nodeFrame && keeping.frames.has(nodeFrame)) { keeping.met.add(nodeFrame); return; }
+  if (keeping && nodeFrame && keeping.frames.has(nodeFrame)) {
+    if (keeping.frames.get(nodeFrame) === node.prefab) { keeping.met.add(nodeFrame); return; }
+    keeping.release(nodeFrame);
+  }
   // A node re-entering a self-containing prefab above it is the one endless shape (I16, #1817): refused, and named.
   if (refuseCyclicReferenceNode(ancestors, node, read, '[loadSceneFile]')) return;
   // A scene's copy stands in for a node only where the scene's list names it live at the save (#1939; Unity backs every
@@ -2482,11 +2487,13 @@ function withSceneCopies(world: World, base: ExpansionReader, scene?: string): E
  *  editor's rebuild keeps a frame whose prefab it cannot expand (`rebuildTeardown`, #1862) and seats it after the respawn.
  *  By frame address (`frameAddress.ts`); `met` collects each one the spawner came to, so the rebuild knows which kept
  *  frames the new expansion still names. The reader is handed down to every nested expansion, so the list reaches them. */
-type KeepingReader = ExpansionReader & { readonly keptFrames?: { readonly frames: ReadonlySet<string>; readonly met: Set<string> } };
+type KeepingReader = ExpansionReader & { readonly keptFrames?: { readonly frames: ReadonlyMap<string, string>; readonly met: Set<string>; readonly release: (address: string) => void } };
 
-/** `read`, keeping the frames at `frames` live — its documents unchanged, and any copy it serves still told apart. */
-export function keepingFrames(read: ExpansionReader, frames: ReadonlySet<string>, met: Set<string>): ExpansionReader {
-  return Object.assign((ref: string) => read(ref), read, { keptFrames: { frames, met } });
+/** `read`, keeping the frames at `frames` live (address → the prefab each was kept for) — its documents unchanged, and any
+ *  copy it serves still told apart. `met` collects the addresses the spawner skipped; `release` takes away a kept frame
+ *  whose statement now names another prefab, before that prefab is spawned in its place. */
+export function keepingFrames(read: ExpansionReader, frames: ReadonlyMap<string, string>, met: Set<string>, release: (address: string) => void): ExpansionReader {
+  return Object.assign((ref: string) => read(ref), read, { keptFrames: { frames, met, release } });
 }
 
 /** The runtime cache, then the scene's copies — the default reader of an expansion and of a load. */

@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { createWorld } from 'koota';
 import { Renderable2D } from '../../src/runtime/traits/Renderable2D';
 import { Text2D } from '../../src/runtime/traits/Text2D';
+import { SkinnedSprite2D } from '../../src/runtime/traits/SkinnedSprite2D';
 import { collectOrderInLayer } from '../../src/runtime/rendering/orderInLayer';
 
 describe('collectOrderInLayer', () => {
@@ -24,6 +25,12 @@ describe('collectOrderInLayer', () => {
     const w = createWorld();
     const e = w.spawn(Text2D({ orderInLayer: 7 }));
     expect(collectOrderInLayer(w).get(e.id())).toBe(7);
+  });
+
+  it('reads orderInLayer from SkinnedSprite2D, so a skinned rig can be put behind or in front of sprites', () => {
+    const w = createWorld();
+    const e = w.spawn(SkinnedSprite2D({ orderInLayer: -10 }));
+    expect(collectOrderInLayer(w).get(e.id())).toBe(-10);
   });
 
   it('Text2D WINS on an entity carrying both, preserving the pre-#1228 runtime order', () => {

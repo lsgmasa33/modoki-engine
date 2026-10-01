@@ -36,7 +36,9 @@ export interface AtlasHashMember {
 
 function stableOpts(src: AtlasSource): string {
   return [src.pageSize, src.padding, src.extrude, src.maxPages ?? '', src.texture?.format ?? 'webp',
-    src.texture?.maxSize ?? '', src.texture?.mipmaps ?? ''].join('|');
+    src.texture?.maxSize ?? '', src.texture?.mipmaps ?? '',
+    // Appended only when set, so every untrimmed atlas keeps the key it already had (no re-pack).
+    ...(src.trim ? ['trim'] : [])].join('|');
 }
 
 /** Stable 16-hex content key for (members' bytes + rects + pack options + version).

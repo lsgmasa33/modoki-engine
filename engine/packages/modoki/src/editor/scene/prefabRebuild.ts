@@ -544,7 +544,14 @@ export function rebuildFromEntry(
   // whole entry, so R2 keeps a node in its row as a load would.
   const keptNodes = new Map(kept.filter((k) => !k.owned && k.address).map((k) => [k.address!, k] as const));
   const namedNodes = new Set<string>();
-  const spawnRead = keptNodes.size ? keepingFrames(read, new Set(keptNodes.keys()), namedNodes) : read;
+  // A kept node whose statement the new document re-points to another prefab goes before that prefab spawns in its place,
+  // so the spawn derives the guids it held, as a reload does (#1948 S1).
+  const released = new Set<number>();
+  const release = (address: string) => {
+    const k = keptNodes.get(address);
+    if (k && !released.has(k.id)) { released.add(k.id); deleteEntities([k.id]); }
+  };
+  const spawnRead = keptNodes.size ? keepingFrames(read, new Map([...keptNodes].map(([a, k]) => [a, k.source!])), namedNodes, release) : read;
 
   // The load's spawn of a scene entry (`onInstantiatePrefab`), from the editor's cache.
   const world = getCurrentWorld();
@@ -592,10 +599,11 @@ export function rebuildFromEntry(
     if (to) writeTraitField(p.id, eaMeta, 'parentId', to);
     else console.warn(`[Prefab] rebuild: the parent ${p.parentGuid} of a member moved in here is gone, and so is its template parent; it stays at the scene root`);
   }
-  seatKeptFrames(kept, newRootId, new Set([...keptNodes].filter(([g]) => !namedNodes.has(g) || orphaned.has(g)).map(([, k]) => k.id)));
+  seatKeptFrames(kept.filter((k) => !released.has(k.id)), newRootId, new Set([...keptNodes].filter(([g, k]) => !released.has(k.id) && (!namedNodes.has(g) || orphaned.has(g))).map(([, k]) => k.id)));
   if (keptOut && kept.length) {
     const links = getAllEntities().map((e) => [e.id, e.parentId] as const);
-    for (const id of collectSubtreeIds(links, kept.filter((k) => findEntity(k.id)).map((k) => k.id))) keptOut.add(id);
+    // Not a released frame: its id is recycled into the very spawn that replaced it (#1948 close-out review).
+    for (const id of collectSubtreeIds(links, kept.filter((k) => !released.has(k.id) && findEntity(k.id)).map((k) => k.id))) keptOut.add(id);
   }
   return newRootId;
 }

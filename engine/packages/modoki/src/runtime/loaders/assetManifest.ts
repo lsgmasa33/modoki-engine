@@ -432,6 +432,9 @@ export interface AtlasFrameRef {
    *  that needs 0..1 UVs (the 2D skin builder) normalizes `rect / page{W,H}`. */
   pageW: number;
   pageH: number;
+  /** A trimmed atlas's crop (`AtlasPackedFrame.orig`/`trim`): `rect` is only the visible part of the member. */
+  orig?: { w: number; h: number };
+  trim?: SpriteRect;
   /** Page-encoding settings + content hash (for variant selection + cache-bust). */
   texture: TextureImportSettings;
   hash: string;
@@ -458,6 +461,7 @@ function addAtlasToIndex(atlasGuid: string, block: AtlasCacheBlock): void {
     atlasFrameIndex.set(spriteGuid, {
       atlasGuid, page: frame.page, rect: frame.rect, pivot: frame.pivot,
       pageW: pageInfo.w, pageH: pageInfo.h,
+      ...(frame.orig && frame.trim ? { orig: frame.orig, trim: frame.trim } : {}),
       texture: block.texture, hash: pageInfo.hash,
     });
     members.add(spriteGuid);

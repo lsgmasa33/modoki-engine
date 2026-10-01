@@ -14,7 +14,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { packAtlas, defaultAtlasSource, ATLAS_FORMAT_VERSION, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
+import { packAtlas, defaultAtlasSource, alphaBounds, ATLAS_FORMAT_VERSION, type PackInput, type AtlasSource, type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { classifyJsonFormatVersion } from '../packages/modoki/src/runtime/core/formatVersion';
 import {
   resolveTextureSettings, TEXTURE_MAX_SIZES,
@@ -98,6 +98,7 @@ function readAtlasSource(absPath: string): AtlasSource {
     padding: typeof raw.padding === 'number' && raw.padding >= 0 ? raw.padding : defaults.padding,
     extrude: typeof raw.extrude === 'number' && raw.extrude >= 0 ? raw.extrude : defaults.extrude,
     ...(typeof raw.maxPages === 'number' ? { maxPages: raw.maxPages } : {}),
+    ...(raw.trim === true ? { trim: true } : {}),
     ...(raw.texture ? { texture: raw.texture } : {}),
   };
 }
@@ -149,15 +150,30 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     !!block && block.pages.every((_, i) => cacheHit(cacheDir, atlasPageUrlPath(sourceUrlPath, i), block.pages[i].hash, settings.format, '2d'));
   if (prev && prev.hash === atlasHash && allPagesCached(prev)) return; // up to date
 
+  const sharp = ((await nativeDynamicImport('sharp')) as typeof import('sharp')).default;
+  // Trim (`src.trim`): each member's visible pixels, in its own frame. A fully transparent member keeps a 1 px
+  // crop, so it still resolves (to nothing visible) rather than dropping out of the atlas.
+  const cropOf = new Map<string, { x: number; y: number; w: number; h: number }>();
+  if (src.trim) {
+    for (const m of members) {
+      const { data, info } = await sharp(bytesFor(m.textureAbs))
+        .extract({ left: m.rect.x, top: m.rect.y, width: m.rect.w, height: m.rect.h })
+        .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      const b = alphaBounds(data, info.width, info.height, info.channels);
+      const crop = b ?? { x: 0, y: 0, w: 1, h: 1 };
+      if (crop.w !== m.rect.w || crop.h !== m.rect.h) cropOf.set(m.guid, crop);
+    }
+  }
+  const sizeOf = (m: ResolvedMember) => cropOf.get(m.guid) ?? { w: m.rect.w, h: m.rect.h };
+
   const result = packAtlas(
-    members.map((m): PackInput => ({ guid: m.guid, w: m.rect.w, h: m.rect.h })),
+    members.map((m): PackInput => ({ guid: m.guid, w: sizeOf(m).w, h: sizeOf(m).h })),
     { pageSize: src.pageSize, padding: src.padding, extrude: src.extrude, ...(src.maxPages != null ? { maxPages: src.maxPages } : {}) },
   );
   if (result.overflow.length) {
     console.warn(`[atlas] ${sourceUrlPath}: ${result.overflow.length} member(s) didn't fit (page too small / maxPages) — omitted from the atlas.`);
   }
 
-  const sharp = ((await nativeDynamicImport('sharp')) as typeof import('sharp')).default;
   // Group placed frames by page, each with its resolved member (source texture + slice).
   const memberByGuid = new Map(members.map((m) => [m.guid, m]));
   const framesByPage = new Map<number, { spriteGuid: string; rect: ResolvedMember['rect']; member: ResolvedMember }[]>();
@@ -181,7 +197,10 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
         // bilinear / mip sampling at the frame border samples the sprite's own pixels,
         // not a neighbour's. The extended buffer's inner content lands exactly at the
         // frame rect when composited at (rect.x - extrude, rect.y - extrude).
-        const sr = fr.member.rect; // SOURCE rect (where to read from the texture)
+        // SOURCE rect (where to read from the texture): the slice, or its visible crop in a trimmed atlas.
+        const crop = cropOf.get(fr.spriteGuid);
+        const mr = fr.member.rect;
+        const sr = crop ? { x: mr.x + crop.x, y: mr.y + crop.y, w: crop.w, h: crop.h } : mr;
         const slice = await sharp(fr.member.textureAbs)
           .extract({ left: sr.x, top: sr.y, width: sr.w, height: sr.h })
           .png()
@@ -190,7 +209,10 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
           ? await sharp(slice).extend({ top: e, bottom: e, left: e, right: e, extendWith: 'copy' }).png().toBuffer()
           : slice;
         composites.push({ input: buf, left: fr.rect.x - e, top: fr.rect.y - e });
-        frames[fr.spriteGuid] = { page: p, rect: fr.rect, pivot: fr.member.pivot };
+        frames[fr.spriteGuid] = {
+          page: p, rect: fr.rect, pivot: fr.member.pivot,
+          ...(crop ? { orig: { w: mr.w, h: mr.h }, trim: crop } : {}),
+        };
       }
       const pagePng = await sharp({ create: { width: w, height: h, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
         .composite(composites)

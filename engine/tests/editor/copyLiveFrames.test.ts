@@ -29,6 +29,7 @@ import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabR
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { findEntity, readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
 import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
@@ -289,6 +290,45 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     await settle();
     expect(qPlaceholders()).toBe(1);
     expect(tree()).toEqual(was);
+  });
+
+  it('#1948 S1: a kept template node the document RE-POINTS is the new prefab after the rebuild, as after a reload', async () => {
+    // 1031's premise (hunt seed 1031 reaches it by real ops: a created prefab's template node kept from Q's copy), then
+    // an outside change of O re-points k-q1 from Q to H. Met by its address alone, the kept Q frame stood in for the H
+    // statement: k-q1 stayed Q, and the save persisted it. The kept frame is released before H spawns, so H's root
+    // derives the guid the Q frame held, and the rebuild equals the reload.
+    // Mutations: (a) the spawn skip ignores the prefab (`keeping.frames.has` alone) → k-q1 is still Q;
+    // (b) no `release` on a re-point → H spawns beside the live Q frame under a fallback guid → the trees differ.
+    const f = await startRun(be, noNest, 'lf-kept-node-repointed');
+    const o = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: Array<Record<string, unknown>> }> };
+    for (const key of ['k-q1', 'k-q2']) {
+      o.entities[1]!.added!.push({ parentLocalId: 2, guid: '', key, name: key, prefab: f.prefabs.Q.guid, traits: { EntityAttributes: { name: key, parentId: 0 } }, children: [] });
+    }
+    let before = be.snapshot();
+    be.write(f.prefabs.O.path, `${JSON.stringify(o, null, 2)}\n`);
+    await flushWatcher(be, before);
+    await reload(f);
+    await trash(f, 'Q');
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    const sc = file(f);
+    sc.embeddedPrefabFrames![f.prefabs.Q.guid] = sc.embeddedPrefabFrames![f.prefabs.Q.guid]!.filter((a) => !a.endsWith('/+k-q2'));
+    write(f, sc);
+    await reload(f);
+    const k1 = () => getAllEntities().filter((e) => templateKeyOf(findEntity(e.id) as never) === 'k-q1').map((e) => piOf(e.id)?.source ?? unresolvedRefOf(findEntity(e.id) as never)?.source);
+    expect(k1(), 'premise: k-q1 is a live Q frame').toEqual([f.prefabs.Q.guid]);
+    const o2 = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: Array<Record<string, unknown>> }> };
+    for (const n of o2.entities[1]!.added!) if (n.key === 'k-q1') n.prefab = f.prefabs.H.guid;
+    before = be.snapshot();
+    be.write(f.prefabs.O.path, `${JSON.stringify(o2, null, 2)}\n`);
+    await flushWatcher(be, before);
+    await settle();
+    expect(k1()).toEqual([f.prefabs.H.guid]);
+    const tree = () => Object.fromEntries(Object.entries(worldTree()).sort(([a], [b]) => a.localeCompare(b)));
+    const rebuilt = tree();
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    await reload(f);
+    expect(k1()).toEqual([f.prefabs.H.guid]);
+    expect(tree()).toEqual(rebuilt);
   });
 
   it('3081, rule 2: an undo on a frame of a missing prefab takes an unmarked field from the document the frame was built from', async () => {

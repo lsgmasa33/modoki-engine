@@ -23,4 +23,5 @@ export const SkinnedSprite2D = trait({
   flipX: false as boolean,     // mirror horizontally about the rig origin (render-only)
   flipY: false as boolean,     // mirror vertically about the rig origin (render-only)
   isVisible: true as boolean,
+  orderInLayer: 0 as number,   // draw order within the 2D layer (higher = in front), as on Renderable2D
 });

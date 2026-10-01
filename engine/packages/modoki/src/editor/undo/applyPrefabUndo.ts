@@ -103,7 +103,7 @@ async function restoreSnapshot(
           // is marked loaded, and the editor's scene path stays null, so Save still asks where. Not rebuilt through
           // `replaceWorldContent`, whose populate is synchronous and cannot instantiate a prefab (#1575). A restore under
           // the same key: it writes nothing.
-          const { world: w } = await sceneManager.loadScene('', { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies() });
+          const { world: w } = await sceneManager.loadScene('', { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies(undefined, scene.id) });
           return adoption.restored(w);
         }
         if (key.startsWith(PREFAB_EDIT_SCENE_PREFIX)) {
@@ -112,13 +112,13 @@ async function restoreSnapshot(
           // entry addresses its entities by, which a rebuild from the edited prefab's document would re-mint (review of
           // the first #1573 fix). No scene path set: that world reaches its file through Save alone. A restore under the
           // same key: it writes nothing, the edit session included.
-          const { world: w } = await sceneManager.loadScene(key, { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies() });
+          const { world: w } = await sceneManager.loadScene(key, { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies(undefined, scene.id) });
           return adoption.restored(w);
         }
         // A3: sceneManager.loadScene({preloaded}) records the base ref internally, but the editor's own baseScene tracking
         // (re-emitted by serializeScene) is separate module state — re-synced with the path. No history write: this runs
         // INSIDE the undo history.
-        const { world: w } = await sceneManager.loadScene(key, { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies() });
+        const { world: w } = await sceneManager.loadScene(key, { preloaded: clone(scene), sceneCopies: sceneManager.captureSceneCopies(undefined, scene.id) });
         return adoption.offer({ world: w, path: key, baseScene: 'loaded' });
       });
       if (!adopted) {

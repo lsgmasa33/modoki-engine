@@ -33,6 +33,7 @@ import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { decomposeTrs } from './decomposeTrs';
 import { createDespawnEviction } from './despawnEviction';
+import { takeLocalFits2D } from './localFit2D';
 // worldRegistry, not ./world: dozens of suites mock `core/ecs/world` wholesale, and a re-export
 // missing from their factory would fail this module's import in all of them.
 import { onWorldSwap } from './worldRegistry';
@@ -234,7 +235,11 @@ export function transformPropagationSystem(world: World) {
   if (_eaCount !== _prevEaCount) eaChanged = true;
   _prevEaCount = _eaCount;
 
-  // ── 2. Snapshot Transform-query entities the same way (pooled + compare-before-write). ──
+  // ── 2. Snapshot Transform-query entities the same way (pooled + compare-before-write). A local fit
+  //      (`Frame2D`, core/ecs/localFit2D.ts) is applied HERE, to the snapshot and never to the Transform: the
+  //      entity composes as `fit · local`, and a fit that changed (the canvas resized) fails the compare below
+  //      exactly like a moved Transform, so the short-circuit in step 3 cannot hold a stale fit. ──
+  const fits = takeLocalFits2D(world, parentIdMap);
   const entities = _entities;
   let transformChanged = worldChanged;
   let entityIndex = 0;
@@ -242,26 +247,31 @@ export function transformPropagationSystem(world: World) {
     const id = entity.id();
     const parentId = parentIdMap.get(id) || 0;
     const isActiveSelf = !selfInactive.has(id);
+    const fit = fits.size ? fits.get(entity.valueOf() as number) : undefined;
+    const x = fit ? fit.x + fit.kx * tf.x : tf.x;
+    const y = fit ? fit.y + fit.ky * tf.y : tf.y;
+    const sx = fit ? fit.kx * tf.sx : tf.sx;
+    const sy = fit ? fit.ky * tf.sy : tf.sy;
     if (entityIndex < entities.length) {
       const rec = entities[entityIndex];
       if (
         rec.id !== id || rec.parentId !== parentId ||
-        rec.x !== tf.x || rec.y !== tf.y || rec.z !== tf.z ||
+        rec.x !== x || rec.y !== y || rec.z !== tf.z ||
         rec.rx !== tf.rx || rec.ry !== tf.ry || rec.rz !== tf.rz ||
-        rec.sx !== tf.sx || rec.sy !== tf.sy || rec.sz !== tf.sz ||
+        rec.sx !== sx || rec.sy !== sy || rec.sz !== tf.sz ||
         rec.isActive !== isActiveSelf
       ) transformChanged = true;
       rec.id = id; rec.parentId = parentId;
-      rec.x = tf.x; rec.y = tf.y; rec.z = tf.z;
+      rec.x = x; rec.y = y; rec.z = tf.z;
       rec.rx = tf.rx; rec.ry = tf.ry; rec.rz = tf.rz;
-      rec.sx = tf.sx; rec.sy = tf.sy; rec.sz = tf.sz;
+      rec.sx = sx; rec.sy = sy; rec.sz = tf.sz;
       rec.isActive = isActiveSelf;
     } else {
       entities.push({
         id, parentId,
-        x: tf.x, y: tf.y, z: tf.z,
+        x, y, z: tf.z,
         rx: tf.rx, ry: tf.ry, rz: tf.rz,
-        sx: tf.sx, sy: tf.sy, sz: tf.sz,
+        sx, sy, sz: tf.sz,
         isActive: isActiveSelf,
       });
       transformChanged = true; // pool grew — a new entity this frame
