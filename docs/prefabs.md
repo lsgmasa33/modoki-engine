@@ -18,6 +18,12 @@ fixes. Most of those bugs came from two parts of the code disagreeing about what
 and no rule said which part was right. The design that rebuilds the instance model on these rules
 is #2001.
 
+**A question these rules cannot answer means the rule set is incomplete (owner, 2026-10-02).** A
+session that cannot settle a prefab behaviour question from the rules stops and flags the hub,
+citing the question and the rules it checked. It does not pick an answer itself. The hub refines
+the rules here (taking a behaviour fork to the owner), and then the work continues. A guess at a
+gap is how two parts of the code came to disagree in the first place.
+
 ⚠️ **The rules are the TARGET. Rules 2, 4 and 9 are not yet what the code does.** Today the live
 world is the truth and Save diffs it against the prefab, and a missing prefab is kept alive by a
 copy stored in the scene. The § Model and invariants section below describes that current code.
