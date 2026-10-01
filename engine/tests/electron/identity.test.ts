@@ -143,6 +143,63 @@ describe('identityMismatch', () => {
   it('the warning names the backend URL, so the fix is actionable', () => {
     expect(identityMismatch(identity(), '/Users/x/Projects/modoki-ai2', URL_)).toContain(URL_);
   });
+
+  // ── An OUT-OF-REPO project in a source editor (#1917) ──────────────────────────────
+  // AI → Connect Claude Code writes `.mcp.json` into the open project (#1894), so `claude`
+  // starts in projectRoot. When that project lives outside the checkout, cwd is nowhere near
+  // repoRoot — and the predicate used to look ONLY at repoRoot.
+  const outOfRepo = identity({ projectRoot: '/Users/x/Games/my-game' });
+
+  it('REGRESSION: silent when cwd is an out-of-repo projectRoot, or inside it', () => {
+    expect(identityMismatch(outOfRepo, '/Users/x/Games/my-game', URL_)).toBeNull();
+    expect(identityMismatch(outOfRepo, '/Users/x/Games/my-game/runtime', URL_)).toBeNull();
+  });
+
+  it('CONTROL: an unrelated cwd still WARNS with an out-of-repo project open', () => {
+    // Without this, a predicate that went silent whenever projectRoot is set would pass.
+    expect(identityMismatch(outOfRepo, '/Users/x/Games/other-game', URL_)).toContain('WRONG EDITOR');
+    // Segment-aware on projectRoot too: a sibling sharing its name as a prefix is outside.
+    expect(identityMismatch(outOfRepo, '/Users/x/Games/my-game-2', URL_)).toContain('WRONG EDITOR');
+  });
+
+  it('projectRoot INSIDE cwd is not a match — a sibling clone root holds its own games/', () => {
+    // modoki-ai's editor with modoki-ai2's game open, driven from the modoki-ai2 ROOT: that
+    // session edits engine code the editor never runs. The one direction deliberately not taken.
+    const crossClone = identity({ projectRoot: '/Users/x/Projects/modoki-ai2/games/3d-test' });
+    expect(identityMismatch(crossClone, '/Users/x/Projects/modoki-ai2', URL_)).toContain('WRONG EDITOR');
+  });
+
+  it('REGRESSION: a token-verified session is silent from the ANCESTOR folder Connect sent it to', () => {
+    // resolveMcpTarget adopts an ancestor .mcp.json up to the project's git root (C9) and the
+    // AI panel says to run `claude` there, so cwd CONTAINS projectRoot, the direction the path
+    // rule refuses. The editor's own token verdict is what clears it.
+    const mono = identity({ projectRoot: '/Users/x/mono/games/my-game', tokenCheck: 'ok' });
+    expect(identityMismatch(mono, '/Users/x/mono', URL_)).toBeNull();
+  });
+
+  it('CONTROL: the same ancestor cwd still WARNS without a verified token', () => {
+    // Only the token clears it. 'absent' and a pre-C6 backend (field missing) fall through to
+    // the path rule. ('mismatch' is tokenMismatchWarning's case, checked before this one.)
+    for (const tokenCheck of ['absent', undefined] as const) {
+      const mono = identity({ projectRoot: '/Users/x/mono/games/my-game', tokenCheck });
+      expect(identityMismatch(mono, '/Users/x/mono', URL_)).toContain('WRONG EDITOR');
+    }
+  });
+
+  it('an EMPTY projectRoot matches nothing, even when cwd is the real process cwd', () => {
+    // `isWithin(x, '')` would canonicalise '' to path.resolve('') = process.cwd(), and production
+    // always passes process.cwd(). So a fixed-string cwd, which is how the rest of this file
+    // calls it, cannot catch the `id.projectRoot &&` guard being deleted. This one can. The
+    // fixture repoRoot (/Users/x/...) is unrelated to the vitest cwd.
+    expect(identityMismatch(identity({ projectRoot: '' }), process.cwd(), URL_)).toContain('WRONG EDITOR');
+  });
+
+  it('an out-of-repo projectRoot matches across Windows spellings', () => {
+    const win = identity({ repoRoot: 'E:\\Projects\\modoki', projectRoot: 'd:/Games/my-game', branch: 'win' });
+    expect(identityMismatch(win, 'D:\\Games\\my-game', URL_)).toBeNull();
+    expect(identityMismatch(win, 'D:\\Games\\my-game\\runtime', URL_)).toBeNull();
+    expect(identityMismatch(win, 'D:\\Games\\other', URL_)).toContain('WRONG EDITOR');
+  });
 });
 
 describe('describeIdentity', () => {

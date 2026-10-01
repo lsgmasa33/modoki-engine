@@ -142,15 +142,39 @@ export function tokenMismatchWarning(id: BackendIdentity, backendUrl: string): s
  *   - A PACKAGED editor: its `repoRoot` is inside the .app bundle, so it never matches a
  *     source checkout. Comparing them would warn on every legitimate DMG session.
  *   - `cwd` inside `repoRoot` (or vice versa): running the MCP from a subdirectory of the
- *     repo the editor serves is correct, not a mismatch. */
+ *     repo the editor serves is correct, not a mismatch.
+ *   - `tokenCheck === 'ok'` (#1917): the editor itself says this session presented the token
+ *     IT minted for the project it is serving now, so the config was written by Connect for
+ *     exactly this editor. That verdict outranks a guess from the cwd. It is load-bearing
+ *     because Connect does not always write into the project: `resolveMcpTarget` adopts an
+ *     ANCESTOR `.mcp.json` up to the project's git root (C9) and tells the user to run
+ *     `claude` there, so a connected session's cwd can CONTAIN `projectRoot` (next case).
+ *   - `cwd` inside `projectRoot` (#1917): for a session with no token (a hand-written
+ *     `.mcp.json`), started in a project that lives OUTSIDE the checkout, cwd is nowhere near
+ *     `repoRoot`. Comparing against `repoRoot` alone put a false WRONG EDITOR banner on every
+ *     call (reproduced live on a scaffold in a temp dir before the fix).
+ *     ⚠️ ONE direction only, unlike `repoRoot`. `projectRoot` inside `cwd` is NOT accepted: a
+ *     sibling clone's ROOT contains its own `games/<id>`, so a session in `modoki-ai2` driving
+ *     `modoki-ai`'s editor with a `modoki-ai2` game open would go silent, and that session
+ *     edits engine code the editor never runs. This only keeps the clone-ROOT session loud. A
+ *     session whose cwd is INSIDE that sibling game folder is silent now, and it warned before.
+ *     That case needs two mistakes at once (the sibling's game opened in this editor AND the
+ *     wrong port), and its game edits do reach the editor it drives.
+ *
+ *  ⚠️ The verdict is computed once per MCP process (the probe is memoized by both callers), and
+ *  `projectRoot` and the token change on a project switch. A tokenless session that started in
+ *  project A stays silent after the editor switches to B. A session with a token is covered by
+ *  the editor's own per-project 403 instead. */
 export function identityMismatch(
   id: BackendIdentity,
   cwd: string,
   backendUrl: string,
 ): string | null {
   if (id.packaged) return null;
+  if (id.tokenCheck === 'ok') return null;
   if (!id.repoRoot || !cwd) return null;
   if (isWithin(cwd, id.repoRoot) || isWithin(id.repoRoot, cwd)) return null;
+  if (id.projectRoot && isWithin(cwd, id.projectRoot)) return null;
   return (
     `⚠️  WRONG EDITOR: MODOKI_BACKEND=${backendUrl} is serving ${id.repoRoot}` +
     `${id.branch ? ` (branch ${id.branch})` : ''}, but this session is running in ${cwd}. ` +

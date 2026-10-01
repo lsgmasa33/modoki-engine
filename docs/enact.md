@@ -744,7 +744,9 @@ captured image maps back to window coordinates.
 
 `GET /api/identity` returns `{repoRoot, projectRoot, backendPort, pid}`. The MCP calls it at
 startup, prints a line like `[modoki] backend 5181 → ~/Projects/modoki-ai2 (work-ai2)`, and
-**warns loudly** when `repoRoot` differs from the MCP's own cwd. This is cheap insurance against
+**warns loudly** when the MCP's own cwd is in neither `repoRoot` nor `projectRoot` (and the editor
+has not verified the session's token, #1917; the rule is `identityMismatch` in
+`engine/tools/shared/identity.ts`). This is cheap insurance against
 a whole session of failures misattributed to a bug when the real cause is `MODOKI_BACKEND`
 pointed at a sibling clone's editor. (See also `modoki_identity` in the debug-tools reference.)
 

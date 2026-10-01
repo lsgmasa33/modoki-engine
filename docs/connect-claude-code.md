@@ -388,6 +388,19 @@ while driving the wrong editor** — the silent failure CLAUDE.md already warns 
 the two-clone setup, and which `modoki_identity` only catches if the agent thinks to ask.
 Sticky ports make this rarer; they don't make it impossible (ports get recycled).
 
+**The other signal, the cwd heuristic, must not contradict the token** (#1917). Besides the
+token, every MCP call runs `identityMismatch` (`engine/tools/shared/identity.ts`), which compares
+the MCP's own cwd with the editor's paths. It looked only at `repoRoot`, so a session in a project
+OUTSIDE the checkout got a false WRONG EDITOR banner on every call (reproduced live with a scaffold
+in a temp dir, a dev editor, and the shipped MCP bundle). Two rules now clear it:
+- **`tokenCheck: 'ok'` skips the heuristic.** The editor has verified the token it minted for the
+  project it is serving, which is a stronger answer than any cwd guess. This rule is needed because
+  Connect does not always write into the project. C9 can adopt an ancestor `.mcp.json` and tell the
+  user to run `claude` THERE, so the session's cwd contains `projectRoot` instead of sitting inside it.
+- **A cwd inside `projectRoot` counts as a match** for a session with no token.
+  ⚠️ Only that direction: `projectRoot` inside cwd still warns, because a sibling clone's root
+  contains its own `games/<id>`, and a session there edits engine code the editor never runs.
+
 **Design.** A GUID that keys on **(install, project root)** — not per-launch (that would
 invalidate the config on every restart and defeat C5's stickiness) and not committed
 per-project (two clones of the same project would share it, which is exactly the case we
