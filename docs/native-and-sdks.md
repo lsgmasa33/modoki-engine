@@ -402,7 +402,7 @@ const { running, connected } = await GameDebug.getStatus();
 
 **Debug files** (`writeDebugFile` / `listDebugFiles` / `deleteDebugFile`, 2026-09-27): a Debug build
 writes text files the developer pulls off the device afterwards — Slime Shooter's per-game play log
-is the first user (docs/plans/slime-shooter.md § Play logs). Paths are confined to a debug-files
+is the first user ([play-logs.md](../games/slime-shooter/docs/play-logs.md)). Paths are confined to a debug-files
 folder — iOS `Documents/modoki-debug/` (pulled with `xcrun devicectl device copy from --domain-type
 appDataContainer`), Android `<external files>/modoki-debug/` (`adb pull`) — and a path that would
 leave it is rejected. One serial queue per platform keeps appends in arrival order. `deleteDebugFile`
