@@ -64,7 +64,8 @@ export const analytics = {
 /**
  * Local notifications — a no-op namespace, mirroring `export * as notifications from './notifications'`
  * in Weaveling's package (#940). A creative has no OS notification centre to reach, so it answers the
- * real wrapper's off-native values: `unavailable` (the reminder row shows the stored choice) and nothing scheduled.
+ * real wrapper's off-native values: `unavailable` and nothing scheduled. Both games HIDE the reminder row in
+ * a playable (Weaveling #1915, Slime Shooter #1584 O11) — off the build define, not off this answer.
  */
 export const notifications = {
   async permission(): Promise<'unavailable'> { return 'unavailable'; },
@@ -146,8 +147,9 @@ export const ads = {
  * ⚠️ Like `ads` above, the no-op is REQUIRED rather than merely a size saving, and for a sharper
  * reason. A playable ad is a few seconds inside somebody else's ad slot: it has no Firebase app, no
  * native plugin bridge, and no business asking for an Apple or Google account. So every sign-in
- * here reports `not-configured` — the SAME answer the real seam gives off-device — which is what
- * makes the caller hide the sign-in UI rather than render a button that can only fail.
+ * here reports `not-configured` — the SAME answer the real seam gives off-device. That answer alone
+ * hid nothing: the Settings Account row stayed up in a creative until each game's `accountEntryShown`
+ * learned the playable define (Weaveling #1915, Slime Shooter #1584 O11) — so the hide lives there.
  *
  * `currentUser` resolving `null` matters just as much: a creative must read as a signed-out player
  * with no cloud save, not as an account whose progress failed to load.
