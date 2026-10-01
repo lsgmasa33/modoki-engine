@@ -362,7 +362,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
   it('retries once and merges correctly when a concurrent writer races the first upload attempt', () => {
     // Seed a real key via the actual ota-keygen.mjs (it's cheap and exercises real code).
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     // First publish: creates release.json fresh (no race — flag absent).
     const first = publish('shell', 'v1');
@@ -383,7 +383,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
 
   it('publishes cleanly with no retry when nothing races it', () => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     const result = publish('shell', 'v1');
     expect(result.status).toBe(0);
@@ -392,20 +392,15 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     expect(releaseJson.bundles).toEqual({ shell: 'v1' });
   });
 
-  it('--repo-root points key resolution somewhere else, and a key ONLY at the default location is not found', () => {
-    // A key generated at the script's own default repoRoot must NOT be visible when an
-    // explicit --repo-root points elsewhere — proving the override actually takes effect
-    // rather than being silently ignored in favor of import.meta.url's own guess.
-    const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
-
+  it('with no key in the project and none left by an earlier editor, the publish is refused — nothing is minted', () => {
+    // The key is the PROJECT's (#1983). `--repo-root` names the editor root an earlier editor may have
+    // left a key in; here neither it nor any ancestor of the project holds one.
     const otherRoot = makeScratchDir('modoki-ota-other-root-');
     try {
-      // If --repo-root were silently ignored, the key generated above (at the script's
-      // own default repoRoot) would be found and this would succeed instead.
       const result = publish('shell', 'v1', {}, ['--repo-root', otherRoot]);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toMatch(/Signing key not found/);
+      expect(fs.existsSync(path.join(repoRoot, 'games', 'testproj-shell', 'build', 'ota-keys'))).toBe(false);
     } finally {
       fs.rmSync(otherRoot, { recursive: true, force: true });
     }
@@ -413,7 +408,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
 
   it('a describe that succeeds but a cat that fails is a hard error, not "no existing release" (F1)', () => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     // First publish creates a real release.json with "shell" in it.
     const first = publish('shell', 'v1');
@@ -439,7 +434,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     ['an array', '[]'],
   ])('a release.json body that is %s is a hard error, not "no bundles yet" (F4)', (_label, malformedBody) => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     // Plant a malformed release.json directly in the fake bucket — describe() will report
     // it exists (generation '0', the fake's default), and cat() will return this body,
@@ -462,7 +457,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
 
   it('#570: preserves another bundle\'s manifests entry across a publish of a different bundle', () => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     const first = publish('shell', 'v1');
     expect(first.status).toBe(0);
@@ -482,7 +477,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
 
   it('#570: prunes a manifests entry whose bundle is no longer in release.bundles (merge/prune mechanics only, fake hash)', () => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
 
     // Seed a release.json directly (simulating a bundle that was removed from `bundles`
     // by some other means, leaving a stale "ghost" entry in `manifests`) — `bundles` has
@@ -518,14 +513,19 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     expect(Object.keys(release.manifests).sort()).toEqual(['shell', 'sling']);
   });
 
-  it('--repo-root points key resolution somewhere else, and a key THERE is found and used', () => {
+  it('a matching key left ONLY at the --repo-root (an earlier editor\'s root) is COPIED into the project and signs (#1983)', () => {
     const otherRoot = makeScratchDir('modoki-ota-other-root-with-key-');
     try {
       writeKeyPair(otherRoot);
+      const original = fs.readFileSync(path.join(otherRoot, 'build', 'ota-keys', 'default.json'));
       const result = publish('shell', 'v1', {}, ['--repo-root', otherRoot]);
       expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/\[ota-keys\] copied default\.json into .* \(the original stays where it was\)/);
       const releaseJson = JSON.parse(fs.readFileSync(path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json'), 'utf8'));
       expect(releaseJson.bundles).toEqual({ shell: 'v1' });
+      const copy = path.join(repoRoot, 'games', 'testproj-shell', 'build', 'ota-keys', 'default.json');
+      expect(fs.readFileSync(copy).equals(original)).toBe(true);
+      expect(fs.readFileSync(path.join(otherRoot, 'build', 'ota-keys', 'default.json')).equals(original)).toBe(true);
     } finally {
       fs.rmSync(otherRoot, { recursive: true, force: true });
     }
@@ -569,7 +569,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
   });
 
   afterEach(() => {
@@ -698,7 +698,7 @@ describe('ota-publish.mjs version-collision guard', () => {
     writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
   });
 
   afterEach(() => {
@@ -1044,7 +1044,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
     realPublicKey = readKeyPublicKey(repoRoot);
 
     projectDir = path.join(repoRoot, 'games', 'testproj');
@@ -1153,15 +1153,33 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   it('c) an ota.publicKey that does NOT match the signing key refuses before any upload', () => {
     const mismatchProjectDir = path.join(repoRoot, 'games', 'testproj-mismatch');
     writeProjectConfig(mismatchProjectDir, { bundleName: 'shell', publicKey: 'not-the-real-key' });
+    // The key in the PROJECT itself (#1983): a key left at the repo root is not adopted by a project
+    // whose ota.publicKey is another (c2), so the mismatch guard is only reachable this way.
+    fs.mkdirSync(path.join(mismatchProjectDir, 'build', 'ota-keys'), { recursive: true });
+    fs.copyFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), path.join(mismatchProjectDir, 'build', 'ota-keys', 'default.json'));
     const result = publish('shell', ['--project', mismatchProjectDir]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/does NOT match/);
     expect(bucketIsEmpty()).toBe(true);
   });
 
+  it('c2) a key left at the repo root whose public half is NOT the project\'s is never adopted (#1983)', () => {
+    const otherProjectDir = path.join(repoRoot, 'games', 'testproj-other-key');
+    writeProjectConfig(otherProjectDir, { bundleName: 'shell', publicKey: 'not-the-real-key' });
+    const result = publish('shell', ['--project', otherProjectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toMatch(/not copying .*is not this project's ota\.publicKey/);
+    expect(result.stderr).toMatch(/Signing key not found/);
+    expect(fs.existsSync(path.join(otherProjectDir, 'build', 'ota-keys'))).toBe(false);
+    expect(bucketIsEmpty()).toBe(true);
+  });
+
   it('d) an empty ota.publicKey refuses with the project-public-key-empty message', () => {
     const emptyKeyProjectDir = path.join(repoRoot, 'games', 'testproj-empty-key');
     writeProjectConfig(emptyKeyProjectDir, { bundleName: 'shell', publicKey: '' });
+    // Its own key (#1983): a project baking no public key never adopts the repo root's.
+    fs.mkdirSync(path.join(emptyKeyProjectDir, 'build', 'ota-keys'), { recursive: true });
+    fs.copyFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), path.join(emptyKeyProjectDir, 'build', 'ota-keys', 'default.json'));
     const result = publish('shell', ['--project', emptyKeyProjectDir]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/ota\.publicKey is EMPTY/);
@@ -1388,7 +1406,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
     writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
-    execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
+    execFileSync('node', ['engine/scripts/ota-keygen.mjs', '--project', repoRoot], { cwd: repoRoot, env: keygenEnv });
     realPublicKey = readKeyPublicKey(repoRoot);
 
     projectDir = path.join(repoRoot, 'games', 'testproj');

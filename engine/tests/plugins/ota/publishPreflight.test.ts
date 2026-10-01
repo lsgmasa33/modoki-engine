@@ -18,19 +18,27 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
-let repoRoot: string;
+/** The scratch: an editor root (`editor/`, where earlier editors left keys) and the project, whose own
+ *  `build/ota-keys/` holds the key the preflight reads (#1983). */
+let scratch: string;
+let repoRoot: string; // the PROJECT (named for the config-reading half of this file)
+let editorRoot: string;
 const KEY = { publicKey: 'pub-A', privateKey: 'priv-A' };
+const keyFile = (root: string, name = 'default') => path.join(root, 'build', 'ota-keys', `${name}.json`);
 
 beforeEach(() => {
-  repoRoot = makeScratchDir('modoki-ota-preflight-');
-  fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
-  fs.writeFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), JSON.stringify(KEY));
+  scratch = makeScratchDir('modoki-ota-preflight-');
+  repoRoot = path.join(scratch, 'project');
+  editorRoot = path.join(scratch, 'editor');
+  fs.mkdirSync(path.dirname(keyFile(repoRoot)), { recursive: true });
+  fs.mkdirSync(editorRoot, { recursive: true });
+  fs.writeFileSync(keyFile(repoRoot), JSON.stringify(KEY));
 });
-afterEach(() => { fs.rmSync(repoRoot, { recursive: true, force: true }); });
+afterEach(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 
 const OTA = { enabled: true, bundleName: 'shell', subgames: ['mini'], publicKey: 'pub-A' };
 const req = (over: Record<string, unknown> = {}) => ({
-  ota: OTA, name: 'shell', version: 'v1', keyName: 'default', bucket: 'gs://b/p', repoRoot, ...over,
+  ota: OTA, name: 'shell', version: 'v1', keyName: 'default', bucket: 'gs://b/p', projectRoot: repoRoot, editorRoot, ...over,
 }) as Parameters<typeof otaPublishPreflight>[0];
 const refusalOf = (over: Record<string, unknown> = {}) => {
   const r = otaPublishPreflight(req(over));
@@ -85,6 +93,7 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
     ['bad-project-retain-versions', { ota: { ...OTA, retainVersions: 0 } }],
     ['ambiguous-bundle', { ota: { ...OTA, subgames: ['shell'] } }],
     ['unknown-bundle', { name: 'not-listed' }],
+    ['key-copy-failed', {}],
     ['key-missing', { keyName: 'nope' }],
     ['no-key-public-half', {}],
     ['project-public-key-empty', { ota: { ...OTA, publicKey: '' } }],
@@ -94,14 +103,22 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
   for (const [refusal, over] of cases) {
     it(refusal, () => {
       if (refusal === 'no-key-public-half') {
-        fs.writeFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), JSON.stringify({ privateKey: 'x' }));
+        fs.writeFileSync(keyFile(repoRoot), JSON.stringify({ privateKey: 'x' }));
+      }
+      if (refusal === 'key-copy-failed') {
+        // The project has no key, an earlier editor's matching key exists, and the copy cannot be made
+        // (the project's build/ota-keys is a FILE): refused, and the original is untouched.
+        fs.rmSync(path.join(repoRoot, 'build'), { recursive: true });
+        fs.writeFileSync(path.join(repoRoot, 'build'), 'not a directory');
+        fs.mkdirSync(path.dirname(keyFile(editorRoot)), { recursive: true });
+        fs.writeFileSync(keyFile(editorRoot), JSON.stringify(KEY));
       }
       expect(refusalOf(over)).toBe(refusal);
     });
   }
 
   it('key-unparseable', () => {
-    fs.writeFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), '{ nope');
+    fs.writeFileSync(keyFile(repoRoot), '{ nope');
     expect(refusalOf()).toBe('key-unparseable');
   });
 
@@ -110,8 +127,27 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
   });
 
   it('refuses an unknown NAME before it reads the key — a bad request never touches the key file', () => {
-    fs.rmSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'));
+    fs.rmSync(keyFile(repoRoot));
     expect(refusalOf({ name: 'not-listed' })).toBe('unknown-bundle');
+  });
+
+  it('reads the PROJECT\'s key, not the editor root\'s (#1983)', () => {
+    // A different key at the editor root is never read while the project has its own.
+    fs.mkdirSync(path.dirname(keyFile(editorRoot)), { recursive: true });
+    fs.writeFileSync(keyFile(editorRoot), JSON.stringify({ publicKey: 'pub-B', privateKey: 'priv-B' }));
+    const r = otaPublishPreflight(req());
+    expect(r.ok && r.keyPath).toBe(keyFile(repoRoot));
+  });
+
+  it('a project with no key adopts the earlier editor\'s matching key, as a COPY (#1983)', () => {
+    fs.rmSync(keyFile(repoRoot));
+    fs.mkdirSync(path.dirname(keyFile(editorRoot)), { recursive: true });
+    fs.writeFileSync(keyFile(editorRoot), JSON.stringify(KEY));
+    const before = fs.readFileSync(keyFile(editorRoot));
+    const r = otaPublishPreflight(req());
+    expect(r).toMatchObject({ ok: true, keyPath: keyFile(repoRoot) });
+    expect(fs.readFileSync(keyFile(repoRoot)).equals(before)).toBe(true);
+    expect(fs.readFileSync(keyFile(editorRoot)).equals(before)).toBe(true);
   });
 });
 
@@ -130,7 +166,7 @@ describe('both OTA entry points run the ONE preflight (#827)', () => {
 
   it('ota-publish.mjs reads the same raw block, calls it, and no longer composes its steps itself', () => {
     expect(cli).toMatch(/const rawConfig = readRawOtaBlock\(projectDir\);/);
-    expect(cli).toMatch(/otaPublishPreflight\(\{ ota, name, version, keyName: args\.key, bucket, repoRoot \}\)/);
+    expect(cli).toMatch(/otaPublishPreflight\(\{ ota, name, version, keyName: args\.key, bucket, projectRoot: projectDir, editorRoot: repoRoot \}\)/);
     expect(cli).not.toMatch(/otaSigningKeyRefusal\(|otaPublishTarget\(|OTA_SAFE_TOKEN\.test\(|OTA_SAFE_BUCKET\.test\(/);
   });
 

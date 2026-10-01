@@ -72,12 +72,67 @@ content hash **chained back to that root** — see § The trust chain.
 
 ### Signing
 
-Ed25519. The private key lives outside the repo; the public key is baked into the app
-binary. **Verification happens in JS** (`@noble/curves`), not native code — deliberately:
+Ed25519. The private key lives in the project, gitignored (§ Signing key: where it lives, backup
+and other machines); the public key is baked into the app binary. **Verification happens in JS** (`@noble/curves`), not native code — deliberately:
 this JS is already running and already trusted (it shipped in a signed binary, or is itself
 a previously-verified update), and Android's minSdk 31 predates native EdDSA (API 33), so
 native verification would need a minSdk bump or a second hand-rolled curve implementation.
 One audited library shared by both platforms is strictly better.
+
+### Signing key: where it lives, backup and other machines
+
+**Where.** `<project>/build/ota-keys/<name>.json` — the PROJECT's folder, not the editor's (#1983).
+`ota-keygen.mjs --project <dir>` writes it (mode 0600, or an owner-only ACL on Windows); the publish
+preflight, the editor's Build → OTA Keys… (`/api/ota/keys`, `/api/ota/keygen`) and
+`modoki_ota_keygen` all read and write that one path (`engine/scripts/ota/keyStore.mjs`). The folder
+ignores itself: keygen and the copy write a `build/ota-keys/.gitignore` of `*` when they create it,
+and every read (OTA Keys, a publish) writes it into a key folder that lacks one, so a key is not
+committable in any project, including one scaffolded before #1983 with no `.gitignore` of its own.
+A config that cannot be read is not taken to mean "no public key": with a same-named earlier key
+present, keygen and the OTA Keys read refuse until `project.config.json` is fixed, rather than mint
+over what may be the shipped key.
+Belt and braces on top: the repo's `.gitignore` (`games/*/build/ota-keys/`, `demos/*/build/ota-keys/`),
+a scaffolded project's own `.gitignore` (the template's `gitignore`), an OTA-enabled game's own
+`.gitignore`, and an `electron-builder.yml` exclude so no key can ride into the signed app. `otaKeyIgnored.test.ts` fails the suite when any
+project's key path is committable, and the publish scan (`scan-publish-safety.mjs`) refuses any file
+under a `build/ota-keys/` and any keypair-shaped `privateKey` in a public snapshot.
+
+**Why it moved.** Before #1983 the key was written under the EDITOR's root: the clone in the dev
+editor, and `Modoki Editor.app/Contents/Resources/app.asar.unpacked` in the packaged one — inside the app
+bundle, where an editor update replaces the bundle and the key with it. A lost key is irreversible
+(§ Gotchas, "Never regenerate the signing key").
+
+**The migration copies; it never moves or deletes.** The first read of a project that has no key copies
+one from where earlier editors wrote it — the editor's root (the dev clone, or a packaged bundle that
+still holds one), then every ancestor of the project (so a game inside a clone finds the clone's root
+key from the packaged editor too) — and logs `[ota-keys] copied <name>.json into … from …`. The
+original stays where it was. A key is copied only into a project whose `ota.publicKey` is that key's
+public half, i.e. a project that shipped with it: a key with another public half could sign nothing
+the project's binaries accept, and a project with no public key yet has no binary that trusts any key,
+so both are reported (`not copying …`) and left alone rather than spreading the private key. So a
+project that shipped with the shared `default` key gets a copy of that same key, and keygen refuses
+to mint over a key it can copy.
+
+⚠️ **An editor UPDATE deletes a packaged editor's key before any of this runs.** The updater (and a
+Finder "Replace" from the DMG) swaps the whole `Modoki Editor.app` — `app.asar.unpacked/build/ota-keys`
+with it — and only then starts the editor that carries #1983. So for a packaged editor before #1983,
+copy `Modoki Editor.app/Contents/Resources/app.asar.unpacked/build/ota-keys/` (Windows: the install
+folder's `resources/app.asar.unpacked/build/ota-keys/`) somewhere safe BEFORE updating, then into each
+project's `build/ota-keys/` that ships with it. No code in the new editor can recover a key the update
+already removed.
+
+**Back it up.** The project's `build/ota-keys/` is the only copy that matters once a project has
+shipped, and it is in no repo by design. Copy the folder to storage you control (an encrypted backup
+or a password manager's file attachment) right after keygen and after every new key. Losing it ends OTA
+for every build already shipped: those binaries can only be fixed by a new store release.
+
+**Other machines are by hand.** Nothing syncs keys. To publish from another machine (the Windows
+machine included), copy the whole `<project>/build/ota-keys/` folder there over a channel you trust,
+into the same place in that machine's checkout of the project, and check the key's `publicKey` equals
+the project's `ota.publicKey` before the first publish. (A key file dropped in on its own is healed on
+the first OTA Keys read or publish, which writes the folder's `.gitignore`; until then it is
+committable, so copy the folder.) Never run keygen on the second machine for a
+project that already shipped.
 
 ### The trust chain
 
@@ -606,7 +661,7 @@ check added there refuses on both. Only the refusal WORDING is per side; each si
 by `OTA_PUBLISH_REFUSALS`, and `publishPreflight.test.ts` holds both maps to the full list.
 `GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
 from the transport-agnostic `editorBackendRouter.ts` so they also work in a packaged Electron
-editor. `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
+editor (the key they write is the project's, so it survives an editor update — § Signing key). `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
 routes need: `resolveGcloudDir` (locates the `gcloud` CLI even in a Finder-launched packaged
 editor's minimal `PATH`), `deriveGcsBucketFromBaseUrl` (reverses `ota.baseUrl`'s
 `https://storage.googleapis.com/…` form to the `gs://…` form `gcloud` needs), and it re-exports
@@ -946,11 +1001,9 @@ questions, recorded so they are not re-opened by accident.
   `subgame.json`'s presence) must match the identity it's published under. `--project <dir>` is
   now a required flag, read for these checks (never for bucket or version, which stay explicit
   args; #837 added a third check, a sub-game's engine API against the shell's `ota.engineApi`) — an unreadable/malformed `project.config.json` aborts loudly
-  rather than degrading to "unguarded". `engine/scripts/ota-keygen.mjs` also gained an explicit
-  `--repo-root` (mirroring `ota-publish.mjs`'s own flag), and `/api/ota/keygen` now passes it as
-  `ctx.editorRoot || ctx.projectRoot` — the SAME expression `/api/ota/keys` reads back with —
-  closing a latent desync the two used to avoid only by the route invoking the script with a
-  cwd-relative path.
+  rather than degrading to "unguarded". (`ota-keygen.mjs`'s `--repo-root`, added here so the route and
+  `/api/ota/keys` agreed on one root, was replaced by `--project` in #1983, when the key moved into
+  the project; both routes now read and write `keyStore.mjs`'s `projectKeyPath`.)
   ⚠️ **`otaBundleDistKindRefusal` is weaker than it can sound**: it pins the dist's kind to the
   SHAPE of the identity (plain shell vs. subgame-dist), not to a SPECIFIC sub-game's identity —
   `subgame.json` carries no name, and neither the guard nor its caller ever checks that

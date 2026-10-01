@@ -148,6 +148,9 @@ files:
   - "!**/*.xcuserdatad/**"
   - "!**/android/**/build/**"
   - "!**/.gradle/**"
+  # An OTA signing key (#1983) is a project's, never the editor's: a project opened from inside the
+  # shipped tree (the template) must not carry one into the signed app.
+  - "!**/build/ota-keys/**"
   # Local editor/build state (5 of these ship today — engine/.modoki,
   # engine/packages/modoki/.modoki, engine/tsconfig.app.scoped.json and two font
   # *.meta.local.json sidecars; the scoped tsconfig is #885's own row 6):

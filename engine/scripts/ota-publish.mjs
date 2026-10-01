@@ -141,7 +141,8 @@ async function main() {
   // #827), and the signing key. BEFORE any hashing/zipping/upload, so a refusal provably reaches
   // nothing in the bucket. Only the wording is this script's; every refusal is keyed below, and
   // `otaPublishPreflight.test.ts` holds this map to the full list.
-  const preflight = otaPublishPreflight({ ota, name, version, keyName: args.key, bucket, repoRoot });
+  // The key is the PROJECT's (#1983); `repoRoot` is only where an earlier editor may have left one.
+  const preflight = otaPublishPreflight({ ota, name, version, keyName: args.key, bucket, projectRoot: projectDir, editorRoot: repoRoot });
   if (!preflight.ok) {
     const r = preflight;
     fail({
@@ -149,16 +150,17 @@ async function main() {
       'not-enabled': `${projectConfigPath}'s ota.enabled is not true — this project has not opted into OTA updates. Enable OTA in Project Settings first, then publish.`,
       'bad-version': `--version must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(version)})`,
       'bad-name': `--name must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(name)}) — in particular, a "/" is rejected: it would silently write bucket objects under a NESTED path while release.json still records --name as a flat string, so the version-collision guard below (which reads back that same flat path) would never see what actually landed. Use a plain bundle-name token, not a path.`,
-      'bad-key-name': `--key must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(args.key)}) — it names a keypair in build/ota-keys/, not a path.`,
+      'bad-key-name': `--key must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(args.key)}) — it names a keypair in the project's build/ota-keys/, not a path.`,
       'bad-bucket': `--bucket must be a gs:// URL matching ${OTA_SAFE_BUCKET} (got ${args.bucket})`,
       'bad-project-bundle-name': `${projectConfigPath}'s ota.bundleName is present but not a non-empty string (got ${JSON.stringify(ota?.bundleName)}) — it decides whether this dist may be published under --name "${name}", so this publish cannot be checked. Set it in project.config.json, or remove the key to use the default ("${OTA_DEFAULT_BUNDLE_NAME}").`,
       'bad-project-subgames': `${projectConfigPath}'s ota.subgames is present but not a list of project ids (got ${JSON.stringify(ota?.subgames)}) — it decides which sub-game names may be published into this shell, so this publish cannot be checked.`,
       'bad-project-retain-versions': `${projectConfigPath}'s ota.retainVersions is present but not a positive integer (got ${JSON.stringify(ota?.retainVersions)}) — it decides how many versions of "${name}" this publish keeps in the bucket, so it cannot prune. Set it in project.config.json, or remove the key to keep the default.`,
       'ambiguous-bundle': `--name "${name}" is BOTH ${projectConfigPath}'s own ota.bundleName and a sub-game listed in its ota.subgames — it cannot say whether it publishes the shell or that sub-game. Rename one.`,
       'unknown-bundle': `--name "${name}" is neither ${projectConfigPath}'s own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). A sub-game is published into this shell only once the shell lists it (Project Settings → OTA → Sub-games) — the same rule the editor's Publish OTA Update… enforces (#837, #827). Pass --name ${JSON.stringify(String(r.bundleName))} to publish this project as itself.`,
-      'key-missing': `Signing key not found: ${path.relative(repoRoot, String(r.keyPath))}. Run: node engine/scripts/ota-keygen.mjs ${args.key}`,
-      'key-unparseable': `Signing key "${args.key}" (${r.keyPath}) could not be parsed as JSON — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
-      'no-key-public-half': `Signing key "${args.key}" (${r.keyPath}) has no publicKey field — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
+      'key-copy-failed': `Signing key "${args.key}": ${r.error}`,
+      'key-missing': `Signing key not found: ${r.keyPath}. Run: node engine/scripts/ota-keygen.mjs ${args.key} --project ${JSON.stringify(projectDir)}`,
+      'key-unparseable': `Signing key "${args.key}" (${r.keyPath}) could not be parsed as JSON — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key} --project ${JSON.stringify(projectDir)}`,
+      'no-key-public-half': `Signing key "${args.key}" (${r.keyPath}) has no publicKey field — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key} --project ${JSON.stringify(projectDir)}`,
       'project-public-key-empty': `${projectConfigPath}'s ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in project.config.json, rebuild + ship the native app so the new key is baked in, and publish then.`,
       mismatch: `Signing key "${args.key}" does NOT match ${projectConfigPath}'s ota.publicKey — every installed app would reject the release as signature-invalid, while this publish would report success. Key "${args.key}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${ota?.publicKey}". Publish with the key that matches (--key <name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
     }[r.refusal] ?? `refused: ${r.refusal}`);

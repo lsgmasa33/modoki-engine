@@ -126,9 +126,9 @@ export default function OtaKeysDialog() {
       }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 4 }}>OTA Keys</div>
         <div style={{ color: '#888', fontSize: 11, marginBottom: 12 }}>
-          The Ed25519 keypair OTA releases are signed with. The private key lives at
-          build/ota-keys/&lt;name&gt;.json (gitignored) — losing it means these installed
-          binaries can never be updated again. There is no overwrite here on purpose.
+          The Ed25519 keypair OTA releases are signed with. The private key lives in this
+          project at build/ota-keys/&lt;name&gt;.json (gitignored) — back it up: losing it means
+          these installed binaries can never be updated again. There is no overwrite here on purpose.
         </div>
 
         <div style={{ marginBottom: 10 }}>

@@ -11,7 +11,7 @@ import { signingPayload } from './schema.mjs';
 /** Generates a fresh Ed25519 keypair. Returns raw base64url-encoded keys —
  *  `publicKey` is what gets baked into the app; `privateKey` MUST stay off the
  *  device and out of the repo (see engine/scripts/ota-keygen.mjs, which writes
- *  it under the gitignored `build/ota-keys/`). */
+ *  it under the project's gitignored `build/ota-keys/`, #1983). */
 export function generateKeypair() {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   return {

@@ -161,7 +161,8 @@ export function openProjectReply(root: string, outcome: ProjectOpenOutcome): Rep
           + 'The open was NOT cancelled and is still running — do not repeat this call.',
         options: [
           'modoki_get_editor_state — answers once the new editor has mounted',
-          'modoki_identity — projectRoot already names the new project; it is not evidence that it finished loading',
+          // #1976: the backend re-roots only once the project is PREPARED, so during `preparing` this still names the old one.
+          'modoki_identity — projectRoot names the new project once it is prepared (before its window loads); it is not evidence that it finished loading',
         ],
       } };
   }

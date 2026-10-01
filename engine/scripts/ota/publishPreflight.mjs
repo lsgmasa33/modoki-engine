@@ -24,13 +24,15 @@
  *
  *  Plain `.mjs` in `ota/` beside the leaf guards it composes, so `ota-publish.mjs` imports it with no
  *  loader and `otaPublishReleaseRace.test.ts`'s copied-subset repo (which copies `ota/` whole) carries
- *  it. It reads one file — the signing key — and nothing else. */
+ *  it. It reads one file — the signing key — and, the first time a project has none, copies the key an
+ *  earlier editor wrote outside the project into it ({@link adoptLegacyKey}, #1983). */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './otaSafeTokens.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME, otaRetainVersions, otaSigningKeyRefusal } from './publishGuards.mjs';
 import { readJsonFile } from '../jsonFile.mjs'; // #1799: a BOM is read through
+import { adoptLegacyKey } from './keyStore.mjs';
 
 /** Every refusal {@link otaPublishPreflight} can return, in the order it checks them. */
 export const OTA_PUBLISH_REFUSALS = Object.freeze([
@@ -45,6 +47,7 @@ export const OTA_PUBLISH_REFUSALS = Object.freeze([
   'bad-project-retain-versions',
   'ambiguous-bundle',
   'unknown-bundle',
+  'key-copy-failed',
   'key-missing',
   'key-unparseable',
   'no-key-public-half',
@@ -86,14 +89,15 @@ export function otaPublishTarget(name, ota) {
 }
 
 /** Check a publish request. `ota` is the project's `ota` block — merged or raw; an absent
- *  `bundleName`/`subgames` resolves to its default here. `repoRoot` is where
- *  `build/ota-keys/<keyName>.json` lives.
+ *  `bundleName`/`subgames` resolves to its default here. The key is the PROJECT's,
+ *  `<projectRoot>/build/ota-keys/<keyName>.json` (#1983); `editorRoot` is only where an earlier editor may
+ *  have left it (see keyStore.mjs).
  *
  *  Returns `{ ok: true, target, keypair, keyPath, bundleName, subgames, name, version, keyName, bucket }`
  *  (the four inputs echoed back as CHECKED strings, so a typed caller narrows through the result), or
  *  `{ ok: false, refusal, bundleName?, subgames?, keyPath?, keyPublicKey? }` — the extra fields are
  *  whatever the check had resolved, for the caller's message. */
-export function otaPublishPreflight({ ota, name, version, keyName, bucket, repoRoot }) {
+export function otaPublishPreflight({ ota, name, version, keyName, bucket, projectRoot, editorRoot }) {
   if (typeof ota !== 'object' || ota === null || Array.isArray(ota)) return { ok: false, refusal: 'no-ota-block' };
   // `enabled` defaults to false, so an ABSENT field correctly means "not enabled". Strictly `true`:
   // a hand-edited `"enabled": "false"` is truthy, and merging passes it through unchanged, so a
@@ -130,7 +134,13 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, repoR
   // The key must be the one the SHIPPED APP verifies against, not merely a key that exists:
   // `ota.publicKey` is baked into the binary and is the only key `verifyReleaseSignature` accepts,
   // so any other keypair signs a well-formed release every installed app silently refuses.
-  const keyPath = path.join(repoRoot, 'build', 'ota-keys', `${keyName}.json`);
+  let keyPath;
+  try {
+    // The config was read (an unreadable one is refused before this, as `no-ota-block`).
+    ({ keyPath } = adoptLegacyKey({ projectRoot, editorRoot, name: keyName, expectedPublicKey: ota.publicKey, configReadable: true }));
+  } catch (e) {
+    return { ok: false, refusal: 'key-copy-failed', bundleName, subgames, error: e instanceof Error ? e.message : String(e) };
+  }
   if (!fs.existsSync(keyPath)) return { ok: false, refusal: 'key-missing', bundleName, subgames, keyPath };
   let keypair;
   try {

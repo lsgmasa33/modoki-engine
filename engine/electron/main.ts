@@ -269,6 +269,7 @@ import { resolveCdpConfig, readCdpEnabled, writeCdpEnabled, probeCdp, newCdpNonc
 import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from './backendPort';
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, mcpBackendDeferred, connectRefusal, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
+import { createSwitchGate, prepareThenReRoot } from './projectSwitch';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
 import { composeDepsInstallError, projectDepsMissing } from './projectDeps';
 import { claimProjectForOpen, createOpenSequencer, type OpenTicket } from './openClaim';
@@ -1397,6 +1398,59 @@ const OPEN_MOUNT_SETTLE_MS = 600_000;
  *  root an open STARTED, so re-picking a project while a different one is queued would be dropped. */
 let requestedRoot = '';
 
+/** Refuses writes while the backend re-roots and the window reloads (#1976, `projectSwitch.ts`). Checked first by
+ *  `hostRoutes`, so it covers the shared router too. */
+const switchGate = createSwitchGate();
+
+/** Install the new project's deps and start its dev server, WITHOUT re-rooting the backend (`prepareThenReRoot` does
+ *  that after). False when a later open replaced this one while it waited; throws on failure.
+ *
+ *  The renderer loads its shell, the project's game CODE, and its ASSETS from the Vite server, rooted at MODOKI_PROJECT
+ *  at startup. main owns that process (devServer.ts) in BOTH dev and packaged, so re-root it by restarting it at the new
+ *  project — otherwise the renderer keeps pulling everything project-specific from the OLD root (the split-brain:
+ *  "Unknown asset guid" / blank scenes / failed saves). This is the same path for dev and packaged ("run Vite in prod"). */
+async function prepareProject(newRoot: string, ticket: OpenTicket): Promise<boolean> {
+  if (process.env.MODOKI_NO_DEV_SERVER === '1') return true;
+  // First open of a project may need its deps installed (external project, or an in-repo game never installed). Show
+  // progress in the title — npm install can take several seconds and the window is already visible.
+  mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — installing ${path.basename(newRoot)}…`);
+  if (app.isPackaged) await ensureNodeProvisioned(); // Core before Vite spawn (see whenReady)
+  // Progress goes to the title bar, or to the splash when this open runs queued behind a launch that has no window yet
+  // (macOS: the menu is live first). Otherwise a claim wait would sit behind a silent splash (#1160 review).
+  const openStatus = (line: string) => {
+    if (mainWindow) mainWindow.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`);
+    else setSplashStatus(line);
+  };
+  // False when a later open replaced this one while it waited on a build claim (#1160). That open owns the dev server
+  // and the title now, so this one must not touch either.
+  if (!(await healAndInstallOnOpen(newRoot, ticket, openStatus))) {
+    console.log(`[modoki-electron] open of ${newRoot} superseded, not starting its dev server`);
+    return false;
+  }
+  await startDevServer({ repoRoot: REPO_ROOT, projectRoot: newRoot, url: DEV_URL });
+  return true;
+}
+
+/** Open the switch gate once the reload COMMITS: from then on the old document is gone, so a write can only come from
+ *  the new one. `did-navigate` fires on a main-frame commit, a reload included; the gate's own timeout covers a
+ *  navigation that never commits. No window (an open queued behind a launch) has no old document to fence. */
+let pendingCommitListener: { wc: Electron.WebContents; fn: () => void } | null = null;
+function openSwitchGateOnCommit(): void {
+  // A previous open whose reload never committed (its gate timed out) must not leave its listener behind: a later
+  // commit would fire it and lift a gate it was never meant for.
+  if (pendingCommitListener) pendingCommitListener.wc.removeListener('did-navigate', pendingCommitListener.fn);
+  pendingCommitListener = null;
+  const wc = mainWindow?.webContents;
+  if (!wc) { switchGate.open(); return; }
+  const fn = () => {
+    pendingCommitListener = null;
+    switchGate.open();
+    console.log('[modoki-electron] project switch committed; writes accepted again');
+  };
+  pendingCommitListener = { wc, fn };
+  wc.once('did-navigate', fn);
+}
+
 async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts): Promise<OpenResult> {
   // A newer open was requested while this one queued: it owns the editor now, so touch nothing.
   if (!ticket.isCurrent()) {
@@ -1404,67 +1458,72 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts)
     return { kind: 'superseded', by: requestedRoot };
   }
   const previousRoot = state.root;
-  await state.backend.stop().catch(() => {});
-  state.root = newRoot;
-  refreshInstanceToken(); // the token is per-project — a new root means a new expected token
-  state.backend = createAssetBackend({ projectRoot: newRoot, onManifestUpdated, onSceneChanged });
-  state.backend.start();
-  await closeSsrLoader(); // recreated lazily against the new root
-  // The renderer loads its shell, the project's game CODE, and its ASSETS from the
-  // Vite server, rooted at MODOKI_PROJECT at startup. main owns that process
-  // (devServer.ts) in BOTH dev and packaged, so re-root it by restarting it at the
-  // new project — otherwise the renderer keeps pulling everything project-specific
-  // from the OLD root (the split-brain: "Unknown asset guid" / blank scenes /
-  // failed saves). This is the same path for dev and packaged ("run Vite in prod").
-  if (process.env.MODOKI_NO_DEV_SERVER !== '1') {
-    try {
-      // First open of a project may need its deps installed (external project, or
-      // an in-repo game never installed). Show progress in the title — npm install
-      // can take several seconds and the window is already visible.
-      mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — installing ${path.basename(newRoot)}…`);
-      if (app.isPackaged) await ensureNodeProvisioned(); // Core before Vite spawn (see whenReady)
-      // False when a later open replaced this one while it waited on a build claim (#1160). That
-      // open owns the dev server and the title now, so this one must not touch either.
-      // Progress goes to the title bar, or to the splash when this open runs queued behind a launch
-      // that has no window yet (macOS: the menu is live first). Otherwise a claim wait would sit
-      // behind a silent splash (#1160 review).
-      const openStatus = (line: string) => {
-        if (mainWindow) mainWindow.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`);
-        else setSplashStatus(line);
-      };
-      if (!(await healAndInstallOnOpen(newRoot, ticket, openStatus))) {
-        console.log(`[modoki-electron] open of ${newRoot} superseded by ${state.root}, not starting its dev server`);
-        return { kind: 'superseded', by: requestedRoot };
-      }
-      await startDevServer({ repoRoot: REPO_ROOT, projectRoot: newRoot, url: DEV_URL });
-    } catch (e) {
-      const detail = e instanceof Error ? e.message : String(e);
-      // A failure of an open the user has already moved on from is not theirs to dismiss (#1160).
-      if (!ticket.isCurrent()) {
-        console.warn(`[modoki-electron] superseded open of ${newRoot} failed (not shown): ${detail}`);
-        return { kind: 'superseded', by: requestedRoot };
-      }
-      console.error('[modoki-electron] open project failed:', detail);
-      mainWindow?.setTitle(titleFor(state.root));
-      if (!opts?.quiet) {
-        await showMessageBox({
-          type: 'error' as const,
-          title: 'Open Project failed',
-          message: 'Could not prepare the new project (dependency install or Vite server).',
-          detail: `${detail}\n\nThe editor may be in an inconsistent state — relaunch:\n  scripts/launch-editor.sh "${newRoot}"`,
-          buttons: ['OK'],
-        }, mainWindow);
-      }
-      return { kind: 'failed', detail };
-    }
-  }
-  // A newer open was requested while this one prepared (#1587 close-out review). It will restart the
-  // dev server and reload the window itself, so this one must not reload into its own root or report
-  // `opened` — an agent waiting on this open would settle on the NEWER project's mount.
-  if (!ticket.isCurrent()) {
-    console.log(`[modoki-electron] open of ${newRoot} superseded after preparing, not reloading`);
+  // The dev server this open found, so `pairBack` restarts only one it MOVED, never one that was not running (a launch
+  // that was superseded before its own Vite started has none, and its fatal path says so).
+  const viteBefore = devServerRoot();
+  // ⚠️ The backend is re-rooted only once the new project is READY, after its install and dev server (#1976,
+  // `projectSwitch.ts`). Its context reads `state.root` live and the old window stays interactive until the reload, so
+  // re-rooting first sent a Cmd+S in the old window into the NEW project, and a failed install left the editor rooted
+  // at a project it was not showing. The re-root's own window is closed by `switchGate`.
+  const outcome = await prepareThenReRoot({
+    gate: switchGate,
+    reason: `opening ${path.basename(newRoot)}`,
+    isCurrent: () => ticket.isCurrent(),
+    prepare: () => prepareProject(newRoot, ticket),
+    // The dev server back on the backend's root, if this open had already moved it (see `prepareThenReRoot`).
+    pairBack: async () => {
+      if (process.env.MODOKI_NO_DEV_SERVER === '1' || !viteBefore) return;
+      const viteRoot = devServerRoot();
+      if (viteRoot && samePath(viteRoot, state.root)) return;
+      console.warn(`[modoki-electron] open of ${newRoot} did not complete; restarting the dev server at ${state.root}`);
+      await startDevServer({ repoRoot: REPO_ROOT, projectRoot: state.root, url: DEV_URL });
+    },
+    reRoot: async () => {
+      await state.backend.stop().catch(() => {});
+      state.root = newRoot;
+      refreshInstanceToken(); // the token is per-project — a new root means a new expected token
+      state.backend = createAssetBackend({ projectRoot: newRoot, onManifestUpdated, onSceneChanged });
+      state.backend.start();
+      await closeSsrLoader(); // recreated lazily against the new root
+    },
+  });
+  if (outcome.kind === 'superseded') {
+    console.log(`[modoki-electron] open of ${newRoot} superseded before it re-rooted`);
+    if (outcome.pairError) console.error('[modoki-electron] could not put the dev server back:', outcome.pairError);
     return { kind: 'superseded', by: requestedRoot };
   }
+  if (outcome.kind === 'failed') {
+    const detail = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+    // A failure of an open the user has already moved on from is not theirs to dismiss (#1160) — unless the re-root
+    // failed half way: every write is now refused until a relaunch, and the user has to be told why, whoever is current.
+    if (!ticket.isCurrent() && !outcome.reRootFailed) {
+      console.warn(`[modoki-electron] superseded open of ${newRoot} failed (not shown): ${detail}`);
+      return { kind: 'superseded', by: requestedRoot };
+    }
+    console.error('[modoki-electron] open project failed:', detail);
+    // A failed prepare left the backend on the project the window shows; a failed re-root left no consistent project.
+    mainWindow?.setTitle(outcome.reRootFailed ? `Modoki Editor ${APP_VERSION} — relaunch required` : titleFor(state.root));
+    if (!opts?.quiet) {
+      await showMessageBox({
+        type: 'error' as const,
+        title: 'Open Project failed',
+        message: outcome.reRootFailed
+          ? 'The new project was prepared, but moving the editor onto it failed part way.'
+          : 'Could not prepare the new project (dependency install or Vite server).',
+        detail: outcome.reRootFailed
+          ? `${detail}\n\nThe switch failed part way, so the editor refuses every write until it is relaunched:\n  scripts/launch-editor.sh "${newRoot}"`
+          : `${detail}\n\nThe editor is still on ${path.basename(state.root) || 'the previous project'}; its saves go there.`
+            + (outcome.pairError
+              ? ` Its dev server could not be restarted (${String(outcome.pairError instanceof Error ? outcome.pairError.message : outcome.pairError)}), so relaunch it:\n  scripts/launch-editor.sh "${state.root}"`
+              : ''),
+        buttons: ['OK'],
+      }, mainWindow);
+    }
+    // The agent's (quiet) open learns the lock from the reply, as the human does from the dialog.
+    return { kind: 'failed', detail: outcome.reRootFailed ? `${detail} — the switch failed part way, so the editor refuses every write until it is relaunched` : detail };
+  }
+  // (A newer open requested while this one prepared is caught by `prepareThenReRoot`'s `isCurrent`, BEFORE the
+  // re-root (#1587 close-out review): that open restarts the dev server and reloads the window itself.)
   addRecentProject(newRoot);
   rebuildMenu();
   mainWindow?.setTitle(titleFor(newRoot));
@@ -1483,6 +1542,7 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts)
   // project's manifest + assets fresh, matching what a manual hard reload does.
   // Numbered BEFORE the reload is issued, so the old document's last menu push cannot settle it.
   const mountEpoch = mountWaiter.armReload();
+  openSwitchGateOnCommit(); // listening BEFORE the reload is issued, so its commit cannot be missed
   mainWindow?.webContents.reloadIgnoringCache();
   console.log(`[modoki-electron] opened project: ${newRoot}`);
   return { kind: 'opened', previousRoot, mountEpoch };
@@ -1813,6 +1873,9 @@ app.whenReady().then(async () => {
   // ── Renderer-bound host routes (capture/input) — only main can serve them
   //    (they touch the live window). Tried before the shared router. ──
   const hostRoutes: HostRoutes = async ({ method, urlPath, query, body, tokenCheck }) => {
+    // ── A project switch in flight (#1976): a write now could land in the other project. ──
+    const switching = switchGate.refusal(method, urlPath);
+    if (switching) return { kind: 'json', status: switching.status, body: switching.body };
     // ── GET /api/identity — WHICH editor is this? Answered before the mainWindow guard
     //    (an identity check must work even while the window is starting or gone).
     //
@@ -2476,10 +2539,11 @@ app.whenReady().then(async () => {
         console.log(`[modoki-electron] launch open superseded by ${requestedRoot}; waiting for the queued open(s)`);
         await opens.idle();
         const viteRoot = devServerRoot();
-        // Rooted at state.root, not merely running: a later open that failed before its own
-        // startDevServer leaves the previous project's Vite up under a backend now rooted elsewhere.
+        // Rooted at state.root, not merely running: a queued open that failed after starting its own Vite puts the
+        // dev server back on state.root (`pairBack`, #1976), and when that restart fails too, nothing serves the
+        // project the backend is on.
         if (!viteRoot || !samePath(viteRoot, state.root)) {
-          throw new Error(`the project opened during launch (${state.root}) did not open, so there is no editor to show. Its own dialog named the cause.`);
+          throw new Error(`no dev server is serving ${state.root} after a project open during launch failed, so there is no editor to show. That open's own dialog named the cause.`);
         }
       }
     } catch (e) {

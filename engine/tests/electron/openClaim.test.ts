@@ -334,10 +334,11 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
   });
 
   it('a queued open reports progress on the splash when no window exists yet', () => {
-    const decl = findNodes(body('openProject'), ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'openStatus');
-    expect(decl, 'openProject lost its status sink').toBeDefined();
+    // #1976: the install and Vite start live in `prepareProject`, which openProject runs before it re-roots.
+    const decl = findNodes(body('prepareProject'), ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'openStatus');
+    expect(decl, 'prepareProject lost its status sink').toBeDefined();
     expect(calledNames(decl!.initializer!).sort()).toEqual(['setSplashStatus', 'setTitle']);
-    expect(callsTo(body('openProject'), 'healAndInstallOnOpen')[0].arguments[2].getText(sf)).toBe('openStatus');
+    expect(callsTo(body('prepareProject'), 'healAndInstallOnOpen')[0].arguments[2].getText(sf)).toBe('openStatus');
   });
 
   it('releases the claim in a finally that covers the heal and the install', () => {
@@ -360,18 +361,26 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
     const first = open.statements[0];
     expect(first && ts.isIfStatement(first) && first.expression.getText(sf)).toBe('!ticket.isCurrent()');
     expect(findNodes((first as ts.IfStatement).thenStatement, ts.isReturnStatement)).toHaveLength(1);
-    const gate = healGate(open);
+    // #1976: the install and Vite start are `prepareProject`'s, which `prepareThenReRoot` runs BEFORE the re-root.
+    const prepare = body('prepareProject');
+    const gate = healGate(prepare);
     expect(gate.expression.getText(sf)).toMatch(/^!\(await healAndInstallOnOpen\(newRoot, ticket,/);
-    expect(findNodes(gate.thenStatement, ts.isReturnStatement)).toHaveLength(1);
-    const vite = callsTo(open, 'startDevServer');
+    expect(gate.thenStatement.getText(sf)).toMatch(/return false;\s*\}?$/);
+    const vite = callsTo(prepare, 'startDevServer');
     expect(vite).toHaveLength(1);
     expect(gate.getEnd()).toBeLessThanOrEqual(vite[0].getStart(sf));
-    const catches = findNodes(open, ts.isCatchClause).filter((c) => callsTo(c.block, 'showMessageBox').length > 0);
-    expect(catches).toHaveLength(1);
-    const guard = catches[0].block.statements.find((st) => ts.isIfStatement(st) && st.expression.getText(sf) === '!ticket.isCurrent()') as ts.IfStatement | undefined;
+    const reRoots = callsTo(open, 'prepareThenReRoot');
+    expect(reRoots, 'openProject no longer prepares through prepareThenReRoot').toHaveLength(1);
+    expect(callsTo(reRoots[0], 'prepareProject')).toHaveLength(1);
+    // A failed prepare comes back as `outcome.kind === 'failed'`, and its dialog is gated on the ticket (a failed
+    // RE-ROOT is the one exception, pinned in projectSwitch.test.ts: it locks writes, so the user is told regardless).
+    const failed = findNodes(open, ts.isIfStatement).filter((n) => n.expression.getText(sf) === "outcome.kind === 'failed'");
+    expect(failed).toHaveLength(1);
+    const block = failed[0].thenStatement as ts.Block;
+    const guard = block.statements.find((st) => ts.isIfStatement(st) && st.expression.getText(sf).startsWith('!ticket.isCurrent()')) as ts.IfStatement | undefined;
     expect(guard, 'the failure dialog is no longer gated on the ticket').toBeDefined();
     expect(findNodes(guard!.thenStatement, ts.isReturnStatement)).toHaveLength(1);
-    expect(guard!.getEnd()).toBeLessThanOrEqual(callsTo(catches[0].block, 'showMessageBox')[0].getStart(sf));
+    expect(guard!.getEnd()).toBeLessThanOrEqual(callsTo(block, 'showMessageBox')[0].getStart(sf));
   });
 
   it('the launch reserves its turn before the menu is live, starts Vite only while current, and waits out a superseding open', () => {
@@ -428,7 +437,11 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
       'the no-dev-server branch must end the reserved turn unconditionally, as a statement of its own').toBe(true);
 
     // Every startDevServer in main.ts is one of the two gated ones.
-    expect(callsTo(sf, 'startDevServer')).toHaveLength(callsTo(body('openProject'), 'startDevServer').length + vite.length);
+    // …plus #1976's `pairBack`, which puts the dev server back on the backend's root after an open that did not
+    // complete (projectSwitch.test.ts pins what it starts).
+    const pairBackStarts = callsTo(body('openProject'), 'startDevServer');
+    expect(pairBackStarts).toHaveLength(1);
+    expect(callsTo(sf, 'startDevServer')).toHaveLength(callsTo(body('prepareProject'), 'startDevServer').length + vite.length + pairBackStarts.length);
   });
 });
 

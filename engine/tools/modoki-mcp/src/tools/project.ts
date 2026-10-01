@@ -333,7 +333,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
       version: z.string().describe('New version string, e.g. "v18". Reusing one already published for this bundleName is refused UNLESS the publish would produce byte-identical contents, in which case it resumes as a retry.'),
       mandatory: z.boolean().optional().describe('Mandatory update: blocks with a restart-to-continue gate instead of applying next launch. true sets it, false CLEARS it, omitted INHERITS the current release\'s mandatory flag (sticky).'),
       bundleName: z.string().optional().describe('Omit it (or pass this project\'s own ota.bundleName) to build and publish the open project as itself. Pass a project id listed in this project\'s ota.subgames to build THAT project as a sub-game module (build-subgame.mjs) and publish it into this project\'s bucket under that id: its engine API is read from what its build stamps, and the publish is refused unless it equals this project\'s ota.engineApi, since a device loads a sub-game only on an exact match. Any other value is refused.'),
-      key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
+      key: z.string().optional().describe('Signing key name: the project\'s build/ota-keys/<key>.json (default "default").'),
       bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
       force: unsavedForceParam,
     },
@@ -388,7 +388,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_ota_keygen',
-    'Generate the Ed25519 OTA signing keypair (build/ota-keys/<name>.json) needed before the ' +
+    'Generate the Ed25519 OTA signing keypair (the project\'s build/ota-keys/<name>.json) needed before the ' +
       'first modoki_ota_publish. REFUSES to overwrite an existing key — regenerating orphans ' +
       'every already-shipped binary (they have the old public key baked in). There is ' +
       'deliberately no force/overwrite option on this tool; if you need to rotate a key, that ' +

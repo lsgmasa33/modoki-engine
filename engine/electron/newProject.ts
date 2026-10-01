@@ -67,6 +67,10 @@ export function scaffoldProject(targetDir: string, opts: ScaffoldOptions): Scaff
 
   // Copy the whole template, then rewrite tokens + scene GUIDs in place.
   fs.cpSync(opts.templateDir, dest, { recursive: true });
+  // The template carries `gitignore`, not `.gitignore` (the npm convention: `npm pack` drops a file
+  // named `.gitignore`), so the rule that keeps the project's OTA signing key uncommittable survives
+  // every way the template travels (#1983).
+  if (fs.existsSync(path.join(dest, 'gitignore'))) fs.renameSync(path.join(dest, 'gitignore'), path.join(dest, '.gitignore'));
 
   for (const file of walkFiles(dest)) {
     if (!TEXT_EXT.has(path.extname(file))) continue;

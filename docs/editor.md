@@ -3376,9 +3376,9 @@ Two properties the human path did not need, and the agent path cannot work witho
   `opened`, `failed` or `superseded`. The human callers ignore the result, and the agent passes
   `quiet` so a failure is returned in the reply instead of opening a modal.
 - **"Ready" means the NEW document has mounted**, tracked by reload epoch in
-  `rendererMountWaiter.ts`. `state.root` is set at the start of `openProject`, before the install,
-  the Vite restart and the reload, so waiting for `modoki_identity.projectRoot` to change would
-  succeed almost immediately. `gateRendererReady` is also wrong: it stays `true` from the old
+  `rendererMountWaiter.ts`. `state.root` is set once the new project is prepared, before the
+  reload (see the next paragraph), so waiting for `modoki_identity.projectRoot` to change would
+  succeed before the new window has loaded. `gateRendererReady` is also wrong: it stays `true` from the old
   document until that document's `did-navigate`, and the old editor can push its menu structure in
   that gap.
 
@@ -3392,9 +3392,36 @@ should wait for `scenePath` first; the tool description says so.
 A `TIMEOUT` names the stage it ran out in (`preparing` or `mounting`) and does **not** cancel the
 open. The same call repeated while that open is still running is refused (point 2 above).
 
+**The backend re-roots only once the new project is ready, and writes wait out the switch** (#1976,
+`engine/electron/projectSwitch.ts`). The backend's context reads `state.root` live, and the old
+project's window stays open and interactive until the reload; its requests carry no project
+identity and a scene save is unconditional. `openProject` used to re-root FIRST, so for the whole
+install and Vite restart (seconds, or minutes for an npm install) a Cmd+S in the old window
+overwrote the NEW project's file at the same path. A failed install or Vite start then left the
+editor rooted at the new project while still showing the old one, so every later save went to the
+other project. Now:
+- `prepareProject` installs and starts Vite with the backend still on the old project, so saves
+  made meanwhile land where the window says. A failed or superseded switch never re-roots, and
+  `pairBack` puts the dev server back on the backend's root if the prepare had already moved it. That
+  matters because a Vite that timed out can still come up seconds later, and the old window's Vite
+  client reloads itself once a server answers: without the pairing, the new project's code would mount
+  over the old project's backend. It only restarts a server the open found running, never one that was
+  not (a superseded launch had none, and its own fatal path reports that). If that restart fails, the
+  dialog says to relaunch.
+- `prepareThenReRoot` closes `switchGate` and only then re-roots. `hostRoutes` checks the gate
+  first, so until the reload COMMITS (`did-navigate`) every request other than GET/HEAD/OPTIONS is
+  refused with 503 `{switching: true, reason: 'project-switching'}`, read-only POSTs (`scene-query`,
+  `eval`, `wait-for`) included. `/api/open-project` passes, so a newer open can still supersede. The gate
+  opens by itself after 30 s, so a navigation that never commits cannot leave the editor read-only. A
+  re-root that THROWS half way is the exception: the backend may be split between the projects, so the
+  gate closes with no timeout, and a reload commit (the old window's Vite client reloading itself) does
+  not lift it. Only a relaunch or another open, which re-roots consistently, does. That failure is
+  reported even if a newer open superseded it: as a dialog, or in an agent's `failed` reply.
+- Unity has no such window: Open Project closes the editor before the other project opens.
+
 **A superseded open does not reload.** If a newer open (a human's Open Recent, or another call)
 is requested while this one is still preparing, `openProject` checks `ticket.isCurrent()` once
-more after starting Vite and returns `superseded` before issuing the reload. Without that check it
+more after starting Vite (inside `prepareThenReRoot`, before the re-root) and returns `superseded` before issuing the reload. Without that check it
 reloaded into its own root and reported `opened`. An agent waiting on it could then settle on the
 newer project's mount, because the waiter counts any document committed after its reload. The
 same can happen during the MOUNT wait, which comes after that check, so the agent path re-checks
@@ -4077,6 +4104,41 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   ⚠️ **A caller must not ALSO send the sidecar as a separate, parallel delete.** modelImport's prune
   did: whichever request ran second 404'd, and the prune logged a false "may still be on disk". One
   request per asset, or both in one `paths` list.
+  This is the delete half of [the sidecar rule below](#a-sidecars-identity-belongs-to-exactly-one-live-file-1956-1974-1975).
+
+#### A sidecar's identity belongs to exactly one live file (#1956, #1974, #1975)
+
+A binary asset's identity lives in its sidecar, not in the file: the `.meta.json` holds the GUID, the
+import settings and the slices (`sprites[].guid`), and `.meta.local.json` and `.meta.json.corrupt`
+(`SIDECAR_SUFFIXES`) ride along. So the rule every route keeps is that **a sidecar belongs to exactly
+one live file, for its whole life**. Three operations could break it, and each one has a single
+owner:
+
+| Operation | What broke | Owner |
+|---|---|---|
+| **Delete** | the file went, the sidecar stayed, and the next file at that path inherited the dead GUID | `/api/delete-asset` takes the named file's sidecars with it (#1956, the bullet above) |
+| **Copy** | Duplicate and Paste re-minted `meta.id` and kept `sprites[].guid`, so two textures defined every slice GUID, and slice refs drew whichever texture registered last | `freshSidecarIdentity` (`asset-fs-ops.ts`) re-mints every GUID a sidecar DEFINES (#1974) |
+| **Create** | a file deleted OUTSIDE the editor (Finder, git) left its sidecar, and an import or drop of a same-named file inherited the dead GUID and slices | `removeOrphanSidecars` runs before import-file, write-file, adopt-file, and the move and duplicate destinations (#1975) |
+
+- **The copy census** (`BinaryAssetMeta`, 2026-10-01): `id` and `sprites[].guid` are the GUIDs a sidecar
+  defines. The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`. ⚠️ A new field
+  that DEFINES a GUID must be added to `freshSidecarIdentity`, or every copy shares it. The scan's
+  collision heal cannot catch it: a sub-asset has no file of its own to re-mint.
+- **No orphan sweep at rescan time, on purpose.** A move done in Finder renames the file and its sidecar
+  as two separate events, and a rescan between them would delete a LIVE asset's identity. A create cannot
+  tell an orphan from a sidecar whose file is on its way either, but it does not need to: it is about to
+  put a NEW file at that exact path, so whatever sidecar sits there cannot be that file's. A path where a
+  file exists is left alone (`existsSync` folds case where the disk does, so a case-only rename keeps its
+  sidecar).
+- **Known gaps, parked (low):** #1977, a Windows delete the OS refuses part way, sends the sidecar to the
+  bin and keeps the file, so the rebuild re-mints it; #1958, a move that fails between the file and its
+  sidecars.
+- Tests: `engine/tests/plugins/sidecarIdentity.test.ts` (both halves on every route, plus the
+  live-file accept side), and the router's seeded sequence test (`routerSequenceFuzz.test.ts`). Its
+  outside-delete and slice ops make it re-find the copy half (I2) and write-file's create call (I3) when
+  removed, and the delete half (I4). The duplicate and move create calls are held by
+  `sidecarIdentity.test.ts` alone: there the copy's own sidecar write overwrites the `.meta.json` orphan,
+  and only the local and quarantined halves show the difference.
 
 ### Folder-tree state lives at module scope, not in `useState` (#309)
 

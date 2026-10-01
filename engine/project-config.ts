@@ -548,7 +548,7 @@ export interface ProjectConfig {
      *  (no trailing slash). Empty when disabled. */
     baseUrl: string;
     /** Ed25519 public key (base64url, 32 raw bytes) baked into the app — the
-     *  counterpart of the PRIVATE key in build/ota-keys/<name>.json (gitignored,
+     *  counterpart of the PRIVATE key in this project's build/ota-keys/<name>.json (gitignored,
      *  never committed). Losing the private key means these installed binaries
      *  can never be updated again. */
     publicKey: string;

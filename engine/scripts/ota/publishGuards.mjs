@@ -11,7 +11,7 @@
 
 /** Why an OTA publish must be REFUSED on the signing key, or null when the key is usable.
  *
- *  `keyPublicKey` is the public half of `build/ota-keys/<name>.json`; `projectPublicKey` is
+ *  `keyPublicKey` is the public half of the project's `build/ota-keys/<name>.json`; `projectPublicKey` is
  *  `project.config.json` `ota.publicKey`, the value baked into the SHIPPED BINARY and the only key
  *  `verifyReleaseSignature` accepts. The preflight used to check merely that the key FILE existed
  *  (independent review, 2026-07-30), so publishing with a non-matching key produced a well-formed,

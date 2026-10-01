@@ -42,16 +42,31 @@ function runNode(repoRoot: string, scriptRelPath: string, args: string[]): { sta
 }
 
 describe('ota-keygen.mjs', () => {
+  // The key is the PROJECT's (#1983): `<project>/build/ota-keys/<name>.json`. The scratch repo stands in
+  // for the editor root, where earlier editors wrote keys.
   let repoRoot: string;
-  beforeEach(() => { repoRoot = makeScratchRepo(); });
+  let projectDir: string;
+  const keyAt = (root: string, name = 'default') => path.join(root, 'build', 'ota-keys', `${name}.json`);
+  const keygen = (args: string[]) => runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', [...args, '--project', projectDir]);
+  const plantKey = (root: string, keypair: { publicKey: string; privateKey: string }, name = 'default') => {
+    fs.mkdirSync(path.dirname(keyAt(root, name)), { recursive: true });
+    fs.writeFileSync(keyAt(root, name), JSON.stringify(keypair, null, 2) + '\n', { mode: 0o600 });
+    return fs.readFileSync(keyAt(root, name));
+  };
+  const bake = (publicKey: string) => fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, publicKey } }));
+  beforeEach(() => {
+    repoRoot = makeScratchRepo();
+    projectDir = path.join(repoRoot, 'games', 'p');
+    fs.mkdirSync(projectDir, { recursive: true });
+  });
   afterEach(() => fs.rmSync(repoRoot, { recursive: true, force: true }));
 
-  it('writes build/ota-keys/default.json and prints the public key on first run', () => {
-    const { status, stdout } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
+  it('writes the PROJECT\'s build/ota-keys/default.json and prints the public key on first run', () => {
+    const { status, stdout } = keygen([]);
     expect(status).toBe(0);
-    const keyPath = path.join(repoRoot, 'build', 'ota-keys', 'default.json');
-    expect(fs.existsSync(keyPath)).toBe(true);
-    const keypair = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+    expect(fs.existsSync(keyAt(projectDir))).toBe(true);
+    expect(fs.existsSync(keyAt(repoRoot))).toBe(false); // never the editor root any more
+    const keypair = JSON.parse(fs.readFileSync(keyAt(projectDir), 'utf8'));
     expect(typeof keypair.publicKey).toBe('string');
     expect(typeof keypair.privateKey).toBe('string');
     expect(stdout).toContain(keypair.publicKey);
@@ -62,16 +77,16 @@ describe('ota-keygen.mjs', () => {
   // Windows has no POSIX bits (Node's `mode` only toggles read-only there, so the file
   // would land 0o666) and gets an icacls ACL instead.
   it.skipIf(process.platform === 'win32')('writes a private key file that is not world/group readable', () => {
-    runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
-    const keyPath = path.join(repoRoot, 'build', 'ota-keys', 'default.json');
+    keygen([]);
+    const keyPath = keyAt(projectDir);
     const mode = fs.statSync(keyPath).mode & 0o777;
     expect(mode).toBe(0o600);
   });
 
   it.runIf(process.platform === 'win32')('restricts the private key to the current account (Windows ACL)', () => {
-    const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
+    const { status } = keygen([]);
     expect(status).toBe(0); // a failed ACL is a hard error — keygen deletes the key and exits 1
-    const keyPath = path.join(repoRoot, 'build', 'ota-keys', 'default.json');
+    const keyPath = keyAt(projectDir);
     expect(fs.existsSync(keyPath)).toBe(true);
     // `icacls <file>` lists the ACEs. Assert the actual security property — no ORDINARY
     // account can read the key — rather than "icacls was invoked".
@@ -82,7 +97,7 @@ describe('ota-keygen.mjs', () => {
     // CI runner, where the temp dir carries an explicit SYSTEM ACE and this test originally
     // failed by demanding sole ownership.
     //
-    // What must be gone are the broad grants. At the real key location (repo `build/`) the
+    // What must be gone are the broad grants. At a real key location (a project's `build/`) the
     // inherited default is `BUILTIN\Users:(RX)` + `NT AUTHORITY\Authenticated Users:(M)` —
     // i.e. every local account could READ and even REPLACE the signing key. That is the
     // exposure this guards, and it is why mode 0o600 being a Windows no-op actually matters.
@@ -101,7 +116,7 @@ describe('ota-keygen.mjs', () => {
     // ACL step were skipped entirely — which is precisely the vacuous-pass this replaces.
     for (const ace of aces) expect(ace.flags).not.toContain('(I)');
 
-    // The broad grants must be absent. At the REAL key location (repo `build/`) the
+    // The broad grants must be absent. At a REAL key location (a project's `build/`) the
     // inherited default is `BUILTIN\Users:(RX)` + `NT AUTHORITY\Authenticated Users:(M)`:
     // every local account could read AND replace the signing key. That is the exposure.
     for (const ace of aces) {
@@ -120,72 +135,137 @@ describe('ota-keygen.mjs', () => {
     }
   });
 
+  it('the minted key\'s folder ignores itself, in a git project with no ignore rules of its own (#1983)', () => {
+    expect(execFileSync('git', ['init', '-q'], { cwd: projectDir, encoding: 'utf8' })).toBe('');
+    expect(keygen([]).status).toBe(0);
+    expect(fs.existsSync(path.join(projectDir, '.gitignore'))).toBe(false);
+    // `check-ignore` exits 0 when ignored, 1 when not (execFileSync throws on 1).
+    execFileSync('git', ['check-ignore', '-q', path.join('build', 'ota-keys', 'default.json')], { cwd: projectDir });
+  });
+
   it('honors a custom key name, writing to <name>.json', () => {
-    const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['prod']);
+    const { status } = keygen(['prod']);
     expect(status).toBe(0);
-    expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'prod.json'))).toBe(true);
-    expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'))).toBe(false);
+    expect(fs.existsSync(keyAt(projectDir, 'prod'))).toBe(true);
+    expect(fs.existsSync(keyAt(projectDir))).toBe(false);
   });
 
   it('REFUSES to overwrite an existing key (regenerating would orphan every shipped build)', () => {
-    const first = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
-    expect(first.status).toBe(0);
-    const originalKeypair = fs.readFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), 'utf8');
+    const first = keygen([]);
+    expect(first.status).toBe(0); // the accept side: no key yet, so one is minted
+    const originalKeypair = fs.readFileSync(keyAt(projectDir), 'utf8');
 
-    const second = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
+    const second = keygen([]);
     expect(second.status).not.toBe(0);
     expect(second.stderr).toMatch(/already exists — refusing to overwrite/);
     // The original key must be byte-for-byte untouched by the refused attempt.
-    expect(fs.readFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), 'utf8')).toBe(originalKeypair);
+    expect(fs.readFileSync(keyAt(projectDir), 'utf8')).toBe(originalKeypair);
   });
 
   it('two independently generated keys never collide', () => {
-    runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['a']);
-    runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['b']);
-    const a = JSON.parse(fs.readFileSync(path.join(repoRoot, 'build', 'ota-keys', 'a.json'), 'utf8'));
-    const b = JSON.parse(fs.readFileSync(path.join(repoRoot, 'build', 'ota-keys', 'b.json'), 'utf8'));
+    keygen(['a']);
+    keygen(['b']);
+    const a = JSON.parse(fs.readFileSync(keyAt(projectDir, 'a'), 'utf8'));
+    const b = JSON.parse(fs.readFileSync(keyAt(projectDir, 'b'), 'utf8'));
     expect(a.publicKey).not.toBe(b.publicKey);
   });
 
-  // #582's "Related" finding: `/api/ota/keygen` passes `--repo-root` explicitly now, the same
-  // value `/api/ota/keys` reads back with — before that flag existed the two agreed only
-  // because the route happened to invoke this script by a cwd-relative path. Prove the
-  // override actually takes effect (mirrors the publish-side "--repo-root points key
-  // resolution somewhere else" test in otaPublishReleaseRace.test.ts) rather than being
-  // silently ignored in favor of import.meta.url's own guess.
-  it('--repo-root writes the key under THAT root, not the script\'s own default root', () => {
-    const otherRoot = makeScratchDir('modoki-ota-keygen-other-root-');
-    try {
-      const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root', otherRoot]);
-      expect(status).toBe(0);
-      expect(fs.existsSync(path.join(otherRoot, 'build', 'ota-keys', 'default.json'))).toBe(true);
-      // If --repo-root were silently ignored, the key would land at the script's own default
-      // root (the scratch repo it actually lives in) instead.
-      expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'))).toBe(false);
-    } finally {
-      fs.rmSync(otherRoot, { recursive: true, force: true });
-    }
-  });
-
-  it('a bare trailing --repo-root fails with a message, not a TypeError stack', () => {
-    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root']);
+  it('--project is required, and without it nothing is written anywhere', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', []);
     expect(status).toBe(1);
-    expect(stderr).toMatch(/--repo-root requires a directory argument/);
-    expect(stderr).not.toMatch(/TypeError/);
-    // And it wrote nothing anywhere: a flag that decides WHERE the private key lands must not
-    // fall back to the default root when its own value is missing.
-    expect(fs.existsSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'))).toBe(false);
+    expect(stderr).toMatch(/--project <dir> is required/);
+    expect(fs.existsSync(path.join(repoRoot, 'build'))).toBe(false);
   });
 
-  it('a positional name plus --repo-root still names the file <name>.json (backward-compatible parsing)', () => {
-    const otherRoot = makeScratchDir('modoki-ota-keygen-other-root-named-');
-    try {
-      const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['prod', '--repo-root', otherRoot]);
-      expect(status).toBe(0);
-      expect(fs.existsSync(path.join(otherRoot, 'build', 'ota-keys', 'prod.json'))).toBe(true);
-    } finally {
-      fs.rmSync(otherRoot, { recursive: true, force: true });
-    }
+  it('a bare trailing --project fails with a message, not a TypeError stack', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--project']);
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/--project requires a directory argument/);
+    expect(stderr).not.toMatch(/TypeError/);
+    expect(fs.existsSync(path.join(repoRoot, 'build'))).toBe(false);
+  });
+
+  it('the old --repo-root is refused with the reason, not read as a key name', () => {
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root', repoRoot]);
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/--repo-root is gone.*--project/);
+    expect(fs.existsSync(path.join(repoRoot, 'build'))).toBe(false);
+  });
+
+  describe('a key an earlier editor wrote outside the project (#1983)', () => {
+    const LEGACY = { publicKey: 'legacy-pub', privateKey: 'legacy-priv' };
+
+    // The scratch repo is both the script's default editor root and the project's ancestor; the
+    // ancestor walk on its own is pinned by otaKeyRoutes.test.ts.
+    it('the shared default at the repo root is COPIED in, never minted over, and the original stays', () => {
+      const original = plantKey(repoRoot, LEGACY);
+      bake(LEGACY.publicKey);
+      const r = keygen([]);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/copied from .*Not minting a new one/);
+      expect(fs.readFileSync(keyAt(projectDir)).equals(original)).toBe(true); // byte-identical
+      expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true); // left in place
+    });
+
+    it('an --editor-root key (the packaged bundle\'s) is found too', () => {
+      const bundle = makeScratchDir('modoki-ota-keygen-bundle-');
+      try {
+        const original = plantKey(bundle, LEGACY, 'prod');
+        bake(LEGACY.publicKey);
+        const r = keygen(['prod', '--editor-root', bundle]);
+        expect(r.status).toBe(1);
+        expect(fs.readFileSync(keyAt(projectDir, 'prod')).equals(original)).toBe(true);
+        expect(fs.readFileSync(keyAt(bundle, 'prod')).equals(original)).toBe(true);
+      } finally {
+        fs.rmSync(bundle, { recursive: true, force: true });
+      }
+    });
+
+    it('an UNREADABLE project.config.json is not "no public key": keygen refuses, mints nothing, copies nothing', () => {
+      const original = plantKey(repoRoot, LEGACY);
+      fs.writeFileSync(path.join(projectDir, 'project.config.json'), '<<<<<<< HEAD\n{ "ota": {} }\n');
+      const r = keygen([]);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/could not be read .*Fix it first; nothing was minted/);
+      expect(fs.existsSync(keyAt(projectDir))).toBe(false);
+      expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
+    });
+
+    it('an unreadable config refuses even with NO earlier key: a new public half could not be written into it', () => {
+      fs.writeFileSync(path.join(projectDir, 'project.config.json'), '{ nope');
+      const r = keygen([]);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/could not be read/);
+      expect(fs.existsSync(keyAt(projectDir))).toBe(false);
+    });
+
+    it('NO project.config.json at all is "no public key", not "unknown": the shared key is passed over and a key minted', () => {
+      const original = plantKey(repoRoot, LEGACY);
+      const r = keygen([]);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/not copying .*bakes no ota.publicKey yet/);
+      expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
+    });
+
+    it('a project that bakes no ota.publicKey yet does not adopt the shared key: it mints its own', () => {
+      const original = plantKey(repoRoot, LEGACY);
+      bake('');
+      const r = keygen([]);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/not copying .*bakes no ota.publicKey yet/);
+      expect(JSON.parse(fs.readFileSync(keyAt(projectDir), 'utf8')).publicKey).not.toBe(LEGACY.publicKey);
+      expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
+    });
+
+    it('a same-named key whose public half is NOT the project\'s is left alone, and a fresh key is minted', () => {
+      const original = plantKey(repoRoot, LEGACY);
+      bake('some-other-public-half');
+      const r = keygen([]);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/not copying .*is not this project's ota.publicKey/);
+      expect(JSON.parse(fs.readFileSync(keyAt(projectDir), 'utf8')).publicKey).not.toBe(LEGACY.publicKey);
+      expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
+    });
   });
 });
 

@@ -1,0 +1,4 @@
+# The OTA signing key (a private Ed25519 key). Never commit it: anyone holding it can sign updates
+# every installed build trusts. Back it up instead — losing it ends OTA for every shipped build.
+# See docs/ota-updates.md § Signing key in the Modoki repo.
+build/ota-keys/

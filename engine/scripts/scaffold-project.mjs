@@ -55,6 +55,10 @@ const walk = (dir, out = []) => {
 };
 
 fs.cpSync(TEMPLATE_DIR, targetDir, { recursive: true });
+// The template carries `gitignore`, not `.gitignore` (the npm convention: `npm pack` drops a file
+// named `.gitignore`), so the rule that keeps the project's OTA signing key uncommittable survives
+// every way the template travels (#1983).
+if (fs.existsSync(path.join(targetDir, 'gitignore'))) fs.renameSync(path.join(targetDir, 'gitignore'), path.join(targetDir, '.gitignore'));
 
 for (const file of walk(targetDir)) {
   if (!TEXT_EXT.has(path.extname(file))) continue;

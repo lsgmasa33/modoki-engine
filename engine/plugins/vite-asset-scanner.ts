@@ -3471,7 +3471,7 @@ export function assetScannerPlugin(): Plugin {
           // overriding bundleName shipped this project's plain shell dist/ under another bundle's
           // identity, with no error until every device that loaded it failed.
           const rawConfig = readRawOtaBlock(projectRoot);
-          const preflight = otaPublishPreflight({ ota: rawConfig.ok ? rawConfig.ota : undefined, name: bundleName, version: versionParam, keyName, bucket: bucketParam, repoRoot: buildCwd });
+          const preflight = otaPublishPreflight({ ota: rawConfig.ok ? rawConfig.ota : undefined, name: bundleName, version: versionParam, keyName, bucket: bucketParam, projectRoot, editorRoot: buildCwd });
           if (!preflight.ok) {
             const r = preflight;
             const why: Record<OtaPublishRefusal, string> = {
@@ -3490,6 +3490,7 @@ export function assetScannerPlugin(): Plugin {
               'bad-project-retain-versions': "This project's ota.retainVersions is not a positive whole number — set it in Project Settings → OTA → Versions kept.",
               'ambiguous-bundle': `bundleName ("${bundleName}") is BOTH this project's own ota.bundleName and a sub-game listed in its ota.subgames, so it cannot say which build it means. Rename one.`,
               'unknown-bundle': `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.`,
+              'key-copy-failed': `Signing key "${keyName}": ${r.error}`,
               'key-missing': `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}`,
               'key-unparseable': `Signing key "${keyName}" (${r.keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}`,
               'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,

@@ -12,6 +12,7 @@ export type OtaPublishRefusal =
   | 'bad-project-retain-versions'
   | 'ambiguous-bundle'
   | 'unknown-bundle'
+  | 'key-copy-failed'
   | 'key-missing'
   | 'key-unparseable'
   | 'no-key-public-half'
@@ -33,7 +34,10 @@ export function otaPublishPreflight(o: {
   version: string | null | undefined;
   keyName: string | null | undefined;
   bucket: string | null | undefined;
-  repoRoot: string;
+  /** The project whose key signs: `<projectRoot>/build/ota-keys/<keyName>.json`. */
+  projectRoot: string;
+  /** Where an earlier editor may have written the key (keyStore.mjs). */
+  editorRoot?: string | null;
 }):
   | {
     ok: true;
@@ -55,6 +59,8 @@ export function otaPublishPreflight(o: {
     subgames?: string[];
     keyPath?: string;
     keyPublicKey?: string | null;
+    /** `key-copy-failed`: why an earlier editor's key could not be copied in (the copy failed safely). */
+    error?: string;
   };
 
 /** The raw `ota` block of `<projectRoot>/project.config.json`, read the same way for both entry points. */

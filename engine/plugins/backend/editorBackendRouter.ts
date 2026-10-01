@@ -54,7 +54,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT, fingerprintBytes, fingerprintFile } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, SIDECAR_SUFFIXES } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, removeOrphanSidecars, SIDECAR_SUFFIXES } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
@@ -363,6 +363,8 @@ import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
 import { checkOpenProjectRequest, openProjectReply, sameRootVerdict, inFlightReply, withExpectedToken, type ProjectSwitchHost } from './openProjectRoute';
 import { parseJsonText, readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
+import { adoptLegacyKey } from '../../scripts/ota/keyStore.mjs';
+import { readRawOtaBlock } from '../../scripts/ota/publishPreflight.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -4137,6 +4139,7 @@ async function describeUnresolvedAgainstLiveWorld(
           return json({ error: 'destination escapes the project' }, 403);
         }
         fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+        removeOrphanSidecars(destAbs); // #1975: a new file never adopts a dead asset's sidecar (a no-op over an existing one)
         const tmpPath = `${destAbs}.tmp`;
         try {
           fs.writeFileSync(tmpPath, bytes);
@@ -4961,6 +4964,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // covers every event of the tmp + rename burst (see its "write+rename"
       // handling), so this doesn't change hot-reload suppression behavior — same
       // pattern as writeJsonAtomic in this file.
+      // #1975: a file created where none existed never adopts a dead asset's sidecar (a no-op when the file exists).
+      removeOrphanSidecars(absPath);
       const tmpPath = `${absPath}.tmp`;
       fs.writeFileSync(tmpPath, bytes);
       fs.renameSync(tmpPath, absPath);
@@ -5078,6 +5083,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
+      removeOrphanSidecars(absTo); // #1975: the copy must not adopt a dead asset's sidecar at its new path
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
       // The editor's own write (#1702) — see `markWrittenFile`. The sidecars it may write never broadcast.
       markWrittenFile(ctx, absTo);
@@ -5190,6 +5196,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // disk does (#1261), and after the move `absFrom` exists no longer, so it would echo the
       // request's casing and the repair below would miss every binding keyed by the real name.
       const canonFrom = ctx.absToAssetUrl(absFrom, { onDisk: true });
+      // #1975: a moved file without sidecars of its own must not adopt a dead asset's at the destination. A case-only
+      // rename resolves to the source itself, which exists, so nothing is removed.
+      if (!isDir) removeOrphanSidecars(absTo);
       moveAssetFile(absFrom, absTo);
       // Before the renderer repair, not after: the manifest is what `modoki_list_assets` reads to
       // verify this move, and the watcher would otherwise catch up on its own 150ms debounce.
@@ -6081,18 +6090,27 @@ async function describeUnresolvedAgainstLiveWorld(
     return json({ teams: discoverSigningTeams() });
   }
 
-  // ── GET /api/ota/keys?name=<name> (M) ── read-only: does build/ota-keys/<name>.json
-  // exist, and if so what's its public key? Pure fs read, no generation — lets the OTA
-  // Keys dialog show current state (and whether it matches project.config.json's
-  // ota.publicKey) WITHOUT a side-effecting keygen call just to check.
+  // ── GET /api/ota/keys?name=<name> (M) ── does the PROJECT's build/ota-keys/<name>.json exist
+  // (#1983), and if so what's its public key? No generation — lets the OTA Keys dialog show current
+  // state (and whether it matches project.config.json's ota.publicKey) WITHOUT a keygen call. Its
+  // writes: the first read's copy of a key an earlier editor left outside the project (keyStore.mjs:
+  // a copy, never a move), so the dialog answers about the key the project already signs with, and the
+  // key folder's own `.gitignore` when it lacks one.
   if (urlPath === '/api/ota/keys' && method === 'GET') {
     const name = query.get('name') || 'default';
     if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
-    const keyPath = path.join(ctx.editorRoot || ctx.projectRoot, 'build', 'ota-keys', `${name}.json`);
+    let keyPath: string;
+    let copiedFrom: string | null;
+    try {
+      const raw = readRawOtaBlock(ctx.projectRoot);
+      ({ keyPath, copiedFrom } = adoptLegacyKey({ projectRoot: ctx.projectRoot, editorRoot: ctx.editorRoot, name, expectedPublicKey: raw.ok ? (raw.ota as { publicKey?: unknown } | undefined)?.publicKey : undefined, configReadable: raw.ok || raw.reason === 'missing' }));
+    } catch (e) {
+      return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500);
+    }
     if (!fs.existsSync(keyPath)) return json({ ok: true, name, exists: false, publicKey: null });
     try {
       const { publicKey } = readJsonFile(keyPath) as { publicKey?: string };
-      return json({ ok: true, name, exists: true, publicKey: publicKey ?? null });
+      return json({ ok: true, name, exists: true, publicKey: publicKey ?? null, ...(copiedFrom ? { copiedFrom } : {}) });
     } catch (e) {
       return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${e instanceof Error ? e.message : String(e)}` }, 500);
     }
@@ -6109,11 +6127,11 @@ async function describeUnresolvedAgainstLiveWorld(
     const name = query.get('name') || 'default';
     if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
     try {
-      // `--repo-root` explicitly, the SAME expression `/api/ota/keys` above reads back with —
-      // before this, the two agreed only because this call happened to invoke the script by a
-      // cwd-relative path (`cwd` set, no `--repo-root`), which desyncs the moment either side's
-      // path resolution changes (#582's "Related" finding).
-      const out = execFileSync('node', ['engine/scripts/ota-keygen.mjs', name, '--repo-root', ctx.editorRoot || ctx.projectRoot], { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
+      // `--project` explicitly, the SAME root `/api/ota/keys` above reads back with (#582's
+      // "Related" finding); `--editor-root` is where an earlier editor may have left the key, which
+      // the script copies in rather than minting over (#1983). `cwd` only locates the script.
+      const keygenArgs = ['engine/scripts/ota-keygen.mjs', name, '--project', ctx.projectRoot, ...(ctx.editorRoot ? ['--editor-root', ctx.editorRoot] : [])];
+      const out = execFileSync('node', keygenArgs, { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
       const publicKey = out.match(/^\s*(\S+)\s*$/m)?.[1] ?? null;
       return json({ ok: true, name, publicKey, log: out });
     } catch (e) {
@@ -6269,6 +6287,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // Decided before the folder is made: a scene this build cannot read throws here, and a refusal leaves nothing behind.
       const decided = importDecidesIdentity(scanUrl) ? importIdentity(ctx, scanUrl, fs.readFileSync(srcPath)).bytes : null;
       if (!fs.existsSync(destDirAbs)) fs.mkdirSync(destDirAbs, { recursive: true });
+      removeOrphanSidecars(destAbs); // #1975: a file that did not exist never adopts a dead asset's sidecar
       if (decided) fs.writeFileSync(destAbs, decided, { flag: 'wx' });
       else fs.copyFileSync(srcPath, destAbs);
       ctx.rebuildManifest();

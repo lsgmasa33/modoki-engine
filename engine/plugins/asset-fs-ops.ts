@@ -59,6 +59,57 @@ export function moveAssetFile(absFrom: string, absTo: string): void {
   }
 }
 
+/** **A sidecar's identity belongs to exactly one live file.** This is the CREATE half (#1975). The COPY half is
+ *  `freshSidecarIdentity` (#1974), and the DELETE half is `/api/delete-asset` taking a file's sidecars with it (#1956).
+ *
+ *  A file's GUID, import settings and slices live in its `.meta.json`. When the file is deleted outside the editor
+ *  (Finder, Explorer, a git checkout), the sidecar stays behind. Without this, the next file created at that path
+ *  silently INHERITS the dead asset's GUID, settings and slices, and every ref to the deleted asset shows the new one.
+ *  Unity "deletes the old 'orphaned' .meta file" and mints a new GUID in the same case.
+ *
+ *  So a route about to create a file where NONE exists calls this first, and it removes every sidecar at that path.
+ *  Removed outright (Unity's rule), not trashed: what an orphan holds is a dead asset's identity, and handing it to a
+ *  new file is the defect. A path where a file DOES exist is left alone: that file owns its sidecars, and `existsSync`
+ *  folds case where the disk does, so `Hero.png` keeps its sidecar from a request for `hero.png`.
+ *
+ *  ⚠️ Deliberately NOT a sweep at rescan time: a move done in Finder renames the file and its sidecar as two separate
+ *  events, and a rescan between them would delete a LIVE asset's identity. Only a create, which is about to put a new
+ *  file at that exact path, can tell an orphan from a sidecar whose file is still on its way.
+ *
+ *  Synchronous, so a caller can keep its check-then-write span free of awaits. Returns the paths it removed. */
+export function removeOrphanSidecars(absTarget: string): string[] {
+  if (fs.existsSync(absTarget)) return [];
+  const removed: string[] = [];
+  for (const suffix of SIDECAR_SUFFIXES) {
+    const side = absTarget + suffix;
+    if (!fs.existsSync(side)) continue;
+    fs.rmSync(side, { force: true });
+    removed.push(side);
+  }
+  return removed;
+}
+
+/** A copied binary's sidecar: every GUID the sidecar DEFINES, re-minted. This is the COPY half of "a sidecar's identity
+ *  belongs to exactly one live file" (#1974; the create half is `removeOrphanSidecars`).
+ *
+ *  Census of `BinaryAssetMeta` (assetManifest.ts, 2026-10-01):
+ *  - `id` and `sprites[].guid` are the GUIDs it DEFINES.
+ *  - The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`.
+ *  - Nothing else in a sidecar holds a GUID.
+ *
+ *  ⚠️ A NEW field that defines a GUID must be added HERE, or every copy shares it with its source. The slices did
+ *  (#1974): two textures then defined every slice GUID, slice refs drew whichever registered last, and the scan's
+ *  collision heal could not see it, because a sub-asset has no file of its own to re-mint. `generated` is dropped:
+ *  derived files belong to the original. */
+export function freshSidecarIdentity(meta: Record<string, unknown>, id: string, genGuid: () => string): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...meta, id };
+  delete out.generated;
+  if (Array.isArray(meta.sprites)) {
+    out.sprites = meta.sprites.map((s: unknown) => (s && typeof s === 'object' ? { ...(s as Record<string, unknown>), guid: genGuid() } : s));
+  }
+  return out;
+}
+
 /** Build the platform-specific command + argv that moves one OR MANY files/folders
  *  to the OS trash in a SINGLE invocation. Pure (no side effects) so the argv can
  *  be asserted directly. Batching the whole set into one call is what stops the
@@ -618,12 +669,7 @@ export function duplicateAssetFile(
     const metaFrom = absFrom + '.meta.json';
     if (fs.existsSync(metaFrom)) {
       try {
-        const meta = readJsonFile(metaFrom);
-        meta.id = newGuid;
-        // Don't carry the parent's `generated` list — derived files belong to
-        // the original, not the copy.
-        delete meta.generated;
-        writeMetaSidecar(absTo, meta);
+        writeMetaSidecar(absTo, freshSidecarIdentity(readJsonFile(metaFrom), newGuid, genGuid));
       } catch {
         writeMetaSidecar(absTo, { id: newGuid });
       }

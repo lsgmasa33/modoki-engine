@@ -133,7 +133,13 @@ engine/tools/game-debug-mcp/dist/
 
 # OTA publish signing key (Ed25519 private key, engine/scripts/ota-keygen.mjs).
 # NEVER commit — anyone with it can sign updates the app will trust and run.
+# It lives in the PROJECT (#1983); the repo-root copy is where editors before #1983 wrote it, and is
+# kept (never deleted) as the source the first read copies from. Scoped per project root, like the
+# keystore rule below; a new root in engine/scripts/projectRoots.mjs fails otaKeyIgnored.test.ts
+# until it is listed here.
 /build/ota-keys/
+games/*/build/ota-keys/
+demos/*/build/ota-keys/
 
 # Android upload/signing keys and their passwords (#196). NEVER commit — an upload key in a public
 # snapshot is a signing-identity compromise, and unlike a leaked id it cannot be rotated by editing
