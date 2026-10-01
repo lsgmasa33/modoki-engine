@@ -9,6 +9,61 @@ See also: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.m
 
 > **Design reference: Unity (owner, 2026-09-28).** When a prefab behaviour is a design choice (which prefab an Apply targets, what Revert or Replace keeps, how a nested override reads), copy Unity's prefab semantics. Example: Apply on a nested instance, of a component an enclosing row added, offers both "Apply to Prefab '<nested>'" (stated truthfully as a component addition) and "Apply as override in Prefab '<enclosing>'", the default (#1658, § "Apply's targets").
 
+## High-level rules (owner, 2026-10-02)
+
+These rules sit above everything else in this doc. When an invariant, a ruling or an incident
+section below disagrees with them, **the rule wins**, and the other text is a defect to fix. They
+were set after review round 5 (#1948) found that about half of its bugs were caused by earlier
+fixes. Most of those bugs came from two parts of the code disagreeing about what an instance is,
+and no rule said which part was right. The design that rebuilds the instance model on these rules
+is #2001.
+
+⚠️ **The rules are the TARGET. Rules 2, 4 and 9 are not yet what the code does.** Today the live
+world is the truth and Save diffs it against the prefab, and a missing prefab is kept alive by a
+copy stored in the scene. The § Model and invariants section below describes that current code.
+The table after the list says how far each rule is built.
+
+1. **Copy Unity.** When a behaviour is a design choice, Unity's answer wins. Unity also decides
+   whether a gap needs fixing. The one exception is silent data loss on an ordinary path, which is
+   fixed even where Unity has the same gap.
+2. **An instance IS its prefab plus its override list.** The list holds property changes, added and
+   removed components, and added and removed children, as in Unity. The live entities are a
+   projection of those two things. ONE function builds them from (prefab chain, list). Load,
+   rebuild, Revert, undo and Apply's fan-out all call it. Nothing reads the live tree back to work
+   out what an instance is.
+3. **Only a gesture changes the list.** An edit adds a record. Only Revert, Apply, undo or Remove
+   Unused take one away. A record is never added or dropped because two values happen to be
+   equal (#1914).
+4. **Save writes the list. It does not diff the live tree.** So load → save is verbatim, and the
+   prefab wins every field the list does not name. A scene can beat its prefab only with a record.
+5. **Identity is minted once and never guessed.** Only a write mints identity; a reader never does.
+   A document with duplicate identifiers is refused (I5, #1937).
+6. **Nested prefabs: the outer layer wins, field by field.** Restructuring a prefab instance
+   (moving or reordering what the prefab supplies) is refused, as in Unity (I1, U7, U29).
+7. **When a prefab file changes, every instance rebuilds from the new file plus its own list.**
+   This covers Apply, an outside edit and a git pull. Overrides survive. A record whose target is
+   gone is kept, and comes back if the target returns (I9, F5).
+8. **Undo restores the exact list, and the prefab document, that it found.** It works in memory;
+   files change on Save (#1868). It never re-derives anything from the live tree.
+9. **A missing or damaged prefab: the instance keeps its list untouched.** It shows an empty
+   Missing Prefab placeholder, as in Unity, and Save writes the list back verbatim. The overrides
+   come back when the prefab does. An edit the list cannot hold is refused (I18, I21). There is
+   **no copy of the prefab in the scene**: existing `embeddedPrefabs` still load, but are no longer
+   written (owner, 2026-10-02).
+10. **One door per operation.** The human and the agent call the same function and get the same
+    refusals.
+11. **Only the authored world is saved.** Play mode and posed states are never written (I13).
+
+**Format rule (owner, 2026-10-02):** older override forms are converted on load and never written
+again. These are the localId channels, path-keyed `nestedOverrides`/`nestedStructure`, `moved` and
+legacy pins. There is one in-memory form and one writer.
+
+| Rule | Built today? |
+|---|---|
+| 1, 3, 5, 6, 10, 11 | Yes. These rules restate existing rulings. |
+| 7, 8 | Mostly. They hold, but through live-tree re-derivations that rule 2 replaces. |
+| 2, 4, 9, format | **No.** This is #2001's design. |
+
 ## Model and invariants
 
 This section states the rules every prefab operation must obey, and names the function that owns
