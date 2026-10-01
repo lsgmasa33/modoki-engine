@@ -271,21 +271,25 @@ export function writeTraitFieldPerEntityWithUndo(
   const reordered = entries.map((e) => reorderWriteRefusal([e.id], meta.name, field, e.newValue)).find((r) => r); // #1869
   if (reordered) return reportWriteRefusal(reordered);
   const affectedScenes = resolveAffectedScenes(entries.map((e) => e.id));
-  // Resolve by guid each invocation (incl. the immediate apply) so redo survives a rebuild.
-  const applyAll = () => {
-    const ids = requireAll(entries.map((e) => e.ref)); // I19, as above
-    entries.forEach(({ newValue }, i) => { writeTraitField(ids[i], meta, field, newValue); markFieldOverrideIfInstance(ids[i], meta, field); });
-  };
-  applyAll();
+  // One gesture with the writers above (#1932, R4-L1 finding 2): a composite sub-field typed in a `BufferedNumberInput`
+  // (a binding's value, a material override's constant, an anim bank's numbers) commits on every keystroke, so retyping
+  // the base value recorded its "2" and "20", and F3 kept the record. After the old marks are read (`entries`).
+  const coalesceKey = fieldCoalesceKey(meta, field, entityIds);
+  resumeGesture(coalesceKey, entries.map((e) => e.id), meta.name, field);
+  entries.forEach(({ id, newValue }) => { writeTraitField(id, meta, field, newValue); markFieldOverrideIfInstance(id, meta, field); });
+  // The redo puts back the record THIS write left, not a fresh diff (finding A, as above).
+  const newMarks = entries.map((e) => markStateOf(e.id, meta.name, [field]));
   const suffix = entries.length > 1 ? ` (${entries.length})` : '';
   _pushAction({
     label: `${label}${suffix}`,
+    // Resolved by guid each invocation, so undo/redo survive a rebuild; every ref before the first write (I19).
     undo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ oldValue, oldMarks }, i) => { writeTraitField(ids[i], meta, field, oldValue); putMarkState(ids[i], meta.name, oldMarks); }); },
-    redo: applyAll,
-    coalesceKey: fieldCoalesceKey(meta, field, entityIds),
+    redo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ newValue }, i) => { writeTraitField(ids[i], meta, field, newValue); putMarkState(ids[i], meta.name, newMarks[i]!); }); },
+    coalesceKey,
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
     affectedScenes,
   });
+  endGestureWrite();
   entries.forEach(({ id, newValue }) => notifyFieldEdited(id, meta.name, field, newValue));
   return null;
 }

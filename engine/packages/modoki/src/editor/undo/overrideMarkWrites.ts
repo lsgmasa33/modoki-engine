@@ -67,13 +67,19 @@ export function markOverrideIfInstance(entityId: number, traitName: string, fiel
  *  no override of its own, or null when that base cannot be read (its template is not cached). A trait the template
  *  does not define here counts as differing whole (`getOverrideValues`' added-trait rule). */
 function fieldsOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Set<string> | null {
+  const diff = traitDiffOffBase(entityId, meta, pi);
+  return diff === null ? null : new Set(Object.keys(diff ?? {}));
+}
+
+/** The member's diff of `meta` against its base (`getOverrideValues`): undefined when nothing differs, the whole trait
+ *  when the base lacks it (a tag: `{}`), null when the base cannot be read. */
+function traitDiffOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Record<string, unknown> | undefined | null {
   if (!pi.source || !pi.localId) return null;
   const prefab = getCachedPrefabSync(pi.source);
   if (!prefab) return null;
   const root = pi.rootInstanceId || 0;
   const current = collectComparableTraits(entityId, [meta]);
-  const diffs = getOverrideValues(pi.localId, current, root ? instanceBase(root, prefab) : prefab, root ? baseTokenResolver(root) : undefined);
-  return new Set(Object.keys(diffs[meta.name] ?? {}));
+  return getOverrideValues(pi.localId, current, root ? instanceBase(root, prefab) : prefab, root ? baseTokenResolver(root) : undefined)[meta.name];
 }
 
 /** THE write-time recorder (#1914 R2, docs/prefabs.md § I2/I17): after an editor write to `fields` of `meta` (every
@@ -122,8 +128,22 @@ const NODE_IDENTITY_FIELDS: Record<string, readonly string[]> = { EntityAttribut
 function recordNodeByDiff(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
   const e = findEntity(entityId);
   if (!e || !e.has(meta.trait)) return;
+  const node = nodeDiffer(entityId, meta);
+  if (!node) return;
+  const { live, differs, identity } = node;
+  const list = (fields ?? Object.keys(live)).filter((f) => !identity.includes(f));
+  const isRotation = (f: string) => (ROTATION_MARKS as readonly string[]).includes(`${meta.name}.${f}`);
+  const rotationOff = list.some(isRotation) && Object.keys(live).some((f) => isRotation(f) && differs(f));
+  for (const f of list) if (isRotation(f) ? rotationOff : differs(f)) markOverride(e, meta.name, f);
+}
+
+/** The node diff {@link recordNodeByDiff} records by, for `meta` on PLAIN template node `entityId`: its live values, and
+ *  whether a field differs from the template node that spawned it ({@link templatePlainNode}), compared as the save's node
+ *  diff compares (a field either side omits reads as the schema default; a trait the node lacks differs whole; identity is
+ *  never a field). Null when `entityId` is no such node. */
+function nodeDiffer(entityId: number, meta: TraitMeta): { live: Record<string, unknown>; differs: (f: string) => boolean; identity: readonly string[] } | null {
   const tpl = templatePlainNode(entityId);
-  if (!tpl) return;
+  if (!tpl) return null;
   const live = collectComparableTraits(entityId, [meta])[meta.name] ?? {};
   const raw = tpl.node.traits?.[meta.name];
   const chain = raw && typeof raw === 'object' ? raw as Record<string, unknown> : undefined;
@@ -138,10 +158,55 @@ function recordNodeByDiff(entityId: number, meta: TraitMeta, fields?: readonly s
     const b = resolve(f in chain ? chain[f] : dflt(f));
     return a !== undefined && !valuesEqual(a, b);
   };
-  const list = (fields ?? Object.keys(live)).filter((f) => !identity.includes(f));
-  const isRotation = (f: string) => (ROTATION_MARKS as readonly string[]).includes(`${meta.name}.${f}`);
-  const rotationOff = list.some(isRotation) && Object.keys(live).some((f) => isRotation(f) && differs(f));
-  for (const f of list) if (isRotation(f) ? rotationOff : differs(f)) markOverride(e, meta.name, f);
+  return { live, differs, identity };
+}
+
+/** Which of the entity's RECORDS still differ from its base — the base {@link recordOverridesByDiff} records against (an
+ *  instance member's, through the layers enclosing its frame; a plain template node's template node) — or null when that
+ *  base cannot be read. A record of a trait the entity no longer has is kept (F5's unused record, not this question).
+ *  Rotation is one record (`ROTATION_MARKS`): its axes differ together.
+ *
+ *  For Create Prefab's tag (#1932, R4-L1 finding 1): a nested frame's members keep their records, and the new document's
+ *  rows now carry their values, so each record that no longer differs is the NEW prefab's statement, not the scene's.
+ *  Asked AFTER the tag, so the base is the new document's. Not a reconcile: the caller removes records only at a
+ *  re-scoping act (the list's owner changed), never after an edit (F3). */
+export function recordsOffBase(entityId: number): Set<string> | null {
+  const e = findEntity(entityId);
+  const records = e ? getStoredOverrideMarks(e) : undefined;
+  const out = new Set<string>();
+  if (!e || !records?.size) return out;
+  const m = memberEntity(entityId);
+  const byTrait = new Map<string, string[]>();
+  for (const k of records) { const i = k.indexOf('.'); const t = k.slice(0, i); byTrait.set(t, [...(byTrait.get(t) ?? []), k.slice(i + 1)]); }
+  for (const [traitName, fields] of byTrait) {
+    const meta = getTraitByName(traitName);
+    if (!meta || !e.has(meta.trait)) { for (const f of fields) out.add(`${traitName}.${f}`); continue; }
+    if (meta.category === 'tag') {
+      // A tag's record is off while the base lacks the tag (the save writes it as an added component).
+      const tpl = m ? null : templatePlainNode(entityId);
+      if (!m && !tpl) return null;
+      const lacks = m ? traitDiffOffBase(entityId, meta, m.pi) : tpl!.node.traits?.[traitName] === undefined ? {} : undefined;
+      if (lacks === null) return null;
+      if (lacks !== undefined) for (const f of fields) out.add(`${traitName}.${f}`);
+      continue;
+    }
+    let off: (f: string) => boolean;
+    if (m) {
+      const set = fieldsOffBase(entityId, meta, m.pi);
+      if (!set) return null;
+      off = (f) => set.has(f);
+    } else {
+      const node = nodeDiffer(entityId, meta);
+      if (!node) return null;
+      off = node.differs;
+    }
+    const rotationOff = [...ROTATION_MARKS].some((k) => k.startsWith(`${traitName}.`) && off(k.slice(traitName.length + 1)));
+    for (const f of fields) {
+      const isRotation = (ROTATION_MARKS as readonly string[]).includes(`${traitName}.${f}`);
+      if (isRotation ? rotationOff : off(f)) out.add(`${traitName}.${f}`);
+    }
+  }
+  return out;
 }
 
 /** Write one field, then record it by {@link recordOverridesByDiff}. THE write for a field an editor gesture changes
@@ -258,8 +323,9 @@ export function takeUnmarkedFromBase(
   recordAdded = false,
 ): void {
   const m = memberEntity(entityId);
-  const { source, localId, rootInstanceId: root } = m?.pi ?? {};
-  if (!m || !source || !localId || !root) return;
+  if (!m) { takeUnmarkedNodeFromBase(entityId, traits, fields); return; }
+  const { source, localId, rootInstanceId: root } = m.pi;
+  if (!source || !localId || !root) return;
   const prefab = getCachedPrefabSync(source);
   if (!prefab) return;
   const base = instanceBase(root, prefab);
@@ -289,6 +355,40 @@ export function takeUnmarkedFromBase(
       // yet, and writing one put the raw `@member:` string into a live ref (#1800 close-out review). What is restored stays.
       if (hasMemberToken(value)) continue;
       writeTraitField(entityId, meta, f, cloneTraitValues({ v: value }).v);
+    }
+  }
+}
+
+/** {@link takeUnmarkedFromBase} for a PLAIN node a template added (no `PrefabInstance`, so not a member; #1932, hunt seed
+ *  1224): its base is the template node that spawned it ({@link templatePlainNode}), and the save writes only the fields
+ *  it RECORDED (`nodeRowDiff`'s `recordedOf`), so an unrecorded field restored from an undo snapshot taken before a saved
+ *  prefab edit showed the OLD template's value until a reload. Its fields take the CURRENT template node's, compared as
+ *  {@link recordNodeByDiff} compares (a field either side omits reads as the schema default; identity is not a field). A
+ *  trait the template node does not have stays as restored: the save writes it as the node's own. No-op for a node no
+ *  enclosing layer states (the writer's own, written whole). */
+function takeUnmarkedNodeFromBase(entityId: number, traits?: readonly TraitMeta[], fields?: readonly string[]): void {
+  const e = findEntity(entityId);
+  const tpl = e ? templatePlainNode(entityId) : null;
+  if (!e || !tpl) return;
+  const marks = getOverrideMarkSet(e);
+  const resolve = baseTokenResolver(tpl.frame);
+  const metas = (traits ?? getAllTraits()).filter((t) => t.category !== 'tag' && t.name !== 'PrefabInstance' && e.has(t.trait));
+  for (const meta of metas) {
+    const raw = tpl.node.traits?.[meta.name];
+    if (!raw || typeof raw !== 'object') continue;
+    const chain = raw as Record<string, unknown>;
+    const live = collectComparableTraits(entityId, [meta])[meta.name] ?? {};
+    const schema = (meta.trait as { schema?: Record<string, unknown> }).schema ?? {};
+    const dflt = (f: string) => { const d = schema[f]; return typeof d === 'function' ? (d as () => unknown)() : d; };
+    const identity = NODE_IDENTITY_FIELDS[meta.name] ?? [];
+    for (const f of new Set([...Object.keys(live), ...Object.keys(chain)])) {
+      if (identity.includes(f) || marks?.has(`${meta.name}.${f}`) || (fields && !fields.includes(f))) continue;
+      if (meta.name === 'EntityAttributes' && f === 'editorFolder') continue;
+      if (!(f in schema)) continue;
+      const value = resolve(f in chain ? chain[f] : dflt(f));
+      if (value === undefined || hasMemberToken(value)) continue;
+      const now = f in live ? live[f] : dflt(f);
+      if (!valuesEqual(now, value)) writeTraitField(entityId, meta, f, cloneTraitValues({ v: value }).v);
     }
   }
 }

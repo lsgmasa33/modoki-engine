@@ -14,7 +14,7 @@ import { UndoRefusedError } from '../undo/undoFailure';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { clearOverrideMarks, restoreOverrideMarks, unmarkOverride, getStoredOverrideMarks } from '../../runtime/loaders/overrideMarks';
-import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, type MarkCapture } from '../undo/overrideMarkWrites';
+import { captureMarks, restoreMarks, recordDetachedMarks, relinkDetachedMembersMarked, recordsOffBase, type MarkCapture } from '../undo/overrideMarkWrites';
 import { authoringEntitiesFor, collectTree, type PrefabFile } from './prefab';
 import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
@@ -519,7 +519,8 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
  *
  *  It also clears the override marks on every entity it links, and its undo puts them back: the tree is written as it
  *  stands, so nothing in it overrides the document just written from it (Unity: a prefab made from an unpacked object
- *  has no overrides). A Detach leaves its marks on the plain tree until a reload, and linked with them they were saved
+ *  has no overrides). The entities it does not write — a nested frame's members, a stamped nested root, a plain node a
+ *  layer added — lose each record the new document's rows now carry (`clearCarriedRecords`, #1932). A Detach leaves its marks on the plain tree until a reload, and linked with them they were saved
  *  as overrides equal to the template's values, which pinned them against every later edit of the prefab.
  *
  *  And its undo takes off every template key the create put on (#1884): a node that had none before it (`unkeyed`) and
@@ -555,7 +556,7 @@ export function tagCreatedPrefab(
     links: snapshot.links.filter((l) => writes.has(l.id)).map(({ frame, ...l }) => (writes.get(l.id) === 'link' && frame ? { ...l, frame } : l)),
     orphans: snapshot.orphans,
   };
-  const undoMarks = clearLinkedMarks(writes, [...unkeyed].filter((id) => templateKeyOf(findEntity(id))));
+  const undoMarks = clearLinkedMarks(rootEcsId, writes, [...unkeyed].filter((id) => templateKeyOf(findEntity(id))));
   const undoUnpack = dropUnpackedRootKeptState(rootEcsId, before, writtenPrefab);
   const undoSettle = settleSwallowedKeptState(rootEcsId);
   const undoKeys = stripCreatedKeys(unkeyed);
@@ -571,11 +572,12 @@ export function tagCreatedPrefab(
  *  the tag changes a value.
  *
  *  A STAMPED nested reference root, and a node the create KEYED (a scene-added node under a nested instance, which the
- *  capture wrote as that row's added node: `keyed`), keep their marks, all but the sibling order: the new template states
- *  the node's place now, so a reload reads no record of it. A scene-added reference node's root records that order
+ *  capture wrote as that row's added node: `keyed`), lose the sibling order here: the new template states the node's
+ *  place now, so a reload reads no record of it. Their other records, and every nested member's, are then taken by
+ *  `clearCarriedRecords` where the new document gives their value (#1932 R4-L1 finding 1). A scene-added reference node's root records that order
  *  always (F7, #1914 R6), so every one carried the mark into the copy (hunt seed 3297); a reorder made before the create
  *  did the same before F7. */
-function clearLinkedMarks(writes: TagWrites, keyed: readonly number[]): () => void {
+function clearLinkedMarks(rootEcsId: number, writes: TagWrites, keyed: readonly number[]): () => void {
   const held = [...writes].filter(([, w]) => w === 'link').map(([id]) => ({ id, marks: captureMarks(id).keys }))
     .filter((h) => h.marks.length).map(({ id, marks }) => ({ ref: entityRef(id), marks }));
   const handle = (ref: EntityRef) => { const id = ref.resolve(); return id == null ? null : findEntity(id); };
@@ -584,9 +586,40 @@ function clearLinkedMarks(writes: TagWrites, keyed: readonly number[]): () => vo
     .map((id) => entityRef(id));
   for (const h of held) { const e = handle(h.ref); if (e) clearOverrideMarks(e); }
   for (const ref of ordered) { const e = handle(ref); if (e) unmarkOverride(e, 'EntityAttributes', 'sortOrder'); }
+  const undoCarried = clearCarriedRecords(rootEcsId, writes);
   return () => {
+    undoCarried();
     for (const h of held) { const e = handle(h.ref); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, h.marks); } }
     for (const ref of ordered) { const e = handle(ref); if (e) restoreOverrideMarks(e, ['EntityAttributes.sortOrder']); }
+  };
+}
+
+/** The records the NEW document now carries, off every entity of the tree the tag did not relink — a nested frame's
+ *  members, a stamped nested root, a plain node a layer added (#1932, R4-L1 finding 1) — and their undo. The capture
+ *  wrote each of those records into the new document's rows, so what the scene instance stated is now its prefab's
+ *  statement, and Unity's connected instance starts with an EMPTY modification list (`SaveAsPrefabAssetAndConnect`, which
+ *  the outermost instance owns). Left on, the scene restated every one of them on save, and a later edit of the new
+ *  prefab's nested copy never reached the instance (#1914 R3 removed the save's depth ≥ 2 subtraction, which had dropped
+ *  them as equal to the row, and gave Create nothing in its place).
+ *
+ *  Per record: one whose live value still DIFFERS from the base the new document gives (`recordsOffBase`) did not reach a
+ *  row, so it stays the scene's — kept, never dropped. An entity whose base cannot be read keeps every record. The undo
+ *  puts each entity's STORED set back exactly. */
+function clearCarriedRecords(rootEcsId: number, writes: TagWrites): () => void {
+  const changed: { ref: EntityRef; marks: string[] }[] = [];
+  for (const info of collectTree(rootEcsId, getAllEntities())) {
+    if (info.id === rootEcsId || writes.get(info.id) === 'link') continue;
+    const e = findEntity(info.id);
+    const marks = e ? [...(getStoredOverrideMarks(e) ?? [])] : [];
+    if (!e || !marks.length) continue;
+    const off = recordsOffBase(info.id);
+    if (!off || marks.every((k) => off.has(k))) continue;
+    changed.push({ ref: entityRef(info.id), marks });
+    clearOverrideMarks(e);
+    restoreOverrideMarks(e, marks.filter((k) => off.has(k)));
+  }
+  return () => {
+    for (const c of changed) { const id = c.ref.resolve(); const e = id == null ? null : findEntity(id); if (e) { clearOverrideMarks(e); restoreOverrideMarks(e, c.marks); } }
   };
 }
 

@@ -27,7 +27,7 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo } from '@modoki/engine/editor';
-import { pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undo, redo, _setUndoClock } from '../../packages/modoki/src/editor/undo/undoManager';
 import { inFieldGesture } from '../../packages/modoki/src/editor/undo/fieldGesture';
 import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
@@ -218,6 +218,19 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
     expect([field(member('U'), 'UIElement', 'width'), recorded()]).toEqual([150, true]);
   });
 
+  // The redo half above cannot tell a restored record from a re-derived one (150 is off the base either way; #1932 R4-L2).
+  // They differ only once the base moves to the typed value between the undo and the redo: the redo must put back the
+  // record the gesture ended with, as Unity's redo restores the recorded state. Mutation: the redo re-records
+  // (`markFieldOverrideIfInstance` in place of `putMarkState(…, newMarks[i]!)` in `writeTraitFieldMultiWithUndo`) — red.
+  it('the gesture\'s redo puts back its record even after the base moved to the typed value', async () => {
+    type('f:1', [1, 15, 150], 100); // inside the undo window: one entry
+    await undo();
+    await reloadUnder(await saved(), (d) => { (d.entities[5]!.traits as Record<string, Record<string, unknown>>).UIElement!.width = 150; });
+    await redo();
+    expect([field(member('U'), 'UIElement', 'width'), recorded()]).toEqual([150, true]);
+    expect(await widthAfterTemplate120()).toBe(150);
+  });
+
   // Outside a field session (an agent's writes, a scrub's frames) each write is its own gesture, F3 for each, even inside
   // the undo window that merges them into one Cmd-Z. Mutation: let a write with no session continue the gesture
   // (`session === null` out of `resumeGesture`'s early return) — the second write drops the first's record.
@@ -225,6 +238,31 @@ describe('F2 by keystrokes: an Inspector field session records what its FINAL va
     type(null, [150, 100], 10);
     expect(recorded()).toBe(true);
     expect(await widthAfterTemplate120()).toBe(100);
+  });
+
+  // The per-entity writer (#1932, R4-L1 finding 2): a composite sub-field's `BufferedNumberInput` (a binding's value, a
+  // material override's constant, an anim bank's numbers) commits on every keystroke through it, and it took no gesture.
+  const typePerEntity = (values: number[]) => {
+    for (const v of values) {
+      now += 1000;
+      inFieldGesture('f:1', () => writeTraitFieldPerEntityWithUndo([member('U')], meta('UIElement'), 'width', () => v, 'Edit width'));
+    }
+  };
+  // Mutation: drop `resumeGesture` from `writeTraitFieldPerEntityWithUndo` — 1 and 10 leave the record, and the reload
+  // keeps 100 over the template's 120.
+  it('the per-entity writer: 100 retyped over its base records nothing', async () => {
+    typePerEntity([1, 10, 100]);
+    expect(recorded()).toBe(false);
+    expect(await widthAfterTemplate120()).toBe(120);
+  });
+
+  // Mutation: its redo re-records (`markFieldOverrideIfInstance` in place of `putMarkState(…, newMarks[i]!)`) — red.
+  it('the per-entity writer: undo×3 then redo×3 of the retype leaves no record', async () => {
+    typePerEntity([1, 10, 100]);
+    for (let i = 0; i < 3; i++) await undo();
+    expect([field(member('U'), 'UIElement', 'width'), recorded()]).toEqual([100, false]);
+    for (let i = 0; i < 3; i++) await redo();
+    expect([field(member('U'), 'UIElement', 'width'), recorded()]).toEqual([100, false]);
   });
 });
 
