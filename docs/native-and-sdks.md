@@ -1207,8 +1207,12 @@ in the engine's `runtime/core/attribution.ts`, and every game's `app-services` r
   takes effect. The SDK still starts and counts installs and events in aggregate (SKAdNetwork keeps
   working). ⚠️ **A failing `anonymizeUser` leaves AppsFlyer off for the run** (fail closed). Off iOS the call
   is never made, so Android's start-up is byte-for-byte what shipped. **AppsFlyer's probabilistic
-  modeling (PMOD) must be OFF for iOS in the AppsFlyer dashboard** (owner ruling): Apple counts it as
-  tracking, and no SDK flag controls it.
+  modeling (PMOD) must be OFF for iOS in the AppsFlyer dashboard** (owner ruling): Apple bans deriving
+  data to identify a device whatever the ATT answer, naming attribution SDKs, and no SDK flag controls it.
+  **Turned OFF 2026-10-01** (App Settings → "Enable view-through attribution via probabilistic modeling")
+  for Court `id6800196811`, Weaveling `id6806073296` and Slime Shooter `id6816376486`, and read back off
+  after a reload. Aggregated Advanced Privacy stays ON. ⚠️ That switch names VIEW-through only; whether
+  click-through probabilistic matching on iOS has its own control is unconfirmed — ask AppsFlyer.
 - **Ads (each game's `ads.ts` `start()`): no UMP on a no.** UMP is not even asked, so no form appears and the
   Privacy choices row stays hidden; MAX gets `setHasUserConsent(false)` and `setDoNotSell(true)` before
   `initialize`, so ads are non-personalized. Do-not-sell is set as well because the US-states opt-out is
