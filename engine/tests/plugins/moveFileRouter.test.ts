@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { sameEntry } from '../../plugins/asset-fs-ops';
 // The REAL resolver and canonicalizer, not hand-rolled stand-ins. A simplified
 // `resolveAssetPath` here silently modelled a route that does NOT tolerate a missing leading
 // slash or a percent-encoded segment — which is precisely the tolerance the canonicalization
@@ -149,6 +150,138 @@ describe('/api/move-file clobber guard', () => {
     expect(r.status).toBeUndefined();
     expect(fs.existsSync(path.join(tmp, 'b.txt'))).toBe(true);
     expect(fs.existsSync(path.join(tmp, 'a.txt'))).toBe(false);
+  });
+});
+
+/** #2068 — a one-off windows CI red: `/assets/f1` moved to its existing child `/assets/f1/g` answered 400 where the
+ *  sequence fuzz expected 409, and seed 7 had passed in the same run. Not a seed only windows draws: one op list answered
+ *  two ways. Inferred cause (only an id collision explains it): `sameEntry` read a `number` `ino`, which rounds two 64-bit
+ *  Windows file ids to one value above 2^53, so the existing child read as a case-only rename of its parent. `fakeIds`
+ *  gives entries such ids on any disk. The route now asks inside-the-source first (400), by entry, and trusts an id
+ *  match as "the source itself" only between spellings that fold together.
+ *
+ *  Mutations, each checked red here:
+ *  - `sameEntry` reads a plain `lstatSync` (no bigint): "a FILE moved onto another…" (its `sameEntry` assertion).
+ *  - `insideEntry` reads plain stats (no bigint): the ACCEPT SIDE and "a FILE moved onto another…" (every parent of a
+ *    destination reads as the source, so each move is refused 400).
+ *  - `destinationTaken` drops the fold check: "two files sharing one id…" (200, the destination replaced).
+ *  - the inside check asked after `destinationTaken`: "a folder moved into its existing child" (409).
+ *  - the inside check by string prefix (`absTo.startsWith(absFrom + sep)`): "a case variant…" (500), on a case-folding
+ *    disk only.
+ *  - `insideEntry` `stat`s the source: "a symlinked source…" (400); `sameEntry` `stat`s: "a link and its target…".
+ *  - `insideEntry` asks the parents by `lstat` only: "a folder moved under a LINK…" (500); by `stat` only: "a symlinked
+ *    source moved to a path THROUGH itself" (200, the link moved into its target). */
+describe('/api/move-file judges entries by their full 64-bit id (#2068)', () => {
+  /** Replace each entry's id with `idOf(real ino, path)` in BOTH stat forms: the bigint one as given, the plain one as
+   *  `Number(id)` — which is what Node's `number` `ino` is, and where 64-bit ids lose their low bits. */
+  function fakeIds(idOf: (ino: bigint, p: string) => bigint): void {
+    for (const name of ['statSync', 'lstatSync'] as const) {
+      const real = fs[name];
+      vi.spyOn(fs, name).mockImplementation(((p: fs.PathLike, opts?: fs.StatSyncOptions) => {
+        const big = real(p, { ...opts, bigint: true });
+        if (!big) return big;
+        const id = idOf(big.ino, String(p));
+        const st = opts?.bigint ? big : real(p, opts)!;
+        Object.defineProperty(st, 'ino', { value: opts?.bigint ? id : Number(id) });
+        return st;
+      }) as typeof fs.statSync);
+    }
+  }
+  /** Every entry gets the next id under a high 16-bit reuse count (0x8000), as an NTFS file id carries it: near 2^63 a
+   *  `number` holds only every 1024th integer, so the plain `ino` of every entry is one value. */
+  function ntfsIds(): void {
+    const ids = new Map<bigint, bigint>();
+    fakeIds((ino) => {
+      let id = ids.get(ino);
+      if (id === undefined) { id = (0x8000n << 48n) | BigInt(ids.size); ids.set(ino, id); }
+      return id;
+    });
+  }
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('a FILE moved onto another file whose ids round to one number is refused 409, and the destination survives', async () => {
+    const a = path.join(tmp, 'a.txt'), b = path.join(tmp, 'b.txt');
+    fs.writeFileSync(a, '1');
+    fs.writeFileSync(b, '2');
+    ntfsIds();
+    expect(Number(fs.statSync(a).ino)).toBe(Number(fs.statSync(b).ino)); // the premise
+    expect(sameEntry(a, b)).toBe(false);
+    const r = (await move('/a.txt', '/b.txt')) as { status?: number };
+    expect(r.status).toBe(409);
+    expect(fs.readFileSync(b, 'utf8')).toBe('2');
+    expect(fs.readFileSync(a, 'utf8')).toBe('1');
+  });
+
+  it('two files sharing one id even as bigints are not one entry unless their spellings fold together: 409', async () => {
+    fs.writeFileSync(path.join(tmp, 'a.txt'), '1');
+    fs.writeFileSync(path.join(tmp, 'b.txt'), '2');
+    fakeIds((ino, p) => (/[\\/][ab]\.txt$/.test(p) ? 7n : ino));
+    const r = (await move('/a.txt', '/b.txt')) as { status?: number };
+    expect(r.status).toBe(409);
+    expect(fs.readFileSync(path.join(tmp, 'b.txt'), 'utf8')).toBe('2');
+  });
+
+  it('a folder moved into its existing child is refused 400 inside-the-source — asked before the destination', async () => {
+    fs.mkdirSync(path.join(tmp, 'f1', 'g'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'f1', 'g', 'a.mat.json'), '{}');
+    const r = (await move('/f1', '/f1/g')) as { status?: number; body?: { error?: string } };
+    expect([r.status, r.body?.error]).toEqual([400, 'Destination is inside the source']);
+    expect(fs.existsSync(path.join(tmp, 'f1', 'g', 'a.mat.json'))).toBe(true);
+  });
+
+  it('ACCEPT SIDE: under NTFS ids a case-only rename still goes through, and a plain move too', async () => {
+    ntfsIds();
+    fs.writeFileSync(path.join(tmp, 'Foo.txt'), 'x');
+    try { fs.linkSync(path.join(tmp, 'Foo.txt'), path.join(tmp, 'foo.txt')); } catch { /* case-insensitive FS */ }
+    expect(((await move('/Foo.txt', '/foo.txt')) as { status?: number }).status).toBeUndefined();
+    fs.mkdirSync(path.join(tmp, 'f1'));
+    fs.mkdirSync(path.join(tmp, 'f2'));
+    expect(((await move('/f1', '/f2/f1')) as { status?: number }).status).toBeUndefined();
+    expect(fs.existsSync(path.join(tmp, 'f2', 'f1'))).toBe(true);
+  });
+
+  // A symlink needs a privilege on Windows; the mechanism under test is not Windows-specific.
+  it.skipIf(process.platform === 'win32')('a symlinked source is the LINK: moving it into its target\'s folder goes through', async () => {
+    fs.mkdirSync(path.join(tmp, 'real'));
+    fs.symlinkSync(path.join(tmp, 'real'), path.join(tmp, 'alias'));
+    expect(((await move('/alias', '/real/alias2')) as { status?: number }).status).toBeUndefined();
+    expect(fs.lstatSync(path.join(tmp, 'real', 'alias2')).isSymbolicLink()).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('a folder moved under a LINK to itself is inside it: 400, not a 500 from renameSync', async () => {
+    fs.mkdirSync(path.join(tmp, 'real'));
+    fs.symlinkSync(path.join(tmp, 'real'), path.join(tmp, 'alias'));
+    expect(((await move('/real', '/alias/x')) as { status?: number }).status).toBe(400);
+    expect(fs.existsSync(path.join(tmp, 'real'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('a symlinked source moved to a path THROUGH itself is inside it: 400, the link stays', async () => {
+    fs.mkdirSync(path.join(tmp, 'real'));
+    fs.symlinkSync(path.join(tmp, 'real'), path.join(tmp, 'alias'));
+    expect(((await move('/alias', '/alias/x')) as { status?: number }).status).toBe(400);
+    expect(fs.lstatSync(path.join(tmp, 'alias')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(tmp, 'real', 'x'))).toBe(false);
+  });
+
+  it.skipIf(process.platform === 'win32')('a link and its target are two entries, not one', () => {
+    fs.writeFileSync(path.join(tmp, 'a.png'), 'x');
+    fs.symlinkSync(path.join(tmp, 'a.png'), path.join(tmp, 'alias.png'));
+    expect(sameEntry(path.join(tmp, 'alias.png'), path.join(tmp, 'a.png'))).toBe(false);
+  });
+
+  const foldsCase = (() => {
+    const dir = makeScratchDir('modoki-caseprobe-');
+    fs.writeFileSync(path.join(dir, 'CaseProbe'), '');
+    const folds = fs.existsSync(path.join(dir, 'caseprobe'));
+    fs.rmSync(dir, { recursive: true, force: true });
+    return folds;
+  })();
+  it.runIf(foldsCase)('a case variant of the source\'s own name is still inside it: 400, not a 500 from renameSync', async () => {
+    fs.mkdirSync(path.join(tmp, 'anim'));
+    fs.writeFileSync(path.join(tmp, 'anim', 'a.json'), '{}');
+    const r = (await move('/anim', '/ANIM/sub')) as { status?: number };
+    expect(r.status).toBe(400);
+    expect(fs.existsSync(path.join(tmp, 'anim', 'a.json'))).toBe(true);
   });
 });
 

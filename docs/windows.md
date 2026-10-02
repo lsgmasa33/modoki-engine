@@ -1666,6 +1666,14 @@ read as a **bigint**: on this box's ReFS volume two directories' 64-bit ids diff
 the same `Number`. The limit of a 2 s poll: a root renamed away AND back inside one check keeps its
 identity, so a write made inside it while it was away is not reported.
 
+⚠️ **Every `ino` comparison reads `{ bigint: true }`** — `nodeDirIdentity`, `pathEntryId` and, since #2068,
+`sameEntry`/`insideEntry` in `asset-fs-ops.ts` (the move route asks both; the conversion-cache move asks
+`sameEntry`). Above 2^53 the `number` form drops low bits (NTFS keeps the record's reuse count in the id's top 16
+bits, so that is a record reused 32 times or more). The move route had its own `sameEntry` reading it that way, and a one-off windows CI red is inferred
+to be two ids rounding together: a folder's existing child read as a case-only rename of it. Bigints are not the
+whole answer — the route also trusts an id match only between spellings that fold together
+([editor.md](editor.md) § What delete and move refuse).
+
 ⚠️ **Any new watcher on an asset root brings #1708 back** — a per-directory library, or a single
 FILE watch. Route it through `createAssetTreeWatcher`, or add the ignore.
 

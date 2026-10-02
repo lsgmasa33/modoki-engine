@@ -4187,7 +4187,7 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   destination was free, awaited, then wrote: a file landing during the probe was overwritten, and two
   concurrent moves to one name both answered ok (#1954). Each now re-checks the destination there, and
   judges the retype there too (#1960). Move keeps its inode compare (a case-only rename is not a
-  collision); duplicate keeps a plain `existsSync` (a copy onto itself must be refused).
+  collision), read as bigints by the one `sameEntry` in `asset-fs-ops.ts` and trusted only for a case variant (#2068, below); duplicate keeps a plain `existsSync` (a copy onto itself must be refused).
   delete-asset decided which operands and sidecars exist before its probes and never asked again: a
   file renamed away during them answered `trashed` (darwin's trash reads "no longer there" as "went")
   and the renderer unbound a file that lived on (#1978). It now snapshots each operand and every
@@ -4220,6 +4220,30 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   did: whichever request ran second 404'd, and the prune logged a false "may still be on disk". One
   request per asset, or both in one `paths` list.
   This is the delete half of [the sidecar rule below](#a-sidecars-identity-belongs-to-exactly-one-live-file-1956-1974-1975).
+
+- **Inside the source is asked FIRST, and by entry (#2068).** `/api/move-file` refuses a folder moved into
+  itself (400) before the never-clobber check (409): no destination makes that move possible, and a 409 for an
+  existing descendant invited a retry under another name that fails the same way. `insideEntry`
+  (`asset-fs-ops.ts`) asks whether an existing parent of the destination IS the source, so `/f1` → `/F1/g` on a
+  case-folding disk is caught too (the string prefix test missed it, and `renameSync` threw a 500). The source is
+  `lstat`ed, so a symlinked source is the link and may move into its target's folder; each parent is asked by `stat`
+  (a parent that is a link TO the source) and by `lstat` (a symlinked source moved through itself, `/alias` →
+  `/alias/x`, would land at its target's `x` while the reply named a path with nothing at it).
+  **"Same entry" means a case variant, not only a matching id.** `destinationTaken` lets a move onto an existing
+  path through only when the two spellings fold together AND `sameEntry` (bigint `lstat`) says they are one entry.
+  An id match alone ends in `renameSync` replacing a file whenever ids collide — and they did. The fold is JS's
+  (`normalize('NFC').toLowerCase()`), not the filesystem's, so an exotic case-only rename the two fold differently
+  (Greek final sigma on APFS) is refused 409: the safe direction. Residual, read-only and not run: on a
+  case-SENSITIVE disk two hard links `Foo.png`/`foo.png` pass both checks, `rename` between them does nothing, and
+  `moveAssetFile` then moves `Foo.png`'s sidecar over `foo.png`'s.
+  ⚠️ Found as a one-off windows red of the sequence test, and the tell was in the same job: seed 7 passed on its
+  own and failed when the reach check re-ran the same seeds, so one op list answered two ways — not a seed only
+  windows draws. The cause is INFERRED, not observed on the runner: a 400 there means `sameEntry` said a folder and
+  its existing child were one entry, which only an id collision explains, and `sameEntry` compared a `number` `ino`.
+  A Windows file id is 64-bit (NTFS keeps the record's reuse count in its top 16 bits), and above 2^53 a `number`
+  rounds neighbours to one value — measured on the windows box's ReFS volume ([windows.md](windows.md) § Recycling a
+  folder while the editor watches it). Which ids the runner handed out decided it, hence once.
+  `moveFileRouter.test.ts` pins the precedence on a real disk, and the id handling under fake ids (`fakeIds`).
 
 #### A write with several steps leaves the disk as its reply says (#1958, #1963, #1977)
 
@@ -4397,7 +4421,6 @@ rule is what keeps it over an orphan.
   removed, and the delete half (I4). The duplicate and move create calls are held by
   `sidecarIdentity.test.ts` alone: there the copy's own sidecar write overwrites the `.meta.json` orphan,
   and only the local and quarantined halves show the difference.
-
 ### Folder-tree state lives at module scope, not in `useState` (#309)
 
 `panels/assetFolderState.ts` owns `expanded` / `pendingFolders` / `typeFilter` / `viewMode` at module scope,

@@ -107,9 +107,15 @@ vi.mock('../../scripts/ota/buildStamp.mjs', async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   return { ...real, readGitProvenance: () => ({ commit: 'abc123', dirty: false }) };
 });
+/** Every gcloud call a route made, as argv. */
+const gcloudCalls = vi.hoisted(() => [] as string[][]);
+// ⚠️ `execGcloudSync` is stubbed too, not only the directory (#2068). The publish's CORS step runs it SYNCHRONOUSLY, and
+// `gcloud` resolves on the step env's PATH — so wherever a real one is installed (ubuntu CI ships one in /usr/bin, a
+// dev Mac in Homebrew) each publish case ran `gcloud storage buckets update gs://fixture-bucket` over the network, under
+// that machine's own credentials. A row lasted as long as gcloud did (~1s on CI, one cold start past the 10s wait).
 vi.mock('../../plugins/backend/gcloud', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../plugins/backend/gcloud')>();
-  return { ...real, resolveGcloudDir: () => '/usr/bin' };
+  return { ...real, resolveGcloudDir: () => '/usr/bin', execGcloudSync: (args: string[]) => { gcloudCalls.push(args); return ''; } };
 });
 
 // Steps "run" and exit 0 without spawning anything.
@@ -327,11 +333,14 @@ describe('#1824: a refusal before the stream opens is sent IN it', () => {
     ['true', '--mandatory'], ['1', '--mandatory'], ['false', '--no-mandatory'], ['0', '--no-mandatory'],
   ])('/api/ota/publish: ?mandatory=%s reaches ota-publish.mjs as %s (`true` used to read as "inherit")', async (q, flag) => {
     spawnedArgv.length = 0;
+    gcloudCalls.length = 0;
     const { res } = drive(`/api/ota/publish?version=v1&mandatory=${q}`);
-    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 10000 });
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
     const publish = spawnedArgv.find((argv) => argv.some((a) => a.endsWith('ota-publish.mjs')));
     expect(publish, `steps: ${JSON.stringify(spawnedArgv)}`).toBeDefined();
     expect(publish).toContain(flag);
+    // The CORS step's gcloud call reached the stub, not a real gcloud (#2068).
+    expect(gcloudCalls.map((a) => a.slice(0, 4))).toEqual([['storage', 'buckets', 'update', 'gs://fixture-bucket']]);
   });
 
   it('/api/ota/publish: no ?bucket= and a baseUrl that names none is told to pass one (not "bucket null")', async () => {

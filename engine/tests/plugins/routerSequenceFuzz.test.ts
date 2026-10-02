@@ -322,12 +322,13 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
           const caseOnly = fk === tk && op.from !== op.to;
           if (!files.has(fk) && !isFolder) expect = 404;
           else if (op.from === op.to) expect = null; // onto itself: not predicted
+          // Inside itself is asked before the destination (#2068): no destination makes that move possible.
+          else if (isFolder && under(tk, fk)) expect = 400;
           else if (!caseOnly && (files.has(tk) || folders.has(tk))) {
             expect = 409;
             // The never-clobber refusal for a FILE onto a FILE: the one a destroyed destination would hide (#1995).
             if (!isFolder && files.has(tk)) reach.moveOntoFile++;
-          } else if (isFolder && under(tk, fk)) expect = 400;
-          else if (!parentExists(op.to)) expect = null;
+          } else if (!parentExists(op.to)) expect = null;
           reply = await post('/api/move-file', { from: op.from, to: op.to });
           apply = () => {
             // Onto its own spelling: the route renames nothing, whatever the disk spells it (a stale spelling after a

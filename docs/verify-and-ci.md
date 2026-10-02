@@ -1462,6 +1462,32 @@ an unexpected outside write. That ended the run before its final save, and the f
 from reading that stale save. Rule D now comes from each saved scene's copy-less form, and the oracle fails a run that
 stopped early (`prefabs.md` § P1).
 
+### No vitest test runs a real gcloud (#2068)
+
+`sseRouteRejection.test.ts` mocked `resolveGcloudDir` to `/usr/bin` and left `execGcloudSync`, which the OTA
+publish's CORS step calls synchronously, resolving `gcloud` on the step env's PATH. Wherever a real gcloud is
+installed (the ubuntu runner ships one in `/usr/bin`, a dev Mac has Homebrew's), every publish row ran
+`gcloud storage buckets update gs://fixture-bucket` over the network under that machine's credentials, and lasted
+as long as gcloud did: ~1 s a row on CI, ~1.7 s here, and once a cold start past the row's 10 s wait (a one-off
+ubuntu red). Not load, and not a racy stream end: a logging fake `gcloud` that sleeps 3 s made each row take 3.1 s
+and then pass. The file now stubs the call and asserts the stub was reached.
+
+So the trash guard's wrapper of the builtin `execFileSync` also blocks and records a REAL gcloud
+(`realGcloudTarget` in `tests/realTrashGuard.ts`), and `tests/setup.ts` fails the test that ran one. Real means
+outside the OS temp dir: a test's fake lives in a scratch dir and runs (`otaStatusRoute.test.ts` points
+`sdk.gcloudPath` at one), and a gcloud on no searched directory fails ENOENT. It reads the bare POSIX command against
+the call's own `env` PATH (an env with NO `PATH` key searches libuv's default `/usr/bin:/bin`, where ubuntu's gcloud
+is) and the `gcloud.cmd` inside the caret-escaped `cmd.exe` line `toSpawn` builds on Windows. It wraps `spawn` too:
+the build steps run gcloud through `spawnBuildStep`, among them the web deploy's `storage rsync
+--delete-unmatched-destination-objects`. A throw alone would not do: the CORS step reads a failed gcloud as non-fatal
+and carries on.
+⚠️ **A fake prepended to the TEST RUN's PATH is not a sweep.** `withGcloudOnPath` puts the resolver's directory
+first, so on a Mac Homebrew's gcloud shadows it: such a run finds a test that mocks the directory to an empty one
+(how this one was found) and misses one that leaves the resolver real (close-out review). Not reached: a spawned
+child process's own gcloud (`otaCliScripts.test.ts` and `otaPublishReleaseRace.test.ts` hand the CLI a PATH of their
+own), and `execFile`/`spawnSync`/`exec`, which no gcloud call uses today (`gcloudSync` is `execFileSync`, a build step
+is `spawn`).
+
 ### Scratch dirs — `makeScratchDir`, never a bare `mkdtemp` (#1117)
 
 A test that needs a throwaway directory calls `makeScratchDir(prefix)` from

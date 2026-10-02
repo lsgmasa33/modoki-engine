@@ -54,7 +54,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT, fingerprintBytes, fingerprintFile } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, moveConversionCaches, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, removeOrphanSidecars, SIDECAR_SUFFIXES } from '../asset-fs-ops';
+import { createFolderAt, insideEntry, moveAssetFile, moveConversionCaches, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, removeOrphanSidecars, sameEntry, SIDECAR_SUFFIXES } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
@@ -773,7 +773,11 @@ function engineAssetRootRefusal(
  *  name both passed it and the second rename destroyed the first file. */
 function destinationTaken(absFrom: string, absTo: string): boolean {
   if (!fs.existsSync(absTo) || absTo === absFrom) return false;
-  return !sameEntry(absFrom, absTo); // a failed stat answers "not the same entry" → a real collision
+  // Only a case (or Unicode-form) variant of the source's own spelling can be the source: an id match alone is not
+  // trusted with a decision that ends in `renameSync` replacing a file (#2068 review — ids collided once, and a mount
+  // can synthesize them). A failed stat answers "not the same entry" → a real collision.
+  const fold = (p: string) => p.normalize('NFC').toLowerCase();
+  return fold(absFrom) !== fold(absTo) || !sameEntry(absFrom, absTo);
 }
 
 // ── The commit point (family/unguarded-asset-write: #1954, #1960, #1978, #1980) ──────────────────────────────────────
@@ -787,14 +791,6 @@ function destinationTaken(absFrom: string, absTo: string): boolean {
  *  import the scanner (it is host-agnostic). Null: no asset kind — a plain data `.json`, a sidecar, an `.obj` source. */
 function kindByName(url: string): string | null {
   return url.endsWith('.json') ? classifyJsonAssetPath(url) : classifyBinaryExt(url);
-}
-
-/** True when `a` and `b` are one directory entry — a case-only rename on a case-insensitive disk. */
-function sameEntry(a: string, b: string): boolean {
-  try {
-    const x = fs.statSync(a), y = fs.statSync(b);
-    return x.ino === y.ino && x.dev === y.dev;
-  } catch { return false; }
 }
 
 /** A move or copy that would change what an asset IS through its destination's name (#1960) — `m.mat.json` moved to
@@ -5569,18 +5565,20 @@ async function describeUnresolvedAgainstLiveWorld(
       const rootRefusal = assetRootOperandRefusal(ctx, absFrom, from, 'move')
         ?? engineAssetRootRefusal(ctx, absFrom, from, 'move') ?? engineAssetRootRefusal(ctx, absTo, to, 'move anything to');
       if (rootRefusal) return rootRefusal;
+      // Moving a folder INTO ITSELF orphans it — `renameSync` throws EINVAL, which would surface
+      // as a 500 ("something broke") rather than the 4xx this is. The drag path cannot reach it
+      // (`planFilesDropMoves` skips it); the agent path can. Asked by entry (`insideEntry`), so a
+      // case variant of the source's name is caught on a case-folding disk too.
+      // ⚠️ Asked BEFORE the never-clobber 409 (#2068): no destination makes this move possible, so
+      // "Destination exists" for an existing descendant named the wrong reason and invited a retry
+      // under another name that fails the same way.
+      if (insideEntry(absFrom, absTo)) {
+        return json({ error: 'Destination is inside the source' }, 400);
+      }
       // Never clobber an existing asset on move/rename (renameSync would silently destroy it), except a case-only
       // rename — see `destinationTaken`. Asked here so a collision refuses before the renderer probe below, and
       // asked AGAIN after that probe, right before the rename.
       if (destinationTaken(absFrom, absTo)) return json({ error: 'Destination exists' }, 409);
-      // Moving a folder INTO ITSELF orphans it — `renameSync` throws EINVAL, which would surface
-      // as a 500 ("something broke") rather than the 4xx this is. The drag path cannot reach it
-      // (`planFilesDropMoves` skips it); the agent path can.
-      // (`absTo === absFrom` is NOT included: a case-only rename resolves to the same entry and is
-      // explicitly allowed above. `startsWith(absFrom + sep)` already excludes equality.)
-      if (absTo.startsWith(absFrom + path.sep)) {
-        return json({ error: 'Destination is inside the source' }, 400);
-      }
       {
         const refusal = await heldAssetEditorRefusal(ctx, [absFrom], 'move', { refuseOnUnknown: true });
         if (refusal) return json(refusal.body, refusal.status);

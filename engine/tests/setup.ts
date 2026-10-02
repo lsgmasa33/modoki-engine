@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { afterAll, afterEach } from 'vitest';
-import { installRealTrashGuard, resetRealTrashGuard, takeRealTrashCalls } from './realTrashGuard';
+import { installRealTrashGuard, resetRealTrashGuard, takeRealGcloudCalls, takeRealTrashCalls } from './realTrashGuard';
 import { installScratchDirCleanup } from '@modoki/engine/testing/scratchDir';
 
 // Scratch dirs made with makeScratchDir are removed after each test file (#1117). The helper refuses
@@ -8,13 +8,18 @@ import { installScratchDirCleanup } from '@modoki/engine/testing/scratchDir';
 installScratchDirCleanup(afterAll);
 // The claims store's per-pid fallback dirs are reaped once per run by globalSetup.ts, not here.
 
-// No test reaches the OS trash by accident (#2033): the builtin execFileSync blocks and records a trash command, and the
-// test (or, from a hook, the file) that made it fails here. Why, and the opt-out: tests/realTrashGuard.ts.
+// No test reaches the OS trash by accident (#2033), nor a real gcloud (#2068): the builtin execFileSync blocks and records
+// either, and the test (or, from a hook, the file) that made it fails here. Why, and the opt-out: tests/realTrashGuard.ts.
 installRealTrashGuard();
 resetRealTrashGuard();
 const failOnTrash = (where: string) => {
+  // Both lists drained before either throws, so a call is never blamed on the NEXT test.
   const calls = takeRealTrashCalls();
+  // And no test runs a REAL gcloud (#2068) — the same wrapper blocks and records it; a route catches the throw (the OTA
+  // publish's CORS step reads it as non-fatal), so this is where it fails.
+  const gcloud = takeRealGcloudCalls();
   if (calls.length) throw new Error(`realTrashGuard (#2033): ${where} sent a delete to the real OS trash (blocked): ${calls.join(' ; ')}. Stub moveToTrash, or call allowRealTrash() if that is the point.`);
+  if (gcloud.length) throw new Error(`realGcloudGuard (#2068): ${where} ran a real gcloud (blocked): ${gcloud.join(' ; ')}. Stub execGcloudSync / spawnBuildStep, or point sdk.gcloudPath at a fake in a scratch dir.`);
 };
 afterEach(() => failOnTrash('this test (or a hook, or async work, that ran since the previous test ended)'));
 afterAll(() => failOnTrash('an afterAll of this file'));

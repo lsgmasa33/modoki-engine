@@ -136,12 +136,39 @@ export function moveConversionCaches(projectRoot: string, fromUrl: string, toUrl
   return moved;
 }
 
-/** Same filesystem entry: a case-only rename's destination on a case-folding disk. */
-function sameEntry(a: string, b: string): boolean {
+/** True when `a` and `b` are one directory entry — a case-only rename's destination on a case-folding disk. A failed
+ *  stat answers false. `lstat`, so a symlink is its own entry: moving a link onto the file it points at is a collision,
+ *  not a rename of that file (`stat` followed the link, and the rename replaced the file with a link to itself).
+ *
+ *  ⚠️ Read as BIGINTS (#2068). A Windows file id is 64-bit (NTFS keeps the record's reuse count in its top 16 bits), and
+ *  above 2^53 a `number` `ino` rounds neighbouring ids to ONE value: on the windows box's ReFS volume two directories'
+ *  ids 1 apart did (measured, `nodeDirIdentity`). Then two different entries read as the same one. The one-off windows
+ *  CI red of #2068 is inferred to be that: the move route answered as if a folder and its existing child were one
+ *  entry, which only an id collision explains. */
+export function sameEntry(a: string, b: string): boolean {
   try {
-    const sa = fs.statSync(a), sb = fs.statSync(b);
+    const sa = fs.lstatSync(a, { bigint: true }), sb = fs.lstatSync(b, { bigint: true });
     return sa.ino === sb.ino && sa.dev === sb.dev;
   } catch { return false; }
+}
+
+/** True when `absTo` lies inside the entry `absFrom` — some existing parent of `absTo` IS `absFrom`. Asked by entry, not
+ *  by spelling, so on a case-folding disk `/f1` → `/F1/g` is caught too: a string prefix test misses it, and
+ *  `renameSync` then throws EINVAL (a 500) or, with `F1/g` present, the refusal named the wrong reason. `absTo` itself is
+ *  not asked: it being the source is a case-only rename. The source is `lstat`ed — a symlinked source is the link, and
+ *  renaming it into its target's folder is legal — and each parent is asked both ways: `stat`ed, because a parent that
+ *  is a link TO the source puts the destination inside it (`rename` throws EINVAL), and `lstat`ed, because a symlinked
+ *  source moved to a path THROUGH itself (`/alias` → `/alias/x`) lands at its target's `x`, a destination the reply
+ *  would name and nothing would be at. Bigints, as `sameEntry`. */
+export function insideEntry(absFrom: string, absTo: string): boolean {
+  let src: fs.BigIntStats;
+  try { src = fs.lstatSync(absFrom, { bigint: true }); } catch { return false; }
+  const isSrc = (read: () => fs.BigIntStats) => { try { const st = read(); return st.ino === src.ino && st.dev === src.dev; } catch { return false; } };
+  for (let p = path.dirname(absTo); ; p = path.dirname(p)) {
+    // A missing parent answers false both ways: its own parents may still be the source.
+    if (isSrc(() => fs.statSync(p, { bigint: true })) || isSrc(() => fs.lstatSync(p, { bigint: true }))) return true;
+    if (path.dirname(p) === p) return false;
+  }
 }
 
 /** **A sidecar's identity belongs to exactly one live file.** This is the CREATE half (#1975). The COPY half is
