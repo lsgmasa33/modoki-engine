@@ -15,6 +15,15 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 import { resolveAssetPath, absToAssetUrl, createBrowserRequestRegistry, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
+// The delete route's trash is the OS's (Finder on darwin): its scratch files would go to the real Trash (#2033).
+vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
+  ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
+  moveToTrash: (paths: string | string[]) => {
+    for (const p of Array.isArray(paths) ? paths : [paths]) fs.rmSync(p, { recursive: true, force: true });
+    return { failed: [] };
+  },
+}));
+
 let tmp: string;
 let tmp2: string;
 

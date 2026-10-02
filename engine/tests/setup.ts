@@ -1,11 +1,23 @@
 import '@testing-library/jest-dom/vitest';
-import { afterAll } from 'vitest';
+import { afterAll, afterEach } from 'vitest';
+import { installRealTrashGuard, resetRealTrashGuard, takeRealTrashCalls } from './realTrashGuard';
 import { installScratchDirCleanup } from '@modoki/engine/testing/scratchDir';
 
 // Scratch dirs made with makeScratchDir are removed after each test file (#1117). The helper refuses
 // to create any until this has run, so a config that forgets it fails loudly instead of leaking.
 installScratchDirCleanup(afterAll);
 // The claims store's per-pid fallback dirs are reaped once per run by globalSetup.ts, not here.
+
+// No test reaches the OS trash by accident (#2033): the builtin execFileSync blocks and records a trash command, and the
+// test (or, from a hook, the file) that made it fails here. Why, and the opt-out: tests/realTrashGuard.ts.
+installRealTrashGuard();
+resetRealTrashGuard();
+const failOnTrash = (where: string) => {
+  const calls = takeRealTrashCalls();
+  if (calls.length) throw new Error(`realTrashGuard (#2033): ${where} sent a delete to the real OS trash (blocked): ${calls.join(' ; ')}. Stub moveToTrash, or call allowRealTrash() if that is the point.`);
+};
+afterEach(() => failOnTrash('this test (or a hook, or async work, that ran since the previous test ended)'));
+afterAll(() => failOnTrash('an afterAll of this file'));
 
 // jsdom implements no layout, and therefore no `document.elementFromPoint` AT ALL — it is
 // `undefined`, not a stub that returns a miss. bridge.ts hit-tests with it to pick the canvas under

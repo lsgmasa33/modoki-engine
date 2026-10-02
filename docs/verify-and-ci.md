@@ -1442,6 +1442,26 @@ carries `exclude: ['**/node_modules/**', 'packages/**', '**/release/**']`, so
 under `npm run verify`, so this only bites while iterating on one file — which is exactly when a
 silent empty run is most expensive. Surfaced by the #426 review, which lost a pass to it.
 
+### No vitest test reaches the OS trash (#2033)
+
+`moveToTrash` (`plugins/asset-fs-ops.ts`) hands a delete to the OS: Finder on darwin, the Recycle Bin on win32,
+`trash-put` elsewhere. A test that drives the backend's delete route without stubbing it sends its scratch files to the
+owner's real Trash, with the trash sound per delete. Two fuzz files and `moveFileRouter.test.ts` did, on every run. So
+`tests/setup.ts` replaces the BUILTIN `child_process.execFileSync` (`tests/realTrashGuard.ts`): a trash command is blocked and recorded, and the setup's `afterEach`/`afterAll` fail the test or
+file that made it. The builtin, not a setup-file `vi.mock`, because the mock missed a jsdom file, a default import and a
+file whose own `vi.mock('child_process')` spreads the original (close-out review; `realTrashGuardBypasses.test.ts`). A
+throw alone would not do it, because on darwin `moveToTrash` reads a failed exec as a refusal and swallows it. A test that
+recycles on purpose (the live win32 ones) calls `allowRealTrash()` at its top level. The per-file
+`vi.mock('…/asset-fs-ops', …moveToTrash…)` stubs stay where a test needs the delete to SUCCEED (every `makeFuzzBackend`
+user): the guard refuses, it does not delete. Out of scope: the MCP live smoke (`engine/tools/modoki-mcp/test-smoke.mjs`)
+trashes its probe files through a real editor, on purpose.
+
+⚠️ **Finder had side effects the fuzz depended on.** It drops a `.DS_Store` in the folder, which the fuzz harness's
+watcher (it has no dotfile filter; production's ignores dot segments, `assetTreeIndex.ts` `isIgnoredSegment`) raised as
+an unexpected outside write. That ended the run before its final save, and the fold oracle's only rule-D coverage came
+from reading that stale save. Rule D now comes from each saved scene's copy-less form, and the oracle fails a run that
+stopped early (`prefabs.md` § P1).
+
 ### Scratch dirs — `makeScratchDir`, never a bare `mkdtemp` (#1117)
 
 A test that needs a throwaway directory calls `makeScratchDir(prefix)` from

@@ -14,8 +14,21 @@ import { getTraitByName, setRunMode } from '@modoki/engine/runtime';
 import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { checkInstance, seen } from './foldOracle';
+import { fileForms, FILE_FORMS, type FileForm } from './prefabFuzz/fileForms';
+import { parseInstanceRecord } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { getCachedPrefab } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, rmSync } from 'node:fs';
+
+// The backend's trash route must not reach Finder (#2033): every fuzz delete would go to the real Trash with its sound,
+// and Finder's `.DS_Store` in the scratch tree failed the run as an outside write, which once supplied rule D (below).
+vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
+  ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
+  moveToTrash: (paths: string | string[]) => {
+    for (const p of Array.isArray(paths) ? paths : [paths]) rmSync(p, { recursive: true, force: true });
+    return { failed: [] };
+  },
+}));
 
 setRunMode('stopped');
 const be = makeFuzzBackend();
@@ -29,7 +42,8 @@ boot(be);
  *  and 235 is the only seed of 1-300 that reaches translation D once #2009's op kinds changed every seed's list. */
 const SEEDS = [...VERIFY_SEEDS, 103, 235];
 const LEN = VERIFY_LEN;
-/** The oracle needs the run's saved files, not its verdict: the fuzzer itself judges the run. */
+/** The oracle needs the run's saved files; the fuzzer judges the run's checks, so every one is tolerated here. A failure
+ *  `tolerate` cannot waive still ends the run, and is red below (#2033). */
 const OPTS = { expectedError: () => true, tolerate: () => true };
 
 const report: Record<string, string[]> = {};
@@ -37,13 +51,24 @@ const report: Record<string, string[]> = {};
  *  would pin a shape a run reached and then lost before its save. A HELD own link is reached only per step (seeds 1-1500
  *  leave none in a saved scene): `prefabFuzz.test.ts` pins it on #2018's repro. */
 const PLACED = ['ownProjected', 'ownAtPlaceholder', 'ownInPlaceholder', 'unresolvedUnderPlaceholder', 'heldUnderPlaceholder'] as const;
+/** Rule D reached on the copy-less form of a saved scene (#2033), not on a run that stopped early. */
+let ruledDNoCopies = 0;
 const reached = Object.fromEntries(PLACED.map((k) => [k, 0])) as Record<(typeof PLACED)[number], number>;
+/** #2030: the variant scenes checked per #2025 file form (`prefabFuzz/fileForms.ts`). */
+const forms = Object.fromEntries(FILE_FORMS.map((k) => [k, 0])) as Record<FileForm, number>;
+/** …and the held slot nodes among them `placementDiverge` judged rather than left unjudged (a slot's placeholder is a walk). */
+let slotJudged = 0;
 
 describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scenes)', () => {
   for (const seed of SEEDS) {
     it(`seed ${seed}`, async () => {
       const before = new Set(be.snapshot().keys());
-      await runOps(be, generate(seed, LEN), OPTS);
+      const run = await runOps(be, generate(seed, LEN), OPTS);
+      // The oracle reads the scene the run saved LAST. A failure `tolerate` cannot waive ends the run — before its final
+      // save, the file on disk is an older one, which compared passes for coverage it is not (#2033: rule D was reached
+      // only that way, through Finder's `.DS_Store` failing a trash step); after it (the end walk), the oracle is the only
+      // judge of seeds 103 and 235, which the fuzzer's own verify seeds do not run.
+      expect(run.failure, `seed ${seed}: the run failed${run.failure ? ` at step ${run.failure.step} (${run.failure.check})` : ''}`).toBeUndefined();
       const files = be.snapshot();
       const fresh = [...files.keys()].filter((p) => !before.has(p));
       const scenePath = fresh.find((p) => p.endsWith('.scene.json') || /\/scenes\/[^/]+\.json$/.test(p));
@@ -67,29 +92,62 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
       const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
       const lines: string[] = [];
       const seen0 = { ...seen };
-      for (const entry of scene.entities ?? []) {
-        if (!entry.prefab || !entry.guid) continue;
+      const opts = { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
+      const check = (entry: SceneEntityEntry, prefix = '', withCopies = copies, parse = opts) => {
         const root = [...getCurrentWorld().entities].find((e) => (e.get(ea) as { guid?: string } | undefined)?.guid === entry.guid);
-        if (!root) { lines.push(`${entry.name}: no live root`); continue; }
-        for (const d of checkInstance(entry, read, root.id(), { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g) => held.has(g) }, copies)) lines.push(`${entry.name}: ${d}`);
-      }
+        if (!root) { lines.push(`${prefix}${entry.name}: no live root`); return; }
+        for (const d of checkInstance(entry, read, root.id(), parse, withCopies)) lines.push(`${prefix}${entry.name}: ${d}`);
+      };
+      for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) check(entry);
       for (const k of PLACED) reached[k] += seen[k] - seen0[k];
+      // Rule D (a nested reference row whose prefab is missing and the scene holds no copy of) is a file the editor wrote
+      // without copies: one saved before v19 (`embeddedPrefabs` arrived then), or open elsewhere while the prefab went.
+      // The run's own save writes the copies, so the same scene is judged once more without them (#2033).
+      if (scene.embeddedPrefabs) {
+        const bare = { ...scene, embeddedPrefabs: undefined, embeddedPrefabFrames: undefined };
+        const path = scenePath!.replace(/\.json$/, '.nocopies.json');
+        be.write(path, JSON.stringify(bare));
+        const got = await loadSceneReporting(path);
+        if (got.outcome !== 'loaded') lines.push(`no copies: the scene did not load (${got.outcome})`);
+        else {
+          const d0 = seen.ruledD;
+          for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) check(entry, 'no copies: ', new Set(), { ...opts, sceneHadCopies: false });
+          ruledDNoCopies += seen.ruledD - d0;
+        }
+      }
+      // #2030: the same scene with each user node AT a placeholder restated in each of #2025's older file forms, loaded
+      // and judged as it is (the rulings place it the same in every form).
+      const variants = fileForms(scene as never, read, (entry) => [...foldInstance(read, parseInstanceRecord(entry, read, opts).record).placeholders.keys()]);
+      const slot0 = seen.heldSlotAdded;
+      for (const [n, v] of variants.entries()) {
+        const path = scenePath!.replace(/\.json$/, `.form${n}.json`);
+        be.write(path, JSON.stringify(v.scene));
+        const got = await loadSceneReporting(path);
+        if (got.outcome !== 'loaded') { lines.push(`${v.form}: the variant did not load (${got.outcome})`); continue; }
+        check(v.scene.entities![v.entry]!, `${v.form}: `);
+        forms[v.form]++;
+      }
+      slotJudged += seen.heldSlotAdded - slot0;
       report[`seed ${seed}`] = lines;
       expect(lines).toEqual([]);
     }, 120_000);
   }
 
   it('checked the fuzzer\'s structure (non-vacuity)', () => {
-    if (process.env.ORACLE_OUT) writeFileSync(process.env.ORACLE_OUT, JSON.stringify({ seen, report }, null, 1));
+    if (process.env.ORACLE_OUT) writeFileSync(process.env.ORACLE_OUT, JSON.stringify({ seen, forms, report }, null, 1));
     expect(seen.instances).toBeGreaterThan(SEEDS.length);
     // Both rule translations are reached, so each is exercised rather than merely written (foldOracle.ts).
     expect(seen.ruledB).toBeGreaterThan(0);
-    expect(seen.ruledD).toBeGreaterThan(0);
+    // Rule D on the copy-less forms (#2033): never on a run that stopped early, which the seeds now fail.
+    expect(ruledDNoCopies).toBeGreaterThan(0);
     // The defaults arm checked something: a broken schema lookup would otherwise pass, checking nothing.
     expect(seen.defaults).toBeGreaterThan(0);
     // #2021: the placement check reached an own link on a projected member, AT and INSIDE a placeholder, and list and
     // held records under one.
     for (const k of PLACED) expect(reached[k], k).toBeGreaterThan(0);
+    // #2030: every one of #2025's file forms was generated from a saved scene and judged.
+    for (const k of FILE_FORMS) expect(forms[k], k).toBeGreaterThan(0);
+    expect(slotJudged).toBeGreaterThan(0);
     // A guid stated twice is left unjudged (#1937), so a regression that states links twice would turn the check off.
     expect(seen.ownDuplicate).toBe(0);
   });

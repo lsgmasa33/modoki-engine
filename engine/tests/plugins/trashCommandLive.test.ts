@@ -28,8 +28,13 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { moveToTrash, trashCommand } from '../../plugins/asset-fs-ops';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { allowRealTrash } from '../realTrashGuard';
+
+
 
 const onWin = process.platform === 'win32';
+// This file recycles for real, on purpose (win32 only): exempt from the setup's trash guard (#2033).
+if (onWin) allowRealTrash();
 const roots: string[] = [];
 
 function fixture(): { root: string; files: string[]; dir: string } {

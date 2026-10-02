@@ -759,7 +759,16 @@ mechanically:
     - Every user-added node is placed exactly once. AT a placeholder it hangs from the placeholder. INSIDE one it is
       `unresolved`. On a projected member it is anchored there. Otherwise it is `heldNode` (B′). A node is one guid,
       whatever states it: a list row's `own` link, its content in `held.heldOwn`, or a scene-owned node in a held
-      legacy row's `added`. § 10.4b's AT-a-placeholder fix covers every file form (#2025).
+      legacy form. § 10.4b's AT-a-placeholder fix covers every file form (#2025), and the held forms are judged by its
+      rulings (#2030):
+      - a held member row's `added` (v16) or `own` (v17), at that row. A node in a row held whole is placed by the
+        record that holds the row;
+      - the entry-level legacy `added` under a MISSING ROOT. It is AT `/` only when the entry states the root's
+        localId, the node names it, and the held `/` row states no whole `added` list. Otherwise it waits, `unresolved`
+        (hub ruling Q3: no localId is guessed, rule 5);
+      - a `nestedStructure` slot's `added` whose path stops at a MISSING nested document. It waits `unresolved`, keyed
+        at that placeholder row, or is `heldNode` there when a removal cut the row (hub ruling Q4). The check walks the
+        documents to find the row (`slotPlaceholder`); it does not take the fold's key.
     - The fold reports only placeholders no removal cut. A placeholder the instance's own removal cuts goes with its
       member: its links are `heldNode` and its other records are inert (hub ruling, 2026-10-02: the cut dominates the
       placeholder, rule 3).
@@ -771,16 +780,34 @@ mechanically:
       leaf pairing alone misses the second;
     - the fold dropping its held `unresolved` legacy records (the close-out review's mutation, green across every
       suite before the held check) turns saved-scene seeds 5, 103 and 235 red.
+  - **#2025's file forms are derived, not generated** (#2030, `prefabFuzz/fileForms.ts`). The editor writes one form
+    per place, so no op reaches the others: AT a nested placeholder a row's v17 `own`, and AT a missing root the legacy
+    entry `added` at the root localId (today's save writes that, not a `/` row). So the saved-scene oracle takes each
+    user node a saved instance hangs AT a placeholder out of the form it is stated in and restates it in each other
+    form, one variant scene per form. It loads each variant through the editor's load and judges it as it judges the
+    saved scene. The forms are a v16 row's whole `added` at a nested placeholder; at a missing root, the `/` row's v16
+    `added`, its v17 `own`, and the legacy `added`; and a `nestedStructure` slot naming the placeholder's reference
+    row (parent localId 1, as a writer of that form stated it). Every form is pinned as reached, on seeds 5, 103 and
+    235; so is a slot node actually JUDGED. Reverting each of #2025's branches turns its form red: the v16 row at a
+    placeholder (9761a16df) seed 5, the root linking (bcc95fcdc) seeds 103 and 235, the slot keying (bf5da623b) seed 5.
+    A `/` row's v17 `own` stays green under the second revert: #2018's older branch links it.
+  - **Rule D is reached on a copy-less form** (#2033). D is a nested reference row whose prefab is missing and the scene
+    holds no copy of it: a file saved before v19 (`embeddedPrefabs` arrived then), or saved while the prefab still
+    existed. The run's own save writes the copies, so each saved scene is judged once more with `embeddedPrefabs`
+    removed. Before this, D was reached only when Finder's `.DS_Store`
+    aborted a trash step and the oracle read an older save, so the oracle now also fails a run whose `run.failure` is
+    set.
   - Not checked:
     - The end walk (undo to the start, redo to the end) and the respawn rebuild.
     - Which part of a held legacy statement the fold reports. The check requires one record, so a statement that loses
       some of its fields passes.
     - A guid stated more than once (a duplicate identifier, rule 5): what it means is #1937's. It is counted
       (`seen.ownDuplicate`, pinned at 0 over the fuzz), not judged.
-    - WHERE a user-added node shows, and its cause, when it is held in a form that does not name its anchor row: the
-      entry-level legacy `added`, or a held `nestedStructure` slot's `added`. That is #2025's open family. Holding it
-      to `unresolved` would push a fix that shows it the wrong way, so only "placed exactly once" is checked: anchored,
-      or held at its own path (counted in `seen.heldNodeUnjudged`).
+    - WHERE a user-added node shows, and its cause, in a held form no ruling places: the entry-level legacy `added`
+      while the root's document LOADS, and a held slot that resolves or names no reference row. Only "placed exactly
+      once" is checked there: anchored, or held at its own path (counted in `seen.heldNodeUnjudged`). The per-step P1
+      passes each stored owner's root localId; a caller of `checkRecord` that passes none leaves the entry-level form
+      unjudged too.
     - A held `nestedOverrides`/`nestedStructure` statement whose path runs through a missing NESTED prefab. It is keyed
       at `/`, and telling which placeholder it waits on is a frame walk the check does not repeat. No fuzz seed reaches
       it (the re-review counted 0).

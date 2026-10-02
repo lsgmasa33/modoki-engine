@@ -21,8 +21,13 @@ import { createAssetTreeWatcher } from '../../plugins/assetTreeWatcher';
 import { projectAssetRootsWatchIgnore } from '../../plugins/vite-asset-scanner';
 import type { TreeEventKind } from '../../plugins/assetTreeIndex';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { allowRealTrash } from '../realTrashGuard';
+
+
 
 const onWin = process.platform === 'win32';
+// This file recycles for real, on purpose (win32 only): exempt from the setup's trash guard (#2033).
+if (onWin) allowRealTrash();
 const scratch: string[] = [];
 const closers: Array<() => Promise<unknown> | unknown> = [];
 afterEach(async () => {

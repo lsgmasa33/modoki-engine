@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { placementDiverge } from './foldOracle';
-import type { FoldedInstance, InstanceRecord, SceneTargetRecord, UnusedRecord, AddedNodeRef, DesiredNode } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
+import type { FoldedInstance, InstanceRecord, SceneTargetRecord, UnusedRecord, AddedNodeRef, DesiredNode, PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 const rec = (rows: Record<string, SceneTargetRecord>, heldOwn?: Record<string, string[]>, pendingLegacy?: Record<string, unknown>): InstanceRecord => ({
   rootGuid: 'root', source: 'P', placement: { parent: '', sortOrder: 0, name: 'P' },
@@ -147,7 +147,7 @@ describe('#2021 P1 oracle: every held legacy statement under a placeholder is re
       .toEqual(['unused legacy ["moved","x"] names no held statement']);
   });
 
-  it('a held node in a form that names no anchor row is #2025\'s: neither held to unresolved nor placed', () => {
+  it('without the context that places it, a held node in a form that names no anchor row is unjudged (counted)', () => {
     const node = { guid: 'n', name: 'N', parentLocalId: 1, traits: {} };
     for (const [form, path] of [
       [{ added: [node] }, ['added', '0']],
@@ -162,7 +162,7 @@ describe('#2021 P1 oracle: every held legacy statement under a placeholder is re
     }
   });
 
-  it('a held node of #2025\'s family is still one node: shown once or held once, never neither, both or twice', () => {
+  it('an unjudged held node is still one node: shown once or held once, never neither, both or twice', () => {
     const r = rec({}, undefined, { added: [{ guid: 'n', name: 'N', parentLocalId: 1, traits: {} }] });
     const at = ['added', '0'];
     expect(placementDiverge(fold({ nodes: [], placeholders: ['/'] }), r)).toEqual(['held node n (["added","0"]): placed []']);
@@ -190,5 +190,75 @@ describe('#2021 P1 oracle: every held legacy statement under a placeholder is re
     expect(placementDiverge(fold({ nodes: ['/', '/A'], placeholders: ['/R'], unused: [atM, legacy('/', ['members', '/A'], 'gone')] }), r)).toEqual([]);
     expect(placementDiverge(fold({ nodes: ['/', '/A'], placeholders: ['/R'], unused: [legacy('/', ['members', '/A'], 'gone')] }), r))
       .toEqual(['under a placeholder, held ["members","/R/M"] not reported']);
+  });
+});
+
+describe('#2030 P1 oracle: #2025\'s held forms are placed by the rules (hub rulings Q3, Q4)', () => {
+  const node = (parentLocalId: number) => ({ guid: 'n', name: 'N', parentLocalId, traits: {} });
+  const at = ['added', '0'];
+
+  it('the entry-level legacy `added` under a missing root: AT it (`/`) when the entry states the root localId and the node names it', () => {
+    const r = rec({}, undefined, { added: [node(1)] });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] } }), r, { rootLid: 1 })).toEqual([]);
+    // Held instead (the fold before #2025's Q3 fix): hidden, where every other form shows it.
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved')] }), r, { rootLid: 1 }))
+      .toEqual(['own link n: stated ["anchor /"] placed ["unused / unresolved"]']);
+  });
+
+  it('…and waits, unresolved, when it is not provably AT the root: no localId stated, another localId, or a whole `/` list', () => {
+    for (const [what, r, rootLid] of [
+      ['no root localId stated (none is guessed, rule 5)', rec({}, undefined, { added: [node(1)] }), null],
+      ['anchored inside the missing frame', rec({}, undefined, { added: [node(2)] }), 1],
+      ['the held `/` row\'s whole list replaces it', rec({}, undefined, { added: [node(1)], members: { '/': { added: [] } } }), 1],
+    ] as const) {
+      const rowRec = what.includes('whole') ? [legacy('/', ['members', '/', 'added'], 'unresolved')] : [];
+      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved'), ...rowRec] }), r, { rootLid }), what).toEqual([]);
+      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: rowRec }), r, { rootLid }), what)
+        .toEqual(['own link n: stated ["unused / unresolved"] placed ["anchor /"]']);
+    }
+    // A REMAINDER `/` row states no whole list: the node is at the root.
+    const rem = rec({}, undefined, { added: [node(1)], members: { '/': { added: [], heldRemainder: true } } });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: [legacy('/', ['members', '/', 'added'], 'unresolved')] }), rem, { rootLid: 1 })).toEqual([]);
+  });
+
+  it('…while the root\'s document loads, the entry-level form stays unjudged', () => {
+    const r = rec({}, undefined, { added: [node(1)] });
+    expect(placementDiverge(fold({ unused: [legacy('/', at, 'gone')] }), r, { rootLid: 1 })).toEqual([]);
+  });
+
+  // P's row 5 (node R) references M; whether M loads decides the slot's placeholder.
+  const P = { id: 'P', version: 5, rootLocalId: 1, entities: [{ localId: 1, nodeGuid: 'PR', parentLocalId: 0 }, { localId: 5, nodeGuid: 'R', parentLocalId: 1, prefab: 'M' }] };
+  const M = { id: 'M', version: 5, rootLocalId: 1, entities: [{ localId: 1, nodeGuid: 'MR', parentLocalId: 0 }] };
+  const reader = (docs: Record<string, unknown>): PrefabReader => (g) => (docs[g] ? { doc: docs[g] as PrefabDoc } : { missing: true });
+  const slot = ['nestedStructure', '5', 'added', '0'];
+  const slotRec = () => rec({}, undefined, { nestedStructure: { 5: { added: [node(1)] } } });
+
+  it('a slot\'s node at a MISSING nested document waits unresolved, keyed at that placeholder row (Q4)', () => {
+    const read = reader({ P });
+    expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R', slot, 'unresolved')] }), slotRec(), { read })).toEqual([]);
+    // Keyed at the instance root (the fold before #2025's Q4 fix), or shown at the row: both red.
+    expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/', slot, 'unresolved')] }), slotRec(), { read }))
+      .toEqual(['own link n: stated ["unused /R unresolved"] placed ["unused / unresolved"]']);
+    expect(placementDiverge(fold({ placeholders: ['/R'], anchors: { '/R': ['n'] } }), slotRec(), { read }))
+      .toEqual(['own link n: stated ["unused /R unresolved"] placed ["anchor /R"]']);
+    // A removal cut the row (the fold reports no placeholder): the user's node is kept, `heldNode`, at the same key.
+    expect(placementDiverge(fold({ unused: [legacy('/R', slot, 'heldNode')] }), slotRec(), { read })).toEqual([]);
+    // The instance's own document missing: inside the root's frame.
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', slot, 'unresolved')] }), slotRec(), { read: reader({}) })).toEqual([]);
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', slot, 'heldNode')] }), slotRec(), { read: reader({}) }))
+      .toEqual(['own link n: stated ["unused / unresolved"] placed ["unused / heldNode"]']);
+    // M loads: no ruling places a slot held there, so it is unjudged.
+    expect(placementDiverge(fold({ unused: [legacy('/', slot, 'gone')] }), slotRec(), { read: reader({ P, M }) })).toEqual([]);
+  });
+
+  it('a held row\'s v17 `own` is placed like its `added`: inside the record that holds the row, or at the row', () => {
+    const inside = rec({}, undefined, { members: { '/R/M': { own: [node(0)] } } });
+    expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R/M', ['members', '/R/M'], 'unresolved')] }), inside)).toEqual([]);
+    expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R/M', ['members', '/R/M', 'own'], 'unresolved')] }), inside)).toEqual([]);
+    expect(placementDiverge(fold({ placeholders: ['/R'] }), inside)).toEqual(['own link n: stated ["unused /R/M unresolved"] placed []', 'under a placeholder, held ["members","/R/M"] not reported']);
+    // AT a missing root (Q3, B4): it shows at `/`, and is not held.
+    const atRoot = rec({}, undefined, { members: { '/': { own: [node(0)] } } });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', ['members', '/'], 'unresolved')] }), atRoot))
+      .toEqual(['own link n: stated ["anchor /"] placed ["unused / unresolved"]']);
   });
 });
