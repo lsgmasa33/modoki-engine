@@ -34,7 +34,7 @@ const L2_FOLDERS = [
   'account', 'animation', 'audio', 'iap', 'input', 'particles', 'physics', 'rendering',
   'skinning', 'storage', 'sync', 'timeline', 'ui', 'zones',
 ];
-const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'scene', 'store'];
+const L3_FOLDERS = ['actions', 'assets', 'debug', 'harness', 'loaders', 'managers', 'ota', 'prefab', 'scene', 'store'];
 
 /** D4 (docs/architecture-layers.md "## Settled decisions"): these files physically sit in
  *  `rendering/` (L2) but are reclassified L3 by the owner — they compose scene data + loaders +
