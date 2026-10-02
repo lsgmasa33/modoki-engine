@@ -31,6 +31,7 @@ import { soaSchema, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchem
 import { registerPosedWorldSource } from './authoredWorld';
 import { registerUndoRestoreBarrier } from '../undo/undoManager';
 import { withRestore } from './sceneAdoption';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 export interface AuthoredSnapshot {
   /** The primary scene's serialization — what the restore reloads. */
@@ -123,7 +124,7 @@ export function currentSceneKey(): string | null {
 /** EntityAttributes fields that are identity or hierarchy, not state — never replayed (see below). */
 const ENTITY_STRUCTURE_FIELDS = new Set(['parentId', 'sortOrder', 'guid', 'sourceScene', 'editorFolder']);
 
-export function restoreAuthoredEntities(entries: SerializedEntity[]): void {
+function restoreAuthoredEntitiesUnmarked(entries: SerializedEntity[]): void {
   const allTraits = getAllTraits();
   const piMeta = allTraits.find((m) => m.name === 'PrefabInstance');
   for (const entry of entries) {
@@ -192,7 +193,7 @@ export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
 /** Put the authored world back: reload the primary under the snapshot's key, then replay the part
  *  the reload carries rather than rebuilds — every base.
  *  The caller has already checked that the key still names the live scene. */
-export async function restoreAuthoredSnapshot(snap: AuthoredSnapshot): Promise<void> {
+async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot): Promise<void> {
   // Counted from the FIRST synchronous line: Stop sets 'stopped' and calls this with no await between,
   // so the Play world is still live for the whole reload with the mode already reading 'stopped'.
   _restoring++;
@@ -236,3 +237,8 @@ registerPosedWorldSource('a Play/preview restore is still landing', () => _resto
 registerUndoRestoreBarrier(() => _restoring > 0);
 registerPosedWorldSource('the last Play/preview restore FAILED — reload the scene before saving', () => _restoreFailed);
 onWorldSwap(() => { _restoreFailed = false; });
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const restoreAuthoredSnapshot = staleAround('stop', restoreAuthoredSnapshotUnmarked);
+export const restoreAuthoredEntities = staleAround('stop', restoreAuthoredEntitiesUnmarked);

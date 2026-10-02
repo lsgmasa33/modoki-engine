@@ -81,8 +81,10 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { boot, bridge, memoryStorage, flushWatcher, editorOwns } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, flushWatcher, editorOwns, authored, piOf } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
+import { s4Seams, s4Seen, DOOR_OPS } from './prefabFuzz/s4Seams';
+import { installShadow } from './prefabFuzz/shadow';
 import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
 import { seen } from './foldOracle';
@@ -90,13 +92,16 @@ import { writeFileSync } from 'node:fs';
 import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, recordKeys, RULING_R } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { fingerprintBytes, EDITOR_DELETE_FINGERPRINT, createEditorWriteGuard } from '../../plugins/editorWriteGuard';
-import { setRunMode } from '@modoki/engine/runtime';
+import { setRunMode, getTraitByName, writeTraitField } from '@modoki/engine/runtime';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
 vi.stubGlobal('window', { __modokiElectron: { bridge } });
 vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
+// #2014 (S4): the real store, capture and doors behind the #2009 shadow harness — I25 and the store's coverage run after
+// every op from here on (`prefabFuzz/s4Seams.ts`).
+installShadow(s4Seams);
 
 /** console.error lines that are the editor TELLING the user something expected, each with why it is expected. A bare
  *  pattern is not allowed: every entry names the issue or the rule behind it. */
@@ -335,12 +340,39 @@ describe('#1789 prefab fuzz', () => {
     }, 120_000);
   }
 
+  // #2014 (S4): I25 must JUDGE records, not merely run — a shadow that skips everything (every record stale, missing or
+  // unresolved) passes vacuously. After the verify seeds, every door op has been judged and records were compared.
+  it('#2014 I25: the shadow judged records after every door op (non-vacuity)', () => {
+    expect(checksRun.get('I25 compared a record') ?? 0).toBeGreaterThan(50);
+    for (const k of DOOR_OPS) expect(checksRun.get(`I25 compared after ${k}`) ?? 0, `I25 compared a record after ${k}`).toBeGreaterThan(0);
+  });
+
   // #1845: what the taints turned off, said on every verify run, so a platform where it grows is visible. A report, not a
   // test: the cause list is closed by its type, and the guard is the "unexpected outside write" self-test below.
   afterAll(() => {
     const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
     process.stderr.write(`[prefabFuzz] verify run — taints: ${tally(taintCounts)}; checks skipped: ${tally(skippedChecks)}; #1880 checks run: ${tally(checksRun)}\n`);
+    process.stderr.write(`[prefabFuzz] I25 translations (#2014): ${JSON.stringify(s4Seen)}\n`);
   });
+
+  // Hub ruling (a), 2026-10-02 (#1831, hunt seed 7078a): a scene reference node at an unresolved placeholder owns its
+  // record and is live, though its owner's fold does not anchor it (its link is held). P1 by the fold must COMPARE it:
+  // a live member of it broken without a mark is reported, under its own guid. Mutation: skip an unanchored node in
+  // `foldCheck` (runner.ts) — QR is never parsed, and the break goes unseen.
+  it('#2014: P1 by the fold compares a reference node whose link is held at an unresolved placeholder (hub (a), 7078a)', async () => {
+    const r = REGRESSIONS.find((x) => x.what.includes('hunt seed 7078a'))!;
+    const res = await runOps(be, r.repro, OPTS);
+    expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
+    const all = authored();
+    const hr = all.find((e) => e.name === 'HR')!;
+    const qr = all.find((e) => e.name === 'QR' && e.parentId === hr?.id && piOf(e.id)?.rootInstanceId === e.id)!;
+    expect(qr, 'the repro still makes QR').toBeDefined();
+    const member = authored().find((e) => e.id !== qr.id && piOf(e.id)?.rootInstanceId === qr.id && !!e.traits?.includes?.('Transform'))
+      ?? authored().find((e) => e.id !== qr.id && piOf(e.id)?.rootInstanceId === qr.id)!;
+    writeTraitField(member.id, getTraitByName('Transform')!, 'x', 123.5);
+    const fails = foldCheck(be, await serializeScene() as Parameters<typeof foldCheck>[1]);
+    expect(fails.some((f) => f.detail.startsWith(qr.guid!)), JSON.stringify(fails).slice(0, 300)).toBe(true);
+  }, 60_000);
 
   // #1933 K1: an entry must still REACH its case (`Reach`, knownOpen.ts), not just pass. Its op's outcome is read off the
   // trace, and the checks its run skipped off the skip tally's growth.

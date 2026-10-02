@@ -20,6 +20,7 @@ import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
 import { unkeyedNodes, stripCreatedKeys, stripKeysNow } from './capturedKeys';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -57,7 +58,7 @@ function instanceSourceRef(source: string, doc?: Pick<PrefabFile, 'id'> | null):
  *  overrides — it is simply gone on the next load. So the plan is checked against the file and a
  *  mismatch REFUSES to tag: an untagged entity round-trips as an `added` node, which is the
  *  degradation that loses nothing. */
-export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
+function tagEntityTreeAsInstanceUnmarked(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): Map<string, string> {
   return tagTree(rootEcsId, source, writtenPrefab).guidRemap;
 }
 
@@ -231,7 +232,7 @@ export function rederiveUntaggedTree(rootEcsId: number, restored: ReadonlyMap<st
  *  keeps the stamp this Create Prefab wrote (its ancestor was not stripped), and one owned by an
  *  OUTER prefab is zeroed rather than returned to that prefab's row id. Both need the pre-create
  *  value, which only the snapshot has — and reattach cannot reach it once the guid re-derives. */
-export function untagEntityTreeAsInstance(rootEcsId: number, source: string, doc?: Pick<PrefabFile, 'id'> | null): void {
+function untagEntityTreeAsInstanceUnmarked(rootEcsId: number, source: string, doc?: Pick<PrefabFile, 'id'> | null): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
@@ -334,7 +335,7 @@ export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: Detac
  *  the same. The strip runs `endFrames` first, as a delete does: an owned nested root moved out becomes a
  *  standalone instance, and anything else is unlinked where it stands. Left linked to a frame that no
  *  longer exists, it was written nowhere and vanished on reload (#1453). Those go in `orphans`. */
-export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean }): DetachSnapshot {
+function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolean }): DetachSnapshot {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return { links: [], orphans: [] };
   const strip = opts?.strip !== false;
@@ -387,7 +388,7 @@ export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
  *  (undo of a detach), and relink the members outside the tree it promoted or unlinked (#1453). */
-export function reattachPrefabInstance(
+function reattachPrefabInstanceUnmarked(
   detached: DetachSnapshot,
   /** The subtree undo is restoring. Given, an unresolved ref is only counted as LOST once the link
    *  is confirmed absent from the world. Omit it and every unresolved ref counts, which is right
@@ -492,7 +493,7 @@ export async function requireLinks(detached: DetachSnapshot, what: string): Prom
  *  which also leaves the tree plain and unrecorded. Left so, the next save captured a member the template had gained
  *  as REMOVED by this instance (#1665's sibling, observed). The reattach puts each frame's record back from the
  *  snapshot, so the rebase sees it. Returns the unresolved count, as the reattach. */
-export async function reattachDetachedInstance(detached: DetachSnapshot): Promise<number> {
+async function reattachDetachedInstanceUnmarked(detached: DetachSnapshot): Promise<number> {
   const unresolved = reattachPrefabInstance(detached);
   await rebaseStaleInstances();
   return unresolved;
@@ -530,7 +531,7 @@ export async function reattachDetachedInstance(detached: DetachSnapshot): Promis
  *  a key the save drops, so live and reloaded disagreed, and a later capture read the stale key as the node's identity.
  *  A node keyed before the create (a nested instance's own template-added node) keeps its key. A redo that refuses takes
  *  its seat back off the same way. Unity: undoing Create Prefab leaves an object with no prefab identity on it. */
-export function tagCreatedPrefab(
+function tagCreatedPrefabUnmarked(
   rootEcsId: number, source: string, writtenPrefab: PrefabFile,
   opts?: {
     keys?: ReadonlyMap<string, string>; unkeyed?: ReadonlySet<number>;
@@ -674,3 +675,12 @@ function dropUnpackedRootKeptState(rootId: number, before: string | undefined, w
   restoreKeptState(rootGuid, {});
   return () => restoreKeptState(rootGuid, kept);
 }
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const detachPrefabInstance = staleAround('detach', detachPrefabInstanceUnmarked);
+export const reattachPrefabInstance = staleAround('detach', reattachPrefabInstanceUnmarked);
+export const reattachDetachedInstance = staleAround('detach', reattachDetachedInstanceUnmarked);
+export const tagCreatedPrefab = staleAround('createPrefab', tagCreatedPrefabUnmarked);
+export const tagEntityTreeAsInstance = staleAround('createPrefab', tagEntityTreeAsInstanceUnmarked);
+export const untagEntityTreeAsInstance = staleAround('createPrefab', untagEntityTreeAsInstanceUnmarked);

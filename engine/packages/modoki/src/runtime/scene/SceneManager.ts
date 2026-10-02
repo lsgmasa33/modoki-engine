@@ -127,6 +127,7 @@ import { loadSpriteAnimNow } from '../loaders/spriteAnimCache';
 import { loadRig2DNow } from '../loaders/rig2dCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
+import { fillInstanceStoreReporting } from '../prefab/instanceLoad';
 import { assetUrl } from '../loaders/assetUrl';
 import {
   loadSceneFile,
@@ -995,6 +996,11 @@ class SceneManagerImpl implements SceneManager {
           loadModels: false, // already preloaded above
         });
         } finally { endBootSpan(spawnSpan); }
+
+        // #2001 S4: the file's instance records, parsed beside the old expansion into this world's store. A shadow —
+        // nothing builds or saves from it yet (`runtime/prefab/instanceStore.ts`) — so a parse failure must not fail
+        // the load: it reports and leaves that owner unstored.
+        fillInstanceStoreReporting(stagingWorld, sceneData);
 
         if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 

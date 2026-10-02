@@ -145,6 +145,18 @@ describe('foldInstance — unused records carry their cause (§ 10.4)', () => {
     ]));
   });
 
+  // Hub ruling G2 (2026-10-02, #2014): removing a BASE component keeps its field records beside the removal. While the
+  // removal stands they are inert — the component is not projected — and NOT unused (their target is in the prefab); a
+  // Revert of the removal brings the component back as it was, edits included.
+  it('field records kept beside a removed base component are inert, not unused, and return with a Revert (G2)', () => {
+    const hull = { guid: G(73), traits: { Sprite: { tint: '#f00' } } };
+    const removed = fold(entry({ members: { [`/${N2}`]: { ...hull, traitRemovals: { Sprite: true } } } }));
+    expect(removed.nodes.get(`/${N2}`)?.traits.Sprite).toBeUndefined();
+    expect(causes(removed).filter((c) => c.startsWith(`/${N2}`))).toEqual([]);
+    const reverted = fold(entry({ members: { [`/${N2}`]: hull } }));
+    expect(reverted.nodes.get(`/${N2}`)?.traits.Sprite).toEqual({ tint: '#f00' });
+  });
+
   it('a record on a member the instance ITSELF removed is not unused: reverting the removal brings it back (rule 3)', () => {
     const f = fold(entry({ removed: [2], overrides: { 2: { Light: { intensity: 9 } } } }));
     expect(causes(f).filter((c) => c.startsWith(`/${N2} field`))).toEqual([]);

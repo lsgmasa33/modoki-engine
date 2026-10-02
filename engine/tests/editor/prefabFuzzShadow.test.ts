@@ -76,14 +76,17 @@ async function run(seams: ShadowSeams, ops: Op[]) {
 }
 
 describe('#2009 I25 (the shadow): a record equals the capture, modulo identity pins, after an op whose door exists', () => {
-  it('listDiff: pins are not overrides, a pins-only row is no record, and a value, a row or own order is a difference', () => {
+  it('listDiff: pins are not overrides, a pins-only row is no record, own order is not a difference, and a value, a row or an own node is', () => {
     const a = list({ '/': { guid: 'g1', name: 'A', traits: { Transform: { x: 1 } } }, '/n1': { guid: 'g2' } });
     expect(listDiff(a, list({ '/': { guid: 'other', traits: { Transform: { x: 1 } } } }))).toBeNull();
     expect(listDiff(a, list({ '/': { traits: { Transform: { x: 2 } } } }))).toMatch(/Transform/);
     expect(listDiff(a, list({ '/': { traits: { Transform: { x: 1 } } }, '/n2': { removed: true } }))).toMatch(/n2/);
     const own = (...g: string[]) => list({ '/': { own: g.map((guid) => ({ guid })) } });
     expect(listDiff(own('a', 'b'), own('a', 'b'))).toBeNull();
-    expect(listDiff(own('a', 'b'), own('b', 'a'))).not.toBeNull();
+    // An added node's order is its own sortOrder, scene content (plan § 3, the m_AddedGameObjects row): `own` is a set.
+    expect(listDiff(own('a', 'b'), own('b', 'a'))).toBeNull();
+    expect(listDiff(own('a', 'b'), own('a', 'c'))).not.toBeNull();
+    expect(listDiff(own('a', 'b'), own('a'))).not.toBeNull();
   });
 
   it('listDiff refuses to compare a record with itself (§ 10.5): the same list, or a row the store owns', () => {
@@ -120,6 +123,55 @@ describe('#2009 I25 (the shadow): a record equals the capture, modulo identity p
     expect(empty.failure?.check).toBe('a live stored instance has no record');
     const oneShort = await run({ records: () => liveStoredRoots().slice(1).map((g) => record(g, structuredClone(captureList(g)!))), captureList, doors: new Set(['copy']) }, [copyAny]);
     expect(oneShort.failure?.check).toBe('a live stored instance has no record');
+  }, 60_000);
+
+  // #2014 (S4's staging): `unrecorded` excuses a live root an op S7 has not moved created without the door — named and
+  // counted — and nothing else.
+  it('unrecorded: a missing root the seam names is excused and counted; one it does not name still fails', async () => {
+    // Read at check time: every run boots fresh guids.
+    const short = () => liveStoredRoots().slice(1).map((g) => record(g, structuredClone(captureList(g)!)));
+    const first = () => liveStoredRoots()[0];
+    const excused = await run({ records: short, captureList, doors: new Set(['copy']), unrecorded: (g) => (g === first() ? 'paste' : undefined) }, [copyAny]);
+    expect(excused.failure, excused.failure ? `${excused.failure.check}: ${excused.failure.detail}` : '').toBeUndefined();
+    expect(excused.counted).toContain('shadow: a live stored root unrecorded by paste');
+    const other = await run({ records: short, captureList, doors: new Set(['copy']), unrecorded: (g) => (g === first() ? undefined : 'paste') }, [copyAny]);
+    expect(other.failure?.check).toBe('a live stored instance has no record');
+  }, 60_000);
+
+  // #2014: `judge` skips a record that says nothing (a stale one, which the door re-seeds from the capture), counted per
+  // reason, and otherwise the list it returns is what is compared — still checked against the capture reading the store.
+  it('judge: a skipped record is not compared and is counted; a judged list is compared; the store-self check still holds', async () => {
+    let frozen: readonly InstanceRecord[] | null = null;
+    const good = () => liveRoots().map((g) => record(g, structuredClone(captureList(g)!)));
+    const missed: ShadowSeams = { records: () => (frozen ??= good()), captureList, doors: new Set(['copy', 'editField']) };
+    const skipped = await run({ ...missed, judge: () => ({ skip: 'stale (apply)' }) }, [copyAny, editRoot]);
+    expect(skipped.failure, skipped.failure ? `${skipped.failure.check}: ${skipped.failure.detail}` : '').toBeUndefined();
+    expect(skipped.counted).toContain('I25 not compared: stale (apply)');
+    expect(skipped.counted).not.toContain('I25 compared a record');
+    // A judge that hands back the frozen list as a fresh copy: compared, and red on the missed edit.
+    frozen = null;
+    const judged = await run({ ...missed, judge: (rec) => ({ rows: new Map([...rec.list.rows].map(([k, r]) => [k, { ...r }])) }) }, [copyAny, editRoot]);
+    expect(judged.failure?.check).toBe('I25 the record is not the capture');
+    expect(judged.counted).toContain('I25 compared a record');
+    // And it is the JUDGED list that is compared, not `rec.list`: a judge that applies the rules' side (here, all of it:
+    // what the capture reads) turns the same frozen store green.
+    frozen = null;
+    const applied = await run({ ...missed, judge: (rec) => structuredClone(captureList(rec.rootGuid)!) }, [copyAny, editRoot]);
+    expect(applied.failure, applied.failure ? `${applied.failure.check}: ${applied.failure.detail}` : '').toBeUndefined();
+    // A judge that translates the list is still checked against a capture that returns the STORE's own rows.
+    let store: InstanceRecord[] | null = null;
+    const held = () => (store ??= good());
+    const selfRead = await run({ records: held, captureList: (g) => held().find((r) => r.rootGuid === g)!.list, doors: new Set(['copy']), judge: (rec) => ({ rows: new Map([...rec.list.rows].map(([k, r]) => [k, { ...r }])) }) }, [copyAny]);
+    expect(selfRead.failure?.check).toBe('shadow check threw');
+    expect(selfRead.failure?.detail).toMatch(/compared the record with itself/);
+  }, 60_000);
+
+  it('a template-added reference node\'s root owns no record (hub, 2026-10-02): the store need not cover it', async () => {
+    expect((await runOps(be, [copyAny], STRICT)).failure).toBeUndefined();
+    const root = authored().find((e) => { const pi = piOf(e.id); return !!pi && pi.rootInstanceId === e.id && !!e.guid; })!;
+    expect(liveStoredRoots()).toContain(root.guid);
+    setTemplateKey(findEntity(root.id) as never, 'k-ref');
+    expect(liveStoredRoots()).not.toContain(root.guid);
   }, 60_000);
 
   it('a Missing Prefab placeholder is a stored root the store must cover, though it carries no PrefabInstance (rule 9)', async () => {

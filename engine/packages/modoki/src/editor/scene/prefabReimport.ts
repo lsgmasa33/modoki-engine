@@ -38,6 +38,7 @@ import { isGuid } from '../../runtime/core/assetRefRules';
 import { markUIDirty } from '../../runtime/core/uiDirty';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 export interface PrefabReimportReport {
   /** Each path whose file document both caches now hold, its instances rebased onto it. */
@@ -61,7 +62,7 @@ export interface PrefabReimportReport {
  *  rebase every live instance of them onto it, in the world as it stands — the prefab step's `'adopt'` landing (#1880 W4,
  *  `commitPrefabChanges`), then the placeholders a put-back can re-expand. See the module comment. `rebase: false`: the
  *  caches only — the world is a prefab-edit template or no scene is open, and nothing there is rebuilt from the file. */
-export async function reimportPrefabsInPlace(paths: readonly string[], opts: { rebase?: boolean } = {}): Promise<PrefabReimportReport> {
+async function reimportPrefabsInPlaceUnmarked(paths: readonly string[], opts: { rebase?: boolean } = {}): Promise<PrefabReimportReport> {
   const release = beginWorldBoundOperation();
   try {
     const world = getCurrentWorld();
@@ -219,8 +220,13 @@ function copiesKeyOf(sourceScene: string | undefined): string {
  *  its undo stack. What the in-place path cannot reach (a frame left stale, a placeholder it could not re-expand) is
  *  reloaded from disk only over a CLEAN scene, where a reload loses nothing; over unsaved work it is reported, and the
  *  reload is left to the user. `needsReload` asks the caller for that reload. */
-export async function reimportOutsidePrefabChanges(paths: readonly string[], opts: { rebase?: boolean } = {}): Promise<{ report: PrefabReimportReport; needsReload: boolean }> {
+async function reimportOutsidePrefabChangesUnmarked(paths: readonly string[], opts: { rebase?: boolean } = {}): Promise<{ report: PrefabReimportReport; needsReload: boolean }> {
   const report = await reimportPrefabsInPlace(paths, opts);
   const leftover = report.notRebased.length + report.placeholders.length;
   return { report, needsReload: leftover > 0 && !worldHasUnsavedEdits() };
 }
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const reimportOutsidePrefabChanges = staleAround('outsideEdit', reimportOutsidePrefabChangesUnmarked);
+export const reimportPrefabsInPlace = staleAround('outsideEdit', reimportPrefabsInPlaceUnmarked);

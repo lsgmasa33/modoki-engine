@@ -23,7 +23,7 @@ import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRef
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
-import { shadowSeams, listDiff, liveStoredRoots, type ShadowSeams } from './shadow';
+import { shadowSeams, listDiff, assertNotSelf, liveStoredRoots, type ShadowSeams } from './shadow';
 import { checkRecord } from '../foldOracle';
 import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, parseReferenceNode } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
@@ -265,17 +265,30 @@ async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]
   // Both checks walk the STORE, so a live instance it lacks is one neither compares: a store that holds nothing would
   // pass both while counting them as run (review). Every live stored root must have a record.
   const stored = new Set(seams.records().map((r) => r.rootGuid));
-  const missing = liveStoredRoots().filter((g) => !stored.has(g));
+  const missing = liveStoredRoots().filter((g) => {
+    if (stored.has(g)) return false;
+    const why = seams.unrecorded?.(g);
+    if (why) ran(`shadow: a live stored root unrecorded by ${why}`);
+    return !why;
+  });
   ran('shadow: the store covers every live stored root');
   if (missing.length) return [{ check: 'a live stored instance has no record', detail: `${missing[0]}${missing.length > 1 ? ` (+${missing.length - 1} more)` : ''}` }];
   if (seams.captureList) {
     if (!seams.doors.has(kind as OpKind)) ran(`I25 after ${kind}: not compared (no door yet)`);
     else {
       ran(`I25 after ${kind}`);
+      // Per op kind, whether a record was COMPARED after it, not only that I25 ran: a door whose records were all skipped
+      // (stale, uncapturable) after it would otherwise count as judged (review).
+      let comparedHere = false;
       for (const rec of seams.records()) {
+        const judged = seams.judge ? seams.judge(rec) : rec.list;
+        if ('skip' in judged) { ran(`I25 not compared: ${judged.skip}`); continue; }
         const captured = seams.captureList(rec.rootGuid);
         if (!captured) { out.push({ check: 'I25 a stored record has no live instance', detail: rec.rootGuid }); break; }
-        const d = listDiff(rec.list, captured);
+        assertNotSelf(rec.list, captured);
+        ran('I25 compared a record');
+        if (!comparedHere) { comparedHere = true; ran(`I25 compared after ${kind}`); }
+        const d = listDiff(judged, captured);
         if (d) { out.push({ check: 'I25 the record is not the capture', detail: `${rec.rootGuid} ${d}` }); break; }
       }
     }
@@ -314,30 +327,34 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
   // Every stored instance: the top-level entries, then each reference node the scene added (its own record, § 2.5),
   // found in its owner's scene-owned content — which a top-level entry's fold leaves as an anchor and never compares —
   // or in the `children` of a plain node the scene added there (#2009 review: a list root's children were never walked).
-  // Only under an own node the owner's fold ANCHORS: one under an anchor the fold does not place (a kept orphan row's,
-  // its member gone) is not projected, and whether the fold keeps that record is the owner's unused comparison.
-  const queue: { parsed: ParsedInstance; counter: string }[] = [];
+  // EVERY reference node in an owner's content is parsed (hub, 2026-10-02: `ownContent` can hold one whose link is held,
+  // ruling (a) for #1831 — a node at an unresolved placeholder owns its record and is live). Each is compared when it is
+  // live. One under an own node the owner's fold does not ANCHOR and that is not live (a kept orphan row's, its member
+  // gone) is not projected: counted, not compared, and whether the fold keeps it is the owner's unused comparison.
+  const queue: { parsed: ParsedInstance; counter: string; anchored: boolean }[] = [];
   const out: Failure[] = [];
-  const parse = (what: string, counter: string, fn: () => ParsedInstance) => {
-    try { queue.push({ parsed: fn(), counter }); } catch (e) { out.push({ check: 'P1 by the fold threw', detail: `parse ${what}: ${String(e)}` }); }
+  const parse = (what: string, counter: string, fn: () => ParsedInstance, anchored = true) => {
+    try { queue.push({ parsed: fn(), counter, anchored }); } catch (e) { out.push({ check: 'P1 by the fold threw', detail: `parse ${what}: ${String(e)}` }); }
   };
   for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) parse(entry.guid, 'P1 by the fold', () => parseInstanceRecord(entry, read, opts));
   const refsUnder = (node: AddedEntity): AddedEntity[] => node.prefab ? [node] : (node.children ?? []).flatMap(refsUnder);
   // Every instance's failure, not the first: a KNOWN_OPEN entry tolerates one instance's, and must not hide another's —
   // and a throw in one instance's parse, fold or comparison is that instance's failure, not `serializeScene threw`.
   for (let i = 0; i < queue.length; i++) {
-    const { parsed: { record, ownContent }, counter } = queue[i]!;
+    const { parsed: { record, ownContent }, counter, anchored: placed } = queue[i]!;
     try {
       const anchored = new Set([...foldInstance(read, record).anchors.values()].flat().map((r) => r.guid));
       for (const node of ownContent.values()) {
-        if (!node.guid || !anchored.has(node.guid)) continue;
+        if (!node.guid) continue;
         for (const ref of refsUnder(node)) {
           if (!ref.guid) continue;
           const counter = ref === node ? 'P1 by the fold: a scene-added reference node' : 'P1 by the fold: a reference node inside a plain added node';
-          parse(ref.guid, counter, () => parseReferenceNode(ref, read, opts));
+          // Placed only inside a placed owner: a node anchored in a record that is itself not projected is not either.
+          parse(ref.guid, counter, () => parseReferenceNode(ref, read, opts), placed && anchored.has(node.guid));
         }
       }
       const root = findEntityByGuid(record.rootGuid);
+      if (!root && !placed) { ran('P1 by the fold: a reference node not projected (not compared)'); continue; }
       if (!root) { out.push({ check: 'P1 a stored instance has no live root', detail: record.rootGuid }); continue; }
       const d = checkRecord(record, read, root.id(), copies);
       // Counted once a comparison RAN, under where the instance was found: a step with no stored instance compares

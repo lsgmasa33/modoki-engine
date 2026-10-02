@@ -46,6 +46,7 @@ import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardD
 import { UndoRefusedError } from '../undo/undoFailure';
 import { useEditorStore } from '../store/editorStore';
 import { localIdCounter, storedLocalIdCounter, advanceLocalIdCounter, markUnstated, sameDocumentContent, canonicalJson, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -350,7 +351,7 @@ const expectedDocOf = (e: PrefabExpectation | undefined): PrefabFile | null => (
  *     caller's `rebuild`, then {@link rebaseStaleInstances} over every source.
  *
  *  One landing per step: no caller mixes them, and a mix would need a rollback across a written file and a park. */
-export async function commitPrefabChanges(
+async function commitPrefabChangesUnmarked(
   changes: readonly PrefabChange[],
   opts: {
     overwrite?: boolean; rebuild?: (landed: { paths: string[] }) => void | Promise<void>; rebase?: boolean;
@@ -1103,3 +1104,6 @@ function expectsDocument(expected: PrefabExpectation, doc: PrefabFile): boolean 
   return prefabTextIsDocument(typeof expected === 'string' ? expected : jsonFileBody(expected), doc);
 }
 
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const commitPrefabChanges = staleAround('prefabWrite', commitPrefabChangesUnmarked);

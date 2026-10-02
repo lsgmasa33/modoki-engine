@@ -44,6 +44,7 @@ import { valuesEqual } from '../scene/prefab';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
 import { entityRef, buildGuidIndex, requireWith } from './entityRef';
+import * as instanceEdits from '../instance/instanceEdits';
 
 interface MemberPi { source?: string; localId?: number; rootInstanceId?: number }
 
@@ -93,6 +94,10 @@ function traitDiffOffBase(entityId: number, meta: TraitMeta, pi: MemberPi): Reco
  *  neither does a write that leaves it at that value. A base that cannot be read records, so what the screen shows is
  *  kept. No-op off an instance, for a tag, and for a trait the entity does not have. */
 export function recordOverridesByDiff(entityId: number, meta: TraitMeta, fields?: readonly string[]): void {
+  // #2001 S4 (#2014): the door records the same write in the instance list FIRST — before the marks, so a stale record's
+  // re-seed from the mark-based capture cannot see this edit. Every field writer reaches the door through here until S8
+  // deletes the recorder and the writers call `setFields` themselves.
+  instanceEdits.setFields(entityId, meta.name, fields);
   recordByDiff(entityId, meta, fields);
   // A record can land in a later event than the write it follows — a handle drag writes live on every frame and records on
   // pointer-up, after the last frame's dirty signal was consumed — so the recorder signals the editor itself. The

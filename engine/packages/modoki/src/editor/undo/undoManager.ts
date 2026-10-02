@@ -10,6 +10,8 @@ import { notifyUndoRedoStep } from './undoRedoStep';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
+import { markStale } from '../../runtime/prefab/instanceStore';
+import { peekCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -1024,6 +1026,11 @@ export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
     const { ok, failed, shortfall, dropped } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
+    // #2001 S4: undo and redo do not maintain the instance list yet (S7: "undo restores the exact list", rule 8), so
+    // every record is stale after one, whatever the step touched or refused (`runtime/prefab/instanceStore.ts`).
+    // The world current NOW (an undo can swap it), and none is made: no world, no records.
+    const world = peekCurrentWorld();
+    if (world) markStale(world, direction);
     return { did: ok, label: action.label, refused: null, failed, shortfall, dropped };
   });
 }

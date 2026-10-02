@@ -31,6 +31,8 @@ import { getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './pr
 import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
 import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
 import { levelDoc } from './prefabBase';
+import { warnInstanceDrift } from '../instance/instanceDrift';
+import { allStoredRoots } from '../instance/instanceKeys';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
@@ -364,6 +366,9 @@ async function serializeSceneScoped(opts?: {
     for (const ecsId of consumedEcsIds) prefabChildIds.add(ecsId);
     entries.set(rootId, entry);
   }
+  // #2001 S4 (#2014): dev and test builds warn when a fresh instance record and its live tree disagree — a change made
+  // outside the door, which the save will stop writing at S6 (`instanceDrift.ts`). Never writes, never throws.
+  warnInstanceDrift(allStoredRoots);
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
    *  stable (QA-HIER-0002). The rule itself lives in `runtime/core/ecs/entityOrder.ts`,

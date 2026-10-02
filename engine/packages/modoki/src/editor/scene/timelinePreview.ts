@@ -32,6 +32,7 @@ import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 /** Authored-world snapshot captured at the first pose of a session — primary, bases, and the scene
  *  key it belongs to (so a scene swap mid-preview can't revert the wrong scene). Captured and
@@ -373,7 +374,7 @@ export async function endTimelinePreviewSession(opts: { restore: boolean; rebind
 /** `endTimelinePreviewSession`, also saying whether the snapshot was actually restored — false when
  *  the scene changed since the begin (the guard below refuses to load it over the new scene). For
  *  toolbar Stop's agent reply (#1574), which otherwise cannot tell a revert from a skip. */
-export async function endTimelinePreviewSessionReporting(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
+async function endTimelinePreviewSessionReportingUnmarked(opts: { restore: boolean; rebind?: () => number | null }): Promise<{ root: number | null; reverted: boolean }> {
   // #1164: taken synchronously, before anything else. Panels call this WITHOUT awaiting and flip the
   // run mode to 'stopped' on the next line, so without the token that flip would count as settled
   // and a deferred hot reload would start a load under the restore below — see `authoringSettle.ts`.
@@ -475,3 +476,7 @@ onWorldSwap(() => {
 // (a panel's ⏹ Exit flips it without awaiting the restore). Every disk writer asks (#1548).
 registerPosedWorldSource('a preview session is open', () => _snap !== null);
 registerPosedWorldSource('a preview restore is still landing', () => _restoresInFlight > 0);
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const endTimelinePreviewSessionReporting = staleAround('stop', endTimelinePreviewSessionReportingUnmarked);

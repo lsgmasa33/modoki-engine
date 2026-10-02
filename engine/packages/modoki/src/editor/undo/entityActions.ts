@@ -43,6 +43,7 @@ import { prefabNestingReader, getCachedPrefabSync } from '../scene/prefabCache';
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { leftBehindReader } from '../scene/prefabBase';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
+import * as instanceEdits from '../instance/instanceEdits';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -117,7 +118,7 @@ export function placeholderGestureRefusal(ids: readonly number[], trait: string)
 /** The open field GESTURE: the record each entity's field held when it began, its coalesce key, the Inspector field
  *  session it belongs to (`fieldGesture.ts`), and the undo entry its last write left on top. Keyed by the PACKED entity:
  *  a gesture outlives the frame, and a recycled index must not inherit another entity's record (#868). */
-let gesture: { key: string; session: string; marks: Map<PackedEntity, MarkState>; top: unknown } | null = null;
+let gesture: { key: string; session: string; marks: Map<PackedEntity, MarkState>; records: Map<PackedEntity, instanceEdits.FieldRecordState | null>; top: unknown } | null = null;
 
 /** Put back the record `field` held on each of `ids` when the gesture this write CONTINUES began (#1914, the hub's
  *  #1922 finding), so the write then records over it (`markFieldOverrideIfInstance`). An Inspector number field commits
@@ -139,12 +140,24 @@ function resumeGesture(key: string | undefined, ids: readonly number[], trait: s
   const continues = !!gesture && gesture.key === key && gesture.session === session && gesture.top === peekUndo();
   const packed = (id: number) => { const e = findEntity(id); return e ? packedOf(e) : undefined; };
   if (continues) {
-    for (const id of ids) { const p = packed(id); const m = p === undefined ? undefined : gesture!.marks.get(p); if (m) putMarkState(id, trait, m); }
+    for (const id of ids) {
+      const p = packed(id);
+      const m = p === undefined ? undefined : gesture!.marks.get(p);
+      if (m) putMarkState(id, trait, m);
+      const r = p === undefined ? undefined : gesture!.records.get(p);
+      if (r) instanceEdits.putFieldRecord(r); // #2001 S4: the door's record of the gesture's start, as the marks
+    }
     return;
   }
   const marks = new Map<PackedEntity, MarkState>();
-  for (const id of ids) { const p = packed(id); if (p !== undefined) marks.set(p, markStateOf(id, trait, [field])); }
-  gesture = { key, session, marks, top: undefined };
+  const records = new Map<PackedEntity, instanceEdits.FieldRecordState | null>();
+  for (const id of ids) {
+    const p = packed(id);
+    if (p === undefined) continue;
+    marks.set(p, markStateOf(id, trait, [field]));
+    records.set(p, instanceEdits.fieldRecordOf(id, trait));
+  }
+  gesture = { key, session, marks, records, top: undefined };
 }
 
 /** After a gesture's write is pushed: the entry it left on top, which only a continuing write may find there. */
@@ -392,11 +405,13 @@ export function addTraitToEntitiesWithUndo(
   const refs = targets.map((id) => entityRef(id));
   // Only this trait's: the add changes no other mark, and its undo's restore must not touch another trait's fields.
   const oldMarks = targets.map((id) => captureMarks(id, meta.name));
+  instanceEdits.prepare(targets); // #2014: the door's record, re-seeded before the capture could see the add
   const apply = () => {
     requireAll(refs).forEach((id) => { // I19: every target, before the first add
       // Clone per entity AND per apply: without it, redo would re-seat the same
       // object on every target and they'd share one array.
       findEntity(id)?.add(initial ? meta.trait(cloneTraitValues(initial)) : meta.trait());
+      instanceEdits.addComponent(id, meta.name); // #2001 S4: the door's `addComponent` (dual write)
       // A trait the TEMPLATE defines here, added back after the instance removed it, is value-diffed by the save,
       // which keeps only marked fields: unmarked, the re-added values were dropped and the reload showed the
       // template's (#1677). Every field that differs from the base is the instance's own now.
@@ -461,7 +476,10 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     });
     markUIDirty(); markStructureDirty();
   };
+  // #2001 S4: the door's `removeComponent` (dual write) — targets read before the removal, committed after it.
+  const commitRecord = instanceEdits.beginRemoveComponent(requireAll(targets.map((t) => t.ref)), meta.name);
   apply();
+  commitRecord();
   _pushAction({
     label: `Remove ${meta.name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: revert,
@@ -864,6 +882,7 @@ export function createEntityWithUndo(
       : spec.data;
     traitInits.push(data !== undefined ? meta.trait(data) : meta.trait());
   }
+  instanceEdits.beginAddChild(parentId); // #2001 S4: re-seeded before the spawn, so the capture cannot see it
   const entity = spawnEntity(getCurrentWorld(), ...traitInits);
   let currentId = entity.id();
   // Under a base entity it belongs to that base (#1429) — before the snapshot, so redo keeps the stamp.
@@ -872,6 +891,7 @@ export function createEntityWithUndo(
   // restores the same guid and the Play snapshot serializes it, so undo/redo can
   // re-find the entity after a world rebuild.
   ensureGuid(currentId);
+  instanceEdits.addChild(currentId); // #2001 S4: the door's `addChild` — under a member, its row's `own` links it
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
   const selfRef = entityRef(currentId);
@@ -936,9 +956,11 @@ export function createEntitySubtreeWithUndo(
   root: SubtreeSpec,
   selectEntity: (id: number | null) => void,
 ): number | null {
+  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
   const rootId = spawnEntitySubtree(parentId, root);
   if (rootId == null) return null;
   adoptParentScene(rootId); // #1429 — see createEntityWithUndo
+  instanceEdits.addChild(rootId); // #2001 S4: the door's `addChild`
   let currentId = rootId;
   const snap = snapshotEntity(currentId);
   const guid = rootGuidOf(snap!);
@@ -994,7 +1016,9 @@ export function duplicateEntity(
     assignFreshSortOrder(id, p);
     return id;
   };
+  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
   let currentId = spawnCopy(parentId);
+  instanceEdits.afterCopy(currentId);
   const selfRef = entityRef(currentId); // the copy's fresh guid, minted by copySnapshot
   // Resolved from the COPY, after spawn — its sourceScene mirrors the source's
   // (respawnFromSnapshot copies EntityAttributes verbatim, sourceScene included).
@@ -1188,7 +1212,9 @@ export function pasteEntityCopy(
     rebaseRespawned([copy]);
     return selfRef.resolve() ?? id;
   };
+  instanceEdits.beginAddChild(parentId); // #2001 S4, before the spawn
   let currentId = spawn(parentId);
+  instanceEdits.afterCopy(currentId);
   const affectedScenes = resolveAffectedScenes([currentId]);
   selectEntity(currentId);
   _pushAction({
@@ -1260,7 +1286,11 @@ export function deleteEntitiesWithUndo(
   for (const s of snaps) snapshotGuids(s.snapshot, respawnedGuids);
   // Taken while the rows are still live: which surviving frame each one is a row of, and that frame's document (#1820).
   const survivors = survivingFrameRows(snaps.map((s) => s.snapshot));
+  // #2001 S4: the door's delete (`removeMember`, and the unlink of an added node or instance) — targets read before the
+  // delete, committed after it (rule 3: a deleted member's records stay).
+  const commitRecord = instanceEdits.beginDelete(snaps.map((s) => s.snapshot.id));
   let detached: DetachedMember[] = recordDetachedMarks(snaps.flatMap(s => deleteEntity(s.snapshot.id)));
+  commitRecord();
   setSelection?.([]);
 
   _pushAction({
@@ -1599,6 +1629,9 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // The marks an undo puts back: taken before ANY write here, since the sortOrder write below marks (#1709), and a
   // snapshot after it made the undo restore that mark, pinning the old order as an override.
   const oldMarks = captureMarks(entityId);
+  // #2001 S4: the door's reparent (`setPlacement` + `own` relinks) — targets read before the parent write, committed
+  // after the compensation below.
+  const commitRecord = parentChanged ? instanceEdits.beginReparent(entityId) : null;
   if (parentChanged) linkOwnerBeforeMove(getCurrentWorld(), entityId);
   if (parentChanged) writeTraitField(entityId, attrMeta, 'parentId', newParentId);
   if (newSortOrder !== undefined) writeTraitFieldMarked(entityId, attrMeta, 'sortOrder', newSortOrder);
@@ -1679,6 +1712,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   // A member that STAYS linked keeps deriving from the row parent it left (#1437) with nothing recorded on it:
   // every identity walk reads its template parent from the document (`identityParents.ts`, #1468 Phase 6).
   if (oldLocal && newLocal) markCompensatedTransform(entityId, oldLocal, newLocal);
+  commitRecord?.({ compensated: oldLocal && newLocal ? { old: oldLocal, next: newLocal } : undefined, detaching });
   markStructureDirty();
 
   const savedOldLocal = oldLocal ? { ...oldLocal } : null;
@@ -1965,7 +1999,10 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     restoreMarks(rid, rootMarks);
   };
   const rootMarks = captureMarks(entityId);
+  // #2001 S4: the door's reparent, as `reparentEntity` (a scene move refuses an instance-member split, so no detach).
+  const commitRecord = parentChanged ? instanceEdits.beginReparent(entityId) : null;
   applyStamps();
+  commitRecord?.({ compensated: oldLocal && newLocal ? { old: oldLocal, next: newLocal } : undefined });
 
   // Rekey (owner decision D: machinery built, not wired to the Hierarchy confirm
   // dialog yet). `rewriteEntityRefsForGuid` is symmetric under argument order, so

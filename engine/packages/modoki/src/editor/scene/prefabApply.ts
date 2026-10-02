@@ -49,6 +49,7 @@ import {
   carryPromotedGuids, deletePromotedNodes, insertAddedSubtree, movedRowsOf, promoteReferenceMoves,
   rehangPromotionSurvivors, snapshotPromotedGuids,
 } from './prefabApplyStructure';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 /** A frame root's durable guid ('' when it has none): what an Apply's plan names a frame by, since the ids it holds can be
  *  dead or recycled once an earlier write's refresh has rebuilt the scene entry around it (#1880 F6). */
@@ -207,7 +208,7 @@ export async function previewApply(rootInstanceId: number, selectedKeys: Set<str
   return { effects: plan.effects, conflicts: plan.conflicts, skipped: plan.skipped, files, fingerprint: effectsFingerprint(plan.effects) };
 }
 
-export async function applyToPrefabSelective(
+async function applyToPrefabSelectiveUnmarked(
   rootInstanceId: number,
   selectedKeys: Set<string>,
   /** Where each key is written (#1693): a prefab on the instance's chain. Absent → each key's default. */
@@ -1389,3 +1390,7 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
     ...(skipped.length ? { skipped } : {}),
   };
 }
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const applyToPrefabSelective = staleAround('apply', applyToPrefabSelectiveUnmarked);

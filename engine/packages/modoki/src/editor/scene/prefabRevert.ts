@@ -24,6 +24,7 @@ import {
 import { isOutermostEntry, captureEntrySide, rebuildEntrySide, preloadRebuildEntry, keptEnclosingSource, type EntrySide } from './prefabRebuild';
 import { getAllEntities, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { unmarkOverride } from '../../runtime/loaders/overrideMarks';
+import { staleAround } from '../../runtime/prefab/instanceStore';
 
 /** Why a Revert of instance `rootInstanceId` would refuse, or null: {@link staleInstanceRefusal}, or its OWN prefab does
  *  not load (#1862). That is a live frame kept across a rebuild after its prefab was trashed, a nested one or #1738's
@@ -219,7 +220,7 @@ export function unrecordReverted(frameId: number, keys: readonly string[]): void
  *  every diff category (field, added/removed trait, added/removed entity) reverts
  *  uniformly. Returns the new instance root + the state needed for undo, or null
  *  if the entity is not an instance / the prefab can't be loaded. */
-export async function revertOverridesSelective(
+async function revertOverridesSelectiveUnmarked(
   rootInstanceId: number,
   selectedKeys: Set<string>,
 ): Promise<RevertResult | null> {
@@ -365,3 +366,7 @@ export async function revertOverridesSelective(
   console.warn(`[Prefab] Revert of an instance of "${source}" not done: no scene entry holding it could be read — reload its scene`);
   return null;
 }
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const revertOverridesSelective = staleAround('revert', revertOverridesSelectiveUnmarked);

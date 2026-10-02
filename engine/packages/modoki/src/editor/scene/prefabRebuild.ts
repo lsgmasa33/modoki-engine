@@ -41,6 +41,7 @@ import {
 } from './prefabFrames';
 import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
 import type { FrameEdit } from './prefabCapture';
+import { markStale, staleAround } from '../../runtime/prefab/instanceStore';
 
 /** `rows` with every scene node in them carrying the template key of the live entity it is — marker, else recovered,
  *  else minted once here — so `templateRowOf` can write it after that entity is gone. The guid stays: the settle's live
@@ -667,7 +668,7 @@ export function rebuildFrameFromSide(rootInstanceId: number, side: EntrySide): n
 
 /** Rebuild each instance frame in `rootIds` onto `newPrefab` — the refresh a prefab write gives every instance of it —
  *  carrying each one's own edits (stated against its record, else `oldPrefab`) across. Returns how many were rebuilt. */
-export function refreshInstances(
+function refreshInstancesUnmarked(
   source: string,
   rootIds: number[],
   oldPrefab: PrefabFile,
@@ -773,7 +774,16 @@ export function rebaseStaleInstancesSoon(opts: { sources?: ReadonlySet<string> }
 }
 
 /** Rebuild `stale` onto the documents it names, every nested prefab those read already cached. */
+/** {@link rebuildStaleFramesUnmarked}, marking the instance store stale when it rebuilt anything — or threw part-way,
+ *  having perhaps rebuilt some (#2001 S4: a rebase does not maintain the list yet; `instanceStore.ts`). */
 export function rebuildStaleFrames(stale: StaleFrame[]): number {
+  let n: number;
+  try { n = rebuildStaleFramesUnmarked(stale); } catch (err) { markStale(getCurrentWorld(), 'rebase'); throw err; }
+  if (n) markStale(getCurrentWorld(), 'rebase');
+  return n;
+}
+
+function rebuildStaleFramesUnmarked(stale: StaleFrame[]): number {
   const pi = getTraitByName('PrefabInstance')!;
   const world = getCurrentWorld();
   // RE-CHECK: a frame is rebuilt only while its id is still a root of the same source holding the very document
@@ -813,3 +823,7 @@ export function refreshBaseInstances(source: string, fromPrefab: PrefabFile, toP
   });
   refreshInstances(source, roots, fromPrefab, toPrefab);
 }
+
+// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
+// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+export const refreshInstances = staleAround('apply', refreshInstancesUnmarked);
