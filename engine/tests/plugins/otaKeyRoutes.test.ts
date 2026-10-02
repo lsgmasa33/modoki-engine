@@ -114,4 +114,19 @@ describe('POST /api/ota/keygen (#1983)', () => {
     expect(fs.readFileSync(keyAt(projectRoot)).equals(original)).toBe(true);
     expect(fs.readFileSync(keyAt(checkout)).equals(original)).toBe(true);
   });
+
+  it('refuses to overwrite the project\'s own key: 409 with the script\'s reason, and the key\'s bytes are unchanged (#1985)', async () => {
+    const original = plant(projectRoot, 'route-own');
+    const r = await call(ctxWith(CHECKOUT), 'POST', '/api/ota/keygen', 'route-own');
+    expect(r.status).toBe(409);
+    expect(String(r.body.error)).toMatch(/already exists — refusing to overwrite/);
+    expect(fs.readFileSync(keyAt(projectRoot, 'route-own')).equals(original)).toBe(true);
+  });
+
+  it('a name that is not a safe token is 400, and no key is written anywhere (#1985)', async () => {
+    const r = await call(ctxWith(CHECKOUT), 'POST', '/api/ota/keygen', '../escaped');
+    expect(r.status).toBe(400);
+    expect(fs.existsSync(path.join(projectRoot, 'build', 'escaped.json'))).toBe(false);
+    expect(fs.existsSync(path.join(projectRoot, 'build', 'ota-keys'))).toBe(false);
+  });
 });

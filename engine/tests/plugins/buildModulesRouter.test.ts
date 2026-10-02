@@ -49,8 +49,13 @@ const getBuildModules = (projectRoot: string) =>
   handleBackendRequest(makeCtx(projectRoot), { method: 'GET', urlPath: '/api/build-modules', query: new URLSearchParams(), body: undefined });
 
 describe('GET /api/build-modules', () => {
-  it('reports an explicit `false` toggle as-is (games/space-invader\'s shape)', async () => {
-    const root = makeProject({ buildModules: { render3d: false } });
+  it('reports an explicit `false` toggle as-is (games/space-invader\'s shape), even over a 3D scene', async () => {
+    // The 3D scene is what makes this case read the config: with no scenes, 'auto' (the default a route that ignored
+    // project.config.json would fall back to) also answers false, and the case stayed green with the read deleted (#1985).
+    const root = makeProject({
+      buildModules: { render3d: false },
+      scenes: { 'main.json': { entities: [ent({ Renderable3D: {}, Camera: {}, Environment: {} })] } },
+    });
     const r = (await getBuildModules(root)) as { body: { modules: Record<string, boolean> } };
     expect(r.body.modules.render3d).toBe(false);
   });
@@ -73,7 +78,7 @@ describe('GET /api/build-modules', () => {
     expect(r.body.modules.render3d).toBe(false);
   });
 
-  it('defaults to "auto" (→ true, no scenes) when project.config.json is absent entirely', async () => {
+  it('defaults to "auto" when project.config.json is absent entirely (→ false: no scenes, no 3D signal)', async () => {
     const root = makeProject({});
     const r = (await getBuildModules(root)) as { body: { modules: Record<string, boolean> } };
     // No scene files at all → detectModules finds no 3D signal → 'auto' resolves false, not true.

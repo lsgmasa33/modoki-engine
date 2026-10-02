@@ -15,13 +15,19 @@
  *  - I3 a GUID never changes: it follows a move, a rewrite keeps it, a copy gets a new one; and no GUID of a deleted
  *    asset or slice is ever defined again (#1956, #1975);
  *  - I4 no `.meta.json` outlives its file except where an outside delete left it, and that orphan stays until a create
- *    or a delete at its path removes it; every binary has a sidecar;
+ *    or a delete at its path removes it; every binary has a sidecar BEFORE the watcher's rebuild (which heals: it
+ *    writes a missing one, so a check after it cannot fail — #1995). I2's "has a GUID" and I3's "the GUID the model
+ *    holds" are asked there too. ⚠️ create, duplicate, move and delete rebuild the manifest THEMSELVES, and that rebuild
+ *    heals too, so after those a missing sidecar is already re-minted when the check runs: there I3 (a GUID other than
+ *    the one the reply named) is what sees it. The existence half reaches only write-file, which does not rebuild;
  *  - I5 nothing outside the asset root changed, except the trash on a delete;
  *  - I6 a refused op changed nothing;
  *  - I7 the reply's class (2xx / which 4xx) is the one the model predicts (an op into a folder that does not exist is
  *    not predicted, only checked by the others);
  *  - I8 every file a successful op added, changed or removed was marked as the editor's own write (`markEditorWrite`),
- *    sidecars excepted (#1702: an unmarked change reads as an outside edit and drops parked work).
+ *    sidecars excepted (#1702: an unmarked change reads as an outside edit and drops parked work) — except a
+ *    file-direct asset-write (no `selfWrite`), which must NOT be marked: it is an outside change the editor has to see.
+ *    A rewrite always changes the doc, so both halves see a real write (#1995).
  *
  *  Modes: `npm run verify` runs VERIFY_SEEDS. `MODOKI_ROUTER_FUZZ=<n>` (optional `MODOKI_ROUTER_FUZZ_SEED=<first>`,
  *  `MODOKI_ROUTER_FUZZ_LEN=<ops>`) hunts n seeds, and `MODOKI_ROUTER_FUZZ_REPLAY='<json op list>'` runs one list. A
@@ -37,10 +43,14 @@
  *  - The outside delete removes a png only (a JSON asset carries its id inline, so its orphan cannot hand one on), and
  *    only `.meta.json` is left behind, not the local or quarantined halves (sidecarIdentity.test.ts covers those).
  *
- *  REACH, measured by putting the fixes back out: #1974's slice re-mint removed → I2 inside the verify seeds; #1975's
- *  orphan removal removed from write-file → I3 inside the verify seeds (from duplicate or move it stays green: the copy's
- *  own sidecar overwrites a `.meta.json` orphan, and sidecarIdentity.test.ts holds those two); #1956's sidecar-with-its-file removed → I4; create-asset's
- *  self-write mark removed → I8; move-file's never-clobber checks removed → I7.
+ *  REACH: the generator reuses paths it already named, and follows an outside op with the op its fix is about, so the
+ *  two-step sequences occur; the last test FLOORS each of them (`REACH`), not just the status classes (#1995). Measured
+ *  by putting the fixes back out, each red inside the verify seeds: #1974's slice re-mint → I2; #1975's orphan removal
+ *  from write-file → I3 (from duplicate or move it stays green: the copy's own sidecar overwrites a `.meta.json` orphan,
+ *  and sidecarIdentity.test.ts holds those two); #1956's sidecar-with-its-file → I4; a duplicate writing no sidecar →
+ *  I3 (the route's own rebuild re-mints one); write-file dropping an overwritten png's sidecar → I4, before the heal;
+ *  asset-write losing the id it preserves → I2; create-asset's self-write mark → I8; asset-write marking a non-selfWrite → I8; move-file's never-clobber checks,
+ *  for files alone → I7; duplicate's `Destination exists` checks → I7.
  *  - Case: a case-only rename is generated, and the model folds case when the scratch filesystem does, so a run means
  *    something different on a case-sensitive CI disk than on APFS/NTFS. Unicode normalisation is not generated. */
 
@@ -74,7 +84,9 @@ export type Op =
   | { op: 'move'; from: string; to: string }
   | { op: 'dup'; from: string; to: string }
   | { op: 'del'; path: string }
-  | { op: 'rewrite'; path: string; kind: Exclude<Kind, 'png'>; keepId: boolean }
+  // `selfWrite`: the editor flushing a doc it already applied (marked as its own write); without it, a file-direct
+  // write_asset, which is deliberately NOT marked (an outside change the editor must pick up).
+  | { op: 'rewrite'; path: string; kind: Exclude<Kind, 'png'>; keepId: boolean; selfWrite: boolean }
   // Outside the editor, not through the router: a Finder/git delete (the file goes, its sidecar stays) and a Sprite
   // Editor save of slices into a png's sidecar. They make the orphans and the sub-asset GUIDs #1975 and #1974 are about.
   | { op: 'rmOutside'; path: string }
@@ -101,7 +113,16 @@ function mulberry32(seed: number): () => number {
 export function generate(seed: number, length: number): Op[] {
   const r = mulberry32(seed);
   const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(r() * xs.length)];
-  const file = (kind: Kind = pick(KINDS)) => `/assets/${pick(FOLDERS)}${pick(NAMES)}${EXT[kind]}`;
+  // Half the time a file op names a path this list already named. The sequences the reach floor requires are two ops
+  // on ONE path (slice then duplicate, an outside delete then a write, a move onto a file that exists), and fresh draws
+  // from even these small pools met that way about once per verify run (#1995). Still fixed up front, so a shrink that
+  // drops an op leaves the others' paths unchanged.
+  const named: Record<Kind, string[]> = { material: [], particle: [], png: [] };
+  const file = (kind: Kind = pick(KINDS), reuse = 0.5) => {
+    const url = named[kind].length && r() < reuse ? pick(named[kind]) : `/assets/${pick(FOLDERS)}${pick(NAMES)}${EXT[kind]}`;
+    named[kind].push(url);
+    return url;
+  };
   const folder = () => `/assets/${pick(FOLDERS.filter(Boolean))}`.replace(/\/$/, '');
   const hex = (n: number) => Array.from({ length: n }, () => Math.floor(r() * 16).toString(16)).join('');
   const guid = () => `${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}`;
@@ -119,9 +140,19 @@ export function generate(seed: number, length: number): Op[] {
       else { const from = r() < 0.5 ? file() : folder(); const base = from.slice(from.lastIndexOf('/') + 1); ops.push({ op: 'move', from, to: from.slice(0, from.lastIndexOf('/') + 1) + base[0].toUpperCase() + base.slice(1) }); }
     } else if (u < 0.72) { const kind = pick(KINDS); ops.push({ op: 'dup', from: file(kind), to: file(kind) }); }
     else if (u < 0.8) ops.push({ op: 'del', path: r() < 0.75 ? file() : folder() });
-    else if (u < 0.86) { const kind = pick(['material', 'particle'] as const); ops.push({ op: 'rewrite', path: file(kind), kind, keepId: r() < 0.5 }); }
-    else if (u < 0.92) ops.push({ op: 'rmOutside', path: file('png') });
-    else ops.push({ op: 'slice', path: file('png'), guids: Array.from({ length: 1 + Math.floor(r() * 2) }, guid) });
+    else if (u < 0.86) { const kind = pick(['material', 'particle'] as const); ops.push({ op: 'rewrite', path: file(kind), kind, keepId: r() < 0.5, selfWrite: r() < 0.5 }); }
+    // An outside op acts only on a png that exists, so it names one this list wrote more often still.
+    else if (u < 0.92) ops.push({ op: 'rmOutside', path: file('png', 0.85) });
+    else ops.push({ op: 'slice', path: file('png', 0.85), guids: Array.from({ length: 1 + Math.floor(r() * 2) }, guid) });
+    // An outside op is often followed straight away by the op its fix is about, on the same path, and the follow-ups
+    // CHAIN: a sliced png duplicated (#1974) or deleted outside, and an orphan written over (#1975) or deleted (#1956)
+    // — so slice → outside delete → write, the one sequence that could revive a dead slice GUID (I3), occurs. Drawn
+    // from the list, not the model.
+    for (let last = ops[ops.length - 1]; i + 1 < length && (last.op === 'slice' || last.op === 'rmOutside') && r() < 0.8; last = ops[ops.length - 1]) {
+      i++;
+      if (last.op === 'slice') ops.push(r() < 0.5 ? { op: 'dup', from: last.path, to: file('png') } : { op: 'rmOutside', path: last.path });
+      else ops.push(r() < 0.6 ? { op: 'writePng', path: last.path } : { op: 'del', path: last.path });
+    }
   }
   return ops;
 }
@@ -157,7 +188,19 @@ function snapshot(dir: string): Map<string, string> {
 
 interface ModelFile { url: string; kind: Kind; guid: string | null; slices?: string[] }
 
-export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; outsideHits: number }> {
+/** The two-step sequences each invariant's reach depends on (#1995). A status-class floor cannot see them: a run can
+ *  reach every route and both outcomes and never one of these. Counted from the model's state — a refusal the model
+ *  predicts (`moveOntoFile`, `dupOntoFile`: the never-clobber 409) when the request is made, the rest when the op
+ *  succeeds. I7 enforces the outcome either way.
+ *  - `slicedOrphaned`: a sliced png deleted OUTSIDE the editor, its sidecar left behind — the only death a later op can
+ *    revive (a router delete trashes the sidecar). `writeOverSlicedOrphan` is that revival attempt: I3's "a dead slice
+ *    GUID is never defined again" rests on it.
+ *  - `writePngOverPng`: the one op after which a missing sidecar is not already re-minted by the route's own rebuild,
+ *    so the pre-heal I4 check reaches it. `rewriteDropsId`: an asset-write whose doc omits the id the file has. */
+export const REACH = ['moveOntoFile', 'dupOntoFile', 'dupSliced', 'writeOverOrphan', 'slicedOrphaned', 'writeOverSlicedOrphan', 'delOrphan', 'writePngOverPng', 'rewriteChangedSelf', 'rewriteChangedOutside', 'rewriteDropsId'] as const;
+export type Reach = Record<(typeof REACH)[number], number>;
+
+export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; outsideHits: number; reach: Reach }> {
   const scratch = makeScratchDir('modoki-router-fuzz-');
   const project = path.join(scratch, 'project');
   const assets = path.join(project, 'runtime', 'assets');
@@ -228,6 +271,8 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
   const statuses: number[] = [];
   /** Outside ops that found a file to act on (one that misses does nothing, and proves nothing). */
   let outsideHits = 0;
+  const reach = Object.fromEntries(REACH.map((k) => [k, 0])) as Reach;
+  const sliced = (f: ModelFile | undefined) => !!f?.slices?.length;
   try {
     for (const [i, op] of ops.entries()) {
       const before = snapshot(scratch);
@@ -245,11 +290,18 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
           if (op.op === 'create' && (existing || folders.has(k))) expect = 409;
           else if (op.op === 'writePng' && folders.has(k)) expect = null; // writing onto a folder: not predicted
           else if (!parentExists(op.path)) expect = null;
+          // Read before the request: does an orphan sidecar with SLICES sit where this file is about to land?
+          const orphanMeta = path.join(assets, spell(op.path).slice('/assets/'.length)) + '.meta.json';
+          const slicedOrphan = !existing && orphans.has(k) && fs.existsSync(orphanMeta)
+            && (((JSON.parse(fs.readFileSync(orphanMeta, 'utf8')) as { sprites?: unknown[] }).sprites?.length) ?? 0) > 0;
           reply = op.op === 'create'
             ? await post('/api/create-asset', { type: op.kind, path: op.path })
             : await post('/api/write-file', { path: op.path, content: PNG, encoding: 'base64' });
           const id = typeof reply.body.id === 'string' ? reply.body.id : null;
           apply = () => {
+            if (!existing && orphans.has(k)) reach.writeOverOrphan++;
+            if (slicedOrphan) reach.writeOverSlicedOrphan++;
+            if (existing && op.op === 'writePng') reach.writePngOverPng++;
             // An overwrite keeps the file's sidecar, so its GUID; a new png gets one from the rebuild (adopted below).
             files.set(k, existing ?? { url: spell(op.path), kind: op.op === 'create' ? op.kind : 'png', guid: id });
             orphans.delete(k); // a create removes an orphan at its path (#1975)
@@ -270,8 +322,11 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
           const caseOnly = fk === tk && op.from !== op.to;
           if (!files.has(fk) && !isFolder) expect = 404;
           else if (op.from === op.to) expect = null; // onto itself: not predicted
-          else if (!caseOnly && (files.has(tk) || folders.has(tk))) expect = 409;
-          else if (isFolder && under(tk, fk)) expect = 400;
+          else if (!caseOnly && (files.has(tk) || folders.has(tk))) {
+            expect = 409;
+            // The never-clobber refusal for a FILE onto a FILE: the one a destroyed destination would hide (#1995).
+            if (!isFolder && files.has(tk)) reach.moveOntoFile++;
+          } else if (isFolder && under(tk, fk)) expect = 400;
           else if (!parentExists(op.to)) expect = null;
           reply = await post('/api/move-file', { from: op.from, to: op.to });
           apply = () => {
@@ -297,11 +352,14 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
         case 'dup': {
           const fk = key(op.from); const tk = key(op.to);
           if (!files.has(fk)) expect = folders.has(fk) ? null : 404;
-          else if (files.has(tk) || folders.has(tk)) expect = 409;
+          else if (files.has(tk) || folders.has(tk)) { expect = 409; if (files.has(tk)) reach.dupOntoFile++; }
           else if (!parentExists(op.to)) expect = null;
           reply = await post('/api/duplicate-asset', { from: op.from, to: op.to });
           const guid = typeof reply.body.guid === 'string' ? reply.body.guid : null;
-          apply = () => { const u = spell(op.to); files.set(tk, { url: u, kind: files.get(fk)!.kind, guid }); orphans.delete(tk); addParents(u); };
+          apply = () => {
+            if (sliced(files.get(fk))) reach.dupSliced++;
+            const u = spell(op.to); files.set(tk, { url: u, kind: files.get(fk)!.kind, guid }); orphans.delete(tk); addParents(u);
+          };
           break;
         }
         case 'del': {
@@ -310,6 +368,7 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
           if (!files.has(k) && !folders.has(k) && !orphans.has(k)) expect = 404;
           reply = await post('/api/delete-asset', { path: op.path });
           apply = () => {
+            if (!files.has(k) && !folders.has(k) && orphans.has(k)) reach.delOrphan++;
             const f = files.get(k); if (f) bury(f);
             files.delete(k); folders.delete(k); orphans.delete(k);
             for (const [fk, g] of [...files]) if (under(fk, k)) { bury(g); files.delete(fk); }
@@ -321,13 +380,30 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
         case 'rewrite': {
           const k = key(op.path);
           const f = files.get(k);
-          if (!f) expect = folders.has(k) ? null : 404;
+          // An agent write edits; it never creates (404). The editor's own flush (`selfWrite`) writes a doc the renderer
+          // already holds, so it CREATES a missing file — with the id that doc carries (the route's #1215 comment).
+          const creates = !f && op.selfWrite && !folders.has(k);
+          if (!f) expect = folders.has(k) ? null : creates ? (parentExists(op.path) ? 200 : null) : 404;
           let data: Record<string, unknown> = {};
+          let abs = '';
+          let bytesBefore = '';
           if (f) {
-            data = JSON.parse(fs.readFileSync(path.join(assets, f.url.slice('/assets/'.length)), 'utf8')) as Record<string, unknown>;
+            abs = path.join(assets, f.url.slice('/assets/'.length));
+            bytesBefore = fs.readFileSync(abs, 'utf8');
+            data = JSON.parse(bytesBefore) as Record<string, unknown>;
             if (!op.keepId) delete data.id;
           }
-          reply = await post('/api/asset-write', { path: op.path, type: op.kind, data });
+          // A rewrite that CHANGES the doc (#1995: writing a file's own bytes back made I8 unable to see a mark). Never
+          // empty, so a missing file is the route's 404 and not its empty-document refusal.
+          data.name = `${typeof data.name === 'string' ? data.name : ''}~${i}`;
+          const createdId = `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
+          if (creates) data.id = createdId;
+          reply = await post('/api/asset-write', { path: op.path, type: op.kind, data, ...(op.selfWrite ? { selfWrite: true } : {}) });
+          apply = () => {
+            if (creates) { const u = spell(op.path); files.set(k, { url: u, kind: op.kind, guid: createdId }); addParents(u); return; }
+            if (abs && fs.readFileSync(abs, 'utf8') !== bytesBefore) reach[op.selfWrite ? 'rewriteChangedSelf' : 'rewriteChangedOutside']++;
+            if (f && !op.keepId) reach.rewriteDropsId++;
+          };
           break;
         }
         case 'rmOutside':
@@ -337,6 +413,7 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
             outsideHits++;
             const absFile = path.join(assets, f.url.slice('/assets/'.length));
             if (op.op === 'rmOutside') {
+              if (sliced(f)) reach.slicedOrphaned++;
               fs.rmSync(absFile);
               files.delete(key(op.path)); bury(f);
               if (fs.existsSync(`${absFile}.meta.json`)) orphans.set(key(op.path), f.url);
@@ -360,7 +437,8 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
       const changed = diff(before, snapshot(scratch));
 
       // I7: the reply's class.
-      if (expect !== null && (ok ? 200 : reply.status) !== expect && !(expect === 404 && reply.status === 409)) {
+      // Exact: move and duplicate ask for the source (404) before the destination (409), so a missing source is 404.
+      if (expect !== null && (ok ? 200 : reply.status) !== expect) {
         throw new Violation('I7', i, `${JSON.stringify(op)} → ${reply.status} ${JSON.stringify(reply.body).slice(0, 300)}, model expected ${expect}`);
       }
       // I6: a refusal changed nothing.
@@ -371,12 +449,36 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
         const inRoot = changed.filter((rel) => rel.startsWith('project/runtime/assets/')).map((rel) => rel.slice('project/runtime/assets/'.length));
         // Compared as the host's guard keys them (`editorWriteGuard.ts`): case folded on a disk that folds it.
         const marks = [...marked].map(key);
-        const unmarked = inRoot.filter((rel) => !rel.endsWith('.meta.json') && !marks.some((m) => key(rel) === m || key(rel).startsWith(`${m}/`)));
-        if (unmarked.length) throw new Violation('I8', i, `${JSON.stringify(op)} changed ${unmarked.join(', ')} without marking it`);
+        const isMarked = (rel: string) => marks.some((m) => key(rel) === m || key(rel).startsWith(`${m}/`));
+        const touched = inRoot.filter((rel) => !rel.endsWith('.meta.json'));
+        if (op.op === 'rewrite' && !op.selfWrite) {
+          // A file-direct write_asset is an OUTSIDE change on purpose: marked, the watcher would skip it and the editor
+          // would keep the def it cached before the write (`selfWrite`'s comment in the route).
+          const wronglyMarked = touched.filter(isMarked);
+          if (wronglyMarked.length) throw new Violation('I8', i, `${JSON.stringify(op)} marked ${wronglyMarked.join(', ')} as the editor's own, but it was not a selfWrite`);
+        } else {
+          const unmarked = touched.filter((rel) => !isMarked(rel));
+          if (unmarked.length) throw new Violation('I8', i, `${JSON.stringify(op)} changed ${unmarked.join(', ')} without marking it`);
+        }
         // I5: outside the root, only the trash may change, and only on a delete.
         const outside = changed.filter((rel) => !rel.startsWith('project/runtime/assets/') && !(op.op === 'del' && rel.startsWith('trash/')));
         if (outside.length) throw new Violation('I5', i, `${JSON.stringify(op)} changed ${outside.join(', ')} outside the asset root`);
         apply();
+      }
+
+      // Identity BEFORE the watcher's rebuild: that rebuild heals (it mints a missing GUID and writes the sidecar), so a
+      // check after it cannot see an op that left a file without one (#1995). Only a png this op wrote fresh is
+      // exempt: its sidecar is the scanner's to mint, and its GUID is adopted below.
+      for (const f of files.values()) {
+        const abs = path.join(assets, f.url.slice('/assets/'.length));
+        let id: unknown;
+        if (f.kind === 'png') {
+          if (f.guid === null) continue;
+          if (!fs.existsSync(`${abs}.meta.json`)) throw new Violation('I4', i, `${JSON.stringify(op)}: ${f.url} has no sidecar before the rebuild`);
+          id = (JSON.parse(fs.readFileSync(`${abs}.meta.json`, 'utf8')) as { id?: unknown }).id;
+        } else id = (JSON.parse(fs.readFileSync(abs, 'utf8')) as { id?: unknown }).id;
+        if (typeof id !== 'string' || !id) throw new Violation('I2', i, `${JSON.stringify(op)}: ${f.url} carries no GUID before the rebuild`);
+        if (f.guid !== null && id !== f.guid) throw new Violation('I3', i, `${JSON.stringify(op)}: ${f.url}'s GUID is ${id} before the rebuild, was ${f.guid}`);
       }
 
       // The watcher's rebuild, then the tree checks.
@@ -418,12 +520,11 @@ export async function runOps(ops: readonly Op[]): Promise<{ statuses: number[]; 
         if (!g) throw new Violation('I2', i, `${JSON.stringify(op)}: ${f.url} has no GUID in the manifest`);
         if (seen.has(g)) throw new Violation('I2', i, `${JSON.stringify(op)}: ${f.url} and ${seen.get(g)} share GUID ${g}`);
         seen.set(g, f.url);
-        if (f.kind === 'png' && !disk.includes(`${f.url.slice('/assets/'.length)}.meta.json`)) throw new Violation('I4', i, `${f.url} has no sidecar`);
         if (f.guid === null) f.guid = g; // a new binary's GUID comes from the rebuild: adopted the first time it is seen
         else if (f.guid !== g) throw new Violation('I3', i, `${JSON.stringify(op)}: ${f.url}'s GUID changed from ${f.guid} to ${g}`);
       }
     }
-    return { statuses, outsideHits };
+    return { statuses, outsideHits, reach };
   } finally {
     warnSpy.mockRestore();
     fs.rmSync(scratch, { recursive: true, force: true });
@@ -464,7 +565,7 @@ async function runSeed(seed: number, length: number): Promise<string | null> {
 }
 
 // ── The suite ──────────────────────────────────────────────────────────────────────────────────────────────────────
-const VERIFY_SEEDS = Array.from({ length: 12 }, (_, i) => i + 1);
+const VERIFY_SEEDS = Array.from({ length: 16 }, (_, i) => i + 1);
 const VERIFY_LEN = 40;
 const HUNT = Number(process.env.MODOKI_ROUTER_FUZZ ?? 0);
 const REPLAY = process.env.MODOKI_ROUTER_FUZZ_REPLAY;
@@ -490,15 +591,20 @@ describe('router seeded sequence (#1970)', () => {
     it(`seed ${seed}`, async () => { expect(await runSeed(seed, VERIFY_LEN)).toBeNull(); });
   }
 
-  it('reaches every route and both outcomes (a generator that stops colliding would pass vacuously)', async () => {
+  it('reaches every route, both outcomes, and every two-step sequence (a generator that stops colliding would pass vacuously)', async () => {
     const statuses: number[] = [];
     let outsideHits = 0;
+    const reach = Object.fromEntries(REACH.map((k) => [k, 0])) as Reach;
     for (const seed of VERIFY_SEEDS) {
       const run = await runOps(generate(seed, VERIFY_LEN));
       statuses.push(...run.statuses);
       outsideHits += run.outsideHits;
+      for (const k of REACH) reach[k] += run.reach[k];
     }
-    // The outside delete and the slice save must actually act, or the I2/I3/I4 reach they buy is vacuous. (5 with
+    // Each two-step sequence an invariant's reach rests on (#1995): 3 or more each with these seeds. Counting status
+    // classes alone let a file move that destroyed its destination, and #1974/#1975 reached once each, pass verify.
+    for (const k of REACH) expect(reach[k], `${k} — ${JSON.stringify(reach)}`).toBeGreaterThanOrEqual(2);
+    // The outside delete and the slice save must actually act, or the I2/I3/I4 reach they buy is vacuous. (33 with
     // these seeds; the floor leaves room for a generator tweak, not for zero.)
     expect(outsideHits).toBeGreaterThan(2);
     const ok = statuses.filter((s) => s < 300).length;

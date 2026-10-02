@@ -1,5 +1,8 @@
 // @vitest-environment node
 import http from 'http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from '../../electron/backendServer';
 import type { BackendContext } from '../../plugins/backend/editorBackendRouter';
@@ -37,10 +40,18 @@ function send(path: string, opts: { method?: string; origin?: string; headers?: 
   });
 }
 
+/** A real project file the backend serves as static bytes (`serveProjectAsset`, a non-`/api` GET). */
+const ASSET_BYTES = 'project-asset-bytes-1982';
+let assetRoot: string;
+
 beforeAll(async () => {
-  handle = await startBackendServer({ projectRoot: '/nonexistent' } as unknown as BackendContext, { hostRoutes, viteOrigin: VITE_ORIGIN });
+  assetRoot = makeScratchDir('modoki-origin-gate-');
+  fs.mkdirSync(path.join(assetRoot, 'assets'));
+  fs.writeFileSync(path.join(assetRoot, 'assets', 'probe.txt'), ASSET_BYTES);
+  const ctx = { projectRoot: assetRoot, resolveAssetPath: (u: string) => path.join(assetRoot, u.replace(/^\//, '')) };
+  handle = await startBackendServer(ctx as unknown as BackendContext, { hostRoutes, viteOrigin: VITE_ORIGIN });
 });
-afterAll(async () => { await handle.close(); });
+afterAll(async () => { await handle.close(); fs.rmSync(assetRoot, { recursive: true, force: true }); });
 
 describe('the backend refuses a foreign Origin before any route runs', () => {
   it('a POST from a public page is 403, and the handler never runs', async () => {
@@ -131,5 +142,26 @@ describe('the backend refuses a cross-site GET with no Origin, and a rebinding H
   it.each(['localhost', 'LOCALHOST', '[::1]'])('ACCEPT: a loopback Host spelled %s is served', async (h) => {
     const r = await send('/api/ping', { method: 'GET', headers: { Host: `${h}:${handle.port}` } });
     expect(r.status).toBe(200);
+  });
+});
+
+/** #1982: project asset bytes (`serveProjectAsset`) are served by the SAME request handler, from a non-`/api` GET. The
+ *  routes above are all `/api`, so moving the static-serving lines above the gate would leave every one of them green.
+ *  A project file is the user's work: a foreign page must not read it either. */
+describe('static project assets are behind the gate too', () => {
+  it.each([
+    ['a foreign Origin', { origin: 'https://evil.example' }],
+    ['a cross-site no-Origin GET (an <img src>)', { headers: { 'Sec-Fetch-Site': 'cross-site' } }],
+    ['a rebinding Host with no Origin', { headers: { Host: 'evil.example:1' } }],
+  ])('%s is 403, and the file\'s bytes are not in the reply', async (_label, opts) => {
+    const r = await send('/assets/probe.txt', { method: 'GET', ...opts });
+    expect(r.status).toBe(403);
+    expect(r.body).not.toContain(ASSET_BYTES);
+  });
+
+  it('ACCEPT: no Origin at all is served the file', async () => {
+    const r = await send('/assets/probe.txt', { method: 'GET' });
+    expect(r.status).toBe(200);
+    expect(r.body).toBe(ASSET_BYTES);
   });
 });

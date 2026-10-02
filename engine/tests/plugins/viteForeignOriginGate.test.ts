@@ -7,7 +7,10 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
+import type { AddressInfo } from 'node:net';
+import { createServer, resolveConfig, type ViteDevServer } from 'vite';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { assetScannerPlugin } from '../../plugins/vite-asset-scanner';
 
@@ -74,7 +77,9 @@ describe('the Vite middleware refuses a foreign Origin ahead of every /api route
     expect((await drive('/api/no-such-route', 'https://evil.example')).status).toBe(403);
   });
 
-  it('DNS rebinding — a foreign NAME on our own port — is 403', async () => {
+  // A rebound page's POST names the foreign host in its Origin, so the Origin check refuses it. Its same-origin GET
+  // carries NO Origin: that one is stopped by Vite's own host check, pinned below — not by this gate (#1982).
+  it('a rebound page\'s POST — Origin a foreign NAME on our own port — is 403', async () => {
     expect((await drive('/api/no-such-route', `http://evil.example:${VITE_PORT}`)).status).toBe(403);
   });
 
@@ -108,5 +113,52 @@ describe('the Vite middleware refuses a cross-site GET with no Origin', () => {
 
   it('ACCEPT: an own Origin reaches the router even when marked cross-site', async () => {
     expect((await drive('/api/no-such-route', `http://127.0.0.1:${VITE_PORT}`, 'GET', { 'sec-fetch-site': 'cross-site' })).status).toBe(404);
+  });
+});
+
+/** #1982: a DNS-rebound page's same-origin GET sends NO Origin, so the gate above cannot see it. On the Vite host the
+ *  only defence is Vite's own Host check (`server.allowedHosts`), which the middleware fixture above does not include.
+ *  So this resolves the REAL `engine/vite.config.ts` — the file the editor's dev server is launched with
+ *  (`electron/devServer.ts`, `--config engine/vite.config.ts`) — and serves a real Vite server with its `allowedHosts`.
+ *  `allowedHosts: true` in that config turns this red. Vite installs the Host check only WITHOUT `server.https` too, so a
+ *  config (or a plugin's `config` hook) turning https on also drops it: that is asserted on the resolved config.
+ *  ⚠️ Resolving the real config runs the asset scanner's `configResolved`, which scans and HEALS (writes sidecars) under
+ *  `MODOKI_PROJECT`, else the repo root. It is safe here only because the file-level `beforeAll` above points
+ *  `MODOKI_PROJECT` at a scratch project first — keep this block in this file, after that hook. */
+describe('Vite\'s own Host check refuses a rebound GET that carries no Origin', () => {
+  let vite: ViteDevServer;
+  let port: number;
+  let realHttps: unknown;
+  const get = (host: string): Promise<number> => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/api/exit', method: 'GET', agent: false, headers: { Host: host } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+
+  beforeAll(async () => {
+    const real = await resolveConfig({ configFile: path.resolve(__dirname, '../../vite.config.ts'), logLevel: 'silent' }, 'serve');
+    realHttps = real.server.https;
+    vite = await createServer({
+      configFile: false, root: projectRoot, logLevel: 'silent', optimizeDeps: { noDiscovery: true, include: [] },
+      server: { host: '127.0.0.1', port: 0, allowedHosts: real.server.allowedHosts, hmr: false, watch: null },
+    });
+    await vite.listen();
+    port = (vite.httpServer!.address() as AddressInfo).port;
+  }, 30_000);
+  afterAll(async () => { await vite?.close(); });
+
+  it('the editor\'s config leaves the Host check ON: no server.https (Vite drops the check under https)', () => {
+    expect(realHttps).toBeFalsy();
+  });
+
+  it('a foreign Host with no Origin (a rebound page\'s same-origin GET) is 403', async () => {
+    expect(await get(`evil.example:${port}`)).toBe(403);
+  });
+
+  it.each(['localhost', '127.0.0.1'])('ACCEPT: a loopback Host spelled %s is not refused by the Host check', async (h) => {
+    expect(await get(`${h}:${port}`)).not.toBe(403);
   });
 });
