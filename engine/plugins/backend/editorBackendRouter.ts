@@ -775,6 +775,9 @@ type PathSnapshot = Map<string, { entry: string; files?: string } | null>;
  *  trashed. A recycled inode is a new allocation, so its birth time differs, at nanosecond precision. Bigints because
  *  NTFS file ids are 64-bit — a `number` `ino` can round two of them to one. A filesystem with no birth time reports 0
  *  (or its ctime, per Node), which falls back to `dev`+`ino`, as before.
+ *  On NTFS it is the file ID that tells them apart, not the birth time: "file tunneling" gives a file re-created at the
+ *  same path within ~15s the deleted file's creation time, but NTFS does not hand the file ID straight back, so
+ *  `ino` differs there.
  *
  *  ⚠️ Deliberately NOT content (`mtime`, `size`): this asks "is it the entry the route probed?", and the caller's own
  *  `ifMatch` is the content precondition. Counting an edit would refuse a delete over a concurrent save of that file. */

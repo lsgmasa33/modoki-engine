@@ -425,7 +425,10 @@ describe('/api/delete-asset re-checks its operands at the commit point (#1978)',
   // #1978 on Linux: ext4 recycles a freed inode NUMBER, so rm + write above kept `dev`+`ino` and the new file was trashed
   // (public CI, ubuntu only). The Mac never recycles that fast, so the route test above cannot see it here — this pins
   // the identity itself, with the stat a recycled inode actually gives.
-  it('…and at the route: rm + write that keeps dev+ino (ext4\'s recycling, forced on this OS) is still refused', async () => {
+  // Not on win32: NTFS "file tunneling" hands a file re-created at the same path within ~15s the deleted file's creation
+  // time, so with dev+ino FORCED equal nothing is left to differ (public CI windows, run 37010329913). That combination
+  // cannot happen for real there — NTFS does not reuse a file id at once, which the unforced test above proves on win32.
+  it.skipIf(process.platform === 'win32')('…and at the route: rm + write that keeps dev+ino (ext4\'s recycling, forced on this OS) is still refused', async () => {
     // `statSync` keeps its real answer but reports ONE dev/ino for the path, which is exactly what Linux gave CI.
     const real = fs.statSync.bind(fs) as (p: fs.PathLike, o?: fs.StatSyncOptions) => fs.Stats | fs.BigIntStats | undefined;
     const spy = vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike, o?: fs.StatSyncOptions) => {
