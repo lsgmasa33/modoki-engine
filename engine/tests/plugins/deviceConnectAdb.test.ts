@@ -119,6 +119,16 @@ function startMockDevice(authority: DeviceLeaseAuthority): Promise<{ port: numbe
 }
 
 describe('DeviceConnectionManager — useAdb branch', () => {
+  // #1961 sibling: `device_connect` over a wedged adb said "no Android device attached".
+  it('a failing `adb devices` is named in the refusal, not read as "no phone attached"', async () => {
+    androidDevicesExec.list = () => { throw new Error('daemon not running; failed to start'); };
+    const mgr = new DeviceConnectionManager('g-adb-wedged', stateDir);
+    const status = await mgr.connect({ useAdb: true });
+    expect(status.state).toBe('error');
+    expect(status.detail).toMatch(/`adb devices` failed \(daemon not running.*does NOT mean no Android phone is attached/);
+    expect(adbRunner.forward).not.toHaveBeenCalled();
+  });
+
   it('reports state:error (not a throw) when `adb forward` fails', async () => {
     (adbRunner.forward as ReturnType<typeof vi.fn>).mockImplementation(() => { throw new Error('no devices/emulators found'); });
     const mgr = new DeviceConnectionManager('g-adbfail', stateDir);

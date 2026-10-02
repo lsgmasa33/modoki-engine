@@ -652,7 +652,8 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   - ⚠️ **The gate must not fail OPEN, and that is the hard part.** `requestBrowser` rejects on a
     timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It asks
     **`relayProvesNoRenderer`** — the GUARD question ("can I prove nothing is at risk"), which is
-    `isRelayTransportFailure` minus `isRelayTimeout` **plus an `unknown agent op` guard**.
+    true only for `classifyRelayFailure`'s `unreachable` (`relayOutcome.ts`, #1957): not a timeout,
+    and **not `unknown agent op`**.
     ⚠️ This used to say it "reuses `applyMovesInRenderer`'s classifier rather than a second copy",
     and that consolidation is exactly what must not happen: `applyMovesInRenderer` is a REPAIR path
     where an absent op means nothing to repair, so `absent` is ITS safe answer and the opposite of
@@ -977,8 +978,12 @@ folder (issue #54). The first version of this check used only the suffixes, and 
 `scene` (close-out review). The url it classifies is the one the scan WILL index the file under
 (`scannerUrlOf`): the disk's spelling of every folder that already exists, because on APFS/NTFS a new
 `/assets/Scenes/x.json` lands in the on-disk `scenes/` and is typed by it (second close-out review).
-A path no kind claims — a plain `.json` outside those folders, or a `.meta.json` sidecar — is NOT
-refused: an unknown kind is not a wrong one. **Except where the route REPLACES an existing file whole**
+An EXISTING file no kind claims — a plain `.json` outside those folders, or a `.meta.json` sidecar — is
+NOT refused: an unknown kind is not a wrong one. **A NEW one is** (#1981): the route chooses the name,
+and `create_asset {type:'material', path:'x.material.json'}` answered `ok` with a GUID that resolved to
+nothing, because the scan never lists the file. It is refused `409 {wrongKind, nameType:null,
+expectedSuffix}` with the corrected path in `options` — the owner's rule for a misnamed scene
+(2026-09-18, `sceneFileName.ts`): refuse and name it, never rename silently. **Except where the route REPLACES an existing file whole**
 (`wrongKindRefusal`'s `replace`, used by `/api/scene-save-as`, #1980): that route accepts an in-project
 `/@fs/` path, which reaches files outside every asset root, and "unknown is not wrong" let a scene
 overwrite `game.ts` (observed). There an existing file must already be a scene.
@@ -1403,9 +1408,9 @@ failures were *"genuinely indistinguishable here"* — which stopped being true 
 `isRelayTransportFailure` + `isRelayTimeout`. ⚠️ **That pair alone is not the rule, and stating it
 as one caused a data-loss regression** — `unknown agent op` is a transport-classified failure that
 does NOT mean no renderer exists (the ops are unregistered; the window may be up holding unsaved
-work). The rule is `relayProvesNoRenderer`: a non-timeout transport failure that is not
-`unknown agent op` means no renderer exists; anything else means one may be attached and did not
-answer. So the route refuses
+work). The rule is `relayProvesNoRenderer`: only `classifyRelayFailure`'s `unreachable` (a
+non-timeout transport failure that is not `unknown agent op`) means no renderer exists; anything else
+means one may be attached and did not answer. So the route refuses
 503 on the second and proceeds on the first, and the headless path now says *why* it skipped the
 guards instead of implying they passed.
 

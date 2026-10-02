@@ -79,6 +79,9 @@ export type DeviceListReply = {
   /** The iOS counterpart (#1096): present only when `ios` is EMPTY *and* a listing source broke, so
    *  an empty list is never reported as "no iPhone attached" when nobody actually managed to look. */
   iosNote?: string;
+  /** The Android counterpart (#1961): adb is present but `adb devices` failed, so an empty `android` is "could not
+   *  look", not "no phone attached". */
+  androidNote?: string;
   /** WHO ASKED — the editor process answering the route. Absent from a backend older than the field;
    *  without it a claim cannot be told apart from a sibling's, so it is rendered as one. */
   self?: { clone: string; pid: number };

@@ -10,6 +10,7 @@ import { describe, it, expect, vi, afterAll } from 'vitest';
 import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
+import { RelayTimeoutError } from '../../plugins/backend/relayOutcome';
 import path from 'path';
 import {
   handleBackendRequest, type BackendContext, type Manifest, getPersistenceMode,
@@ -549,7 +550,9 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(r.body.saved).toBe(false); // changed:0 ⇒ auto mode never even attempts a save
   });
 
-  it('a mid-call apply-scene-ops failure is a hard 500, not a silent file-direct retry', async () => {
+  // #1957 member 2: an op THROWING is the op answering — 400, through the one classifier. It was a literal 500, which the
+  // MCP client reads as NOT_AVAILABLE_HERE ("relaunch the editor"). Still never a silent file-direct retry.
+  it('a mid-call apply-scene-ops throw is the op answering (400), not a 500 and not a silent file-direct retry', async () => {
     const scenePath = tempScene();
     const requestBrowser = vi.fn(async (op: string, params?: unknown) => {
       if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
@@ -563,9 +566,83 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
       throw new Error(`unexpected op ${op}`);
     });
     const ctx = makeCtx({ requestBrowser });
+    const before = fs.readFileSync(scenePath, 'utf8');
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { error?: string } };
-    expect(r.status).toBe(500);
+    expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/renderer wedged mid-call/);
+    expect(requestBrowser.mock.calls.map((c) => c[0])).not.toContain('resolve-unsaved'); // never reached file-direct
+    expect(fs.readFileSync(scenePath, 'utf8')).toBe(before);
+  });
+
+  // ── #1957: the live path reads the relay through the ONE classifier (`relayOp`) ─────────────────────
+  /** A live editor on `scenePath` whose `apply-scene-ops` does `apply`. */
+  const liveOn = (scenePath: string, apply: () => unknown) => vi.fn(async (op: string) => {
+    if (op === 'editor-state') return { playState: 'stopped', scenePath, unsavedChanges: false };
+    if (op === 'apply-scene-ops') return apply();
+    throw new Error(`unexpected op ${op}`);
+  });
+
+  it('#1957 m1: an op-gate §5 refusal travels as itself — not PARTIAL "may have already applied"', async () => {
+    const scenePath = tempScene();
+    // The envelope `opReplyFor` sends when the op gate refuses (an undo step or a prefab Apply is running).
+    const envelope = { ok: false, code: 'REFUSED_BY_OP', error: 'an undo step is running. Nothing was changed.', options: ['retry once it finishes'] };
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser: liveOn(scenePath, () => envelope) }))) as {
+      status?: number; body: Record<string, unknown>;
+    };
+    expect(r.status).toBe(400);
+    expect(r.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP', error: envelope.error, options: envelope.options, saved: false });
+    expect(String(r.body.error)).not.toMatch(/ALREADY APPLIED/);
+  });
+
+  it('#1957 m1 accept side: the op\'s OWN answer carrying ok:false + a code is still decoded, not passed through as a refusal', async () => {
+    const scenePath = tempScene();
+    const own = { ok: false, changed: 0, errors: ['op[0]: no LIVE entity'], warnings: ['w-live'], unresolved: [{ guid: 'g' }], code: 'NOT_FOUND' };
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser: liveOn(scenePath, () => own) }))) as {
+      status?: number; body: Record<string, unknown>;
+    };
+    // 200 + the decoded shape: `mode` and the unresolved list are the route's own reading of the op's answer.
+    expect(r.status).toBeUndefined();
+    expect(r.body).toMatchObject({ ok: false, code: 'NOT_FOUND', unresolved: [{ guid: 'g' }], mode: 'manual' });
+  });
+
+  it('#1957 m1 accept side: an unreadable reply that is NOT a §5 envelope is still PARTIAL', async () => {
+    const scenePath = tempScene();
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({ requestBrowser: liveOn(scenePath, () => ({ ok: false, error: 'skewed' })) }))) as {
+      body: Record<string, unknown>;
+    };
+    expect(r.body).toMatchObject({ ok: false, code: 'PARTIAL' });
+  });
+
+  it('#1957 m2: ops:[] against the OPEN scene answers ok:true, changed:0 — as the closed scene does — without relaying', async () => {
+    const scenePath = tempScene();
+    const requestBrowser = liveOn(scenePath, () => { throw new Error('apply-scene-ops requires a non-empty { ops } array'); });
+    const r = (await post('/api/scene-mutate', { path: scenePath, ops: [] }, makeCtx({ requestBrowser }))) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBeUndefined();
+    expect(r.body).toMatchObject({ ok: true, changed: 0, saved: false });
+    expect(requestBrowser.mock.calls.map((c) => c[0])).not.toContain('apply-scene-ops');
+  });
+
+  it('#1957 m3: a relay TIMEOUT is "delivered, outcome unknown" — TIMEOUT, never a retryable not-delivered', async () => {
+    const scenePath = tempScene();
+    const before = fs.readFileSync(scenePath, 'utf8');
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({
+      requestBrowser: liveOn(scenePath, () => { throw new RelayTimeoutError('timed out waiting for the renderer — is the editor window open?'); }),
+    }))) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body).toMatchObject({ code: 'TIMEOUT', delivered: true, saved: false });
+    expect(String(r.body.error)).toMatch(/whether it applied is UNKNOWN/);
+    expect((r.body.options as string[]).join(' ')).toMatch(/re-read .* before retrying/);
+    expect(fs.readFileSync(scenePath, 'utf8')).toBe(before);
+  });
+
+  it('#1957 m3 accept side: a renderer that provably went away keeps the plain 504 — no TIMEOUT claim', async () => {
+    const scenePath = tempScene();
+    const r = (await post('/api/scene-mutate', setX(scenePath), makeCtx({
+      requestBrowser: liveOn(scenePath, () => { throw new Error('editor window closed'); }),
+    }))) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body.code).toBeUndefined();
+    expect(r.body.delivered).toBeUndefined();
   });
 
   // ── #647: a reply that RETURNED but cannot be read ───────────────────────────────────────

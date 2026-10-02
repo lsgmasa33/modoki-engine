@@ -911,13 +911,16 @@ export function registerTools(server: McpServer) {
         // desk.
         // #1096: an empty iOS list with a reason behind it is NOT "no iPhone attached" — say which.
         if (r.iosNote) lines.push(`iOS: ${r.iosNote}`);
+        if (r.androidNote) lines.push(`Android: ${r.androidNote}`);
         if (r.android.length === 0 && r.ios.length === 0 && r.otherClaims.length === 0) {
           // Scoped per platform: with adb working and zero phones, Android genuinely WAS checked, so
           // a blanket "no devices could be checked" trades a falsehood about iOS for one about
           // Android. The `iOS:` line above already carries the iOS half.
-          lines.push(r.adb.present
-            ? (r.iosNote ? 'No Android devices attached and no claims on record; the iOS listing is above.' : 'No devices attached, and no claims on record.')
-            : 'No devices could be checked, and no claims on record.');
+          // #1961: adb present but unable to list is the Android half of "could not check" — the line above says why.
+          const androidChecked = r.adb.present && !r.androidNote;
+          lines.push(!androidChecked
+            ? (r.adb.present && !r.iosNote ? 'No iOS devices attached and no claims on record; the Android listing could not be taken (above).' : 'No devices could be checked, and no claims on record.')
+            : r.iosNote ? 'No Android devices attached and no claims on record; the iOS listing is above.' : 'No devices attached, and no claims on record.');
         }
         return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
       } catch (e) {

@@ -176,16 +176,22 @@ describe('/api/create-asset', () => {
     expect(fs.readdirSync(path.join(projectRoot, 'scenes'))).toEqual([]);
   });
 
+  // Both of these used to be ACCEPTED, as "not a scene, so not refused". Neither is a particle either: the scan lists
+  // neither file, so the create answered ok with a GUID that resolved to nothing (#1981). They still must NOT read as a
+  // scene — `nameType:null`, not `'scene'` — which is what each case was written to pin.
   it.skipIf(!caseInsensitive)('…and the mirror: a lowercase /scenes/ over an on-disk Scenes/ is NOT a legacy scene folder', async () => {
     fs.mkdirSync(path.join(projectRoot, 'Scenes'));
     const res = await post('/api/create-asset', { type: 'particle', path: '/scenes/burst.json' });
-    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(409);
+    expect(res.body.nameType).toBeNull();
   });
 
-  it('refuses nothing for a sidecar name — the scan never indexes a .meta.json', async () => {
+  it('a sidecar name is not read as a scene — and, being no particle either, is refused as nameless (#1981)', async () => {
     fs.mkdirSync(path.join(projectRoot, 'scenes'));
     const res = await post('/api/create-asset', { type: 'particle', path: '/scenes/hero.png.meta.json' });
-    expect(res.body.wrongKind).toBeUndefined();
+    expect(res.status).toBe(409);
+    expect(res.body.nameType).toBeNull();
+    expect(fs.existsSync(path.join(projectRoot, 'scenes/hero.png.meta.json'))).toBe(false);
   });
 
   it('creates at a matching suffix (the accept side)', async () => {
@@ -195,10 +201,37 @@ describe('/api/create-asset', () => {
     expect(fs.existsSync(path.join(projectRoot, 'materials/blue.mat.json'))).toBe(true);
   });
 
-  it('does not refuse a name no kind claims — an unknown kind is not a wrong one', async () => {
-    fs.mkdirSync(path.join(projectRoot, 'data'));
-    const res = await post('/api/create-asset', { type: 'material', path: '/data/blue.json' });
-    expect(res.body.ok).toBe(true);
+  // #1981: this case used to pin the opposite ("an unknown kind is not a wrong one"), and the asset it created was one the
+  // scan never lists — `ok:true` with a GUID nothing could resolve. A NEW name must claim the kind; the refusal names it.
+  for (const [name, corrected] of [['blue.json', 'blue.mat.json'], ['blue.material.json', 'blue.mat.json'], ['blue.particle.json', 'blue.mat.json']] as const) {
+    it(`refuses a NEW ${name} for a material, names the suffix, and creates nothing (#1981)`, async () => {
+      fs.mkdirSync(path.join(projectRoot, 'data'), { recursive: true });
+      const res = await post('/api/create-asset', { type: 'material', path: `/data/${name}` }) as Reply & { body: { expectedSuffix?: string; options?: string[] } };
+      if (name === 'blue.particle.json') {
+        // A name ANOTHER kind claims keeps its own refusal (#1472) — this one is the cross-kind case, not #1981's.
+        expect(res.body.nameType).toBe('particle');
+        return;
+      }
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ wrongKind: true, nameType: null, expectedSuffix: '.mat.json' });
+      expect(res.body.options).toEqual([`use /data/${corrected}`]);
+      expect(fs.existsSync(path.join(projectRoot, `data/${name}`))).toBe(false);
+    });
+  }
+
+  it('asset-write to a NEW nameless path is refused the same way (#1981 — the route shares the check)', async () => {
+    fs.mkdirSync(path.join(projectRoot, 'data'), { recursive: true });
+    const res = await post('/api/asset-write', { path: '/data/new.json', type: 'material', data: { ...(defaultAssetData('material') as object), id: '12121212-1212-4121-8121-121212121212' } });
+    expect(res.status).toBe(409);
+    expect(res.body.nameType).toBeNull();
+    expect(fs.existsSync(path.join(projectRoot, 'data/new.json'))).toBe(false);
+  });
+
+  it('asset-write to an EXISTING nameless file is still not refused — an unknown kind is not a wrong one (accept side)', async () => {
+    const id = '13131313-1313-4131-8131-131313131313';
+    place('data/old.json', { ...(defaultAssetData('material') as object), id });
+    const res = await post('/api/asset-write', { path: '/data/old.json', type: 'material', data: { ...(defaultAssetData('material') as object), id, roughness: 0.5 } });
+    expect(res.body.wrongKind).toBeUndefined();
   });
 });
 

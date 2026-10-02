@@ -218,6 +218,23 @@ describe('iosTargetRows', () => {
 });
 
 describe('androidTargetRows', () => {
+  // #1961 — the Android twin of #1096's iOS cases: adb ran, but `adb devices` failed.
+  it('an empty list WITH a reason shows the reason under Default, not a bare picker', () => {
+    const rows = androidTargetRows(listWith({ android: [], androidNote: 'an empty Android list here does NOT mean no phone is attached — `adb devices` failed (boom).' }), noTarget);
+    expect(rows.map((r) => r.label)).toEqual(['Default (first adb device)', expect.stringMatching(/does NOT mean no phone is attached/)]);
+    expect(rows[1].disabled).toBe(true);
+  });
+
+  it('…and the CONFIGURED-target row carries it instead of "not attached"', () => {
+    const rows = androidTargetRows(listWith({ android: [], androidNote: '`adb devices` failed (boom).' }), { ...noTarget, androidDeviceId: 'SER' });
+    expect(rows.at(-1)!.label).toBe('SER — `adb devices` failed (boom).');
+  });
+
+  it('ACCEPT: with no reason, an empty list adds nothing and a configured target is "not attached"', () => {
+    expect(androidTargetRows(listWith({ android: [] }), noTarget)).toHaveLength(1);
+    expect(androidTargetRows(listWith({ android: [] }), { ...noTarget, androidDeviceId: 'SER' }).at(-1)!.label).toBe('SER — not attached');
+  });
+
   it('the first row is always "Default (first adb device)"', () => {
     const rows = androidTargetRows(listWith({ android: [androidRow()] }), noTarget);
     expect(rows[0].label).toBe('Default (first adb device)');

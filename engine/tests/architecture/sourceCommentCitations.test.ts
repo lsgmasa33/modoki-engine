@@ -94,9 +94,14 @@ const NOT_A_CITATION: ReadonlyArray<{ file: string; tokens: Readonly<Record<stri
   },
   {
     file: 'engine/plugins/backend/editorBackendRouter.ts',
-    tokens: { ':8100': 6, ':1028': 1, ':1028`/`:2372': 1, ':2372': 1 },
-    reason: 'PORT and HISTORY: WebDriverAgent\'s :8100 on the phone, and two line numbers quoted to explain '
-      + 'why that comment says to grep instead.',
+    tokens: { ':8100': 6 },
+    reason: 'PORT: WebDriverAgent\'s :8100 on the phone.',
+  },
+  {
+    // `refusalStatus`'s comment, moved here from the router by #1957.
+    file: 'engine/plugins/backend/relayOutcome.ts',
+    tokens: { ':1028': 1, ':1028`/`:2372': 1, ':2372': 1 },
+    reason: 'HISTORY: two line numbers quoted to explain why that comment says to grep instead.',
   },
   {
     file: 'engine/tests/architecture/glContextRelease.test.ts',

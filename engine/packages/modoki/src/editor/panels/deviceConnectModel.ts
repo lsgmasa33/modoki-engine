@@ -127,6 +127,9 @@ export interface DeviceListReply {
    *  "no iPhone is paired". Every consumer of `note` must render this too — an empty iOS list with
    *  a reason nobody shows is the same silent absence #1096 exists to remove. */
   iosNote?: string;
+  /** The Android half of the same rule (#1961): adb is present but `adb devices` failed, so the empty `android` list
+   *  is "could not look", not "no phone attached". Render it wherever `note` is rendered. */
+  androidNote?: string;
 }
 
 export async function fetchDeviceList(signal?: AbortSignal): Promise<DeviceListReply | null> {

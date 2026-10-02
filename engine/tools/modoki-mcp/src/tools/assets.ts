@@ -87,7 +87,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'an explicit "write this file" tool, not a live-state edit.',
     {
       type: z.enum(ASSET_TYPES)
-        .describe('Asset type to create — decides the file extension and the default contents. Read modoki_asset_schema first.'),
+        .describe('Asset type to create — decides the default contents. The PATH decides the kind, so it must carry this type\'s suffix (material → .mat.json, particle → .particle.json); a name no kind claims is refused. Read modoki_asset_schema first.'),
       path: z.string().describe('Asset-root URL, e.g. /games/x/assets/fx/spark.particle.json'),
     },
     async ({ type, path }) => postJson('/api/create-asset', { type, path }),

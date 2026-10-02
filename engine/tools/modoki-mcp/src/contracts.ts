@@ -751,7 +751,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/create-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { type: 'particle', path: '/assets/particles/probe.particle.json' },
-    notes: 'Refuses 409 `wrongKind` (with `nameType`) for a name the manifest would type as another kind — `type:\'material\'` at `x.scene.json` (#1472). A name no kind claims is not refused.',
+    notes: 'Refuses 409 `wrongKind` (with `nameType`) for a name the manifest would type as another kind — `type:\'material\'` at `x.scene.json` (#1472). A NEW name no kind claims is refused 409 too (#1981) — `x.material.json` is not a material, `.mat.json` is — with `expectedSuffix` and the corrected path in `options`.',
   },
   modoki_write_asset: {
     kind: 'asset', method: 'POST', route: '/api/asset-write',

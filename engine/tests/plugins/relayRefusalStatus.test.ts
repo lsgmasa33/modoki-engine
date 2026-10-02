@@ -226,9 +226,14 @@ function literal504s(code: string, label: string): Array<{ line: number; text: s
     const carrier = valueCarrier(lit);
     const cond = carrier.parent;
     const test = cond && ts.isConditionalExpression(cond) ? unwrapValue(cond.condition) : undefined;
-    const sanctioned = !!cond && ts.isConditionalExpression(cond) && cond.whenTrue === carrier
-      && !!test && ts.isCallExpression(test) && calleeName(test) === 'isRelayTransportFailure'
-      && ts.isNumericLiteral(unwrapValue(cond.whenFalse)) && (unwrapValue(cond.whenFalse) as ts.NumericLiteral).text === '400'
+    // Either branch order, but the OTHER branch must be the 400 and the test must be the classifier's own verdict —
+    // `classifyRelayFailure(e) === 'op-threw' ? 400 : 504` since #1957 moved the classifier to `relayOutcome.ts`.
+    const other = cond && ts.isConditionalExpression(cond) ? (cond.whenTrue === carrier ? cond.whenFalse : cond.whenTrue) : undefined;
+    const classifierTest = !!test && (ts.isCallExpression(test)
+      ? calleeName(test) === 'isRelayTransportFailure'
+      : ts.isBinaryExpression(test) && ts.isCallExpression(unwrapValue(test.left)) && calleeName(unwrapValue(test.left) as ts.CallExpression) === 'classifyRelayFailure');
+    const sanctioned = !!cond && ts.isConditionalExpression(cond) && classifierTest
+      && !!other && ts.isNumericLiteral(unwrapValue(other)) && (unwrapValue(other) as ts.NumericLiteral).text === '400'
       && enclosingNamedFunction(lit)?.name === 'relayFailureStatus';
     return { line: lineOf(lit), text: flatText(statementOf(lit)).slice(0, 120), sanctioned };
   });
@@ -239,14 +244,19 @@ describe('#1013 — no route may hard-code its catch status', () => {
     path.join(__dirname, '..', '..', 'plugins', 'backend', 'editorBackendRouter.ts'),
   ).code;
 
-  it('editorBackendRouter names 504 in exactly one place: relayFailureStatus', () => {
-    const all = literal504s(routerSrc, 'editorBackendRouter.ts');
+  // The classifier lives in `relayOutcome.ts` since #1957, so the router names no 504 at all and the module names it once.
+  const outcomeSrc = readScannedSource(
+    path.join(__dirname, '..', '..', 'plugins', 'backend', 'relayOutcome.ts'),
+  ).code;
+
+  it('editorBackendRouter and relayOutcome name 504 in exactly one place: relayFailureStatus', () => {
+    const all = [...literal504s(routerSrc, 'editorBackendRouter.ts'), ...literal504s(outcomeSrc, 'relayOutcome.ts')];
     const hits = all.filter((h) => !h.sanctioned);
-    expect(hits, 'use relayJson (or relayFailureStatus, for a route that post-processes its reply) '
+    expect(hits, 'use relayJson / relayFailure (or relayFailureStatus, for a route that post-processes its reply) '
       + 'instead of naming 504 — see #1013. Offending lines: '
       + hits.map((h) => `${h.line}: ${h.text}`).join(' | ')).toEqual([]);
     // …and the classifier is still there to be the one place — otherwise "no offenders" is vacuous.
-    expect(all.filter((h) => h.sanctioned)).toHaveLength(1);
+    expect(literal504s(outcomeSrc, 'relayOutcome.ts').filter((h) => h.sanctioned)).toHaveLength(1);
   });
 
   it('the Electron host carries no literal 504 either — its relay fails through a 500', () => {

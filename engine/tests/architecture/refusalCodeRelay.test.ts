@@ -39,8 +39,8 @@ const OWNERS = [
 const KNOWN_COPIES: ReadonlyArray<{ item: string; reason: string }> = [
   { item: 'engine/plugins/backend/deviceAim.ts', reason:
     'lifts a code onto a device refusal envelope; needs the optional-code sibling of codeFromBody (#1211 C-16 follow-up)' },
-  { item: 'engine/plugins/backend/editorBackendRouter.ts', reason:
-    'detects a coded refusal in an op result; same sibling (#1211 C-16 follow-up)' },
+  { item: 'engine/plugins/backend/relayOutcome.ts', reason:
+    'detects a coded refusal in an op result (`opRefusal`, moved out of the router by #1957); same sibling (#1211 C-16 follow-up)' },
 ];
 
 describe('the §5 refusal code is relayed, never re-derived', () => {

@@ -783,6 +783,15 @@ Rules:
   op raised as `NOT_AVAILABLE_HERE` — the editor declared unreachable while it is answering. Twenty-
   six routes did that; `relayJson` in `editorBackendRouter.ts` now states the recipe once, and a
   guard (`tests/plugins/relayRefusalStatus.test.ts`) fails on a new literal.
+  - **One classifier decides every rejection: `classifyRelayFailure` in
+    `engine/plugins/backend/relayOutcome.ts`** (#1957) — `timeout` (delivered, outcome unknown),
+    `unreachable` (provably not delivered), `unregistered` (`unknown agent op`) or `op-threw`. The
+    status (`relayFailureStatus`), the guard (`relayProvesNoRenderer`) and the reply
+    (`relayFailureReply`, which names a timeout `TIMEOUT` + `delivered:true`) are all derived from it,
+    and `relayOp` relays an op into that union so a route reads a `kind` rather than re-deriving one.
+    The router used to answer this six ways — a §5 refusal decoded as unreadable, a literal 500, a
+    timeout called retryable, a status used as a guard, a bare `catch {}` in front of a refusal. Both
+    transports reject a timeout with the typed `RelayTimeoutError`; the wording stays as a fallback.
   - **The classifier is what PRESERVES the 504**, so adopting it costs a genuine transport failure
     nothing. The argument for leaving a route on a hard-coded 504 — *"a route SHOULD 504 on a real
     transport failure"* — is true and is an argument FOR `relayFailureStatus`, not against it.
@@ -1040,8 +1049,15 @@ FALSE rather than failing:
 4. The refusal says **what it is NOT**: "this is not 'the project has no assets', it is a reply this
    build cannot read."
 
-⚠️ **Pick the remedy by whether the work already happened.** A relay that never returned is safe to
-call "no editor" and safe to retry. A relay that RETURNED an unreadable shape is neither — the ops
+⚠️ **Pick the remedy by whether the work already happened.** A relay with no surface to deliver to
+(no window, no socket) is safe to call "no editor" and safe to retry. A TEARDOWN (`editor window
+closed`, `project changed — renderer reloading`) is classed with it because the live world died with
+the renderer, so a live-world op left nothing behind — but an op with a DISK effect (`save-all`, an
+asset write) in flight at that moment may have finished, so re-read before repeating one. A relay
+that TIMED OUT is not: both transports send and then arm the timer, and the renderer cannot cancel,
+so the op may yet apply — it answers `code:'TIMEOUT', delivered:true` with options that say to re-read
+before retrying (#1957; this paragraph used to call every unreturned relay retry-safe, and a retried
+`addEntity` made two entities). A relay that RETURNED an unreadable shape is neither — the ops
 already applied. `/api/scene-mutate` reported the second as a 500, which `context.ts` maps to
 `NOT_AVAILABLE_HERE` ("relaunch the editor"), so a caller retried and **double-applied a write**. It
 now answers 200 `{ok:false, code:'PARTIAL'}`: `isFailureBody` makes it a failure and `codeFromBody`

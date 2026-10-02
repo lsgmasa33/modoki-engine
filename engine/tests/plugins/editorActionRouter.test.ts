@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { RelayTimeoutError } from '../../plugins/backend/relayOutcome';
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
 import { readScannedSource } from '@modoki/engine/testing';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -70,10 +71,30 @@ describe('/api/editor-action', () => {
     expect(r.status).toBe(504);
   });
 
-  it('504 for a relay TIMEOUT too — that is a gateway failure', async () => {
+  // #1957 m3: a timeout is still a 504, but it is NOT "not delivered" — both transports send, then arm the timer, and the
+  // renderer cannot cancel, so the action may yet apply. It names itself (TIMEOUT, delivered) so a retried create does
+  // not make two. This test used to pin it as a plain gateway failure, the "safe to retry" premise #1957 retired.
+  it('a relay TIMEOUT is 504 + TIMEOUT, delivered — outcome unknown, not a retryable not-delivered', async () => {
     const ctx = makeCtx({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer — is the editor window open?'); } });
-    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
+    const r = (await post('/api/editor-action', { action: 'create-entity' }, ctx)) as { status?: number; body: Record<string, unknown> };
     expect(r.status).toBe(504);
+    expect(r.body).toMatchObject({ code: 'TIMEOUT', delivered: true });
+    expect(String(r.body.error)).toMatch(/whether it applied is UNKNOWN/);
+  });
+
+  it('the transport\'s TYPED timeout is read by class, whatever its wording (#1957)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new RelayTimeoutError('renderer did not reply'); } });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body.code).toBe('TIMEOUT');
+  });
+
+  it('a renderer that is provably absent is a plain 504 — no TIMEOUT, no delivered claim (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body.code).toBeUndefined();
+    expect(r.body.delivered).toBeUndefined();
   });
 
   /** REGRESSION (independent review, 2026-07-30). The matcher must cover every string
@@ -1928,6 +1949,26 @@ describe('/api/asset-meta', () => {
     const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number };
     expect(r.status).toBe(400);
   });
+  // #1957 m4: the disk fallback is a GUARD decision ("can I prove no parked edit exists?"), and a status helper answered it.
+  // A timeout is a busy editor that IS attached and may hold a parked import-settings edit — it fell back to disk and said
+  // `editorConnected:false, unsaved:false`.
+  it('a TIMEOUT does NOT fall back to the disk read — it says it could not look', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer — is the editor window open?'); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body).toMatchObject({ code: 'TIMEOUT' });
+    expect(r.body.source).toBeUndefined();
+    expect(r.body.editorConnected).toBeUndefined();
+  });
+
+  // …but an op every client DECLINED (#1030) means no editor is attached — a game page only — and parking is editor-only,
+  // so the disk read is the whole answer. The tool is `requires:['project']` so that it keeps working there.
+  it('an unregistered op (no editor, a game page only) still falls back to the disk read (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error("unknown agent op 'read-asset-meta'"); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number; body: Record<string, unknown> };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toMatchObject({ source: 'disk', editorConnected: false });
+  });
 });
 
 /** `GET /api/game-view-devices` — the fourth route the #1012 sweep found relaying a bare `json(raw)`.
@@ -2089,6 +2130,54 @@ describe('render-sequence refuses a STOPPED editor at the ROUTE (review follow-u
     expect(r.body.spanMs).toBeGreaterThanOrEqual(0);
   });
 
+  // #1957 m5: the STOPPED refusal sat behind a bare `catch {}` on a 2s probe, so a busy renderer skipped it and N identical
+  // frames were reported as a motion capture. A probe that cannot read the run mode now refuses — unless the relay PROVES
+  // no renderer (the render call then reports that itself), or the caller asked for identical frames.
+  const probeFails = (err: Error) => {
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') throw err;
+      return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+    });
+    return { requestBrowser, ctx: makeCtx({ requestBrowser }) };
+  };
+
+  it('a probe that TIMES OUT refuses, renders nothing, and says so (#1957 m5)', async () => {
+    const { requestBrowser, ctx } = probeFails(new RelayTimeoutError('timed out waiting for the renderer — is the editor window open?'));
+    const r = (await post('/api/render-sequence', { frames: 3, fps: 30 }, ctx)) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body).toMatchObject({ ok: false, code: 'TIMEOUT' });
+    expect(String(r.body.error)).toMatch(/could not read whether the editor is advancing time/);
+    expect(r.body.paths).toBeUndefined();
+    expect(requestBrowser.mock.calls.map((c) => c[0])).not.toContain('render-scene');
+  });
+
+  it('…and forceRender:true still captures through an unreadable probe (accept side)', async () => {
+    const { ctx } = probeFails(new RelayTimeoutError('timed out waiting for the renderer — is the editor window open?'));
+    const r = (await post('/api/render-sequence', { frames: 2, fps: 30, forceRender: true }, ctx)) as { status?: number; body: { paths?: unknown[] } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.paths).toHaveLength(2);
+  });
+
+  it('…and a GAME page with no editor ops (editor-state unregistered) still renders — nothing there can be STOPPED', async () => {
+    // close-out review, observed: `render-scene` is a runtime op, `editor-state` an editor one, so a dev server whose only
+    // bridge client is the game page declines the probe and renders a game that is always running.
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') throw new Error("unknown agent op 'editor-state'");
+      return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+    });
+    const r = (await post('/api/render-sequence', { frames: 2, fps: 30 }, makeCtx({ requestBrowser }))) as { status?: number; body: { paths?: unknown[] } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.paths).toHaveLength(2);
+  });
+
+  it('…and a probe that PROVES no renderer goes on to the render call, which reports it (accept side)', async () => {
+    const requestBrowser = vi.fn(async (_op: string) => { throw new Error('no editor renderer window'); });
+    const r = (await post('/api/render-sequence', { frames: 2, fps: 30 }, makeCtx({ requestBrowser }))) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(504);
+    expect(r.body.framesWritten).toBe(0);
+    expect(requestBrowser.mock.calls.map((c) => c[0])).toContain('render-scene');
+  });
+
   it('force:true renders while stopped, deliberately', async () => {
     const r = (await post('/api/render-sequence', { frames: 2, fps: 30, force: true }, rendering('stopped'))) as
       { status?: number; body: { paths?: unknown[] } };
@@ -2210,5 +2299,55 @@ describe('/api/editor-action — a refusal is not a transport failure', () => {
       const r = (await post('/api/editor-action', { action: 'play' }, failing(msg))) as { status?: number };
       expect(r.status, msg).toBe(504);
     }
+  });
+});
+
+/** #1984 — `/api/toolchain/uninstall` answered ok without checking anything was removed. */
+describe('/api/toolchain/uninstall', () => {
+  const saved = process.env.MODOKI_TOOLCHAIN_DIR;
+  const tc = makeScratchDir('uninstall-route-');
+  beforeEach(() => { process.env.MODOKI_TOOLCHAIN_DIR = tc; });
+  afterEach(() => { if (saved === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR; else process.env.MODOKI_TOOLCHAIN_DIR = saved; });
+  afterAll(() => fs.rmSync(tc, { recursive: true, force: true }));
+
+  it('an id no tool has is a 400 that lists the real ids — not ok', async () => {
+    const r = (await post('/api/toolchain/uninstall', { id: 'jdk' }, makeCtx())) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(400);
+    expect(r.body).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(String(r.body.error)).toMatch(/unknown tool id 'jdk'/);
+    expect(r.body.options).toContain('java');
+  });
+
+  it('a KNOWN tool the toolchain does not provision is a 400 without the id list — it would offer the refused id back', async () => {
+    const r = (await post('/api/toolchain/uninstall', { id: 'xcodebuild' }, makeCtx())) as { status?: number; body: Record<string, unknown> };
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toMatch(/not provisioned/);
+    expect(r.body.options).toBeUndefined();
+  });
+
+  it('a removal that did not happen is a 500 with the reason — not ok', async () => {
+    fs.mkdirSync(path.join(tc, 'npm-tools', 'node_modules', 'gltfpack'), { recursive: true });
+    fs.writeFileSync(path.join(tc, 'npm-tools', 'package.json'), '{}');
+    const env = { node: process.env.MODOKI_NODE, cli: process.env.MODOKI_NPM_CLI };
+    process.env.MODOKI_NODE = path.join(tc, 'deleted-node');
+    process.env.MODOKI_NPM_CLI = path.join(tc, 'npm-cli.js');
+    try {
+      const r = (await post('/api/toolchain/uninstall', { id: 'gltfpack' }, makeCtx())) as { status?: number; body: Record<string, unknown> };
+      expect(r.status).toBe(500);
+      expect(String(r.body.error)).toMatch(/still installed/);
+      expect(String(r.body.error)).toMatch(/reinstall Node\.js from Build Support/); // the remedy for a Node that is gone
+    } finally {
+      for (const [k, v] of [['MODOKI_NODE', env.node], ['MODOKI_NPM_CLI', env.cli]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
+  it('removing a tool that is installed answers ok (accept side)', async () => {
+    fs.mkdirSync(path.join(tc, 'jdk', '21'), { recursive: true });
+    const r = (await post('/api/toolchain/uninstall', { id: 'java' }, makeCtx())) as { status?: number; body: Record<string, unknown> };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual({ ok: true });
+    expect(fs.existsSync(path.join(tc, 'jdk'))).toBe(false);
   });
 });

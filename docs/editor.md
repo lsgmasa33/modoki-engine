@@ -4101,8 +4101,12 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   delete-asset decided which operands and sidecars exist before its probes and never asked again: a
   file renamed away during them answered `trashed` (darwin's trash reads "no longer there" as "went")
   and the renderer unbound a file that lived on (#1978). It now snapshots each operand and every
-  sidecar it could have — existence, which entry (inode), and a folder's files, minus `.DS_Store` and
-  `~` variants — and answers `409 {reason:'changed'}`, trashing nothing, if any differ. write-meta has
+  sidecar it could have — existence, which entry, and a folder's files, minus `.DS_Store` and
+  `~` variants — and answers `409 {reason:'changed'}`, trashing nothing, if any differ.
+  ⚠️ **"Which entry" is `dev` + `ino` + the entry's BIRTH TIME (ns), read as bigints (`pathEntryId`)**:
+  ext4 recycles a freed inode number at once, so rm + write during the probe kept `dev`+`ino` and the
+  new file was trashed — public CI red on ubuntu only. Content is deliberately not part of it; that is
+  the caller's `ifMatch`. write-meta has
   the same check for its asset: a rename during its park probe minted an orphan sidecar carrying the
   live asset's GUID. This is the check-then-act rule `ifMatch` already documents for write-file.
   ⚠️ **A test of this rule must change the disk INSIDE the last awaited probe** (the stub renderer's

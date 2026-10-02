@@ -299,6 +299,7 @@ import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListe
 import { createUnsavedGateClient } from './unsavedGateClient';
 import { createPendingOutside } from '../tools/shared/pendingOutside';
 import { setResultStamp } from '../plugins/backend/writeResult';
+import { RelayTimeoutError } from '../plugins/backend/relayOutcome';
 import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
 /**
@@ -858,7 +859,9 @@ function requestRenderer(op: string, params: unknown, timeoutMs = 3000): Promise
     const id = nextRequestId++;
     const timer = setTimeout(() => {
       pendingRenderer.delete(id);
-      reject(new Error('timed out waiting for the renderer — is the editor window open?'));
+      // Typed (#1957): the request was SENT above and the renderer cannot cancel it, so a timeout is "delivered, outcome
+      // unknown" — `classifyRelayFailure` reads the class, and the wording stays for a caller holding only the message.
+      reject(new RelayTimeoutError('timed out waiting for the renderer — is the editor window open?'));
     }, timeoutMs);
     pendingRenderer.set(id, { resolve, reject, timer, op });
     mainWindow.webContents.send('modoki:bridge-request', { id, op, params });

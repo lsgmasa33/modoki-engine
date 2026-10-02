@@ -303,7 +303,8 @@ export default function DeviceConnectSection(): React.ReactElement {
         deviceList && !deviceList.adb.present
           ? <div style={{ color: '#c99', marginBottom: 8 }}>{deviceList.note ?? 'adb is not installed.'}</div>
           : deviceList && deviceList.android.length === 0
-            ? <div style={{ color: '#888', marginBottom: 8 }}>No Android devices attached.</div>
+            // #1961: adb ran but could not list — say so, as the iOS arm does with `iosNote`.
+            ? <div style={{ color: deviceList.androidNote ? '#c99' : '#888', marginBottom: 8 }}>{deviceList.androidNote ?? 'No Android devices attached.'}</div>
             : deviceList && (
               <DevicePicker
                 rows={androidPickerRows(deviceList.android, deviceList.self?.clone)}

@@ -114,10 +114,11 @@ export function registerRenderTools(tool: ToolDef, ctx: ToolContext): void {
     async (args) => {
       // Allow enough wall-clock for the whole sequence: frames sampled at fps, each
       // with its own backend render budget, plus headroom — so the MCP-side timeout
-      // never fires before the backend's own per-frame timeout would.
+      // never fires before the backend's own per-frame timeout would — nor before its 8s run-mode probe (#1957), which
+      // precedes the first frame.
       const frames = Math.min(args.frames ?? 8, 120);
       const fps = Math.max(args.fps ?? 10, 1);
-      const timeoutMs = Math.ceil((frames / fps) * 1000) + frames * 16_000 + 5_000;
+      const timeoutMs = 8_000 + Math.ceil((frames / fps) * 1000) + frames * 16_000 + 5_000;
       return postJson('/api/render-sequence', args, timeoutMs);
     },
   );

@@ -234,13 +234,31 @@ export function _clearFriendlyNameCache(): void { nameCache.clear(); }
  *  Absence of adb is reported as an empty list rather than a throw because every caller's next move
  *  is the same either way — refuse and explain — and `adbBinary()`'s own error already says how to
  *  install it. A caller that needs to distinguish "no adb" from "no phones" should call
- *  `adbBinary()` itself. */
+ *  `adbBinary()` itself — and one that must tell "no phones" from "could not ask" calls
+ *  `listAndroidDevicesResult`. */
 export function listAndroidDevices(): AndroidDevice[] {
+  return listAndroidDevicesResult().devices;
+}
+
+/** The listing with the reason it is empty when it could not be taken (#1961) — the Android twin of #1096's
+ *  `listIosDevicesForSelectionResult`. adb present but `adb devices` failing (its server will not start, the 4s exec
+ *  times out) used to read as "no Android attached": the human looking at a wedged adb saw no phones and no reason. */
+export function listAndroidDevicesResult(): { devices: AndroidDevice[]; unavailable?: string } {
   try {
-    return parseAdbDevices(androidDevicesExec.list());
-  } catch {
-    return [];
+    return { devices: parseAdbDevices(androidDevicesExec.list()) };
+  } catch (e) {
+    return { devices: [], unavailable: `\`adb devices\` failed (${e instanceof Error ? e.message : String(e)})` };
   }
+}
+
+/** A device pick that REFUSED over an empty listing, told why the listing was empty (#1961). Every place that picks an
+ *  Android serial or platform from `adb devices` — `device_connect`, the build's serial, the host-side log/crash ops —
+ *  refused a wedged adb as "no Android device attached", the same misexplained empty `/api/device/list` had. One
+ *  helper, so the sites carry the same sentence. A pick that succeeded, or a listing that worked, passes unchanged. */
+export function explainUnlisted<T extends object>(picked: T, listing: { devices: readonly AndroidDevice[]; unavailable?: string }): T {
+  if (!('error' in picked) || !listing.unavailable || listing.devices.length > 0) return picked;
+  const error = (picked as { error: unknown }).error;
+  return { ...picked, error: `${String(error)} — but ${listing.unavailable}, so this does NOT mean no Android phone is attached (try \`adb kill-server\`)` };
 }
 
 /** Add each device's own name for itself (cached — see `friendlyName`). Separate from

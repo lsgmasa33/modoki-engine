@@ -185,6 +185,8 @@ export function androidTargetRows(list: DeviceListReply | null, target: DeviceTa
     return rows;
   }
   const devices: AndroidDeviceRow[] = list?.android ?? [];
+  // #1961: adb ran but `adb devices` failed — the empty list is "could not look", which the bare Default row hides.
+  if (list.androidNote && !devices.length) rows.push({ label: list.androidNote, checked: false, disabled: true });
   for (const d of devices) {
     rows.push({
       label: withNotes(androidRowLabel(d), [
@@ -201,7 +203,7 @@ export function androidTargetRows(list: DeviceListReply | null, target: DeviceTa
     });
   }
   if (target.androidDeviceId && !devices.some((d) => d.serial === target.androidDeviceId)) {
-    rows.push({ label: `${target.androidDeviceId} — not attached`, checked: true, disabled: true });
+    rows.push({ label: list.androidNote ? `${target.androidDeviceId} — ${list.androidNote}` : `${target.androidDeviceId} — not attached`, checked: true, disabled: true });
   }
   return rows;
 }

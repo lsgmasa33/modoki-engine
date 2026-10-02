@@ -242,6 +242,22 @@ describe('device_list decodes its reply and knows its own claim', () => {
     expect(s.text(await s.call('device_list'))).toMatch(/CLAIMED by \/r\/modoki-qa \(work-qa\), debug/);
   });
 
+  // #1961: adb present but `adb devices` failing must not read as "no Android attached".
+  it('an Android listing that could not be taken says so — never "No devices attached"', async () => {
+    s = await loadDeviceSurface((req) => req.path === '/api/device/list'
+      ? { body: { adb: { present: true }, android: [], ios: [], otherClaims: [], androidNote: '`adb devices` failed (boom).' } } : undefined);
+    const text = s.text(await s.call('device_list'));
+    expect(text).toContain('Android: `adb devices` failed (boom).');
+    expect(text).not.toMatch(/No devices attached/);
+    expect(text).toMatch(/the Android listing could not be taken/);
+  });
+
+  it('ACCEPT: adb present, nothing failed, nothing attached — still "No devices attached"', async () => {
+    s = await loadDeviceSurface((req) => req.path === '/api/device/list'
+      ? { body: { adb: { present: true }, android: [], ios: [], otherClaims: [] } } : undefined);
+    expect(s.text(await s.call('device_list'))).toMatch(/No devices attached, and no claims on record/);
+  });
+
   it('an unreadable reply is a refusal, never "No devices attached"', async () => {
     // Strings, not arrays: `''.length` is 0, so the old cast walked straight past every section and
     // printed "No devices attached" — a shape that merely THREW would not tell the decoder from it.

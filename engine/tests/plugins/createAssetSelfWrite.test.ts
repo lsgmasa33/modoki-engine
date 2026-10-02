@@ -55,18 +55,18 @@ describe('/api/create-asset — the self-write guard', () => {
   it('marks the new file as the editor\'s own write', async () => {
     const markEditorWrite = vi.fn();
     const ctx = makeCtx({ markEditorWrite });
-    const res = (await post('/api/create-asset', { type: 'material', path: '/assets/probe.material.json' }, ctx)) as { body: { ok?: boolean } };
+    const res = (await post('/api/create-asset', { type: 'material', path: '/assets/probe.mat.json' }, ctx)) as { body: { ok?: boolean } };
 
     expect(res.body.ok).toBe(true);
     expect(markEditorWrite).toHaveBeenCalledOnce();
     const [abs] = markEditorWrite.mock.calls[0];
-    expect(abs).toBe(path.join(projectRoot, 'assets/probe.material.json'));
+    expect(abs).toBe(path.join(projectRoot, 'assets/probe.mat.json'));
   });
 
   it('fingerprints the bytes that actually landed on disk — a mismatch fails OPEN', async () => {
     const markEditorWrite = vi.fn();
     const ctx = makeCtx({ markEditorWrite });
-    await post('/api/create-asset', { type: 'material', path: '/assets/probe.material.json' }, ctx);
+    await post('/api/create-asset', { type: 'material', path: '/assets/probe.mat.json' }, ctx);
 
     const [abs, hash] = markEditorWrite.mock.calls[0] as [string, string];
     const onDisk = fs.readFileSync(abs);
@@ -79,9 +79,9 @@ describe('/api/create-asset — the self-write guard', () => {
     const markEditorWrite = vi.fn();
     const ctx = makeCtx({ markEditorWrite });
     fs.mkdirSync(path.join(projectRoot, 'assets'), { recursive: true });
-    fs.writeFileSync(path.join(projectRoot, 'assets/taken.material.json'), '{}');
+    fs.writeFileSync(path.join(projectRoot, 'assets/taken.mat.json'), '{}');
 
-    const res = (await post('/api/create-asset', { type: 'material', path: '/assets/taken.material.json' }, ctx)) as { status?: number };
+    const res = (await post('/api/create-asset', { type: 'material', path: '/assets/taken.mat.json' }, ctx)) as { status?: number };
     expect(res.status).toBe(409);
     expect(markEditorWrite).not.toHaveBeenCalled();
   });

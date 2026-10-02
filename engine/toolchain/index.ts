@@ -1632,11 +1632,26 @@ function forceRemoveDir(dir: string): void {
   }
 }
 
+/** An uninstall the caller asked for that has nothing to act on — an id no tool has, or a tool this toolchain does not
+ *  provision (#1984). Distinct from a removal that FAILED: the route answers this one 400, the other 500. */
+export class UninstallRefusal extends Error {
+  constructor(message: string) { super(message); this.name = 'UninstallRefusal' }
+}
+
 /** Remove a provisioned tool from the toolchain. The npm-CLI model tools are `npm uninstall`'d
  *  (they share npm-tools/, so we can't just delete a dir); everything else has its owned dir(s)
- *  removed. Idempotent — a no-op when nothing is installed. */
+ *  removed. Idempotent — a no-op when nothing is installed.
+ *
+ *  ⚠️ **It checks the outcome on DISK, and throws when the tool is still there** (#1984). It answered for every id
+ *  and every npm run: an unknown id (`'jdk'`) fell through to `toolOwnedDirs`' `default: []` and removed nothing, and
+ *  `npm uninstall` resolved on both `close` and `error` with its exit code ignored — so with the provisioned Node gone,
+ *  or a locked binary on Windows, Build Support logged "✅ Removed glTFpack" while its own refresh still listed it. The
+ *  exit code is reported but does not decide: the package directory still being there is what "not removed" means. */
 export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?: (line: string) => void }): Promise<void> {
   const log = opts.onLog ?? (() => {})
+  if (!(TOOL_IDS as readonly string[]).includes(id)) {
+    throw new UninstallRefusal(`unknown tool id '${id}' — nothing was removed (tools: ${TOOL_IDS.join(', ')})`)
+  }
   const NPM_TOOL_PKGS: Partial<Record<ToolId, string>> = {
     'gltf-transform-cli': '@gltf-transform/cli', gltfpack: 'gltfpack',
     ffmpeg: NPM_BINARY_PINS.ffmpeg.pkg, ffprobe: NPM_BINARY_PINS.ffprobe.pkg,
@@ -1644,20 +1659,32 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
   if (NPM_TOOL_PKGS[id]) {
     const pkg = NPM_TOOL_PKGS[id]!
     const dir = npmToolsDir(opts.toolchainDir)
+    let ran: { code: number | null; error?: string } | null = null
     if (fs.existsSync(path.join(dir, 'package.json'))) {
       const spec = npmSpawnSpec()
       log(`Removing ${pkg}…`)
-      await new Promise<void>((resolve) => {
+      ran = await new Promise<{ code: number | null; error?: string }>((resolve) => {
         const s = spawnSpecCall(spec, ['uninstall', pkg, '--no-audit', '--no-fund'])
         const p = spawn(s.command, s.args, { ...s.options, cwd: dir, env: spec.env })
         p.stdout?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
         p.stderr?.on('data', (d: Buffer) => log(d.toString().trimEnd()))
-        p.on('close', () => resolve())
-        p.on('error', () => resolve()) // best-effort removal
+        p.on('close', (code) => resolve({ code }))
+        p.on('error', (e) => resolve({ code: null, error: e.message })) // the first settle wins
       })
     }
     resetToolchainCache()
+    const left = path.join(dir, 'node_modules', ...pkg.split('/'))
+    if (fs.existsSync(left)) {
+      const why = !ran ? 'npm-tools/package.json is missing, so npm could not be run against it'
+        : ran.error ? `npm could not be run (${ran.error})` : `npm uninstall exited with code ${ran.code}`
+      throw new Error(`${pkg} is still installed at ${left} — ${why}. Nothing was removed.`
+        + (ran?.error ? ' npm runs on the provisioned Node — reinstall Node.js from Build Support, then remove this again.' : ''))
+    }
     return
+  }
+  const owned = toolOwnedDirs(id, opts.toolchainDir)
+  if (owned.length === 0) {
+    throw new UninstallRefusal(`'${id}' is not provisioned into the toolchain (it is guided or system-only), so there is nothing to remove`)
   }
   // ⚠️ **`finally`, because the loop can now throw PART-WAY** (#1004 close-out review).
   // `toolOwnedDirs('cocoapods')` returns TWO dirs; if the first is removed and the second refuses,
@@ -1666,13 +1693,15 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
   // partial removal. The shape pre-dates the refusal (an EBUSY throw did the same), but the
   // refusal makes it a first-class reachable path rather than a lock accident.
   try {
-    for (const dir of toolOwnedDirs(id, opts.toolchainDir)) {
+    for (const dir of owned) {
       log(`Removing ${dir}…`)
       forceRemoveDir(dir)
     }
   } finally {
     resetToolchainCache()
   }
+  const left = owned.filter((dir) => fs.existsSync(dir))
+  if (left.length) throw new Error(`still on disk after the removal: ${left.join(', ')}`)
 }
 
 /** Remove the ENTIRE toolchain folder — a hard reset. Everything (including settings.json) is wiped;

@@ -38,7 +38,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 
-import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { handleBackendRequest, pathEntryId, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // Minimal context: /api/delete-asset touches resolveAssetPath and (once anything
@@ -420,6 +420,44 @@ describe('/api/delete-asset re-checks its operands at the commit point (#1978)',
     expect(trashed).toEqual([]);
     expect(fs.readFileSync(path.join(dir, 'fx/a.particle.json'), 'utf8')).toBe('{"new":true}');
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // #1978 on Linux: ext4 recycles a freed inode NUMBER, so rm + write above kept `dev`+`ino` and the new file was trashed
+  // (public CI, ubuntu only). The Mac never recycles that fast, so the route test above cannot see it here — this pins
+  // the identity itself, with the stat a recycled inode actually gives.
+  it('…and at the route: rm + write that keeps dev+ino (ext4\'s recycling, forced on this OS) is still refused', async () => {
+    // `statSync` keeps its real answer but reports ONE dev/ino for the path, which is exactly what Linux gave CI.
+    const real = fs.statSync.bind(fs) as (p: fs.PathLike, o?: fs.StatSyncOptions) => fs.Stats | fs.BigIntStats | undefined;
+    const spy = vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike, o?: fs.StatSyncOptions) => {
+      const st = real(p, o);
+      if (st && String(p).endsWith('a.particle.json')) {
+        Object.defineProperty(st, 'ino', { value: o?.bigint ? 4242n : 4242 });
+        Object.defineProperty(st, 'dev', { value: o?.bigint ? 7n : 7 });
+      }
+      return st;
+    }) as typeof fs.statSync);
+    try {
+      const { dir, ctx } = setup(['fx/a.particle.json'], (d) => {
+        const p = path.join(d, 'fx/a.particle.json');
+        fs.rmSync(p);
+        fs.writeFileSync(p, '{"new":true}');
+      });
+      const r = (await del({ path: '/fx/a.particle.json' }, ctx)) as Changed;
+      expect(r.status).toBe(409);
+      expect(r.body.changed).toEqual(['/fx/a.particle.json']);
+      expect(trashed).toEqual([]);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a recycled inode number is still another entry — the birth time tells them apart', () => {
+    const was = { dev: 66n, ino: 1234n, birthtimeNs: 1_700_000_000_000_000_001n };
+    expect(pathEntryId({ ...was, birthtimeNs: was.birthtimeNs + 1n })).not.toBe(pathEntryId(was));
+    expect(pathEntryId({ ...was })).toBe(pathEntryId(was)); // accept side: the same entry is the same
+    // 64-bit NTFS file ids that a `number` would round to one value stay distinct.
+    expect(pathEntryId({ ...was, ino: 2n ** 60n })).not.toBe(pathEntryId({ ...was, ino: 2n ** 60n + 1n }));
   });
 
   it('a sidecar that APPEARS during the probe is a change too — the sidecar list was decided without it', async () => {

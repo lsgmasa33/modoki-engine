@@ -59,7 +59,7 @@ import { getReimportHandler, getReimportTypes, type ReimportContext, type Reimpo
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
 import { classifyPrefabIdentityWrite, admittedPrefab } from './prefabIdentityGuard';
-import { classifyBinaryExt, classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
+import { JSON_ASSET_SUFFIX_TYPE, classifyBinaryExt, classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -278,7 +278,7 @@ export function fromFsUrl(url: string): string {
   return path.resolve(p);
 }
 import { discoverSigningTeams } from '../signingTeams';
-import { toolchainStatus, writeToolchainSettings, uninstall, uninstallAll, type ToolId } from '../../toolchain';
+import { toolchainStatus, writeToolchainSettings, uninstall, uninstallAll, UninstallRefusal, TOOL_IDS, type ToolId } from '../../toolchain';
 import {
   loadProjectConfig, writeProjectConfig, validateBuildConfig, loadProjectUserConfig, writeProjectUserConfig,
   readRawProjectConfig, readRawProjectUserConfig, MalformedProjectConfigError,
@@ -292,11 +292,14 @@ import {
 import { validateSceneData, validatePrefabData, fieldValueWarning, jsonBankWarnings, type SceneSchema, type PrefabResolver, type AssetRefResolver, makeAssetRefResolver } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, partialApplyVerdict, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
-import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
+import { type ErrorCode } from '../../tools/shared/mcpResult';
 import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../tools/shared/waitForTiming';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { PROFILER_MUTATING_ACTIONS, PROFILER_READ_ACTIONS } from '../../tools/shared/profilerActions';
 import { decodeSceneOpsReply } from './sceneOpsReply';
+import { classifyRelayFailure, opRefusal, refusalStatus, relayFailureReply, relayFailureStatus, relayOp, relayProvesNoRenderer } from './relayOutcome';
+// Re-exported: the classifiers moved to `./relayOutcome` (#1957), and callers outside the router import them from here.
+export { isRelayTimeout, isRelayTransportFailure } from './relayOutcome';
 import { parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../tools/shared/handlesReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
@@ -344,7 +347,7 @@ import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/renderin
 const ASSET_WRITE_FORMAT_VERSION = ASSET_FORMAT_VERSION;
 import { pruneOldTempFiles } from './tempFiles';
 import { deviceConnection, type ConnectRequest } from './deviceConnection';
-import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
+import { adbBinary, isUsable, listAndroidDevicesResult, explainUnlisted, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM, isCdpRoutableMethod } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, tryDeviceWdaScreenshot, captureDeviceWdaLease, isWdaRoutableMethod, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, WDA_NEEDS_WIFI_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
@@ -628,9 +631,10 @@ function assetKindAt(ctx: BackendContext, absPath: string): { kind: string | nul
  *  `/api/scene-save-as`, and `/api/scene-mutate`, `/api/asset-write` and `/api/create-asset` got
  *  nothing, so an agent could rewrite a prefab through the scene path.
  *
- *  A kind nothing can name (a plain `.json` outside the legacy `/scenes/`/`/materials/` folders) is
+ *  An EXISTING file nothing can name (a plain `.json` outside the legacy `/scenes/`/`/materials/` folders) is
  *  NOT refused: an unknown kind is not a wrong one, and refusing it would break a write this never
- *  had grounds to judge. */
+ *  had grounds to judge. A NEW one is (#1981): the route is choosing the name, and a name no kind claims
+ *  makes an asset the scan never lists. */
 function wrongKindRefusal(
   ctx: BackendContext, absPath: string, expected: string,
   /** `replace` (scene-save-as, #1980): an EXISTING file must already BE `expected`, so one no kind names is refused too.
@@ -640,6 +644,27 @@ function wrongKindRefusal(
 ): BackendResult | null {
   const { kind, exists, url } = assetKindAt(ctx, absPath);
   if (kind === expected) return null;
+  // A NEW file the route would create under a name no kind claims (#1981): the scan never lists it, so the asset is
+  // written and its GUID resolves to nothing — `create_asset {type:'material', path:'x.material.json'}` answered ok.
+  // Refused with the name the scan WOULD type as `expected`, the owner's rule for a misnamed scene (2026-09-18): refuse
+  // and name the corrected path, never rename silently. (Unity's `AssetDatabase.CreateAsset` refuses a non-native
+  // extension the same way.) An `expected` with no suffix of its own has no right name to offer, so it keeps the old rule.
+  if (kind === null && !exists) {
+    const right = JSON_ASSET_SUFFIX_TYPE.find(([, t]) => t === expected)?.[0];
+    if (!right) return null;
+    const shown = url ?? absPath;
+    // The guessed suffix is everything after the name's FIRST dot — `x.material.json`, `x.particles.json` — so the
+    // offer is `x.mat.json`, not `x.material.mat.json`.
+    const slash = shown.lastIndexOf('/') + 1;
+    const dot = shown.indexOf('.', slash + 1);
+    const corrected = (dot > 0 ? shown.slice(0, dot) : shown) + right;
+    return json({
+      error: `${shown} names no asset kind, so the scan would never list it and its GUID would resolve to nothing — `
+        + `a ${expected} is named <name>${right}. Nothing was written.`,
+      wrongKind: true, nameType: null, expectedSuffix: right,
+      options: [`use ${corrected}`],
+    }, 409);
+  }
   if (kind === null && !(opts.replace && exists)) return null;
   if (kind === null) {
     return json({
@@ -742,13 +767,26 @@ function retypeRefusal(ctx: BackendContext, absFrom: string, absTo: string, isDi
  *  under it — so the commit point can ask again (#1978). The entry matters, not just existence: a file replaced at the
  *  same path (an atomic save, a rename landing on it) is not the file the route probed. And a folder's contents matter:
  *  a file moved INTO it during the probe was never probed, and the trash would take it with the folder. */
-type PathSnapshot = Map<string, { ino: number; dev: number; files?: string } | null>;
+type PathSnapshot = Map<string, { entry: string; files?: string } | null>;
+/** Which directory entry a stat names — `dev`, `ino` AND the entry's birth time, all read as bigints.
+ *
+ *  ⚠️ **`ino`+`dev` alone is not an identity on Linux** (#1978, public CI red on ubuntu only): ext4 hands a freed inode
+ *  number straight back, so `rm x` + `write x` during the probe looked like the SAME entry and the unprobed new file was
+ *  trashed. A recycled inode is a new allocation, so its birth time differs, at nanosecond precision. Bigints because
+ *  NTFS file ids are 64-bit — a `number` `ino` can round two of them to one. A filesystem with no birth time reports 0
+ *  (or its ctime, per Node), which falls back to `dev`+`ino`, as before.
+ *
+ *  ⚠️ Deliberately NOT content (`mtime`, `size`): this asks "is it the entry the route probed?", and the caller's own
+ *  `ifMatch` is the content precondition. Counting an edit would refuse a delete over a concurrent save of that file. */
+export function pathEntryId(st: Pick<fs.BigIntStats, 'dev' | 'ino' | 'birthtimeNs'>): string {
+  return `${st.dev}:${st.ino}:${st.birthtimeNs}`;
+}
 function snapshotPaths(abs: Iterable<string>): PathSnapshot {
   const snap: PathSnapshot = new Map();
   for (const p of abs) {
     try {
-      const st = fs.statSync(p);
-      snap.set(p, { ino: st.ino, dev: st.dev, ...(st.isDirectory() ? { files: snapshotFilesOf(p) } : {}) });
+      const st = fs.statSync(p, { bigint: true });
+      snap.set(p, { entry: pathEntryId(st), ...(st.isDirectory() ? { files: snapshotFilesOf(p) } : {}) });
     } catch { snap.set(p, null); }
   }
   return snap;
@@ -765,7 +803,7 @@ function changedSince(snap: PathSnapshot): string[] {
   const now = snapshotPaths(snap.keys());
   return [...snap].filter(([p, was]) => {
     const is = now.get(p) ?? null;
-    return was === null || is === null ? was !== is : was.ino !== is.ino || was.dev !== is.dev || was.files !== is.files;
+    return was === null || is === null ? was !== is : was.entry !== is.entry || was.files !== is.files;
   }).map(([p]) => p);
 }
 
@@ -1274,8 +1312,8 @@ async function applyMovesInRenderer(
     // A definitively-absent renderer is a normal state, silent: there is nothing in memory to
     // repair, so nothing was lost. `unknown agent op` is the same case one layer in — a runtime
     // build with the editor ops never registered.
-    if (/unknown agent op/i.test(msg)) return { kind: 'absent' };
-    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    const failure = classifyRelayFailure(e);
+    if (failure === 'unregistered' || failure === 'unreachable') return { kind: 'absent' };
     // ⚠️ A TIMEOUT is NOT "no renderer", and folding it in there is how this fails silently.
     // Electron rejects synchronously when the window is gone, so a timeout there means the
     // renderer IS attached and did not answer in the window — mid-scene-load, a GLB parse, a TSL
@@ -1444,9 +1482,8 @@ async function unsavedGate(
     if (!holds.length) return { kind: 'clear' };
     return { kind: 'held', holds, discarded: decodeHolds(r?.discarded) };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (relayProvesNoRenderer(msg)) return { kind: 'absent' };
-    return { kind: 'unknown', reason: msg };
+    if (relayProvesNoRenderer(e)) return { kind: 'absent' };
+    return { kind: 'unknown', reason: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -1915,7 +1952,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // calls the op directly to aim tap_handle / drag_handle.
       return json(await shapeHandlesReply(raw as HandlesResponse, params,
         async () => await ctx.requestBrowser('enact-handles', {}) as HandlesResponse, EDITOR_HANDLES_REMEDIES));
-    } catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
+    } catch (e) { return relayFailure(e); }
   }
 
   // ── GET /api/diagnose (M→R) ── structured render/scene health report (Phase F). ──
@@ -1986,7 +2023,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // the cable when the SDK is what is missing.
     let adbPath: string | null = null;
     try { adbPath = adbBinary(); } catch { /* not installed — reported below */ }
-    const android = (adbPath ? withFriendlyNames(listAndroidDevices()) : []).map((d) => ({
+    // #1961: adb present but `adb devices` failing is the third Android state — not "no adb" (`note`), not "no phones".
+    const androidListing = adbPath ? listAndroidDevicesResult() : { devices: [] };
+    const android = withFriendlyNames(androidListing.devices).map((d) => ({
       ...d,
       usable: isUsable(d),
       claim: claimFor(adbDeviceId(d.serial)) ?? null,
@@ -2022,6 +2061,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       ...(adbPath ? {} : { note: 'adb is not installed, so Android devices cannot be listed — install the Android SDK from Build Support (or set ANDROID_HOME).' }),
       // Only when the listing came back EMPTY: a source that broke while others still found phones
       // costs nothing to stay quiet about, and reporting it on every poll would be noise.
+      ...(androidListing.unavailable
+        ? { androidNote: `an empty Android list here does NOT mean no phone is attached — ${androidListing.unavailable}. Try \`adb kill-server\`, then refresh.` }
+        : {}),
       ...(iosListing.unavailable.length && ios.length === 0
         ? { iosNote: `an empty iOS list here does NOT mean no iPhone is paired — ${iosListing.unavailable.join('; ')}.` }
         : {}),
@@ -2136,19 +2178,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // deliberately not latched.
         if (st.target?.serial) return { serial: st.target.serial };
         const connected = st.state === 'connected';
+        const listing = listAndroidDevicesResult(); // one `adb devices` for both rungs below, with why it is empty (#1961)
         const picked = pickHostSideAndroidSerial({
           leasePlatform: connected ? await deviceConnection.devicePlatform() : null,
           leaseModel: connected ? (await deviceConnection.deviceHardware()).deviceModel : null,
-          attached: withFriendlyNames(listAndroidDevices().filter(isUsable)),
+          attached: withFriendlyNames(listing.devices.filter(isUsable)),
         });
-        if (!('unleased' in picked)) return picked;
+        if (!('unleased' in picked)) return explainUnlisted(picked, listing);
         // No Android lease to consult — the ordinary ladder. ⚠️ `listAndroidDevices()` is passed
         // UNFILTERED here, unlike the `attached` list above: `resolveAndroidSerial` does its own
         // usability check and its refusal names an `unauthorized`/`offline` handset as such, which
         // is the actionable answer when the phone you meant is the one that has not trusted this
         // Mac yet. Pre-existing, and preserved deliberately.
-        const built = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
-        return 'error' in built ? built : { serial: built.serial };
+        const built = resolveBuildAndroidSerial(listing.devices, { projectPin: loadProjectUserConfig(ctx.projectRoot).device.androidDeviceId });
+        return 'error' in built ? explainUnlisted(built, listing) : { serial: built.serial };
       };
       // WHICH PLATFORM these host-side ops read. The lease answers it when there is one — but these
       // ops exist precisely for when there ISN'T (the app died, so the lease died with it), and the
@@ -2168,12 +2211,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // attached", which the decision then reads as evidence rather than as an error — the whole
       // point being to answer from what IS present.
       const resolveHostSidePlatform = async (explicit?: string): Promise<'ios' | 'android' | { error: string }> => {
-        let androids: string[] = [];
-        try { androids = listAndroidDevices().filter(isUsable).map((d) => d.serial); } catch { /* no adb */ }
+        const listing = listAndroidDevicesResult();
+        const androids = listing.devices.filter(isUsable).map((d) => d.serial);
         let iphones: string[] = [];
         const goIos = resolveGoIos();
         if (goIos) { try { iphones = await listGoIosUdids(goIos); } catch { /* no usbmuxd */ } }
-        return pickHostSidePlatform({ explicit, leased: await deviceConnection.devicePlatform(), iphones, androids });
+        const plat = pickHostSidePlatform({ explicit, leased: await deviceConnection.devicePlatform(), iphones, androids });
+        return typeof plat === 'string' ? plat : explainUnlisted(plat, listing);
       };
       if (b.method === 'nativeLogs' && (b.params as { source?: string } | undefined)?.source === 'system') {
         const p = (b.params ?? {}) as { seconds?: number; limit?: number; filter?: string; platform?: string };
@@ -2511,7 +2555,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // successful eval into a 400. It is wrapped in `{result: …}` for the same reason, so no
     // envelope reaches the top level of the response body where a client would read it as one.
     try { return json({ result: await ctx.requestBrowser('eval', { code: b.code, timeoutMs: opTimeout }, relayTimeoutMs) }); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
+    catch (e) { return relayFailure(e); }
   }
 
   // ── GET /api/module-url (M) ── the URL that reaches the app's own instance of a module (#1155).
@@ -2617,7 +2661,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 404);
       return json(result);
     }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
+    catch (e) { return relayFailure(e); }
   }
   if (urlPath === '/api/watch/list' && method === 'GET') {
     return relayJson(ctx, 'watch-list', {});
@@ -2737,7 +2781,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // REFUSED_BY_OP. Generic (that under-specification is #1012's class) but not a LIE, and not
       // in the live gate's ENV_CODES — so a genuinely wedged GPU still reddens `test:mcp:live`
       // rather than being waved through as editor state.
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -2766,17 +2810,39 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // and unactionable (there is nothing to press Play on; it is already advancing). Only the
       // genuine `stopped` mode freezes time. `editor-state` has reported the 4-value runMode since
       // the preview-mode refactor; falling back to playState keeps an older renderer working.
-      let runMode: string | undefined;
-      try {
-        const st = await ctx.requestBrowser('editor-state', {}, 2000) as { runMode?: string; playState?: string };
-        runMode = st?.runMode ?? st?.playState;
-      } catch { /* headless / no renderer — the render call below reports it */ }
       // `forceRender`, with `force` still accepted. The TOOL param was renamed (§2: `force` means
       // "proceed despite unsaved work" on build/load_scene/ota_publish, and meant something
       // unrelated here). The old name stays valid on the WIRE because the dev-server curl API has
       // human callers, unlike the tool surface, where there are none to protect.
       const forceIdentical = (b as { forceRender?: boolean; force?: boolean }).forceRender
         ?? (b as { force?: boolean }).force;
+      let runMode: string | undefined;
+      // ⚠️ The refusal must not sit behind a probe that can fail OPEN (#1957 member 5). This was a bare `catch {}` on a 2s
+      // probe, so a busy renderer skipped the refusal and N identical frames were reported as a motion capture. A probe that
+      // could not read the run mode — a timeout, a refusal, an op fault — refuses, since the frames might not move. Two
+      // failures go on, because there is no editor to be STOPPED: no renderer at all (the render call below reports that
+      // itself), and `unregistered` — `editor-state` is an editor op, so a dev server whose only client is the GAME page
+      // declines it while `render-scene`, a runtime op, renders a game that is always running (close-out review).
+      const probe = await relayOp(ctx, 'editor-state', {}, 8000);
+      if (probe.kind === 'answered') {
+        const st = probe.value as { runMode?: string; playState?: string } | null;
+        runMode = st?.runMode ?? st?.playState;
+      } else if (!forceIdentical && !(probe.kind === 'failed' && (probe.failure === 'unreachable' || probe.failure === 'unregistered'))) {
+        const why = probe.kind === 'refused' ? String(probe.body.error ?? probe.code) : String(probe.error instanceof Error ? probe.error.message : probe.error);
+        const unread = probe.kind === 'refused'
+          ? { status: refusalStatus(probe.code), code: probe.code }
+          : { status: relayFailureStatus(probe.error), code: (probe.failure === 'timeout' ? 'TIMEOUT' : probe.failure === 'op-threw' ? 'REFUSED_BY_OP' : 'NOT_AVAILABLE_HERE') satisfies ErrorCode };
+        return json({
+          ok: false,
+          code: unread.code,
+          error: `REFUSED: could not read whether the editor is advancing time (editor-state: ${why}), so every frame `
+            + 'might be IDENTICAL — a sequence cannot promise motion from here. Nothing was rendered.',
+          options: [
+            'retry once the editor is responsive (modoki_identity is the cheapest probe)',
+            'pass forceRender:true to capture regardless — the frames may not move',
+          ],
+        }, unread.status);
+      }
       if (runMode === 'stopped' && !forceIdentical) {
         return json({
           ok: false,
@@ -2840,8 +2906,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       });
     } catch (e) {
       // Same reclassification as /api/render-scene above (#994 close-out F1).
-      return json({ error: String(e instanceof Error ? e.message : e), framesWritten: paths.length, paths, tMs },
-        relayFailureStatus(e));
+      return relayFailure(e, '', { framesWritten: paths.length, paths, tMs });
     }
   }
 
@@ -3143,7 +3208,7 @@ async function describeUnresolvedAgainstLiveWorld(
       try { st = (await ctx.requestBrowser('editor-state', {}, 8000)) as EditorStateProbe; }
       catch (e) {
         probeReason = e instanceof Error ? e.message : String(e);
-        probeOutcome = relayProvesNoRenderer(probeReason) ? 'absent' : 'unknown';
+        probeOutcome = relayProvesNoRenderer(e) ? 'absent' : 'unknown';
       }
       // ── §8: a renderer that MAY be attached and did not answer is a refusal. ──
       // Placed here rather than beside the old warning further down because the write must not
@@ -3263,90 +3328,100 @@ async function describeUnresolvedAgainstLiveWorld(
       const canGoLive = !!st && !hasSetBaseScene
         && (prefabEditTarget ? st.prefabEditWorld === scenePath : !!liveRef && liveRef === wantRef);
       if (canGoLive) {
-        try {
-          // #647: DECODE the reply, never cast it. The renderer that produces this versions
-          // independently of this host, and three of the fields below are read with `.length`
-          // or a spread — so a shape skew used to throw into the catch beneath, whose remedy
-          // ("relaunch the editor") is the WRONG one for a call whose ops already applied.
-          const decoded = decodeSceneOpsReply(await ctx.requestBrowser('apply-scene-ops', { ops }, 30_000));
-          if (decoded.kind === 'unreadable') {
-            // ⚠️ 200 + PARTIAL, deliberately NOT a 500. The relay RETURNED, so the ops are very
-            // likely already applied to the live world; a 500 maps to NOT_AVAILABLE_HERE
-            // ("relaunch the editor"), which invites the caller to retry and DOUBLE-APPLY a
-            // write. `isFailureBody` turns `ok:false` into a failure and `codeFromBody` lifts
-            // `code` out of the body, so this reaches the agent as a PARTIAL envelope with no
-            // new plumbing on either side.
-            // ⚠️ No `changed` and no `errors` here, deliberately. `isFailureBody` carries the whole
-            // body into the envelope's `got`, so a `changed: 0` would sit directly beside the
-            // sentence saying the ops may ALREADY have applied — asserting the one number this
-            // branch provably cannot know. Omitting it is the honest shape; review caught the
-            // first cut claiming it.
-            return json({
-              ok: false,
-              code: 'PARTIAL' satisfies ErrorCode,
-              warnings: preflightWarnings,
-              saved: false,
-              mode: PERSISTENCE_MODE,
-              error: 'apply-scene-ops answered a shape this build cannot read '
-                + `(${decoded.got}). The relay RETURNED, so these ops may have ALREADY APPLIED to `
-                + 'the live world — do NOT retry this call, it would apply them twice. Re-read the '
-                + 'live world with modoki_get_scene_state and reconcile before acting. A shape skew '
-                + 'here means the editor renderer and its backend are from different builds; '
-                + 'relaunching the editor from this checkout is what fixes the cause.',
-            });
-          }
-          const live = decoded.reply;
-          // A mixed call (something applied, something failed) is PARTIAL, not the failing op's own code (#1910).
-          const partial = partialApplyVerdict(live, 'live');
-          // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
-          // every live call now, and the hint says how to persist — the field is kept (rather
-          // than dropped) because callers already branch on it and `false` is meaningful.
-          return json({
-            ok: live.errors.length === 0, changed: live.changed, errors: live.errors,
-            warnings: [...live.warnings, ...preflightWarnings],
-            saved: false, mode: PERSISTENCE_MODE,
-            // S3.12 applies to BOTH branches, and shipped on only one. `applySceneOpsLive` builds
-            // `created` and the `apply-scene-ops` op returns it; this literal simply dropped it, so
-            // the file-direct fallback answered `created:[…]` while the LIVE path — the one the
-            // comment above calls the path almost every agent edit takes — answered `changed:1` and
-            // nothing else. That is the exact dead-end S3.12 closed (re-find your own new entity by
-            // name, which this surface refuses when ambiguous), left open on the hot branch and
-            // verified on the cold one. Same shape as the `set_transform {space:'world'}` S1: a
-            // capability with two backends chosen by ambient state, checked on one of them.
-            ...(live.created?.length ? { created: live.created } : {}),
-            // A trait the write ADDED rather than edited (#1216 C-12, D6) — both branches, for S3.12's reason above.
-            ...(live.addedTraits?.length ? { addedTraits: live.addedTraits } : {}),
-            // What a removeEntity's cascade took (#1262) — both branches, for S3.12's reason above.
-            ...(live.alsoDeleted ? { alsoDeleted: live.alsoDeleted } : {}),
-            ...(live.alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds: live.alsoDeletedNoGuidIds } : {}),
-            ...(live.alsoDeletedTotal ? { alsoDeletedTotal: live.alsoDeletedTotal } : {}),
-            // In the prefab-edit world modoki_save_all REFUSES — edit-save is that world's save.
-            ...(live.changed > 0 ? {
-              hint: prefabEditTarget
-                ? "applied to the LIVE prefab-edit world only — run modoki_prefab {action:'edit-save'} to write the .prefab.json."
-                : 'applied to the LIVE world only — run modoki_save_all to write it to disk.',
-            } : {}),
-            ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
-            ...(live.code ? { code: live.code } : {}),
-            // The refusal's way out and its staleness travel with its code (#1223 D4) — this literal
-            // dropped both, so a stale runtime guid reached the agent as a bare NOT_FOUND.
-            ...(live.options ? { options: live.options } : {}),
-            ...(live.stale ? { stale: live.stale } : {}),
-            // Last, so PARTIAL replaces the failing op's code; that op's own options still follow the partial ones.
-            ...(partial ? { ...partial, options: [...partial.options, ...(live.options ?? [])] } : {}),
-          });
-        } catch (e) {
-          // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
-          // "fall back to file-direct" territory (that would silently re-run the edit against a
-          // stale file while the live world is in an unknown state); surface it.
-          //
-          // ⚠️ This now means ONLY "the relay did not return" — a rejected `requestBrowser`,
-          // a timeout, a transport error. An UNREADABLE-but-returned reply is handled above as
-          // PARTIAL and never reaches here (#647), because the two need opposite remedies: this
-          // one is safe to treat as "the editor is not answering", and that one is not safe to
-          // retry at all.
-          return json({ error: `apply-scene-ops failed: ${e instanceof Error ? e.message : String(e)}` }, 500);
+        // An empty call changes nothing, and the closed-scene path answers it `ok:true, changed:0`; the live op refuses an
+        // empty array, which reached the agent as an op fault for the same input (#1957 member 2). Answer it here, the same.
+        if (ops.length === 0) {
+          return json({ ok: true, changed: 0, errors: [], warnings: preflightWarnings, saved: false, mode: PERSISTENCE_MODE });
         }
+        // Through `relayOp`, the one place a relayed reply is classified (#1957). A rejection is answered by
+        // `relayFailure`: a TIMEOUT is "delivered, outcome unknown" (the renderer cannot cancel, so the ops may yet apply —
+        // a retry would apply them twice), an op fault is the op answering (400), and only the relay's own failure is a
+        // gateway failure. This catch used to answer a literal 500 for all three, i.e. "relaunch the editor".
+        const outcome = await relayOp(ctx, 'apply-scene-ops', { ops }, 30_000);
+        if (outcome.kind === 'failed') {
+          return relayFailure(outcome.error, 'apply-scene-ops failed: ', { saved: false, mode: PERSISTENCE_MODE });
+        }
+        // #647: DECODE the reply, never cast it. The renderer that produces this versions
+        // independently of this host, and three of the fields below are read with `.length`
+        // or a spread — so a shape skew used to throw into a catch whose remedy
+        // ("relaunch the editor") is the WRONG one for a call whose ops already applied.
+        // ⚠️ The op's own SHAPE is read before the §5 envelope, not after: apply-scene-ops' ANSWER can itself carry
+        // `ok:false` + a code (a per-op NOT_FOUND beside its `errors`), so `relayOp` calls it `refused` too, and passing
+        // that through as a bare refusal would drop the partial verdict and the preflight warnings. Only a refusal that
+        // is NOT the op's shape is the op gate saying no.
+        const decoded = decodeSceneOpsReply(outcome.kind === 'answered' ? outcome.value : outcome.body);
+        if (decoded.kind === 'unreadable') {
+          // A §5 envelope (#1957 member 1): the op gate refused — an undo step or a prefab Apply is running — and its
+          // own error says "Nothing was changed". It decoded as unreadable here and was answered PARTIAL: "may have
+          // ALREADY APPLIED — do NOT retry, relaunch the editor", the opposite advice for a call that changed nothing.
+          if (outcome.kind === 'refused') {
+            return json({ ...outcome.body, warnings: preflightWarnings, saved: false, mode: PERSISTENCE_MODE }, refusalStatus(outcome.code));
+          }
+          // ⚠️ 200 + PARTIAL, deliberately NOT a 500. The relay RETURNED, so the ops are very
+          // likely already applied to the live world; a 500 maps to NOT_AVAILABLE_HERE
+          // ("relaunch the editor"), which invites the caller to retry and DOUBLE-APPLY a
+          // write. `isFailureBody` turns `ok:false` into a failure and `codeFromBody` lifts
+          // `code` out of the body, so this reaches the agent as a PARTIAL envelope with no
+          // new plumbing on either side.
+          // ⚠️ No `changed` and no `errors` here, deliberately. `isFailureBody` carries the whole
+          // body into the envelope's `got`, so a `changed: 0` would sit directly beside the
+          // sentence saying the ops may ALREADY have applied — asserting the one number this
+          // branch provably cannot know. Omitting it is the honest shape; review caught the
+          // first cut claiming it.
+          return json({
+            ok: false,
+            code: 'PARTIAL' satisfies ErrorCode,
+            warnings: preflightWarnings,
+            saved: false,
+            mode: PERSISTENCE_MODE,
+            error: 'apply-scene-ops answered a shape this build cannot read '
+              + `(${decoded.got}). The relay RETURNED, so these ops may have ALREADY APPLIED to `
+              + 'the live world — do NOT retry this call, it would apply them twice. Re-read the '
+              + 'live world with modoki_get_scene_state and reconcile before acting. A shape skew '
+              + 'here means the editor renderer and its backend are from different builds; '
+              + 'relaunching the editor from this checkout is what fixes the cause.',
+          });
+        }
+        const live = decoded.reply;
+        // A mixed call (something applied, something failed) is PARTIAL, not the failing op's own code (#1910).
+        const partial = partialApplyVerdict(live, 'live');
+        // Manual-only: a live edit NEVER writes the file. `saved:false` is the truth for
+        // every live call now, and the hint says how to persist — the field is kept (rather
+        // than dropped) because callers already branch on it and `false` is meaningful.
+        return json({
+          ok: live.errors.length === 0, changed: live.changed, errors: live.errors,
+          warnings: [...live.warnings, ...preflightWarnings],
+          saved: false, mode: PERSISTENCE_MODE,
+          // S3.12 applies to BOTH branches, and shipped on only one. `applySceneOpsLive` builds
+          // `created` and the `apply-scene-ops` op returns it; this literal simply dropped it, so
+          // the file-direct fallback answered `created:[…]` while the LIVE path — the one the
+          // comment above calls the path almost every agent edit takes — answered `changed:1` and
+          // nothing else. That is the exact dead-end S3.12 closed (re-find your own new entity by
+          // name, which this surface refuses when ambiguous), left open on the hot branch and
+          // verified on the cold one. Same shape as the `set_transform {space:'world'}` S1: a
+          // capability with two backends chosen by ambient state, checked on one of them.
+          ...(live.created?.length ? { created: live.created } : {}),
+          // A trait the write ADDED rather than edited (#1216 C-12, D6) — both branches, for S3.12's reason above.
+          ...(live.addedTraits?.length ? { addedTraits: live.addedTraits } : {}),
+          // What a removeEntity's cascade took (#1262) — both branches, for S3.12's reason above.
+          ...(live.alsoDeleted ? { alsoDeleted: live.alsoDeleted } : {}),
+          ...(live.alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds: live.alsoDeletedNoGuidIds } : {}),
+          ...(live.alsoDeletedTotal ? { alsoDeletedTotal: live.alsoDeletedTotal } : {}),
+          // In the prefab-edit world modoki_save_all REFUSES — edit-save is that world's save.
+          ...(live.changed > 0 ? {
+            hint: prefabEditTarget
+              ? "applied to the LIVE prefab-edit world only — run modoki_prefab {action:'edit-save'} to write the .prefab.json."
+              : 'applied to the LIVE world only — run modoki_save_all to write it to disk.',
+          } : {}),
+          ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
+          ...(live.code ? { code: live.code } : {}),
+          // The refusal's way out and its staleness travel with its code (#1223 D4) — this literal
+          // dropped both, so a stale runtime guid reached the agent as a bare NOT_FOUND.
+          ...(live.options ? { options: live.options } : {}),
+          ...(live.stale ? { stale: live.stale } : {}),
+          // Last, so PARTIAL replaces the failing op's code; that op's own options still follow the partial ones.
+          ...(partial ? { ...partial, options: [...partial.options, ...(live.options ?? [])] } : {}),
+        });
       }
       // A prefab-edit handle that could not go live has NO file-direct fallback (#1254): nothing on disk is that world.
       if (prefabEditTarget) {
@@ -5910,7 +5985,7 @@ async function describeUnresolvedAgainstLiveWorld(
         persistenceMode: getPersistenceMode(),
       });
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -6059,8 +6134,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // read is a real, if weaker, answer — so fall back rather than fail, and SAY which it is.
       // Silently returning disk would be the #872 defect again, one layer down: an agent reading
       // a pre-edit value with no way to know a newer one might exist.
-      const status = relayFailureStatus(e);
-      if (status === 400) return json({ error: String(e instanceof Error ? e.message : e) }, 400);
+      // A TIMEOUT does not fall back (#1957 member 4): `relayFailureStatus` is a status, not a guard,
+      // and used as one it sent a TIMEOUT here — a busy editor that may hold a parked edit — to the disk answer below,
+      // stating `editorConnected:false, unsaved:false` about an editor that was connected and was not asked.
+      // `unregistered` falls back too (close-out review): since #1030 it means every connected client declined the op, i.e.
+      // no EDITOR is attached — and parking is editor-only, so there is nothing a disk read could miss. The tool is
+      // `requires:['project']` precisely so it keeps working without one.
+      const failure = classifyRelayFailure(e);
+      if (failure !== 'unreachable' && failure !== 'unregistered') return relayFailure(e);
       return json({
         ok: true, path: assetPath, meta: readMetaSidecar(preResolved), source: 'disk', unsaved: false,
         read: 'ok', editorConnected: false,
@@ -6086,7 +6167,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const refusal = opRefusal(result);
       return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -6109,8 +6190,7 @@ async function describeUnresolvedAgainstLiveWorld(
       return json(result);
     }
     catch (e) {
-      const msg = String(e instanceof Error ? e.message : e);
-      return json({ error: msg }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -6154,8 +6234,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
       return json(result);
     } catch (e) {
-      const msg = String(e instanceof Error ? e.message : e);
-      return json({ error: msg }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -6174,7 +6253,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const refusal = opRefusal(result);
       return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+      return relayFailure(e);
     }
   }
 
@@ -6399,10 +6478,21 @@ async function describeUnresolvedAgainstLiveWorld(
     const tc = process.env.MODOKI_TOOLCHAIN_DIR;
     if (!tc) return json({ error: 'no toolchain directory (dev editor) — nothing to uninstall' }, 400);
     const { id } = (body ?? {}) as { id?: string };
-    if (id === 'all') { uninstallAll(tc); return json({ ok: true }); }
     if (!id) return json({ error: 'id required' }, 400);
-    await uninstall(id as ToolId, { toolchainDir: tc });
-    return json({ ok: true });
+    // `uninstall` checks the outcome on DISK (#1984): it answered ok for an id no tool has and for an `npm uninstall` that
+    // never ran, so Build Support logged "✅ Removed" over a tool its own refresh still listed. A request with nothing to
+    // act on is the caller's (400, with the real ids); a removal that did not happen is not (500).
+    try {
+      if (id === 'all') uninstallAll(tc);
+      else await uninstall(id as ToolId, { toolchainDir: tc });
+      return json({ ok: true });
+    } catch (e) {
+      const error = String(e instanceof Error ? e.message : e);
+      // The real ids only for an id that names no tool — for a known tool the editor does not provision, the list would offer
+      // the refused id back.
+      if (e instanceof UninstallRefusal) return json({ error, code: 'REFUSED_BY_OP' satisfies ErrorCode, ...(TOOL_IDS.includes(id as ToolId) ? {} : { options: [...TOOL_IDS] }) }, 400);
+      return json({ error }, 500);
+    }
   }
 
   // ── POST /api/import-identity {path, content} (M) ── the Assets panel's half of an import (#1713): the bytes a
@@ -6523,46 +6613,6 @@ async function describeUnresolvedAgainstLiveWorld(
   return null; // not a router-owned route
 }
 
-/** An op that answered with a §5 refusal ENVELOPE rather than a result (#994), or null.
- *
- *  The discriminator is a `code` from the CLOSED set (`mcpResult.ts`'s `ERROR_CODES`) alongside
- *  `ok:false` — deliberately narrow, because the ordinary `{ok:false, reason}` an op returns for a
- *  bad parameter must keep its 200 + `isFailureBody` handling. Only an op that has named a code is
- *  claiming to know which §5 failure this is, and only that claim earns a status of its own.
- *
- *  ⚠️ Why a route must relay this at all, when the op could just throw: it CANNOT. A throw becomes
- *  a hard-coded 504 at ~24 catch sites, which the MCP client reads as `NOT_AVAILABLE_HERE` — "the
- *  route is absent". So an op that knows the real code has no way to say it except by RETURNING it,
- *  and the route has no way to honour it except by looking. That is the inversion #994 fixes. */
-function opRefusal(result: unknown): { code: ErrorCode; error?: string; options?: string[] } | null {
-  if (!result || typeof result !== 'object') return null;
-  const r = result as { ok?: unknown; code?: unknown };
-  if (r.ok !== false || typeof r.code !== 'string') return null;
-  if (!(ERROR_CODES as readonly string[]).includes(r.code)) return null;
-  return result as { code: ErrorCode; error?: string; options?: string[] };
-}
-
-/** The HTTP status a §5 refusal travels on. The CODE is what the agent reacts to (`codeFromBody`
- *  in the MCP client lets a body code beat the status-derived one), so this only has to avoid
- *  lying to anything that reads the status alone — and 200 would, since `writeDataUrlToTemp` never
- *  ran and there is no frame.
- *
- *  503 for `NO_RENDERER` matches every envelope this router already emits for it — one in the
- *  unsaved-work probe and two in `/api/scene-mutate` (grep `code: 'NO_RENDERER'`; all three are
- *  503). ⚠️ That count was wrong on the first attempt too, in the very comment written to stop
- *  citing stale line numbers — so grep it, do not trust this sentence's arithmetic either.
- *
- *  One code, one status, so the mapping is a rule rather than a per-site choice. Anything the ops
- *  start naming beyond `NO_RENDERER` is still the op ANSWERING, which `relayFailureStatus` (below)
- *  already argues is a 400 rather than a gateway failure.
- *
- *  ⚠️ Deliberately NOT citing line numbers: they were `:1028`/`:2372` when written and one of
- *  them already pointed at nothing two commits later. A line number in a comment is the
- *  shadowing-constant class — it has to be kept in sync by hand and silently goes stale. */
-function refusalStatus(code: ErrorCode): number {
-  return code === 'NO_RENDERER' ? 503 : 400;
-}
-
 /** **Relay one M→R op and turn its answer into a response.** The single place the three rules
  *  about a relayed reply live, rather than 26 copies of them (#1013).
  *
@@ -6598,154 +6648,17 @@ async function relayJson(
   ctx: { requestBrowser(op: string, params: unknown, timeoutMs?: number): Promise<unknown> },
   op: string, params: unknown, timeoutMs?: number,
 ): Promise<BackendResult> {
-  try {
-    const raw = await ctx.requestBrowser(op, params, timeoutMs);
-    const refusal = opRefusal(raw);
-    if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
-    return json(raw);
-  } catch (e) {
-    return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
-  }
+  const outcome = await relayOp(ctx, op, params, timeoutMs);
+  if (outcome.kind === 'answered') return json(outcome.value);
+  if (outcome.kind === 'refused') return json(outcome.body, refusalStatus(outcome.code));
+  return relayFailure(outcome.error);
 }
 
-/** **Does this relay rejection PROVE there is no renderer holding state we must respect?**
- *
- *  ⚠️ **Fail-closed by construction, because the two questions that look alike have OPPOSITE safe
- *  answers** (#1013 close-out F1 — a data-loss regression this file's own shape invited).
- *  `isRelayTransportFailure` answers "did the transport fail", which is the right question for a
- *  STATUS (`relayFailureStatus`) and the wrong one for a GUARD. A guard needs "can I prove nothing
- *  is at risk", and `unknown agent op` is exactly the case where those diverge: the editor ops are
- *  absent, but the WINDOW may be very much alive and holding unsaved work.
- *
- *  The scar: #1013 added `unknown agent op` to `isRelayTransportFailure` — correct for the routes
- *  it was fixing, where an absent op really is "could not look". `unsavedGate` and
- *  `applyMovesInRenderer` were immune because each already tested that string explicitly first.
- *  `/api/scene-mutate`'s state probe was not, and its comment said it used "the same classifier
- *  pair as `unsavedGate`, deliberately not a second copy" — but `unsavedGate` is the pair PLUS a
- *  guard, so it had copied the half that could not stand alone. Measured on the broken tree: a
- *  mutate that answered **503 NO_RENDERER, file untouched** became **200 `ok:true, changed:1` with
- *  the file rewritten**, skipping the unsaved-work probe entirely and hot-reloading the scene out
- *  from under live edits. Reachable two ways — ⚠️ **the first is CLOSED as of #1030**, which made
- *  the relay settle on the first AUTHORITATIVE reply; it is kept here because the guard must not
- *  depend on that, and because the second way is still open. The relay is a BROADCAST and was
- *  first-reply-wins, so a
- *  second tab on the runtime route answers `unknown agent op` instantly and beats the editor tab;
- *  and the launch race / a bridge connected from a game page rather than `#/editor`, which
- *  `relayFailureStatus`'s own comment already names.
- *
- *  ⚠️ An earlier version of this banner also claimed *"a game-code boot fault means
- *  `registerEditorAgentOps()` never runs"*. **That is refuted by the tree** — `gameBootFaults.ts`
- *  is the module that FIXED it, and every game hook now goes through `runGameHook`
- *  (`editor/setup.ts`), which catches, records the fault and returns, so step 5's
- *  `registerEditorAgentOps()` is unconditionally reached; an import-time throw falls back to
- *  `virtual:modoki-games`. Corrected rather than deleted because it would have sent anyone
- *  debugging a live `unknown agent op` to read a module that cannot produce one.
- *
- *  ⚠️ `applyMovesInRenderer` deliberately does NOT use this and must not be "made consistent": it
- *  is a REPAIR path, so a build that genuinely never registered the editor ops has nothing in
- *  memory to repair and `absent` is its safe answer. Same string, opposite correct outcome — which
- *  is the whole reason this is a named question rather than a shared predicate.
- *
- *  ⚠️ **That is the honest scope of the blessing, and it is narrower than it first read.**
- *  `apply-asset-path-moves` is itself registered inside `registerEditorAgentOps`, so under the
- *  broadcast race above `unknown agent op` does NOT prove the editor tab lacks it — a live editor
- *  can be holding bindings and a parked write on the old path while a runtime tab answers first,
- *  and that repair is skipped SILENTLY (no warn, no `repairFailed`).
- *
- *  ⚠️ **FIXED in #1030 — at the TRANSPORT, not here.** A client with no handler for an op now
- *  answers `{declined:true}` instead of rejecting, and the registry counts declines, settling
- *  `absent` only once every announced bridge client has declined. So `unknown agent op` reaching
- *  this function now really does mean nothing out there has the op. The asymmetry this banner
- *  describes is unchanged and still deliberate; what is gone is the race that made it dangerous.
- *  Do not add a second guard at that site for it. */
-function relayProvesNoRenderer(msg: string): boolean {
-  // The ops being unregistered says nothing about whether a window is up holding state.
-  if (/unknown agent op/i.test(msg)) return false;
-  // ⚠️ A TIMEOUT is not "no renderer" — a busy renderer misses the window and IS attached.
-  return isRelayTransportFailure(msg) && !isRelayTimeout(msg);
-}
-
-/** Which status a thrown relay error deserves.
- *
- *  Everything used to be a **504**, which reads as "the editor hung" — so a DELIBERATE, correct
- *  refusal was indistinguishable from a dead renderer. Measured while running batch use case 8:
- *  `load-scene` refused because the editor had unsaved live-world changes (exactly right, and its
- *  message says what to do), and it arrived as `backend 504`. An agent reading that chases a
- *  wedged editor instead of calling `save_all`.
- *
- *  Only the RELAY's own failures are gateway failures; an error the op raised is the op answering,
- *  so it is a 400. The two transport signatures come from `requestRenderer` in `electron/main.ts`
- *  (and the Vite HMR relay's equivalents). Matching on the message is deliberately conservative:
- *  an unrecognized error is treated as the OP speaking, which is the common case. */
-function relayFailureStatus(e: unknown): number {
-  const msg = String(e instanceof Error ? e.message : e);
-  // Match BOTH hosts' relay wordings. This listed only the Electron strings, so on the Vite dev
-  // server every renderer transport failure — "timed out waiting for the BROWSER", "dev server
-  // websocket not ready" — fell through to 400 and surfaced as REFUSED_BY_OP: an unreachable
-  // renderer reported as a deliberate op refusal, which is the "could not look" vs "it said no"
-  // confusion §5 exists to prevent, mirrored across the two backends (§9).
-  //
-  // The list must cover every string `failPendingRenderer` (electron/main.ts) actually sends, and
-  // it did not (independent review, 2026-07-30): `'project changed — renderer reloading'` fell
-  // through to 400, so a request killed by a deliberate renderer TEARDOWN was reported to the
-  // agent as an op refusal — the same could-not-look/it-said-no inversion this function exists to
-  // fix, in the opposite direction. (`'editor window closed'` was already covered by `window
-  // closed`.) A teardown is retryable once the renderer is back; a refusal is not, so telling the
-  // two apart changes what the agent does next.
-  // ⚠️ **`project changed` was REMOVED as a bare alternative** — subject-less, exactly what the
-  // `destroyed` scar below says must never recur, and strictly redundant: its only producer
-  // (`electron/main.ts`) sends `'project changed — renderer reloading'`, which the
-  // `renderer reloading` alternative already matches. Left in place it would have let any op
-  // refusal whose prose contains "project changed" make `relayProvesNoRenderer` return true, and
-  // that hard-codes `mutateUnsaved = absent` and writes the scene file.
-  // ⚠️ **`unknown agent op` is here because the op being ABSENT is "could not look", not "it said
-  // no"** (#1013 close-out F5). `runAgentOp` throws it when the bridge is connected from a game
-  // page rather than `#/editor`, or in the window before `registerEditorAgentOps()` has run — so
-  // every editor-only route (`eval`, `eval-api`, `editor-journal`, `wait-for-edit`) hits it during
-  // a normal launch race. Adopting `relayFailureStatus` at those routes moved them from 504 →
-  // `NOT_AVAILABLE_HERE` to 400 → `REFUSED_BY_OP`, and `ERROR_CODES` defines the latter as "the
-  // operation itself declined" — a claim about an operation that does not exist. Subject-named, per
-  // the scar below: `unknown agent op`, never a bare `unknown`.
-  // ⚠️ **`destroyed` WAS A BARE ALTERNATIVE, AND IT MATCHED THE REFUSALS THIS FUNCTION EXISTS TO
-  // PROTECT** (bug BHdZZ52JIu4afJmoX7O6). It is here for Electron's own `Object has been
-  // destroyed`, thrown when a BrowserWindow/webContents dies mid-request — a genuine transport
-  // failure. But `load-scene`'s unsaved-work refusal reads "…the scene edits would be DESTROYED
-  // (gone from the world, the file, and the undo stack)", so an op answering clearly and correctly
-  // was reported as `HTTP 504 / NOT_AVAILABLE_HERE`: "this editor cannot do that", when the truth
-  // was "save first, or pass discardUnsaved". That is precisely the could-not-look vs it-said-no
-  // inversion described above, produced BY the fix for it.
-  //
-  // Reproduced 2026-08-22 against a live editor: create_entity, then load_scene with no
-  // discardUnsaved → 504 with the correct message. The wording that tripped it is the WORD
-  // "destroyed" in ordinary prose, so the lesson generalises: every alternative here must name its
-  // SUBJECT. A bare verb will eventually appear in an op's own explanation of what it refuses to
-  // do — that is the vocabulary these messages are written in.
-  // ⚠️ `\b` around the subject group, and it is NOT decoration: without it `view` matches inside
-  // `preview`, `overview` and `review`, so "…the PREVIEW was destroyed…" would be misclassified as
-  // transport — this fix reintroducing its own bug one word smaller. Caught in review, before it
-  // could bite.
-  return isRelayTransportFailure(msg) ? 504 : 400;
-}
-
-/** Did the relay itself fail, rather than the op answering? The single maintained list of both
- *  hosts' transport wordings — every string `failPendingRenderer` (electron/main.ts) and the Vite
- *  HMR relay actually send.
- *
- *  ⚠️ **Extracted (#867) because a SECOND hand-copy was written and was born incomplete.** The
- *  move/delete repair added its own regex to decide "no renderer" vs "the repair failed", and it
- *  missed `no editor renderer window`, `editor window closed`, `project changed — renderer
- *  reloading` and `Object has been destroyed` — every Electron string, i.e. the whole default
- *  editor surface. This list has now been found incomplete three times by review; a copy of it is
- *  the wrong shape of thing to own. Read the history above before touching the pattern. */
-export function isRelayTransportFailure(msg: string): boolean {
-  return /no (editor )?renderer|unknown agent op|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
-}
-
-/** Was the relay failure specifically a TIMEOUT — the renderer never answered in the window?
- *  Distinct from the rest of `isRelayTransportFailure`, which all mean the surface was
- *  definitively absent. See `applyMovesInRenderer`. */
-export function isRelayTimeout(msg: string): boolean {
-  return /timed out waiting for the (renderer|browser)/i.test(msg);
+/** A relay rejection as a response — `relayFailureReply`'s status and body (#1957). Every catch around a
+ *  relayed op answers through this, so a timeout says "delivered, outcome unknown" on every route. */
+function relayFailure(e: unknown, prefix = '', extra: Record<string, unknown> = {}): BackendResult {
+  const r = relayFailureReply(e, prefix);
+  return json({ ...extra, ...r.body }, r.status);
 }
 
 /** Editor actions the /api/editor-action relay accepts (op names dispatched in

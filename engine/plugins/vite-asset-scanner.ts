@@ -13,6 +13,7 @@ import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatche
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
 import { foreignRequestRefusal } from './backend/requestOrigin';
+import { RelayTimeoutError } from './backend/relayOutcome';
 import { computeKeptAssets, damagedPrefabBuildError, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
@@ -25,7 +26,7 @@ import { samePath, canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mj
 import { readJsonFile, parseJsonText } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
-import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
+import { listAndroidDevicesResult, explainUnlisted, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
@@ -539,7 +540,7 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // other while agreeing on the wrong set. `invalidatorsAreReachable.test.ts` is the guard that
   // closes that blind spot, by asking the question from the invalidator's end instead.
   if (type === 'animset') return 'animset';
-  // `.material.json` / `.shader.json` — agent-writable (`/api/asset-write` covers all 8
+  // `.mat.json` / `.shader.json` — agent-writable (`/api/asset-write` covers all 8
   // ASSET_SCHEMA_TYPES) and parkable in the Inspector, but absent from this function until #842:
   // an external write fell through to `return null` — no broadcast, so `dropParkedWriteFor` never
   // ran (a stale parked material edit could clobber a newer on-disk write at Cmd+S) and no cache
@@ -1063,7 +1064,8 @@ export function createBrowserRequestRegistry(
       const id = nextId++;
       const timer = timers.set(() => {
         pending.delete(id);
-        reject(new Error('timed out waiting for the browser — is the app open at the dev URL?'));
+        // Typed (#1957): `send` runs below and nothing can recall it, so a timeout is "delivered, outcome unknown".
+        reject(new RelayTimeoutError('timed out waiting for the browser — is the app open at the dev URL?'));
       }, timeoutMs);
       pending.set(id, { resolve, reject, timer, op, expected: Math.max(1, expected), declinedBy: new Set(), declinedAnon: 0 });
       try {
@@ -2837,7 +2839,8 @@ export function assetScannerPlugin(): Plugin {
             // two claimed handsets report null so the ordinary rule refuses with both named.
             const ownClaim = ownAdbClaim();
             const leaseSerial = ownClaim ? adbSerialOf(ownClaim.deviceId) : undefined;
-            const picked = resolveBuildAndroidSerial(listAndroidDevices(), { projectPin: user.device.androidDeviceId, leaseSerial });
+            const listing = listAndroidDevicesResult();
+            const picked = explainUnlisted(resolveBuildAndroidSerial(listing.devices, { projectPin: user.device.androidDeviceId, leaseSerial }), listing);
             if ('error' in picked) androidSerialError = picked.error;
             else {
               androidSerial = picked.serial;

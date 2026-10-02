@@ -20,7 +20,7 @@ import crypto from 'crypto';
 import { execFileSync, execFile as execFileDevice } from 'child_process';
 import { promisify } from 'node:util';
 import {
-  adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
+  adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevicesResult, explainUnlisted, resolveAndroidSerial,
   withFriendlyNames,
 } from './androidDevices';
 import { adbDeviceId, claimDevice, iosDeviceId, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
@@ -1114,12 +1114,13 @@ export class DeviceConnectionManager {
   private resolveSerial(want: string | undefined, strict: boolean): { serial: string; label?: string } | { error: string } {
     // Named, so a refusal says "Galaxy A23 5G" rather than "SC_56C" — the names are memoized, so
     // this is one extra shell per phone per process, not per connect.
-    const devices = withFriendlyNames(listAndroidDevices());
+    const listing = listAndroidDevicesResult();
+    const devices = withFriendlyNames(listing.devices);
     let picked = resolveAndroidSerial(devices, { explicit: want });
     if ('error' in picked && want && !strict && !devices.some((d) => d.serial === want)) {
       picked = resolveAndroidSerial(devices, { explicit: undefined });
     }
-    if ('error' in picked) return picked;
+    if ('error' in picked) return explainUnlisted(picked, listing);
     const hit = devices.find((d) => d.serial === picked.serial);
     return { serial: picked.serial, ...(hit ? { label: describeAndroidDevice(hit) } : {}) };
   }

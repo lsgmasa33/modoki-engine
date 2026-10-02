@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { expectInOrder } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, UninstallRefusal, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, whichSync, type DetectResult } from '../../toolchain'
 import { makeDirLink } from '../helpers/linkFixture';
 import { TOOLCHAIN_OWNED_ENTRIES } from '../../scripts/toolchainRoot.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -1004,6 +1004,56 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     await uninstall('cocoapods', { toolchainDir: tc })
     expect(fs.existsSync(path.join(tc, 'cocoapods-gems'))).toBe(false)
     expect(fs.existsSync(path.join(tc, 'ruby'))).toBe(false)
+  })
+
+  // #1984: it answered for every id and every npm run. It checks the DISK now, and throws when the tool is still there.
+  it('refuses an id no tool has, and a tool the toolchain does not provision — nothing to act on (#1984)', async () => {
+    await expect(uninstall('jdk' as never, { toolchainDir: tc })).rejects.toBeInstanceOf(UninstallRefusal)
+    // Named as what it is — a typo'd id is not "a tool we do not provision", and the two need different fixes.
+    await expect(uninstall('jdk' as never, { toolchainDir: tc })).rejects.toThrow(/unknown tool id 'jdk'/)
+    await expect(uninstall('xcodebuild', { toolchainDir: tc })).rejects.toBeInstanceOf(UninstallRefusal)
+    await expect(uninstall('xcodebuild', { toolchainDir: tc })).rejects.toThrow(/not provisioned into the toolchain/)
+  })
+
+  describe('an npm tool is removed only when its package directory is GONE (#1984)', () => {
+    const saved = { node: process.env.MODOKI_NODE, cli: process.env.MODOKI_NPM_CLI }
+    afterEach(() => {
+      for (const [k, v] of [['MODOKI_NODE', saved.node], ['MODOKI_NPM_CLI', saved.cli]] as const) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v
+      }
+    })
+    /** npm-tools with gltfpack installed, and an "npm" that runs `script` (a node program) in it. */
+    const withNpm = (script: string | null) => {
+      fs.mkdirSync(path.join(tc, 'npm-tools', 'node_modules', 'gltfpack'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'npm-tools', 'package.json'), '{}')
+      const cli = path.join(root, 'fake-npm.cjs')
+      if (script !== null) fs.writeFileSync(cli, script)
+      process.env.MODOKI_NODE = script === null ? path.join(root, 'deleted-node') : process.execPath
+      process.env.MODOKI_NPM_CLI = cli
+    }
+    const pkgDir = () => path.join(tc, 'npm-tools', 'node_modules', 'gltfpack')
+
+    it('npm that cannot be spawned (the provisioned Node is gone) is a failure, and says so', async () => {
+      withNpm(null)
+      await expect(uninstall('gltfpack', { toolchainDir: tc })).rejects.toThrow(/still installed .* npm could not be run/)
+      expect(fs.existsSync(pkgDir())).toBe(true)
+    })
+
+    it('npm that exits non-zero and leaves the package is a failure with its exit code', async () => {
+      withNpm('process.exit(3)')
+      await expect(uninstall('gltfpack', { toolchainDir: tc })).rejects.toThrow(/exited with code 3/)
+    })
+
+    it('npm that removes the package succeeds (accept side)', async () => {
+      withNpm(`require('fs').rmSync(${JSON.stringify(path.join(tc, 'npm-tools', 'node_modules', 'gltfpack'))}, { recursive: true })`)
+      await expect(uninstall('gltfpack', { toolchainDir: tc })).resolves.toBeUndefined()
+      expect(fs.existsSync(pkgDir())).toBe(false)
+    })
+
+    it('a tool that was never installed is still a quiet no-op (idempotent)', async () => {
+      await expect(uninstall('gltfpack', { toolchainDir: tc })).resolves.toBeUndefined()
+      await expect(uninstall('java', { toolchainDir: tc })).resolves.toBeUndefined()
+    })
   })
 
   it('uninstallAll deletes the ENTIRE toolchain folder (settings included)', () => {
