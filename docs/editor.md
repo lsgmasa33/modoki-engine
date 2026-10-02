@@ -4235,9 +4235,23 @@ there, and the scan's collision heal never re-mints one (#2003).
 open in a DEV clone and refuses only in the packaged editor** (`devOnly`). The Inspector shows a
 built-in's import settings, and an engine developer applying them in a clone is editing the engine
 repo, which is where a built-in is changed. A packaged recursive re-import leaves the built-ins out,
-and one aimed at the engine root or a folder in it is refused like a single one. Open (#2060): the
-Font and Environment views' "re-import to fill in the stats" hint still shows for a packaged
-built-in, whose re-import is refused.
+and one aimed at the engine root or a folder in it is refused like a single one.
+**The packaged Inspector does not OFFER what the backend refuses there (#2060).** `builtinImportLock.ts`
+locks a built-in's import settings when the editor is packaged: the Font, Environment and Texture
+views wrap their import block in `ImportLockFieldset` (a `<fieldset disabled>`, so a control added
+later is covered without wiring, plus the reason on screen), and so does the multi-select batch view
+when any selected path is a built-in (`batchImportLock`; Cmd-clicking a project texture after an
+Engine-section one mixes them). The Sprite Editor and 9-slice editor portal OUT of that fieldset, so
+the Sprite Editor button (outside it) is disabled on its own, `open-sprite-editor`/`open-nine-slice-editor` refuse
+(`currentBuiltinImportLock`), and the view drops a headless open request for a locked asset. A
+missing-stats row still says the stats are missing (#1305), via `missingStatsHint`, which drops only the
+"re-import" remedy. ⚠️ `chromeHandles.isDisabled` reads `:disabled`, not `.disabled`: a control under a
+disabled fieldset keeps `.disabled === false`, so `modoki_handles` reported every locked control live
+and a `modoki_tap` on a locked Apply clicked nothing. The renderer learns
+it is packaged through ONE seam, `editorHost.ts`, filled from `/api/identity`'s `packaged` at boot and
+subscribed (boot reads it after the editor mounts). Only a literal `true` counts, so a host without the
+route offers the dev behaviour, and the backend refusal stays the gate. The Assets panel's Engine section
+needed nothing: it already offers only Copy Path and Reveal, no move drag and no drop target.
 A packaged refusal of a parked edit is DROPPED, not re-parked (`MetaWriteResult.readOnly`): no save
 could ever land it, so re-parked it would hold `hasUnsavedChanges()` true for good.
 

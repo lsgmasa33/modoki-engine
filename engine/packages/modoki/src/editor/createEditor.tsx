@@ -25,7 +25,8 @@ import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
 import { getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
-import { matchFsRuntimeAsset, isProjectRoot, setOpenProjectRoots, toOpenProjectScenePath } from './scene/openProjectScenePath';
+import { matchFsRuntimeAsset, isProjectRoot, getOpenProjectRoots, toOpenProjectScenePath } from './scene/openProjectScenePath';
+import { applyEditorIdentity } from './editorHost';
 import { withAdoption } from './scene/sceneAdoption';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
@@ -752,12 +753,12 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // old name-based check in canonicalBootScenePath, never blocks boot.
     // Both spellings of the root (#1898): Vite's `/@fs/` paths are realpaths, so a project opened through a link
     // (`/tmp` → `/private/tmp`) matches only `projectRootReal`. Kept module-wide too, for setCurrentScenePath.
-    const projectRoot = await backendFetch('/api/identity')
+    // The same answer carries `packaged` (#2060) — what the asset Inspectors read to stop offering a built-in's import
+    // settings in the packaged editor, where the backend refuses them (#1959). `editorHost.ts` is the one seam for it.
+    applyEditorIdentity(await backendFetch('/api/identity')
       .then((r) => (r.ok ? r.json() : null))
-      .then((data: { projectRoot?: string; projectRootReal?: string } | null) =>
-        [data?.projectRoot, data?.projectRootReal].filter((r): r is string => typeof r === 'string' && r.length > 0))
-      .catch(() => [] as string[]);
-    setOpenProjectRoots(projectRoot);
+      .catch(() => null));
+    const projectRoot = getOpenProjectRoots();
 
     // Re-open the .rig2d the user was last editing in the Skin panel. A rig is a
     // scene-independent asset (loaded by path, sprites resolved via the manifest), so

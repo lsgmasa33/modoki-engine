@@ -19,7 +19,9 @@ import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../..
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
-import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
+import { useBuiltinImportLock } from './builtinImportLock';
+import { ImportLockFieldset } from './ImportLockFieldset';
+import { sumMeasured, missingStatsHint } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
@@ -186,6 +188,10 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   // #1305: this host holds no measurement for some of the rows below — say so rather than
   // render a blank (or, as texture and model once did, a defaulted 0 B).
   const statsIncomplete = useMissingLocalStats(path, 'textureCache');
+  // #2060: a built-in's import settings are refused in the packaged editor — offer none of them there (the Sprite
+  // Editor and 9-slice editor write the same .meta.json, so they are locked with them: the buttons here, and a
+  // headless open request below, which the agent ops already refuse up front).
+  const importLock = useBuiltinImportLock(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<TextureImportSettings>(DEFAULT_TEXTURE_SETTINGS);
   const [type, setType] = useState<TextureType>('3d');
@@ -201,10 +207,14 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   const clearTextureEditorRequest = useEditorStore((s) => s.clearTextureEditorRequest);
   useEffect(() => {
     if (!textureEditorRequest || textureEditorRequest.path !== path) return;
-    if (textureEditorRequest.kind === 'nineslice') setNineSliceOpen(true);
-    else setSpriteEditorOpen(true);
+    // The modals portal to document.body, so the locked fieldset cannot disable them: a locked asset's request is
+    // dropped here instead of opening an editor whose Save is refused.
+    if (importLock === null) {
+      if (textureEditorRequest.kind === 'nineslice') setNineSliceOpen(true);
+      else setSpriteEditorOpen(true);
+    }
     clearTextureEditorRequest();
-  }, [textureEditorRequest, path, clearTextureEditorRequest]);
+  }, [textureEditorRequest, path, clearTextureEditorRequest, importLock]);
   const spriteCount = Array.isArray(meta?.sprites) ? (meta!.sprites as unknown[]).length : 0;
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
@@ -327,6 +337,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       {/* Source preview */}
       <img src={assetUrl(path)} alt={name} style={{ width: '100%', maxHeight: 140, objectFit: 'contain', background: '#1a1a1a', border: '1px solid #333', marginBottom: 6 }} />
 
+      <ImportLockFieldset lock={importLock}>
       <TextureSettingsControls type={type} settings={settings} onChangeType={changeType} onChange={update} advancedOpen={false} />
 
       {type === 'ui' && (
@@ -366,13 +377,16 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       >
         {importing ? 'Converting...' : converted ? 'Re-import' : 'Apply'}
       </button>
-      {converted && <TextureImportedStats cache={meta?.textureCache as TextureCacheInfo | undefined} incomplete={statsIncomplete} />}
+      </ImportLockFieldset>
+      {converted && <TextureImportedStats cache={meta?.textureCache as TextureCacheInfo | undefined} incomplete={statsIncomplete} reimportable={importLock === null} />}
 
       <div style={sectionStyle}>Sprites</div>
       <button
         data-ui-id="assetView.texture.spriteEditor" data-ui-kind="button" data-ui-label="Sprite Editor"
         onClick={() => setSpriteEditorOpen(true)}
-        style={{ ...reimportBtnStyle, marginTop: 2 }}
+        disabled={importLock !== null}
+        title={importLock ?? undefined}
+        style={{ ...reimportBtnStyle, marginTop: 2, ...(importLock !== null ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
       >
         Sprite Editor{spriteCount > 0 ? ` (${spriteCount})` : ''}
       </button>
@@ -386,14 +400,15 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
 
 /** Post-conversion stats read back from the meta sidecar: actual (snapped)
  *  dimensions, baked mip levels, and on-disk size per produced variant. */
-function TextureImportedStats({ cache, incomplete }: { cache: TextureCacheInfo | undefined; incomplete?: boolean }) {
+function TextureImportedStats({ cache, incomplete, reimportable }: { cache: TextureCacheInfo | undefined; incomplete?: boolean; reimportable: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
   const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', textTransform: 'uppercase', margin: '10px 0 3px' };
 
   if (!cache || cache.width === undefined) {
-    return <div style={{ color: '#666', fontSize: '10px', marginTop: 4 }}>Converted ✓ — re-import to compute stats</div>;
+    // #2060: the remedy is named only where it can work.
+    return <div style={{ color: '#666', fontSize: '10px', marginTop: 4 }}>{reimportable ? 'Converted ✓ — re-import to compute stats' : 'Converted ✓'}</div>;
   }
   const bytes = cache.variantBytes ?? {};
   // ⚠️ `undefined` is NOT zero here, and defaulting it was the worse half of #1305. `variantBytes`
@@ -417,7 +432,7 @@ function TextureImportedStats({ cache, incomplete }: { cache: TextureCacheInfo |
       </div>
       {incomplete && (
         <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
-          {MISSING_STATS_HINT}
+          {missingStatsHint(reimportable)}
         </div>
       )}
     </>

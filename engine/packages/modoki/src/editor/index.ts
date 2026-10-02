@@ -27,6 +27,7 @@ export {
 export { preflightSceneMove, formatSceneMoveConfirm } from './scene/sceneMoveScan';
 export { prefabEditRefusal, assertPrefabEditAllows, PrefabEditRefusalError, PREFAB_EDIT_REFUSAL_TEXT, type PrefabEditRefusalReason } from './scene/prefabEditRefusal';
 export { createTargetScene } from './scene/sceneDirty';
+export { currentBuiltinImportLock } from './panels/assetViews/builtinImportLock';
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,

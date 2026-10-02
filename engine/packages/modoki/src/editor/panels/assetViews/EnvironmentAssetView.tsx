@@ -22,7 +22,9 @@ import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../..
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
-import { MISSING_STATS_HINT } from './measuredStats';
+import { useBuiltinImportLock } from './builtinImportLock';
+import { ImportLockFieldset } from './ImportLockFieldset';
+import { missingStatsHint } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
@@ -64,6 +66,8 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   // `environmentCache.bytes` is peeled (#1305), so the Variant size row below is absent on a
   // machine that never baked this map — say so rather than silently dropping the row.
   const statsIncomplete = useMissingLocalStats(path, 'environmentCache');
+  // #2060: a built-in's import settings are refused in the packaged editor — offer none of them there.
+  const importLock = useBuiltinImportLock(path);
 
   const applyMeta = useCallback((m: Record<string, unknown>) => {
     setMeta(m);
@@ -213,6 +217,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       </div>
 
       <div style={sectionStyle}>Import</div>
+      <ImportLockFieldset lock={importLock}>
       <div style={rowStyle}>
         <span style={labelStyle}>Format</span>
         <select data-ui-id="assetView.environment.format" data-ui-kind="field" data-ui-label="Format" value={settings.format} onChange={(e) => update({ format: e.target.value as EnvImportSettings['format'] })} style={{ ...inputStyle, flex: 1 }}>
@@ -247,6 +252,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
       >
         {importing ? (settings.format === 'ultrahdr' ? 'Encoding...' : 'Downscaling...') : converted ? 'Re-import' : 'Apply'}
       </button>
+      </ImportLockFieldset>
 
       <div style={sectionStyle}>Info</div>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '1px 0' }}>
@@ -270,7 +276,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
             )}
             {statsIncomplete && (
               <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
-                {MISSING_STATS_HINT}
+                {missingStatsHint(importLock === null)}
               </div>
             )}
           </>

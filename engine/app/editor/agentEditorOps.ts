@@ -79,6 +79,7 @@ detachPrefabInstanceWithUndo, detachRefusal,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, setFreshFileReadObserver, beginFreshFileRead, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
 UndoRefusedError, isUndoStepInFlight, isSnapshotOperationInFlight, beginForwardEdit,
+  currentBuiltinImportLock,
 } from '@modoki/engine/editor';
 import { recordsUndo, stepRunningRefusal, applyRunningRefusal } from './agentOpUndoClass';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
@@ -681,6 +682,13 @@ function resolveLiveIdOrSkip(ref: EntityAddress, op: string, miss: { stale?: str
  *  because `modoki_open_skin_editor {path:'/assets/textures/ui.png'}` opened the Skin editor on
  *  a PNG with a clean success). `getAssetEntry` indexes BOTH guid and path, so it actually
  *  resolves what this asserts against. */
+/** Refuse to open a texture's Sprite / 9-slice editor on an asset whose import settings are locked (#2060): an engine
+ *  built-in in the packaged editor, whose `.meta.json` write is refused (#1959), so the modal could never save. */
+function refuseLockedTextureEditor(path: string, op: string): void {
+  const lock = currentBuiltinImportLock(path);
+  if (lock !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${path} — ${lock}`);
+}
+
 function requireAssetPath(path: string | undefined, expected: string, op: string): void {
   if (typeof path !== 'string' || !path) throw new Error(`${op} requires { path } — the asset's served URL (see modoki_list_assets).`);
   if (!getGuidForPath(path)) throw new OpRefusal('NOT_FOUND', `${op}: no asset found at "${path}" — it resolves to no manifest entry (typo, or wrong path). Find it with modoki_list_assets.`);
@@ -2173,6 +2181,7 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('open-sprite-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-sprite-editor');
+    refuseLockedTextureEditor(p.path!, 'open-sprite-editor');
     // The modal's own mount effect resets `spriteEditorSelection` to null, but a call on a path
     // that is ALREADY open re-triggers no mount (TextureAssetView's `setSpriteEditorOpen(true)`
     // is a no-op on an already-true boolean) — so without this, joining a session the human
@@ -2186,6 +2195,7 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('open-nine-slice-editor', async (params) => {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
+    refuseLockedTextureEditor(p.path!, 'open-nine-slice-editor');
     useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.displayName);
     const path = p.path!;
     await awaitTextureModal('nineslice', path, 'open-nine-slice-editor');

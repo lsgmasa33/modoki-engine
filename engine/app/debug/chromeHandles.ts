@@ -38,11 +38,16 @@ const UI_LABEL_ATTR = 'data-ui-label';
 const UI_STATE_ATTR = 'data-ui-state';
 
 /** Is this control present but inert? Covers the three ways the editor greys something out:
- *  a real `disabled` property, `aria-disabled`, and the `data-ui-disabled` escape hatch for
+ *  a real `disabled` state, `aria-disabled`, and the `data-ui-disabled` escape hatch for
  *  a styled div that isn't a `<button>`. Reported as `meta.disabled` — an agent should not
- *  have to infer "greyed out" from a JPEG's shade of grey. */
+ *  have to infer "greyed out" from a JPEG's shade of grey.
+ *
+ *  ⚠️ `:disabled`, never the `.disabled` property (#2060): a control inside a `<fieldset disabled>` is disabled
+ *  while its own property still reads `false`. The asset Inspectors lock a built-in's import settings that way, and
+ *  the property check reported every one of them live, so a `modoki_tap` on a locked Apply passed the disabled-handle
+ *  refusal and clicked nothing. `projectSettingsPaths.ts` learned the same rule for the same primitive. */
 function isDisabled(el: Element): boolean {
-  if ((el as HTMLButtonElement).disabled === true) return true;
+  if (el.matches(':disabled')) return true;
   const aria = el.getAttribute('aria-disabled');
   if (aria === 'true') return true;
   return el.getAttribute('data-ui-disabled') === 'true';

@@ -54,6 +54,8 @@ import { AtlasAssetView } from './assetViews/AtlasAssetView';
 import { AudioAssetView } from './assetViews/AudioAssetView';
 import { VideoAssetView } from './assetViews/VideoAssetView';
 import { EnvironmentAssetView } from './assetViews/EnvironmentAssetView';
+import { useBatchImportLock } from './assetViews/builtinImportLock';
+import { ImportLockFieldset } from './assetViews/ImportLockFieldset';
 import { FontAssetView } from './assetViews/FontAssetView';
 import { ModelAssetView } from './assetViews/ModelAssetView';
 import { ShaderAssetView } from './assetViews/ShaderAssetView';
@@ -1441,6 +1443,11 @@ function AssetBatchInspector({ assets }: { assets: SelectedAsset[] }) {
   const types = new Set(assets.map((a) => a.type));
   const commonType = types.size === 1 ? assets[0].type : null;
   const paths = assets.map((a) => a.path);
+  // #2060: one engine built-in in the selection locks the batch in the packaged editor — every edit lands on every path.
+  // Only a selection that GETS a batch view is judged: a mixed or unsupported one has nothing to lock, and the reason
+  // would sit above "no shared settings" telling the human to deselect for an edit that was never offered.
+  const hasBatchView = commonType === 'texture' || commonType === 'material' || commonType === 'model';
+  const importLock = useBatchImportLock(hasBatchView ? paths : []);
   return (
     <div style={containerStyle}>
       <div style={{ padding: '4px 8px', borderBottom: '1px solid #333' }}>
@@ -1453,9 +1460,11 @@ function AssetBatchInspector({ assets }: { assets: SelectedAsset[] }) {
         {!commonType && <div style={{ color: '#555', fontSize: '10px', marginTop: 2 }}>mixed types — no shared settings</div>}
       </div>
       <div style={{ padding: '8px', flex: 1, minHeight: 0, overflowY: 'auto' }}>
-        {commonType === 'texture' && <TextureBatchView paths={paths} />}
-        {commonType === 'material' && <MaterialBatchView paths={paths} />}
-        {commonType === 'model' && <ModelBatchView assets={assets} />}
+        <ImportLockFieldset lock={importLock}>
+          {commonType === 'texture' && <TextureBatchView paths={paths} />}
+          {commonType === 'material' && <MaterialBatchView paths={paths} />}
+          {commonType === 'model' && <ModelBatchView assets={assets} />}
+        </ImportLockFieldset>
         {commonType && !['texture', 'material', 'model'].includes(commonType) && (
           <div style={{ color: '#555', fontSize: '11px' }}>Batch editing not supported for {commonType} assets</div>
         )}

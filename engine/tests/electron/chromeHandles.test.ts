@@ -100,6 +100,19 @@ describe('chromeHandles', () => {
       expect(byId('inspector.health.paste')!.meta).toEqual({ disabled: true });
     });
 
+    /** #2060: an ancestor `<fieldset disabled>` disables a control while its own `.disabled` stays false — the asset
+     *  Inspectors lock a built-in's import settings that way, and the property check reported them all live. */
+    it('detects a control disabled by an ancestor <fieldset disabled>', () => {
+      const fieldset = document.createElement('fieldset');
+      fieldset.disabled = true;
+      document.body.appendChild(fieldset);
+      const { el, cx, cy } = tag('assetView.font.apply');
+      fieldset.appendChild(el);
+      stubHitTest([{ x: cx, y: cy, el }]);
+      expect((el as HTMLButtonElement).disabled).toBe(false); // the trap: the property does not see the ancestor
+      expect(byId('assetView.font.apply')!.meta).toEqual({ disabled: true });
+    });
+
     it('detects aria-disabled and the data-ui-disabled escape hatch for styled divs', () => {
       const a = tag('m.a.x', { attrs: { 'aria-disabled': 'true' } });
       const b = tag('m.b.x', { tag: 'div', attrs: { 'data-ui-disabled': 'true' }, rect: { left: 0, top: 200, width: 10, height: 10 } });

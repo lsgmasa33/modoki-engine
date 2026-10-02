@@ -22,6 +22,7 @@ import { useEditorStore } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { setEditorPackaged } from '../../packages/modoki/src/editor/editorHost';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -33,6 +34,9 @@ const RIG_PATH = '/assets/characters/hero.rig2d.json';
 
 registerAsset(TEXTURE_GUID, TEXTURE_PATH, 'texture');
 registerAsset(RIG_GUID, RIG_PATH, 'rig2d');
+const BUILTIN_TEXTURE_GUID = '00000012-0000-4000-8000-000000000012';
+const BUILTIN_TEXTURE_PATH = '/modoki/assets/favicon.png';
+registerAsset(BUILTIN_TEXTURE_GUID, BUILTIN_TEXTURE_PATH, 'texture');
 
 type OpReply = { ok: boolean; error?: string; [k: string]: unknown };
 
@@ -65,7 +69,7 @@ beforeEach(() => {
   });
   unmount = mountEditorsLikeTheRealPanels();
 });
-afterEach(() => { unmount?.(); unmount = null; vi.useRealTimers(); });
+afterEach(() => { unmount?.(); unmount = null; vi.useRealTimers(); setEditorPackaged(false); });
 
 /** Run an opener with no panel to mount, fast-forwarding its mount wait. */
 async function openWithNothingMounting(op: string, params: unknown): Promise<unknown> {
@@ -219,6 +223,21 @@ describe('open-sprite-editor resets the prior selection', () => {
     useEditorStore.setState({ editorMounts: {} }); // the modal closed
     const e = await openWithNothingMounting('open-nine-slice-editor', { path: TEXTURE_PATH });
     expect(e).toMatchObject({ code: 'NOT_AVAILABLE_HERE' });
+  });
+
+  /** #2060: an engine built-in's .meta.json write is refused in the packaged editor (#1959), so neither modal may
+   *  open on one — the human's buttons are disabled, and the modals portal out of the locked fieldset. */
+  it.each(['open-sprite-editor', 'open-nine-slice-editor'])('%s REFUSES an engine built-in in the packaged editor, and posts no request', async (op) => {
+    setEditorPackaged(true);
+    await expect(runAgentOp(op, { path: BUILTIN_TEXTURE_PATH }))
+      .rejects.toMatchObject({ code: 'REFUSED_BY_OP', message: expect.stringMatching(/read-only in the packaged editor/) });
+    expect(useEditorStore.getState().textureEditorRequest).toBeNull();
+    expect(useEditorStore.getState().editorMounts).toEqual({});
+  });
+
+  /** Accept side: a dev clone edits the engine repo's built-ins on purpose, so the same call opens there. */
+  it('opens an engine built-in in a dev editor', async () => {
+    await expect(runAgentOp('open-sprite-editor', { path: BUILTIN_TEXTURE_PATH })).resolves.toMatchObject({ ok: true });
   });
 
   it('REFUSES a rig2d path — the sprite editor only opens textures', async () => {

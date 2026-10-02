@@ -22,7 +22,9 @@ import { OUTLINE_MAX_SPREAD } from '../../../runtime/rendering/text/mtsdfStyle';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
 import { useMissingLocalStats } from '../useMissingLocalStats';
-import { MISSING_STATS_HINT } from './measuredStats';
+import { useBuiltinImportLock } from './builtinImportLock';
+import { ImportLockFieldset } from './ImportLockFieldset';
+import { missingStatsHint } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
 
@@ -76,6 +78,8 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
   // #1305: this host holds no measurement for some of the rows below — say so rather than
   // render a blank (or, as texture and model once did, a defaulted 0 B).
   const statsIncomplete = useMissingLocalStats(path, 'fontCache');
+  // #2060: a built-in's import settings are refused in the packaged editor — offer none of them there.
+  const importLock = useBuiltinImportLock(path);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<FontImportSettings>(DEFAULT_FONT_SETTINGS);
   const [customChars, setCustomChars] = useState('');
@@ -196,6 +200,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
     <>
       <div style={{ color: '#ccc', fontSize: 12, marginBottom: 6, wordBreak: 'break-all' }}>{name}</div>
 
+      <ImportLockFieldset lock={importLock}>
       <div style={sectionStyle}>Atlas</div>
       {/* Field type is BAKED-only. The dynamic path's WASM generator emits MSDF and
           synthesizes alpha as median(RGB), so it cannot honour this — and an unwired
@@ -341,7 +346,8 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       >
         {importing ? 'Baking...' : converted ? 'Re-bake' : 'Apply'}
       </button>
-      {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} incomplete={statsIncomplete} />}
+      </ImportLockFieldset>
+      {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} incomplete={statsIncomplete} reimportable={importLock === null} />}
       {converted && <FontAtlasPreview path={path} cache={meta?.fontCache as FontCacheInfo | undefined} />}
       <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.font.unsaved" />
     </>
@@ -499,7 +505,7 @@ function FontAtlasPreview({ path, cache }: { path: string; cache: FontCacheInfo 
 
 /** Post-bake stats read back from the meta sidecar: atlas dimensions, glyph count,
  *  and atlas PNG size. */
-function FontImportedStats({ cache, incomplete }: { cache: FontCacheInfo | undefined; incomplete?: boolean }) {
+function FontImportedStats({ cache, incomplete, reimportable }: { cache: FontCacheInfo | undefined; incomplete?: boolean; reimportable: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -519,7 +525,7 @@ function FontImportedStats({ cache, incomplete }: { cache: FontCacheInfo | undef
       )}
       {incomplete && (
         <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
-          {MISSING_STATS_HINT}
+          {missingStatsHint(reimportable)}
         </div>
       )}
     </>

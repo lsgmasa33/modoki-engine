@@ -16,7 +16,10 @@ import { subscribeMissingLocalStats, getMissingLocalStatsVersion, missingLocalSt
  *
  *  The subscription is established BEFORE the early exit, deliberately: hooks cannot be
  *  conditional, and a panel whose path arrives asynchronously must already be subscribed when it
- *  does. */
+ *  does.
+ *
+ *  It answers whether the stats are missing, never whether they can be fixed: a view whose re-import is locked
+ *  (#2060) still says so, through `missingStatsHint`, minus the remedy. */
 export function useMissingLocalStats(path: string | undefined, block: string): boolean {
   useSyncExternalStore(subscribeMissingLocalStats, getMissingLocalStatsVersion, getMissingLocalStatsVersion);
   if (!path) return false;

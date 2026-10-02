@@ -29,6 +29,12 @@
  *  is the action — the button is already in every one of these panels. */
 export const MISSING_STATS_HINT = 'Some stats were never computed on this machine — re-import to fill them in.';
 
+/** The same sentence without its remedy, for a view whose re-import is refused (#2060 — an engine built-in in the
+ *  packaged editor). The row still says it does not know — #1305's point — but no longer names an action that fails. */
+export function missingStatsHint(reimportable: boolean): string {
+  return reimportable ? MISSING_STATS_HINT : 'Some stats were never computed on this machine.';
+}
+
 export function sumMeasured(values: ReadonlyArray<number | undefined> | undefined): number | undefined {
   if (!values) return undefined;
   let total: number | undefined;

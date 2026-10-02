@@ -2040,11 +2040,14 @@ if (canUC3) {
 }
 
 const uc14Assets = JSON.parse(text(await client.callTool({
-  name: 'modoki_list_assets', arguments: { type: 'texture', limit: 5 },
+  name: 'modoki_list_assets', arguments: { type: 'texture', limit: 50 },
 })));
-const uc14Path = uc14Assets?.assets?.[0]?.path;
+// A PROJECT texture, never an engine built-in (`/modoki/assets/…`): the packaged editor refuses a built-in's sidecar
+// write (#1959), and the listing put the engine's favicon.png first, so the case failed against every packaged editor
+// while passing in a dev clone, where that write is allowed on purpose (#2060's live sweep).
+const uc14Path = (uc14Assets?.assets ?? []).map((a) => a.path).find((p) => typeof p === 'string' && !p.startsWith('/modoki/'));
 if (!uc14Path) {
-  skipped.push('UC14 (.meta.json round trip) — the open project has no texture asset to read a sidecar from');
+  skipped.push('UC14 (.meta.json round trip) — the open project has no texture asset of its own to read a sidecar from');
 } else {
   const before = JSON.parse(text(await client.callTool({
     name: 'modoki_get_asset_meta', arguments: { path: uc14Path },
