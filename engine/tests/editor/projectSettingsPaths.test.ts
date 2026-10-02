@@ -2,7 +2,7 @@
  *  control that produced it. The dialog renders whatever this returns; the decision is here so it
  *  can be tested without mounting a panel in jsdom (CLAUDE.md § Editor). */
 import { describe, it, expect } from 'vitest';
-import { committedPathWarning, imagePreviewPath, isNonPortableProjectPath, shouldAcceptSettingsDrop } from '../../packages/modoki/src/editor/panels/projectSettingsPaths';
+import { committedPathWarning, imagePreviewPath, isNonPortableProjectPath, shouldAcceptSettingsDrop, draftForSave } from '../../packages/modoki/src/editor/panels/projectSettingsPaths';
 
 const icon = { type: 'path', committedPath: true } as const;
 const javaHome = { type: 'path' } as const;
@@ -131,5 +131,43 @@ describe('shouldAcceptSettingsDrop', () => {
     // The ordering is the whole guard: a types-only check passes for exactly the drags that do
     // damage.
     expect(shouldAcceptSettingsDrop(true, ['Files', 'application/editor-asset'])).toBe(false);
+  });
+});
+
+// #2049's sibling: Apply posts the whole draft loaded on open, so a readonly field went back as its open-time value and
+// replaced what its own flow (OTA Keys → Sync) or an agent wrote since. Mutation (measured): return the draft unchanged —
+// the first two go red (and the route test in projectSettingsPrecondition.test.ts); delete every field — the second.
+describe('draftForSave (#2049)', () => {
+  const schema = {
+    tabs: [{ title: 'OTA', groups: [{ title: 'OTA', fields: [
+      { key: 'ota.enabled', label: 'Enabled', type: 'checkbox' as const },
+      { key: 'ota.publicKey', label: 'Public key', type: 'readonly-text' as const },
+    ] }] }],
+  };
+  const draft = () => ({ ota: { enabled: true, publicKey: 'pk-read-on-open', baseUrl: 'https://x' }, app: { appId: 'com.x.y' } });
+
+  it('leaves out a readonly field, so the route leaves the file\'s value alone', () => {
+    expect(draftForSave(draft(), schema).ota).not.toHaveProperty('publicKey');
+  });
+
+  it('keeps every editable field and every field the schema does not name, and does not touch the draft itself', () => {
+    const d = draft();
+    expect(draftForSave(d, schema)).toEqual({ ota: { enabled: true, baseUrl: 'https://x' }, app: { appId: 'com.x.y' } });
+    expect(d.ota.publicKey).toBe('pk-read-on-open'); // the form still shows it
+  });
+
+  // The tests above use their own schema; this ties them to the REAL one, which `createGameEditor` builds inline
+  // (`engine/app/editor/setup.ts`, not importable without booting the editor), so it reads the source. Text-based: it
+  // proves the field is declared readonly there, which is what `draftForSave` keys on.
+  it('the real Project Settings schema declares ota.publicKey readonly-text', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync(new URL('../../app/editor/setup.ts', import.meta.url), 'utf-8');
+    const line = src.split('\n').find((l) => l.includes("key: 'ota.publicKey'"));
+    expect(line, 'setup.ts no longer declares an ota.publicKey field').toBeDefined();
+    expect(line).toContain("type: 'readonly-text'");
+  });
+
+  it('a readonly field whose section the draft lacks is not an error', () => {
+    expect(draftForSave({ app: { appId: 'com.x.y' } }, schema)).toEqual({ app: { appId: 'com.x.y' } });
   });
 });

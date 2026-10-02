@@ -19,3 +19,16 @@ export function otaKeySyncConfirmation(configPublicKey: string | null | undefine
     okLabel: 'Replace key',
   };
 }
+
+/** The POST body for the sync: the key's public half, PRECONDITIONED on the value the decision above was made against
+ *  (`readPublicKey`, the click-time read; #2049). The route refuses 409 `{conflict:true}` when `ota.publicKey` holds
+ *  anything else by the time the user answers, so a value an agent or another window set while the confirm was open is
+ *  never replaced unasked. `''` is what an empty field reads as. */
+export function otaKeySyncBody(keyPublicKey: string, readPublicKey: string | null | undefined): Record<string, unknown> {
+  return { ota: { publicKey: keyPublicKey }, expected: { ota: { publicKey: readPublicKey ?? '' } } };
+}
+
+/** What the dialog says when that precondition refuses the write. */
+export const OTA_KEY_SYNC_CONFLICT =
+  'Project Settings → OTA → Public key changed while you were deciding, so nothing was written. '
+  + 'The value shown is the one there now; press Sync again to decide against it.';

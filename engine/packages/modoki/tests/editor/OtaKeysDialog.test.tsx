@@ -109,8 +109,53 @@ describe('OtaKeysDialog', () => {
     const { getByText } = render(<OtaKeysDialog />);
     await waitFor(() => getByText('Sync to Project Settings'));
     fireEvent.click(getByText('Sync to Project Settings'));
-    await waitFor(() => expect(h.backendPostJson).toHaveBeenCalledWith('/api/project-settings', { ota: { publicKey: 'pk-new' } }));
+    await waitFor(() => expect(h.backendPostJson).toHaveBeenCalledWith('/api/project-settings',
+      { ota: { publicKey: 'pk-new' }, expected: { ota: { publicKey: '' } } }));
     expect(h.confirmInEditor).not.toHaveBeenCalled();
+  });
+
+  // #2049: the confirm can sit open while an agent writes ota.publicKey, so the write is preconditioned on the value the
+  // user was asked about, and the route's 409 is shown rather than read as a save. Mutation: post without `expected`
+  // (otaKeySyncBody), or drop the 409 branch — the first assertion, or the notice/error pair, goes red.
+  it('Sync is preconditioned on the value the user was asked about, and a 409 says nothing was written (#2049)', async () => {
+    let settingsReads = 0;
+    h.backendFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/ota/keys')) return jsonResponse({ ok: true, exists: true, publicKey: 'pk-new' });
+      settingsReads++;
+      return jsonResponse({ ota: { publicKey: settingsReads <= 2 ? 'pk-shipped' : 'pk-agent' } }); // the agent wrote last
+    });
+    h.confirmInEditor.mockResolvedValue(true);
+    h.backendPostJson.mockResolvedValue({ ok: false, status: 409, json: async () => ({ conflict: true, changed: ['ota.publicKey'], error: 'changed' }) } as Response);
+    useEditorStore.setState({ otaKeysOpen: true });
+
+    const { getByText, queryByText } = render(<OtaKeysDialog />);
+    await waitFor(() => getByText('Sync to Project Settings'));
+    fireEvent.click(getByText('Sync to Project Settings'));
+    await waitFor(() => expect(h.backendPostJson).toHaveBeenCalledWith('/api/project-settings',
+      { ota: { publicKey: 'pk-new' }, expected: { ota: { publicKey: 'pk-shipped' } } }));
+    await waitFor(() => getByText(/changed while you were deciding, so nothing was written/));
+    expect(queryByText(/Saved to Project Settings/)).toBeNull();
+    expect(settingsReads).toBe(3); // re-read after the refusal, so the banner shows the value there now
+  });
+
+  // The 409's other outcome: the concurrent writer synced this very key, so the re-read clears the mismatch and the Sync
+  // button is gone — "press Sync again" would point at nothing (close-out review). Mutation: always show the conflict.
+  it('a 409 whose re-read already holds this key says so, not "press Sync again"', async () => {
+    let settingsReads = 0;
+    h.backendFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/ota/keys')) return jsonResponse({ ok: true, exists: true, publicKey: 'pk-new' });
+      settingsReads++;
+      return jsonResponse({ ota: { publicKey: settingsReads <= 2 ? 'pk-shipped' : 'pk-new' } });
+    });
+    h.confirmInEditor.mockResolvedValue(true);
+    h.backendPostJson.mockResolvedValue({ ok: false, status: 409, json: async () => ({ conflict: true, changed: ['ota.publicKey'], error: 'changed' }) } as Response);
+    useEditorStore.setState({ otaKeysOpen: true });
+
+    const { getByText, queryByText } = render(<OtaKeysDialog />);
+    await waitFor(() => getByText('Sync to Project Settings'));
+    fireEvent.click(getByText('Sync to Project Settings'));
+    await waitFor(() => getByText(/already holds this key/));
+    expect(queryByText(/press Sync again/)).toBeNull();
   });
 
   it('does NOT show a mismatch warning once the keys match', async () => {

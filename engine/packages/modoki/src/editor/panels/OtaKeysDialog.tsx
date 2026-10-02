@@ -19,7 +19,7 @@ import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
 import { ModalShell } from '../components/ModalShell';
 import { confirmInEditor } from '../utils/saveDialog';
-import { otaKeySyncConfirmation } from './otaKeySync';
+import { otaKeySyncConfirmation, otaKeySyncBody, OTA_KEY_SYNC_CONFLICT } from './otaKeySync';
 
 interface KeyStatus { name: string; exists: boolean; publicKey: string | null }
 
@@ -116,8 +116,18 @@ export default function OtaKeysDialog() {
       // the DEFAULTS instead, so this button reset the whole project config (app
       // identity, signing) as a side effect of saving one key. Don't "simplify" the
       // route back to a full replace without fixing this caller too.
-      const res = await backendPostJson('/api/project-settings', { ota: { publicKey: status.publicKey } });
-      const j = await res.json() as { ok?: boolean; error?: string };
+      // Preconditioned on `current` (#2049): the confirm above can sit open for as long as the user reads it.
+      const res = await backendPostJson('/api/project-settings', otaKeySyncBody(status.publicKey, current));
+      const j = await res.json() as { ok?: boolean; error?: string; conflict?: boolean };
+      if (res.status === 409 && j.conflict) {
+        const again = await backendFetch('/api/project-settings');
+        const now = again.ok ? ((await again.json()) as { ota?: { publicKey?: string } })?.ota?.publicKey ?? null : undefined;
+        if (now !== undefined) setConfigPublicKey(now);
+        // Another writer synced this very key meanwhile: nothing is left to decide, and the Sync button is gone.
+        if (now === status.publicKey) setNotice('Project Settings → OTA → Public key already holds this key.');
+        else setError(OTA_KEY_SYNC_CONFLICT);
+        return;
+      }
       if (!res.ok || !j.ok) throw new Error(j.error || `save failed (${res.status})`);
       setConfigPublicKey(status.publicKey);
       setNotice('Saved to Project Settings → OTA → Public key.');

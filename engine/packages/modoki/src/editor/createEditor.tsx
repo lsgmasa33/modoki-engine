@@ -481,8 +481,9 @@ export interface ProjectSettingsField {
   committedPath?: boolean;
   /** `readonly-text` renders a disabled input showing the current value — for a
    *  setting that's DERIVED (e.g. `ota.publicKey`, written by a dedicated flow
-   *  like the OTA Keys dialog), never hand-typed. Still persisted through the
-   *  normal save path; the form just never offers an editable control for it. */
+   *  like the OTA Keys dialog), never hand-typed. NOT posted back on Apply
+   *  (`draftForSave`, #2049): the value shown is the one read when the dialog
+   *  opened, and writing it back replaced whatever that flow wrote since. */
   /** Conditional visibility: show this field only when the current value at
    *  `key` (a dot-path into the settings object) is one of `in`. Used e.g. to
    *  show the GCS/CDN fields only in the matching web-deploy mode. */

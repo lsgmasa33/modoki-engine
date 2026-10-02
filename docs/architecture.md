@@ -387,8 +387,10 @@ entity both values are correct anyway, so stating it costs nothing where it cann
 Two implementations, because `set_transform` has two backends and a capability that works in only
 one of them is the mode-dependent inconsistency this contract exists to prevent:
 
-- **Live path** — `getWorldTransform3D` + `getParentWorldMatrix3D` for the parent chain (a koota
-  query), then `matrixToTrs` → `worldToLocalTrs`.
+- **Live path** — `parentChainTrs` over the editor's live hierarchy (`livePoseHierarchy`, the one a
+  keep-world reparent walks: each local read now, each Frame2D fit from `frame2DFitNow`), then
+  `worldToLocalTrs`. Not the on-demand `getParentWorldMatrix3D`, whose fits are the last pass's: an
+  `apply-scene-ops` list runs no pass between ops (#2047).
 - **File path** — `runtime/scene/transformSpace.ts`, which walks `EntityAttributes.parentId`
   through the scene JSON's entity array and composes the same euler-XYZ product.
 

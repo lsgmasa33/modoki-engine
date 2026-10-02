@@ -115,6 +115,9 @@ it: it refuses a key name starting with `-` and puts the name after `--`, and ke
 that is not one safe token. (`?name=--rotate` used to reach the script's argv as the flag.) And OTA
 Keys' **Sync to Project Settings** asks first whenever it would REPLACE a non-empty `ota.publicKey`,
 judged on the value re-read at click time (`otaKeySync.ts`), since that strands every installed build.
+The write is preconditioned on that same value (`expected` on `POST /api/project-settings`, #2049): a key an
+agent or another window sets while the confirm is open makes the route refuse 409, the dialog says nothing was
+written and shows the value there now, and the user decides again.
 Belt and braces on top: the repo's `.gitignore` (`games/*/build/ota-keys/`, `demos/*/build/ota-keys/`),
 a scaffolded project's own `.gitignore` (the template's `gitignore`), an OTA-enabled game's own
 `.gitignore`, and an `electron-builder.yml` exclude so no key can ride into the signed app. `otaKeyIgnored.test.ts` fails the suite when any

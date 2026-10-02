@@ -15,7 +15,6 @@
  *  reparent) DO go through the undoable actions, exactly like the menus, so the
  *  agent's edits are undoable too. */
 
-import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
@@ -48,7 +47,7 @@ import {
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
   isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing, returnSceneTarget,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, ensureGuid, type TraitSpec,
-  planReparent, applyReparent, type ReparentPlan, preflightSceneMove, formatSceneMoveConfirm, createTargetScene, PREFAB_EDIT_REFUSAL_TEXT, PrefabEditRefusalError, assertPrefabEditAllows,
+  planReparent, applyReparent, type ReparentPlan, livePoseHierarchy, preflightSceneMove, formatSceneMoveConfirm, createTargetScene, PREFAB_EDIT_REFUSAL_TEXT, PrefabEditRefusalError, assertPrefabEditAllows,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, outsideChangeSuperseded, discardDirtyAssets,
@@ -90,7 +89,7 @@ import {
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid, resolveRef,
   getAllTraits, readTraitData, resolveCreateEntitySpec, parentRefusal, isResourceEntity, traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal, type MutateOp, type MutateEntityRef,
-  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, localFit2DOf, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
+  getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, localToWorldTrs, persistedTrsKeys, collapsedParentAxes, parentChainTrs, fittedLocalTrs, sameTrsMatrix,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, setEditorScenePathReader, assetUrl, normScenePath, type AssetSchemaType, collectHandles, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
@@ -1012,33 +1011,32 @@ function requireExistingAsset(path: string, op: string, kind: string): { ok: fal
  *  a per-frame decompose is a cost with no authoring benefit. The split is authoring vs simulation,
  *  which is a real line, not two accidental conventions.
  *
- *  A ROOT entity's parent matrix is the identity, so this is an exact no-op there. */
-/** Scratch for the parent-chain composition — this runs per set_transform op, not per frame,
- *  but allocating a Matrix4 per call for no reason is still noise. */
-const _parentM = new THREE.Matrix4();
-
+ *  A ROOT entity's parent matrix is the identity, so this is an exact no-op there.
+ *
+ *  THE PARENT FRAME IS COMPOSED AS THE NEXT PASS WILL COMPOSE IT (#2047), through the live hierarchy a reparent walks
+ *  (`livePoseHierarchy`): each node's local read now, and each Frame2D's fit computed now (`frame2DFitNow`). The
+ *  on-demand composer this used (`getParentWorldMatrix3D`) folds in the LAST pass's fits (`localFit2DOf`), and an
+ *  `apply-scene-ops` list runs no pass between its ops — so a world write after a reparent of a Frame2D host, or after
+ *  an edit of its `width`/`fit`, in the same list, inverted through a fit the host no longer had: written as (100,100),
+ *  drawn at (-100,400). Agent-only, since a human's edits have frames between them; the per-frame cache and the other
+ *  on-demand composers (physics write-back, gizmos) keep the last pass's fit, which is what is on screen. */
 function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { fields: Record<string, unknown> } | { error: string } {
-  const entity = findEntity(id);
-  const cur = entity?.get(Transform) as Record<string, number> | undefined;
-  if (!cur) return { fields };
-  const local = {
-    x: cur.x ?? 0, y: cur.y ?? 0, z: cur.z ?? 0,
-    rx: cur.rx ?? 0, ry: cur.ry ?? 0, rz: cur.rz ?? 0,
-    sx: cur.sx ?? 1, sy: cur.sy ?? 1, sz: cur.sz ?? 1,
-  };
-  const w = getWorldTransform3D(id);
-  const world = { x: w.x, y: w.y, z: w.z, rx: w.rx, ry: w.ry, rz: w.rz, sx: w.sx, sy: w.sy, sz: w.sz };
-  // Root: world == local already, so no conversion is needed (and none is safe to apply — the
-  // decompose round-trip would introduce float noise on untouched axes).
-  const isRoot = (['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const)
-    .every((k) => Math.abs(world[k] - local[k]) < 1e-9);
-  if (isRoot) return { fields };
+  const h = livePoseHierarchy();
+  if (!h) return { error: "space:'world' cannot be converted here: the Transform or EntityAttributes trait is not registered, so the parent chain cannot be read. Write space:'local'." };
+  // An entity with no Transform YET is converted too: the write adds one, as a LOCAL value under a parent that places
+  // it, and `trsOf` reads identity for the missing one (close-out review: passed through, world x 10 under a parent at
+  // x 100 landed at 110).
+  const local = h.trsOf(id);
+  const fit = h.fitOf?.(id);
+  const parentTrs = parentChainTrs(h, id);
+  // Root (or a parent chain composing to the identity) and no fit of its own: world == local already, so no conversion
+  // is needed (and none is safe to apply — the decompose round-trip would introduce float noise on untouched axes).
+  if (!fit && sameTrsMatrix(parentTrs, null)) return { fields };
 
-  const wantWorld = mergeTrs(world, fields);
   // Compose the parent chain exactly, then decompose ONCE — byte-for-byte what `parentWorldTrs`
-  // does on the file side, and what the render cache hands the gizmo. `getParentWorldMatrix3D` is
-  // the composition; the decompose is what makes this the TRS convention rather than the exact one.
-  const parentTrs = matrixToTrs(getParentWorldMatrix3D(id, getCurrentWorld(), _parentM));
+  // does on the file side, and what the render cache hands the gizmo. The decompose is what makes
+  // this the TRS convention rather than the exact one.
+  const wantWorld = mergeTrs(localToWorldTrs(fittedLocalTrs(local, fit), parentTrs), fields);
   // Same refusal as the file path: a zero-scaled ancestor collapses every descendant onto its
   // origin, so the request has no solution and `decompose` would silently substitute an identity
   // parent. See `collapsedParentAxes`.
@@ -1055,7 +1053,6 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
   // that snapshot, so undo the fit the same way — writing it as-is would put the fitted pose in the Transform, fitted
   // again next pass. Per axis, not as a matrix: a non-uniform (`stretch`) fit sits inside the rotation, and a
   // `P·T·S` matrix inverse decomposes to the wrong angle (rz 1.0 asked, 0.914 written).
-  const fit = entity ? localFit2DOf(entity.valueOf() as number) : undefined;
   if (fit) {
     const kx = fit.kx || 1, ky = fit.ky || 1;
     next = { ...next, x: (next.x - fit.x) / kx, y: (next.y - fit.y) / ky, sx: next.sx / kx, sy: next.sy / ky };
@@ -2955,8 +2952,9 @@ export function registerEditorAgentOps(): void {
     if (r.saved) {
       return {
         ok: true, scenePath: r.path,
-        // A Save As (#1414): name what the copy was made from, and that it carries its own id.
-        ...(r.savedAs ? { savedAsCopyOf: r.savedAs.from, freshSceneId: true } : {}),
+        // A Save As (#1414): name what the copy was made from, that it carries its own id, and which id the route
+        // stamped (#2052): a copy whose file holds any other id was re-minted by the scanner's collision heal.
+        ...(r.savedAs ? { savedAsCopyOf: r.savedAs.from, freshSceneId: true, copySceneId: r.savedAs.sceneId } : {}),
         ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}),
         // Name the asset docs this save wrote. They are the half a caller cannot otherwise see —
         // `saved:false` was the answer when the edit was parked, and this is where that promise

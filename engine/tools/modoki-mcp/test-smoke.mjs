@@ -1650,7 +1650,8 @@ if (canUC3) {
 // re-minted the committed scene. The case then dodged the collision (a plain `.json`, later a
 // `new_scene` first) instead of testing it. Since #1414 a save-as writes the copy under a FRESH scene
 // id with reminted entity guids and reopens it, so the case now does the dangerous thing on purpose
-// and asserts the ORIGINAL FILE IS BYTE-IDENTICAL afterwards, and the copy's id differs from it.
+// and asserts the ORIGINAL FILE IS BYTE-IDENTICAL afterwards, and the copy holds the id the route
+// stamped on it (`copySceneId`, #2052), which differs from the original's.
 //
 // It still exercises both halves of what `save-all` does, which is the whole point — but they are
 // observed with DIFFERENT strength, and the difference is worth knowing before trusting this case:
@@ -1674,11 +1675,12 @@ if (canUC3) {
   // Both probes sit in the run's own SMOKE_DIR, so this runs on whatever project is open without
   // assuming a folder layout. They used to sit in `/assets/scenes/` and `/assets/particles/` under a
   // comment claiming "every project has" them. games/anim-bug has no `particles/`, and the
-  // save left the folder behind (#1415). The scene probe's location is load-bearing, not a
-  // convenience: `…/assets/mcp-smoke/…` must still sort BEFORE `…/assets/scenes/tropical-island…`
-  // ('m' < 's') so the collision is the dangerous one (see the #1414 warning above). Named
-  // `mcp-smoke-save` so a leftover is identifiable as this case's.
-  const SAVE_SCENE = `${SMOKE_DIR}/mcp-smoke-save.scene.json`;   // sorts BEFORE scenes/tropical-island — see the #1414 warning above
+  // save left the folder behind (#1415). Where the probe sorts no longer decides whether the #1414
+  // check can fail (#2052: the stamped-id arm below holds either way); `…/assets/mcp-smoke/…` still
+  // sorts BEFORE `…/assets/scenes/tropical-island…`, so with no owner record the path-order heal
+  // would re-mint the ORIGINAL, which the byte-identity arm catches. Named `mcp-smoke-save` so a
+  // leftover is identifiable as this case's.
+  const SAVE_SCENE = `${SMOKE_DIR}/mcp-smoke-save.scene.json`;
   // A scene file's bytes as the backend serves its asset URL — straight off disk, through the same
   // path resolution the save used, so no guess about the project's asset-root layout is needed
   // (3d-test's is `runtime/assets`). Read before and after to prove the save-as never touched it.
@@ -1688,14 +1690,15 @@ if (canUC3) {
   };
   const originalBytes = SCENE ? await readSceneBytes(SCENE).catch(() => null) : null;
   const SAVE_PART = `${SMOKE_DIR}/mcp-smoke-save.particle.json`;
-  // The #1414 check only measures something when the COPY sorts first. Otherwise the healer keeps
-  // the original's id and rewrites the copy's, and "original byte-identical" passes on a regression
-  // too. A comment cannot enforce that across a SMOKE_DIR rename or an open scene at
-  // `/assets/main.scene.json`, so a run that cannot measure it says so (F12) instead of reporting it green.
-  // The healer compares with `localeCompare` (vite-asset-scanner.ts `buildManifest`), and so does this.
-  if (SCENE && SAVE_SCENE.localeCompare(SCENE) >= 0) {
-    skipped.push(`save_all's #1414 check — the probe ${SAVE_SCENE} does not sort before the open scene ${SCENE}, so a shared-id regression would re-mint the COPY and the byte-identity assertion could not fail`);
-  }
+  // The #1414 check does NOT rest on which file the heal re-mints (#2052). The route rebuilds the
+  // manifest before it answers, so a copy that still shared the original's id has already been
+  // healed by the time anything here reads it — and since #1996 the heal keeps the PRIOR OWNER this
+  // machine recorded (the original, which a live editor has always scanned), so it re-mints the
+  // COPY whatever the sort order. "Original byte-identical" alone then passes on that regression.
+  // What the heal cannot fake is the id the ROUTE stamped: `copySceneId` in the reply. A copy whose
+  // file holds any other id was re-minted, so the case asserts the file's id IS the stamped one and
+  // differs from the original's. Between them the two arms cover both heal orders: one that
+  // re-mints the original breaks byte-identity, one that re-mints the copy breaks the stamped id.
 
   // Four preconditions, each of which is about NOT damaging the human's editor — reported through
   // the SKIPPED mechanism (F12), never forced past.
@@ -1833,14 +1836,22 @@ if (canUC3) {
       if (onDisk.isError) throw new Error(`save_all reported ok, but the file is NOT on disk — validate_scene could not read ${SAVE_SCENE}: ${text(onDisk)}`);
       const vj = JSON.parse(text(onDisk));
       if (vj.path !== SAVE_SCENE) throw new Error(`validate_scene answered about ${vj.path}, not ${SAVE_SCENE}`);
-      // #1414: the ORIGINAL is byte-identical, and the copy carries its own scene id. Read straight
-      // off disk — the scanner's heal is what rewrote the original before, and it acts on files.
+      // #1414: the ORIGINAL is byte-identical, and the copy carries the id the route stamped on it.
+      // Read straight off disk — the scanner's heal is what rewrote the original before, and it acts
+      // on files. The stamped-id arm is what makes this falsifiable whichever file the heal keeps
+      // (#2052, see the comment where SAVE_SCENE is named).
       if (await readSceneBytes(SCENE) !== originalBytes) {
         throw new Error(`save_all's save-as MODIFIED the original scene ${SCENE} — restore it with git checkout (#1414)`);
       }
       const originalId = JSON.parse(originalBytes.replace(/^\uFEFF/, '')).id;
       const copyId = JSON.parse((await readSceneBytes(SAVE_SCENE)) ?? '{}').id;
-      if (!copyId || copyId === originalId) throw new Error(`save_all's copy carries the original's scene id (${originalId}) — #1414 regressed`);
+      if (typeof saved.copySceneId !== 'string' || !saved.copySceneId) {
+        throw new Error(`save_all's save-as reply names no copySceneId, so the copy's identity cannot be checked: ${JSON.stringify(saved).slice(0, 300)}`);
+      }
+      if (saved.copySceneId === originalId) throw new Error(`save_all stamped the copy with the original's scene id (${originalId}) — #1414 regressed`);
+      if (copyId !== saved.copySceneId) {
+        throw new Error(`save_all's copy holds scene id ${copyId}, not the ${saved.copySceneId} the route stamped — the scanner's collision heal re-minted it, so the copy was written sharing an id (#1414 regressed)`);
+      }
       console.log(`save_all saves the open scene as a copy with a fresh id (original untouched, verified on disk) and flushes ${saved.savedAssets.length} parked asset doc(s) ✓`);
     }, async () => {
       // 1. Put the editor back on the human's scene FIRST, so it is never left pointing at a file

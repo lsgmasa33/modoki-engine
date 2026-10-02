@@ -893,7 +893,11 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   other file's (`buildManifest(…, heal=true)`), so it re-minted the COMMITTED original whenever the
   copy sorted first. (Since #1996 the heal keeps the prior owner and falls back to path order only with no
   record: [editor.md](editor.md) § the copy census.) Measured on the MCP smoke: `mcp-smoke-save` rewrote `tropical-island`'s id. The
-  smoke case now does exactly that save-as and asserts the original stays byte-identical.
+  smoke case now does exactly that save-as and asserts the original stays byte-identical AND that the copy's file holds
+  the id the route stamped, which the reply names as `copySceneId` (#2052). Byte-identity alone stopped being able to
+  fail with #1996: the route rebuilds the manifest before it answers, and the prior-owner heal re-mints the COPY of a
+  shared id whatever the sort order, so the original was untouched on a regression too (observed with the route
+  mutated to keep the original's id: the old check passed, the stamped-id check failed).
 - **The editor reopens the copy.** The live world still holds the original's scene and entity guids.
   Left pointing at the copy, the next save would write them straight back into it, so the copy is
   loaded from disk. Any undo stack kept for the target path is dropped first (`forgetHistory`), since

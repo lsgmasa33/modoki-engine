@@ -518,8 +518,9 @@ export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuth
 export { isAncestorOf, isResourceEntity, parentRefusal, parentOrRootFor, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
 export { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from './core/ecs/traitEditPolicy';
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
- *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
-export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
+ *  The live path (`agentEditorOps.ts`) composes the same chain through the editor's live hierarchy and `parentChainTrs`,
+ *  each Frame2D fit as the next pass applies it (#2047). */
+export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, parentChainTrs, fittedLocalTrs, sameTrsMatrix, type TRS } from './scene/transformSpace';
 export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoadedFonts, fontFamilyFromPath, fontPathFromFamily, parseFontFilename, type FontInfo } from './loaders/fontLoader';
 // Text MEASUREMENT, exported because fitting text into a box is a game-level concern, not just a
 // renderer-internal one: a game that generates its own copy (Court's hint narration) has to be

@@ -450,6 +450,87 @@ describe("setTrait {space:'world'} on the LIVE path — the branch most agent ed
     expect(wt.sy).toBeCloseTo(4, 6); // the untouched axis keeps its fitted scale
   });
 
+  // #2047: an op list runs no propagation pass between its ops, so a world write after a structural edit in the SAME
+  // list must compose the fit the next pass will apply, not the last pass's. The Ice Reef shape: canvas 1000 x 2000 (no
+  // Transform), Reef a Frame2D 500 x 500 `cover` (fit k 4, x -500 once directly under the canvas), Fish under Reef.
+  // Mutation (measured): hand the world write the last pass's fit (`localFit2DOf`) instead of `frame2DFitNow` — the
+  // first test writes (100,100), drawn at (-100,400); the second is drawn at x -2900; the third at x 255. The other
+  // world-write tests stay green, since a pass ran before each of them.
+  const reefWithFish = (reefUnder: 'group' | 'canvas') => {
+    const w = getCurrentWorld();
+    const canvas = spawnEntity(w, Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', parentId: 0, guid: newGuid() }));
+    const group = spawnEntity(w, Transform({}), EntityAttributes({ name: 'Group', parentId: canvas.id(), guid: newGuid() }));
+    const reefGuid = newGuid();
+    const reef = spawnEntity(w, Transform({}), Frame2D({ width: 500, height: 500, fit: 'cover' }),
+      EntityAttributes({ name: 'Reef', parentId: reefUnder === 'group' ? group.id() : canvas.id(), guid: reefGuid }));
+    const fishGuid = newGuid();
+    const fish = spawnEntity(w, Transform({}), EntityAttributes({ name: 'Fish', parentId: reef.id(), guid: fishGuid }));
+    transformPropagationSystem(w);
+    expect(worldTransforms.get(reef.id())!.sx).toBe(reefUnder === 'group' ? 1 : 4); // nested under Group: not fitted
+    return { w, canvas, reef, reefGuid, fish, fishGuid };
+  };
+
+  it("space:'world' after a reparent INTO the canvas in the same op list lands where asked (#2047)", async () => {
+    const { w, canvas, fish, fishGuid, reefGuid } = reefWithFish('group');
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [
+        { op: 'setTrait', entity: { guid: reefGuid }, trait: 'EntityAttributes', fields: { parentId: (canvas.get(EntityAttributes) as { guid: string }).guid } },
+        { op: 'setTrait', entity: { guid: fishGuid }, trait: 'Transform', space: 'world', fields: { x: 100, y: 100 } },
+      ],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    expect([(await localOf(fishGuid)).x, (await localOf(fishGuid)).y]).toEqual([150, 25]);
+    transformPropagationSystem(w);
+    expect([worldTransforms.get(fish.id())!.x, worldTransforms.get(fish.id())!.y]).toEqual([100, 100]);
+  });
+
+  it("space:'world' after a Frame2D edit of the host in the same op list lands where asked (#2047)", async () => {
+    const { w, fish, fishGuid, reefGuid } = reefWithFish('canvas');
+    // 2000 x 500 `cover` in 1000 x 2000: k = 4 still (2000/500), but the box is now 8000 wide, so x = -3500.
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [
+        { op: 'setTrait', entity: { guid: reefGuid }, trait: 'Frame2D', fields: { width: 2000 } },
+        { op: 'setTrait', entity: { guid: fishGuid }, trait: 'Transform', space: 'world', fields: { x: 100, y: 100 } },
+      ],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    transformPropagationSystem(w);
+    expect(worldTransforms.get(fish.id())!.x).toBeCloseTo(100, 6);
+    expect(worldTransforms.get(fish.id())!.y).toBeCloseTo(100, 6);
+  });
+
+  it("space:'world' on the host itself after its own fit changed in the same op list lands where asked (#2047)", async () => {
+    const { w, reef, reefGuid } = reefWithFish('canvas');
+    // `stretch`: kx 2, ky 4, x 0 — the host's OWN fit is what the write undoes, so it must be the new one.
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [
+        { op: 'setTrait', entity: { guid: reefGuid }, trait: 'Frame2D', fields: { fit: 'stretch' } },
+        { op: 'setTrait', entity: { guid: reefGuid }, trait: 'Transform', space: 'world', fields: { x: 10 } },
+      ],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    transformPropagationSystem(w);
+    expect(worldTransforms.get(reef.id())!.x).toBeCloseTo(10, 6);
+    expect(worldTransforms.get(reef.id())!.sx).toBeCloseTo(2, 6);
+  });
+
+  // The write ADDS a Transform to an entity that has none, so it is converted like any other (close-out review of #2047:
+  // it was passed through as local, so world x 10 under a parent at x 100 landed at 110). Mutation: skip the conversion
+  // when the entity has no Transform — this goes red at 10 for -90.
+  it("space:'world' on an entity with no Transform yet adds the local that lands there", async () => {
+    const w = getCurrentWorld();
+    const parent = spawnEntity(w, Transform({ x: 100 }), EntityAttributes({ name: 'P', parentId: 0, guid: newGuid() }));
+    const kidGuid = newGuid();
+    const kid = spawnEntity(w, EntityAttributes({ name: 'C', parentId: parent.id(), guid: kidGuid }));
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'setTrait', entity: { guid: kidGuid }, trait: 'Transform', space: 'world', fields: { x: 10 } }],
+    }) as { errors: string[] };
+    expect(r.errors).toEqual([]);
+    expect((await localOf(kidGuid)).x).toBeCloseTo(-90, 6);
+    transformPropagationSystem(w);
+    expect(worldTransforms.get(kid.id())!.x).toBeCloseTo(10, 6);
+  });
+
   it("space:'world' places the child at the world point asked for", async () => {
     const { child } = await parentAndChild();
     await runAgentOp('apply-scene-ops', {

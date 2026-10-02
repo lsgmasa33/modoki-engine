@@ -22,7 +22,7 @@ export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
   reparentEntity, setActionCallback, createEntityWithUndo,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, type TraitSpec,
-  planReparent, applyReparent, COLLAPSED_PARENT_REFUSAL_TEXT, type ReparentPlan,
+  planReparent, applyReparent, COLLAPSED_PARENT_REFUSAL_TEXT, type ReparentPlan, livePoseHierarchy,
 } from './undo/entityActions';
 export { preflightSceneMove, formatSceneMoveConfirm } from './scene/sceneMoveScan';
 export { prefabEditRefusal, assertPrefabEditAllows, PrefabEditRefusalError, PREFAB_EDIT_REFUSAL_TEXT, type PrefabEditRefusalReason } from './scene/prefabEditRefusal';

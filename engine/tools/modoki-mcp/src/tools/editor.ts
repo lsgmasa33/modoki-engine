@@ -359,7 +359,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
         'named <name>.scene.json; any other name is REFUSED with the corrected path (the open scene keeps its own name). ' +
         'Required for a scene from new_scene (which has no path yet); the scene keeps it for later saves. ' +
         'Another file than the open scene\'s is a Save As: the copy gets a FRESH scene id and entity guids, OVERWRITES any ' +
-        'scene there (refs to it stop resolving), leaves the original unwritten, and is reopened. A loaded base is refused.',
+        'scene there (refs to it stop resolving), leaves the original unwritten, and is reopened; the reply\'s `copySceneId` is that id. A loaded base is refused.',
       ),
     },
     async ({ path }) => editorAction('save-all', path ? { path } : {}),

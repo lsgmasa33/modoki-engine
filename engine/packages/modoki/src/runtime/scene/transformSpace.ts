@@ -259,20 +259,30 @@ export function reparentSuffixes<N>(h: PoseHierarchy<N>, entity: N, newParent: N
   const newChain = newParent != null && h.places(newParent) ? [...chainOf(h, newParent), newParent] : [];
   let k = 0;
   while (k < oldChain.length && k < newChain.length && oldChain[k] === newChain[k]) k++;
-  const compose = (chain: N[]): TRS | null => {
-    if (!chain.length) return null;
-    _acc.identity();
-    for (const a of chain) {
-      const t = h.trsOf(a);
-      const fit = h.fitOf?.(a);
-      // Folded into the local FIELD BY FIELD, as transformPropagationSystem folds it (#1952). A fit matrix before the
-      // local agrees only when its scale commutes with the host's rotation: a turned `stretch` host's child landed 30 px off.
-      _acc.multiply(matrixOf(fit ? { ...t, x: fit.x + fit.kx * t.x, y: fit.y + fit.ky * t.y, sx: fit.kx * t.sx, sy: fit.ky * t.sy } : t, _m));
-    }
-    return decompose(_acc);
-  };
   const unknown = h.unreadable ? [...oldChain.slice(k), ...newChain.slice(k)].find((n) => h.unreadable!(n)) : undefined;
-  return { from: compose(oldChain.slice(k)), to: compose(newChain.slice(k)), ...(unknown !== undefined ? { unknown } : {}) };
+  return { from: composeChain(h, oldChain.slice(k)), to: composeChain(h, newChain.slice(k)), ...(unknown !== undefined ? { unknown } : {}) };
+}
+
+/** `node`'s local pose with its `fitOf` fit folded in FIELD BY FIELD, as transformPropagationSystem folds it (#1952). A
+ *  fit matrix before the local agrees only when its scale commutes with the host's rotation: a turned `stretch` host's
+ *  child landed 30 px off. */
+export function fittedLocalTrs(t: TRS, fit: LocalFit2D | undefined): TRS {
+  return fit ? { ...t, x: fit.x + fit.kx * t.x, y: fit.y + fit.ky * t.y, sx: fit.kx * t.sx, sy: fit.ky * t.sy } : t;
+}
+
+/** A root-first chain composed to one TRS, each node's fit folded in; null for an empty chain. */
+function composeChain<N>(h: PoseHierarchy<N>, chain: N[]): TRS | null {
+  if (!chain.length) return null;
+  _acc.identity();
+  for (const a of chain) _acc.multiply(matrixOf(fittedLocalTrs(h.trsOf(a), h.fitOf?.(a)), _m));
+  return decompose(_acc);
+}
+
+/** The frame `node`'s local pose lives in, before its own fit: its whole parent chain composed, each ancestor's fit
+ *  folded in. Null at the root. With a live hierarchy whose `fitOf` is `frame2DFitNow` this is what the NEXT pass will
+ *  compose, so a world write in the same op list as a reparent or a Frame2D edit lands where it was asked to (#2047). */
+export function parentChainTrs<N>(h: PoseHierarchy<N>, node: N): TRS | null {
+  return composeChain(h, chainOf(h, node));
 }
 
 /** The MINIMAL local write that keeps a reparented entity's world pose — the one owner every reparent route computes with

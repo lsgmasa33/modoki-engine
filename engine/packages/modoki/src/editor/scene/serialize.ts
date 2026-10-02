@@ -1291,8 +1291,10 @@ export interface SaveResult {
   /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
    *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
    *  carries the identities the file does. `reopened:false` means the copy IS on disk but the editor
-   *  is still on `from`, with its edits unsaved there — `note` says why. */
-  savedAs?: { from: string; reopened: boolean; note?: string };
+   *  is still on `from`, with its edits unsaved there — `note` says why. `sceneId` is the id the route stamped on the
+   *  copy, which the scanner's heal re-mints if the copy still shares an id with the original (#2052): the live smoke
+   *  compares it with the file's. */
+  savedAs?: { from: string; reopened: boolean; note?: string; sceneId: string };
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -1382,7 +1384,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   forgetHistory(written.path);
   editorEmit('!save', { path: written.path, entities: entityCount }); // Editor Percept (V2)
   console.log(`[Editor] Saved scene as a copy (fresh id ${written.guid}): ${entityCount} entities → ${written.path}`);
-  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note }, ...othersReport });
+  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note, sceneId: written.guid }, ...othersReport });
   // An edit that landed during the writes is in the live world but not in the copy — reopening
   // would discard it. Stay on the original, still dirty, and say so (#573's window, one level up).
   // …or the world is not at the state the copy was serialized at: a step or an edit during the serialize (the settled
@@ -1403,7 +1405,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   if (outcome !== 'loaded' && !adopted) {
     return stay(`the copy could not be reopened (${outcome}${_lastLoadFailureMessage ? `: ${_lastLoadFailureMessage}` : ''}); the editor stays on ${from} with its edits unsaved`);
   }
-  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true }, ...othersReport };
+  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true, sceneId: written.guid }, ...othersReport };
 }
 
 /** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */

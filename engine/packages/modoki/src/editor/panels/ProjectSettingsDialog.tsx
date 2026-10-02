@@ -19,7 +19,7 @@ import PhysicsLayersEditor from './PhysicsLayersEditor';
 import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
 import QualityTiersEditor from './QualityTiersEditor';
-import { committedPathWarning, imagePreviewPath, shouldAcceptSettingsDrop } from './projectSettingsPaths';
+import { committedPathWarning, imagePreviewPath, shouldAcceptSettingsDrop, draftForSave } from './projectSettingsPaths';
 import { parseStringList, stringListText } from './stringListText';
 import { Info } from './fields';
 import { fileToBase64 } from './fileBytes';
@@ -474,7 +474,7 @@ export default function ProjectSettingsDialog() {
     if (!draft) return;
     setSaving(true);
     setSaveError(null);
-    const res = await schema.save(draft);
+    const res = await schema.save(draftForSave(draft, schema)); // never a readonly field's open-time value (#2049)
     setSaving(false);
     if (res === true) { close(); return; }
     // Keep the dialog open AND say why: the draft is still in the fields, so the

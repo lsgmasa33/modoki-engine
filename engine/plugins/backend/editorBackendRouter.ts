@@ -489,6 +489,20 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** The dotted paths where `expected` (a POST /api/project-settings precondition, shaped like the GET reply) names a value
+ *  `current` does not hold (#2049). A nested object is walked; anything else is a leaf compared as JSON, so an expected
+ *  `''` matches only `''`. */
+function staleExpectedPaths(expected: Record<string, unknown>, current: unknown, prefix = ''): string[] {
+  const stale: string[] = [];
+  for (const [k, want] of Object.entries(expected)) {
+    const at = prefix ? `${prefix}.${k}` : k;
+    const have = isPlainObjectLocal(current) && Object.prototype.hasOwnProperty.call(current, k) ? current[k] : undefined;
+    if (isPlainObjectLocal(want)) stale.push(...staleExpectedPaths(want, have, at));
+    else if (JSON.stringify(want) !== JSON.stringify(have)) stale.push(at);
+  }
+  return stale;
+}
+
 /** Every key path in a reference object, NESTED KEYS INCLUDED (`postFX.bloom`, not `postFX`).
  *
  *  ⚠️ **A TOP-LEVEL LIST LETS THROUGH THE ONE SHAPE THE TIERS GUARD BELOW EXISTS TO REFUSE**
@@ -5715,6 +5729,12 @@ async function describeUnresolvedAgainstLiveWorld(
   // partial callers silently reset app identity to com.modokiengine.prototype and
   // blanked appleTeamId. Absence must mean "don't touch", never "reset to default".
   //
+  // `expected` (optional, not a section) is a PRECONDITION, shaped like the GET reply: every leaf it names must still
+  // hold that value, or the POST is refused 409 `{conflict:true, changed:[paths]}` and nothing is written (#2049). It is
+  // how a writer that ASKED the user about a value makes sure it replaces the value the user was asked about: OTA Keys
+  // → Sync asks before replacing a non-empty `ota.publicKey`, and an agent's write while that confirm was open was
+  // otherwise replaced unasked. The 409 names paths, never values, since a path may be a signing password.
+  //
   // What lands on disk is PRUNED, not the resolved config — see the file-stays-
   // minimal invariant in project-config.ts. Writing the resolved config is what
   // once handed an internal game the demo deploy bucket.
@@ -5736,7 +5756,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // `unknown config section(s) "configWarnings" — nothing was written`. No setting
       // could be saved until the file was hand-edited. Latent when found: no committed
       // project.config.json currently resolves to a warning.
-      const { configErrors: _configErrors, configWarnings: _configWarnings, ...bodyIn } =
+      const { configErrors: _configErrors, configWarnings: _configWarnings, expected, ...bodyIn } =
         (body ?? {}) as Record<string, unknown>;
       const { user: userPartIn, ...configPart } = bodyIn;
       let userPart = userPartIn;
@@ -5826,6 +5846,20 @@ async function describeUnresolvedAgainstLiveWorld(
             error: `rendering.three.tiers is replaced wholesale — post the complete block. ` +
               `${incompleteTiers.map(([k]) => `"${k}"`).join(', ')} is missing one or more of: ${requiredFields.join(', ')}.`,
           }, 400);
+        }
+      }
+      // The precondition (#2049), checked against what the GET answers, after every refusal that writes nothing and
+      // before any read the write is computed from. Synchronous from here to the writes, so no other request runs between.
+      if (expected !== undefined) {
+        if (!isPlainObjectLocal(expected)) {
+          return json({ error: '`expected` must be an object shaped like the GET /api/project-settings reply — nothing was written.' }, 400);
+        }
+        const changed = staleExpectedPaths(expected, { ...loadProjectConfig(ctx.projectRoot), user: loadProjectUserConfig(ctx.projectRoot) });
+        if (changed.length) {
+          return json({
+            error: `${changed.join(', ')} changed since it was read — nothing was written. Read Project Settings again and decide against the value there now.`,
+            conflict: true, changed,
+          }, 409);
         }
       }
       // Keep the PRE-EDIT file around: it is what prune measures "was already

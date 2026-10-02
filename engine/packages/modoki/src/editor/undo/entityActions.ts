@@ -1419,6 +1419,15 @@ function liveHierarchy(transformMeta: TraitMeta, attrMeta: TraitMeta): PoseHiera
   };
 }
 
+/** The live hierarchy for a caller outside this module: the agent's live `space:'world'` write composes its parent frame
+ *  through it (#2047), so a world write in the same op list as a reparent or a Frame2D edit sees the fit the next pass
+ *  applies, exactly as a reparent does. Null when the Transform or EntityAttributes trait is not registered. */
+export function livePoseHierarchy(): PoseHierarchy<number> | null {
+  const transformMeta = getTraitByName('Transform');
+  const attrMeta = getTraitByName('EntityAttributes');
+  return transformMeta && attrMeta ? liveHierarchy(transformMeta, attrMeta) : null;
+}
+
 /** The minimal Transform write that keeps `entityId`'s world pose under `newParentId` (0 = the root), from its LIVE local
  *  pose and the live chains — `reparentWrite`, the owner the file route shares. */
 function liveReparentWrite(entityId: number, newParentId: number, local: Record<string, unknown>, transformMeta: TraitMeta, attrMeta: TraitMeta):

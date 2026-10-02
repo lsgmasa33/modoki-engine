@@ -5405,7 +5405,12 @@ matches non-uniformly) and `alignX`/`alignY` (which part stays: 0 = left/top, 1 
   through `localFrame2D`. The live `space:'world'` write (`modoki_set_transform`, `modoki_mutate_scene` with an editor
   open; `agentEditorOps.ts`) works on full 3D TRS, so it inverts the bare parent and then undoes the fit PER AXIS
   (`(x − fit.x)/kx`, `sx/kx`), as propagation applied it; a fit folded into the parent matrix decomposes a `stretch`
-  fit to the wrong angle. A new writer must do one or the other.
+  fit to the wrong angle. A new writer must do one or the other. The live world write takes every fit, the
+  ancestors' and its own, as the NEXT pass will apply it (`livePoseHierarchy` → `parentChainTrs`, fits from
+  `frame2DFitNow`; #2047): an `apply-scene-ops` list runs no pass between ops, so a world write after a reparent of a
+  Frame2D host or an edit of its `width`/`fit` in the same list used to invert through the last pass's fit and land
+  off (asked (100,100) in the Ice Reef, drawn at (-100,400)). The gizmo and physics keep the last pass's fit, which is
+  the one on screen.
 - **A keep-world re-parent composes the fit in** (#1952): a Hierarchy drag into or out of a Frame2D subtree keeps
   the pose as drawn, with the fit as the next pass will apply it. The scene FILE cannot know a fit (it depends on the screen), so with no
   editor open `modoki_mutate_scene` never invents one: a re-parent across a fitted Frame2D keeps the local and warns,
