@@ -31,7 +31,7 @@ import { dropInstanceRecord, freshInstanceRecord, markStale, setInstanceRecord }
 import { ROOT_ROW_KEY, type InstanceRecord, type RowKey, type SceneTargetRecord } from '../../runtime/prefab/instanceRecord';
 import { valuesEqual } from '../scene/prefab';
 import { collectComparableTraits } from '../scene/prefabInstanceOverrides';
-import { guidOfEntity, instanceKeyMap, instanceTargetOf, outermostStoredRoot, storedRootsUnder, type InstanceTarget } from './instanceKeys';
+import { guidOfEntity, instanceKeyMap, instanceTargetOf, outermostStoredRoot, storedRootsAbove, storedRootsUnder, type InstanceTarget } from './instanceKeys';
 import { editorPrefabReader, recordForWrite } from './instanceSync';
 
 type Bag = Record<string, unknown>;
@@ -461,15 +461,16 @@ function prepareImpl(entityIds: readonly number[]): void {
 
 /** A copy (Duplicate, Paste) of `copyId` has just been spawned. A plain subtree is one added child (`addChild`). A copy
  *  that holds an instance, or that stayed linked as a member (#1756's link rules), is an instance copy, which S7 moves onto
- *  records (§ 3.2, the duplicate/paste row): the enclosing record is marked stale and the copies' records are seeded when
- *  first needed. Call `beginAddChild(parent)` before the spawn. */
+ *  records (§ 3.2, the duplicate/paste row): every enclosing record is marked stale (#2037) and the copies' records are
+ *  seeded when first needed. Call `beginAddChild(parent)` before the spawn. */
 function afterCopyImpl(copyId: number, world: World = getCurrentWorld()): void {
   const t = instanceTargetOf(copyId);
   if (storedRootsUnder(copyId).length || t?.kind === 'member') {
-    // The enclosing record (if any) goes stale, and the instances the copy holds are named unrecorded: a plain copy
-    // holding instances has no enclosing record, but its roots are new all the same.
-    const top = outermostStoredRoot(copyId);
-    markStale(world, 'duplicateInstance', top ? [guidOfEntity(top)] : []);
+    // The enclosing records (if any) go stale, and the instances the copy holds are named unrecorded: a plain copy
+    // holding instances outside every instance has no enclosing record, but its roots are new all the same. EVERY
+    // enclosing record, nearest first, not the outermost alone: a copy under a scene-added reference node nested in an
+    // instance changes the NODE's record, which stayed fresh and was compared without the copy's link (#2037).
+    markStale(world, 'duplicateInstance', storedRootsAbove(copyId).map(guidOfEntity));
     return;
   }
   addChild(copyId, world);

@@ -26,7 +26,7 @@ import {
   frameKeyIndex,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../core/version';
-import { memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
+import { instanceRowKeysIn, memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
 import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
 import { rowFrameAddress, nodeFrameAddress, liveFrameAddresser } from './frameAddress';
@@ -1341,7 +1341,7 @@ type PrefabFileEntry = {
 type PrefabDocReader = (ref: string) => unknown;
 
 /** R2's orphan test — does the template at `source` still declare what the scene row keyed `key` names? — the ONE
- *  spelling, for the load (`applyStoredMemberRows`) and the editor's rebuild (`settleKeptOrphans`, #1535), which
+ *  spelling, for the load (`applyStoredMemberRows`) and the editor's rebuild (`settleEntryRows`, #1535), which
  *  must leave the kept store exactly as a reload of the same scene would. A member row is backed while every
  *  component of its key is a node the template tree still declares; a NODE row (#1516) while its frame's row adds
  *  its key (`templateFrameKeys`, per frame).
@@ -1504,7 +1504,7 @@ export function keptMemberOrphans(rootGuid: string): Record<string, SceneMemberR
 }
 
 /** Replace the orphan rows kept for the instance root with guid `rootGuid` — the editor rebuild's write-back
- *  (`settleKeptOrphans`, #1535). A Refresh is the other route a template change reaches an open scene by, so it
+ *  (`settleEntryRows`, #1535). A Refresh is the other route a template change reaches an open scene by, so it
  *  must leave this store as a reload would: every row the NEW template no longer backs kept (fork 2), whatever
  *  frame it is in, and every one it backs again applied and gone. */
 export function setKeptMemberOrphans(rootGuid: string, rows: Record<string, SceneMemberRow>): void {
@@ -1862,7 +1862,7 @@ function userLinksOf(row: SceneMemberRow): SceneMemberRow | undefined {
 }
 
 /** R2 for a TEMPLATE reference node (#1542): the node's rows the template it expands no longer backs are kept under its
- *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleKeptOrphans`) read it
+ *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleEntryRows`) read it
  *  by. Runs after the derive, because until then the root has no guid to key by.
  *
  *  `keyed` is what `collectReferenceNodeRows` found in ONE scene entry's own statements — the file that entry came
@@ -1972,6 +1972,12 @@ function applyStoredMemberRows(
   const backed = (key: string) => test.backed(key);
   const orphans: Record<string, SceneMemberRow> = {};
   const lost: [string, SceneMemberRow][] = [];
+  // The walk's keys without an `a+` component are `live`'s member keys and the root (whose row no template backs, so it never
+  // asks), so only a key with one asks it — built on first ask, since it walks the whole world (close-out review: once per
+  // instance, on every load).
+  let liveAll: Set<string> | undefined;
+  const liveRow = (key: string): boolean => live.has(key)
+    || (key.includes('/a+') && (liveAll ??= new Set(instanceRowKeysIn(rootEcsId, world).values())).has(key));
   for (const [key, row] of Object.entries(members)) {
     // A NODE row (#1516) orphans when the template no longer adds its node, and is kept exactly as a member
     // row is (fork 2, owner 2026-09-24): the node vanishes with the template, and a template that brings it
@@ -1979,13 +1985,16 @@ function applyStoredMemberRows(
     // …and a row whose member a template layer REMOVED (#1914 R4, `isUntargetedRow`): its node is in the document, so
     // the test above calls it backed, but no member takes it. Kept the same way, without the warning: the template
     // still declares the node.
-    // …and the user-added nodes linked on a MEMBER row whose member the instance's OWN removal cuts (#2035; design § 10.4b:
-    // under the instance's own removal a user node is held, never dropped). A member row that is backed, untargeted by no
-    // lower layer and not live is that cut. Only a member row: `live` holds member keys alone, so a node row (`…/a+<key>`)
-    // is never in it, and its live node's children would be kept as well as spawned (close-out review). Only the links
-    // are kept: the cut takes the row's other records with it, as before (#1914 R4).
+    // …and the user-added nodes linked on a row whose node the instance's OWN removal cuts (#2035, #2038; design § 10.4b:
+    // under the instance's own removal a user node is held, never dropped). A row that is backed, untargeted by no lower
+    // layer and names no LIVE node is that cut — a member row, a node row (`…/a+<key>`), or one reaching into a template
+    // reference node (`…/a+<key>/…`). Live is every key the instance's keyed nodes answer to (`instanceRowKeysIn`), not
+    // `live`'s member keys alone: by those a live template-added node read as cut, and its user children were kept as well
+    // as spawned (#2035's close-out review). Only the links are kept: the cut takes the row's other records with it, as
+    // before (#1914 R4).
     const gone = !backed(key);
-    const cutLinks = !gone && isRecord(row) && !isUntargetedRow(row) && !live.has(key) && parseMemberRowKey(key).length ? userLinksOf(row) : undefined;
+    const links = !gone && isRecord(row) && !isUntargetedRow(row) ? userLinksOf(row) : undefined;
+    const cutLinks = links && !liveRow(key) ? links : undefined;
     if (!gone && !(isRecord(row) && isUntargetedRow(row)) && !cutLinks) continue;
     orphans[key] = cutLinks ?? row;
     if (gone) lost.push([key, row]);
@@ -3987,7 +3996,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // the walk that finds a member's row key reads the finished ECS parent tree.
         // Every instance, rows or not: a load is what makes the kept-orphan store current for this root (R2), and
         // one whose entry states no rows keeps none — a stale set left behind would be replayed by the editor's
-        // next rebuild (`settleKeptOrphans`, #1535 close-out review F4).
+        // next rebuild (`settleEntryRows`, #1535 close-out review F4).
         spawnedEntries.push(entryRowsOf(rootEcsId, source, entry));
       } else {
         // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a

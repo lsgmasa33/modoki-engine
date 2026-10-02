@@ -249,6 +249,63 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       expect(JSON.stringify((await loadSave(s1)).saved)).not.toContain(KID);
     });
 
+    // #2038: the same cut over a NODE row. R's row in P adds template node k1 under QA; the scene links Kid on k1's row
+    // (`…/a+k1`) and removes R. The fold holds Kid (§ 10.4b), so the load must keep the link as it keeps a member row's.
+    // R3b: k1 is a REFERENCE node (prefab S), and the link is on a row reaching into it (`…/a+k1/<SA>`).
+    describe('#2038: a user node on a NODE row under the instance\'s own cut', () => {
+      const KID = G(92);
+      const kid = { parentLocalId: 0, guid: KID, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: tf }, children: [] };
+      const S = { id: 'S', version: 5, rootLocalId: 1, entities: [row(1, 'S', 0), row(2, 'SA', 1)] };
+      const k1 = (prefab?: string) => ({ parentLocalId: 2, guid: '', key: 'k1', name: 'K1', ...(prefab ? { prefab } : {}), traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] });
+      const withK1 = (prefab?: string) => ({ ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [k1(prefab)] })] });
+      const NODE = `${R}/a+k1`, R3B = `${NODE}/${row(2, 'SA', 0).nodeGuid}`;
+      const forms: Array<[string, string, string?]> = [['the node-row form', NODE], ['R3b: a row reaching into a template reference node', R3B, 'S']];
+      for (const [name, at, prefab] of forms) {
+        it(`${name}: kept through load → save → reload → save`, async () => {
+          install(withK1(prefab), Q, S);
+          const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [at]: { own: [kid] } } })] });
+          expect(first.lines).toEqual([]);
+          expect(rowsOf(first.saved)[R]).toEqual({ removed: true });
+          expect(JSON.stringify(rowsOf(first.saved)[at])).toContain(KID);
+          const second = await loadSave(first.saved);
+          expect(second.lines).toEqual([]);
+          expect(rowsOf(second.saved)).toEqual(rowsOf(first.saved));
+        });
+
+        it(`${name}: the route — a template edit drops k1, R is deleted, the edit is undone — Kid is kept`, async () => {
+          install(P, Q, S); // P's edit drops k1
+          const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            await loadSave({ version: 15, entities: [top({ members: { [at]: { own: [kid] } } })] });
+            deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]);
+            const s1 = await save();
+            expect(rowsOf(s1)[R]).toEqual({ removed: true });
+            expect(JSON.stringify(rowsOf(s1)[at])).toContain(KID);
+            install(withK1(prefab), Q, S); // the edit is undone
+            const back = await loadSave(s1);
+            expect(back.lines).toEqual([]);
+            expect(JSON.stringify(rowsOf(back.saved)[at])).toContain(KID);
+          } finally { warn.mockRestore(); }
+        });
+      }
+
+      // The accept side of R3b: a user child of a member INSIDE a live template reference node spawns once and is not
+      // kept as well — its delete sticks (the #2035 review's HIGH, in the frame it did not test).
+      it('R3b, live: a user child under a member of a LIVE template reference node is not kept as well: its delete sticks', async () => {
+        install(withK1('S'), Q, S);
+        const first = await loadSave({ version: 15, entities: [top({ members: { [R3B]: { own: [kid] } } })] });
+        expect(first.lines).toEqual([]);
+        expect(JSON.stringify(first.saved)).toContain(KID);
+        await loadSave(first.saved);
+        expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
+        const kidEntity = [...getCurrentWorld().entities].find((x) => (x.get(ea()) as { guid?: string } | undefined)?.guid === KID)!;
+        deleteEntitiesWithUndo([kidEntity.id()]);
+        const s1 = await save();
+        expect(JSON.stringify(s1)).not.toContain(KID);
+        expect(JSON.stringify((await loadSave(s1)).saved)).not.toContain(KID);
+      });
+    });
+
     it('the route ordinary editing takes: a template edit orphans the link, the cut row is deleted, the edit is undone — the node is kept', async () => {
       const Q0 = { ...Q, entities: Q.entities.filter((r) => r.localId !== 2) }; // Q's edit drops QA
       install(P, Q0);

@@ -12,11 +12,11 @@
 import type { Entity } from 'koota';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { memberRowKeysIn } from '../../runtime/core/ecs/memberRows';
+import { instanceRowKeysIn } from '../../runtime/core/ecs/memberRows';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
 import { isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
-import { ROOT_ROW_KEY, type RowKey } from '../../runtime/prefab/instanceRecord';
+import type { RowKey } from '../../runtime/prefab/instanceRecord';
 
 function handles() {
   const world = getCurrentWorld();
@@ -41,49 +41,10 @@ function ownsRecord(pi: MemberPi, id: number, e: Entity | undefined): boolean {
   return (pi ? isStoredRoot(pi, id) : !!unresolvedRefOf(e as never)) && !templateKeyOf(e as never);
 }
 
-/** Every keyed node of the instance rooted at record-owning root `rootId`: the root, its members, its template-added nodes,
- *  and — through each template-added REFERENCE node, which opens a frame of its own (`…/a+<key>/…`) — every member and
- *  template-added node inside that frame, at any depth. The capture keys them the same way (`prefabCapture.ts`
- *  `referenceNodeRows`: the node's own member keys under its `a+` key). Keys are flat within a frame (§ 2.1). */
+/** Every keyed node of the instance rooted at record-owning root `rootId` — `instanceRowKeysIn`, in the runtime since the
+ *  load asks it too (#2038). */
 export function instanceKeyMap(rootId: number): Map<number, RowKey> {
-  const { world, byId, parentOf, piOf } = handles();
-  const keyOf = new Map<number, RowKey>([[rootId, ROOT_ROW_KEY]]);
-  for (const [id, k] of memberRowKeysIn(rootId, world)) keyOf.set(id, k);
-  const tk = (id: number) => templateKeyOf(byId.get(id) as never);
-  const refNode = (id: number) => isStoredRoot(piOf(id), id) && !!tk(id);
-  /** The frame a keyed node's children are keyed in: an owned nested root and a template-added reference node open their
-   *  own; any other node sits in its key's parent frame. */
-  const frameOf = (id: number): string => {
-    if (id === rootId) return '';
-    const k = keyOf.get(id)!;
-    return (piOf(id) as { parentLocalId?: number } | null)?.parentLocalId || refNode(id) ? k : k.slice(0, k.lastIndexOf('/'));
-  };
-  const depthUnder = (id: number): number => { let n = 0; for (let p = parentOf(id); p && n < 512; p = parentOf(p), n++) if (p === rootId) return n + 1; return 0; };
-  // Ancestors first, so a template-added reference node is usually keyed before its members are reached; to a FIXPOINT,
-  // because a member of one can sit above it (moved under the instance root, which keeps it linked) and only keys once the
-  // node does (review of #2026: the old oracle keying's fixpoint, kept).
-  const under = [...byId.keys()].map((id) => [id, depthUnder(id)] as const).filter(([, d]) => d > 0).sort((a, b) => a[1] - b[1]);
-  /** An instance entity this map does not key (yet) is ANOTHER instance's — a reference node the scene added under a
-   *  member, or one of its members — unless the frame it expanded from is keyed here (a member a pre-v5 frame leaves
-   *  unkeyed). A template-keyed node under another instance's entity belongs to that record, never this one (#2009). */
-  const foreign = (id: number): boolean => {
-    const pi = piOf(id);
-    return !!pi && !keyOf.has(pi.rootInstanceId ?? 0);
-  };
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const [id] of under) {
-      if (keyOf.has(id) || !tk(id)) continue;
-      let p = parentOf(id);
-      while (p && !keyOf.has(p) && !foreign(p)) p = parentOf(p);
-      if (!p || !keyOf.has(p)) continue;
-      const key = `${frameOf(p)}/a+${tk(id)}`;
-      keyOf.set(id, key);
-      grew = true;
-      if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world)) if (!keyOf.has(m)) keyOf.set(m, `${key}${k}`);
-    }
-  }
-  return keyOf;
+  return instanceRowKeysIn(rootId, getCurrentWorld());
 }
 
 /** Where an entity sits relative to the instance records:
@@ -120,6 +81,16 @@ export function outermostStoredRoot(entityId: number): number {
   let found = 0;
   for (let a = entityId, n = 0; a && n < 1024; a = parentOf(a), n++) if (ownsRecord(piOf(a), a, byId.get(a))) found = a;
   return found;
+}
+
+/** Every record-owning stored root above (or at) `entityId`, nearest first. A scene-added reference node owns a record
+ *  of its own inside its enclosing instance's (§ 2.5), so the record a node under it belongs to is the NEAREST of these,
+ *  not the outermost (#2037). */
+export function storedRootsAbove(entityId: number): number[] {
+  const { byId, parentOf, piOf } = handles();
+  const out: number[] = [];
+  for (let a = entityId, n = 0; a && n < 1024; a = parentOf(a), n++) if (ownsRecord(piOf(a), a, byId.get(a))) out.push(a);
+  return out;
 }
 
 /** Every record-owning stored root inside the subtree at `entityId`, itself included. */

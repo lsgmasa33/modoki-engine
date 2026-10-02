@@ -288,6 +288,29 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     expect(instanceKeyMap(rootId()).has(kid)).toBe(false);
     expect(instanceKeyMap(id).get(kid)).toBe('/a+k-x');
   });
+  // #2037 (hunt seed 1094): a copy holding an instance, landing under a scene-added reference node nested in an instance,
+  // is staged stale (S7 moves instance copies onto records). The record it changes is the NODE's, which owns one of its
+  // own inside Inst's (§ 2.5), so every enclosing record goes stale — and only those: an unrelated instance stays fresh.
+  // Mutations: mark `outermostStoredRoot` alone in `afterCopyImpl` (the node's record stays fresh); mark every record.
+  it('a copy holding an instance under a nested reference node stales every record enclosing it, and no other (#2037)', async () => {
+    const Q3 = 'cccccccc-0000-4000-8000-000000002018';
+    const q3 = { id: Q3, version: 5, name: 'Q3', rootLocalId: 1, entities: [
+      { localId: 1, name: 'QR3', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002023', traits: { EntityAttributes: { name: 'QR3', parentId: 0, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      { localId: 2, name: 'QM3', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002024', traits: { EntityAttributes: { name: 'QM3', parentId: 1, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+    ] };
+    const q = qDoc();
+    prefabs.set(Q3, q3); setPrefabCache(Q3, q3 as never); prefabs.set(Q, q); setPrefabCache(Q, q as never);
+    const node = await instantiatePrefabInstance(q3 as never, 'q3.prefab.json', byName('A'));
+    const unrelated = await instantiatePrefabInstance(q as never, 'q.prefab.json', 0);
+    await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('QM3')); // the instance the copy will hold
+    const world = getCurrentWorld();
+    expect(storedInstance(world, guidOf(node)!)?.stale).toBeUndefined();
+    expect(storedInstance(world, guidOf(unrelated)!)?.stale).toBeUndefined();
+    duplicateEntity(byName('QM3'), () => {}); // QM3's frame root is not in the copy: a PLAIN node under QR3, holding the instance
+    expect(storedInstance(world, guidOf(node)!)?.stale).toBe('duplicateInstance');
+    expect(storedInstance(world, ROOT1)?.stale).toBe('duplicateInstance');
+    expect(storedInstance(world, guidOf(unrelated)!)?.stale).toBeUndefined();
+  });
   const handle = (id: number) => [...getCurrentWorld().entities].find((e) => e.id() === id)!;
   // Mutation: run `instanceKeyMap`'s template pass once (no fixpoint) — X is reached before T keys its member M.
   it('a template-added node under a MOVED member of a template-added reference node keys in that node\'s frame (fixpoint)', async () => {

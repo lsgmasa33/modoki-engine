@@ -1676,4 +1676,14 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       {kind: 'addComponent', u: [0.834665124071762,  0.5015800362452865,  0.31836718623526394,  0.7737857250031084,  0.9253228609450161,  0.4302700215484947,  0.5980705958791077,  0.6880792316514999]},
     ],
   },
+  {
+    issue: 2037,
+    what: "#2037 (hunt seed 1094, minimized): copy O1, paste it under M (a member of the scene-added Q reference node under H1), duplicate that M: the copy is a stripped PLAIN node under the Q node, holding the pasted instance. The door's instance-copy branch marked only the OUTERMOST record (H1) stale, so the Q node's own record stayed fresh and I25 compared it without the copy's `/` own link. Every enclosing record goes stale now",
+    reaches: { op: 2, outcome: 'done' },
+    repro: [
+      {kind: 'copy', u: [0.047603919403627515, 0.1860050461255014, 0.7616051095537841, 0.7350369652267545, 0.3258965630084276, 0.8664930600207299, 0.6159129564184695, 0.4834953863173723]},
+      {kind: 'paste', u: [0.8183805355802178, 0.9486813894473016, 0.01189982588402927, 0.0742787797935307, 0.4845500800292939, 0.13237358047626913, 0.23614742350764573, 0.8943054398987442]},
+      {kind: 'duplicate', u: [0.6945080934092402, 0.6400255267508328, 0.6276550388429314, 0.33482245658524334, 0.3410636903718114, 0.628475341014564, 0.4927038447931409, 0.34074873523786664]},
+    ],
+  },
 ];

@@ -47,6 +47,7 @@ import { getCurrentWorld, findEntityById } from './world';
 import { getTraitByName } from './traitRegistry';
 import { durableGuid, formatMemberRowKey, isOwnedRoot, isStoredRoot, memberNodeId, type MemberPi } from '../assetRefRules';
 import { worldIdentityParents } from './identityParents';
+import { templateKeyOf } from '../templateIdentity';
 
 type RowPi = (NonNullable<MemberPi> & { nodeGuid?: string; parentNodeGuid?: string }) | null;
 
@@ -220,4 +221,62 @@ export function memberRowsToWrite(rootEcsId: number, world: World = getCurrentWo
     if (durableGuid((e.get(eaMeta.trait) as { guid?: string }).guid)) out.set(id, key);
   }
   return out;
+}
+
+/** Every KEYED node of the instance rooted at record-owning root `rootId`, by the fold's keys (design § 2.1): the root
+ *  (`'/'`), its members ({@link memberRowKeysIn}), its template-added nodes (their frame plus `/a+<key>`), and, through
+ *  each template-added REFERENCE node (which opens a frame of its own, `…/a+<key>/…`), every member and template-added
+ *  node inside that frame, at any depth. The capture keys them the same way (`prefabCapture.ts` `referenceNodeRows`: the
+ *  node's own member keys under its `a+` key). Keys are flat within a frame (§ 2.1).
+ *
+ *  In the runtime because the LOAD asks it too (#2038): which of a scene's rows name a node that is live now, member row
+ *  or not. The editor reads it as `instanceKeyMap`. */
+export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld()): Map<number, string> {
+  const ea = getTraitByName('EntityAttributes')?.trait;
+  const pi = getTraitByName('PrefabInstance')?.trait;
+  const keyOf = new Map<number, string>([[rootId, '/']]);
+  if (!ea || !pi) return keyOf;
+  const byId = new Map<number, Entity>();
+  for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
+  const parentOf = (id: number): number => ((byId.get(id)?.get(ea) as { parentId?: number } | undefined)?.parentId ?? 0);
+  const piOf = (id: number): MemberPi => {
+    const e = byId.get(id);
+    return e && e.has(pi) ? (e.get(pi) as MemberPi) : null;
+  };
+  for (const [id, k] of memberRowKeysIn(rootId, world)) keyOf.set(id, k);
+  const tk = (id: number) => templateKeyOf(byId.get(id) as never);
+  const refNode = (id: number) => isStoredRoot(piOf(id), id) && !!tk(id);
+  /** The frame a keyed node's children are keyed in: an owned nested root and a template-added reference node open their
+   *  own; any other node sits in its key's parent frame. */
+  const frameOf = (id: number): string => {
+    if (id === rootId) return '';
+    const k = keyOf.get(id)!;
+    return (piOf(id) as { parentLocalId?: number } | null)?.parentLocalId || refNode(id) ? k : k.slice(0, k.lastIndexOf('/'));
+  };
+  const depthUnder = (id: number): number => { let n = 0; for (let p = parentOf(id); p && n < 512; p = parentOf(p), n++) if (p === rootId) return n + 1; return 0; };
+  // Ancestors first, so a template-added reference node is usually keyed before its members are reached; to a FIXPOINT,
+  // because a member of one can sit above it (moved under the instance root, which keeps it linked) and only keys once the
+  // node does (review of #2026: the old oracle keying's fixpoint, kept).
+  const under = [...byId.keys()].map((id) => [id, depthUnder(id)] as const).filter(([, d]) => d > 0).sort((a, b) => a[1] - b[1]);
+  /** An instance entity this map does not key (yet) is ANOTHER instance's — a reference node the scene added under a
+   *  member, or one of its members — unless the frame it expanded from is keyed here (a member a pre-v5 frame leaves
+   *  unkeyed). A template-keyed node under another instance's entity belongs to that record, never this one (#2009). */
+  const foreign = (id: number): boolean => {
+    const p = piOf(id);
+    return !!p && !keyOf.has(p.rootInstanceId ?? 0);
+  };
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [id] of under) {
+      if (keyOf.has(id) || !tk(id)) continue;
+      let p = parentOf(id);
+      while (p && !keyOf.has(p) && !foreign(p)) p = parentOf(p);
+      if (!p || !keyOf.has(p)) continue;
+      const key = `${frameOf(p)}/a+${tk(id)}`;
+      keyOf.set(id, key);
+      grew = true;
+      if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world)) if (!keyOf.has(m)) keyOf.set(m, `${key}${k}`);
+    }
+  }
+  return keyOf;
 }

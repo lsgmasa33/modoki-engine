@@ -743,10 +743,13 @@ mechanically:
     editing reached it. A template edit drops the member, so the link is kept as an orphan; a delete of the cut row
     cannot take it (it is not live), so the save writes the cut beside it; undo the template edit, and the next save
     lost the node. Since #2035 (hub ruling: fixed now, not at S6) `applyStoredMemberRows` keeps such a row's user links
-    (`own`, and keyless legacy `added`) as an orphan, and the cut still takes its other records and any keyed copy. Only a
-    MEMBER row: the load's live keys hold member keys alone, so a node row read as cut, and a user child of a live
-    template-added node was kept as well as spawned (its delete came back; the close-out review's regression test).
-    Regression tests for each shape and that route: `foldInstanceOracle.test.ts`.
+    (`own`, and keyless legacy `added`) as an orphan, and the cut still takes its other records and any keyed copy.
+    #2035 first did this for a MEMBER row only, so a NODE row (`…/a+<key>`) and a row reaching into a template reference
+    node (`…/a+<key>/<guid>`, R3b) under the same cut still lost their node by the same route (#2038). "Cut" is now a
+    backed row that names no live keyed node of the instance (`instanceRowKeysIn`, the fold's keys, which the editor reads
+    as `instanceKeyMap`), not one missing from the member keys: by member keys alone a live template-added node read as
+    cut, and its user child was kept as well as spawned (its delete came back; #2035's close-out review).
+    Regression tests for each shape, that route, and the live side of both: `foldInstanceOracle.test.ts`.
   - Kept-only lines name their row and carry a marker that separates the waived shapes from loss:
     - `(applied)` only when the record, with that removal turned into a restore, projects the member. A gone member
       does not project after the restore either, so the fold losing its "removed, gone" record cannot read as applied.
