@@ -46,6 +46,9 @@ export interface EditorSceneStateBinding {
   setBaseScene(baseScene: string | undefined): void;
   /** The live world is the new clean baseline (`markSceneSaved`). */
   markSaved(): void;
+  /** `path` was just READ into the live world and adopted, baseline and all: a `baseScene` edit parked on it is applied
+   *  to the opened document, leaving it unsaved (#2069). After the baseline, or `markSaved` would erase that. */
+  openedFromFile(path: string): void;
   /** The PRIMARY world has edits since the baseline (`CAUSE_SPECS.sceneDirty`). */
   worldEdited(): boolean;
   /** How many `serialize.loadScene` calls are still COMING: past their entry (waiting included) and not yet in their
@@ -379,6 +382,8 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt, changesSeen: number): b
     clearSceneDirtyExcept(keptBaseGuids);
     baselineSeq += 1;
   }
+  // A world READ from a file (a load, a hot reload) carries that file's edit parked while it was closed (#2069).
+  if (record.path && record.baseScene === 'loaded') s.openedFromFile(record.path);
   // Leaving an edit world whose session is still open owes its repair (#1666) — whatever this world is, another edit
   // world included. Recorded from the owner's own record: the flag cannot say what was left (#1690).
   if (lastAdopted.edit) owed.add(lastAdopted.edit.path);

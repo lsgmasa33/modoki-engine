@@ -101,7 +101,7 @@ async function getModule() {
   // write routed to the spy the A3 case asserts on — the restore's base write now goes through the owner.
   const { bindEditorSceneState } = await import('../../src/editor/scene/sceneAdoption');
   bindEditorSceneState({
-    setScenePath: () => {}, setBaseScene: (b) => setCurrentBaseScene(b), markSaved: () => {},
+    setScenePath: () => {}, setBaseScene: (b) => setCurrentBaseScene(b), markSaved: () => {}, openedFromFile: () => {},
     worldEdited: () => false, sceneLoadsComing: () => 0, sceneLoadsSwappingComing: () => 0,
   });
   return import('../../src/editor/undo/applyPrefabUndo');

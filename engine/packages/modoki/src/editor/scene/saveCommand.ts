@@ -27,6 +27,7 @@ import {
 } from './timelinePreview';
 import { getModeOwner } from './playMode';
 import { beginWorldReplacement } from './authoringSettle';
+import { runSerialisedSave } from './saveQueue';
 
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
@@ -111,7 +112,9 @@ let _inFlight: Promise<SaveOutcome> | null = null;
 
 export function runSaveAll(): Promise<SaveOutcome> {
   if (_inFlight) return _inFlight;
-  _inFlight = runSaveAllOnce()
+  // Queued behind any other save (an agent's `save-all`, a Create Scene — #2069); the conflict questions after it are
+  // not, since they wait on a human and flush only asset docs.
+  _inFlight = runSerialisedSave(runSaveAllOnce)
     .then(async (o) => ({ ...o, assets: await answerParkedConflicts(o.assets) }))
     .finally(() => { _inFlight = null; });
   return _inFlight;

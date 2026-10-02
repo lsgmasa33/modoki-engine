@@ -25,6 +25,7 @@ import { useEditorStore } from '../store/editorStore';
 import { setPlayState } from '../../runtime/core/playState';
 import { whyWorldNotAuthored } from './authoredWorld';
 import { beginWorldReplacement } from './authoringSettle';
+import { UNREACHABLE_STATE } from '../undo/stateToken';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled, worldStateToken, beginFreshWorldState, captureSavePoint, captureSceneSavePoint, settleSavePoint, settleSceneSavePoint, restoreWorldStateToken, type SavePoint } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './prefabCache';
@@ -49,7 +50,7 @@ import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
-import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes, dropReplacedBaseSceneEdit } from './pendingBaseScene';
+import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes, reconcileBaseScenePark } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
 import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld, beginWorldRequest, SCENE_SWITCH_LANDING } from './sceneAdoption';
@@ -896,13 +897,24 @@ export function onScenePathChange(fn: () => void): () => void {
   scenePathListeners.add(fn);
   return () => { scenePathListeners.delete(fn); };
 }
-export function setCurrentScenePath(scenePath: string | null) {
+/** Make `scenePath` the open scene's path.
+ *
+ *  ⚠️ **THE RULE for a `baseScene` edit parked on that file (#2069, hub ruling 2026-10-03)** — every path change passes
+ *  through here, so a route that binds a path gets it without doing anything:
+ *   - `'adopted'`: the world was READ from the file's bytes, so the park edited THIS document — it is APPLIED, by the
+ *     adoption owner after its baseline (`applyParkToOpenedScene`).
+ *   - `'bound'` (every other writer — a save binding a path, Create Scene, the dialog's Create or Replace, a rename): the
+ *     world was NOT read from the file, so the park edited a DIFFERENT document — it is DROPPED here and the drop is
+ *     returned for the caller to report (`droppedBaseSceneEdit`). Applying it would graft one document's edit onto
+ *     another's; leaving it, the flush would write it file-direct onto the open scene for the next save to overwrite. */
+export function setCurrentScenePath(scenePath: string | null, how: 'bound' | 'adopted' = 'bound'): { droppedBaseSceneEdit?: true } {
   // ONE spelling for the open project's scenes (#1898): every writer — each load's adoption, save, save-as, new scene —
   // passes through here, and a `/@fs/<abs>/runtime/assets/…` path of the open project is stored as `/assets/…`, the
   // form the edit routes, `modoki_wait_for` and the next boot all compare against. See openProjectScenePath.ts.
   const path = scenePath === null ? null : toOpenProjectScenePath(scenePath);
   const changed = path !== _currentScenePath;
   _currentScenePath = path;
+  const bound = changed && path && how === 'bound' ? dropParkOnReplacedFile(path) : {};
   if (changed) notifyListeners([...scenePathListeners], 'scene path', []);
   if (path) {
     // Per-project key: what createEditor restores on startup, AND what prefab-edit's
@@ -920,6 +932,7 @@ export function setCurrentScenePath(scenePath: string | null) {
     // than fixed in place — see `lastSceneKey`.
     localStorage.setItem(lastSceneKey(_sceneProject), path);
   }
+  return bound;
 }
 
 /** Save scene to the current path (via the backend write-file API).
@@ -1295,8 +1308,8 @@ export interface SaveResult {
    *  copy, which the scanner's heal re-mints if the copy still shares an id with the original (#2052): the live smoke
    *  compares it with the file's. */
   savedAs?: { from: string; reopened: boolean; note?: string; sceneId: string };
-  /** This save REPLACED an existing file (a Save As, or an untitled scene saved over it) that held a parked `baseScene`
-   *  edit, and the edit was dropped with the bytes it edited (#2050, `dropReplacedBaseSceneEdit`). */
+  /** This save REPLACED an existing file (a Save As, an untitled scene saved over it, the dialog's Replace) that held a
+   *  parked `baseScene` edit, and the edit was dropped with the bytes it edited (#2050, #2069 — `reconcileBaseScenePark`). */
   droppedBaseSceneEdit?: true;
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
@@ -1336,12 +1349,27 @@ export interface SaveResult {
   importSettings?: MetaFlushResult;
 }
 
-/** The report half of `dropReplacedBaseSceneEdit` (#2050), for each save that REPLACED `path`'s bytes: a Save As over
- *  it, or an untitled scene saved over it (by an agent's explicit path or the dialog's Replace). Spread into the result. */
+/** The `'replaced'` half of `reconcileBaseScenePark` (#2050, #2069), with its report: the live world's bytes replaced
+ *  `path`'s, so a park on it was an edit to bytes that are gone. Reached through `setCurrentScenePath` for every route
+ *  that BINDS the replaced file, and called directly by the two that can replace a file WITHOUT binding it — a Save As
+ *  whose copy is not reopened, and a dialog save whose world was switched during the panel. Spread into the result. */
 function dropParkOnReplacedFile(path: string): { droppedBaseSceneEdit?: true } {
-  if (!dropReplacedBaseSceneEdit(path)) return {};
+  if (!reconcileBaseScenePark(path, 'replaced')) return {};
   console.warn(`[Editor] The save replaced ${path}, so its pending baseScene edit was dropped with it`);
   return { droppedBaseSceneEdit: true };
+}
+
+/** The `'opened'` half (#2069): `path` was just READ into the live world, after the adoption set its baseline. A park
+ *  on it is the human's pending edit, so it is applied to the opened document — and the scene is left UNSAVED, since the
+ *  file does not hold it yet: the next save writes it with the scene, never file-direct. No undo entry: the edit was
+ *  made, and undoable, before the open; this only carries it across. A park whose value the file already holds (its
+ *  flush landed before the read) changes nothing and leaves the scene clean. */
+function applyParkToOpenedScene(path: string): void {
+  const loaded = _currentBaseScene;
+  const r = reconcileBaseScenePark(path, 'opened', setCurrentBaseScene);
+  if (!r || !('applied' in r) || (r.applied || undefined) === loaded) return;
+  _savedWorldState = UNREACHABLE_STATE;
+  console.info(`[Editor] Applied the pending baseScene edit on ${path} to the opened scene — unsaved until the next save`);
 }
 
 /** `saveScene`'s agent Save As (#1414): write the open scene to `target` as a COPY with its own
@@ -1446,11 +1474,12 @@ async function writePrimaryScene(
   // Binding `path` to that new world would name a file holding the OLD one's bytes, mark it saved, and hand it the
   // file's undo key (#1712 close-out re-review). The world, not the path, is what the bytes are.
   if (openBefore === null && getCurrentWorld() !== worldSerialized) return { saved: true, path, reason: 'ok' };
-  if (path !== _currentScenePath) setCurrentScenePath(path);
+  // Binding a file the world was not read from replaces it, and drops its park (#2069) — reported with the save.
+  const bound = path !== _currentScenePath ? setCurrentScenePath(path) : {};
   // An untitled world's first file (#1712): its undo stacks move to the file's key, which a hot reload of it adopts.
   if (openBefore === null) rekeyUntitledHistory(path);
   markSceneSaved(savedAt);
-  return { saved: true, path, reason: 'ok' };
+  return { saved: true, path, reason: 'ok', ...bound };
 }
 
 export async function saveScene(opts: {
@@ -1545,7 +1574,8 @@ export async function saveScene(opts: {
   // scene.id is always populated by serializeScene (required field).
   if (knownPath) {
     const r = await writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAt, worldSerialized);
-    // An untitled scene saved over an EXISTING file replaces its bytes, as a Save As does (#2050): drop its park too.
+    // An untitled scene saved over an EXISTING file replaces its bytes, as a Save As does (#2050). The bind drops its
+    // park (`setCurrentScenePath`); this covers the exits where a world switch during the write left the file unbound.
     return kind === 'untitled' && r.saved ? { ...r, ...dropParkOnReplacedFile(knownPath) } : r;
   }
 
@@ -1591,12 +1621,12 @@ export async function saveScene(opts: {
     // A world switch during the panel or the write (a Create Scene, a scene open) owns the editor now: the file holds
     // the world that was serialized, not this one, so nothing binds to it (#1712 close-out re-review).
     if (getCurrentWorld() !== worldSerialized) return { saved: true, path: saved, reason: 'ok', ...replaced };
-    setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
+    const bound = setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
     rekeyUntitledHistory(saved); // its undo stacks now belong to the file (#1712 close-out review) — see writePrimaryScene
     editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
     markSceneSaved(savedAt);
-    return { saved: true, path: saved, reason: 'ok', ...replaced };
+    return { saved: true, path: saved, reason: 'ok', ...replaced, ...bound };
   }
   const error = written.outcome === 'failed' ? written.error : undefined;
   console.error(`[Editor] Failed to save scene to ${target}${error ? `: ${error}` : ''}`);
@@ -2368,8 +2398,9 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
 // The adoption owner writes the editor scene state this module holds (#1698). Bound rather than imported by
 // `sceneAdoption.ts`, which this module imports: no cycle.
 bindEditorSceneState({
-  setScenePath: setCurrentScenePath,
+  setScenePath: (path) => { setCurrentScenePath(path, 'adopted'); },
   setBaseScene: setCurrentBaseScene,
+  openedFromFile: applyParkToOpenedScene,
   markSaved: () => markSceneSaved(),
   worldEdited: () => CAUSE_SPECS.sceneDirty.has(),
   sceneLoadsComing: () => _loadsInFlight - _loadsEnding,

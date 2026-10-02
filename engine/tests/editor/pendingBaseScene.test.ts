@@ -302,7 +302,9 @@ describe('a supersession DURING a flush survives the re-park (#831 re-review, fi
 
     const r = await flushPendingBaseScenes();
 
-    expect(r.failed.map((f) => f.path)).toEqual([LEVEL]);
+    // Not in `failed` either (#2069 close-out review): `failed` means "re-parked, still pending, save again", and this
+    // entry is neither — the live edit superseded it and the next scene save writes that.
+    expect(r.failed.map((f) => f.path)).toEqual([]);
     expect(live).toEqual(['newer-guid']);
     expect(isBaseSceneDirty(LEVEL), 'the stale ref was resurrected and would overwrite the live one')
       .toBe(false);

@@ -41,7 +41,7 @@ import {
   type AssetEditorKind, type AssetEditorMount, colliderEditBlocker,
   enterPlay, stopPlay, pausePlay, type PlayOutcome, type StopOutcome,
   undoStep, undoStepPending, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
-  loadSceneReporting, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, captureWorldDirtyBaseline, adoptWorldReloadedFromDisk, openChoiceModal,
+  loadSceneReporting, saveAll, runSerialisedSave, SaveQueueBusyError, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses, captureWorldDirtyBaseline, adoptWorldReloadedFromDisk, openChoiceModal,
   SCENE_EXT, correctedScenePath, isAcceptableScenePath,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors,
@@ -615,6 +615,10 @@ function requireEditorOpen(kind: AssetEditorKind, op: string): AssetEditorMount 
 }
 
 const EDITOR_MOUNT_WAIT_MS = 3000;
+/** How long an agent `save-all` waits for a save ahead of it in the queue (#2069) — under the backend relay's 60 s, with
+ *  room left for the save itself, so a refusal reaches the agent instead of a relay timeout. A mechanism bound, not a
+ *  tunable. Exported for the test. */
+export const SAVE_ALL_QUEUE_WAIT_MS = 30_000;
 
 /** An opener waits for its editor to MOUNT on the asset it named, rather than answering once the
  *  store is pointed (#1213) — the same readiness rule `open-animation-editor` already follows. The
@@ -2696,7 +2700,8 @@ export function registerEditorAgentOps(): void {
     // The parked half is the honest surprise: it is why this refusal exists at all for a
     // parked-only cause, and it is the opposite of "would be lost".
     const survives = parkedHalf
-      ? ' The parked entries are keyed by PATH and SURVIVE the swap — they stay pending either way.'
+      ? ' The parked entries are keyed by PATH and SURVIVE the swap — they stay pending either way, except a baseScene'
+        + ' ref parked on the scene being opened: the open APPLIES it to that scene, which is then unsaved (#2069).'
       : '';
     // Inside prefab-edit mode the remedy is split BY CAUSE (#1424). The live half is the prefab
     // world, and only `edit-save` writes it — save_all refuses the scene half there. The parked half
@@ -2860,7 +2865,19 @@ export function registerEditorAgentOps(): void {
       release: releaseOutsideChanges,
     }, scene);
   });
+  // QUEUED behind any other save — a human Cmd+S, a Create Scene, another agent call (#2069, scene/saveQueue.ts). Called
+  // straight through, two saves overlapped and a park on a file one of them replaced could still land on it.
+  // BOUNDED: a human save can sit in its Save As panel for minutes, and the relay gives up at 60 s. Past the wait the
+  // op is refused and its body never runs — run late, it saved whatever scene was open by then, to nobody (close-out).
   registerAgentOp('save-all', async (params) => {
+    try {
+      return await runSerialisedSave(() => saveAllOp(params), { maxWaitMs: SAVE_ALL_QUEUE_WAIT_MS });
+    } catch (e) {
+      if (!(e instanceof SaveQueueBusyError)) throw e;
+      throw new OpRefusal('REFUSED_BY_OP', `save-all: ${e.message}. Nothing was written. Call save_all again once the other save finishes.`);
+    }
+  });
+  async function saveAllOp(params: unknown) {
     const { path: savePath } = (params ?? {}) as { path?: string };
     // Prefab-edit mode deliberately NULLS the scene path so a normal save can't target a real
     // file (prefabEdit.ts) — the human paths honour that via isEditingPrefab(). The agent path
@@ -3045,7 +3062,7 @@ export function registerEditorAgentOps(): void {
       `save-all FAILED (${r.error ? `${r.reason}: ${r.error}` : r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
       + (landed.length ? landedNote : ' Nothing was written.') + droppedNote,
     );
-  });
+  }
 
   /** The counterpart to `save-all` for PARKED ASSET WRITES: drop them instead of persisting them.
    *

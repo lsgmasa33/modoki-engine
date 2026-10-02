@@ -16,7 +16,7 @@
  *  live primary world and the other loaded scenes); parked asset docs, base-scene refs and import
  *  settings are path-keyed module state that SURVIVES the swap (see `guardUnsaved`'s consequence
  *  clause), so asking about them before a scene open would be a prompt about work nothing is about
- *  to lose. A page unload (project switch, window close, reload) loses every cause. A hand-written
+ *  to lose — a base-scene ref on the very scene being opened included: the open APPLIES it (#2069). A page unload (project switch, window close, reload) loses every cause. A hand-written
  *  subset here would be #972 again.
  *
  *  The decision (`decideUnsavedGate`) is a pure function over injected deps so it is unit-tested

@@ -39,6 +39,7 @@
 
 import { backendFetch } from '../backend/editorBackend';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
+import { toOpenProjectScenePath } from './openProjectScenePath';
 
 /** Set (or clear, with `null`) the `baseScene` ref on a scene FILE.
  *
@@ -69,8 +70,15 @@ export async function mutateScene(path: string, baseScene: string | null): Promi
  *  dirty-asset registry: a second edit before a save simply supersedes the first. */
 const pending = new Map<string, string | null>();
 
-/** One marker set per flush IN FLIGHT: the paths whose park that flush's batch is holding, and
- *  which a live application has since superseded.
+/** Do two spellings name the same scene FILE? The open-project `/@fs/` form folds to `/assets/…`, and case is ignored
+ *  as `classifyExplicitSceneSave` already ignores it (#1273). A park is keyed by the manifest's spelling, while the open
+ *  scene can carry an agent's (`copy` against `Copy`, #2069 row 6). */
+export function sameSceneFile(a: string, b: string): boolean {
+  return toOpenProjectScenePath(a).toLowerCase() === toOpenProjectScenePath(b).toLowerCase();
+}
+
+/** One record per flush IN FLIGHT: the batch it took out of the map, and the paths in it that have since been
+ *  superseded, by a live application or by {@link reconcileBaseScenePark}.
  *
  *  ⚠️ **Why the markers are needed at all.** The re-park's `!pending.has(path)` guard can only see
  *  a newer PARKED claim, and the live branch's `pending.delete` is a no-op during a flush — the map
@@ -80,14 +88,18 @@ const pending = new Map<string, string | null>();
  *  the file back to OLD. Exactly the revert the live branch's discard exists to prevent, restored
  *  through the error path.
  *
- *  ⚠️ **And why it is a set PER FLUSH rather than one shared set.** Two flushes really can overlap:
- *  a human Cmd+S goes through `runSaveAll`'s `_inFlight` coalescing, but the `save-all` AGENT op
- *  calls `saveAll()` directly, so `modoki_save_all` landing during a human save gives two. A single
- *  module-level set cleared by whichever flush starts next erases the markers the FIRST one is
- *  still holding, and its re-park falls back to `!pending.has(path)` alone — the hole above,
- *  reopened by the very mechanism closing it. A live application adds the path to EVERY set,
- *  because each in-flight flush is separately holding a batch that may contain it. */
-const activeFlushMarkers = new Set<Set<string>>();
+ *  ⚠️ **And why it is a record PER FLUSH rather than one shared set.** The save entry points are serialised since
+ *  #2069 (`saveQueue.ts`), so two of THEIRS no longer overlap. But a flush can still be called outside that queue, and
+ *  one shared set cleared by whichever flush starts next would erase the markers an earlier one is still holding. A
+ *  live application marks EVERY record, because each in-flight flush is separately holding a batch that may contain it.
+ *
+ *  The batch is kept so that a scene OPENED while its park is in flight still gets the edit (#2069): the park is out
+ *  of the map by then, and this is the only place its value still lives. */
+interface InFlightFlush {
+  readonly batch: ReadonlyMap<string, string | null>;
+  readonly superseded: Set<string>;
+}
+const activeFlushes = new Set<InFlightFlush>();
 
 let _version = 0;
 const listeners = new Set<() => void>();
@@ -120,46 +132,88 @@ export function markBaseSceneEdit(path: string, baseScene: string | null): void 
  *
  *  ⚠️ `undefined`, not `''`, for an unset base on the live path: `serializeScene` emits the field
  *  only when it is truthy, and an empty string would be written as `baseScene: ""` — a ref that
- *  resolves to nothing and reads as a broken link rather than as "no base" (A3). */
+ *  resolves to nothing and reads as a broken link rather than as "no base" (A3).
+ *
+ *  ⚠️ The open scene is matched by FILE ({@link sameSceneFile}), not by string (#2069). A park made under another
+ *  spelling of the open scene is a park ON the open scene, and the flush would write it file-direct for the next save
+ *  to overwrite with the stale base. This is the "normalise both sides" the panel's comment asks for. */
 export function applyBaseSceneEdit(
   path: string,
   value: string,
   currentScenePath: string | null,
   setLiveBaseScene: (baseScene: string | undefined) => void,
 ): 'live' | 'parked' {
-  if (currentScenePath === path) {
+  if (currentScenePath !== null && sameSceneFile(currentScenePath, path)) {
     setLiveBaseScene(value || undefined);
     // ⚠️ Mark the path SUPERSEDED for every flush in flight, even when nothing is parked for it
     // right now: a flush is holding its batch out of the map, and this is the only record its
-    // re-park can read. No flush in flight ⇒ no sets ⇒ the `delete` below is the whole story.
-    for (const markers of activeFlushMarkers) markers.add(path);
+    // re-park can read. No flush in flight ⇒ no records ⇒ the `delete` below is the whole story.
+    for (const flush of activeFlushes) for (const key of flush.batch.keys()) if (sameSceneFile(key, path)) flush.superseded.add(key);
     // …and DISCARD any park still held for it — it is superseded, and leaving it is silent
     // data loss with the newer value on the losing side. Reachable in the ordinary way: set a base
     // on scene B in the Assets panel (parks), then OPEN B and change it again (live). The scene
     // write puts the NEW ref in the file and `flushPendingBaseScenes`, which runs after it, mutates
     // the file back to the OLD one — the exact revert #831 fixed, reached from the other side. The
     // Cmd+Z variant is the same: undo applies `old` live while the stale park still writes `next`.
-    if (pending.delete(path)) bump();
+    let dropped = false;
+    for (const key of [...pending.keys()]) if (sameSceneFile(key, path)) dropped = pending.delete(key) || dropped;
+    if (dropped) bump();
     return 'live';
   }
   markBaseSceneEdit(path, value || null);
   return 'parked';
 }
 
-/** A save REPLACED the file at `path` with other bytes — a Save As over it, or an untitled scene saved over it (#2050) —
- *  so a park for it was an edit to bytes that are gone. Dropped, because left parked the flush writes it onto the file
- *  that has just become the OPEN scene, whose in-memory base came from the new bytes, and the next save writes that
- *  stale value straight back over it (observed live, reported ok both times). Marked superseded for every flush in
- *  flight too, exactly as the live branch of {@link applyBaseSceneEdit} does: an earlier save's flush holding this path
- *  in its batch would otherwise re-park it on a failure, after the replace. Returns whether a park was dropped.
+/** What {@link reconcileBaseScenePark} did. `applied` carries the ref now live (`null` = cleared). */
+export type ParkReconcile = { applied: string | null } | { dropped: true } | null;
+
+/** THE check for a park whose file becomes — or is replaced by — the open scene (#2069). Every route that makes a
+ *  path the open scene ends here, so no park can outlive it into the flush, where it would be written file-direct
+ *  onto the open scene's file and then overwritten by the stale in-memory base on the next save (reported ok twice).
  *
- *  ⚠️ Not closed: an earlier flush whose mutate SUCCEEDS after the replace lands it anyway. Only serialising `saveAll`
- *  (the agent op bypasses `runSaveAll`'s coalescing — see the markers above) would close that. */
-export function dropReplacedBaseSceneEdit(path: string): boolean {
-  for (const markers of activeFlushMarkers) markers.add(path);
-  const dropped = pending.delete(path);
-  if (dropped) bump();
-  return dropped;
+ *  Two rules, by what happened to the FILE (hub ruling, #2069):
+ *   - `'opened'` — the file was READ into the live world (a load, a hot reload). The human's pending edit must
+ *     survive, so it is APPLIED to the opened document through `setLive`; the caller marks the scene unsaved.
+ *   - `'replaced'` — the live world's bytes were written over the file, or bound to it to be written there (Save As,
+ *     an untitled scene saved over it, the dialog's Replace, Create Scene over it). The edit was to bytes that are
+ *     gone, so it is DROPPED, as #2050 dropped it; the caller reports the drop.
+ *
+ *  Both look in the map AND in every flush in flight, matching by FILE: a park keyed under another spelling is the
+ *  same park (row 6), and one a flush took out of the map is still pending until its write lands (rows 7–8). An
+ *  in-flight entry is marked superseded either way — the flush then skips it if it has not reached it yet, and never
+ *  re-parks it. A parked edit is newer than any in-flight one (a flush takes its batch before it starts), so it wins.
+ *
+ *  ⚠️ An in-flight write that is already on the wire cannot be recalled. For `'opened'` that is harmless — it writes
+ *  the same value the world now holds, or the route refuses it because the world is unsaved. For `'replaced'` it is
+ *  closed by ORDER rather than here: every replace route runs inside the save queue (`saveQueue.ts`), so no flush is
+ *  in flight while it runs. */
+export function reconcileBaseScenePark(
+  path: string,
+  how: 'opened' | 'replaced',
+  setLive?: (baseScene: string | undefined) => void,
+): ParkReconcile {
+  let found: { value: string | null } | null = null;
+  for (const flush of activeFlushes) {
+    for (const [key, value] of flush.batch) {
+      // An entry already superseded is not this flush's to hand out again: a second open of the same file in one flush
+      // (a hot reload, a reopen after Discard) would otherwise re-apply the old value over a newer live edit.
+      if (!sameSceneFile(key, path) || flush.superseded.has(key)) continue;
+      flush.superseded.add(key);
+      found = { value };
+    }
+  }
+  let unparked = false;
+  for (const [key, value] of [...pending]) {
+    if (!sameSceneFile(key, path)) continue;
+    pending.delete(key);
+    unparked = true;
+    found = { value };
+  }
+  if (unparked) bump();
+  if (!found) return null;
+  if (how === 'replaced') return { dropped: true };
+  setLive?.(found.value || undefined);
+  return { applied: found.value };
 }
 
 /** The parked base ref for `path`, or `undefined` when nothing is pending for it.
@@ -234,14 +288,15 @@ export async function flushPendingBaseScenes(): Promise<BaseSceneFlushResult> {
   if (!batch.length) return { saved, failed };
   pending.clear();
   bump();
-  /** THIS flush's markers, registered for the duration so a live application can reach it.
+  /** THIS flush's record, registered for the duration so a live application or an open can reach it.
    *
-   *  The `finally` below is HYGIENE, not correctness — a leaked set would keep collecting marks
+   *  The `finally` below is HYGIENE, not correctness — a leaked record would keep collecting marks
    *  that nothing reads, since every flush reads only its own. Said plainly because a draft of the
    *  test for it asserted a behaviour change that does not exist, and passed against a deliberately
    *  broken unregister; there is no test here because there is nothing observable to assert. */
   const superseded = new Set<string>();
-  activeFlushMarkers.add(superseded);
+  const flush: InFlightFlush = { batch: new Map(batch), superseded };
+  activeFlushes.add(flush);
   try {
     /** Entries to put back, collected and applied AFTER the loop.
      *
@@ -254,8 +309,15 @@ export async function flushPendingBaseScenes(): Promise<BaseSceneFlushResult> {
      *  the flush; re-parking mid-loop undid it after the first failure. */
     const toRepark: Array<[string, string | null]> = [];
     for (const [path, baseScene] of batch) {
+      // Superseded before its turn — applied live, applied to the scene just opened, or dropped with a replaced file
+      // (#2069). Written now it would land on the open scene's file, for the next save to overwrite with the stale
+      // base. Whoever superseded it owns it, so it is neither saved nor failed here.
+      if (superseded.has(path)) continue;
       const { ok, errors } = await mutateScene(path, baseScene);
       if (ok) { saved.push(path); continue; }
+      // Superseded WHILE its mutate was on the wire (the route then refuses it, the world being unsaved): not pending,
+      // not re-parked, so reporting it as a failure that "stays pending" would be false (#2069 row 7). Its owner reports it.
+      if (superseded.has(path)) continue;
       failed.push({ path, error: errors.join('; ') || 'the scene mutation was rejected' });
       toRepark.push([path, baseScene]);
     }
@@ -264,12 +326,12 @@ export async function flushPendingBaseScenes(): Promise<BaseSceneFlushResult> {
       // `flushDirtyAssets` applies to its own deletes, and for the same reason: an edit made
       // during the save is on screen, is not on disk, and must not be replaced by an older value.
       // "Newer" is BOTH shapes: a newer park (`pending.has`) and a newer LIVE application, which
-      // parks nothing and would otherwise be invisible here — see `activeFlushMarkers`.
+      // parks nothing and would otherwise be invisible here — see `activeFlushes`.
       if (!pending.has(path) && !superseded.has(path)) pending.set(path, baseScene);
     }
     if (failed.length) bump();
     return { saved, failed };
   } finally {
-    activeFlushMarkers.delete(superseded);
+    activeFlushes.delete(flush);
   }
 }

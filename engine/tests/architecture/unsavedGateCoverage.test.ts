@@ -293,10 +293,10 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[]; c
     + 'create-asset grows an overwrite mode, or if the asset flush loses its changed-on-disk CAS.' },
   // ⚠️ OBSERVED (#2050): a park on the target WAS lost through this route, and the fix is NOT a gate here. A route
   //    refusal deadlocked — the refused save_all's base-scene flush is itself refused by /api/scene-mutate while the
-  //    open scene is dirty, the usual state at a Save As — so the renderer drops the park instead (`saveSceneAs` → `dropReplacedBaseSceneEdit`).
+  //    open scene is dirty, the usual state at a Save As — so the renderer drops the park instead (`saveSceneAs` → `reconcileBaseScenePark`).
   '/api/scene-save-as': { reason: 'issued only by the renderer\'s `saveSceneAs`, which holds the registries and acts on '
     + 'the one that can hold this path: a `baseScene` edit parked on the REPLACED file is dropped after a successful '
-    + 'write (the copy replaced the bytes it was an edit to; reported as `droppedBaseSceneEdit`, `dropReplacedBaseSceneEdit`). Every other '
+    + 'write (the copy replaced the bytes it was an edit to; reported as `droppedBaseSceneEdit`, `reconcileBaseScenePark`). Every other '
     + 'registry is ruled out by kind or by file identity: `dirtyAsset` holds only ASSET_SCHEMA_TYPES documents (no '
     + 'scene), a JSON asset has no `.meta.json` for `pendingMeta`, the open scene and every loaded one are refused 409 '
     + '(`sameFile` / `targetLoaded`) by the file the disk resolves, and `openAssetEditor` holds a texture. ⚠️ VOID the '

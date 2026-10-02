@@ -1,6 +1,6 @@
 /** #2050, the dialog half: an untitled scene saved through the Save dialog with REPLACE swaps an existing file's bytes for
  *  its own, exactly as a Save As does, so a `baseScene` edit parked on that file goes with them
- *  (`dropReplacedBaseSceneEdit`). The native panel and the create-only write are mocked — a test cannot answer the panel
+ *  (`reconcileBaseScenePark`, #2069). The native panel and the create-only write are mocked — a test cannot answer the panel
  *  (docs/editor.md § Panels) — so this pins the branch's decision, not the dialog. The agent and Save As halves:
  *  saveSceneAs.test.ts. */
 
@@ -53,11 +53,13 @@ describe('Save dialog → Replace over a file holding a parked baseScene edit (#
     expect(getPendingBaseScenePaths()).not.toContain(TARGET);
   });
 
-  it('a Create (no file was there) drops nothing', async () => {
+  // #2069: a Create binds TARGET as the open scene, so a park left on it (its file was deleted since) would be flushed
+  // file-direct onto the open scene and overwritten by the stale base at the next save. The file now holds the world's
+  // bytes, not the ones the park edited — dropped and reported, as a Replace is. (Before #2069 it was kept.)
+  it('a Create (no file was there) binding the path drops its park too, and reports it', async () => {
     outcome = 'created';
     const r = await saveScene({ allowDialog: true });
-    expect(r.saved).toBe(true);
-    expect(r.droppedBaseSceneEdit).toBeUndefined();
-    expect(getPendingBaseScenePaths()).toContain(TARGET);
+    expect(r).toMatchObject({ saved: true, path: TARGET, droppedBaseSceneEdit: true });
+    expect(getPendingBaseScenePaths()).not.toContain(TARGET);
   });
 });

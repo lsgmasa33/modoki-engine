@@ -941,24 +941,55 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   close-out reviews). A
   scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
   refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
-- **A save that REPLACES a file drops a `baseScene` edit parked on it (#2050).** The Scene inspector
-  parks a base-scene ref on a scene that is not open (`pendingBaseScene.ts`), and `saveAll` flushes it
-  AFTER the scene write. Observed before the fix: a Save As overwrote the target, the editor reopened
-  it, then the flush wrote the ref onto that file through `/api/scene-mutate`. The reopened world's
-  in-memory base came from the copy's bytes (none), so the next save wrote `baseScene: null` back over
-  it, and both saves answered ok. That is the stale-module-value loss `pendingBaseScene.ts` describes
-  for the open scene, reached through a reopen. Three saves that replace a file's bytes and then make it
-  the open scene are covered: a Save As (`saveSceneAs`), an untitled scene saved to an existing path by
-  an agent (`writePrimaryScene`), and the Save dialog's Replace. ⚠️ **They are not the only ways in —
-  #2069** names the class (any park on a path that becomes the open scene before the flush: Create
-  Scene over an existing scene, simply opening it, a spelling variant at the untitled site) and the one
-  check at the flush or open seam that would subsume all of them. Each covered save calls `dropReplacedBaseSceneEdit` AFTER a
-  successful write, so a refused or failed write keeps the park. The drop is reported as
+- **A `baseScene` edit parked on a file that becomes the OPEN scene is never flushed onto it — applied
+  if the world was READ from that file, dropped if the world was BOUND to it (#2050, #2069; hub ruling
+  2026-10-03).** The Scene inspector parks a base-scene ref on a scene that is not open
+  (`pendingBaseScene.ts`), and `saveAll` flushes it file-direct AFTER the scene write. Observed before
+  #2050: a Save As overwrote the target, the editor reopened it, then the flush wrote the ref onto that
+  file through `/api/scene-mutate`. The reopened world's in-memory base came from the copy's bytes
+  (none), so the next save wrote `baseScene: null` back over it, and both saves answered ok. That is
+  the stale-module-value loss `pendingBaseScene.ts` describes for the open scene, reached through a
+  reopen. #2050 fixed three replacing saves one at a time. #2069 found five more ways in: Create Scene
+  over the file, simply opening it, a spelling variant, and two overlapping saves. It replaced the
+  per-route fixes with ONE check, `reconcileBaseScenePark`, which matches by FILE (`sameSceneFile`: the
+  `/@fs/` form folded, case ignored, as `classifyExplicitSceneSave` already does). It looks in the park
+  map AND in every flush still in flight. It runs at the two seams where a path becomes the open scene:
+  - **Read from the file** (a load, a hot reload): the adoption owner's `openedFromFile`, AFTER its
+    baseline. The park edited THIS document, so it is APPLIED to the live base and the scene is left
+    unsaved; the next save writes it with the scene, never file-direct. A park a flush is still
+    holding is applied too, and the flush skips it if it has not reached it yet.
+  - **Bound without being read** (`setCurrentScenePath(path)` — every other writer: a save binding a
+    path, Create Scene, the dialog's Create or Replace, a rename): the park edited a DIFFERENT document,
+    so it is DROPPED. Applying it would graft one document's edit onto another's. The rule is written
+    once at `setCurrentScenePath`, so the next route that binds a path gets it for free.
+
+  Two #2050 call sites remain for saves that replace a file WITHOUT binding it: a Save As whose copy is
+  not reopened, and a dialog save whose world switched during the panel. Both drop only AFTER a
+  successful write, so a refused or failed write keeps the park. A drop is reported as
   `droppedBaseSceneEdit` on `save_all`'s answer, on every exit the save reaches after its write, the
-  PARTIAL ones included. It also marks the path superseded for every flush in flight, as a live
-  base-scene edit does, so an earlier save's flush that failed cannot re-park it. ⚠️ **Still open:** an
-  earlier flush whose mutate SUCCEEDS after the replace lands the stale ref anyway. Only serialising
-  `saveAll` would close that. Any two saves can overlap: the agent op bypasses `runSaveAll`'s coalescing.
+  PARTIAL ones included, and with a console warning. An applied park is logged with `console.info`.
+  `applyBaseSceneEdit` compares by file as well, so a park cannot be MADE on the open scene under
+  another spelling. **Saves are queued** (`saveQueue.ts`): `runSaveAll`, the `save-all` agent op and
+  Create Scene each wait for the save ahead of them. So no flush is in flight while a save replaces a
+  file, and a mutate cannot land the stale ref after the replace. Queued, not coalesced: an agent's
+  `save_all({path})` must not be answered with a human Cmd+S's result. ⚠️ **The agent's wait is
+  BOUNDED (30 s, `SAVE_ALL_QUEUE_WAIT_MS`)**: a human save can sit in its Save As panel or an
+  Overwrite question for minutes, and the relay gives up at 60 s. Past the wait the op is refused
+  (`REFUSED_BY_OP`, nothing written) and its body NEVER runs. Before this, the agent was told the
+  call timed out, and the save then ran when the human answered, against whatever scene was open by
+  then (close-out review). Only the TURN is timed: a save that has started runs to its end. The
+  bound takes from the save's own budget: a turn reached at ~29 s leaves ~31 s of the relay's 60 s,
+  so a slow Save As + reopen can still answer a relay timeout for a save that landed.
+  An entry superseded while its mutate was on the wire is reported in neither `saved` nor `failed`:
+  `failed` means "re-parked, save again", and the live edit or the drop that superseded it owns it.
+  ⚠️ **Accepted trade-offs** (close-out review, reported to the hub):
+  - An APPLIED park is an ordinary live edit from then on. A later hot reload of that scene (disk
+    wins) discards it, where before it was path-keyed state that survived any world swap.
+  - Create Scene binds its path BEFORE its write, so its drop also happens before the write. A
+    failed write followed by Discard leaves the old file untouched and the park gone (console warn
+    only).
+  - Matching ignores case, as `classifyExplicitSceneSave` does. On a case-sensitive volume holding
+    both `Level` and `level`, one file's park would match the other.
   ⚠️ **Not a route refusal — that was tried and deadlocked.** A refused primary does still run the
   flush, but `/api/scene-mutate` refuses the flush while the open scene has unsaved edits, the usual
   state at a Save As, so "repeat `save_all`" was refused again forever. The other registries cannot

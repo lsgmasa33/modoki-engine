@@ -14,6 +14,7 @@ import { defaultAtlasSource } from '../../runtime/loaders/spriteAtlas';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newScene, saveScene, NewSceneRefusedError } from '../scene/serialize';
+import { runSerialisedSave } from '../scene/saveQueue';
 import { SCENE_EXT } from '../scene/sceneFileName';
 import { classifyExistingDocumentId } from '../scene/prefabCache';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
@@ -32,7 +33,9 @@ export function registerBuiltinCreatableAssets(): void {
     // Full override: default content (Camera + white-HDR Environment) comes from
     // newScene(), persisted via saveScene() — this replaces the old File → New Scene
     // flow. Dialog first so a cancel leaves the current world untouched.
-    create: async (path) => {
+    // Queued with every other save (#2069): over an existing scene this REPLACES its file, and a flush still writing that
+    // file's parked baseScene edit would otherwise land it on the new scene, for the next save to overwrite.
+    create: (path) => runSerialisedSave(async () => {
       // Over an existing scene (`runCreate` asked first, #1264) the new scene takes the replaced
       // one's guid, so what points at that scene keeps pointing at it (owner 2026-09-15). The save
       // below reads the id back through the manifest for `path`; registering the on-disk id first
@@ -61,7 +64,7 @@ export function registerBuiltinCreatableAssets(): void {
       }
       useEditorStore.getState().selectEntity(null);
       await saveScene();
-    },
+    }),
   });
 
   registerCreatableAsset({

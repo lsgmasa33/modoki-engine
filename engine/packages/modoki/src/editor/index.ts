@@ -198,6 +198,7 @@ export {
 } from './scene/serialize';
 // The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
 export { runSaveAll, toastForSave, sceneNeedsWriting, type SaveOutcome } from './scene/saveCommand';
+export { runSerialisedSave, SaveQueueBusyError } from './scene/saveQueue';
 // #901 — the wording a modal editor shows when Save does not write. Exported for its unit test:
 // the DECISION is a plain module precisely so it can be asserted without mounting a dialog
 // (docs/editor.md § Panels). The `SaveRefusedNotice` component that renders it stays internal.
