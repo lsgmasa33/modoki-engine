@@ -114,7 +114,7 @@ const show = (v: unknown) => JSON.stringify(v)?.slice(0, 160);
 const IGNORED_FIELDS: Record<string, Set<string>> = { EntityAttributes: new Set(['guid', 'parentId']) };
 
 /** What the comparisons reached, for the non-vacuity pins. */
-export const seen = { ruledB: 0, ruledD: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0 };
+export const seen = { ruledB: 0, ruledD: 0, ruledOwn: 0, ruledOwnFix: 0, defaults: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0 };
 
 /** Every way the fold and the live tree disagree, one line each. */
 export function diverge(fold: FoldedInstance, live: Live): string[] {
@@ -143,6 +143,16 @@ export function diverge(fold: FoldedInstance, live: Live): string[] {
         if (IGNORED_FIELDS[n]?.has(field)) continue;
         seen.fields++;
         if (!close(v, lv[field])) out.push(`field ${k} ${n}.${field}: fold ${show(v)} live ${show(lv[field])}`);
+      }
+      // A live field the fold does NOT state must be the schema default: otherwise a record the fold dropped, on a field
+      // the template bag lacks, would pass (close-out review).
+      const schema = (getTraitByName(n)?.trait as { schema?: Record<string, unknown> } | undefined)?.schema ?? {};
+      for (const [field, lvv] of Object.entries(lv)) {
+        if (field in fv || IGNORED_FIELDS[n]?.has(field) || !(field in schema)) continue;
+        const d = schema[field];
+        const def = typeof d === 'function' ? (d as () => unknown)() : d;
+        seen.defaults++;
+        if (!close(lvv, def)) out.push(`unstated ${k} ${n}.${field}: live ${show(lvv)} default ${show(def)}`);
       }
     }
   }
@@ -205,7 +215,7 @@ const unusedLeaf = (u: UnusedRecord): string => {
  *    member's kept unused part (#1914 R4's fix), and so does the record.
  *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
  *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
-export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true): string[] {
+export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true, held?: Bag, ruledKept: readonly string[] = []): string[] {
   const kept: { key: string; leaf: string }[] = [];
   const legacy: string[] = [];
   legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
@@ -219,8 +229,26 @@ export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceh
       for (const leaf of leaves) kept.push({ key, leaf });
     }
   }
+  // Today's kept copy of a link the rules now SHOW (#2018 (i), `checkRecord`), where today kept one.
+  for (const key of ruledKept) { const at = kept.findIndex((k) => k.key === key && k.leaf === 'own'); if (at >= 0) kept.splice(at, 1); }
   const compared = fold.unused.filter((u) => !(u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k))));
-  return pairUnused(compared, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments);
+  // A held MEMBER ROW's record (part path `['members', k, field?, i?]`) is today's kept row, verbatim: paired as the
+  // leaves that row shows in today's store, at `k` (close-out review round 4).
+  const out: string[] = [];
+  const rest = compared.filter((u) => {
+    if (u.part.kind !== 'legacy' || u.part.path[0] !== 'members') return true;
+    const [, k, field, i] = u.part.path;
+    const row = ((held?.members ?? {}) as Bag)[k!] as Bag | undefined;
+    if (!row || typeof row !== 'object') return true;
+    const leaves: string[] = [];
+    rowLeaves({ [k!]: field === undefined ? row : { [field]: i === undefined ? row[field] : [(row[field] as unknown[])[Number(i)]] } }, leaves, skip);
+    for (const leaf of leaves) {
+      const at = kept.findIndex((e) => e.key === k && e.leaf === leaf);
+      if (at >= 0) kept.splice(at, 1); else out.push(`fold-only unused ${k} ${leaf} (${u.cause})`);
+    }
+    return false;
+  });
+  return [...out, ...pairUnused(rest, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments)];
 }
 
 /** The pairing half of {@link unusedDiverge}, pure: the fold's unused records against today's kept leaves, by row.
@@ -273,6 +301,8 @@ export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootI
 export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set()): string[] {
   const fold = foldInstance(read, rec);
   const live = liveTree(rootId);
+  // What today shows, anchored anywhere, before any translation moves a subtree out.
+  const shownToday = new Set([...live.anchors.values()].flat());
   for (const [k, ph] of fold.placeholders) {
     if (ph.reason !== 'missing' || live.placeholders.has(k)) continue;
     const today = [...live.nodes.keys()].filter((n) => under(n, k));
@@ -282,6 +312,23 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
     for (const n of today) live.nodes.delete(n);
     for (const a of [...live.anchors.keys()]) if (under(a, k)) live.anchors.delete(a);
     live.placeholders.add(k);
+  }
+  // Every scene-owned node the record links AT a placeholder hangs from it (#2018; hub ruling 2026-10-02 (i), a visible
+  // FIX): today shows it under the copy's root (B) or the instance root (D) — or, in the v17+ `own` form and under a
+  // template-added reference node, HIDES it (kept as an unused row, or in no store, lost on the next save).
+  const ruledKept: string[] = [];
+  for (const k of fold.placeholders.keys()) {
+    const linked = new Set(((rec.list.rows.get(k) as { own?: { guid: string }[] } | undefined)?.own ?? []).map((o) => o.guid));
+    if (!linked.size) continue;
+    const shown = new Set([...linked].filter((g) => shownToday.has(g)));
+    for (const [a, gs] of [...live.anchors]) {
+      const rest = gs.filter((g) => !linked.has(g));
+      if (rest.length === gs.length) continue;
+      if (rest.length) live.anchors.set(a, rest); else live.anchors.delete(a);
+    }
+    live.anchors.set(k, [...linked]);
+    if (shown.size) seen.ruledOwn++;
+    if (shown.size < linked.size) { seen.ruledOwnFix++; for (let i = shown.size; i < linked.size; i++) ruledKept.push(k); }
   }
   const removedRows = [...rec.list.rows].filter(([, r]) => r.removed).map(([k]) => k);
   const projectsWhenRestored = (key: string): boolean => {
@@ -308,5 +355,5 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
     const last = key.slice(key.lastIndexOf('/') + 1);
     return last.startsWith('a+') || nodeGuids.has(last);
   };
-  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments)];
+  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept)];
 }

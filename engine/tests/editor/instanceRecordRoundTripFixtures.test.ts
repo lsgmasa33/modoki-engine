@@ -152,3 +152,15 @@ describe('#2008 P2 over fixtures: template form', () => {
     expect(after.docHeld, 'the document-level remainder').toEqual(before.docHeld);
   });
 });
+
+describe('a document\'s held `moved` round-trips through the writer (#2007 close-out: the parser holds a non-record one whole)', () => {
+  it('a non-record moved is written back as it was; named-nothing entries as their record', async () => {
+    const { parseTemplateLists } = await import('../../packages/modoki/src/runtime/prefab/parseInstanceRecord');
+    const { serializeTemplateDocHeld } = await import('../../packages/modoki/src/runtime/prefab/serializeInstanceRecord');
+    const doc = (moved: unknown) => ({ id: 'D', rootLocalId: 1, moved, entities: [{ localId: 1, nodeGuid: 'aaaaaaaa-0000-4000-8000-0000000000d1', traits: {} }] }) as never;
+    const read = () => ({ missing: true as const });
+    for (const moved of ['junk', 7, ['x']]) expect(serializeTemplateDocHeld(parseTemplateLists(doc(moved), 'D', read).docHeld)).toEqual({ moved });
+    expect(serializeTemplateDocHeld(parseTemplateLists(doc({ '9.9': '@member:1' }), 'D', read).docHeld)).toEqual({ moved: { '9.9': '@member:1' } });
+    expect(serializeTemplateDocHeld(undefined)).toEqual({});
+  });
+});

@@ -141,6 +141,15 @@ export type LegacyChannels = Pick<
   'overrides' | 'added' | 'removed' | 'removedTraits' | 'moved' | 'nestedOverrides' | 'nestedStructure' | 'members'
 >;
 
+/** The marker on a held container that stood for a WHOLE list — a `nestedStructure` slot, or a `members` row's `added`
+ *  (scene or template form) — when only its unnameable REMAINDER is held (hub ruling 2026-10-02, #2006,
+ *  option C). A held record must mean on reload what it meant in the file; the remainder alone, read as a whole list,
+ *  would mean "everything else is gone". So a container carrying `heldRemainder: true` converts ADDITIVELY: each
+ *  element becomes its own record, or is held again with the marker. Writers put held data back verbatim, marker
+ *  included. On a `members` row it scopes to the row's `added` alone: a written row may also carry v20 statements beside it
+ *  (`own`, pins), which read as they always do. v20 is refused by older editors, so none misreads it. */
+export const HELD_REMAINDER = 'heldRemainder';
+
 /** What the load could not interpret, or could not place. Written back verbatim; never projected. */
 export interface HeldData {
   /** A value in a shape no reader takes (I18 / F-CB1(a)), under its own channel name, e.g.
@@ -185,7 +194,9 @@ export type ParseWarningCode =
   /** A value no reader takes went to `held.unparsed` (F-CB1(a)). */
   | 'unparsed'
   /** Legacy channels went to `held.pendingLegacy` because the document did not resolve (rule 9). */
-  | 'pendingLegacy';
+  | 'pendingLegacy'
+  /** A v20 entry states no `"/"` name: the root shows the template root's (hub ruling 2026-10-02). */
+  | 'rootNameMissing';
 
 export interface ParseWarning {
   code: ParseWarningCode;
@@ -281,8 +292,9 @@ export interface DesiredNode {
   key: RowKey;
   /** The fully folded component data (template, then each layer inner to outer, then this list). */
   traits: Record<string, Record<string, unknown> | true>;
-  /** `null` for the instance root. Otherwise the parent's key, or — only through a legacy `parent`
-   *  record — a scene-owned node's guid (§ 10.4, review L8). */
+  /** `null` for the instance root, and only for it. Otherwise the parent's key, or a guid: a scene-owned node's (only
+   *  through a legacy `parent` record, § 10.4, review L8), or — for a row whose stated parent names no row — the
+   *  instance's own parent (`Placement.parent`; `''` is the scene's top level, and in a nested frame, no parent). */
   parent: { key: RowKey } | { guid: string } | null;
   sortOrder: number;
   /** The template row's minted identity, or a pre-v5 document's in-memory derivation (§ 2.7). */
@@ -299,6 +311,9 @@ export interface Placeholder {
   source: string;
   reason: 'missing' | 'damaged';
   text?: string;
+  /** Where the placeholder hangs, as its row would (`DesiredNode.parent`): what realize (S5) parents it by, and what the
+   *  removal cascade follows (#2007 review, item 3). */
+  parent?: DesiredNode['parent'];
 }
 
 /** The definition of "what this instance is": a pure function of (reader, record). */

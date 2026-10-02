@@ -95,6 +95,10 @@ export const SCENE_FORMAT_VERSION = 19;
 /** The scene format whose keyed-node guids are frame-rooted (#1809): a file below it is renamed on load. A literal, not
  *  {@link SCENE_FORMAT_VERSION}, which moves on with every later bump while this stays the version the rule arrived in. */
 export const FLAT_KEYED_GUIDS_SCENE_VERSION = 18;
+/** The scene format of the prefab instance model (#2001): from it on, an instance entry's own `name` is not read — the
+ *  `"/"` row's name is the root name's one home (hub ruling 2026-10-02, design § 10.4). A literal, for the same reason as
+ *  {@link FLAT_KEYED_GUIDS_SCENE_VERSION}; files are not stamped with it until #2001 S5. */
+export const INSTANCE_MODEL_SCENE_VERSION = 20;
 
 /** The oldest scene format this build reads; an older scene, or one with no `version` at all, is
  *  REFUSED. No released editor ever wrote a scene below v8: the first tag, v0.1.0, wrote 8, and v8

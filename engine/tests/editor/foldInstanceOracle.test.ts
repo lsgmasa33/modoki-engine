@@ -28,6 +28,9 @@ import {
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { clearKeptMemberOrphans, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
+import { memberIdentities } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { memberToken } from '../../packages/modoki/src/runtime/core/templateRefs';
+import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { checkInstance, seen } from './foldOracle';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -137,5 +140,90 @@ describe.skipIf(!hasInternalGames())('#2007 oracle: the fold is what today spawn
   it('checked the corpus (non-vacuity)', () => {
     if (process.env.ORACLE_OUT) writeFileSync(process.env.ORACLE_OUT, JSON.stringify({ seen, report }, null, 1));
     expect(seen.instances).toBeGreaterThan(20);
+    expect(seen.defaults).toBeGreaterThan(0);
+  });
+});
+
+/** The close-out review's cases (#2007) that neither the corpus nor the fuzz seeds reach, through today's real load:
+ *  synthetic documents, the same comparison. Not layout-conditional — they need no game. */
+describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
+  const G = (n: number): string => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-00000000c0de`;
+  const ROOT = G(100), SCENE = G(200);
+  const tf = { x: 0, y: 0, z: 0 };
+  const row = (localId: number, name: string, parentId: number, extra: object = {}) => ({ localId, nodeGuid: G(localId + 10 * (name.length + 1)), traits: { EntityAttributes: { name, parentId }, Transform: tf }, ...extra });
+  const install = (...docs: Array<{ id: string } & Record<string, unknown>>) => {
+    for (const id of prefabs.keys()) setPrefabCache(id, null);
+    prefabs.clear();
+    for (const d of docs) { prefabs.set(d.id, d); setPrefabCache(d.id, d as never); }
+  };
+  const ea = () => getTraitByName('EntityAttributes')!.trait;
+  const check = async (entries: SceneEntityEntry[], entry: SceneEntityEntry): Promise<string[]> => {
+    vi.stubGlobal('fetch', async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => '' }));
+    await load({ version: 15, entities: entries } as unknown as SceneData);
+    vi.unstubAllGlobals();
+    const root = [...getCurrentWorld().entities].find((e) => (e.get(ea()) as { guid?: string } | undefined)?.guid === ROOT)!;
+    const held = new Set(entries.map((e) => e.guid).filter((g): g is string => !!g));
+    return checkInstance(entry, reader, root.id(), { held: (g) => held.has(g) });
+  };
+  const top = (extra: object = {}): SceneEntityEntry => ({ id: 2, name: 'Ship', prefab: 'P', guid: ROOT, traits: { PrefabInstance: { source: 'P', localId: 1 }, EntityAttributes: { name: 'Ship', guid: ROOT, parentId: 0 } }, ...extra }) as SceneEntityEntry;
+
+  it('a template-added reference node is nested in the document that WROTE it, not the frame it hangs in (fuzz seed 6)', async () => {
+    const node = (prefab: string) => ({ parentLocalId: 1, guid: '', key: 'ks', prefab, name: 'K', traits: { EntityAttributes: { name: 'K' }, Transform: tf }, children: [] });
+    const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1)] };
+    const S = { id: 'S', version: 5, rootLocalId: 1, entities: [row(1, 'S', 0), row(2, 'QinS', 1, { prefab: 'Q' })] };
+    // S nests Q, and the node hangs in R's frame of Q: no document contains itself.
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'Q', added: [node('S')] })] }, Q, S);
+    expect(await check([top()], top())).toEqual([]);
+    // A node of Q itself, written by P and hanging in R's frame of Q: P contains Q twice, still no cycle.
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'Q', added: [node('Q')] })] }, Q);
+    expect(await check([top()], top())).toEqual([]);
+  });
+
+  it('#2018: a scene node anchored at a missing nested row hangs from its placeholder (today: under the instance root)', async () => {
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'M-missing' })] });
+    const node = { parentLocalId: 2, guid: G(51), name: 'S', traits: { EntityAttributes: { name: 'S', guid: G(51) }, Transform: tf }, children: [] };
+    const before = seen.ruledOwn;
+    expect(await check([top({ added: [node] })], top({ added: [node] }))).toEqual([]);
+    expect(seen.ruledOwn).toBe(before + 1);
+  });
+
+  it('#2018 (i), a ruled visible fix: a v17 own row at a missing nested row now shows under its placeholder (today hides it)', async () => {
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'M-missing' })] });
+    const R = row(2, 'R', 1).nodeGuid;
+    const s = { parentLocalId: 0, guid: G(54), name: 'S', traits: { EntityAttributes: { name: 'S', guid: G(54) }, Transform: tf }, children: [] };
+    const e = top({ members: { [`/${R}`]: { own: [s] } } });
+    const before = seen.ruledOwnFix;
+    expect(await check([e], e)).toEqual([]);
+    expect(seen.ruledOwnFix).toBe(before + 1);
+  });
+
+  it('a whole-list row on a gone member is held verbatim and unused at its key, as today keeps the row', async () => {
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'A', 1)] });
+    const e = top({ members: { [`/${G(999)}`]: { removedTraits: ['Light'] } } });
+    expect(await check([e], e)).toEqual([]);
+  });
+
+  it('item 4: a member moved to a scene node survives its template ancestor\'s removal, as today', async () => {
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'A', 1), row(3, 'X', 2)] });
+    const entry = top({ removed: [2], moved: { 3: SCENE } });
+    const holder = { id: 1, name: 'Holder', guid: SCENE, traits: { EntityAttributes: { name: 'Holder', guid: SCENE, parentId: 0 }, Transform: tf } } as SceneEntityEntry;
+    expect(await check([holder, entry], entry)).toEqual([]);
+  });
+
+  it('item 5: a document-level move two frames deep lands where today puts it', async () => {
+    const T = { id: 'T', version: 5, rootLocalId: 1, entities: [row(1, 'TRoot', 0), row(2, 'Tx', 1)] };
+    const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'QRoot', 0), row(2, 'S', 1, { prefab: 'T' }), row(3, 'Qx', 1)] };
+    const P0 = { id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'Q' })] };
+    install(T, Q, P0);
+    const byId = new Map([...memberIdentities('P', {}, reader)].map(([p, id]) => [id, p] as const));
+    install(T, Q, { ...P0, moved: { [byId.get('/2/2/2')!]: memberToken(0, parseSteps(byId.get('/2/3')!)) } });
+    expect(await check([top()], top())).toEqual([]);
+  });
+
+  it('item 3: a missing nested row under a removed member leaves no placeholder, as today spawns nothing', async () => {
+    install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'A', 1), row(3, 'R', 2, { prefab: 'M-missing' })] });
+    const before = seen.ruledD;
+    expect(await check([top({ removed: [2] })], top({ removed: [2] }))).toEqual([]);
+    expect(seen.ruledD).toBe(before);
   });
 });

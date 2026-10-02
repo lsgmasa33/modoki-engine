@@ -78,5 +78,7 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     // Both rule translations are reached, so each is exercised rather than merely written (foldOracle.ts).
     expect(seen.ruledB).toBeGreaterThan(0);
     expect(seen.ruledD).toBeGreaterThan(0);
+    // The defaults arm checked something: a broken schema lookup would otherwise pass, checking nothing.
+    expect(seen.defaults).toBeGreaterThan(0);
   });
 });

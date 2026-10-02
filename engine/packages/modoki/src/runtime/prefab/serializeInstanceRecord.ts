@@ -155,8 +155,11 @@ export function serializeTemplateOwner(list: TemplateOverrideList): { fields: Re
  * no nested member, which belong to no row's list. S6's document writer spreads the result onto the document, verbatim
  * (design § 10.4b).
  */
-export function serializeTemplateDocHeld(docHeld: { moved: Record<string, string> } | undefined): { moved?: Record<string, string> } {
-  return docHeld && Object.keys(docHeld.moved).length ? { moved: { ...docHeld.moved } } : {};
+export function serializeTemplateDocHeld(docHeld: { moved?: Record<string, string>; unparsed?: { moved: unknown } } | undefined): { moved?: Record<string, string> } {
+  // A `moved` that is not a record at all is held whole (`unparsed`), and written back byte-for-byte as the file had it
+  // — the document type describes a well-formed file, which this one was not.
+  if (docHeld?.unparsed) return { moved: docHeld.unparsed.moved as Record<string, string> };
+  return docHeld?.moved && Object.keys(docHeld.moved).length ? { moved: { ...docHeld.moved } } : {};
 }
 
 // ── Scene form ──────────────────────────────────────────────────────────────────────────────────────────

@@ -91,40 +91,6 @@ const orphanBookedTwice = (f: StepFailure): boolean => {
   return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
 };
 
-/** #2015: a template move INTO a nested instance's member, made in prefab edit: today places the node under that member,
- *  the fold at the frame above. Every divergence line is a parent the fold puts at an ANCESTOR of today's. */
-const templateMoveIntoNested = (f: Failure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => {
-    const m = /^parent \S+: fold \{"key":"([^"]+)"\} live \{"key":"([^"]+)"\}$/.exec(l);
-    // Under a NESTED instance's member: at least a frame and a member below where the fold puts it.
-    const depth = (k: string) => k.split('/').filter(Boolean).length;
-    return !!m && m[2]!.startsWith(m[1] === '/' ? '/' : `${m[1]}/`) && depth(m[2]!) - depth(m[1]!) >= 2;
-  });
-};
-
-/** #2016: a held reference copy's unused legacy part, keyed at '/' instead of the node it stands for. */
-const projectedAndLegacyGone = (f: Failure): boolean =>
-  f.check === 'P1 the live instance is not the fold of its record'
-  && f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^fold-only unused \/ legacy \(gone\)$/.test(l));
-
-/** #2017: a scene-added reference node stated once, in a template-added reference node's `added`, anchored twice by the
- *  fold. Every line is an anchor list that is the live one with a guid repeated — nothing missing, nothing extra. */
-const anchorFoldedTwice = (f: Failure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => {
-    const m = /^anchors \S+: fold (\[[^\]]*\]) live (\[[^\]]*\])$/.exec(l);
-    if (!m) return false;
-    const fold = JSON.parse(m[1]!) as string[], live = JSON.parse(m[2]!) as string[];
-    return fold.length > live.length && new Set(live).size === live.length && [...new Set(fold)].sort().join() === [...live].sort().join();
-  });
-};
-
-/** #2018: an own link on a row whose member the fold does not project, kept by today and by neither side of the fold. */
-const ownLinkLost = (f: Failure): boolean =>
-  f.check === 'P1 the live instance is not the fold of its record'
-  && f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^kept-only unused \/\S* own \(unprojected\)$/.test(l));
-
 export const KNOWN_OPEN: KnownOpen[] = [
   {
     issue: 1951,
@@ -173,56 +139,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => orphanBookedTwice(f),
     // Tolerated, not a stop: frequent and benign (the save writes the row once), so the run goes on past it.
     tolerates: (f) => orphanBookedTwice(f as StepFailure),
-  },
-  {
-    issue: 2018,
-    what: "#2018 (#2009 close-out review; hunt seed 1056): an own link on a row whose member the fold does not project is in neither the fold's anchors nor its unused; today's orphan store keeps it. Fold owner ai3; the fix deletes this",
-    repro: [
-      {kind: 'agentInstantiate', u: [0.4559346667956561, 0.37867973023094237, 0.5694238140713423, 0.25957475206814706, 0.43067003530450165, 0.023551187943667173, 0.005278054159134626, 0.010750872315838933]},
-      {kind: 'copy', u: [0.21567681711167097, 0.7286644533742219, 0.7490342773962766, 0.5499166115187109, 0.8973726592957973, 0.8362372894771397, 0.9806615179404616, 0.5986551374662668]},
-      {kind: 'paste', u: [0.06879417202435434, 0.8586573472712189, 0.23260780214332044, 0.5008264498319477, 0.8013004933018237, 0.19319971976801753, 0.38576094480231404, 0.4331498169340193]},
-      {kind: 'duplicate', u: [0.9156414228491485, 0.6522056800313294, 0.2831795741803944, 0.3938902891241014, 0.6584261360112578, 0.9838417551945895, 0.8780419887043536, 0.7850812294054776]},
-      {kind: 'prefabEdit', u: [0.7092356325592846, 0.24598290212452412, 0.15701974369585514, 0.3087505749426782, 0.08162508602254093, 0.46456338628195226, 0.05596627830527723, 0.7852319057565182], inner: [{kind: 'delete', u: [0.20540676708333194, 0.15140634472481906, 0.6272719907574356, 0.5795787451788783, 0.2754221009090543, 0.9344441038556397, 0.33999770134687424, 0.09485156228765845]}]},
-    ],
-    reproduces: (f) => ownLinkLost(f),
-    tolerates: (f) => ownLinkLost(f),
-  },
-  {
-    issue: 2015,
-    what: "#2015 (#2009's P1 in regression #1809's win seed 6858, a #2001 S5 entry criterion): a member moved in prefab edit under a NESTED instance's member — today places it there (self-consistent, and right per the hub's ruling: an added-child override on the nested instance), the fold at the frame above. Tolerated so P1 lands; the fold's fix deletes this",
-    repro: [
-      {kind: 'prefabEdit', u: [0.5173346495721489, 0.08749266993254423, 0.8221204644069076, 0.18406294146552682, 0.3249459487851709, 0.8549291610252112, 0.2693206842523068, 0.9086369727738202], inner: [{kind: 'reparent', u: [0.22139877150766551, 0.8194225707557052, 0.8731111134402454, 0.3676116168498993, 0.9742902971338481, 0.127988196676597, 0.6087110303342342, 0.1887473629321903]}]},
-      {kind: 'instantiate', u: [0.7440747111104429, 0.43991357320919633, 0.6826722382102162, 0.4947671240661293, 0.6600351938977838, 0.9901851266622543, 0.6497153099626303, 0.006117034703493118]},
-      {kind: 'delete', u: [0.6108392698224634, 0.46971312118694186, 0.05811715195886791, 0.6591711670625955, 0.9784175350796431, 0.0649864545557648, 0.2063837342429906, 0.6221727712545544]},
-      {kind: 'apply', u: [0.21948481863364577, 0.29272619541734457, 0.5293124683666974, 0.5085932151414454, 0.07048665941692889, 0.9514830820262432, 0.5172908876556903, 0.5575136966072023]},
-    ],
-    reproduces: (f) => templateMoveIntoNested(f),
-    tolerates: (f) => templateMoveIntoNested(f),
-  },
-  {
-    issue: 2016,
-    what: "#2016 (#2009's P1 in regression #1738's win seed 6136): a held copy of a reference node whose prefab was trashed (a converted row's `added` remainder) is keyed at '/' as an unused legacy part, instead of at the node it stands for — so the oracle's under-a-placeholder skip cannot see it. Hub ruling (a) 2026-10-02: the fold keys it at <frame>/a+<copy.key>; ai3's fix deletes this",
-    repro: [
-      {kind: 'instantiate', u: [0.4431566004641354, 0.7968979061115533, 0.40783188841305673, 0.5022549307905138, 0.19927031104452908, 0.6920147859491408, 0.2723008228931576, 0.9618998144287616]},
-      {kind: 'createPrefab', u: [0.0038380103651434183, 0.591657679527998, 0.6498477926943451, 0.16832039435394108, 0.2952046236023307, 0.20283732656389475, 0.14619030989706516, 0.46976823825389147]},
-      {kind: 'trashPrefab', u: [0.366121573606506, 0.12152830720879138, 0.5724751548841596, 0.37606001063250005, 0.03529732837341726, 0.28352958406321704, 0.45296140434220433, 0.5870168737601489]},
-      {kind: 'prefabEdit', u: [0.301515509840101, 0.43780972715467215, 0.667069936171174, 0.5753587565850466, 0.6484025486279279, 0.15705850371159613, 0.9615241875872016, 0.1484056394547224], inner: []},
-    ],
-    reproduces: (f) => projectedAndLegacyGone(f),
-    tolerates: (f) => projectedAndLegacyGone(f),
-  },
-  {
-    issue: 2017,
-    what: "#2017 (#2009's P1, hunt seed 1039, a #2001 S5 entry criterion): a scene-added reference node stated ONCE in a template-added reference node's `added` list is anchored TWICE by the fold; the live world has it once. Tolerated so P1 lands; the fold's fix deletes this",
-    repro: [
-      {kind: 'instantiate', u: [0.5609265118837357, 0.6023040043655783, 0.9762438023462892, 0.298269433202222, 0.8683141528163105, 0.9474625086877495, 0.828145133331418, 0.6475943445693702]},
-      {kind: 'createPrefab', u: [0.29290726501494646, 0.19988887920044363, 0.16759243491105735, 0.09675576607696712, 0.4572025721427053, 0.12822362151928246, 0.04358621081337333, 0.08530493942089379]},
-      {kind: 'instantiate', u: [0.8249817844480276, 0.9148745054844767, 0.3363472269847989, 0.08276237524114549, 0.6854521201457828, 0.144374803872779, 0.008927585324272513, 0.847050443990156]},
-      {kind: 'agentInstantiate', u: [0.1483824928291142, 0.6918918816372752, 0.38471077801659703, 0.9342870214022696, 0.22695961454883218, 0.011585129424929619, 0.5545891183428466, 0.6955016700085253]},
-      {kind: 'duplicate', u: [0.8299716536421329, 0.6594416976440698, 0.47682820400223136, 0.7401402303948998, 0.9696856064256281, 0.5790280047804117, 0.3553627871442586, 0.5044258621055633]},
-    ],
-    reproduces: (f) => anchorFoldedTwice(f),
-    tolerates: (f) => anchorFoldedTwice(f),
   },
   {
     issue: 2001,

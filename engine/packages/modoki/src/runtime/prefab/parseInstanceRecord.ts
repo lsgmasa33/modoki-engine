@@ -34,6 +34,7 @@
  */
 import type { AddedEntity, NestedStructureDelta, SceneEntityEntry, SceneMemberRow } from '../loaders/loadSceneFile';
 import { emptyDocMap } from '../core/docKeys';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../core/version';
 import { deriveGuid, deriveMemberGuidAvoiding, memberPathSteps, nodeRowComponent, nodeRowKey, parseSteps } from '../core/assetRefRules';
 import { restoreMalformed, splitMalformedChannels } from '../loaders/malformedChannels';
 import { memberPathRecords } from '../loaders/memberPaths';
@@ -43,7 +44,7 @@ import {
   type ForwardState, type FrameChannels, type MemberRowChannels, type StructureLayer,
 } from '../loaders/prefabOverrides';
 import {
-  ROOT_ROW_KEY,
+  HELD_REMAINDER, ROOT_ROW_KEY,
   type AddedNodeRef, type HeldData, type TemplateHeldData, type InstanceRecord, type LegacyChannels, type ParsedInstance, type ParseWarning,
   type Placement, type PrefabDoc, type PrefabDocRow, type PrefabReader, type RecordTraits, type RowKey,
   type SceneOwnedNode, type TargetRecordOf, type TemplateAddedNode, type TemplateOverrideList, type TemplateTargetRecord,
@@ -294,6 +295,12 @@ class Pending {
     const last = steps[steps.length - 1]!;
     ((at[last] ??= []) as unknown[]).push(structuredClone(value));
   }
+  /** Mark the held container at `container` as a whole list's REMAINDER (`HELD_REMAINDER`). */
+  mark(container: (string | number)[]): void {
+    let at = this.channels;
+    for (const step of container.map(String)) at = (at[step] ??= emptyDocMap()) as Record<string, unknown>;
+    at[HELD_REMAINDER] = true;
+  }
   get empty(): boolean { return !Object.keys(this.channels).length; }
 }
 
@@ -355,8 +362,10 @@ function convertOwner<Own>(ctx: Ctx<Own>, f: Frame, o: OwnerChannels, opts: Owne
     legacyValues(ctx, at.frame, values as Record<string, unknown>, (lid) => opts.at('nestedOverrides', path, lid));
   }
   legacyValues(ctx, f, o.overrides as Record<string, unknown> | undefined, (lid) => opts.at('overrides', lid), opts.skip);
-  if (opts.whole) {
+  if (opts.whole && !isRemainder(o)) {
     slotLists(ctx, f, o, (...p) => opts.at(...p));
+  } else if (opts.whole) {
+    remainderLists(ctx, f, o, (...p) => opts.at(...p));
   } else {
     legacyRemoved(ctx, f, o.removed, opts.at('removed'));
     legacyRemovedTraits(ctx, f, o.removedTraits, (lid) => opts.at('removedTraits', lid));
@@ -367,8 +376,10 @@ function convertOwner<Own>(ctx: Ctx<Own>, f: Frame, o: OwnerChannels, opts: Owne
     const at = frameAtPath(f, path, ctx.read);
     if (!('frame' in at) || !isRecord(s)) { ctx.pending.put(opts.at('nestedStructure', path), s); continue; }
     const slotAt = (...p: Path) => opts.at('nestedStructure', path, ...p);
-    slotLists(ctx, at.frame, s, slotAt);
-    legacyMoved(ctx, at.frame, (s as NestedStructureDelta).moved, (lid) => slotAt('moved', lid));
+    if (isRemainder(s)) remainderLists(ctx, at.frame, s, slotAt);
+    else slotLists(ctx, at.frame, s, slotAt);
+    // A slot is whole: a held move alone would read back as a slot that states nothing else (#2007 review, item 1).
+    legacyMoved(ctx, at.frame, (s as NestedStructureDelta).moved, (lid) => slotAt('moved', lid), slotAt());
   }
   convertRows(ctx, f.prefix, o.members, opts.pins);
 }
@@ -420,10 +431,10 @@ function legacyRemovedTraits<Own>(ctx: Ctx<Own>, f: Frame, lists: Record<number,
 
 /** Legacy `moved` of frame `f` (member localId → its new parent: a guid in scene form, #1437): a legacy `parent` record
  *  (U7: kept, revertable, never written by a gesture). */
-function legacyMoved<Own>(ctx: Ctx<Own>, f: Frame, moved: Record<number, string> | undefined, pendingAt: (lid: string) => Path): void {
+function legacyMoved<Own>(ctx: Ctx<Own>, f: Frame, moved: Record<number, string> | undefined, pendingAt: (lid: string) => Path, remainderOf?: Path): void {
   for (const [lid, parent] of Object.entries(moved ?? {})) {
     const key = /^\d+$/.test(lid) ? keyOfLid(f, Number(lid)) : null;
-    if (key === null || typeof parent !== 'string') { ctx.pending.put(pendingAt(lid), parent); continue; }
+    if (key === null || typeof parent !== 'string') { ctx.pending.put(pendingAt(lid), parent); if (remainderOf) ctx.pending.mark(remainderOf); continue; }
     ctx.out.parent(key, parent, 'legacy');
   }
 }
@@ -440,7 +451,7 @@ function slotLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDelta, '
   const named = new Set<number>();
   for (const lid of s.removed ?? []) {
     const key = keyOfLid(f, lid);
-    if (key === null) { ctx.pending.push(at('removed'), lid); continue; }
+    if (key === null) { ctx.pending.push(at('removed'), lid); ctx.pending.mark(at()); continue; }
     named.add(lid);
     ctx.out.removed(key, true, 'legacy');
   }
@@ -453,8 +464,8 @@ function slotLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDelta, '
   const stated = (s.removedTraits ?? {}) as Record<string, string[]>;
   for (const [lid, names] of Object.entries(stated)) {
     const key = /^\d+$/.test(lid) ? keyOfLid(f, Number(lid)) : null;
-    if (key === null) { ctx.pending.put(at('removedTraits', lid), names); continue; }
-    for (const t of names ?? []) ctx.out.traitRemoval(key, t, true, 'legacy');
+    if (key === null || !Array.isArray(names)) { ctx.pending.put(at('removedTraits', lid), names); ctx.pending.mark(at()); continue; }
+    for (const t of names) if (typeof t === 'string') ctx.out.traitRemoval(key, t, true, 'legacy');
   }
   for (const [lid, names] of Object.entries(chain.lists.removedTraits ?? {})) {
     const key = keyOfLid(f, Number(lid));
@@ -465,12 +476,37 @@ function slotLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDelta, '
   pinAdded(ctx, chain, s.added ?? [], undefined, at('added'));
 }
 
+/** Does this held container stand for a whole list's REMAINDER (`HELD_REMAINDER`)? */
+const isRemainder = (o: unknown): boolean => isRecord(o) && o[HELD_REMAINDER] === true;
+
+/** A whole-list container's held REMAINDER, read back (hub ruling 2026-10-02, #2006, option C): ADDITIVELY. Each
+ *  element is its own record — a removal, a component removal, a node copy paired with its chain node — or is held
+ *  again, marker kept. It says nothing about the chain's other entries: they were converted the first time. */
+function remainderLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDelta, 'added' | 'removed' | 'removedTraits'>, at: (...p: Path) => Path): void {
+  const chain = chainAt(ctx.top, f.prefix, ctx.read);
+  if (!('frame' in chain)) {
+    for (const k of ['added', 'removed', 'removedTraits'] as const) if (s[k] !== undefined) ctx.pending.put(at(k), s[k]);
+    ctx.pending.mark(at());
+    return;
+  }
+  for (const lid of Array.isArray(s.removed) ? s.removed : []) {
+    const key = typeof lid === 'number' ? keyOfLid(f, lid) : null;
+    if (key === null) { ctx.pending.push(at('removed'), lid); ctx.pending.mark(at()); } else ctx.out.removed(key, true, 'legacy');
+  }
+  for (const [lid, names] of Object.entries(isRecord(s.removedTraits) ? s.removedTraits : {})) {
+    const key = /^\d+$/.test(lid) ? keyOfLid(f, Number(lid)) : null;
+    if (key === null || !Array.isArray(names)) { ctx.pending.put(at('removedTraits', lid), names); ctx.pending.mark(at()); continue; }
+    for (const t of names) if (typeof t === 'string') ctx.out.traitRemoval(key, t, true, 'legacy');
+  }
+  pinAdded(ctx, chain, Array.isArray(s.added) ? s.added : [], undefined, at('added'), true);
+}
+
 /** PIN conversion of a whole added list (§ 5.2): `list` replaced the chain's nodes of the chain's frame anchored at
  *  `anchorLid` (every anchor when undefined: a slot). A node pairs with the chain node it replaced as today's fold pairs
  *  them (`pairWithBase`: same key, among the replaced nodes, same prefab-ness); a paired node becomes that node's ROW,
  *  every field it states recorded; each replaced chain node nothing pairs with is removed; every other node is an own
  *  node. */
-function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[], anchorLid: number | undefined, at: Path): void {
+function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[], anchorLid: number | undefined, at: Path, additive = false): void {
   const f = chain.frame;
   const lower = chain.lists.added ?? [];
   const replaced = lower.filter((n) => anchorLid === undefined || n.parentLocalId === anchorLid);
@@ -498,7 +534,8 @@ function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[]
     for (const c of kids) if (!paired.has(c)) removeNode(c);
   };
   for (const node of list) visit(node, keyOfLid(f, anchorLid ?? node.parentLocalId) ?? (f.prefix || ROOT_ROW_KEY), replaced);
-  for (const n of replaced) if (!paired.has(n)) removeNode(n);
+  // A held REMAINDER is not the whole list: the chain nodes it does not name were converted already (`HELD_REMAINDER`).
+  if (!additive) for (const n of replaced) if (!paired.has(n)) removeNode(n);
 }
 
 /** A whole-list copy of a template REFERENCE node `a+key` in `chain`'s frame. Scene form: its values layer over the
@@ -507,10 +544,18 @@ function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[]
 function referenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, node: AddedEntity, at: Path): void {
   if (ctx.form.template) { templateReferenceCopy(ctx, chain, key, node, at); return; }
   const sub = chainStep(chain, nodeRowComponent(key), ctx.read);
-  if (!('frame' in sub)) { ctx.pending.push(at, node); return; }
+  // Held whole, as a remainder of the list it was stated in (`HELD_REMAINDER`).
+  const hold = (): void => { ctx.pending.push(at, node); ctx.pending.mark(at.slice(0, -1)); };
+  if (!('frame' in sub)) { hold(); return; }
+  // Its `templateMoved` tokens are written from the COPY's frame, and a scene record's token is read from the instance's
+  // top frame: no record can carry them, so the copy is held whole rather than lose them (#2007 review, item 8).
+  if (isRecord(node.templateMoved) && Object.keys(node.templateMoved).length) { hold(); return; }
+  // A copy with a channel in no shape a reader takes is held whole, verbatim, rather than read lossily (I18; close-out
+  // review round 2: a value read as a tag, a malformed row skipped).
+  if (splitMalformedChannels(node).malformed.length || badRows(node.members)) { hold(); return; }
   const scratch: Ctx<Own> = { ...ctx, out: new ListBuilder<Own>(ctx.warnings), pending: new Pending(), ownContent: new Map() };
   convertOwner(scratch, sub.frame, node, { whole: true, pins: true, at: (...p) => p });
-  if (!scratch.pending.empty) { ctx.pending.push(at, node); return; }
+  if (!scratch.pending.empty) { hold(); return; }
   ctx.out.absorb(scratch.out, 'legacy');
   for (const [g, n] of scratch.ownContent) if (!ctx.ownContent.has(g)) ctx.ownContent.set(g, n);
 }
@@ -541,7 +586,7 @@ function templateReferenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, co
   const comp = nodeRowComponent(key);
   const c = chainStep(chain, comp, ctx.read);
   const n = frameKeyIndex(chain.lists.added as (AddedEntity & { key?: string })[] | undefined).get(key);
-  if (!('frame' in c) || !n) { ctx.pending.push(at, copy); return; }
+  if (!('frame' in c) || !n) { ctx.pending.push(at, copy); ctx.pending.mark(at.slice(0, -1)); return; }
   const dLayers: Layer[] = [{ slots: copy.nestedStructure, rows: copy.members, values: copy.overrides, valuePaths: copy.nestedOverrides }];
   const folded = foldStructureLayers(c.frame.doc as never, dLayers, 0, { added: copy.added, removed: copy.removed, removedTraits: copy.removedTraits });
   const d: Chain = { frame: c.frame, lists: folded.channels as Lists, state: { layers: dLayers, forwardRoots: folded.forwardRoots as Chain['state']['forwardRoots'] } };
@@ -552,7 +597,7 @@ function templateReferenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, co
   for (const p of paths) {
     const cp = p ? walkLids(c, p, ctx.read) : c;
     const dp = p ? walkLids(d, p, ctx.read) : d;
-    if (!cp || !dp) { ctx.pending.push(at, copy); return; }
+    if (!cp || !dp) { ctx.pending.push(at, copy); ctx.pending.mark(at.slice(0, -1)); return; }
     const f = cp.frame;
     const own = (p ? copy.nestedOverrides?.[p] : copy.overrides) as Record<string, Record<string, Record<string, unknown>>> | undefined;
     // Structure: the lists today shows, pinned against the chain.
@@ -584,7 +629,7 @@ function templateReferenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, co
       }
     }
   }
-  if (!scratch.pending.empty) { ctx.pending.push(at, copy); return; }
+  if (!scratch.pending.empty) { ctx.pending.push(at, copy); ctx.pending.mark(at.slice(0, -1)); return; }
   ctx.out.absorb(scratch.out, 'legacy');
   if (erased.length) {
     ctx.warnings.push({ code: 'pendingLegacy', key: `${chain.frame.prefix}/${comp}`, message: `a template copy of ${key} restates none of ${erased.join(', ')}; recorded with the value each shows today (#2006 gap A)` });
@@ -608,6 +653,10 @@ function rowTarget<Own>(ctx: Ctx<Own>, key: RowKey): { chain: Chain; lid: number
   return { chain: inner, lid: inner.frame.rootLid };
 }
 
+/** A template-form key through the owner's OWN added nodes (`/a+<key>/…`): the template chain lists no such node, so
+ *  `rowTarget` cannot name it, and that is no reason to hold the row (close-out review round 3). */
+const ownAddedKey = <Own>(ctx: Ctx<Own>, key: RowKey): boolean => ctx.form.template && !!nodeRowKey(key.split('/').filter(Boolean)[0] ?? '');
+
 function rowOfComponent(f: Frame, component: string): PrefabDocRow | undefined {
   for (const [lid, row] of f.byLid) if ((row.nodeGuid || preV5NodeGuid(f.docGuid, lid)) === component) return row;
   return undefined;
@@ -625,10 +674,18 @@ function convertRows<Own>(ctx: Ctx<Own>, prefix: string, rows: Record<string, Sc
       if (typeof row.name === 'string') ctx.out.pin(key, 'name', row.name);
     }
     if (isRecord(row.traits)) for (const [t, data] of Object.entries(row.traits)) ctx.out.traitData(key, t, data, 'row');
-    if (Array.isArray(row.removedTraits)) wholeRemovedTraits(ctx, key, row.removedTraits);
+    // The two whole lists convert AGAINST the chain. A target no chain names — in a frame no document gives (missing or
+    // damaged), or a gone member — leaves them nothing to convert against: held verbatim, marker kept, as today keeps
+    // the row (rule 9; close-out review rounds 2-4: converting it pinned a template copy as a scene-owned node and
+    // dropped the list's restores). Not a template key through the owner's OWN added nodes, which no chain lists.
+    const unnamed = (Array.isArray(row.added) || Array.isArray(row.removedTraits)) && rowTarget(ctx, key) === null && !ownAddedKey(ctx, key);
+    if (unnamed) {
+      for (const f of ['added', 'removedTraits'] as const) if (Array.isArray(row[f])) ctx.pending.put(['members', rawKey, f], row[f]);
+      if (isRemainder(row)) ctx.pending.mark(['members', rawKey]);
+    } else if (Array.isArray(row.removedTraits)) wholeRemovedTraits(ctx, key, row.removedTraits);
     if (isRecord(row.traitRemovals)) for (const [t, on] of Object.entries(row.traitRemovals)) if (typeof on === 'boolean') ctx.out.traitRemoval(key, t, on, 'row');
     if (typeof row.removed === 'boolean') ctx.out.removed(key, row.removed, 'row');
-    if (Array.isArray(row.added)) wholeAdded(ctx, key, row.added, ['members', rawKey, 'added']);
+    if (Array.isArray(row.added) && !unnamed) wholeAdded(ctx, key, row.added, ['members', rawKey, 'added'], isRemainder(row));
     if (Array.isArray(row.own)) ctx.out.own(key, row.own.map((n) => ctx.form.ownNode(n, key)), 'row');
     if (typeof row.parent === 'string') ctx.out.parent(key, row.parent, 'row');
   }
@@ -660,15 +717,23 @@ function wholeRemovedTraits<Own>(ctx: Ctx<Own>, key: RowKey, list: readonly stri
 
 /** A row's `added` (v16): the whole list of nodes under its member, over the chain's (§ 5.2 "pin conversion"). It
  *  replaces the owner's own legacy nodes anchored there (today's fold: `row.added` replaces the lower layer's). */
-function wholeAdded<Own>(ctx: Ctx<Own>, key: RowKey, list: readonly AddedEntity[], at: Path): void {
-  ctx.out.replaceLegacyOwn(key);
+function wholeAdded<Own>(ctx: Ctx<Own>, key: RowKey, list: readonly AddedEntity[], at: Path, remainder = false): void {
+  // A held REMAINDER of a row's list replaces nothing: it is read back additively (`HELD_REMAINDER`). The legacy nodes
+  // a whole list replaces leave `ownContent` too, so nothing holds content no link names (close-out review); a node the
+  // row's list states again is put back by its own conversion below.
+  if (!remainder) {
+    for (const d of ctx.out.replaceLegacyOwn(key)) {
+      const g = (d as { guid?: unknown }).guid;
+      if (!ctx.form.template && typeof g === 'string') ctx.ownContent.delete(g);
+    }
+  }
   const target = rowTarget(ctx, key);
   if (!target || target.lid === null) {
     // Under a template-added node: its children are the node's own list, not a chain member's anchor.
     ctx.out.own(key, list.map((n) => ctx.form.ownNode(n, key)), 'row');
     return;
   }
-  pinAdded(ctx, target.chain, list, target.lid, at);
+  pinAdded(ctx, target.chain, list, target.lid, at, remainder);
 }
 
 // ── Template moves (member path → member token) ─────────────────────────────────────────────────────
@@ -708,7 +773,7 @@ export function memberIdentities(docGuid: string, owner: OwnerChannels, read: Pr
 /** Template moves (`templateMoved` on a template reference node, or one reference row's share of its document's
  *  `moved`): `parent` member tokens on the template list (§ 5.2). A move of a keyed node (#1883 ruling C) is kept the
  *  same way and reported unused by the fold. A path that names no member is held verbatim. */
-function templateMoves(ctx: Ctx<TemplateAddedNode>, docGuid: string, owner: OwnerChannels, moves: Record<string, string> | undefined, at: (path: string) => Path): void {
+function templateMoves<Own>(ctx: Ctx<Own>, docGuid: string, owner: OwnerChannels, moves: Record<string, string> | undefined, at: (path: string) => Path): void {
   if (!moves || !Object.keys(moves).length) return;
   const ids = memberIdentities(docGuid, owner, ctx.read);
   for (const [path, token] of Object.entries(moves)) {
@@ -800,12 +865,51 @@ function templateForm(read: PrefabReader, warnings: ParseWarning[]): Form<Templa
 // ── Entry points ────────────────────────────────────────────────────────────────────────────────────
 
 /** Split off what no reader takes (F-CB1(a)): kept verbatim under its channel name. */
+/** A `members` channel holding a key no row reader takes (not `/`-rooted) or a row that is not a record. */
+const badRows = (members: unknown): boolean => isRecord(members) && Object.entries(members).some(([k, r]) => !k.startsWith('/') || !isRecord(r));
+
+/** Values `splitMalformedChannels` does not inspect, in shapes no reader takes, moved out to `unparsed` (I18; the close-out
+ *  review and #2008): a member row's non-boolean `traitRemovals` value, a non-record `templateMoved`. Each was dropped silently before. */
+function malformedValues<T extends object>(clean: T, unparsed: Record<string, unknown>, original: T): T {
+  const o = clean as Record<string, unknown>;
+  const origRows = (original as Record<string, unknown>).members;
+  let out = o;
+  const take = (): Record<string, unknown> => (out === o ? (out = { ...o }) : out);
+  if (o.templateMoved !== undefined && !isRecord(o.templateMoved)) { unparsed.templateMoved = o.templateMoved; delete take().templateMoved; }
+  if (isRecord(o.members)) {
+    let rows: Record<string, unknown> | undefined;
+    for (const [k, row] of Object.entries(o.members)) {
+      if (!isRecord(row) || !k.startsWith('/')) {
+        // A row no reader takes, kept verbatim rather than skipped (close-out review round 2).
+        // The ORIGINAL row, whole: the shared splitter may already have moved a malformed part of it out.
+        ((unparsed.members ??= emptyDocMap()) as Record<string, unknown>)[k] = structuredClone(isRecord(origRows) ? origRows[k] : row);
+        const rest = { ...(rows ?? (o.members as object)) } as Record<string, unknown>;
+        delete rest[k];
+        rows = rest;
+        continue;
+      }
+      const bad: Record<string, unknown> = {};
+      if (isRecord(row.traitRemovals)) for (const [t, on] of Object.entries(row.traitRemovals)) if (typeof on !== 'boolean') ((bad.traitRemovals ??= emptyDocMap()) as Record<string, unknown>)[t] = on;
+      if (!Object.keys(bad).length) continue;
+      // Merged into what the shared splitter already moved out of this row, never assigned over it.
+      const held = (((unparsed.members ??= emptyDocMap()) as Record<string, unknown>)[k] ??= emptyDocMap()) as Record<string, unknown>;
+      held.traitRemovals = { ...(isRecord(held.traitRemovals) ? held.traitRemovals : {}), ...structuredClone(bad.traitRemovals as object) };
+      const fixed: Record<string, unknown> = { ...row };
+      if (bad.traitRemovals) fixed.traitRemovals = Object.fromEntries(Object.entries(row.traitRemovals as object).filter(([, on]) => typeof on === 'boolean'));
+      (rows ??= { ...(o.members as object) })[k] = fixed;
+    }
+    if (rows) take().members = rows;
+  }
+  return out as T;
+}
+
 function unparsedOf<T extends object>(owner: T, warnings: ParseWarning[]): { clean: T; unparsed?: Record<string, unknown> } {
-  const { clean, malformed } = splitMalformedChannels(owner);
-  if (!malformed.length) return { clean };
+  const { clean: split, malformed } = splitMalformedChannels(owner);
   const unparsed: Record<string, unknown> = {};
   restoreMalformed(unparsed, malformed);
-  warnings.push({ code: 'unparsed', message: `kept verbatim, no reader takes: ${malformed.map((m) => m.path.join('.')).join(', ')}` });
+  const clean = malformedValues(split, unparsed, owner);
+  if (!Object.keys(unparsed).length) return { clean };
+  warnings.push({ code: 'unparsed', message: `kept verbatim, no reader takes: ${Object.keys(unparsed).join(', ')}` });
   return { clean, unparsed };
 }
 
@@ -821,7 +925,16 @@ function unresolvedOwner<Own>(clean: OwnerChannels, out: ListBuilder<Own>, form:
   for (const [key, row] of Object.entries(clean.members ?? {})) {
     if (!isRecord(row)) continue;
     if (Array.isArray(row.added) || Array.isArray(row.removedTraits)) {
-      ((pending.members ??= emptyDocMap()) as Record<string, unknown>)[key] = structuredClone(row);
+      const kept = structuredClone(row);
+      // The "/" row's root defaults have one home, the placement, held row or not (#2008 round 3, D1's sibling): they
+      // leave for the "/" record, which `takeRootDefaults` moves to the placement.
+      const ea = pins && key === ROOT_ROW_KEY && isRecord(kept.traits) ? kept.traits.EntityAttributes : undefined;
+      if (isRecord(ea)) {
+        for (const f of ROOT_DEFAULT_FIELDS) if (f in ea) { out.field(key, 'EntityAttributes', f, ea[f], 'row'); delete ea[f]; }
+        if (!Object.keys(ea).length) delete (kept.traits as Record<string, unknown>).EntityAttributes;
+        if (!Object.keys(kept.traits as object).length) delete kept.traits;
+      }
+      ((pending.members ??= emptyDocMap()) as Record<string, unknown>)[key] = kept;
       continue;
     }
     if (pins && typeof row.guid === 'string') out.pin(key, 'guid', row.guid);
@@ -847,6 +960,10 @@ export interface ParseOptions {
   sceneHadCopies?: boolean;
   /** Guids other entities of the scene hold: a derived link never takes one (#1882). */
   held?: (guid: string) => boolean;
+  /** The scene file's stated `version`. From `INSTANCE_MODEL_SCENE_VERSION` on, an entry's own `name` (and stored
+   *  `EntityAttributes.name`) is not read: the `"/"` row is the root name's one home, and the entry's name "equals the
+   *  record, and nothing reads it" (hub ruling 2026-10-02, design § 10.4). Absent: an earlier file, read by the fallback. */
+  sceneVersion?: number;
 }
 
 type RootBag = Record<string, unknown>;
@@ -870,7 +987,12 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
   const source = typeof owner.prefab === 'string' ? owner.prefab : typeof pi?.source === 'string' ? pi.source : '';
   const rootGuid = typeof owner.guid === 'string' ? owner.guid : '';
   const ea = attrs(traits);
-  const ownName = typeof owner.name === 'string' && owner.name ? owner.name : undefined;
+  // A v20 entry's own name is the record's echo; nothing reads it (`ParseOptions.sceneVersion`).
+  const v20 = entry && (opts.sceneVersion ?? 0) >= INSTANCE_MODEL_SCENE_VERSION;
+  const ownName = !v20 && typeof owner.name === 'string' && owner.name ? owner.name : undefined;
+  const rootNamed = (rowDefaults: RootBag): void => {
+    if (v20 && str(rowDefaults.name) === undefined) warnings.push({ code: 'rootNameMissing', key: ROOT_ROW_KEY, message: 'a v20 entry states no "/" name; the root shows the template root\'s' });
+  };
   const ownContent = new Map<string, SceneOwnedNode>();
   const out = new ListBuilder<AddedNodeRef>(warnings);
   const got = read(source);
@@ -883,7 +1005,8 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
     const rootOv = attrs((clean.overrides as Record<string, unknown> | undefined)?.[rootLid]);
     const pending = unresolvedOwner(clean, out, form, true, entry ? {} : { templateMoved: (clean as unknown as AddedEntity).templateMoved });
     const rowDefaults = takeRootDefaults(out, held, warnings);
-    const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? str(ea?.name) ?? 'Missing Prefab';
+    rootNamed(rowDefaults);
+    const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? (v20 ? undefined : str(ea?.name)) ?? 'Missing Prefab';
     const sortOrder = num(rowDefaults.sortOrder) ?? num(ea?.sortOrder) ?? num(rootOv?.sortOrder) ?? 0;
     if (pending) {
       held.pendingLegacy = pending;
@@ -911,6 +1034,9 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
   }
   const skip = (key: RowKey, trait: string, field: string): boolean => key === ROOT_ROW_KEY && trait === 'EntityAttributes' && ROOT_DEFAULT_FIELDS.has(field);
   convertOwner(ctx, top, clean, { pins: true, skip, at: (...p) => p });
+  // A scene reference node's `templateMoved` (`spawnReferenceNode` applies it for any reference node): its member tokens
+  // become `parent` records, which the fold resolves as template moves (#2007 review, item 8). It was dropped before.
+  if (!entry) templateMoves(ctx, source, clean as OwnerChannels, (clean as unknown as AddedEntity).templateMoved, (path) => ['templateMoved', path]);
   // The entry's extra root traits are applied LAST and win (SceneManager's `rootExtraTraits`).
   if (entry) for (const [t, data] of Object.entries(traits)) if (t !== 'PrefabInstance' && t !== 'Transform' && t !== 'EntityAttributes') out.traitData(ROOT_ROW_KEY, t, data, 'legacy');
   if (!pending.empty) {
@@ -921,11 +1047,15 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
   const templateName = (typeof tAttrs?.name === 'string' ? tAttrs.name : undefined) ?? (typeof templateRoot?.name === 'string' ? templateRoot.name : '');
   const rowDefaults = takeRootDefaults(out, held, warnings);
   // Root name (hub ruling 2026-10-02, rule 1 + U10b): the "/" row (v20; a row wins over a legacy channel, § 10.3), else
-  // the root override, else the entry's own name, else the template root's.
+  // the root override, else the entry's own name (before v20 only), else the template root's.
+  rootNamed(rowDefaults);
   const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? templateName;
   // sortOrder: the "/" row, else the override, else the entry's stored order (where v20 writes the placement, § 2.2;
   // #2008 P2 D2), else the template root's (§ 10.4, review L4).
-  const sortOrder = num(rowDefaults.sortOrder) ?? num(rootOv?.sortOrder) ?? (entry ? num(ea?.sortOrder) : undefined) ?? num(tAttrs?.sortOrder) ?? 0;
+  // From v20 the entry's stored order IS the placement the writer wrote: it outranks a legacy root override still held
+  // and written back (close-out review round 2: a reorder made while the prefab was missing).
+  const stored = entry ? num(ea?.sortOrder) : undefined;
+  const sortOrder = num(rowDefaults.sortOrder) ?? (v20 ? stored ?? num(rootOv?.sortOrder) : num(rootOv?.sortOrder) ?? stored) ?? num(tAttrs?.sortOrder) ?? 0;
   const placement: Placement = { parent, sortOrder, name, ...folderOf(entry ? ea : undefined, { ...rootOv, ...rowDefaults }) };
   return { record: { rootGuid, source, placement, list: { rows: out.rows }, held }, ownContent, warnings };
 }
@@ -953,7 +1083,10 @@ function takeRootDefaults(out: ListBuilder<AddedNodeRef>, held: HeldData, warnin
   if (!row || !isRecord(ea)) return taken;
   for (const f of ROOT_DEFAULT_FIELDS) if (f in ea) { taken[f] = ea[f]; delete ea[f]; }
   if ('parentId' in taken) {
-    (held.unparsed ??= {}).members = { [ROOT_ROW_KEY]: { traits: { EntityAttributes: { parentId: taken.parentId } } } };
+    // Merged into what is already held there (a malformed sibling row, #2008 round 3), never assigned over it.
+    const rows = ((held.unparsed ??= {}).members ??= emptyDocMap()) as Record<string, unknown>;
+    const traits = ((((rows[ROOT_ROW_KEY] ??= emptyDocMap()) as Record<string, unknown>).traits ??= emptyDocMap()) as Record<string, unknown>);
+    ((traits.EntityAttributes ??= emptyDocMap()) as Record<string, unknown>).parentId = taken.parentId;
     warnings.push({ code: 'unparsed', key: ROOT_ROW_KEY, message: 'the root row states EntityAttributes.parentId; kept verbatim, the placement is the entry\'s' });
   }
   if (!Object.keys(ea).length) delete row.traits!.EntityAttributes;
@@ -984,6 +1117,7 @@ function parseTemplateOwner(
 ): { list: TemplateOverrideList; warnings: ParseWarning[] } {
   const warnings: ParseWarning[] = [];
   const { clean, unparsed } = unparsedOf(owner as SceneEntityEntry, warnings);
+  if (movesChannel === 'templateMoved') moves = (clean as unknown as AddedEntity).templateMoved;
   const held: TemplateHeldData = {};
   const list = (): TemplateOverrideList => ({ rows: out.rows as Map<RowKey, TemplateTargetRecord>, ...(Object.keys(held).length ? { held } : {}) });
   if (unparsed) held.unparsed = unparsed;
@@ -1010,13 +1144,15 @@ function parseTemplateOwner(
  *  document's root). A move naming no nested member is held verbatim in `docHeld`. */
 export function parseTemplateLists(doc: PrefabDoc, docGuid: string, read: PrefabReader): {
   rows: Map<number, { list: TemplateOverrideList; warnings: ParseWarning[] }>;
-  docHeld?: { moved: Record<string, string> };
+  docHeld?: { moved?: Record<string, string>; unparsed?: { moved: unknown } };
 } {
   const rows = new Map<number, { list: TemplateOverrideList; warnings: ParseWarning[] }>();
   const top = frameOf('', doc, docGuid);
   // The document's moves, by the reference row whose frame they reach into.
   const share = new Map<number, Record<string, string>>();
   let docHeld: Record<string, string> | undefined;
+  // A document-level `moved` in no shape a reader takes is kept verbatim (I18; #2008), not dropped.
+  const docUnparsed = doc.moved !== undefined && !isRecord(doc.moved) ? { moved: doc.moved as unknown } : undefined;
   const moved = doc.moved && isRecord(doc.moved) ? doc.moved : undefined;
   if (moved && Object.keys(moved).length) {
     const readRaw = (g: string): unknown => { const r = read(g); return 'doc' in r ? r.doc : null; };
@@ -1036,7 +1172,8 @@ export function parseTemplateLists(doc: PrefabDoc, docGuid: string, read: Prefab
     if (!row?.prefab || typeof row.localId !== 'number' || row.localId === top.rootLid) continue;
     rows.set(row.localId, parseTemplateOwner(row, row.prefab, read, share.get(row.localId), 'moved'));
   }
-  return { rows, ...(docHeld ? { docHeld: { moved: docHeld } } : {}) };
+  const held = { ...(docHeld ? { moved: docHeld } : {}), ...(docUnparsed ? { unparsed: docUnparsed } : {}) };
+  return { rows, ...(Object.keys(held).length ? { docHeld: held } : {}) };
 }
 
 /** `path` (a member path from the document's root) as a path from the root of nested row `rowLid`'s frame: the

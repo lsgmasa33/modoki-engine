@@ -938,19 +938,19 @@ describe('#1789 prefab fuzz', () => {
     });
   }, 60_000);
 
-  it('KNOWN_OPEN\'s P1 waivers each tolerate their own shape and nothing near it (#2013, #2015, #2016, #2017, #2018)', () => {
+  it('KNOWN_OPEN\'s P1 waiver tolerates its own shape and nothing near it (#2013; #2015-#2018 fixed by #2007\'s close-out)', () => {
     const g = 'aaaaaaaa-0000-4000-8000-000000000001';
     const P1 = (lines: string[]) => ({ check: 'P1 the live instance is not the fold of its record', detail: `${g} ${lines.join(' ; ')}` });
     const who = (f: { check: string; detail: string }) => KNOWN_OPEN.filter((k) => k.tolerates?.(f)).map((k) => k.issue);
     const moved = 'parent /R/A: fold {"key":"/R"} live {"key":"/R/QR/M"}';
     // Accept: each shape, alone and repeated.
     expect(who(P1(['kept-only unused /R/A removed (applied)', 'kept-only unused /R/B removed (applied)']))).toEqual([2013]);
-    expect(who(P1([moved, 'parent /A: fold {"key":"/"} live {"key":"/QR/M"}']))).toEqual([2015]);
-    expect(who(P1(['fold-only unused / legacy (gone)']))).toEqual([2016]);
-    expect(who(P1(['anchors /F/a+X: fold ["g1","g1"] live ["g1"]']))).toEqual([2017]);
-    expect(who(P1(['kept-only unused /R/A own (unprojected)', 'kept-only unused /R/QR own (unprojected)']))).toEqual([2018]);
-    // Reject: nothing tolerates these.
+    // Reject: nothing tolerates these — the fixed waivers' old shapes included, so a regression of #2015-#2018 goes red.
     for (const lines of [
+      [moved, 'parent /A: fold {"key":"/"} live {"key":"/QR/M"}'],
+      ['fold-only unused / legacy (gone)'],
+      ['anchors /F/a+X: fold ["g1","g1"] live ["g1"]'],
+      ['kept-only unused /R/A own (unprojected)', 'kept-only unused /R/QR own (unprojected)'],
       ['kept-only unused /R/A -Rotate3D'], // another kept leaf: B1, the oracle's own fix
       ['kept-only unused /R/A own (unprojected)', 'kept-only unused /R/B removed (applied)'], // #2018's beside #2013's: neither waiver's whole
       ['kept-only unused /R/A own'], // an own link lost on a PROJECTED member: not #2018's mechanism
