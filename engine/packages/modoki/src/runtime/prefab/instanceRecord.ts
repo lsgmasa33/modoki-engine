@@ -82,8 +82,10 @@ export interface TemplateAddedNode {
   children: TemplateAddedNode[];
   /** Present on a template REFERENCE node: the nested prefab it instances … */
   prefab?: string;
-  /** … and that nested instance's own list, in template form. */
+  /** … and that nested instance's own list, in template form … */
   members?: Record<RowKey, TemplateTargetRecord>;
+  /** … and what of it the parser could not name or interpret, kept verbatim (format rule; rule 9). */
+  held?: TemplateHeldData;
 }
 
 export type SceneTargetRecord = TargetRecordOf<AddedNodeRef>;
@@ -100,6 +102,9 @@ export interface OverrideList {
  *  `Placement`. */
 export interface TemplateOverrideList {
   rows: Map<RowKey, TemplateTargetRecord>;
+  /** What the parser could not name (its nested prefab missing or damaged) or interpret, kept verbatim so the first
+   *  save does not lose it (rule 9; format rule, hub refinement 2026-10-02; hub ruling 2026-10-02, #2006). */
+  held?: TemplateHeldData;
 }
 
 // ── The stored instance ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +157,10 @@ export interface HeldData {
    *  note only; dropped at the next save. */
   ignoredCopies?: true;
 }
+
+/** A template-form owner's held data: `HeldData` minus what template form cannot have — no scene-owned nodes (an
+ *  own node is scene content) and no embedded copies (a scene-file field). Hub ruling 2026-10-02, #2006. */
+export type TemplateHeldData = Pick<HeldData, 'unparsed' | 'pendingLegacy'>;
 
 export interface InstanceRecord {
   /** The stored root's durable guid, minted by the write that placed it (rule 5). */
@@ -233,8 +242,8 @@ export type PrefabReader = (guid: string) => PrefabRead;
 
 // ── The fold's output (§ 3.1; built in S2) ──────────────────────────────────────────────────────────
 
-/** Why a record does not apply. Remove Unused and the unused count use `gone` ONLY (rules 7 and 9,
- *  § 10.4, review R7). */
+/** Why a record does not apply. Remove Unused and the unused count use `gone` and `unknownField` only (rules 7 and 9,
+ *  § 10.4, review R7; `unknownField`: rule 1, hub 2026-10-02, #2007). */
 export type UnusedCause =
   /** Its target is gone from a prefab that is loaded and intact. */
   | 'gone'
@@ -243,7 +252,11 @@ export type UnusedCause =
   /** It names a component type not yet registered (I24: not a removal). */
   | 'unregistered'
   /** A scene-owned node held under an anchor that is not projected (`held.heldOwn`). */
-  | 'heldNode';
+  | 'heldNode'
+  /** A field a REGISTERED component does not persist: renamed or removed in code, written by a newer engine, or on a
+   *  component that became a tag (#1933 L2). Unity's Remove Unused Overrides takes a modification whose property no
+   *  longer exists; until removed it is kept and written back verbatim. */
+  | 'unknownField';
 
 /** Which part of a record does not apply. */
 export type RecordPart =
@@ -252,7 +265,10 @@ export type RecordPart =
   | { kind: 'traitRemoval'; trait: string }
   | { kind: 'removed' }
   | { kind: 'own'; guid: string }
-  | { kind: 'parent' };
+  | { kind: 'parent' }
+  /** A legacy record held verbatim because its target cannot be named (format rule, hub refinement 2026-10-02,
+   *  #2006): its path into `held.pendingLegacy`, e.g. `['overrides', '12', 'Transform', 'x']`. */
+  | { kind: 'legacy'; path: string[] };
 
 export interface UnusedRecord {
   key: RowKey;
