@@ -89,6 +89,8 @@ export interface AudioLogEntry {
    *  voice-cap steal are both invisible headlessly — the ramp is the whole behaviour, and
    *  a no-op `fade()` cannot tell an authored 250 ms from a hardcoded 10 ms. */
   durationSec?: number;
+  /** The playback rate of an `op:'play'` (record mode), present only when it is not 1. */
+  pitch?: number;
 }
 
 // ── Record mode (headless / tests) ────────────────────────────────
@@ -742,6 +744,8 @@ export function play(spec: AudioPlaySpec): AudioHandle {
       op: 'play', clip: spec.clip, bus: resolveBus(spec.bus),
       volume: spec.volume ?? 1, spatial: !!spec.spatial, loop: !!spec.loop,
       ...(spec.spatial && spec.position ? { position: { ...spec.position } } : {}),
+      // Only when it is not 1, so every log written before pitch was recorded still reads the same.
+      ...(spec.pitch !== undefined && spec.pitch !== 1 ? { pitch: spec.pitch } : {}),
     });
     return new RecordingHandle(spec.clip);
   }

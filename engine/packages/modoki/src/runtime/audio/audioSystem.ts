@@ -625,7 +625,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
       const pos = positionOf(entity);
       const spec = resolveSpec(a.clip, {
         bus: (cue.bus ?? a.bus) as BusName, volume: cue.volume ?? a.volume,
-        pitch: cue.pitch ?? a.pitch, spatial: a.spatial, refDistance: a.refDistance,
+        pitch: cue.pitch ?? a.pitch * (cue.pitchScale ?? 1), spatial: a.spatial, refDistance: a.refDistance,
         maxDistance: a.maxDistance, rolloff: a.rolloff, position: pos,
       });
       if (spec) {

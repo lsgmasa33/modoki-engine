@@ -195,6 +195,18 @@ describe('audioSystem — cue bus', () => {
     expect(getAudioLog().filter((l) => l.op === 'play')).toHaveLength(1);
   });
 
+  it('cueSound pitchScale multiplies the source\'s own pitch for that shot only', () => {
+    const clip = mintClip();
+    world = createWorld();
+    world.spawn(Transform(), AudioSource({ clip, autoplay: false, playOnCue: 'crack', pitch: 1.2 }));
+    cueSound('crack', world, { pitchScale: 0.95 });
+    cueSound('crack', world);
+    audioSystem(world);
+    const plays = getAudioLog().filter((l) => l.op === 'play');
+    expect(plays[0].pitch, 'scaled from the authored 1.2, not replacing it').toBeCloseTo(1.14, 10);
+    expect(plays[1].pitch, 'the next shot is the source\'s own again').toBe(1.2);
+  });
+
   it('cueClip plays a direct one-shot with no entity', () => {
     const clip = mintClip();
     world = createWorld();

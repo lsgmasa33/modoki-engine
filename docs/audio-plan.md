@@ -87,8 +87,9 @@ AudioListener trait ─┘        │
 - **`audioService`** (`runtime/audio/`) — raw Web Audio graph, buffer + stream
   playback paths, global mute gain (`setAudioMuted`). Headless → **record mode**
   (`getAudioLog()`) so tests assert *what would play* with no journal dependency.
-- **Cue bus** (`audioCues.ts`) — `cueSound(name)` / `cueClip(guid, opts)`,
-  per-world queue drained each frame. The "emit an event, audio reacts" channel.
+- **Cue bus** (`audioCues.ts`) — `cueSound(name, world?, {pitchScale}?)` / `cueClip(guid, opts)`,
+  per-world queue drained each frame (a cue's `pitchScale` multiplies each source's own pitch for
+  that shot; record mode logs a play's `pitch` when it is not 1). The "emit an event, audio reacts" channel.
   A one-shot clip cue whose buffer isn't decoded YET is **retried for a bounded window**
   (`audioSystem` `pendingCues`, ~120 frames), not dropped — on iOS the eager decode
   completes only after the first-gesture resume, and the first shot's cue fires on that

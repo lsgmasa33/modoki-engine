@@ -25,6 +25,9 @@ export interface AudioCue {
   bus?: 'master' | 'music' | 'sfx' | 'ui';
   volume?: number;
   pitch?: number;
+  /** Named cues only: MULTIPLIES each matching source's own `pitch` for this shot, so the authored
+   *  pitch stays the base (a spread of shots around it, not a replacement of it). */
+  pitchScale?: number;
 }
 
 const queues = new WeakMap<World, AudioCue[]>();
@@ -36,9 +39,10 @@ function queueFor(world: World): AudioCue[] {
 }
 
 /** Raise a named cue — every `AudioSource` with a matching `playOnCue` fires a
- *  one-shot this frame. */
-export function cueSound(name: string, world: World = getCurrentWorld()): void {
-  queueFor(world).push({ name });
+ *  one-shot this frame. `pitchScale` multiplies each source's own pitch for this shot only (a
+ *  burst of one cue at slightly different rates, so a row of identical clips does not phase). */
+export function cueSound(name: string, world: World = getCurrentWorld(), opts?: { pitchScale?: number }): void {
+  queueFor(world).push(opts?.pitchScale === undefined ? { name } : { name, pitchScale: opts.pitchScale });
 }
 
 /** Play a clip directly as a one-shot, with no entity. */
