@@ -2,3 +2,5 @@
 // imports this folder yet. This index exists so the runtime barrel's import-order test has an entry
 // point for the folder (tests/runtime/barrelImportOrder.test.ts).
 export type * from './instanceRecord';
+// S3 (#2008): the writer. Dead code until the save flips (S6).
+export * from './serializeInstanceRecord';
