@@ -201,6 +201,30 @@ describe('parseInstanceRecord — the root\'s default overrides (placement)', ()
     expect(row(at({}, { sourceScene: 'OV' }).list.rows, '/')).toBeUndefined();
   });
 
+  it('#2008 P2 D1: the "/" row\'s root defaults leave the list for the placement, their one home; the row wins over the override', () => {
+    const r = parseInstanceRecord(entry({
+      overrides: { 1: { EntityAttributes: { name: 'Ov', sortOrder: 2 } } },
+      members: { '/': { traits: { EntityAttributes: { name: 'RowName', sortOrder: 6, isActive: false } } } },
+    }), reader()).record;
+    expect(r.placement).toMatchObject({ name: 'RowName', sortOrder: 6 });
+    expect(row(r.list.rows, '/')?.traits).toEqual({ EntityAttributes: { isActive: false } });
+    // Emptied, the row itself goes: a v20 renamed root is no list record at all.
+    expect(row(parseInstanceRecord(entry({ members: { '/': { traits: { EntityAttributes: { name: 'Only' } } } } }), reader()).record.list.rows, '/')).toBeUndefined();
+  });
+
+  it('#2008 P2 D1: the same on the missing-prefab path; a "/" row parentId is held verbatim, as the override\'s is', () => {
+    const r = parseInstanceRecord(entry({ members: { '/': { traits: { EntityAttributes: { name: 'RowName', parentId: G(97) } } } } }), reader(new Map())).record;
+    expect(r.placement.name).toBe('RowName');
+    expect(row(r.list.rows, '/')).toBeUndefined();
+    expect(r.held.unparsed).toEqual({ members: { '/': { traits: { EntityAttributes: { parentId: G(97) } } } } });
+  });
+
+  it('#2008 P2 D2: a resolved entry\'s stored sortOrder (where v20 writes the placement) beats the template\'s; the override beats it', () => {
+    const at = (extra: Partial<SceneEntityEntry>) => parseInstanceRecord(entry({ traits: { PrefabInstance: { source: 'P', localId: 1 }, EntityAttributes: { sortOrder: 91 } }, ...extra }), reader()).record.placement.sortOrder;
+    expect(at({})).toBe(91);
+    expect(at({ overrides: { 1: { EntityAttributes: { sortOrder: 3 } } } })).toBe(3);
+  });
+
   it('a numeric parentId (files before v12) goes through the caller\'s resolver', () => {
     const { record } = parseInstanceRecord(entry({ traits: { PrefabInstance: { source: 'P' }, EntityAttributes: { parentId: 3 } } }), reader(), { parentGuid: (r) => (r === 3 ? G(91) : '') });
     expect(record.placement.parent).toBe(G(91));

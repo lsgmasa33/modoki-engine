@@ -353,6 +353,10 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
   }
   for (const u of heldUnused(st, rec, 'doc' in top ? top.doc : null)) unused.push(u);
 
+  // A stable order (by key, then part, then cause), not the rows' insertion order: a legacy record and its v20 spelling
+  // hold the same rows in a different order, and the two folds must agree (#2008 P2).
+  const order = (u: UnusedRecord) => `${u.key}\u0000${JSON.stringify(u.part)}\u0000${u.cause}`;
+  unused.sort((a, b) => (order(a) < order(b) ? -1 : order(a) > order(b) ? 1 : 0));
   return { nodes, placeholders: st.placeholders, unused, anchors };
 }
 

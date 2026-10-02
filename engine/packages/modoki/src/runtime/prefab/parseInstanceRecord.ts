@@ -881,14 +881,15 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
     // EntityAttributes first, then the root override, read through the root localId the entry names.
     const rootLid = typeof pi?.localId === 'number' ? pi.localId : 1;
     const rootOv = attrs((clean.overrides as Record<string, unknown> | undefined)?.[rootLid]);
-    const name = (typeof rootOv?.name === 'string' ? rootOv.name : undefined) ?? ownName ?? (typeof ea?.name === 'string' ? ea.name : undefined) ?? 'Missing Prefab';
-    const sortOrder = num(ea?.sortOrder) ?? num(rootOv?.sortOrder) ?? 0;
     const pending = unresolvedOwner(clean, out, form, true, entry ? {} : { templateMoved: (clean as unknown as AddedEntity).templateMoved });
+    const rowDefaults = takeRootDefaults(out, held, warnings);
+    const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? str(ea?.name) ?? 'Missing Prefab';
+    const sortOrder = num(rowDefaults.sortOrder) ?? num(ea?.sortOrder) ?? num(rootOv?.sortOrder) ?? 0;
     if (pending) {
       held.pendingLegacy = pending;
       warnings.push({ code: 'pendingLegacy', message: `prefab ${source} did not resolve; its legacy channels are kept verbatim (rule 9)` });
     }
-    const placement: Placement = { parent, sortOrder, name, ...folderOf(ea, undefined) };
+    const placement: Placement = { parent, sortOrder, name, ...folderOf(ea, rowDefaults) };
     return { record: { rootGuid, source, placement, list: { rows: out.rows }, held }, ownContent, warnings };
   }
 
@@ -918,15 +919,19 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
   }
   const tAttrs = attrs(templateRoot?.traits);
   const templateName = (typeof tAttrs?.name === 'string' ? tAttrs.name : undefined) ?? (typeof templateRoot?.name === 'string' ? templateRoot.name : '');
-  // Root name (hub ruling 2026-10-02, rule 1 + U10b): the override, else the entry's own name, else the template root's.
-  const name = (typeof rootOv?.name === 'string' ? rootOv.name : undefined) ?? ownName ?? templateName;
-  // sortOrder: the override, else the template root's (§ 10.4, review L4).
-  const sortOrder = num(rootOv?.sortOrder) ?? num(tAttrs?.sortOrder) ?? 0;
-  const placement: Placement = { parent, sortOrder, name, ...folderOf(entry ? ea : undefined, rootOv) };
+  const rowDefaults = takeRootDefaults(out, held, warnings);
+  // Root name (hub ruling 2026-10-02, rule 1 + U10b): the "/" row (v20; a row wins over a legacy channel, § 10.3), else
+  // the root override, else the entry's own name, else the template root's.
+  const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? templateName;
+  // sortOrder: the "/" row, else the override, else the entry's stored order (where v20 writes the placement, § 2.2;
+  // #2008 P2 D2), else the template root's (§ 10.4, review L4).
+  const sortOrder = num(rowDefaults.sortOrder) ?? num(rootOv?.sortOrder) ?? (entry ? num(ea?.sortOrder) : undefined) ?? num(tAttrs?.sortOrder) ?? 0;
+  const placement: Placement = { parent, sortOrder, name, ...folderOf(entry ? ea : undefined, { ...rootOv, ...rowDefaults }) };
   return { record: { rootGuid, source, placement, list: { rows: out.rows }, held }, ownContent, warnings };
 }
 
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
 /** `editorFolder` and `sourceScene`: the entry's stored value wins over a root override's (SceneManager patches the
  *  root after the overrides). `''` is absent: it is what an ungrouped root, and a primary scene's root, holds. */
@@ -935,6 +940,26 @@ function folderOf(ea: RootBag | undefined, rootOv: RootBag | undefined): { edito
     : typeof rootOv?.[f] === 'string' && rootOv[f] ? rootOv[f] as string : undefined);
   const folder = pick('editorFolder'), scene = pick('sourceScene');
   return { ...(folder ? { editorFolder: folder } : {}), ...(scene ? { sourceScene: scene } : {}) };
+}
+
+/** The `"/"` row's root default fields, taken OUT of the list (#2008 P2, D1). The placement is their one home in memory
+ *  (hub ruling 2026-10-02, rule 1 + U10b), and a v20 file states the root's name on that row (`Placement.name`), so a
+ *  reader that left it there would hold it twice. An emptied EntityAttributes, traits bag and row go with them. A
+ *  `parentId` is kept verbatim, as the root override's is (F-CB1(a)): no reader takes it as a parent. */
+function takeRootDefaults(out: ListBuilder<AddedNodeRef>, held: HeldData, warnings: ParseWarning[]): RootBag {
+  const taken: RootBag = {};
+  const row = out.rows.get(ROOT_ROW_KEY);
+  const ea = row?.traits?.EntityAttributes;
+  if (!row || !isRecord(ea)) return taken;
+  for (const f of ROOT_DEFAULT_FIELDS) if (f in ea) { taken[f] = ea[f]; delete ea[f]; }
+  if ('parentId' in taken) {
+    (held.unparsed ??= {}).members = { [ROOT_ROW_KEY]: { traits: { EntityAttributes: { parentId: taken.parentId } } } };
+    warnings.push({ code: 'unparsed', key: ROOT_ROW_KEY, message: 'the root row states EntityAttributes.parentId; kept verbatim, the placement is the entry\'s' });
+  }
+  if (!Object.keys(ea).length) delete row.traits!.EntityAttributes;
+  if (row.traits && !Object.keys(row.traits).length) delete row.traits;
+  if (!Object.keys(row).length) out.rows.delete(ROOT_ROW_KEY);
+  return taken;
 }
 
 /** A scene ENTRY → its `InstanceRecord` (§ 5.2, every legacy form). */

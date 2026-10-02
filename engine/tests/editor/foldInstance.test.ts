@@ -76,6 +76,19 @@ describe('foldInstance — the chain (§ 2.4)', () => {
     expect(f.nodes.get(`/${N3}/${NQ3}`)?.traits.Sprite).toEqual({ tint: '#fff' });
   });
 
+  it('a scene move (`parent`): to a member the list pins, by its key; to a scene-owned node, by its guid (§ 10.4, L8)', () => {
+    const f = fold(entry({ members: { [`/${N3}`]: { guid: G(53) }, [`/${N2}`]: { guid: G(54), parent: G(53) }, [`/${N3}/${NQ3}`]: { guid: G(55), parent: G(56) } } }));
+    expect(f.nodes.get(`/${N2}`)?.parent).toEqual({ key: `/${N3}` });
+    expect(f.nodes.get(`/${N3}/${NQ3}`)?.parent).toEqual({ guid: G(56) });
+  });
+
+  it('a template move: the row\'s list moves a nested member by member token, resolved in the nested frame', () => {
+    const PT: PrefabDoc = { ...P, id: 'PT', entities: P.entities.map((e) => (e.localId === 3 ? { ...e, removed: [], members: { [`/${NQ3}`]: { parent: '@member:2' } } } : e)) };
+    const m = new Map<string, PrefabDoc>([['PT', PT], ['Q', Q]]);
+    const f = fold(entry({ prefab: 'PT', traits: { PrefabInstance: { source: 'PT', localId: 1 } } }), m);
+    expect(f.nodes.get(`/${N3}/${NQ3}`)?.parent).toEqual({ key: `/${N3}/${NQ2}` });
+  });
+
   it('a removal takes the member\'s subtree with it, a nested frame included', () => {
     const f = fold(entry({ removed: [3] }));
     expect([...f.nodes.keys()].filter((k) => k.startsWith(`/${N3}`))).toEqual([]);
@@ -143,6 +156,15 @@ describe('foldInstance — unused records carry their cause (§ 10.4)', () => {
 
   it('a held legacy record whose localId names no row is unused, gone (format rule, hub refinement 2026-10-02)', () => {
     expect(causes(fold(entry({ overrides: { 12: { Light: { intensity: 1 } } } })))).toContain('/ legacy gone');
+  });
+
+  it('unused comes in a stable order (key, part, cause), whatever order the rows were stated in (#2008 P2)', () => {
+    const a = fold(entry({ overrides: { 2: { Bogus: { a: 1 } }, 3: { Bogus: { b: 1 } } } }));
+    const b = fold(entry({ overrides: { 3: { Bogus: { b: 1 } }, 2: { Bogus: { a: 1 } } }, members: {} }));
+    const c = fold(entry({ members: { [`/${N3}`]: { guid: G(57), traits: { Bogus: { b: 1 } } }, [`/${N2}`]: { guid: G(58), traits: { Bogus: { a: 1 } } } } }));
+    expect(causes(a)).toEqual(causes(b));
+    expect(causes(c)).toEqual(causes(a));
+    expect(causes(a)[0]!.startsWith(`/${N2}`)).toBe(true);
   });
 
   it('a legacy move of a template-keyed node (#1883 ruling C) is unused, gone', () => {
