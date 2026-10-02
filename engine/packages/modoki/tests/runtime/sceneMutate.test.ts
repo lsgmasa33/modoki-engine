@@ -1190,3 +1190,83 @@ describe('applyOps — which ops applied and which failed (#1910)', () => {
     expect(partialApplyVerdict({ changed: 1, errors: ['x'], appliedOps: [0], failedOps: [1] }, 'file')?.code).toBe('PARTIAL');
   });
 });
+
+describe('file route under a Frame2D: the fit depends on the screen, so it is never invented (#1952)', () => {
+  // The Ice Reef shape as a FILE: canvas 1000 x 2000, a Frame2D host directly under it. Live, the host is drawn at
+  // x -500 x4; a file cannot know that (it depends on what part of the canvas is on screen).
+  const reef = (): MutableScene => {
+    guidN = 0;
+    return {
+      version: 8,
+      entities: [
+        { id: 1, name: 'Canvas', traits: { EntityAttributes: { name: 'Canvas', guid: 'g-canvas', parentId: 0 }, Canvas2D: { referenceWidth: 1000, referenceHeight: 2000 } } },
+        { id: 2, name: 'Reef', traits: { EntityAttributes: { name: 'Reef', guid: 'g-reef', parentId: 'g-canvas' }, Transform: { x: 0 }, Frame2D: { width: 500, height: 500, fit: 'cover' } } },
+        { id: 3, name: 'Fish', traits: { EntityAttributes: { name: 'Fish', guid: 'g-fish', parentId: 'g-canvas' }, Transform: { x: 100, y: 100 } } },
+        { id: 4, name: 'Weed', traits: { EntityAttributes: { name: 'Weed', guid: 'g-weed', parentId: 'g-reef' }, Transform: { x: 150, y: 25 } } },
+        { id: 5, name: 'Rock', traits: { EntityAttributes: { name: 'Rock', guid: 'g-rock', parentId: 'g-reef' }, Transform: { x: 10 } } },
+      ],
+    } as MutableScene;
+  };
+  const tfOf = (s: MutableScene, name: string) => s.entities.find((e) => e.name === name)!.traits.Transform;
+  const move = (s: MutableScene, guid: string, parentId: string | 0) =>
+    applyOps(s, [{ op: 'setTrait', entity: { guid }, trait: 'EntityAttributes', fields: { parentId } }], mint);
+
+  // Mutation (both): drop `isFitted2D` from fileHierarchy's `unreadable` — no warning, and the move compensates against
+  // the host's UNFITTED pose, which here is identity, so the local is kept silently: the answer is right only by luck.
+  it('a reparent into or out of the host keeps the authored local, and says why', () => {
+    const into = reef();
+    expect(move(into, 'g-fish', 'g-reef').warnings.join('\n')).toMatch(/'Reef' \(a Frame2D on the parent chain\) is fitted to what is on screen/);
+    expect(tfOf(into, 'Fish')).toEqual({ x: 100, y: 100 });
+    const out = reef();
+    expect(move(out, 'g-weed', 'g-canvas').warnings.join('\n')).toMatch(/'Reef' \(a Frame2D on the parent chain\)/);
+    expect(tfOf(out, 'Weed')).toEqual({ x: 150, y: 25 });
+  });
+
+  // The accept side: inside the host both chains share it, so its fit cancels and the move is compensated, silently.
+  // Mutation: test `unreadable` on the whole chains instead of the suffixes — this warns.
+  it('a move within the host is compensated with no warning', () => {
+    const s = reef();
+    const res = move(s, 'g-weed', 'g-rock');
+    expect(res.warnings).toEqual([]);
+    expect((tfOf(s, 'Weed') as { x: number }).x).toBeCloseTo(140, 9);
+  });
+
+  // A canvas that is a prefab INSTANCE may be a Canvas2D through its template, which the file cannot read, so a Frame2D
+  // under it counts as fitted (#1952 review). Mutation: read only `parent.traits.Canvas2D` in isFitted2D — the move is
+  // compensated against the unfitted host, silently.
+  it('a Frame2D under a prefab-instance canvas: kept local, warned', () => {
+    const s = reef();
+    const canvas = s.entities[0]!;
+    canvas.prefab = 'g-canvas-prefab';
+    canvas.traits = { EntityAttributes: canvas.traits.EntityAttributes, PrefabInstance: { localId: 1 } };
+    canvas.overrides = { 1: { Transform: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 } } };
+    expect(move(s, 'g-fish', 'g-reef').warnings.join('\n')).toMatch(/'Reef' \(a Frame2D on the parent chain\)/);
+    expect(tfOf(s, 'Fish')).toEqual({ x: 100, y: 100 });
+  });
+
+  // A HOST that is a prefab instance carrying Frame2D in its root override is fitted too (#1952 re-review). Mutation:
+  // read only `e.traits.Frame2D` in isFitted2D — the move is compensated against the unfitted host, silently.
+  it('a Frame2D host that is a prefab instance (in its override): kept local, warned', () => {
+    const s = reef();
+    const host = s.entities[1]!;
+    host.prefab = 'g-reef-prefab';
+    host.traits = { EntityAttributes: host.traits.EntityAttributes, PrefabInstance: { localId: 1 } };
+    host.overrides = { 1: { Transform: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }, Frame2D: { width: 500, height: 500, fit: 'cover' } } };
+    expect(move(s, 'g-fish', 'g-reef').warnings.join('\n')).toMatch(/'Reef' \(a Frame2D on the parent chain\)/);
+    expect(tfOf(s, 'Fish')).toEqual({ x: 100, y: 100 });
+  });
+
+  // A world write needs the fit on the entity's own chain. Mutation: drop the `fittedOnChain` refusal — Weed is written
+  // x 100 (the world point taken as local under an identity host), and drawn at -100.
+  it("space:'world' under the host, or on the host itself, is refused", () => {
+    for (const name of ['Weed', 'Reef']) {
+      const s = reef();
+      const res = applyOps(s, [{ op: 'setTrait', entity: { guid: `g-${name.toLowerCase()}` }, trait: 'Transform', space: 'world', fields: { x: 100 } }], mint);
+      expect(res.errors.join('\n')).toMatch(/'Reef' is a Frame2D fitted to what is on screen/);
+    }
+    // …and next to it, a sibling the fit does not reach is solved as before.
+    const s = reef();
+    expect(applyOps(s, [{ op: 'setTrait', entity: { guid: 'g-fish' }, trait: 'Transform', space: 'world', fields: { x: 7 } }], mint).errors).toEqual([]);
+    expect((tfOf(s, 'Fish') as { x: number }).x).toBe(7);
+  });
+});

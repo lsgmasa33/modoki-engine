@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   setRunMode, getCurrentWorld, spawnEntity, Transform, EntityAttributes, readTraitData, getTraitByName,
-  worldTransforms, getOverrideMarkSet, PrefabInstance,
+  worldTransforms, getOverrideMarkSet, PrefabInstance, Canvas2D, Frame2D, transformPropagationSystem, forgetCanvasView2D,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { reparentEntity, planReparent, setActionCallback, pushAction, clearHistory, undo, redo } from '@modoki/engine/editor';
@@ -211,5 +211,92 @@ describe('a stored instance root is marked only on what the move changed (the ru
     reparentEntity(root, parent);
     const marks = [...(getOverrideMarkSet(live(root)) ?? [])].filter((m) => m.startsWith('Transform.')).sort();
     expect(marks).toEqual(['Transform.x', 'Transform.y']);
+  });
+});
+
+describe('a reparent into or out of a Frame2D subtree keeps the pose as drawn (#1952)', () => {
+  // The Ice Reef shape: canvas 1000 x 2000 (no Transform: it places nothing), a Frame2D host 500 x 500 `cover` directly
+  // under it — fit k = 4, x -500. The fit is applied by propagation, never authored, so only `fitOf` brings it into the
+  // chains. Mutation (into + out): drop `fitOf` from liveHierarchy, or skip the fit in reparentSuffixes' compose — the
+  // sprite keeps (100,100) going in (drawn at -100,400) and (150,25) coming out.
+  const w = () => worldTransforms.get(sprite)!;
+  let canvas = 0, host = 0, sprite = 0;
+  const reef = (spriteParent: 'canvas' | 'host', at: Partial<Tf>) => {
+    forgetCanvasView2D();
+    canvas = spawnEntity(getCurrentWorld(), Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', guid: crypto.randomUUID() })).id();
+    host = spawnEntity(getCurrentWorld(), Transform({}), Frame2D({ width: 500, height: 500, fit: 'cover' }),
+      EntityAttributes({ name: 'Reef', guid: crypto.randomUUID(), parentId: canvas })).id();
+    sprite = spawn('Fish', at, { parentId: spriteParent === 'canvas' ? canvas : host });
+    transformPropagationSystem(getCurrentWorld());
+    expect([worldTransforms.get(host)!.x, worldTransforms.get(host)!.sx]).toEqual([-500, 4]); // the fit took
+  };
+
+  it('into the host: the sprite drawn at canvas (100,100) stays there', () => {
+    reef('canvas', { x: 100, y: 100 });
+    expect(reparentEntity(sprite, host)).toBe(true);
+    expect([tf(sprite).x, tf(sprite).y, tf(sprite).sx]).toEqual([150, 25, 0.25]);
+    transformPropagationSystem(getCurrentWorld());
+    expect([w().x, w().y, w().sx]).toEqual([100, 100, 1]);
+  });
+
+  it('out of the host: the sprite drawn at (100,100) lands at its drawn pose, not its unfitted one', () => {
+    reef('host', { x: 150, y: 25, sx: 0.25, sy: 0.25 });
+    expect([w().x, w().y]).toEqual([100, 100]);
+    expect(reparentEntity(sprite, canvas)).toBe(true);
+    expect([tf(sprite).x, tf(sprite).y, tf(sprite).sx]).toEqual([100, 100, 1]);
+    transformPropagationSystem(getCurrentWorld());
+    expect([w().x, w().y]).toEqual([100, 100]);
+  });
+
+  // A TURNED host under a `stretch` fit (kx 2, ky 4): propagation folds the fit into the host's fields, which only a
+  // per-field fold matches. Mutation: fold the fit as a matrix before the host's local in reparentSuffixes — the sprite
+  // going in is drawn at (73, 85), and the one coming out turns to rz 0.53, sx 2.6. (Going IN, a sheared pose has no
+  // TRS, so only the position is exact; coming OUT, the world pose is a TRS and is kept whole.)
+  const turnedStretch = (spriteParent: 'canvas' | 'host', at: Partial<Tf>) => {
+    forgetCanvasView2D();
+    canvas = spawnEntity(getCurrentWorld(), Canvas2D({ referenceWidth: 1000, referenceHeight: 2000 }), EntityAttributes({ name: 'Canvas', guid: crypto.randomUUID() })).id();
+    host = spawnEntity(getCurrentWorld(), Transform({ x: 30, rz: 0.5 }), Frame2D({ width: 500, height: 500, fit: 'stretch' }),
+      EntityAttributes({ name: 'Reef', guid: crypto.randomUUID(), parentId: canvas })).id();
+    sprite = spawn('Fish', at, { parentId: spriteParent === 'canvas' ? canvas : host });
+    transformPropagationSystem(getCurrentWorld());
+  };
+
+  it('into a turned, stretched host: the sprite stays where it was drawn', () => {
+    turnedStretch('canvas', { x: 100, y: 100 });
+    reparentEntity(sprite, host);
+    transformPropagationSystem(getCurrentWorld());
+    expect(w().x).toBeCloseTo(100, 6); expect(w().y).toBeCloseTo(100, 6);
+  });
+
+  it('out of a turned, stretched host: the whole drawn pose is kept', () => {
+    turnedStretch('host', { x: 20, y: 30 });
+    const before = { ...w() };
+    reparentEntity(sprite, canvas);
+    transformPropagationSystem(getCurrentWorld());
+    for (const k of ['x', 'y', 'rz', 'sx', 'sy'] as const) expect(w()[k], k).toBeCloseTo(before[k], 6);
+  });
+
+  // An op list (apply-scene-ops with two parentId ops) runs no pass between its moves, so the fit is computed NOW, not
+  // read from the last pass. Mutation: read `localFit2DOf` (the last pass's) in liveHierarchy's fitOf — the host was not
+  // fitted at that pass, so the sprite keeps (100,100) and is drawn at (-100, 400).
+  it('a host moved under the canvas earlier in the same op list is fitted for the next move', () => {
+    reef('canvas', { x: 100, y: 100 });
+    const group = spawn('Group', {}, { parentId: canvas });
+    reparentEntity(host, group);
+    transformPropagationSystem(getCurrentWorld());                 // the host is nested now: no fit
+    expect(worldTransforms.get(host)!.sx).toBe(1);
+    reparentEntity(host, canvas);                                  // …then, with no pass between,
+    reparentEntity(sprite, host);                                  // the sprite goes into it
+    expect([tf(sprite).x, tf(sprite).y]).toEqual([150, 25]);
+    transformPropagationSystem(getCurrentWorld());
+    expect([w().x, w().y]).toEqual([100, 100]);
+  });
+
+  // The accept side: the MOVER's own fit is not compensated — a Frame2D keeps its authored box and is re-fitted by its
+  // new parent. Mutation: compose the mover's own fit into the old chain — the host is written x -500, sx 4.
+  it('the Frame2D host itself keeps its authored box when it moves', () => {
+    reef('canvas', { x: 0 });
+    expect(reparentEntity(host, 0)).toBe(true);
+    expect([tf(host).x, tf(host).sx]).toEqual([0, 1]);
   });
 });

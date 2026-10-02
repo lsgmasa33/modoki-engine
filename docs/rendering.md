@@ -5406,10 +5406,11 @@ matches non-uniformly) and `alignX`/`alignY` (which part stays: 0 = left/top, 1 
   open; `agentEditorOps.ts`) works on full 3D TRS, so it inverts the bare parent and then undoes the fit PER AXIS
   (`(x − fit.x)/kx`, `sx/kx`), as propagation applied it; a fit folded into the parent matrix decomposes a `stretch`
   fit to the wrong angle. A new writer must do one or the other.
-- ⚠️ **Re-parenting and file-space world math do not see the fit.** A keep-world re-parent into or out of a Frame2D
-  subtree (the Hierarchy drag, `editor/undo/entityActions.ts`) composes world poses from the authored local Transforms,
-  and `modoki_mutate_scene` with no editor open computes from the scene FILE (`runtime/scene/transformSpace.ts`).
-  Neither includes a fit, which depends on the screen. Under a Frame2D, write local values or drag in the SceneView.
+- **A keep-world re-parent composes the fit in** (#1952): a Hierarchy drag into or out of a Frame2D subtree keeps
+  the pose as drawn, with the fit as the next pass will apply it. The scene FILE cannot know a fit (it depends on the screen), so with no
+  editor open `modoki_mutate_scene` never invents one: a re-parent across a fitted Frame2D keeps the local and warns,
+  and a `space:'world'` write under one is refused. A Frame2D that is itself moved keeps its box and is re-fitted by
+  its new parent. Detail: docs/scene-loading.md § "A reparent keeps the world pose".
 - **"On screen" is the primary Scene2D's** (the Game view in the editor), which publishes each canvas's visible
   design rect every frame (`publishCanvasView2D`, from `computeCanvasScale`). With no renderer (headless, tests)
   it is the canvas's reference rect. A resize changes the fit, which fails the pass's unchanged check like a
@@ -5422,7 +5423,8 @@ matches non-uniformly) and `alignX`/`alignY` (which part stays: 0 = left/top, 1 
 - All of its maps are keyed by the packed entity, so an index recycled between passes never inherits a fit.
 - Tests (from `engine/`): `packages/modoki/tests/runtime/frame2D.test.ts`; the redraw in
   `packages/modoki/tests/runtime/Scene2D.test.ts`; the write-backs in `packages/modoki/tests/editor/gizmoFrame2D.test.ts`,
-  `tests/editor/applySceneOpsLive.test.ts` and `packages/modoki/tests/runtime/physics2DParented.test.ts`. The
+  `tests/editor/applySceneOpsLive.test.ts` and `packages/modoki/tests/runtime/physics2DParented.test.ts`; the re-parent in
+  `tests/editor/reparentWorldPose.test.ts` and `packages/modoki/tests/runtime/sceneMutate.test.ts`. The
   SceneView wiring of `localFrame2D` (a `.tsx`) has no unit test.
 
 ### Sprite batches — many short-lived sprites with no entity each

@@ -13,7 +13,7 @@
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
 import { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentLinkRefusal, type ParentGraph } from '../core/ecs/parentLink';
-import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, fileHierarchy, reparentSuffixes, reparentWrite, isTemplatePlaced, sameTrsMatrix, sameRotationScale, IDENTITY_TRS, type TRS } from './transformSpace';
+import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, fileHierarchy, fittedOnChain, reparentSuffixes, reparentWrite, isTemplatePlaced, sameTrsMatrix, sameRotationScale, IDENTITY_TRS, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
  *  SceneEntityEntry — kept structural to avoid a cross-layer import). */
@@ -547,13 +547,23 @@ export function entityGuid(e: { traits?: Record<string, unknown>; guid?: string 
  *  overlaid on THAT, and the result converted back — so a partial world write moves only what the
  *  caller named.
  *
- *  A ROOT entity's parent chain is empty, so this is an exact no-op there. */
+ *  A ROOT entity's parent chain is empty, so this is an exact no-op there.
+ *
+ *  Refused when a Frame2D fit takes part (the entity's own, or an ancestor's, #1952): the fit depends on what is on
+ *  screen, which a file cannot know, so any answer here would place the entity right on one screen shape only. */
 function worldFieldsToLocal(
   scene: MutableScene,
   entity: MutableEntity,
   existingLocal: Record<string, unknown>,
   fields: Record<string, unknown>,
 ): { fields: Record<string, unknown> } | { error: string } {
+  const fitted = fittedOnChain(scene.entities, entity);
+  if (fitted) {
+    return { error:
+      `space:'world' is not solvable from the scene file here: '${fitted.name ?? entityGuid(fitted) ?? fitted.id}' is a `
+      + 'Frame2D fitted to what is on screen of its canvas, which a scene file cannot know. Open the scene in the editor '
+      + "(the live write knows the fit), or write space:'local'." };
+  }
   const parent = parentWorldTrs(scene.entities, entity);
   if (!parent) return { fields }; // root: world == local
   // A collapsed (zero-scale) ancestor makes the request unsatisfiable — refuse rather than answer
@@ -667,7 +677,8 @@ function judgeFileParent(scene: MutableScene, entity: MutableEntity, raw: unknow
  *  (`sameRotationScale`). A decomposition picks its own Euler angles and mirror axis, so comparing numbers rewrote an
  *  untouched `{sy:-1}` as `{sx:-1, rz:π}` and a backwards yaw as `{rx:-π, ry:…, rz:-π}` on every move — not equivalent
  *  to a game reading the sign of `sy` (#1847 close-out re-review). When the recompute needs a pose this file cannot
- *  read — the entity's own, or an entry on either suffix, being an instance root placed partly by its template — the
+ *  read — the entity's own, or an entry on either suffix, being an instance root placed partly by its template, or an
+ *  entry on either suffix being a Frame2D fitted to its canvas (#1952: the fit depends on the screen) — the
  *  entity keeps its local transform and the reply says so, rather than computing against a guessed identity. A
  *  ZERO-scale new suffix cannot hold any pose, so the move is refused, as `space:'world'` refuses it. */
 function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: MutableEntity | null):
@@ -685,10 +696,13 @@ function keepWorldPose(scene: MutableScene, entity: MutableEntity, newParent: Mu
   // repo's scenes store exactly that shape).
   const positionOnly = !!stored && (['x', 'y', 'z'] as const).every((k) => typeof stored[k] === 'number')
     && sameRotationScale(from ?? IDENTITY_TRS, to ?? IDENTITY_TRS);
-  const who = unknown ? `'${unknown.name ?? entityGuid(unknown) ?? unknown.id}' (a prefab instance root on the parent chain)`
-    : isTemplatePlaced(entity) && !positionOnly ? 'this instance root' : null;
-  if (who) {
-    return { write: null, warning: `${who} takes part of its placement from its prefab, which this route does not read, so the world pose cannot be kept: the entity kept its LOCAL transform and its world position follows the new parent. modoki_reparent_entity with the scene open keeps it` };
+  const unknownName = unknown ? `'${unknown.name ?? entityGuid(unknown) ?? unknown.id}'` : '';
+  const why = unknown && !isTemplatePlaced(unknown)
+    ? `${unknownName} (a Frame2D on the parent chain) is fitted to what is on screen of its canvas, which a scene file cannot know` // #1952
+    : unknown ? `${unknownName} (a prefab instance root on the parent chain) takes part of its placement from its prefab, which this route does not read`
+      : isTemplatePlaced(entity) && !positionOnly ? 'this instance root takes part of its placement from its prefab, which this route does not read' : null;
+  if (why) {
+    return { write: null, warning: `${why}, so the world pose cannot be kept: the entity kept its LOCAL transform and its world position follows the new parent. modoki_reparent_entity with the scene open keeps it` };
   }
   // The write itself is the one owner every reparent route shares (#1848). A template-placed root is compensated on its
   // POSITION only: its rotation and scale are partly in the template, and a rotation written into the partial override

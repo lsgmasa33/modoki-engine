@@ -25,6 +25,7 @@
 import * as THREE from 'three';
 import type { MutableEntity } from './sceneMutate';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
+import type { LocalFit2D } from '../core/ecs/localFit2D';
 
 /** The nine `Transform` fields. */
 export interface TRS {
@@ -184,19 +185,22 @@ export function isTemplatePlaced(e: MutableEntity): boolean {
  *  (`liveHierarchy` in `editor/undo/entityActions.ts`). `places` says whether a node holds its children in its frame —
  *  one with no Transform does not, and `transformPropagationSystem` puts its children at the root (world = local), so a
  *  chain ends there and such a new parent is the root (#1848 close-out: composing past it moved the mover by its
- *  ancestors' offset). `unreadable` names a node whose local pose the source cannot read in full — only the file has one
- *  (an instance root placed partly by its template). */
+ *  ancestors' offset). `unreadable` names a node whose local pose the source cannot read in full — the file has two: an
+ *  instance root placed partly by its template, and a Frame2D fitted to its canvas. `fitOf` is a node's `Frame2D` fit,
+ *  folded into its local exactly as `transformPropagationSystem` folds it (#1952) — only the live world knows one, since
+ *  a fit depends on the screen. */
 export interface PoseHierarchy<N> {
   parentOf(node: N): N | null;
   places(node: N): boolean;
   trsOf(node: N): TRS;
   unreadable?(node: N): boolean;
+  fitOf?(node: N): LocalFit2D | undefined;
 }
 
 /** The scene file's entries as a {@link PoseHierarchy}: parent refs of either form, an instance root's pose from its
- *  overrides, and `isTemplatePlaced` as the unreadable test. A plain entry with no `traits.Transform` loads with none, so it
- *  places nothing. An instance entry is read as placing: live it places only when its template root has a Transform,
- *  which this file cannot see (docs/scene-loading.md § "A reparent keeps the world pose"). */
+ *  overrides, and `isTemplatePlaced` or {@link isFitted2D} as the unreadable test. A plain entry with no `traits.Transform`
+ *  loads with none, so it places nothing. An instance entry is read as placing: live it places only when its template
+ *  root has a Transform, which this file cannot see (docs/scene-loading.md § "A reparent keeps the world pose"). */
 export function fileHierarchy(entities: MutableEntity[]): PoseHierarchy<MutableEntity> {
   // Index by EVERY addressable key (numeric id AND guid), because a parent ref is a GUID in current files and a number in
   // legacy ones — a map keyed on `e.id` alone could never match the common case, which is exactly how this returned "no
@@ -204,12 +208,31 @@ export function fileHierarchy(entities: MutableEntity[]): PoseHierarchy<MutableE
   // (`mutate_scene` already warns about those separately, and a conversion is not the place to fail the whole op).
   const byKey = new Map<string | number, MutableEntity>();
   for (const e of entities) for (const k of keysOf(e)) if (!byKey.has(k)) byKey.set(k, e);
+  const parentOf = (e: MutableEntity) => { const ref = parentRefOf(e); return (ref && byKey.get(ref)) || null; };
   return {
-    parentOf: (e) => { const ref = parentRefOf(e); return (ref && byKey.get(ref)) || null; },
+    parentOf,
     places: (e) => !!e.prefab || !!e.traits?.Transform,
     trsOf,
-    unreadable: isTemplatePlaced,
+    unreadable: (e) => isTemplatePlaced(e) || isFitted2D(e, parentOf(e)),
   };
+}
+
+/** May the runtime fit this entry to its canvas (#1952)? A `Frame2D` directly under a `Canvas2D`, the only place
+ *  `rendering/frame2D.ts` fits one. The fit depends on what part of the canvas is on screen, which a file cannot know, so
+ *  a reparent across one cannot keep the world pose here — inventing a fit (the reference rect, say) would be right only
+ *  on the one screen shape that happens to match. A prefab-instance PARENT may be a canvas through its template, which
+ *  this file cannot read, so it counts as one. KNOWN GAP: a Frame2D only an instance's TEMPLATE carries (not its
+ *  overrides) is not seen; no prefab in the repo carries one (2026-10-02). */
+export function isFitted2D(e: MutableEntity, parent: MutableEntity | null): boolean {
+  if (!e.traits?.Frame2D && !instanceOverrideTraits(e)?.Frame2D) return false;
+  return !!parent && (!!parent.traits?.Canvas2D || !!parent.prefab);
+}
+
+/** The entry whose fit decides `entity`'s world pose and that the file cannot know (#1952): `entity` itself or an
+ *  ancestor placing it, being a Frame2D fitted to its canvas ({@link isFitted2D}). Null when no fit takes part. */
+export function fittedOnChain(entities: MutableEntity[], entity: MutableEntity): MutableEntity | null {
+  const h = fileHierarchy(entities);
+  return [entity, ...chainOf(h, entity)].find((e) => isFitted2D(e, h.parentOf(e))) ?? null;
 }
 
 /** `node`'s ancestors that place it, root-first. Stops at a missing parent, one that places nothing (`places`), a cycle,
@@ -225,7 +248,9 @@ function chainOf<N>(h: PoseHierarchy<N>, node: N): N[] {
 }
 
 /** What a reparent of `entity` under `newParent` (null = the root) actually depends on (#1847): the two parent chains
- *  BELOW their shared prefix. new local = inv(to) · from · local, because the shared part cancels (exactly for suffixes
+ *  BELOW their shared prefix, each node with its `fitOf` fit folded in (#1952: a Frame2D host on either suffix, so a
+ *  drag into or out of a fitted subtree keeps the pose as drawn). The MOVER's own fit is deliberately not compensated:
+ *  a Frame2D is re-fitted by its new parent, its authored box kept, which is what the trait is for. new local = inv(to) · from · local, because the shared part cancels (exactly for suffixes
  *  without shear: each suffix is decomposed to one TRS, as `parentWorldTrs` decomposes a whole chain) — so a node on it
  *  whose pose the source cannot read (`unreadable`) does not matter, and one on either suffix does (`unknown`). */
 export function reparentSuffixes<N>(h: PoseHierarchy<N>, entity: N, newParent: N | null):
@@ -237,7 +262,13 @@ export function reparentSuffixes<N>(h: PoseHierarchy<N>, entity: N, newParent: N
   const compose = (chain: N[]): TRS | null => {
     if (!chain.length) return null;
     _acc.identity();
-    for (const a of chain) _acc.multiply(matrixOf(h.trsOf(a), _m));
+    for (const a of chain) {
+      const t = h.trsOf(a);
+      const fit = h.fitOf?.(a);
+      // Folded into the local FIELD BY FIELD, as transformPropagationSystem folds it (#1952). A fit matrix before the
+      // local agrees only when its scale commutes with the host's rotation: a turned `stretch` host's child landed 30 px off.
+      _acc.multiply(matrixOf(fit ? { ...t, x: fit.x + fit.kx * t.x, y: fit.y + fit.ky * t.y, sx: fit.kx * t.sx, sy: fit.ky * t.sy } : t, _m));
+    }
     return decompose(_acc);
   };
   const unknown = h.unreadable ? [...oldChain.slice(k), ...newChain.slice(k)].find((n) => h.unreadable!(n)) : undefined;

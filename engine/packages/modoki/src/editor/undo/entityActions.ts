@@ -26,6 +26,7 @@ import { keptStateOf, restoreKeptState, type KeptState } from '../../runtime/cor
 import { reparentSuffixes, reparentWrite, mergeTrs, IDENTITY_TRS, type PoseHierarchy } from '../../runtime/scene/transformSpace';
 import { pushAction, peekUndo, type EditDetail } from './undoManager';
 import { packedOf, type PackedEntity } from '../../runtime/core/ecs/entityTable';
+import { frame2DFitNow } from '../../runtime/rendering/frame2D';
 import { currentFieldGesture } from './fieldGesture';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
@@ -1406,12 +1407,15 @@ export function deleteEntityWithUndo(entityId: number): void {
 /** The live hierarchy a reparent walks, read ON DEMAND, node by node — only the two chains the move asks about. Never the
  *  per-frame `worldTransforms` cache (#1848): it is only as fresh as the last propagation pass, so a parent created, or a
  *  mover edited, since then was read at its stale pose — the mover jumped by the new parent's offset, or the reparent
- *  undid the edit. An entity with no Transform places nothing (`PoseHierarchy.places`), as in `transformPropagationSystem`. */
+ *  undid the edit. An entity with no Transform places nothing (`PoseHierarchy.places`), as in `transformPropagationSystem`.
+ *  A Frame2D's fit is computed NOW (#1952), not read from the last pass, for the same reason: an op list that moves a host
+ *  and then a child into it runs no pass between them. It is applied, never authored, so no Transform holds it. */
 function liveHierarchy(transformMeta: TraitMeta, attrMeta: TraitMeta): PoseHierarchy<number> {
   return {
     parentOf: (id) => Number(readTraitData(id, attrMeta)?.parentId) || null,
     places: (id) => !!readTraitData(id, transformMeta),
     trsOf: (id) => mergeTrs(IDENTITY_TRS, readTraitData(id, transformMeta) ?? {}),
+    fitOf: frame2DFitNow,
   };
 }
 

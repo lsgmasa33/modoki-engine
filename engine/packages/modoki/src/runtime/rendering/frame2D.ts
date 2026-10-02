@@ -7,6 +7,7 @@ import type { Entity, World } from 'koota';
 
 import { setLocalFit2DProvider, localFit2DOf, type LocalFit2D } from '../core/ecs/localFit2D';
 import { onWorldSwap } from '../core/ecs/worldRegistry';
+import { findEntity } from '../core/ecs/entityUtils';
 import { Canvas2D } from '../traits/Canvas2D';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { Frame2D, type Frame2DFit } from '../traits/Frame2D';
@@ -114,17 +115,34 @@ function provide(world: World, parentOf: ReadonlyMap<number, number>): ReadonlyM
       }
       continue;
     }
-    const view = canvasView2D(canvas);
-    if (!view) continue;
-    const f = e.get(Frame2D)!;
-    next.set(key, frame2DFit(view, f.width, f.height, f.fit, f.alignX, f.alignY));
-    fittedTo.set(key, view);
+    const fit = fitUnder(e, canvas);
+    if (!fit) continue;
+    next.set(key, fit);
+    fittedTo.set(key, canvasView2D(canvas)!);
   }
   canvasById.clear();
   if (!sameFits(next, fits)) fitEpoch++;
   spare = fits;
   fits = next;
   return fits;
+}
+
+/** The fit `frame` gets with `canvas` as its parent: the provider's rule for ONE entity (a Frame2D directly under a
+ *  Canvas2D, fitted to what is on screen of it), so the pass and {@link frame2DFitNow} cannot disagree. */
+function fitUnder(frame: Entity, canvas: Entity | null | undefined): LocalFit2D | undefined {
+  const f = frame.get(Frame2D);
+  if (!f || !canvas?.has(Canvas2D)) return undefined;
+  const view = canvasView2D(canvas);
+  return view ? frame2DFit(view, f.width, f.height, f.fit, f.alignX, f.alignY) : undefined;
+}
+
+/** The fit entity `id` gets NOW, from its current parent: what the next pass will apply. A writer that must not lag a
+ *  structural edit asks this rather than `localFit2DOf` (the last pass's): a reparent in the same op list as a move of
+ *  its host would compensate against a fit the host no longer has, or lacks one it just gained (#1952). */
+export function frame2DFitNow(id: number): LocalFit2D | undefined {
+  const e = findEntity(id);
+  const parentId = e?.get(EntityAttributes)?.parentId;
+  return e && parentId ? fitUnder(e, findEntity(parentId)) : undefined;
 }
 
 /** Whether a Canvas2D is anywhere up the entity's parent chain (depth-capped against a cycle). */
