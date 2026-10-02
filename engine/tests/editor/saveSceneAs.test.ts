@@ -21,6 +21,9 @@ import { sceneManager, type LoadedSceneEntry } from '@modoki/engine/runtime';
 import { noteAuthoredWriteWhileStopped, clearAuthoredWritesWhileStopped } from '../../packages/modoki/src/runtime/core/ecs/authoredWrites';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { found } from '@modoki/engine/testing/inOrder';
+import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
+import { runAgentOp } from '../../app/debug/agentBridge';
+import { markBaseSceneEdit, getPendingBaseScenePaths, clearPendingBaseScenes } from '../../packages/modoki/src/editor/scene/pendingBaseScene';
 
 const OPEN_PATH = '/assets/scenes/Level.scene.json';
 const OPEN_ID = '00000031-0000-4000-8000-000000000031';
@@ -36,6 +39,8 @@ let calls: { url: string; body: { path?: string; content?: string; openPath?: st
 let saveAsAnswer: () => Response;
 let duringSaveAs: () => void;
 let writeFileOk: (path: string) => boolean;
+/** Per-test override of /api/scene-mutate (the base-scene flush); unset, it 404s like every other unknown route. */
+let mutateAnswer: ((path: string) => Promise<Response>) | undefined;
 
 beforeEach(() => {
   registerAsset(OPEN_ID, OPEN_PATH, 'scene');
@@ -51,11 +56,13 @@ beforeEach(() => {
   saveAsAnswer = () => ({ ok: true, status: 200, json: async () => ({ ok: true, guid: COPY_ID, path: COPY_PATH }) }) as unknown as Response;
   duringSaveAs = () => {};
   writeFileOk = () => true;
+  mutateAnswer = undefined;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
     const u = String(url);
     const body = init?.body ? JSON.parse(init.body) : {};
     calls.push({ url: u, body });
     if (u.includes('/api/scene-save-as')) { duringSaveAs(); return saveAsAnswer(); }
+    if (u.includes('/api/scene-mutate') && mutateAnswer) return mutateAnswer(body.path);
     if (u.includes('/api/write-file')) { const ok = writeFileOk(body.path); return { ok, json: async () => ({ ok }) } as unknown as Response; }
     // Anything else — the reopen's scene fetch — fails, so the copy is NOT reopened here. The
     // reopen itself needs a real SceneManager load and is covered by the live smoke case.
@@ -340,5 +347,103 @@ describe('writePrimaryScene — a load landing during the write (#1414 close-out
     expect(r).toMatchObject({ saved: true, path: OPEN_PATH });
     expect(getCurrentScenePath()).toBe(OTHER);
     expect(hasUnsavedChanges()).toBe(true);
+  });
+});
+
+// #2050: a `baseScene` edit parked on the file a Save As replaces. Observed live before the fix: saveAll's after-scene
+// flush wrote it onto the copy, the scene the reopen makes current, whose in-memory base came from the copy's bytes,
+// and the next save wrote that stale value straight back over it, reported ok both times. Driven through saveAll, the
+// seam that runs the flush, because the park only does harm there.
+describe('saveAll — Save As over a scene holding a parked baseScene edit (#2050)', () => {
+  const OTHER = '/assets/scenes/unrelated.scene.json';
+  const mutates = () => calls.filter((c) => c.url.includes('/api/scene-mutate')).map((c) => c.body.path);
+  afterEach(() => clearPendingBaseScenes());
+
+  it('drops the park on the replaced file, so the flush never writes it onto the copy, and says so', async () => {
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = await saveAll({ path: COPY_PATH, allowDialog: false });
+    expect(r.saved).toBe(true);
+    expect(r.droppedBaseSceneEdit).toBe(true);
+    expect(mutates()).not.toContain(COPY_PATH);
+    expect(getPendingBaseScenePaths()).not.toContain(COPY_PATH);
+    expect(warn.mock.calls.some(([m]) => String(m).includes('baseScene edit was dropped'))).toBe(true);
+  });
+
+  it('keeps the park when the copy was REFUSED — nothing replaced the file it is an edit to', async () => {
+    saveAsAnswer = () => ({ ok: false, status: 403, json: async () => ({ error: 'outside the project' }) }) as unknown as Response;
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await saveAll({ path: COPY_PATH, allowDialog: false });
+    expect(r.saved).toBe(false);
+    // Still pending: the flush tried it (the stub 404s every mutate) and re-parked it — not dropped.
+    expect(mutates()).toContain(COPY_PATH);
+    expect(getPendingBaseScenePaths()).toContain(COPY_PATH);
+  });
+
+  it('leaves a park on ANOTHER scene to the flush, and reports no drop', async () => {
+    markBaseSceneEdit(OTHER, '/assets/scenes/Base.scene.json');
+    const r = await saveAll({ path: COPY_PATH, allowDialog: false });
+    expect(r.saved).toBe(true);
+    expect(r.droppedBaseSceneEdit).toBeUndefined();
+    expect(mutates()).toContain(OTHER);
+  });
+
+  // The agent's answer is the only place the drop is said. Here the stub fails the reopen, so it is the PARTIAL exit;
+  // the ok exit's `droppedBaseSceneEdit: true` was observed live (#2050 close-out) — a real reopen needs a SceneManager load.
+  it('save_all\'s answer names the drop (the PARTIAL exit, copy not reopened)', async () => {
+    registerEditorAgentOps();
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = await runAgentOp('save-all', { path: COPY_PATH }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err?.code).toBe('PARTIAL');
+    expect(err?.message).toContain(`baseScene edit parked on ${COPY_PATH} was dropped`);
+  });
+
+  it('the answer still names the drop when ANOTHER channel fails (the PARTIALLY-failed exit)', async () => {
+    registerEditorAgentOps();
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    markBaseSceneEdit(OTHER, '/assets/scenes/Base.scene.json'); // the stub 404s its mutate: a channel that fails
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = await runAgentOp('save-all', { path: COPY_PATH }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err?.message).toContain('PARTIALLY failed');
+    expect(err?.message).toContain(`baseScene edit parked on ${COPY_PATH} was dropped`);
+  });
+
+  // The sibling the re-review found: an UNTITLED scene saved over an existing file replaces its bytes just as a Save As
+  // does, through writePrimaryScene, and the scene it opens is that file. Also the ok exit's field, which the Save As
+  // tests above cannot reach here (their reopen fails).
+  it('an untitled scene saved over a file drops that file\'s park too, and save_all\'s ok answer says so', async () => {
+    registerEditorAgentOps();
+    setCurrentScenePath(null);
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ok = await runAgentOp('save-all', { path: COPY_PATH }) as { ok?: boolean; droppedBaseSceneEdit?: boolean; savedAsCopyOf?: string };
+    expect(ok.ok).toBe(true);
+    expect(ok.savedAsCopyOf).toBeUndefined(); // the untitled branch, not a Save As
+    expect(ok.droppedBaseSceneEdit).toBe(true);
+    expect(mutates()).not.toContain(COPY_PATH);
+    expect(getPendingBaseScenePaths()).not.toContain(COPY_PATH);
+  });
+
+  it('an earlier save\'s flush that holds the park does not re-park it after the replace', async () => {
+    markBaseSceneEdit(COPY_PATH, '/assets/scenes/Base.scene.json');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const inMutate = new Promise<void>((r) => { entered = r; });
+    // The first flush's mutate is held, then answered 409 — the failure branch that re-parks.
+    mutateAnswer = async () => { entered(); await held; return { ok: false, status: 409, json: async () => ({ ok: false, error: 'held' }) } as unknown as Response; };
+    pushAction({ label: 'an edit, so the plain save has something to write', undo: () => {}, redo: () => {} });
+    const first = saveAll({ allowDialog: false });
+    await inMutate; // the plain save's flush has taken COPY's park into its batch
+    mutateAnswer = undefined;
+    const second = await saveAll({ path: COPY_PATH, allowDialog: false });
+    expect(second.saved).toBe(true);
+    release();
+    await first;
+    expect(getPendingBaseScenePaths(), 'the held flush re-parked an edit to bytes the Save As replaced').not.toContain(COPY_PATH);
   });
 });

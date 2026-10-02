@@ -941,6 +941,29 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   close-out reviews). A
   scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
   refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+- **A save that REPLACES a file drops a `baseScene` edit parked on it (#2050).** The Scene inspector
+  parks a base-scene ref on a scene that is not open (`pendingBaseScene.ts`), and `saveAll` flushes it
+  AFTER the scene write. Observed before the fix: a Save As overwrote the target, the editor reopened
+  it, then the flush wrote the ref onto that file through `/api/scene-mutate`. The reopened world's
+  in-memory base came from the copy's bytes (none), so the next save wrote `baseScene: null` back over
+  it, and both saves answered ok. That is the stale-module-value loss `pendingBaseScene.ts` describes
+  for the open scene, reached through a reopen. Three saves that replace a file's bytes and then make it
+  the open scene are covered: a Save As (`saveSceneAs`), an untitled scene saved to an existing path by
+  an agent (`writePrimaryScene`), and the Save dialog's Replace. ⚠️ **They are not the only ways in —
+  #2069** names the class (any park on a path that becomes the open scene before the flush: Create
+  Scene over an existing scene, simply opening it, a spelling variant at the untitled site) and the one
+  check at the flush or open seam that would subsume all of them. Each covered save calls `dropReplacedBaseSceneEdit` AFTER a
+  successful write, so a refused or failed write keeps the park. The drop is reported as
+  `droppedBaseSceneEdit` on `save_all`'s answer, on every exit the save reaches after its write, the
+  PARTIAL ones included. It also marks the path superseded for every flush in flight, as a live
+  base-scene edit does, so an earlier save's flush that failed cannot re-park it. ⚠️ **Still open:** an
+  earlier flush whose mutate SUCCEEDS after the replace lands the stale ref anyway. Only serialising
+  `saveAll` would close that. Any two saves can overlap: the agent op bypasses `runSaveAll`'s coalescing.
+  ⚠️ **Not a route refusal — that was tried and deadlocked.** A refused primary does still run the
+  flush, but `/api/scene-mutate` refuses the flush while the open scene has unsaved edits, the usual
+  state at a Save As, so "repeat `save_all`" was refused again forever. The other registries cannot
+  hold a scene path that is neither open nor loaded (`dirtyAsset` holds only `ASSET_SCHEMA_TYPES`, a
+  JSON asset has no sidecar), which is the route's `EXEMPT` row in `unsavedGateCoverage.test.ts`.
 - **An IMPORT keeps its id unless the project already holds it (#1713, owner ruling 2026-09-28: copy
   Unity).** `modoki_import_file` (`/api/import-file`) and the Assets panel's OS-file drop decide an
   imported JSON asset's identity through ONE function, `importedAssetBytes`
@@ -1481,6 +1504,17 @@ path-scoped ask from `/api/validate-prefab` match) and a marker for a genuinely 
   create` and `save_all` all reach it THROUGH the renderer (#1215). The exemption survives because
   each of those writes is issued by the renderer, which holds the registries. ⚠️ Void the day it
   gains an MCP contract.
+- **A write behind a ROUTER-LOCAL helper was invisible too, until #2050 derived them.** #1965 folded
+  write-file's `writeFileSync` into a local `writeFileAtomic` and named that one trigger. Its sibling
+  `writeJsonAtomic` stayed blind, along with every closure over a primitive (`readAiSettings`,
+  `writeDataUrlToTemp`, `plannedMoveLandings`, `importIdentity`). `CONTENT_CALLS` now lists only
+  primitives and imported helpers. Every function the router defines on top of them is found by a fixed
+  point over its parsed source, and it inherits the registries of what it calls. Nine route blocks
+  surfaced, not the four the issue named. `/api/scene-save-as` was a real loss, fixed in the renderer, not by a gate (above).
+  `/api/create-asset` is exempt on a live run: a park outliving its file (deleted outside, the unlink
+  held by #1879) is refused at flush as changed-on-disk, then dropped at refresh by the outside-change
+  rule, and the created file stands. The rest are settings, temp frames, or the move's own fingerprint
+  read, each with its row.
 
 ## 6. Prior fix this generalizes
 

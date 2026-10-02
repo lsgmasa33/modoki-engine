@@ -31,7 +31,8 @@ import { trait as kootaTrait } from 'koota';
 import { clearMissingComponents } from '../../packages/modoki/src/runtime/core/ecs/missingComponents';
 import { unusedOverridesLine } from '../../packages/modoki/src/editor/panels/applyDialogModel';
 import { localIdCounter, clearReservedLocalIds } from '../../packages/modoki/src/runtime/core/localIdCounter';
-import { createEntityWithUndo, deleteEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { createEntityWithUndo, deleteEntitiesWithUndo, removeMissingComponentWithUndo, duplicateEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { liveMissingSource, missingComponentRows } from '../../packages/modoki/src/editor/panels/missingComponentRows';
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { damagedPrefabReason } from '../../packages/modoki/src/runtime/core/damagedPrefabs';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
@@ -704,6 +705,67 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
     if ('error' in out) throw new Error(out.error);
     return (out.prefab.entities.find((e) => e.localId === 2) as unknown as { added: Array<{ key?: string; traits: Record<string, unknown> }> }).added.find((n) => n.key === 'k-t')!;
   };
+  // ── #1944, the UI half: the Inspector row and its Remove — the one deliberate act that drops the data. ──
+  // Mutations: removeMissingComponent leaves the name in the bag — save 1 keeps it; the undo's restore is a no-op — the
+  // undone save lacks it; no _pushAction — nothing to undo, and the scene does not read as unsaved.
+  it('#1944: the row shows it, Remove drops it from the next save, undo puts it back verbatim, redo drops it again', async () => {
+    await load(plainScene({ RetiredTraitN1bR: { speed: 3, nested: { k: [1] } } }));
+    const id = getAllEntities().find((e) => e.name === 'Plain')!.id;
+    expect(missingComponentRows([id], liveMissingSource)).toEqual([{ name: 'RetiredTraitN1bR', removeRefusal: null }]);
+
+    expect(removeMissingComponentWithUndo([id], 'RetiredTraitN1bR')).toBeNull();
+    expect(missingComponentRows([id], liveMissingSource)).toEqual([]);
+    const { peekUndo } = await import('../../packages/modoki/src/editor/undo/undoManager');
+    expect(peekUndo()?.label, 'one undo entry — what marks the scene as owing a save').toBe('Remove Missing RetiredTraitN1bR');
+    expect(plainOf(await saved()).traits.RetiredTraitN1bR).toBeUndefined();
+
+    const { undo, redo } = await import('../../packages/modoki/src/editor/undo/undoManager');
+    await undo();
+    expect(plainOf(await saved()).traits.RetiredTraitN1bR).toEqual({ speed: 3, nested: { k: [1] } });
+    await redo();
+    expect(plainOf(await saved()).traits.RetiredTraitN1bR).toBeUndefined();
+  });
+
+  // Mutations: drop `missing` from snapshotEntity — the copy has no row and saves without it; record nothing in
+  // respawnFromSnapshot — the same; keep the source's guid on the copy's record — the copy's entry lacks it.
+  it('#1944: a duplicate carries its missing components under its own guid, and the original keeps them', async () => {
+    await load(plainScene({ RetiredTraitDup: { speed: 4 } }));
+    const id = getAllEntities().find((e) => e.name === 'Plain')!.id;
+    const copy = duplicateEntity(id, () => {})!;
+    expect(copy).not.toBe(id);
+    expect(missingComponentRows([copy], liveMissingSource).map((r) => r.name)).toEqual(['RetiredTraitDup']);
+    const ents = (await saved()).entities as unknown as Array<{ traits: Record<string, unknown> }>;
+    expect(ents).toHaveLength(2);
+    const guids = ents.map((e) => (e.traits.EntityAttributes as { guid: string }).guid);
+    expect(new Set(guids).size, 'premise: the copy has its own guid').toBe(2);
+    for (const e of ents) expect(e.traits.RetiredTraitDup, (e.traits.EntityAttributes as { guid: string }).guid).toEqual({ speed: 4 });
+    // Its own record, not a shared one: removing it from the copy leaves the original's.
+    removeMissingComponentWithUndo([copy], 'RetiredTraitDup');
+    expect(plainOf(await saved()).traits.RetiredTraitDup).toEqual({ speed: 4 });
+  });
+
+  // Mutation: isTemplateMember answers true for the root (drop `t.rootId !== id`) — the root's Remove is refused.
+  it('#1944: an instance ROOT\'s extra component is the scene entry\'s own, so Remove runs and the save drops it', async () => {
+    await load(scene({ traits: { EntityAttributes: { name: 'Inst', parentId: 0 }, RetiredTraitRootR: { speed: 9 } } }));
+    const root = getAllEntities().find((e) => (e as { guid?: string }).guid === ROOT1)!.id;
+    expect(missingComponentRows([root], liveMissingSource)).toEqual([{ name: 'RetiredTraitRootR', removeRefusal: null }]);
+    expect(removeMissingComponentWithUndo([root], 'RetiredTraitRootR')).toBeNull();
+    expect((entryOf(await saved()).traits as Record<string, unknown>).RetiredTraitRootR).toBeUndefined();
+  });
+
+  // The refuse side. Mutation: liveMissingSource.isTemplateMember always false — the Remove runs and reports nothing.
+  it('#1944: a TEMPLATE node of an instance (its prefab holds the component) refuses Remove and keeps the record', async () => {
+    install(oDoc({ added: [tNode({ RetiredTraitTplR: { speed: 6 } })] }));
+    await load(scene({}, O));
+    const t = getAllEntities().find((e) => e.name === 'TNode')!.id;
+    const rows = missingComponentRows([t], liveMissingSource);
+    expect(rows.map((r) => r.name), 'premise: the template node carries the record').toEqual(['RetiredTraitTplR']);
+    expect(rows[0]!.removeRefusal).toMatch(/Prefab Mode/);
+    const refused = quietly(() => { const e = vi.spyOn(console, 'error').mockImplementation(() => {}); try { return removeMissingComponentWithUndo([t], 'RetiredTraitTplR'); } finally { e.mockRestore(); } });
+    expect(refused).toMatch(/Prefab Mode/);
+    expect(missingComponentRows([t], liveMissingSource).map((r) => r.name)).toEqual(['RetiredTraitTplR']);
+  });
+
   it('a template node in a prefab\'s own `added` keeps it through a prefab-edit save, and the next save is the same', async () => {
     const doc = oDoc({ added: [tNode({ RetiredTraitN1bE: { speed: 6 } })] });
     install(doc);

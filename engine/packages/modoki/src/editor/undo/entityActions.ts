@@ -46,6 +46,8 @@ import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
 import { leftBehindReader } from '../scene/prefabBase';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 import * as instanceEdits from '../instance/instanceEdits';
+import { removeMissingComponent, restoreMissingComponent, missingComponentsFor, setMissingComponents } from '../../runtime/core/ecs/missingComponents';
+import { liveMissingSource, missingRemoveRefusal } from '../panels/missingComponentRows';
 
 // The override-mark writes live in `overrideMarkWrites.ts` (#1709); re-exported for the callers that import them here.
 export { markOverrideIfInstance };
@@ -497,6 +499,41 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
   return null;
 }
 
+/** Remove a MISSING component — one whose trait this build does not register, kept for its entity and written back on
+ *  every save — from every selected entity carrying it, as one undo entry (#1944; Unity's remove of a "Missing (Mono
+ *  Script)"). The one deliberate act that drops that data: the record goes, so the next save writes the entity without
+ *  it. Keyed by guid, as the record is, so the undo puts it back on the entity a delete-and-undo respawned. Refused on a
+ *  template member of a prefab instance (`missingRemoveRefusal`): the prefab file holds it there, which no scene save
+ *  writes. Returns the refusal, or null. */
+export function removeMissingComponentWithUndo(entityIds: number[], name: string): string | null {
+  const refused = missingRemoveRefusal(entityIds, liveMissingSource);
+  if (refused) return reportWriteRefusal(`Remove Missing ${name} refused: ${refused}`);
+  const carrying = entityIds.filter((id) => Object.hasOwn(liveMissingSource.bagOf(id) ?? {}, name));
+  if (carrying.length === 0) return null;
+  const onPlaceholder = placeholderWriteRefusalAny(carrying, name); // #1818: a Missing Prefab placeholder writes its kept record
+  if (onPlaceholder) return reportWriteRefusal(onPlaceholder);
+  const targets = carrying.map((id) => { const ref = entityRef(id); return { ref, guid: ref.guid, data: undefined as unknown }; });
+  const affectedScenes = resolveAffectedScenes(carrying);
+  const apply = () => {
+    requireAll(targets.map((t) => t.ref));
+    for (const t of targets) t.data = removeMissingComponent(t.guid, name)?.data ?? t.data;
+    markUIDirty();
+  };
+  const revert = () => {
+    requireAll(targets.map((t) => t.ref)).forEach((id, i) => restoreMissingComponent(targets[i].guid, name, targets[i].data, id));
+    markUIDirty();
+  };
+  apply();
+  _pushAction({
+    label: `Remove Missing ${name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
+    undo: revert,
+    redo: apply,
+    check: refsCheck(() => targets.map((t) => t.ref)),
+    affectedScenes,
+  });
+  return null;
+}
+
 /** Paste copied trait values onto every selected entity that ALREADY carries the
  *  trait, as a single undo entry. Fields are matched against each target's own
  *  live keys, so a clipboard entry captured before a trait gained/lost a field
@@ -592,6 +629,11 @@ export interface EntitySnapshot {
    *  (`layerFieldsLeftBehind`, #1914): a copy that makes its frame a stored root shows them with no layer to give them,
    *  so it records them (`copySnapshot`). An undo's respawn, which puts the entity back where it was, ignores them. */
   layerMarks?: string[];
+  /** Its MISSING components — the ones this build registers no trait for, kept by guid (`missingComponents.ts`, #1944).
+   *  The record is keyed by the guid, so an undo's respawn under the same guid already has it; a COPY has a new guid and
+   *  got none, so the original kept the data and the duplicate silently lacked it (Unity's duplicate carries a Missing
+   *  script). Carried by `copySnapshot` under the copy's guid, recorded again by `respawnFromSnapshot`. */
+  missing?: Record<string, unknown>;
 }
 
 /** Is this a copy of the prefab-edit world's scaffolding (a `SCAFFOLD_PREFIX` entity)? */
@@ -640,8 +682,11 @@ export function snapshotEntity(entityId: number, scope?: SnapshotScope): EntityS
   const markers = captureMarkers(entity);
   const frameDoc = frameRootDoc(getCurrentWorld(), entity);
   const kept = keptStateOf(durableGuidOf(traits));
+  const missing = missingComponentsFor(rawGuidOf(traits), entityId);
   return {
     id: entityId, traits, children,
+    // Not cloned: no bag is edited in place (Remove and its undo replace the record's bag), so the snapshot can share it.
+    ...(missing ? { missing: missing as Record<string, unknown> } : {}),
     ...(marks && marks.size > 0 ? { marks: [...marks] } : {}),
     ...(layerMarks.length ? { layerMarks } : {}),
     ...(markers ? { markers } : {}),
@@ -764,6 +809,9 @@ export function copySnapshot(snapshot: EntitySnapshot): EntitySnapshot {
       ...rest,
       // A stripped node is no instance any more, so it has no rows to keep.
       ...(kept && link !== 'strip' ? { kept: remapGuidValues(kept, fullRemap) as KeptState } : {}),
+      // Its missing components, under the copy's guid (recorded by the respawn), with refs into the copy carried like any
+      // trait's (#1338's rule): the data is opaque, but a guid it names that the copy re-minted is the copy's now.
+      ...(s.missing ? { missing: remapGuidValues(s.missing, fullRemap) as Record<string, unknown> } : {}),
       // An override mark means something only on a member of an instance: a stripped node is an added node.
       ...(recorded.length && link !== 'strip' ? { marks: recorded } : {}),
       markers: markersOf(s),
@@ -800,6 +848,8 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     if (snap.frameDoc) noteFrameRootDoc(getCurrentWorld(), entity, snap.frameDoc);
     if (snap.kept) restoreKeptState(durableGuidOf(snap.traits), snap.kept);
     const id = entity.id();
+    // Set, never cleared when absent: a record outlives a snapshot that predates it (keyed by guid, see `missing`).
+    if (snap.missing) setMissingComponents(rawGuidOf(snap.traits), snap.missing, id);
     idMap.set(snap.id, id);
     spawned.push([snap, id]);
     for (const child of snap.children) spawnTree(child, id);
@@ -808,6 +858,13 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
   const newId = spawnTree(snapshot, newParentId);
   carryEntityIdFields(spawned.map(([snap, id]) => ({ id, traits: snap.traits.map((t) => ({ name: t.meta.name, data: t.data })) })), idMap);
   return newId;
+}
+
+/** The EntityAttributes.guid in a snapshot's traits exactly as the entity carries it ('' if none) — the key the missing-
+ *  component record is under (`missingComponents.ts` keys by the live guid, not the durable one). */
+function rawGuidOf(traits: EntitySnapshot['traits']): string {
+  const ea = traits.find((t) => t.data !== true && t.meta.name === 'EntityAttributes');
+  return ea && ea.data !== true ? String((ea.data as Record<string, unknown>).guid ?? '') : '';
 }
 
 /** The durable EntityAttributes.guid in a snapshot's traits ('' if none) — the key R2 keeps a stored root's state under. */

@@ -49,7 +49,7 @@ import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
-import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes } from './pendingBaseScene';
+import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes, dropReplacedBaseSceneEdit } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
 import { createSupersessionToken } from '../../runtime/core/liveness';
 import { withAdoption, settleLeaveDebts, bindEditorSceneState, adoptedWorld, beginWorldRequest, SCENE_SWITCH_LANDING } from './sceneAdoption';
@@ -1295,6 +1295,9 @@ export interface SaveResult {
    *  copy, which the scanner's heal re-mints if the copy still shares an id with the original (#2052): the live smoke
    *  compares it with the file's. */
   savedAs?: { from: string; reopened: boolean; note?: string; sceneId: string };
+  /** This save REPLACED an existing file (a Save As, or an untitled scene saved over it) that held a parked `baseScene`
+   *  edit, and the edit was dropped with the bytes it edited (#2050, `dropReplacedBaseSceneEdit`). */
+  droppedBaseSceneEdit?: true;
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -1331,6 +1334,14 @@ export interface SaveResult {
    *  `ASSET_SCHEMA_TYPES` document, so it does not go through `/api/asset-write`. Present on a
    *  FAILED result too — this flush is unconditional, same as the asset flush above. */
   importSettings?: MetaFlushResult;
+}
+
+/** The report half of `dropReplacedBaseSceneEdit` (#2050), for each save that REPLACED `path`'s bytes: a Save As over
+ *  it, or an untitled scene saved over it (by an agent's explicit path or the dialog's Replace). Spread into the result. */
+function dropParkOnReplacedFile(path: string): { droppedBaseSceneEdit?: true } {
+  if (!dropReplacedBaseSceneEdit(path)) return {};
+  console.warn(`[Editor] The save replaced ${path}, so its pending baseScene edit was dropped with it`);
+  return { droppedBaseSceneEdit: true };
 }
 
 /** `saveScene`'s agent Save As (#1414): write the open scene to `target` as a COPY with its own
@@ -1382,9 +1393,12 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   registerAsset(written.guid, written.path, 'scene');
   // The overwritten file's kept undo stack names guids the copy does not have — on every exit below.
   forgetHistory(written.path);
+  // AFTER the write, so a refused or failed copy keeps the park; keyed by the disk spelling the route returns, the same
+  // one the park is keyed by.
+  const asReport = dropParkOnReplacedFile(written.path);
   editorEmit('!save', { path: written.path, entities: entityCount }); // Editor Percept (V2)
   console.log(`[Editor] Saved scene as a copy (fresh id ${written.guid}): ${entityCount} entities → ${written.path}`);
-  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note, sceneId: written.guid }, ...othersReport });
+  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note, sceneId: written.guid }, ...asReport, ...othersReport });
   // An edit that landed during the writes is in the live world but not in the copy — reopening
   // would discard it. Stay on the original, still dirty, and say so (#573's window, one level up).
   // …or the world is not at the state the copy was serialized at: a step or an edit during the serialize (the settled
@@ -1405,7 +1419,7 @@ async function saveSceneAs(target: string, content: string, sceneId: string, ent
   if (outcome !== 'loaded' && !adopted) {
     return stay(`the copy could not be reopened (${outcome}${_lastLoadFailureMessage ? `: ${_lastLoadFailureMessage}` : ''}); the editor stays on ${from} with its edits unsaved`);
   }
-  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true, sceneId: written.guid }, ...othersReport };
+  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true, sceneId: written.guid }, ...asReport, ...othersReport };
 }
 
 /** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */
@@ -1529,7 +1543,11 @@ export async function saveScene(opts: {
   // case-variant `path` names the same file, and adopting it would give the manifest a second key.
   const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
   // scene.id is always populated by serializeScene (required field).
-  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAt, worldSerialized);
+  if (knownPath) {
+    const r = await writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAt, worldSerialized);
+    // An untitled scene saved over an EXISTING file replaces its bytes, as a Save As does (#2050): drop its park too.
+    return kind === 'untitled' && r.saved ? { ...r, ...dropParkOnReplacedFile(knownPath) } : r;
+  }
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.
@@ -1568,15 +1586,17 @@ export async function saveScene(opts: {
     // and the current scene path persists — a second spelling would be what every later save writes.
     const saved = written.path;
     registerAsset(written.guid, saved, 'scene');
+    // A Replace swapped the file's bytes for this scene's (#2050) — on every exit below, the world-switch one included.
+    const replaced = written.outcome === 'replaced' ? dropParkOnReplacedFile(saved) : {};
     // A world switch during the panel or the write (a Create Scene, a scene open) owns the editor now: the file holds
     // the world that was serialized, not this one, so nothing binds to it (#1712 close-out re-review).
-    if (getCurrentWorld() !== worldSerialized) return { saved: true, path: saved, reason: 'ok' };
+    if (getCurrentWorld() !== worldSerialized) return { saved: true, path: saved, reason: 'ok', ...replaced };
     setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
     rekeyUntitledHistory(saved); // its undo stacks now belong to the file (#1712 close-out review) — see writePrimaryScene
     editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
     markSceneSaved(savedAt);
-    return { saved: true, path: saved, reason: 'ok' };
+    return { saved: true, path: saved, reason: 'ok', ...replaced };
   }
   const error = written.outcome === 'failed' ? written.error : undefined;
   console.error(`[Editor] Failed to save scene to ${target}${error ? `: ${error}` : ''}`);

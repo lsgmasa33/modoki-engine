@@ -6,7 +6,7 @@ import { pinEntityAt } from '../../runtime/core/ecs/entityPin';
 import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
-import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
+import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, removeMissingComponentWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
 import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitClipboard';
 import { type TraitMeta, type FieldHint, getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
@@ -31,6 +31,7 @@ import { STRETCH_X, STRETCH_Y, isSizeInert } from '../../runtime/ui/anchorLayout
 import { inertUIAnchorBooleanReason } from '../../runtime/ui/anchorCss';
 import { BufferedTextInput, BufferedNumberInput, BufferedFieldScope, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
 import { type TraitEntry, sameTraitResult, readMergedTraits } from './inspectorMerge';
+import { missingComponentRows, missingRowsKey, liveMissingSource, MISSING_COMPONENT_HELP, type MissingComponentRow } from './missingComponentRows';
 import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
@@ -800,6 +801,23 @@ function FilterIgnoredNote({ layer }: { layer: string }) {
  *  as a short list (#764 — the owner reads this note) rather than one ~300-character sentence
  *  naming the five fields twice. `entry-prefab`'s items have no "forced to" suffix, matching
  *  `mixed`: the fields are not being forced RIGHT NOW, only described. */
+/** One "Missing component" row (#1944). Read-only: there is no trait to draw fields from, only the name and Remove. The
+ *  decisions (which rows, whether Remove may run) are `missingComponentRows.ts`'s. */
+function MissingComponentRowView({ row, onRemove }: { row: MissingComponentRow; onRemove: () => void }) {
+  return (
+    <div data-ui-id={`inspector.missing.${row.name}`} data-ui-kind="text" data-ui-label={`Missing component ${row.name}`}
+      title={MISSING_COMPONENT_HELP}
+      style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderBottom: '1px solid #333', background: '#3a2f1c', color: '#e8c070', fontSize: '11px' }}>
+      <span style={{ flex: 1 }}>⚠️ Missing component <b>{row.name}</b></span>
+      <button data-ui-id={`inspector.missing.${row.name}.remove`} data-ui-kind="button" data-ui-label={`Remove missing ${row.name}`}
+        disabled={row.removeRefusal !== null} title={row.removeRefusal ?? `Remove ${row.name} from this entity — the next save writes it without the data`}
+        onClick={onRemove} style={{ fontSize: '10px' }}>
+        Remove
+      </button>
+    </div>
+  );
+}
+
 function PooledRowNote({ mode }: { mode: 'inert' | 'mixed' | 'entry-prefab' }) {
   const { intro, items } = pooledRowNoteSegments(mode);
   return (
@@ -1682,6 +1700,9 @@ export default function Inspector() {
   const [entityName, setEntityName] = useState('');
   const [overrides, setOverrides] = useState<Set<string>>(new Set());
   const [nonSharedTraits, setNonSharedTraits] = useState<string[]>([]);
+  // #1944: components this build registers no trait for, kept and written back by the save — shown so they are not invisible.
+  const [missingRows, setMissingRows] = useState<MissingComponentRow[]>([]);
+  const missingKeyRef = useRef('');
   // Phase 13 (scene-loading.md): which selection is unlocked for
   // in-place editing of a ghosted base entity — store-backed (not local state) so
   // the SceneView gizmo reads the SAME unlock (see editorStore.ts's own doc
@@ -1703,6 +1724,10 @@ export default function Inspector() {
   useEffect(() => {
     if (selectedIds.length === 0) { setTraits([]); setEntityName(''); setNonSharedTraits([]); lastReadRef.current = []; return; }
     const refresh = () => {
+      // Before the early returns below: the rows change on their own (a Remove, its undo) while the traits stay put.
+      const rows = missingComponentRows(selectedIds, liveMissingSource);
+      const rowsKey = missingRowsKey(rows);
+      if (rowsKey !== missingKeyRef.current) { missingKeyRef.current = rowsKey; setMissingRows(rows); }
       const { result, nonShared } = readMergedTraits(selectedIds);
       if (result.length === 0) { setTraits([]); setEntityName(''); setNonSharedTraits([]); lastReadRef.current = []; return; }
 
@@ -2124,6 +2149,10 @@ export default function Inspector() {
             />
           );
         })}
+
+        {missingRows.map((row) => (
+          <MissingComponentRowView key={row.name} row={row} onRemove={() => removeMissingComponentWithUndo(selectedIds, row.name)} />
+        ))}
 
         {/* Note: components present on only some of the selected entities are
             hidden because they aren't shared across the whole selection. */}

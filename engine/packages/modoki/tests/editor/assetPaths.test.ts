@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   splitAssetPath, duplicatePathFor, pastePathIn, remapPrefix, buildFolderTree, planAutoImports,
-  autoImportBaseline, diffAutoImportScan, markAutoImported, effectiveAssetsRoot, collectFolderPaths,
+  autoImportBaseline, diffAutoImportScan, markAutoImported, effectiveAssetsRoot, collectFolderPaths, createNewFolder,
   type AssetEntry,
 } from '../../src/editor/utils/assetPaths';
 
@@ -337,5 +337,55 @@ describe('collectFolderPaths', () => {
     expect(result).toBe(out);
     expect(out[0]).toBe('seed');
     expect(out).toContain('/assets');
+  });
+});
+
+// #2040: New Folder's name. Observed live: an empty folder made OUTSIDE the panel is in no list the panel keeps, so the
+// name check alone picked it and every click was refused "Folder exists".
+describe('createNewFolder', () => {
+  /** A backend holding `onDisk`: 409 for a taken path, ok (and now taken) otherwise; records every attempt. */
+  const backend = (onDisk: string[], failWith?: { status: number; error: string }) => {
+    const disk = new Set(onDisk);
+    const tried: string[] = [];
+    const create = async (p: string) => {
+      tried.push(p);
+      if (failWith) return { ok: false as const, ...failWith };
+      if (disk.has(p)) return { ok: false as const, status: 409, error: 'Folder exists' };
+      disk.add(p);
+      return { ok: true as const };
+    };
+    return { create, tried };
+  };
+
+  it('the first name the panel does not know, with no collision', async () => {
+    const b = backend([]);
+    expect(await createNewFolder('/assets/p', (p) => p === '/assets/p/New Folder', b.create))
+      .toEqual({ ok: true, path: '/assets/p/New Folder 2', collided: false });
+    expect(b.tried).toEqual(['/assets/p/New Folder 2']);
+  });
+
+  // Mutation: return on the first non-ok answer (no retry on 409) — the refusal the live run showed.
+  it('a name the backend refuses as taken (a folder made outside the panel) is skipped, and the caller told to rescan', async () => {
+    const b = backend(['/assets/p/New Folder 3']);
+    const known = new Set(['/assets/p/New Folder', '/assets/p/New Folder 2']);
+    expect(await createNewFolder('/assets/p', (p) => known.has(p), b.create))
+      .toEqual({ ok: true, path: '/assets/p/New Folder 4', collided: true });
+    expect(b.tried).toEqual(['/assets/p/New Folder 3', '/assets/p/New Folder 4']);
+  });
+
+  // Mutation: retry on every failure — a 403 would be retried 50 times and reported as "no free name".
+  it('any other refusal is reported as it is, not retried', async () => {
+    const b = backend([], { status: 403, error: 'outside the asset roots' });
+    expect(await createNewFolder('/x', () => false, b.create)).toEqual({ ok: false, error: 'outside the asset roots', collided: false });
+    expect(b.tried).toHaveLength(1);
+  });
+
+  it('gives up after a bounded number of real attempts, and the root parent spells /New Folder', async () => {
+    const b = backend([]);
+    const always = async (p: string) => { b.tried.push(p); return { ok: false as const, status: 409, error: 'Folder exists' }; };
+    const r = await createNewFolder('', () => false, always);
+    expect(r.ok).toBe(false);
+    expect(b.tried[0]).toBe('/New Folder');
+    expect(b.tried).toHaveLength(50);
   });
 });

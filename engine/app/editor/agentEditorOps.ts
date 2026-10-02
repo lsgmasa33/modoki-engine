@@ -2949,6 +2949,12 @@ export function registerEditorAgentOps(): void {
         + 'built-in assets are read-only in this editor, so nothing about them is pending. To change one for this project, '
         + 'copy it into the project (modoki_duplicate_asset), edit the copy, and point its references at the copy.'
       : '';
+    // A park on a file this save REPLACED, dropped with the bytes it edited (#2050). Said on EVERY exit the save reaches
+    // after its write — the PARTIALs below included — because the answer is the only place it is said: the caller may
+    // have parked that edit itself, and nothing refused.
+    const baseDropNote = r.droppedBaseSceneEdit
+      ? ` The baseScene edit parked on ${r.path} was dropped: this save replaced the file it edited.`
+      : '';
     const allFails = [...sceneFails, ...assetFails, ...baseSceneFails, ...metaFails];
     if (allFails.length) {
       throw new OpRefusal(
@@ -2956,7 +2962,7 @@ export function registerEditorAgentOps(): void {
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
         `${allFails.length} item(s) did NOT: ${allFails.join('; ')}. Those changes are still in the ` +
         `live world / pending only, and stay marked dirty — a build reads FILES and would ship ` +
-        `WITHOUT them. Fix the cause and call save_all again.${droppedNote}${r.saved ? '' : landedNote}`,
+        `WITHOUT them. Fix the cause and call save_all again.${baseDropNote}${droppedNote}${r.saved ? '' : landedNote}`,
       );
     }
     // A Save As whose copy landed but could not be reopened (#1414): the copy is on disk under a
@@ -2965,12 +2971,12 @@ export function registerEditorAgentOps(): void {
     if (r.saved && r.savedAs && !r.savedAs.reopened) {
       throw new OpRefusal('PARTIAL',
         `save-all: the scene WAS written to ${r.path} as a copy with a fresh scene id, but ${r.savedAs.note ?? 'it could not be reopened'}. ` +
-        `${r.savedAs.from} itself was not written.${landedNote}${droppedNote}`);
+        `${r.savedAs.from} itself was not written.${baseDropNote}${landedNote}${droppedNote}`);
     }
     // Only where the save otherwise SUCCEEDED (close-out review 3): every exit below and above says why the scene did not
     // save, with the dropped edit as a rider — raised first, this sentence hid `needs-path`, `playing`, `write-failed`.
     if (r.saved && metaDropped.length) {
-      throw new OpRefusal('PARTIAL', `save-all: the primary scene saved to ${r.path}, but${droppedNote}`);
+      throw new OpRefusal('PARTIAL', `save-all: the primary scene saved to ${r.path}, but${droppedNote}${baseDropNote}`);
     }
     if (r.saved) {
       return {
@@ -2978,6 +2984,9 @@ export function registerEditorAgentOps(): void {
         // A Save As (#1414): name what the copy was made from, that it carries its own id, and which id the route
         // stamped (#2052): a copy whose file holds any other id was re-minted by the scanner's collision heal.
         ...(r.savedAs ? { savedAsCopyOf: r.savedAs.from, freshSceneId: true, copySceneId: r.savedAs.sceneId } : {}),
+        // …and that a base-scene edit parked on a REPLACED file went with it (#2050, `baseDropNote`). Not a PARTIAL like an
+        // import-settings drop: that one is an edit that could not land, this one was superseded by the replace asked for.
+        ...(r.droppedBaseSceneEdit ? { droppedBaseSceneEdit: true } : {}),
         ...(r.extraSaved?.length ? { extraSaved: r.extraSaved } : {}),
         // Name the asset docs this save wrote. They are the half a caller cannot otherwise see —
         // `saved:false` was the answer when the edit was parked, and this is where that promise

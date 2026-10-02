@@ -258,6 +258,35 @@ export function isFolderPath(
   return known.assets.some((a) => a.path === path || a.path.startsWith(path + '/'));
 }
 
+/** How many names New Folder tries before it gives up (each a real 409 from the backend, so not a hot loop). */
+const NEW_FOLDER_ATTEMPTS = 50;
+
+/** Create Assets → New Folder's folder under `parent` (`''` for the root): the first of `New Folder`, `New Folder 2`, …
+ *  that `isTaken` does not claim AND the backend accepts (#2040).
+ *
+ *  ⚠️ The panel's own list is not the authority. An EMPTY folder made outside the panel (an agent's
+ *  `modoki_create_folder`, Finder, a git checkout) is not an asset change, so nothing refreshes the panel's folder list,
+ *  and a name check against that list alone picked the taken name and was refused "Folder exists" on every click until
+ *  something else refreshed it — observed live. So a 409 marks that name taken and the next one is tried; `collided`
+ *  tells the caller to refresh, which is what makes the outside folder appear in the tree. */
+export async function createNewFolder(
+  parent: string,
+  isTaken: (path: string) => boolean,
+  create: (path: string) => Promise<{ ok: true } | { ok: false; error: string; status: number }>,
+): Promise<{ ok: true; path: string; collided: boolean } | { ok: false; error: string; collided: boolean }> {
+  let collided = false;
+  for (let n = 1, attempts = 0; attempts < NEW_FOLDER_ATTEMPTS; n++) {
+    const path = `${parent}/${n === 1 ? 'New Folder' : `New Folder ${n}`}`;
+    if (isTaken(path)) continue;
+    attempts++;
+    const made = await create(path);
+    if (made.ok) return { ok: true, path, collided };
+    if (made.status !== 409) return { ok: false, error: made.error, collided };
+    collided = true; // and `n` moves past it: a name is never tried twice
+  }
+  return { ok: false, error: `no free "New Folder" name after ${NEW_FOLDER_ATTEMPTS} tries`, collided };
+}
+
 /** A move that RELOCATES rather than deletes — `PathMove` with its `to: null` case ruled out.
  *  A drag-and-drop can only ever put a file somewhere, so the planner below is total in `to`. */
 export type RelocateMove = PathMove & { to: string };

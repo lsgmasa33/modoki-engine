@@ -146,6 +146,22 @@ export function applyBaseSceneEdit(
   return 'parked';
 }
 
+/** A save REPLACED the file at `path` with other bytes — a Save As over it, or an untitled scene saved over it (#2050) —
+ *  so a park for it was an edit to bytes that are gone. Dropped, because left parked the flush writes it onto the file
+ *  that has just become the OPEN scene, whose in-memory base came from the new bytes, and the next save writes that
+ *  stale value straight back over it (observed live, reported ok both times). Marked superseded for every flush in
+ *  flight too, exactly as the live branch of {@link applyBaseSceneEdit} does: an earlier save's flush holding this path
+ *  in its batch would otherwise re-park it on a failure, after the replace. Returns whether a park was dropped.
+ *
+ *  ⚠️ Not closed: an earlier flush whose mutate SUCCEEDS after the replace lands it anyway. Only serialising `saveAll`
+ *  (the agent op bypasses `runSaveAll`'s coalescing — see the markers above) would close that. */
+export function dropReplacedBaseSceneEdit(path: string): boolean {
+  for (const markers of activeFlushMarkers) markers.add(path);
+  const dropped = pending.delete(path);
+  if (dropped) bump();
+  return dropped;
+}
+
 /** The parked base ref for `path`, or `undefined` when nothing is pending for it.
  *
  *  ⚠️ `undefined` means NOT PENDING and `null` means PENDING A CLEAR — a distinction a caller

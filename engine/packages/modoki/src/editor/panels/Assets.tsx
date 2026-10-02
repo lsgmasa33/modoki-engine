@@ -56,7 +56,7 @@ import RenameInput from '../components/RenameInput';
 import { startDragGhost, endDragGhost, setAssetDragPayload, completeAssetDrop, armGrabCursor } from '../utils/dragGhost';
 import {
   splitAssetPath, duplicatePathFor, pastePathIn, buildFolderTree, autoImportBaseline, diffAutoImportScan, markAutoImported,
-  effectiveAssetsRoot, collectFolderPaths, planFilesDropMoves, isFolderPath,
+  effectiveAssetsRoot, collectFolderPaths, planFilesDropMoves, isFolderPath, createNewFolder,
   type AssetEntry, type AutoImportBaseline, type FolderNode, type RelocateMove,
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
@@ -508,6 +508,9 @@ const FolderView = React.memo(function FolderView({ node, depth, expanded, onTog
   return (
     <>
       <div
+        // Addressable by its path, as a file row is by `data-asset-path` (#2040: an agent could not right-click, rename or
+        // drag a folder by name — QA's "an unaddressable control is a finding").
+        data-asset-folder={node.path} data-ui-kind="toggle" data-ui-label={node.name}
         onClick={(e) => { if (!isRenaming) { if (e.altKey) onToggleDeep(node); else onToggle(node.path); } }}
         onContextMenu={(e) => onFolderContextMenu(e, node.path, node.name)}
         draggable={depth > 0 && !isRenaming}
@@ -1337,12 +1340,11 @@ export default function Assets() {
   const createFolder = useCallback(async (parentFolder: string) => {
     const norm = parentFolder === '/' ? '' : parentFolder;
     const isTaken = (p: string) => isFolderPath(p, { pendingFolders, diskFolders, assets });
-    let name = 'New Folder';
-    let path = `${norm}/${name}`;
-    let n = 2;
-    while (isTaken(path)) { name = `New Folder ${n}`; path = `${norm}/${name}`; n++; }
-    const made = await createAssetFolder(path);
+    const made = await createNewFolder(norm, isTaken, createAssetFolder);
+    // A name the backend refused as taken is a folder this panel did not know about: rescan, so it shows.
+    if (made.collided) refresh();
     if (!made.ok) { reportGestureRefusal(`Could not create a folder under ${parentFolder}: ${made.error}`); return; }
+    const { path } = made;
     setPendingFolders((prev) => new Set(prev).add(path));
     // Expand the WHOLE ancestor chain down to the new folder's parent — not just
     // the immediate parent — so a folder created in a deep target (e.g.
@@ -1357,7 +1359,7 @@ export default function Assets() {
     });
     setViewMode('folder');
     setRenamingFolderPath(path); // immediately editable, Finder-style
-  }, [assets, pendingFolders, diskFolders]);
+  }, [assets, pendingFolders, diskFolders, refresh]);
 
   const commitFolderRename = useCallback(async (node: FolderNode, newName: string) => {
     setRenamingFolderPath(null);

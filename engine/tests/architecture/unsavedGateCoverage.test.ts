@@ -20,7 +20,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import fs from 'fs';
 import path from 'path';
+import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
@@ -49,11 +51,63 @@ const ROUTER = 'engine/plugins/backend/editorBackendRouter.ts';
  *  intended trade: `EXEMPT` is the honest home for those, and a declaration a reader can check
  *  beats a trigger tuned until nothing inconvenient matches.
  *
- *  ⚠️ **A write moved into a helper leaves this set unless the helper is named here** (#1965): folding
- *  write-file's inline `writeFileSync` into `writeFileAtomic` dropped `/api/write-file` out of the
- *  population, and its EXEMPT row went stale. `writeJsonAtomic` is NOT listed yet — naming it surfaces
- *  four routes nothing has considered (#2050). */
-const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|readJsonFile|tryReadJsonFile|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync|writeFileAtomic)\s*\(/;
+ *  ⚠️ **A ROUTER-LOCAL wrapper is not named here — it is DERIVED** (#2050, below). Folding
+ *  write-file's inline `writeFileSync` into a local `writeFileAtomic` dropped `/api/write-file` out of
+ *  the population (#1965), and naming that one wrapper left its sibling `writeJsonAtomic` blind: four
+ *  routes (create-asset, scene-save-as, layout, ai-settings) were never candidates. This list holds
+ *  the primitives and the IMPORTED helpers; anything the router itself defines on top of them is
+ *  found by {@link routerLocalWrappers}. */
+const BASE_CONTENT_SYMBOLS = ['writeMetaSidecar', 'readMetaSidecar', 'duplicateAssetFile', 'getReimportHandler',
+  'readFileSync', 'readJsonFile', 'tryReadJsonFile', 'computeUnused', 'computeRefEdges', 'validateSceneData',
+  'validatePrefabData', 'moveToTrash', 'moveAssetFile', 'writeFileSync'] as const;
+const callsAny = (names: Iterable<string>): RegExp => new RegExp(`\\b(${[...names].join('|')})\\s*\\(`);
+
+/** Every function the ROUTER defines (declaration, or a `const` bound to an arrow/function expression,
+ *  at any depth) whose body reaches a content symbol — directly or through another such function. A
+ *  fixed point, so a wrapper of a wrapper (`writeJsonAtomic` → `writeFileAtomic` → `writeFileSync`)
+ *  is found without anyone naming either.
+ *
+ *  ⚠️ **A function containing a route block is skipped.** The router's request handler holds every
+ *  route, so it would always qualify; no route calls it, so it adds nothing but noise to the reason
+ *  a reader sees. Bodies are read from comment-STRIPPED code at the parser's own offsets, so a comment
+ *  naming a primitive cannot make a function a writer (the same rule as {@link source}). */
+function routerLocalWrappers(rel: string, base: readonly string[]): Map<string, string[]> {
+  const abs = path.join(REPO, rel);
+  const raw = fs.readFileSync(abs, 'utf8');
+  const code = readScannedSource(abs).code;
+  const sf = ts.createSourceFile(rel, raw, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const bodies = new Map<string, string>();
+  const visit = (n: ts.Node): void => {
+    let name: string | undefined;
+    let body: ts.Node | undefined;
+    if (ts.isFunctionDeclaration(n) && n.name && n.body) { name = n.name.text; body = n.body; }
+    else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer
+      && (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) {
+      name = n.name.text; body = n.initializer.body;
+    }
+    if (name && body) {
+      const text = code.slice(body.getStart(sf), body.getEnd());
+      if (!/urlPath\s*===\s*'/.test(text)) bodies.set(name, (bodies.get(name) ?? '') + text);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  // name → the content symbols it calls DIRECTLY (base or derived), which is what its registries are inherited from.
+  const found = new Map<string, string[]>();
+  for (let grew = true; grew;) {
+    grew = false;
+    const known = new RegExp(callsAny([...base, ...found.keys()]).source, 'g');
+    for (const [name, text] of bodies) {
+      if ((base as readonly string[]).includes(name)) continue;
+      const calls = [...new Set([...text.matchAll(known)].map((m) => m[1]!))].filter((c) => c !== name);
+      if (calls.length > (found.get(name)?.length ?? 0)) { found.set(name, calls); grew = true; }
+    }
+  }
+  return found;
+}
+
+const ROUTER_WRAPPERS = routerLocalWrappers('engine/plugins/backend/editorBackendRouter.ts', BASE_CONTENT_SYMBOLS);
+const CONTENT_CALLS = callsAny([...BASE_CONTENT_SYMBOLS, ...ROUTER_WRAPPERS.keys()]);
 
 /** Every registry name in the vocabulary, and the subset that holds an unsaved DOCUMENT. The split
  *  exists because `openAssetEditor` (#1362) is not a registry of parked documents — it is "a modal
@@ -126,6 +180,11 @@ const HELPER_REGISTRIES: Record<string, readonly string[]> = {
   moveAssetFile: DOCUMENT_REGISTRY_NAMES,
   // Same argument as readFileSync: a raw write says nothing about WHAT was written.
   writeFileSync: [],
+  // ⚠️ A DERIVED wrapper (#2050) with its own row, because what it reads is known: the move's SOURCE file, hashed to
+  // fingerprint where it lands so the watcher takes the move for the editor's own. The same file `moveAssetFile`
+  // moves, so the same registries — and /api/move-file's scoped row then speaks for it. Without this row the read
+  // maps to nothing (readFileSync) and the scope could not pardon it.
+  plannedMoveLandings: DOCUMENT_REGISTRY_NAMES,
 };
 
 /** The `registries: [...]` a route DECLARES on its `unsavedGate` call.
@@ -159,7 +218,7 @@ function declaredRegistries(body: string): string[] {
  *  its effect is total — `/api/read-meta` is circular for `pendingMeta` in particular — and
  *  without it, a route that later needs gating for one registry and not another has to be either
  *  wholly exempt or wholly gated, which is how a narrow exemption rots into a blanket one. */
-const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }> = {
+const EXEMPT: Record<string, { reason: string; registries?: readonly string[]; count?: number }> = {
   // ── The two move/delete routes. FULLY exempt (no `registries`), because the reasoning is total
   //    rather than per-registry — and note they can never satisfy `gapsNowGated`, since the
   //    correct implementation of these routes calls no gate at all. ──
@@ -209,8 +268,45 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   '/api/read-file': { reason: 'serves SOURCE/art bytes under resolveSourcePath (a .psd, an .aseprite) — inputs to the import pipeline, not documents any panel edits.' },
   '/api/source-image': { reason: 'same as /api/read-file, for the image half.' },
   '/api/adopt-file': { reason: 'copies an OUTSIDE file into the project. Its source is not under an asset root, so no registry can be keyed to it, and its destination is new.' },
-  '/api/layout': { reason: 'reads editor WINDOW layouts from the user profile — chrome state, not project content, and not under any asset root.' },
+  // ⚠️ `count: 2` — one per method block. Both were here only as the GET until #2050 derived `writeJsonAtomic`;
+  //    the POST that writes the file was never a candidate.
+  '/api/layout': { count: 2, reason: 'reads and writes editor WINDOW layouts in the user profile (the GET lists them, the POST saves '
+    + 'one) — chrome state, not project content, and not under any asset root, so no registry can be keyed to it.' },
   '/api/layout-delete': { reason: 'same store as /api/layout.' },
+  // ── Found by #2050's derived writer set: each reaches a primitive only through a function the router
+  //    defines itself, so the hand-named trigger list never saw them. ──
+  '/api/ai-settings': { count: 2, reason: 'the open project\'s `.modoki/ai-settings.json` (the GET reads it, the POST '
+    + 'merges a patch into it): machine-local AI-panel preferences, gitignored like layouts. Not under an asset root and '
+    + 'not a document any registry holds — no panel parks an edit to it; the POST is the whole write.' },
+  '/api/render-scene': { reason: 'writes the RENDERED FRAME the renderer just returned to a fresh file under os.tmpdir() '
+    + '(`writeDataUrlToTemp`), so the agent receives a path rather than an inline image. A new temp file outside the '
+    + 'project, named per process and sequence: nothing any registry is keyed to.' },
+  '/api/render-sequence': { reason: 'same as /api/render-scene, one temp file per frame.' },
+  // ⚠️ OBSERVED, not argued (#2050): the one way a registry can be keyed to a path that does not exist is a document
+  //    parked on a file then deleted OUTSIDE the editor, whose unlink #1879 holds until a refresh.
+  '/api/create-asset': { reason: 'it REFUSES an existing destination (409), so it writes only where no file is, and '
+    + 'the one park that can outlive its file — a document parked, then deleted outside the editor while #1879 holds '
+    + 'the unlink — cannot overwrite what this creates, nor be overwritten by it. Driven live: park a material doc, rm '
+    + 'the file, create_asset at that path → created; save_all → the parked flush REFUSED as changed-on-disk, nothing '
+    + 'written; modoki_refresh → the held unlink is applied and the park dropped by the outside-change rule (disk '
+    + 'wins), the created file intact. What drops the park is the outside delete, not this route. ⚠️ VOID if '
+    + 'create-asset grows an overwrite mode, or if the asset flush loses its changed-on-disk CAS.' },
+  // ⚠️ OBSERVED (#2050): a park on the target WAS lost through this route, and the fix is NOT a gate here. A route
+  //    refusal deadlocked — the refused save_all's base-scene flush is itself refused by /api/scene-mutate while the
+  //    open scene is dirty, the usual state at a Save As — so the renderer drops the park instead (`saveSceneAs` → `dropReplacedBaseSceneEdit`).
+  '/api/scene-save-as': { reason: 'issued only by the renderer\'s `saveSceneAs`, which holds the registries and acts on '
+    + 'the one that can hold this path: a `baseScene` edit parked on the REPLACED file is dropped after a successful '
+    + 'write (the copy replaced the bytes it was an edit to; reported as `droppedBaseSceneEdit`, `dropReplacedBaseSceneEdit`). Every other '
+    + 'registry is ruled out by kind or by file identity: `dirtyAsset` holds only ASSET_SCHEMA_TYPES documents (no '
+    + 'scene), a JSON asset has no `.meta.json` for `pendingMeta`, the open scene and every loaded one are refused 409 '
+    + '(`sameFile` / `targetLoaded`) by the file the disk resolves, and `openAssetEditor` holds a texture. ⚠️ VOID the '
+    + 'day it gains an MCP contract (a direct caller would skip the drop), or a scene becomes an asset-schema document.' },
+  '/api/import-identity': { reason: 'WRITES NOTHING: it answers the bytes a file dropped from OUTSIDE the project becomes. '
+    + 'Its one project read is prefab TEMPLATES (`makePrefabResolver`), used to re-mint the dropped scene\'s member '
+    + 'guids by anchor — and the dropped file\'s member rows were authored against whatever template its author had, '
+    + 'never against this editor\'s unsaved prefab-edit, so the template on disk is the right anchor, not a stale one. '
+    + 'The panel then writes the answer through /api/write-file, whose own row covers the write. ⚠️ VOID if it starts '
+    + 'reading the project\'s own scenes or assets to decide identity.' },
   // ── One of the three `docs/mcp-persistence.md` named and this guard could not previously see
   //    (#889 phase 3). Its two siblings are in KNOWN_GAPS below — they repair MOST of what they
   //    touch, and "most" is a gap, not an exemption. ──
@@ -240,7 +336,18 @@ const scopedRegistries = (route: string): readonly string[] | undefined =>
  *  gate or be exempt at ROUTE grain, whatever its scoped row says. */
 const unscopedTriggers = (body: string): string[] =>
   [...body.matchAll(new RegExp(CONTENT_CALLS.source, 'g'))].map((m) => m[1]!)
-    .filter((sym) => !(HELPER_REGISTRIES[sym]?.length));
+    .filter((sym) => !registriesOf(sym).length);
+
+/** The registries a trigger symbol's inputs can live in: its own HELPER_REGISTRIES row when it has one, otherwise —
+ *  for a router-local wrapper (#2050) — the union of what it calls. A wrapper of `readMetaSidecar` must need
+ *  `pendingMeta` exactly as a direct call does, or wrapping a helper would be a way to stop declaring it. */
+function registriesOf(sym: string, wrappers: ReadonlyMap<string, readonly string[]> = ROUTER_WRAPPERS,
+  seen: Set<string> = new Set()): readonly string[] {
+  if (Object.hasOwn(HELPER_REGISTRIES, sym)) return HELPER_REGISTRIES[sym]!;
+  if (seen.has(sym)) return [];
+  seen.add(sym);
+  return [...new Set((wrappers.get(sym) ?? []).flatMap((c) => registriesOf(c, wrappers, seen)))];
+}
 
 /** Routes that DO read content the editor can hold unsaved, and are **not fixed yet**.
  *
@@ -313,7 +420,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       label: 'EXEMPT + KNOWN_GAPS in unsavedGateCoverage (routes)',
       population: ungated,
       exempt: [
-        ...Object.entries(EXEMPT).filter(([, e]) => !e.registries).map(([item, e]) => ({ item, reason: e.reason })),
+        ...Object.entries(EXEMPT).filter(([, e]) => !e.registries).map(([item, e]) => ({ item, count: e.count, reason: e.reason })),
         ...Object.entries(KNOWN_GAPS).map(([item, g]) => ({ item, reason: `${g.issue}: ${g.reason}` })),
       ],
       floor: 1,
@@ -346,9 +453,8 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       const gated = /\bunsavedGate\s*\(/.test(b.body);
       if (!gated && !scopedRegistries(b.route)) continue;
       const needed = new Set<string>();
-      for (const [symbol, registries] of Object.entries(HELPER_REGISTRIES)) {
-        if (!new RegExp(`\\b${symbol}\\s*\\(`).test(b.body)) continue;
-        for (const r of registries) needed.add(r);
+      for (const m of b.body.matchAll(new RegExp(CONTENT_CALLS.source, 'g'))) {
+        for (const r of registriesOf(m[1]!)) needed.add(r);
       }
       const declared = new Set(gated ? declaredRegistries(b.body) : []);
       for (const r of needed) {
@@ -385,6 +491,28 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     const write = blocks.find((b) => b.route === '/api/write-meta');
     expect(declaredRegistries(write!.body), 'the scoped case must read as scoped, not as everything')
       .toEqual(['pendingMeta']);
+  });
+
+  it('the writer set is DERIVED from the router, and the derivation can see a wrapper of a wrapper (#2050)', () => {
+    // ⚠️ The positive control for `routerLocalWrappers`. Without it a derivation that silently finds nothing (a parser
+    // change, a body read at the wrong offsets) puts the guard straight back to the hand-named list, green and blind —
+    // the state #2050 was filed against. `writeJsonAtomic` is the case that matters: it reaches `writeFileSync` only
+    // through `writeFileAtomic`, so finding it proves the fixed point iterates, not just one level.
+    expect(ROUTER_WRAPPERS.get('writeFileAtomic'), 'writeFileAtomic is gone or renamed — re-point this control').toContain('writeFileSync');
+    expect(ROUTER_WRAPPERS.get('writeJsonAtomic'), 'the second level of the fixed point').toEqual(['writeFileAtomic']);
+    // …and its candidates reach the routes: create-asset writes ONLY through writeJsonAtomic, so it is in the
+    // population exactly when the derivation works.
+    const create = routeBlocks(source(ROUTER)).find((b) => b.route === '/api/create-asset');
+    expect(create && CONTENT_CALLS.test(create.body), '/api/create-asset must be a candidate').toBe(true);
+    // A HELPER_REGISTRIES row for a symbol that is neither listed nor derived declares registries for nothing.
+    const known = new Set<string>([...BASE_CONTENT_SYMBOLS, ...ROUTER_WRAPPERS.keys()]);
+    expect(Object.keys(HELPER_REGISTRIES).filter((k) => !known.has(k)), 'stale HELPER_REGISTRIES rows').toEqual([]);
+    // Inheritance: a derived wrapper with no row of its own needs what it calls. No router wrapper wraps a
+    // registry-bearing helper TODAY, so the real map cannot show it — a synthetic one, two levels deep and cyclic, can.
+    const synthetic = new Map([['outer', ['inner', 'readFileSync']], ['inner', ['readMetaSidecar', 'outer']]]);
+    expect(registriesOf('outer', synthetic)).toEqual(['pendingMeta']);
+    expect(registriesOf('writeJsonAtomic')).toEqual([]);
+    expect(registriesOf('plannedMoveLandings'), 'an own row wins over inheritance').toEqual(DOCUMENT_REGISTRY_NAMES);
   });
 
   it('EXEMPT names no route that has left the router, and none that now gates', () => {
