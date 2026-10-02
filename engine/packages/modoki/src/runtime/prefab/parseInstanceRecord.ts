@@ -35,141 +35,25 @@
 import type { AddedEntity, NestedStructureDelta, SceneEntityEntry, SceneMemberRow } from '../loaders/loadSceneFile';
 import { emptyDocMap } from '../core/docKeys';
 import { INSTANCE_MODEL_SCENE_VERSION } from '../core/version';
-import { deriveGuid, deriveMemberGuidAvoiding, memberPathSteps, nodeRowComponent, nodeRowKey, parseSteps } from '../core/assetRefRules';
+import { deriveMemberGuidAvoiding, memberPathSteps, nodeRowComponent, nodeRowKey, parseSteps } from '../core/assetRefRules';
 import { restoreMalformed, splitMalformedChannels } from '../loaders/malformedChannels';
 import { memberPathRecords } from '../loaders/memberPaths';
 import { placedAnchor } from '../loaders/memberTranslation';
 import { isMemberToken, memberToken, parseMemberToken } from '../core/templateRefs';
-import {
-  foldRowStep, foldStructureLayers, frameKeyIndex, overRowsOf,
-  type ForwardState, type FrameChannels, type MemberRowChannels, type StructureLayer,
-} from '../loaders/prefabOverrides';
+import { foldStructureLayers, frameKeyIndex, overRowsOf } from '../loaders/prefabOverrides';
 import {
   HELD_REMAINDER, ROOT_ROW_KEY,
   type AddedNodeRef, type HeldData, type TemplateHeldData, type InstanceRecord, type LegacyChannels, type ParsedInstance, type ParseWarning,
   type Placement, type PrefabDoc, type PrefabDocRow, type PrefabReader, type RecordTraits, type RowKey,
   type SceneOwnedNode, type TargetRecordOf, type TemplateAddedNode, type TemplateOverrideList, type TemplateTargetRecord,
 } from './instanceRecord';
+import {
+  frameOf, componentOf, keyOfLid, childFrame, frameAtPath, chainStep, chainAt, rowTarget, rowOfComponent, badRows, canonicalRowKey,
+  type Frame, type Lists, type Layer, type Chain,
+} from '../loaders/frameChain';
+export { preV5NodeGuid, frameOf, componentOf, type Frame } from '../loaders/frameChain';
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-
-// ── Identity of a document row ──────────────────────────────────────────────────────────────────────
-
-/** The node identity a PRE-v5 document's row (no `nodeGuid`: v0.7.2 and earlier wrote prefab v4) has in
- *  memory (§ 2.7, § 10.5). Deterministic in (document, localId); the first editor write of that document
- *  must mint exactly this value, so a scene's converted keys never orphan. `lid:` is no member-step
- *  spelling (`parseStep`), so this seed can never equal a derived member guid's. */
-export function preV5NodeGuid(docGuid: string, localId: number): string {
-  return deriveGuid(`${docGuid}|lid:${localId}`);
-}
-
-/** One FRAME of an instance: the document that supplies it, and the row key of its root (`''` for the
- *  owner's own top frame, whose root is `"/"`). */
-export interface Frame {
-  prefix: string;
-  doc: PrefabDoc;
-  docGuid: string;
-  byLid: Map<number, PrefabDocRow>;
-  rootLid: number;
-}
-
-export function frameOf(prefix: string, doc: PrefabDoc, docGuid: string): Frame {
-  const byLid = new Map<number, PrefabDocRow>();
-  for (const row of doc.entities ?? []) if (typeof row?.localId === 'number') byLid.set(row.localId, row);
-  return { prefix, doc, docGuid, byLid, rootLid: doc.rootLocalId ?? 1 };
-}
-
-/** The row-key component of row `lid` of `f`'s document, or null when no row has that localId. */
-export function componentOf(f: Frame, lid: number): string | null {
-  const row = f.byLid.get(lid);
-  if (!row) return null;
-  return row.nodeGuid || preV5NodeGuid(f.docGuid, lid);
-}
-
-/** The key of member `lid` of frame `f`. The frame's own root is the frame's key (a nested root is named
- *  by its reference row's key, never `/<row>/<innerRoot>`: `memberNodeId`). Null: no row has `lid`. */
-function keyOfLid(f: Frame, lid: number): RowKey | null {
-  if (lid === f.rootLid) return f.prefix || ROOT_ROW_KEY;
-  const c = componentOf(f, lid);
-  return c === null ? null : `${f.prefix}/${c}`;
-}
-
-type FrameRead = { frame: Frame } | { gone: true } | { unresolved: true };
-
-/** The frame nested row `lid` of `f` expands. `gone`: no row has `lid`, or it is no reference row.
- *  `unresolved`: its document is missing or damaged. */
-function childFrame(f: Frame, lid: number, read: PrefabReader): FrameRead {
-  const row = f.byLid.get(lid);
-  if (!row?.prefab || lid === f.rootLid) return { gone: true };
-  const got = read(row.prefab);
-  if (!('doc' in got)) return { unresolved: true };
-  return { frame: frameOf(`${f.prefix}/${componentOf(f, lid)!}`, got.doc, row.prefab) };
-}
-
-/** A `.`-joined localId path (`nestedOverrides` / `nestedStructure` keys, `nestedPathKey`) from frame `f`. */
-function frameAtPath(f: Frame, path: string, read: PrefabReader): FrameRead {
-  let at = f;
-  for (const step of parseSteps(path)) {
-    if (typeof step !== 'number' || !Number.isInteger(step)) return { gone: true };
-    const next = childFrame(at, step, read);
-    if (!('frame' in next)) return next;
-    at = next.frame;
-  }
-  return { frame: at };
-}
-
-// ── The chain: what the layers UNDER an owner give a frame ──────────────────────────────────────────
-
-type Lists = FrameChannels<AddedEntity>;
-type Layer = StructureLayer<NestedStructureDelta, MemberRowChannels<AddedEntity>>;
-
-/** The chain at one frame: the frame's lists as the template layers alone fold them, and what those layers
- *  hand the frames below. */
-interface Chain { frame: Frame; lists: Lists; state: ForwardState<NestedStructureDelta, MemberRowChannels<AddedEntity>> }
-
-const topChain = (f: Frame): Chain => ({ frame: f, lists: {}, state: { layers: [{}], forwardRoots: [] } });
-
-/** One frame down the chain, into the nested row whose row-key component is `component` (a `nodeGuid`, or
- *  `a+<key>` for a template-added reference node). The same fold today's spawner runs (`foldRowStep`, and for a
- *  reference node `spawnReferenceNode`'s layers: its own channels, then what the layers above state into it),
- *  with no layer of the owner's own: that is what makes it the CHAIN. */
-function chainStep(c: Chain, component: string, read: PrefabReader): Chain | { gone: true } | { unresolved: true } {
-  const key = nodeRowKey(component);
-  if (key) {
-    const node = frameKeyIndex(c.lists.added as (AddedEntity & { key?: string })[] | undefined).get(key);
-    if (!node?.prefab) return { gone: true };
-    const got = read(node.prefab);
-    if (!('doc' in got)) return { unresolved: true };
-    const frame = frameOf(`${c.frame.prefix}/${component}`, got.doc, node.prefab);
-    const layers: Layer[] = [
-      { slots: node.nestedStructure, rows: node.members, values: node.overrides, valuePaths: node.nestedOverrides },
-      ...overRowsOf<AddedEntity>(node).map((o): Layer => ({ rows: o.rows, rootRow: o.rootRow })),
-    ];
-    const folded = foldStructureLayers(got.doc as never, layers, 0, { added: node.added, removed: node.removed, removedTraits: node.removedTraits });
-    return { frame, lists: folded.channels, state: { layers, forwardRoots: folded.forwardRoots } };
-  }
-  const row = (c.frame.doc.entities ?? []).find((r) => (r.nodeGuid || (typeof r.localId === 'number' ? preV5NodeGuid(c.frame.docGuid, r.localId) : '')) === component);
-  if (!row?.prefab || row.localId === c.frame.rootLid) return { gone: true };
-  const got = read(row.prefab);
-  if (!('doc' in got)) return { unresolved: true };
-  const step = foldRowStep(row as never, c.state as never, got.doc as never);
-  return {
-    frame: frameOf(`${c.frame.prefix}/${component}`, got.doc, row.prefab),
-    lists: step.channels as Lists,
-    state: (step.forward ?? { layers: [{}], forwardRoots: [] }) as Chain['state'],
-  };
-}
-
-/** The chain at the frame whose key is `prefix` (`''` = the owner's top frame). */
-function chainAt(top: Frame, prefix: string, read: PrefabReader): Chain | { gone: true } | { unresolved: true } {
-  let c = topChain(top);
-  for (const component of prefix.split('/').filter(Boolean)) {
-    const next = chainStep(c, component, read);
-    if (!('frame' in next)) return next;
-    c = next;
-  }
-  return c;
-}
 
 // ── The record builder ──────────────────────────────────────────────────────────────────────────────
 
@@ -843,23 +727,6 @@ function templateReferenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, co
   }
 }
 
-/** The frame a row key's TARGET belongs to (its chain) and the target's localId there; null for a template-added node
- *  (`a+key`) or a key that names nothing. A nested row names its frame's ROOT. */
-function rowTarget<Own>(ctx: Ctx<Own>, key: RowKey): { chain: Chain; lid: number | null } | null {
-  const comps = key.split('/').filter(Boolean);
-  if (!comps.length) { const c = topChain(ctx.top); return { chain: c, lid: ctx.top.rootLid }; }
-  const last = comps[comps.length - 1]!;
-  const outer = chainAt(ctx.top, comps.length > 1 ? `/${comps.slice(0, -1).join('/')}` : '', ctx.read);
-  if (!('frame' in outer)) return null;
-  if (nodeRowKey(last)) return { chain: outer, lid: null };
-  const row = rowOfComponent(outer.frame, last);
-  if (!row || typeof row.localId !== 'number') return null;
-  if (!row.prefab) return { chain: outer, lid: row.localId };
-  const inner = chainStep(outer, last, ctx.read);
-  if (!('frame' in inner)) return null;
-  return { chain: inner, lid: inner.frame.rootLid };
-}
-
 /** Is `key` a nested reference ROW whose frame no document gives (a Missing Prefab placeholder), in a frame that does? */
 function placeholderRow<Own>(ctx: Ctx<Own>, key: RowKey): boolean {
   const comps = key.split('/').filter(Boolean);
@@ -873,11 +740,6 @@ function placeholderRow<Own>(ctx: Ctx<Own>, key: RowKey): boolean {
 /** A template-form key through the owner's OWN added nodes (`/a+<key>/…`): the template chain lists no such node, so
  *  `rowTarget` cannot name it, and that is no reason to hold the row (close-out review round 3). */
 const ownAddedKey = <Own>(ctx: Ctx<Own>, key: RowKey): boolean => ctx.form.template && !!nodeRowKey(key.split('/').filter(Boolean)[0] ?? '');
-
-function rowOfComponent(f: Frame, component: string): PrefabDocRow | undefined {
-  for (const [lid, row] of f.byLid) if ((row.nodeGuid || preV5NodeGuid(f.docGuid, lid)) === component) return row;
-  return undefined;
-}
 
 /** v16/v17 member rows (`members`), keyed from frame `prefix`: field records, removals, own nodes and pins carry over;
  *  the two whole-list fields convert as pins against the chain (§ 5.2 rows "row `added`", "member-row `removedTraits`").
@@ -961,13 +823,8 @@ function convertRows<Own>(ctx: Ctx<Own>, prefix: string, rows: Record<string, Sc
 
 /** A hand-written `/<row>/<innerRoot>` alias names the nested root `/<row>` (§ 2.1): canonicalised, with a warning. */
 function canonicalKey<Own>(ctx: Ctx<Own>, key: RowKey): RowKey {
-  const comps = key.split('/').filter(Boolean);
-  if (comps.length < 2 || nodeRowKey(comps[comps.length - 1]!)) return key;
-  const canon = `/${comps.slice(0, -1).join('/')}`;
-  const outer = chainAt(ctx.top, canon, ctx.read);
-  if (!('frame' in outer) || outer.frame.prefix !== canon) return key;
-  const root = outer.frame.byLid.get(outer.frame.rootLid);
-  if (!root || (root.nodeGuid || preV5NodeGuid(outer.frame.docGuid, outer.frame.rootLid)) !== comps[comps.length - 1]) return key;
+  const canon = canonicalRowKey(ctx.top, key, ctx.read);
+  if (canon === key) return key;
   ctx.warnings.push({ code: 'aliasCanonicalised', key: canon, message: `${key} names its frame's root; read as ${canon}` });
   return canon;
 }
@@ -1143,7 +1000,7 @@ function templateForm(read: PrefabReader, warnings: ParseWarning[]): Form<Templa
 
 /** Split off what no reader takes (F-CB1(a)): kept verbatim under its channel name. */
 /** A `members` channel holding a key no row reader takes (not `/`-rooted) or a row that is not a record. */
-const badRows = (members: unknown): boolean => isRecord(members) && Object.entries(members).some(([k, r]) => !k.startsWith('/') || !isRecord(r));
+
 
 /** Values `splitMalformedChannels` does not inspect, in shapes no reader takes, moved out to `unparsed` (I18; the close-out
  *  review and #2008): a member row's non-boolean `traitRemovals` value, a non-record `templateMoved`. Each was dropped silently before. */

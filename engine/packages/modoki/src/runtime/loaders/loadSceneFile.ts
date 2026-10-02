@@ -36,6 +36,8 @@ import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
 import { fieldFate, removalFate } from './overrideFate';
 import { SceneFormatRefusedError, assertSceneFormatReadable } from './sceneFormatGate';
 import { parseClipBankResult } from '../audio/clipBank';
+import { canonicalRowKey, cutRowUserLinks, frameOf } from './frameChain';
+import type { PrefabDoc, PrefabReader } from '../prefab/instanceRecord';
 import { parseAnimClipBankResult } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
@@ -1851,16 +1853,6 @@ export function settleEntryRows(
   for (const e of entries) if (e.templateNodeRows.length) keepTemplateNodeOrphans(world, e.root, e.templateNodeRows, read);
 }
 
-/** The user-added nodes stored row `row` links, as a row of their own: its `own`, and each element of a legacy `added`
- *  without a template key (a keyed one states a node a template added, not one the user did). Undefined when it links
- *  none (#2035). */
-function userLinksOf(row: SceneMemberRow): SceneMemberRow | undefined {
-  const own = row.own ?? [];
-  const added = (row.added ?? []).filter((n) => !(n as { key?: string } | undefined)?.key);
-  if (!own.length && !added.length) return undefined;
-  return { ...(own.length ? { own } : {}), ...(added.length ? { added } : {}) };
-}
-
 /** R2 for a TEMPLATE reference node (#1542): the node's rows the template it expands no longer backs are kept under its
  *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleEntryRows`) read it
  *  by. Runs after the derive, because until then the root has no guid to key by.
@@ -1972,6 +1964,12 @@ function applyStoredMemberRows(
   const backed = (key: string) => test.backed(key);
   const orphans: Record<string, SceneMemberRow> = {};
   const lost: [string, SceneMemberRow][] = [];
+  const lifted: [string, SceneMemberRow][] = [];
+  const docReader: PrefabReader = (guid) => { const doc = read(guid) as PrefabDoc | null | undefined; return doc ? { doc } : { missing: true }; };
+  const canonicalOf = (key: string): string => {
+    const got = docReader(source);
+    return 'doc' in got ? canonicalRowKey(frameOf('', got.doc, source), key, docReader) : key;
+  };
   // The walk's keys without an `a+` component are `live`'s member keys and the root (whose row no template backs, so it never
   // asks), so only a key with one asks it — built on first ask, since it walks the whole world (close-out review: once per
   // instance, on every load).
@@ -1992,12 +1990,31 @@ function applyStoredMemberRows(
     // `live`'s member keys alone: by those a live template-added node read as cut, and its user children were kept as well
     // as spawned (#2035's close-out review). Only the links are kept: the cut takes the row's other records with it, as
     // before (#1914 R4).
+    // …and the user's nodes INSIDE a keyed copy on such a row (#2041): the cut takes the copy, and its nodes are kept at the
+    // key the parse links them at (`cutRowUserLinks`), so a row's links can land on rows other than its own.
+    // Asked of the CANONICAL key, as the parse reads it (`canonicalRowKey`): a hand-written alias of a live nested root is
+    // never in the live keys, so it read as cut, and its nodes were kept as well as spawned (#2041 review).
     const gone = !backed(key);
-    const links = !gone && isRecord(row) && !isUntargetedRow(row) ? userLinksOf(row) : undefined;
-    const cutLinks = links && !liveRow(key) ? links : undefined;
-    if (!gone && !(isRecord(row) && isUntargetedRow(row)) && !cutLinks) continue;
-    orphans[key] = cutLinks ?? row;
+    const canon = !gone && isRecord(row) && !isUntargetedRow(row) && memberRowNodes(row).length && !liveRow(key) ? canonicalOf(key) : null;
+    const cut = canon !== null && (canon === key || !liveRow(canon)) ? cutRowUserLinks(source, canon, row, docReader) : null;
+    if (cut) { lifted.push(...Object.entries(cut)); continue; }
+    if (!gone && !(isRecord(row) && isUntargetedRow(row))) continue;
+    orphans[key] = row;
     if (gone) lost.push([key, row]);
+  }
+  // A lifted node row can also be a row the scene states (its own cut row, say): the lists are appended, a guid either of
+  // the kept row's lists already holds not again.
+  for (const [key, links] of lifted) {
+    const kept = orphans[key];
+    if (!kept) { orphans[key] = links; continue; }
+    const held = new Set(memberRowNodes<{ guid?: unknown }>(kept).map((n) => n?.guid).filter((g) => typeof g === 'string' && g));
+    const merge = (a: unknown, b: readonly AddedEntity[] | undefined): AddedEntity[] | undefined => {
+      const list = Array.isArray(a) ? [...a] as AddedEntity[] : [];
+      for (const n of b ?? []) if (!(typeof n?.guid === 'string' && held.has(n.guid))) list.push(n);
+      return list.length ? list : undefined;
+    };
+    const own = merge(kept.own, links.own), added = merge(kept.added, links.added);
+    orphans[key] = { ...kept, ...(own ? { own } : {}), ...(added ? { added } : {}) };
   }
   if (!Object.keys(orphans).length) { dropKeptOrphanRows(rootGuid); return; }
   // Keep them either way — what differs is whether we are entitled to SAY they are gone.

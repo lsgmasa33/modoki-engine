@@ -749,6 +749,28 @@ mechanically:
     backed row that names no live keyed node of the instance (`instanceRowKeysIn`, the fold's keys, which the editor reads
     as `instanceKeyMap`), not one missing from the member keys: by member keys alone a live template-added node read as
     cut, and its user child was kept as well as spawned (its delete came back; #2035's close-out review).
+    #2035 also dropped every KEYED element of a cut row's legacy `added` whole, taking any key to mean "a copy of a
+    template node". The same route reached this on a legacy copy: a template edit kept QA's row whole as an orphan, the cut
+    was written beside it, and once the edit was undone the reload dropped the copy and the user's child inside it
+    (#2041, measured). A key means a copy only where `pinAdded` PAIRS it with a template node anchored at the row's
+    member. `cutRowUserLinks` (parseInstanceRecord.ts) runs that pairing on the parse's own chain, so the load and the
+    fold cannot disagree about whose node it is:
+    - An unpaired keyed node is the user's. It is kept on the row, in `own`, the list the parse links it in. Left in
+      `added`, any reader of a cut row takes a key there for a copy.
+    - A node row's `added` is the node's own list (`wholeAdded`), keyed or not.
+    - A paired copy is taken. The user's nodes inside it are lifted to the key the parse links them at, the node-row form
+      #2038 keeps:
+      - A plain copy's unpaired children go to `<frame>/a+<key>`, and a paired child is followed the same way.
+      - A reference copy's member-row nodes go to `<frame>/a+<key><row>`.
+      - A reference copy's keyless `added` goes to the member it anchors at, unless a member row's whole `added`
+        replaces it (`copySession`).
+    - A reference copy carrying anything else of the user's is kept whole on the row: a keyed node in its lists, a slot's
+      node, children, or a statement the parse holds the copy whole for. Kept is never lost.
+    A lifted row the scene also states gets both lists, and a guid either list already holds is not added again.
+    Liveness and pairing are both asked of the row's CANONICAL key (`canonicalRowKey`, frameChain.ts), as the parse reads
+    it. A hand-written alias of a live nested root (`/R/<innerRoot>`, § 2.1) once read as cut, so its nodes were kept
+    AND spawned and a delete came back (the #2041 review, observed, and on #2035's own links too). The frame chain lives
+    in `loaders/frameChain.ts` because both the parse and the load read it: `prefab/` already depends on `loaders/`.
     Regression tests for each shape, that route, and the live side of both: `foldInstanceOracle.test.ts`.
   - Kept-only lines name their row and carry a marker that separates the waived shapes from loss:
     - `(applied)` only when the record, with that removal turned into a restore, projects the member. A gone member

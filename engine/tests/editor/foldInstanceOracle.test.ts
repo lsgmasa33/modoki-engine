@@ -222,11 +222,29 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       });
     }
 
+    // A keyed node is a COPY only where it pairs with a template node anchored at the row's member (`pinAdded`). This test
+    // stated an UNPAIRED one (P adds no k1) and expected the cut to take it, which is the parse's user node lost (#2041).
     it('the cut takes the row\'s other records and a keyed copy, as before: only the user\'s links are kept', async () => {
-      install(P, Q);
+      const k1 = { parentLocalId: 2, guid: '', key: 'k1', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] };
+      install({ ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [k1] })] }, Q);
       const keyed = { ...mine(2), guid: G(91), key: 'k1', name: 'K1' };
-      const { saved } = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { traits: { Transform: { x: 4 } }, added: [keyed, mine(2)] } }) })] });
+      const { lines, saved } = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { traits: { Transform: { x: 4 } }, added: [keyed, mine(2)] } }) })] });
+      expect(lines).toEqual([]);
       expect(rowsOf(saved)[QA]).toEqual({ added: [expect.objectContaining({ guid: MINE })] });
+      expect(JSON.stringify(saved)).not.toContain(G(91));
+    });
+
+    // …and a keyed node no template node pairs with is the user's (`pinAdded` links it `own` at the row): kept, in `own`,
+    // the list it is linked in, so no reader of the cut row takes it for a copy (#2041).
+    it('#2041: an UNPAIRED keyed node on the cut row is the user\'s: kept in own, through load → save → reload → save', async () => {
+      install(P, Q);
+      const keyed = { ...mine(2), guid: G(91), key: 'zz', name: 'ZZ' };
+      const first = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { added: [keyed, mine(2)] } }) })] });
+      expect(first.lines).toEqual([]);
+      expect(rowsOf(first.saved)[QA]).toEqual({ added: [expect.objectContaining({ guid: MINE })], own: [expect.objectContaining({ guid: G(91), key: 'zz' })] });
+      const second = await loadSave(first.saved);
+      expect(second.lines).toEqual([]);
+      expect(rowsOf(second.saved)).toEqual(rowsOf(first.saved));
     });
 
     // The close-out review's regression: a NODE row (`…/a+<key>`) is never in the load's live member keys, so "not live"
@@ -288,6 +306,163 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
           } finally { warn.mockRestore(); }
         });
       }
+
+      // #2041: the same node stated in the legacy form — inside a VALID keyed copy of k1 on QA's member row, as its keyless
+      // child. The parser pairs the copy with k1 and links Kid at k1's node row; the cut took the copy whole, Kid included.
+      it('#2041: a user child inside a keyed copy of k1 on a member row under the cut: kept through load → save → reload → save', async () => {
+        install(withK1(), Q, S);
+        const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
+        expect(first.lines).toEqual([]);
+        expect(rowsOf(first.saved)[R]).toEqual({ removed: true });
+        expect(JSON.stringify(rowsOf(first.saved)[NODE])).toContain(KID);
+        const second = await loadSave(first.saved);
+        expect(second.lines).toEqual([]);
+        expect(rowsOf(second.saved)).toEqual(rowsOf(first.saved));
+      });
+
+      // Ordinary editing reaches it, by #2035's route: a template edit drops QA, so its row (the legacy copy in it) is kept
+      // whole as an orphan; a delete of R cannot take it (it is not live), so the save writes the cut beside it; undo the
+      // template edit, and the reload reads the copy under the cut. Before #2041 that load dropped the copy, Kid inside.
+      it('#2041: the route — a template edit drops QA, R is deleted, the edit is undone — Kid is kept', async () => {
+        const Q0 = { ...Q, entities: Q.entities.filter((r) => r.localId !== 2) };
+        install(withK1(), Q0, S);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          await loadSave({ version: 15, entities: [top({ members: { [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
+          deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]);
+          const s1 = await save();
+          expect(rowsOf(s1)[R]).toEqual({ removed: true });
+          expect(rowsOf(s1)[QA]).toEqual({ added: [expect.objectContaining({ key: 'k1', children: [expect.objectContaining({ guid: KID })] })] });
+          install(withK1(), Q, S); // the edit is undone
+          const back = await loadSave(s1);
+          expect(back.lines).toEqual([]);
+          expect(JSON.stringify(rowsOf(back.saved)[NODE])).toContain(KID);
+        } finally { warn.mockRestore(); }
+      });
+
+      // The #2041 review: a hand-written ALIAS of a nested root (`/R/<QRoot>`, § 2.1) is read by the parse as `/R`. The load
+      // asked liveness and the pairing of the stored key, so a LIVE R's alias row read as cut: its nodes were kept as well
+      // as spawned, and a delete came back (and #2035's own link on it spawned twice). Both now ask the canonical key.
+      describe('#2041 review: an alias row of a nested root is read by its canonical key', () => {
+        const ALIAS = `${R}/${row(1, 'Q', 0).nodeGuid}`;
+        const k0 = { ...k1(), key: 'k0', name: 'K0', parentLocalId: 1 };
+        const withK0 = { ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [k0] })] };
+        const live = () => [...getCurrentWorld().entities].filter((x) => (x.get(ea()) as { guid?: string } | undefined)?.guid === KID);
+        const shapes: Array<[string, object]> = [['a copy of k0 holding Kid', { added: [{ ...k0, children: [kid] }] }], ['Kid as an own link (#2035\'s form)', { own: [kid] }]];
+        for (const [name, alias] of shapes) {
+          it(`${name}, R live: shown once, not kept as well, and its delete sticks`, async () => {
+            install(withK0, Q, S);
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            try {
+              const first = await loadSave({ version: 15, entities: [top({ members: { [ALIAS]: alias } })] });
+              expect(first.lines).toEqual([]);
+              expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
+              await loadSave(first.saved);
+              expect(live()).toHaveLength(1);
+              expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
+              deleteEntitiesWithUndo([live()[0]!.id()]);
+              const s1 = await save();
+              expect(JSON.stringify(s1)).not.toContain(KID);
+              expect(JSON.stringify((await loadSave(s1)).saved)).not.toContain(KID);
+            } finally { warn.mockRestore(); }
+          });
+          it(`${name}, R cut: kept, through load → save → reload → save`, async () => {
+            install(withK0, Q, S);
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            try {
+              const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [ALIAS]: alias } })] });
+              expect(first.lines).toEqual([]);
+              expect(JSON.stringify(first.saved)).toContain(KID);
+              const second = await loadSave(first.saved);
+              expect(second.lines).toEqual([]);
+              expect(rowsOf(second.saved)).toEqual(rowsOf(first.saved));
+            } finally { warn.mockRestore(); }
+          });
+        }
+      });
+
+      // #2041's siblings, one per place the parse links a user node from inside a copy (`cutRowUserLinks`): a plain copy's
+      // PAIRED child is a copy too, so its own children go to its node row; a reference copy's member rows and keyless
+      // `added` go below the copy's node row. Each has its live accept side: with no cut the node shows and is written back.
+      describe('#2041: every place inside a copy the parse links a user node from', () => {
+        const node = (n: number, extra: object = {}) => ({ parentLocalId: 0, guid: G(n), name: `N${n}`, traits: { EntityAttributes: { name: `N${n}` }, Transform: tf }, children: [], ...extra });
+        const k2 = { parentLocalId: 0, guid: '', key: 'k2', name: 'K2', traits: { EntityAttributes: { name: 'K2' }, Transform: tf }, children: [] };
+        const withK1k2 = { ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [{ ...k1(), children: [k2] }] })] };
+        const SA = `/${row(2, 'SA', 0).nodeGuid}`;
+        // [case, the docs, QA's row, each kept node → the row it is kept on under the cut]
+        const shapes: Array<[string, () => void, object, Record<number, string>]> = [
+          ['a paired child\'s children go to its own node row, an unpaired one to the parent\'s', () => install(withK1k2, Q, S),
+            { added: [{ ...k1(), children: [{ ...k2, children: [node(94)] }, node(95)] }] }, { 94: `${R}/a+k2`, 95: NODE }],
+          ['a reference copy\'s member row own', () => install(withK1('S'), Q, S), { added: [{ ...k1('S'), members: { [SA]: { own: [node(96)] } } }] }, { 96: `${NODE}${SA}` }],
+          ['a reference copy\'s keyless added, at a member', () => install(withK1('S'), Q, S), { added: [{ ...k1('S'), added: [node(97, { parentLocalId: 2 })] }] }, { 97: `${NODE}${SA}` }],
+          ['a reference copy\'s keyless added, at its root', () => install(withK1('S'), Q, S), { added: [{ ...k1('S'), added: [node(98, { parentLocalId: 1 })] }] }, { 98: NODE }],
+        ];
+        // A copy's user node lifted onto a row the scene ALSO states: both lists kept, each node once.
+        it('a lifted node lands beside the node row the scene states, each kept once', async () => {
+          install(withK1(), Q, S);
+          const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [NODE]: { own: [node(99)] }, [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
+          expect(first.lines).toEqual([]);
+          expect(rowsOf(first.saved)[NODE]).toEqual({ own: [expect.objectContaining({ guid: G(99) }), expect.objectContaining({ guid: KID })] });
+          expect(rowsOf((await loadSave(first.saved)).saved)).toEqual(rowsOf(first.saved));
+        });
+        // …and a guid the stated row holds in EITHER list is not lifted again (the #2041 review: one list at a time wrote it twice).
+        it('a lifted node the stated node row already holds, in its other list, is kept once', async () => {
+          install(withK1(), Q, S);
+          const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            const { saved } = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [NODE]: { added: [kid] }, [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
+            expect(JSON.stringify(rowsOf(saved)[NODE]).split(KID).length - 1).toBe(1);
+          } finally { warn.mockRestore(); }
+        });
+        // A node row's `added` is the node's own list, keyed or not (`wholeAdded`): under the cut a keyed node there is kept.
+        it('a keyed node in a cut NODE row\'s added is the node\'s own: kept', async () => {
+          install(withK1(), Q, S);
+          const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [NODE]: { added: [node(93, { key: 'zz' })] } } })] });
+          expect(first.lines).toEqual([]);
+          expect(rowsOf(first.saved)[NODE]).toEqual({ own: [expect.objectContaining({ guid: G(93), key: 'zz' })] });
+        });
+        // A reference copy's keyless node at a member whose row in the copy states a whole `added` is replaced by that list
+        // (`copySession`): linked by nothing, so not lifted either; the row's own node is.
+        it('a reference copy\'s keyless added node replaced by its member row\'s whole added is not lifted', async () => {
+          install(withK1('S'), Q, S);
+          const qa = { added: [{ ...k1('S'), added: [node(97, { parentLocalId: 2 })], members: { [SA]: { added: [node(96)] } } }] };
+          const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [QA]: qa } })] });
+          expect(first.lines).toEqual([]);
+          expect(rowsOf(first.saved)[`${NODE}${SA}`]).toEqual({ own: [expect.objectContaining({ guid: G(96) })] });
+          expect(JSON.stringify(first.saved)).not.toContain(G(97));
+        });
+        // A reference copy carrying a user node this does not place (here a slot's) is kept whole on the row: never lost.
+        it('a reference copy with a node it cannot place is kept whole on the cut row', async () => {
+          install(withK1('S'), Q, S);
+          const qa = { added: [{ ...k1('S'), nestedStructure: { '9': { added: [node(97)] } } }] };
+          const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [QA]: qa } })] });
+            expect(first.lines).toEqual([]);
+            expect(rowsOf(first.saved)[QA]).toEqual({ added: [expect.objectContaining({ key: 'k1', nestedStructure: expect.anything() })] });
+            expect(rowsOf((await loadSave(first.saved)).saved)).toEqual(rowsOf(first.saved));
+          } finally { warn.mockRestore(); }
+        });
+        for (const [name, docs, qa, at] of shapes) {
+          it(`${name}: kept through load → save → reload → save`, async () => {
+            docs();
+            const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [QA]: qa } })] });
+            expect(first.lines).toEqual([]);
+            const rows = rowsOf(first.saved);
+            expect(rows[QA]).toBeUndefined();
+            for (const [n, key] of Object.entries(at)) expect(JSON.stringify(rows[key])).toContain(G(Number(n)));
+            const second = await loadSave(first.saved);
+            expect(second.lines).toEqual([]);
+            expect(rowsOf(second.saved)).toEqual(rows);
+          });
+          it(`${name}: with no cut, every node shows, unreported, and the save writes it back`, async () => {
+            docs();
+            const { lines, saved } = await loadSave({ version: 15, entities: [top({ members: { [QA]: qa } })] });
+            expect(lines).toEqual([]);
+            for (const n of Object.keys(at)) expect(JSON.stringify(rowsOf(saved))).toContain(G(Number(n)));
+          });
+        }
+      });
 
       // The accept side of R3b: a user child of a member INSIDE a live template reference node spawns once and is not
       // kept as well — its delete sticks (the #2035 review's HIGH, in the frame it did not test).
