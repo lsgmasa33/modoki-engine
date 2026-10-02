@@ -173,10 +173,19 @@ function registerRead(source: string, prefab: PrefabFile): void {
   if (prefab.id && url) registerAsset(prefab.id, url, 'prefab');
 }
 
+const refusedReads = new Map<string, string>();
+
+/** Why the last read of `source` REFUSED its document (#1937 C-A: an identifier declared twice; #1948 F3: a malformed nested owner), or null when it was not
+ *  refused — so a door that answers in words says the file is damaged, not that it is missing (#1948 F7). */
+export function prefabReadRefusal(source: string): string | null {
+  return refusedReads.get(source) ?? null;
+}
+
 /** Read a prefab file from disk, uncached — the editor's ONE prefab read (#1671 row 6): `getPrefabSource`'s fetch half,
  *  `refreshPrefabSourceForPath`'s, and the prefab-edit open's. It registers nothing: its callers do, for a read they
  *  keep (`registerRead`). Null for anything that is not a readable prefab document. */
 export async function fetchPrefabSource(source: string, init: RequestInit = ASSET_FETCH_INIT): Promise<PrefabFile | null> {
+  refusedReads.delete(source);
   // Normally a GUID (resolve via manifest). A freshly-instantiated instance can
   // still carry a path before its owning scene is saved + normalized; resolveRef
   // rejects internal asset paths loudly, so fetch a path ref directly instead.
@@ -193,7 +202,11 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
     // An identifier declared twice is refused as the runtime cache refuses it (#1937 C-A); a keyless template node gets
     // the same deterministic key there and here, so both caches name it alike.
     const admitted = admitPrefabDocument(prefab);
-    if ('refusal' in admitted) { console.error(`[prefabCache] ${source} refused: ${admitted.refusal}`); return null; }
+    if ('refusal' in admitted) {
+      console.error(`[prefabCache] ${source} refused: ${admitted.refusal}`);
+      refusedReads.set(source, admitted.refusal);
+      return null;
+    }
     // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
     // nothing on the loading path inspects (#365/#379). Applying the zIndex migration
     // unconditionally here (cheap, idempotent) is the smallest thing that closes the same

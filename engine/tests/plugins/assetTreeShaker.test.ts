@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { computeKeptAssets, damagedPrefabBuildError, virtualToAbs } from '../../plugins/asset-tree-shaker';
+import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { detectType, resolveAssetPath, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { JSON_ASSET_SUFFIX_TYPE, ID_BEARING_TYPES, classifyJsonAssetSuffix } from '../../plugins/assetTypes';
 import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -1696,6 +1697,106 @@ describe('asset-tree-shaker', () => {
 
     expect(result.warnings.some(w => /unresolved GUID/i.test(w))).toBe(true);
     expect(result.kept).toContain('/games/test/assets/scenes/main.json');
+  });
+
+  // ── #1988: an atlas member's SOURCE texture is dropped from the build (its atlas page ships), but it
+  // is the next pack's input — so it must never land in `orphanDetails`, the list the Clean Up dialog
+  // pre-selects for deletion. Each case also asserts the source IS still dropped (in `orphans`, not
+  // `kept`), so a fix that "solved" this by shipping the source would fail here.
+  describe('atlas member sources are packedIntoAtlas, not deletable orphans (#1988)', () => {
+    const ATLAS = '10101010-1988-4222-8333-444444444444';
+    const SHEET = '20202020-1988-4222-8333-444444444444';
+    const SLICE = '30303030-1988-4222-8333-444444444444';
+    const WHOLE = '40404040-1988-4222-8333-444444444444';
+    const SHEET_PATH = '/games/test/assets/tex/sheet.png';
+    const WHOLE_PATH = '/games/test/assets/tex/whole.png';
+    const ATLAS_PATH = '/games/test/assets/tex/fx.atlas.json';
+
+    beforeEach(() => {
+      // A sliced sheet (member = a slice guid) and a plain 2D texture (member = its auto-emitted
+      // whole-image sprite guid) — the two ways a member resolves to a source.
+      fx.writeVirtual(SHEET_PATH, 'fake-png');
+      fx.writeJson(`${SHEET_PATH}.meta.json`, {
+        id: SHEET, version: 2, type: '2d',
+        sprites: [{ guid: SLICE, name: 'a', rect: { x: 0, y: 0, w: 32, h: 32 }, pivot: { x: 0.5, y: 0.5 } }],
+      });
+      fx.writeVirtual(WHOLE_PATH, 'fake-png');
+      fx.writeJson(`${WHOLE_PATH}.meta.json`, { id: WHOLE, version: 2, type: '2d' });
+      fx.writeVirtual('/games/test/assets/tex/stray.png', 'fake-png-stray');
+      fx.writeJson('/games/test/assets/tex/stray.png.meta.json', { id: '50505050-1988-4222-8333-444444444444', version: 2 });
+    });
+
+    const wholeSprite = () => deriveGuid('sprite:' + WHOLE);
+
+    it('a kept atlas: its sources are dropped but listed apart, with the atlas named', () => {
+      fx.writeJson(ATLAS_PATH, { id: ATLAS, members: [SLICE, wholeSprite()] });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 9, entities: [{ id: 1, traits: { Renderable2D: { sprite: SLICE } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.kept).toContain(ATLAS_PATH);
+      for (const src of [SHEET_PATH, WHOLE_PATH]) {
+        expect(result.kept).not.toContain(src);
+        expect(result.orphans).toContain(src);
+        expect(result.orphanDetails.map(o => o.path)).not.toContain(src);
+      }
+      expect(result.packedIntoAtlas.map(p => [p.path, p.atlases]).sort()).toEqual([
+        [SHEET_PATH, [ATLAS_PATH]],
+        [WHOLE_PATH, [ATLAS_PATH]],
+      ]);
+      // Accept side: a texture no atlas packs is still a plain, deletable orphan.
+      expect(result.orphanDetails.map(o => o.path)).toContain('/games/test/assets/tex/stray.png');
+      expect(result.packedIntoAtlas.map(p => p.path)).not.toContain('/games/test/assets/tex/stray.png');
+    });
+
+    it('an orphaned atlas: the atlas is deletable, its sources still are not', () => {
+      fx.writeJson(ATLAS_PATH, { id: ATLAS, members: [SLICE] });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.orphanDetails.map(o => o.path)).toContain(ATLAS_PATH);
+      expect(result.orphanDetails.map(o => o.path)).not.toContain(SHEET_PATH);
+      expect(result.packedIntoAtlas.map(p => p.path)).toEqual([SHEET_PATH]);
+      // Only members make a source: the unpacked whole-image texture is an ordinary orphan.
+      expect(result.orphanDetails.map(o => o.path)).toContain(WHOLE_PATH);
+    });
+
+    it('a member two atlases share names both atlases, not just the first one read', () => {
+      const SECOND = '/games/test/assets/tex/other.atlas.json';
+      fx.writeJson(ATLAS_PATH, { id: ATLAS, members: [SLICE] });
+      fx.writeJson(SECOND, { id: '60606060-1988-4222-8333-444444444444', members: [SLICE] });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.packedIntoAtlas.find(p => p.path === SHEET_PATH)?.atlases).toEqual([SECOND, ATLAS_PATH].sort());
+    });
+
+    it('a member naming a texture\'s OWN guid packs nothing, so that texture stays a deletable orphan', () => {
+      // The packer resolves sprite members only (slices, whole-image sprites); a texture guid is skipped.
+      fx.writeJson(ATLAS_PATH, { id: ATLAS, members: ['50505050-1988-4222-8333-444444444444'] });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.orphanDetails.map(o => o.path)).toContain('/games/test/assets/tex/stray.png');
+      expect(result.packedIntoAtlas).toEqual([]);
+    });
+
+    it('a texture whose OWN guid an atlas lists is not redirected: a scene ref to it still keeps it', () => {
+      // The runtime resolves that guid to the texture (only packed sprites fold into the atlas), so
+      // redirecting it here dropped a used texture from the build AND offered it for deletion.
+      const STRAY = '50505050-1988-4222-8333-444444444444';
+      fx.writeJson(ATLAS_PATH, { id: ATLAS, members: [STRAY] });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 9, entities: [{ id: 1, traits: { UIElement: { imageSrc: STRAY } } }],
+      });
+
+      const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      expect(result.kept).toContain('/games/test/assets/tex/stray.png');
+      expect(result.orphanDetails.map(o => o.path)).not.toContain('/games/test/assets/tex/stray.png');
+    });
   });
 
   // ── #731: a swallowed parse error inside an inline bank/members string used to read back as

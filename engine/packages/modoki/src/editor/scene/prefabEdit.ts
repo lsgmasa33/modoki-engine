@@ -16,7 +16,7 @@ import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { channelsOf } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { PREFAB_EDIT_LOCAL_GUID_PREFIX, PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { warnInertPrefabSizes } from './prefab';
-import { getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource } from './prefabCache';
+import { getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource, prefabReadRefusal } from './prefabCache';
 import { serializePrefab } from './prefabSerialize';
 import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
@@ -471,6 +471,14 @@ async function openPrefabForEditingSwitching(
   const fileRead = peekDirtyAsset(asset.path) ? null : beginFreshFileRead(asset.path);
   const prefab = await fetchPrefabSource(asset.path);
   if (!prefab) {
+    // A document the read REFUSED (#1937 C-A, #1948 F3) is damaged, and the user is told why, not left with a click that
+    // did nothing: it is the only door left to a malformed prefab, and its prefab-edit save dropped what it could not read.
+    const refusal = prefabReadRefusal(asset.path);
+    if (refusal) {
+      console.error(`[PrefabEdit] ${asset.path} was not opened: ${refusal}`);
+      useEditorStore.getState().showToast(`"${asset.name}" was not opened — the prefab file is damaged: ${refusal}`, 'warn');
+      return;
+    }
     console.error(`[PrefabEdit] ${asset.path} is not a prefab document it could read — not opened`);
     return;
   }

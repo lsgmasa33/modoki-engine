@@ -79,7 +79,7 @@ export {
 export { installEditorPrefabCacheWarm, warmEditorPrefabCacheFor } from './scene/prefabCacheWarm';
 export { PREFAB_FORMAT_VERSION, warnInertPrefabSizes, resolveInstanceContext, type PrefabFile } from './scene/prefab';
 export {
-  setPrefabSource, primeEditorPrefabCache, isEditorPrefabCached, getPrefabSource, setPrefabCache,
+  setPrefabSource, primeEditorPrefabCache, isEditorPrefabCached, getPrefabSource, prefabReadRefusal, setPrefabCache,
   refreshPrefabSourceForPath, refreshPrefabSourceAfterDiskChange, preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   classifyExistingPrefabId, parkedPrefabRead,
 } from './scene/prefabCache';
@@ -207,7 +207,7 @@ export {
 // is .tsx; the decision is a plain module so it is assertable without a jsdom mount
 // (docs/editor.md § Panels).
 export { reimportPrefabsInPlace, reimportOutsidePrefabChanges, type PrefabReimportReport } from './scene/prefabReimport';
-export { readUnusedStaleness, readPriorDocument, createPrefabFromEntity, createdFrameRebuiltRefusal, relinkedFramesCheck, type UnusedStaleness } from './panels/assetOps';
+export { readUnusedStaleness, readPackedIntoAtlas, readPriorDocument, createPrefabFromEntity, createdFrameRebuiltRefusal, relinkedFramesCheck, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.

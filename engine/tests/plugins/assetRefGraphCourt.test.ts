@@ -120,7 +120,10 @@ describe.skipIf(!hasInternalGames())('assetRefGraph — games/court integration 
 describe.skipIf(!hasInternalGames())('assetRefGraph — reachability agrees with the shake keep-set (#284)', () => {
   const repo = path.resolve(__dirname, '../..', '..');
 
-  for (const rel of ['games/court', 'games/sling', 'demos/forest-camp']) {
+  // `games/skin-test` brings an `.atlas.json` (#1988): its 23 member sources are dropped by the shake,
+  // so the graph's atlas → source edges must not make them reachable. (`games/slime-shooter` has two
+  // atlases too, but its art is mid-re-skin on another clone; a fixture project is the stable pin.)
+  for (const rel of ['games/court', 'games/sling', 'demos/forest-camp', 'games/skin-test']) {
     it(`${rel}: graph.reachable equals computeKeptAssets().kept`, () => {
       const projectRoot = path.join(repo, rel);
       const roots: AssetRoot[] = [

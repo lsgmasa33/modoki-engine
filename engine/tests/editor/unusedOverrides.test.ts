@@ -692,6 +692,60 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
     const s1 = await twoSaves(scene({ added: [node] }));
     expect(JSON.stringify(entryOf(s1))).toContain('"RetiredTraitN1bD":{"speed":5}');
   });
+
+  // #1948 F2: a TEMPLATE node (keyed, no guid of its own) in a prefab's own `added` — the prefab-edit save rebuilds it from
+  // the live world, so "its prefab keeps it" was false there. Mutations: record nothing for a guid-less node at the spawn
+  // (`if (!meta) { if (node.guid) …`) — the node loses it; drop the drain's record loop — the same.
+  const tNode = (traits: Record<string, unknown> = {}) => ({ parentLocalId: 2, guid: '', key: 'k-t', name: 'TNode', traits: { EntityAttributes: { name: 'TNode', parentId: 0 }, Transform: { x: 1, y: 0, z: 0 }, ...traits }, children: [] });
+  const tNodeOf = (out: ReturnType<typeof serializePrefabEditWorld>) => {
+    if ('error' in out) throw new Error(out.error);
+    return (out.prefab.entities.find((e) => e.localId === 2) as unknown as { added: Array<{ key?: string; traits: Record<string, unknown> }> }).added.find((n) => n.key === 'k-t')!;
+  };
+  it('a template node in a prefab\'s own `added` keeps it through a prefab-edit save, and the next save is the same', async () => {
+    const doc = oDoc({ added: [tNode({ RetiredTraitN1bE: { speed: 6 } })] });
+    install(doc);
+    await load(buildPrefabEditScene(doc) as SceneData);
+    const first = tNodeOf(serializePrefabEditWorld(O));
+    expect(first.traits.RetiredTraitN1bE).toEqual({ speed: 6 });
+    const again = oDoc({ added: [first] });
+    install(again);
+    await load(buildPrefabEditScene(again) as SceneData);
+    expect(JSON.stringify(tNodeOf(serializePrefabEditWorld(O)))).toBe(JSON.stringify(first));
+  });
+
+  // #1948 close-out R1: a template node destroyed later in the load (its anchor N removed by the instance) frees its id;
+  // a scene-added node spawned after takes it. Queued by bare id, the drain recorded TNode's bag onto that node, over its
+  // own. Mutation: resolve the queued entry by id at the drain (`findEntityById(entity.id())`, no handle check) — SN1
+  // carries RetiredTraitRecycle and loses RetiredTraitSN.
+  it('a template node destroyed in the load: its component lands on no other entity, and that entity keeps its own', async () => {
+    install(oDoc({ added: [tNode({ RetiredTraitRecycle: { speed: 6 } })] }));
+    const sn = (i: number, traits: Record<string, unknown> = {}) => ({ parentLocalId: 1, guid: `dddddddd-0000-4000-8000-00000019485${i}`, name: `SN${i}`, traits: { EntityAttributes: { name: `SN${i}`, parentId: 0, guid: `dddddddd-0000-4000-8000-00000019485${i}` }, Transform: { x: i, y: 0, z: 0 }, ...traits }, children: [] });
+    const s = await twoSaves(scene({ members: { [`/${g(8)}`]: { removed: true } }, added: [sn(1, { RetiredTraitSN: { speed: 1 } }), sn(2), sn(3)] }, O));
+    expect(JSON.stringify(s), 'TNode\'s component reaches no entity').not.toContain('RetiredTraitRecycle');
+    const sn1 = (entryOf(s).added as Array<{ name: string; traits: Record<string, unknown> }>).find((n) => n.name === 'SN1')!;
+    expect(sn1.traits.RetiredTraitSN).toEqual({ speed: 1 });
+  });
+
+  // The clear side: the derived guid is the same at every load, so a record left from the last one would put back a
+  // component the file no longer holds. Mutation: queue only a node that HAS missing components — it comes back.
+  it('a template node reloaded without it: the component stays out', async () => {
+    const withIt = oDoc({ added: [tNode({ RetiredTraitN1bF: { speed: 6 } })] });
+    install(withIt);
+    await load(buildPrefabEditScene(withIt) as SceneData);
+    const without = oDoc({ added: [tNode()] });
+    install(without);
+    await load(buildPrefabEditScene(without) as SceneData);
+    expect(tNodeOf(serializePrefabEditWorld(O)).traits.RetiredTraitN1bF).toBeUndefined();
+  });
+
+  // On an INSTANCE of O the node is the template's, and the scene save states nothing about it. Red under both mutations
+  // above: unrecorded, the live node lacks the component its template states, and the save wrote a spurious
+  // `traitRemovals: { RetiredTraitN1bG: true }` on `/N/a+k-t` (#1933 N1's class, on a template node).
+  it('an untouched instance of a prefab whose template node carries it: the scene save writes nothing of it', async () => {
+    install(oDoc({ added: [tNode({ RetiredTraitN1bG: { speed: 6 } })] }));
+    const s = await twoSaves(scene({}, O));
+    expect(JSON.stringify(s)).not.toContain('RetiredTraitN1bG');
+  });
 });
 
 /** #1933 S3 / #1938 C-B step 2 (owner ruling F-CB1 (a)): a value of a shape no reader takes is split off at the file

@@ -166,6 +166,65 @@ describe('an instance of a refused prefab is a Damaged Prefab placeholder that k
   });
 });
 
+/** #1948 F3 (hub ruling 2026-10-02, fork (b)): a malformed channel on a prefab document's NESTED row. The S3 split covers
+ *  scene owners only, and the fold read the prefab's row raw: `removed: 3` crashed the load of every scene placing it
+ *  ("(lower.removed ?? []) is not iterable"). The seat now refuses such a document, so its instance is a Damaged Prefab
+ *  placeholder keeping its entry. */
+describe('a malformed channel on a prefab\'s nested row refuses the instance (#1948 F3)', () => {
+  const NESTED = 'cccccccc-0000-4000-8000-000000019482';
+  const withNestedRow = (channels: Record<string, unknown>) => { const d = clean() as ReturnType<typeof clean> & { entities: Array<Record<string, unknown>> }; d.entities.push(row(3, 'N', 1, { prefab: NESTED, ...channels })); return d; };
+  const members = { [`/${g(2)}`]: { traits: { Transform: { x: 55 } } } };
+  // Mutation: drop admission's `malformedOwnerRefusal` (documentIdentity.ts) — each load throws (the fold's TypeError), or
+  // expands with the value dropped.
+  for (const [what, channels] of [
+    ['removed: 3', { removed: 3 }], ['added: "xy"', { added: 'xy' }], ['added: [3]', { added: [3] }],
+    ['a member row that is a string', { members: { '/x': 'y' } }], ['overrides: 3', { overrides: 3 }],
+  ] as const) {
+    it(`${what}: a Damaged Prefab placeholder naming it, the entry written back verbatim, byte-stable`, async () => {
+      onDisk = withNestedRow(channels);
+      await load(scene({ members }));
+      const placeholder = getAllEntities().find((e) => e.missingPrefab);
+      expect(placeholder?.damagedPrefab).toMatch(/nested row N \(localId 3\) states .* in a shape no reader takes/);
+      expect(getAllEntities().some((e) => e.name === 'R'), 'nothing of D expanded').toBe(false);
+      const s1 = await serializeScene() as unknown as SceneData;
+      expect(entryOf(s1)?.members).toEqual(members);
+      await load(s1);
+      expect(JSON.stringify((await serializeScene() as unknown as SceneData).entities)).toBe(JSON.stringify(s1.entities));
+    });
+  }
+
+  // A REFERENCE node is a nested owner too. Before, `removed: 3` on one loaded, then crashed the scene's SAVE ("number 3
+  // is not iterable", prefabCapture's `stateFrame`). Mutation: visit rows only (no walk into the template lists) — red.
+  it('a reference node in a template list: the same placeholder, and the scene saves', async () => {
+    const d = clean() as ReturnType<typeof clean> & { entities: Array<Record<string, unknown>> };
+    d.entities[0] = { ...d.entities[0], added: [{ ...node('Ref', 'k-ref'), prefab: NESTED, removed: 3 }] };
+    onDisk = d;
+    await load(scene({ members }));
+    expect(getAllEntities().find((e) => e.missingPrefab)?.damagedPrefab).toMatch(/reference node Ref \(key k-ref\) states removed in a shape no reader takes/);
+    expect(entryOf(await serializeScene() as unknown as SceneData)?.members).toEqual(members);
+  });
+
+  // #1948 close-out R2: a reference node under a plain node's `children` states no `parentLocalId` (the spawner does not
+  // need one there). Mutation: ask for a numeric `localId`/`parentLocalId` again — admitted, and the open and the save
+  // read `removed: 3` raw.
+  it('a reference node in `children`, stating no parentLocalId: refused too', async () => {
+    const d = clean() as ReturnType<typeof clean> & { entities: Array<Record<string, unknown>> };
+    const { parentLocalId: _p, ...ref } = { ...node('Ref', 'k-ref'), prefab: NESTED, removed: 3 };
+    d.entities[0] = { ...d.entities[0], added: [{ ...node('Holder', 'k-h'), children: [ref] }] };
+    onDisk = d;
+    await load(scene({ members }));
+    expect(getAllEntities().find((e) => e.missingPrefab)?.damagedPrefab).toMatch(/reference node Ref \(key k-ref\) states removed/);
+  });
+
+  // The accept side: the same channels well-formed. Mutation: refuse every nested row that states a channel.
+  it('the same channels well-formed: D expands, no placeholder', async () => {
+    onDisk = withNestedRow({ removed: [3], added: [], members: { '/x': { traits: { Transform: { x: 2 } } } } });
+    await load(scene({ members }));
+    expect(getAllEntities().some((e) => e.missingPrefab)).toBe(false);
+    expect(getAllEntities().some((e) => e.name === 'R')).toBe(true);
+  });
+});
+
 describe('a scene\'s copy that cannot be admitted is kept for the save and never expanded (#1937 T13)', () => {
   // Mutations: drop the damaged copy (today's `ignored`) — the save loses it; keep it in the expansion's store — the
   // instance expands from it.

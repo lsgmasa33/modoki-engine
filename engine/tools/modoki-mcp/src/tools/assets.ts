@@ -452,7 +452,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'hardcoded in .ts is a ref the build cannot see, so the asset shows up here and then fails '
     + 'only once you ship (that is why an asset GUID belongs in a scene/prefab/config, never a code '
     + 'constant). Returns `orphans` (largest first, each with `bytes`), `totalBytes`, `sceneCount` '
-    + 'and `warnings`. Scoped to the PROJECT\'s own assets — the engine\'s shared /modoki/assets '
+    + 'and `warnings`. An atlas member\'s SOURCE texture is not shipped (its atlas page is) but is '
+    + 'the next pack\'s input, so it is NOT in `orphans`: it is listed apart in `packedIntoAtlas` '
+    + '(with the `atlases` packing it, absent when there are none) — never delete those. Scoped to the PROJECT\'s own assets — the engine\'s shared /modoki/assets '
     + 'root is excluded, because those are engine-owned and shared with every other project. '
     + 'The INVERSE question ("what points AT this?") is modoki_find_references.\n\n'
     + '⚠️ Reads FILES ON DISK, not the live editor — a ref you just added in an UNSAVED scene is '
@@ -577,6 +579,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'plus the two fields that ANSWER the usual question outright: `unreferenced` (nothing points ' +
       'at it, which is NOT the same as `direct.length === 0`, since that can still have indirect ' +
       'hits) and `reachable` (whether the target survives a production build). ' +
+      '`unreferenced:false` with `reachable:false` and a hit via `members[]` (origin `atlas-source`) is an ' +
+      "atlas member's SOURCE texture: not shipped (the atlas page is) but the next pack reads it — do " +
+      'not delete it. ' +
       'And `staleInputs` / `staleInputsUnknown` / `staleInputsNote`, which name what this pass could ' +
       'NOT see because the editor held it unsaved — ABSENT when the editor is clean, never an empty ' +
       'array, so their absence is what makes the disk-vs-live caveat above verifiable instead of a ' +

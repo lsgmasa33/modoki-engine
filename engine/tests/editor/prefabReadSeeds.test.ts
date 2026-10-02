@@ -556,23 +556,80 @@ describe('placement reads the file as every seat does (#1937 C-A)', () => {
     expect(staleFrames({ sources: new Set([W, W_PATH]) })).toEqual([]);
   });
 
-  // #1933 L5. Mutation: drop placement's `frameRepeatRefusal` — W is placed, its two k5 nodes on one guid.
-  it('a key two prefab files give one frame is refused, with a toast', async () => {
-    const Y = 'cccccccc-0000-4000-8000-000000019339';
+  const Y = 'cccccccc-0000-4000-8000-000000019339';
+  /** #1933 L5 on disk: X's row XN (a Y instance) adds k5 under YA, and W's row N (an X instance) adds k5 AT XN — one key,
+   *  two files, one frame. Every editor cache of the three is evicted, so the next read is the disk's. */
+  const writeL5 = () => {
     const Y_PATH = '/assets/prefabs/Y.prefab.json';
     const yDoc = { id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, 'eeeeeeee-0000-4000-8000-000000019331'), row(2, 'YA', 1, 'eeeeeeee-0000-4000-8000-000000019332')] };
     const k5 = { ...loose, key: 'k5' };
-    // X: XR → XN, a Y row adding k5 under YA. W: WR → N, an X row adding k5 AT XN.
     const x2 = { ...xDoc(), entities: [row(1, 'XR', 0, g(1)), row(2, 'XN', 1, g(2), { prefab: Y, added: [{ ...k5, name: 'FromX' }] })] };
     registerAsset(Y, Y_PATH, 'prefab');
-    setPrefabCache(Y, null); setPrefabCache(X, null);
+    for (const k of [Y, Y_PATH, X, X_PATH, W, W_PATH]) setPrefabCache(k, null);
     route.disk.set(Y_PATH, jsonFileBody(yDoc as never));
     route.disk.set(X_PATH, jsonFileBody(x2 as never));
     route.disk.set(W_PATH, jsonFileBody(withAdded([{ ...k5, name: 'FromW' }])));
+  };
+  const agentPlace = (path = W_PATH) => quietly(() => runAgentOp('prefab', { prefabAction: 'instantiate', path })
+    .catch((e: Error & { code?: string }) => ({ ok: false, error: e.message, code: e.code }))) as Promise<{ ok?: boolean; error?: string; code?: string }>;
+
+  // #1933 L5, now asked by `instantiatePrefabInstance` for every placement (#1948 F1). Mutation: drop that check — W is
+  // placed, its two k5 nodes on one guid (this case, and the two agent cases below).
+  it('a key two prefab files give one frame is refused, with a toast', async () => {
+    writeL5();
     expect(await quietly(() => placePrefabFromPath(W_PATH, { tag: 'T' }))).toBeNull();
     expect(named('WR')).toHaveLength(0);
     expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
     setPrefabCache(Y, null);
+  });
+
+  // #1948 F1: the agent's door read the file through `getPrefabSource` and never asked the L5 check, which lived in the
+  // human door's read; it placed W expanded, and the next save lost FromW.
+  it('the agent `prefab instantiate`: an L5 prefab is REFUSED_BY_OP with the reason, nothing spawned', async () => {
+    writeL5();
+    const r = await agentPlace();
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.error).toMatch(/prefab instantiate refused: .*W\.prefab\.json was not placed: .*template key k5/);
+    expect(named('WR')).toHaveLength(0);
+    expect(canUndo(), 'no step for a placement that did not happen').toBe(false);
+    setPrefabCache(Y, null);
+  });
+
+  // The agent's REDO re-reads the file: one that became L5 since the placement is refused, and the step dropped.
+  it("the agent's redo of a placement whose prefab has since become L5 is refused, and its step dropped", async () => {
+    expect((await agentPlace()).ok, 'premise: the clean W is placed').toBe(true);
+    await quietly(() => undo());
+    expect(named('WR')).toHaveLength(0);
+    writeL5();
+    await quietly(() => redo());
+    expect(named('WR'), 'the redo spawned nothing').toHaveLength(0);
+    expect(canRedo(), 'the refused step is dropped').toBe(false);
+    expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
+    setPrefabCache(Y, null);
+  });
+
+  // #1948 close-out R3, F7's redo twin. Mutation: drop the redo's `prefabReadRefusal` check — "did not fully apply".
+  it("the agent's redo of a placement whose prefab the read now refuses says it is damaged", async () => {
+    expect((await agentPlace()).ok, 'premise: the clean W is placed').toBe(true);
+    await quietly(() => undo());
+    route.disk.set(W_PATH, jsonFileBody(withAdded([{ ...loose, key: 'k1' }, { ...loose, name: 'Loose2', key: 'k1' }])));
+    for (const k of [W, W_PATH]) setPrefabCache(k, null);
+    await quietly(() => redo());
+    expect(named('WR')).toHaveLength(0);
+    expect(canRedo(), 'the refused step is dropped').toBe(false);
+    expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
+  });
+
+  // #1948 F7. Mutation: `fetchPrefabSource` records no refusal (`refusedReads.set` dropped) — "prefab not found".
+  it('the agent `prefab instantiate` of a document the read refused says it is damaged, not missing', async () => {
+    route.disk.set(W_PATH, jsonFileBody(withAdded([{ ...loose, key: 'k1' }, { ...loose, name: 'Loose2', key: 'k1' }])));
+    const r = await agentPlace();
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.error).toMatch(/W\.prefab\.json was not placed, the prefab file is damaged: .*k1/);
+    expect(r.error).not.toMatch(/not found/);
+    expect(named('WR')).toHaveLength(0);
   });
 
   // Mutation: drop the refusal in `readPrefabFile` — the document is placed.
@@ -581,6 +638,23 @@ describe('placement reads the file as every seat does (#1937 C-A)', () => {
     expect(await quietly(() => placePrefabFromPath(W_PATH, { tag: 'T' }))).toBeNull();
     expect(named('WR')).toHaveLength(0);
     expect(useEditorStore.getState().toast?.message).toMatch(/damaged/);
+  });
+});
+
+/** #1948 F4, closed upstream by F3: the prefab-edit save wrote a nested owner's malformed values nowhere (the template
+ *  form drops a scene's), while the load warned they would be written back. A prefab stating one is refused at its read
+ *  now, so the session that would have dropped them never opens, and the user is told why. */
+describe('a prefab whose nested owner states a malformed value is not opened in prefab edit (#1948 F4)', () => {
+  // Mutation: drop admission's `malformedOwnerRefusal` — the session opens, and its save drops `removed: 3`.
+  it('a nested row with `removed: 3`: not opened, a toast with the reason, the file untouched', async () => {
+    const d = wDoc() as unknown as { entities: Array<Record<string, unknown>> };
+    d.entities[1] = { ...d.entities[1], removed: 3 };
+    const text = jsonFileBody(d as never);
+    route.disk.set(W_PATH, text);
+    expect(await quietly(() => openPrefabForEditing({ path: W_PATH, name: 'W' }))).toBeUndefined();
+    expect(useEditorStore.getState().editingPrefab, 'no session').toBeFalsy();
+    expect(useEditorStore.getState().toast?.message).toMatch(/"W" was not opened — the prefab file is damaged: .*nested row N \(localId 2\) states removed/);
+    expect(route.disk.get(W_PATH)).toBe(text);
   });
 });
 

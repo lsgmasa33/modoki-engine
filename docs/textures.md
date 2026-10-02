@@ -603,6 +603,23 @@ fails on the phone. The texture provider's `getAssetType` therefore answers `'sp
 nothing, which is how Ice Reef's atlas debris vanished on the phone only (#1926). Pinned by
 `packages/modoki/tests/runtime/atlasMemberShipped.test.ts`.
 
+⚠️ **A member's SOURCE texture is not shipped, and it is not unused either** (#1988). The same redirect means the
+build ships the atlas page and drops the member's source PNG — correctly — but that PNG is the next pack's INPUT.
+The Clean Up Unused Assets dialog and `modoki_unused_assets` used to list every source as an orphan, pre-selected
+for deletion (all but one of Slime Shooter's 253 orphans), and Find References called each one `unreferenced`; trashing them
+makes the next pack lose its members. So the shake records each member's pre-redirect source
+(`buildGuidIndex`'s `atlasInputs`) and:
+- the orphan report lists them in **`packedIntoAtlas`** (with the `atlases` packing each), never in
+  `orphanDetails` — the route returns it beside `orphans`, absent when empty, and the dialog only counts it, so
+  nothing that deletes what `orphans` lists can reach one. A source of an atlas that is itself an orphan stays here
+  too: delete the atlas first, and its members become ordinary orphans on the next scan;
+- the reference graph adds an **atlas → source edge** (`origin: 'atlas-source'`, via `members[]`). It is a
+  build-INPUT edge, so `computeReachable` does not follow it: a source answers `unreferenced: false,
+  reachable: false`, which is exactly "referenced, not shipped".
+
+Pinned by the `#1988` cases in `tests/plugins/assetTreeShaker.test.ts`, `assetRefGraph.test.ts` and
+`unusedAssetsRouter.test.ts`.
+
 ## Runtime resolution
 
 `runtime/loaders/textureResolver.ts` picks the best variant for the call site +

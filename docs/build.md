@@ -1269,6 +1269,7 @@ and they are the majority of the 2D/UI surface:
 | **derived sprite** | a `Renderable2D.sprite` / `UIElement.imageSrc` holds `deriveGuid('sprite:' + textureGuid)` | that guid appears in **no file** as the texture's id |
 | **slice** | a sprite-sheet slice guid, living in the texture's `.meta.json` `sprites[]` | the ref names the slice, not the sheet |
 | **atlas member** | a packed member guid, redirected to the built `.atlas.json` | the ref names the member, not the atlas |
+| **atlas source** (#1988) | the `.atlas.json` `members[]`, as atlas → the member's source texture | after the redirect above, no ref resolves to the source at all; a build-INPUT edge, so `reachable` does not follow it |
 
 This is not hypothetical. An agent asked "is this texture still used?", swept for each texture's own
 guid, and reported **every icon in `games/court` as orphaned** — including two wired minutes
@@ -1311,7 +1312,9 @@ POINTS of a dead subtree while the orphan list reports the whole subtree (38 aga
 A second, weaker answer to a question that already has one is the cross-tool inconsistency
 [mcp-tool-conventions.md](mcp-tool-conventions.md) § 2 exists to prevent, so it is gone rather than
 kept "for completeness". If the Clean Up dialog ever wants its orphans GROUPED by dead-subtree
-root, that is a presentation pass over `orphanDetails`, not a second query.
+root, that is a presentation pass over `orphanDetails`, not a second query. ⚠️ "Dropped" is not
+"deletable": an atlas member's source texture is dropped (its atlas page ships) but is the next pack's
+input, so it is reported apart as `packedIntoAtlas` — [textures.md](textures.md) § Sprite atlas packing (#1988).
 
 **There are TWO reachability implementations, and a test is what keeps them equal.** The shake
 already computes reachability — its keep-set IS that answer, and it is the one production ships by.

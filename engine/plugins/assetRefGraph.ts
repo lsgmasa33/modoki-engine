@@ -65,7 +65,7 @@ export interface GraphEdge {
   /** Provenance of the guid to path resolution. Anything but `'own'` is an
    *  implicit edge no file records — worth showing, because it is precisely the
    *  kind a reader would not have found by searching. */
-  origin: GuidOrigin | 'entity-ref';
+  origin: GuidOrigin | 'entity-ref' | 'atlas-source';
   /** The value as authored, when it differs from the target's own id — i.e. the
    *  guid actually written in the file. Present for implicit edges. */
   raw?: string;
@@ -211,6 +211,21 @@ export function buildRefGraph(enumeration: RefEdgeEnumeration): RefGraph {
     push(outbound, from.id, g);
   }
 
+  // #1988 — an atlas is PACKED from its members' source textures, and the member redirect left no edge
+  // saying so: a member guid resolves to the atlas, never to its source. So a source read as
+  // `unreferenced` — "safe to delete" — while deleting it breaks the next pack. One edge per pair,
+  // atlas → source. It is a BUILD-INPUT edge, not a shipping one: `computeReachable` does not follow
+  // it, because the build ships the atlas page and not the source (`/api/unused-assets` reports it
+  // dropped, as `packedIntoAtlas`) — so the source answers `unreferenced: false, reachable: false`.
+  for (const [source, atlases] of enumeration.atlasInputs) {
+    const to = intern(assetNode(source));
+    for (const atlas of atlases) {
+      const g: GraphEdge = { from: intern(assetNode(atlas)), to, via: 'members[]', origin: 'atlas-source' };
+      push(inbound, to.id, g);
+      push(outbound, g.from.id, g);
+    }
+  }
+
   return {
     inbound,
     outbound,
@@ -271,7 +286,7 @@ function computeReachable(
     if (id.startsWith('asset:')) {
       for (const child of entitiesByFile.get(id.slice('asset:'.length)) ?? []) visit(child.id);
     }
-    for (const e of outbound.get(id) ?? []) visit(e.to.id);
+    for (const e of outbound.get(id) ?? []) if (e.origin !== 'atlas-source') visit(e.to.id);
   }
   return reachable;
 }

@@ -11,7 +11,8 @@ import { parseJsonText } from '../../scripts/jsonFile.mjs';
 /** Why writing `incoming` (a prefab document's text, or the document itself) to `absPath` is refused — asked by
  *  `/api/write-file`, the one raw route a prefab reaches disk by (`/api/asset-write` takes no prefab type): it declares a
  *  localId, nodeGuid or template key twice (#1937 C-A step 6, owner ruling F-D: an agent write that introduces one is
- *  refused with the reason, so it is fixed before anything breaks). Every seat refuses such a document, and every
+ *  refused with the reason, so it is fixed before anything breaks), or a nested row states a channel in a shape no reader
+ *  takes (#1948 F3, `prefab-channel-malformed`). Every seat refuses such a document, and every
  *  instance of it would become a Damaged Prefab placeholder. Null for a non-prefab path, unparseable text (the format
  *  rules own that), or an admissible document — keyless template nodes included: the seats mint their keys.
  *
@@ -20,7 +21,7 @@ import { parseJsonText } from '../../scripts/jsonFile.mjs';
  *  this document's lists anchored at members of one nested frame, which admission cannot see since it groups keys by
  *  anchor, or a node added at a nested row whose own document gives that key. The load, placement and a commit refuse
  *  that prefab too. Without `read`, same-document only. ⚠️ Synchronous, like the others here. */
-export function classifyPrefabIdentityWrite(absPath: string, incoming: string | object, read?: (guid: string) => unknown): { message: string } | null {
+export function classifyPrefabIdentityWrite(absPath: string, incoming: string | object, read?: (guid: string) => unknown): { message: string; reason: 'prefab-identifier-repeated' | 'prefab-channel-malformed' } | null {
   if (!isPrefabPath(absPath)) return null;
   let doc: unknown = incoming;
   if (typeof incoming === 'string') {
@@ -29,9 +30,11 @@ export function classifyPrefabIdentityWrite(absPath: string, incoming: string | 
   // Not a document at all is the format rules' to say (and a create-only write's own reason, #1273), not this gate's.
   if (!isPrefabDocument(doc)) return null;
   const admitted = admitPrefabDocument(doc);
-  if ('refusal' in admitted) return { message: `${absPath} was not written: ${admitted.refusal}.` };
+  if ('refusal' in admitted) {
+    return { message: `${absPath} was not written: ${admitted.refusal}.`, reason: admitted.malformed ? 'prefab-channel-malformed' : 'prefab-identifier-repeated' };
+  }
   const repeat = read ? frameRepeatRefusal(admitted.doc, (g) => read(g) ?? null) : null;
-  return repeat ? { message: `${absPath} was not written: ${repeat}.` } : null;
+  return repeat ? { message: `${absPath} was not written: ${repeat}.`, reason: 'prefab-identifier-repeated' } : null;
 }
 
 /** A prefab document a NODE reader parsed, read as every seat reads it (#1937 C-A step 7, I7): admitted, so a keyless

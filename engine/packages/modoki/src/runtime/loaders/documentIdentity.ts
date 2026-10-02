@@ -18,6 +18,7 @@
 
 import { deriveGuid } from '../core/assetRefRules';
 import { isPrefabDocument } from './prefabDocumentShape';
+import { splitMalformedChannels, malformedPaths } from './malformedChannels';
 
 type Node = Record<string, unknown>;
 const isObj = (v: unknown): v is Node => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -117,11 +118,45 @@ function documentRepeat(doc: { name?: unknown; id?: unknown; entities: Node[] },
   return null;
 }
 
-/** Admit `raw` as a prefab document, or refuse it with the reason. The input is never mutated: a document with keyless
+/** A NESTED owner — a row expanding another prefab, or a reference node in any of the document's template lists, at any
+ *  depth — stating a channel in a shape no reader takes (#1948 F3, hub ruling 2026-10-02, the C-A/F-D shape). Read raw,
+ *  `removed: 3` on a row crashed the load of every scene placing the prefab ("(lower.removed ?? []) is not iterable"),
+ *  and on a reference node it crashed that scene's SAVE and the prefab-edit load, and a malformed `overrides` there was
+ *  dropped by the prefab-edit save. A scene owner's such value is split and kept (#1933 S3, F-CB1 (a)); a prefab's is
+ *  refused here, as Unity rejects a malformed asset, so its instances load as Damaged Prefab placeholders keeping every
+ *  record and the writers refuse to land it. The check is the split's own (`splitMalformedChannels`). */
+function malformedOwnerRefusal(doc: { name?: unknown; id?: unknown; entities: Node[] }): string | null {
+  let found: string | null = null;
+  const visit = (v: unknown): void => {
+    if (found) return;
+    if (Array.isArray(v)) { for (const x of v) visit(x); return; }
+    if (!isObj(v)) return;
+    // Any record naming a prefab: the spawner expands a node with `prefab` whether or not it states `parentLocalId` (a
+    // `children` node does not need one), so the walk does not ask for it (close-out review R2).
+    if (typeof v.prefab === 'string') {
+      const { malformed } = splitMalformedChannels(v);
+      if (malformed.length) {
+        const label = `prefab "${str(doc.name) || str(doc.id) || '(unnamed)'}"`;
+        const owner = typeof v.localId === 'number' ? `nested row ${nameOf(v)} (localId ${v.localId})` : `reference node ${nameOf(v)}${str(v.key) ? ` (key ${str(v.key)})` : ''}`;
+        found = `${label}'s ${owner} states ${malformedPaths(malformed)} in a shape no reader takes — fix the value in the prefab file (a hand or agent edit made it; the editor never writes it)`;
+        return;
+      }
+    }
+    // Into every list a node can sit in (`added`, `own`, `children`, a slot's or a member row's), not into trait data.
+    for (const [k, x] of Object.entries(v)) if (k !== 'traits' && k !== 'overrides' && k !== 'nestedOverrides') visit(x);
+  };
+  visit(doc.entities);
+  return found;
+}
+
+/** Admit `raw` as a prefab document, or refuse it with the reason (`malformed` when it is a nested owner's malformed
+ *  value, not a repeated identifier). The input is never mutated: a document with keyless
  *  template nodes comes back as a copy carrying their minted keys; one with none comes back as itself. */
-export function admitPrefabDocument<T>(raw: T): { doc: T } | { refusal: string } {
+export function admitPrefabDocument<T>(raw: T): { doc: T } | { refusal: string; malformed?: true } {
   if (!isPrefabDocument(raw)) return { refusal: 'not a prefab document (no `entities` list of rows)' };
   let doc = raw as unknown as { id?: unknown; name?: unknown; entities: Node[] };
+  const malformed = malformedOwnerRefusal(doc);
+  if (malformed) return { refusal: malformed, malformed: true };
   let walked = walkTemplateNodes(doc, false);
   if (walked.keyless) {
     doc = structuredClone(doc);

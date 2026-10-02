@@ -6,17 +6,23 @@
  *  hits Delete; each goes to the OS trash (recoverable) via /api/delete-asset,
  *  alongside its `.meta.json` sidecar when present.
  *
+ *  An atlas's member source textures are dropped from the build too, but the next pack reads them,
+ *  so the route reports them apart (`packedIntoAtlas`, #1988) and this dialog only counts them — it
+ *  can never select one.
+ *
  *  Gated by editorStore.cleanupAssetsOpen (opened from the Assets menu). */
 
 import { useState, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
-import { describeRefusedDeletes, readUnusedStaleness } from './assetOps';
+import { describeRefusedDeletes, readPackedIntoAtlas, readUnusedStaleness } from './assetOps';
 import { ModalShell } from '../components/ModalShell';
 
 interface Orphan { path: string; type: string; bytes: number }
 interface UnusedResponse {
   orphans?: Orphan[];
+  /** #1988 — atlas member sources: not shipped, not deletable. Display-only; never selectable. */
+  packedIntoAtlas?: Array<Orphan & { atlases: string[] }>;
   totalBytes?: number;
   sceneCount?: number;
   warnings?: string[];
@@ -101,6 +107,7 @@ export default function CleanupAssetsDialog() {
   // #889 — the DECISION lives in assetOps so it is testable without mounting this dialog.
 
   const staleness = readUnusedStaleness(data);
+  const packed = readPackedIntoAtlas(data);
   const toggle = (path: string) => setSelected((prev) => {
     const next = new Set(prev);
     if (next.has(path)) next.delete(path); else next.add(path);
@@ -206,6 +213,17 @@ export default function CleanupAssetsDialog() {
                 would break a reference you cannot see yet.
               </div>
             ) : null}
+          </div>
+        )}
+
+        {/* #1988: outside the result chain, so it shows beside "No unused assets" too — the case where
+            a human is most likely to wonder why the build still drops something. */}
+        {!loading && packed && (
+          <div data-testid="cleanup-packed" data-ui-id="assets.cleanup.packed" title={packed.atlases.join('\n')}
+            style={{ color: '#8a8aa8', fontSize: 11, marginBottom: 8, flexShrink: 0 }}>
+            {packed.count} atlas source file{packed.count === 1 ? '' : 's'} ({formatBytes(packed.bytes)}) not listed: the
+            build ships {packed.atlases.length === 1 ? 'its atlas' : `their ${packed.atlases.length} atlases`} instead,
+            but {packed.atlases.length === 1 ? 'that atlas is' : 'those atlases are'} packed from them.
           </div>
         )}
 

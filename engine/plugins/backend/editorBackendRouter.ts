@@ -3784,9 +3784,16 @@ async function describeUnresolvedAgainstLiveWorld(
       // Largest first — the reclaimable-space wins are what the user scans for.
       const orphans = result.orphanDetails.filter(inProject).sort((a, b) => b.bytes - a.bytes);
       const totalBytes = orphans.reduce((sum, o) => sum + o.bytes, 0);
+      // #1988 — an atlas's member sources: dropped from the build (the atlas page ships instead) but
+      // NOT unused, since the next pack reads them. Reported beside `orphans`, never inside it, so
+      // nothing that deletes what `orphans` lists can reach them, and not counted in `totalBytes`.
+      const packedIntoAtlas = result.packedIntoAtlas.filter(inProject).sort((a, b) => b.bytes - a.bytes);
       return json({
         orphans,
         totalBytes,
+        // Absent when empty, like the staleness fields below: a field present on every call is one
+        // readers learn to skip.
+        ...(packedIntoAtlas.length ? { packedIntoAtlas } : {}),
         sceneCount: result.stats.scenes,
         // Drop warnings about the engine root we filtered out — they'd be noise here.
         warnings: result.warnings,
@@ -4929,12 +4936,13 @@ async function describeUnresolvedAgainstLiveWorld(
           return json({ ok: false, conflict: true, reason: 'prefab-mark-lowered', stored: markRefusal.stored, incoming: markRefusal.incoming, error: markRefusal.message }, 409);
         }
       }
-      // …and it declares no identifier twice (#1937 C-A step 6, owner ruling F-D): this route is the raw one.
+      // …and it declares no identifier twice (#1937 C-A step 6, owner ruling F-D), nor a nested row in a shape no reader
+      // takes (#1948 F3): this route is the raw one.
       if (typeof content === 'string') {
         const identity = classifyPrefabIdentityWrite(absPath, encoding === 'base64' ? Buffer.from(content, 'base64').toString('utf8') : content, makePrefabResolver(ctx));
         if (identity) {
           console.error(`[Prefab] ${identity.message}`);
-          return json({ ok: false, reason: 'prefab-identifier-repeated', error: identity.message }, 422);
+          return json({ ok: false, reason: identity.reason, error: identity.message }, 422);
         }
       }
       const refusal = ifMatchRefusal(absPath, ifMatch);

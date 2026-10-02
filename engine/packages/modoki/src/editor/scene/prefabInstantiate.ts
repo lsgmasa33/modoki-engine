@@ -17,8 +17,9 @@ import { applyStructureCore, deriveInstanceMemberGuids, instantiatePrefabIntoWor
 import type { StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
 import { type PrefabFile } from './prefab';
 import {
-  getCachedPrefabSync, prefabNestingReader, preloadNestedPrefabs, primeEditorPrefabCache, setPrefabSource,
+  getCachedPrefabSync, getPrefabSource, prefabNestingReader, preloadNestedPrefabs, primeEditorPrefabCache, setPrefabSource,
 } from './prefabCache';
+import { frameRepeatRefusal, nestedDocReader } from '../../runtime/loaders/frameRepeat';
 import { instanceRowDomain } from './prefabMembers';
 
 // ── Instantiate Prefab ──────────────────────────────────
@@ -111,6 +112,12 @@ export async function instantiatePrefabInstance(
   // whole module under every reader of this one. Before the read-token check, so check → spawn stays synchronous.
   const { assertPrefabEditAllows } = await import('./prefabEditRefusal');
   await preloadNestedPrefabs(prefab);
+  // A key two prefab files give one frame (#1933 L5) is refused HERE, the one function every placement reaches: the
+  // human gestures, the agent's instantiate and both their redos (#1948 F1: the agent's door skipped a check that lived
+  // in the human door's read). Before the read-token check, so check → spawn stays synchronous; the reader fetches what
+  // the walk needs, reference nodes included, which `preloadNestedPrefabs` does not reach.
+  const repeat = frameRepeatRefusal(prefab, await nestedDocReader(prefab, (g) => getPrefabSource(g)));
+  if (repeat) throw new UndoRefusedError(`${sourcePath} was not placed: ${repeat}`, 'the prefab file is damaged — it was not placed');
   if (!readAt()) throw new StalePrefabRead(prefab.name ?? 'the prefab');
   const parentId = typeof parent === 'function' ? parent() : parent;
   // In prefab edit (#1817, #1836): an instance outside the root is dropped by the save, and one of the edited prefab — or

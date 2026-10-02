@@ -15,6 +15,7 @@ function mkEnumeration(opts: {
   entities?: GraphEntity[];
   guidIndex?: Map<string, string>;
   allFiles?: string[];
+  atlasInputs?: Map<string, Set<string>>;
   seeds?: string[];
 }): RefEdgeEnumeration {
   return {
@@ -22,6 +23,7 @@ function mkEnumeration(opts: {
     entities: opts.entities ?? [],
     guidIndex: opts.guidIndex ?? new Map(),
     guidOrigin: new Map(),
+    atlasInputs: opts.atlasInputs ?? new Map(),
     allFiles: opts.allFiles ?? [],
     seeds: opts.seeds ?? [],
     warnings: [],
@@ -413,3 +415,40 @@ describe('resolveTarget', () => {
   });
 });
 
+
+// ── #1988: an atlas's member sources ─────────────────
+
+describe('findReferences — an atlas member source (#1988)', () => {
+  // The member guid resolves to the ATLAS (the shake's redirect), so no walked edge points at the
+  // source texture; only `atlasInputs` says the atlas is packed from it.
+  const enumeration = () => mkEnumeration({
+    edges: [
+      {
+        from: { virtual: '/scene.json', entity: { guid: 'e1', name: 'Hero' }, trait: 'Renderable2D', field: 'sprite' },
+        to: '/assets/fx.atlas.json', raw: 'member-guid', kind: 'asset', origin: 'atlas-member',
+      },
+      { from: { virtual: '/scene.json', field: 'resources[]' }, to: '/assets/dummy.json', raw: 'dummy-guid', kind: 'asset', origin: 'own' },
+    ],
+    entities: [{ virtual: '/scene.json', guid: 'e1', name: 'Hero' }],
+    atlasInputs: new Map([['/assets/piece.png', new Set(['/assets/fx.atlas.json'])]]),
+    allFiles: ['/scene.json', '/assets/fx.atlas.json', '/assets/piece.png', '/assets/dummy.json'],
+    seeds: ['/scene.json'],
+  });
+
+  it('names the atlas as a referrer, so the source is not "unreferenced"', () => {
+    const graph = buildRefGraph(enumeration());
+    const result = findReferences(graph, resolveTarget(graph, '/assets/piece.png')!);
+    expect(result.unreferenced).toBe(false);
+    expect(result.direct.map((h) => [h.from.path, h.chain[0].via, h.chain[0].origin])).toEqual([
+      ['/assets/fx.atlas.json', 'members[]', 'atlas-source'],
+    ]);
+    // ...and through it, whoever uses the atlas.
+    expect(result.indirect.map((h) => h.from.id)).toEqual(['entity:e1']);
+  });
+
+  it('is a build INPUT, not a shipping edge: the source stays unreachable while its atlas ships', () => {
+    const graph = buildRefGraph(enumeration());
+    expect(findReferences(graph, resolveTarget(graph, '/assets/piece.png')!).reachable).toBe(false);
+    expect(findReferences(graph, resolveTarget(graph, '/assets/fx.atlas.json')!).reachable).toBe(true);
+  });
+});

@@ -189,6 +189,19 @@ describe('the raw routes refuse a prefab that declares an identifier twice (#193
     expect((await post('/api/write-file', body('/assets/k.prefab.json', keyless()))).body.ok).toBe(true);
   });
 
+  // #1948 F3. Mutation: drop admission's `malformedOwnerRefusal` — written; report the identity reason — the reason fails.
+  it('/api/write-file: a nested row stating a channel in a shape no reader takes is refused 422, prefab-channel-malformed', async () => {
+    const malformed = () => ({ ...clean(), entities: [row(1, 'g-1'), row(2, 'g-2', { prefab: 'cccccccc-0000-4000-8000-000000019481', removed: 3 })] });
+    const res = await post('/api/write-file', body('/assets/m.prefab.json', malformed()));
+    expect(res.status).toBe(422);
+    expect(res.body.reason).toBe('prefab-channel-malformed');
+    expect(res.body.error).toMatch(/nested row R2 \(localId 2\) states removed in a shape no reader takes/);
+    expect(fs.existsSync(path.join(projectRoot, 'assets/m.prefab.json'))).toBe(false);
+    // The accept side: the same row well-formed is written.
+    const ok = () => ({ ...clean(), entities: [row(1, 'g-1'), row(2, 'g-2', { prefab: 'cccccccc-0000-4000-8000-000000019481', removed: [3] })] });
+    expect((await post('/api/write-file', body('/assets/w.prefab.json', ok()))).body.ok).toBe(true);
+  });
+
   // A scene is not gated (its gate is C-A step 5, parked): its damaged embedded copy is written back as the file held it.
   it('/api/write-file: a scene holding a damaged embedded prefab copy is written', async () => {
     const scene = { version: 19, name: 'S', entities: [], embeddedPrefabs: { 'cccccccc-0000-4000-8000-000000019311': repeatedKey() } };

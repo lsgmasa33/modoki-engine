@@ -1120,3 +1120,27 @@ export function readUnusedStaleness(body: {
   if (!note || (!inputs.length && !unknown)) return null;
   return { inputs, unknown, note };
 }
+
+/** #1988 — what the Clean Up dialog says about `packedIntoAtlas`: the atlas member sources the build
+ *  drops (their atlas page ships instead) but the next pack reads. The route lists them APART from
+ *  `orphans`, so the dialog can never select or delete them; this is only the line telling the human
+ *  why a file the build size counts as dropped is missing from the list. Null when there are none —
+ *  the route omits the field then — and for a malformed body, which shows nothing rather than a
+ *  half-built line. */
+export function readPackedIntoAtlas(body: {
+  packedIntoAtlas?: Array<{ path: string; bytes: number; atlases: string[] }>;
+} | null | undefined): { count: number; bytes: number; atlases: string[] } | null {
+  const list = Array.isArray(body?.packedIntoAtlas) ? body.packedIntoAtlas : [];
+  if (!list.length) return null;
+  const atlases = new Set<string>();
+  let bytes = 0;
+  let count = 0;
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    count++;
+    bytes += typeof s.bytes === 'number' ? s.bytes : 0;
+    for (const a of Array.isArray(s.atlases) ? s.atlases : []) atlases.add(a);
+  }
+  if (!count) return null;
+  return { count, bytes, atlases: [...atlases].sort() };
+}

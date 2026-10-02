@@ -29,7 +29,7 @@ export async function nestedDocReader(doc: unknown, fetch: (guid: string) => Pro
   const visit = async (v: unknown): Promise<void> => {
     if (Array.isArray(v)) { for (const x of v) await visit(x); return; }
     if (!isObj(v)) return;
-    if (typeof v.prefab === 'string' && !docs.has(v.prefab) && (typeof v.localId === 'number' || typeof v.parentLocalId === 'number')) {
+    if (typeof v.prefab === 'string' && !docs.has(v.prefab)) { // a `children` reference node states no parentLocalId (#1948 close-out R2)
       docs.set(v.prefab, null);
       const nested = await fetch(v.prefab);
       docs.set(v.prefab, nested ?? null);

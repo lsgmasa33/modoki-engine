@@ -58,7 +58,7 @@ function makeCtx(
     ssrLoadModule: vi.fn(),
     invalidateProjectConfig: vi.fn(),
     computeUnused: vi.fn(() => ({ orphans: [], orphanDetails: [] }) as unknown as ReturnType<BackendContext['computeUnused']>),
-    computeRefEdges: vi.fn(() => ({ edges: [], entities: [], allFiles: [], seeds: [], warnings: [], guidIndex: new Map(), guidOrigin: new Map() }) as ReturnType<BackendContext['computeRefEdges']>),
+    computeRefEdges: vi.fn(() => ({ edges: [], entities: [], allFiles: [], seeds: [], warnings: [], guidIndex: new Map(), guidOrigin: new Map(), atlasInputs: new Map() }) as ReturnType<BackendContext['computeRefEdges']>),
   };
 }
 

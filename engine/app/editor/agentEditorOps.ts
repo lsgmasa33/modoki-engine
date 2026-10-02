@@ -52,7 +52,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, peekDirtyAsset, keepParkedPrefabOverFileChange, outsideChangeSuperseded, discardDirtyAssets,
   applyAssetPathMoves, getAssetFileOpVersion, type PathMove,
-  getPrefabSource, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, createPrefabFromEntity,
+  getPrefabSource, prefabReadRefusal, instantiatePrefabInstance, capturePrefabRead, StalePrefabRead, existingAssetPath, createPrefabFromEntity,
   runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
 detachPrefabInstanceWithUndo, detachRefusal,
@@ -3386,7 +3386,12 @@ export function registerEditorAgentOps(): void {
       // The read's token, taken before it (#1752): a write landing before the spawn refuses the placement.
       const readAt = capturePrefabRead(path);
       const prefab = await getPrefabSource(path);
-      if (!prefab) throw new Error(`prefab not found: ${path}`);
+      if (!prefab) {
+        // A document the read REFUSED is damaged, not missing (#1948 F7): said as the human door says it, with the reason.
+        const refusal = prefabReadRefusal(path);
+        if (refusal) throw new OpRefusal('REFUSED_BY_OP', `prefab instantiate refused: ${path} was not placed, the prefab file is damaged: ${refusal}`);
+        throw new Error(`prefab not found: ${path}`);
+      }
       // Track the parent by guid: `redo` can run after a world rebuild (Play→Stop), where a
       // raw parent id would resolve to a DIFFERENT entity and reparent the instance silently.
       // Validated like every other parent now (#1223): a stale or invented `parentId` used to pass through raw.
@@ -3416,7 +3421,13 @@ export function registerEditorAgentOps(): void {
           const at = placedPrefabPath((prefab as PrefabFile).id, path);
           const readAgain = capturePrefabRead(at);
           const again = await getPrefabSource(at);
-          if (!again) return null;
+          if (!again) {
+            // A document the read REFUSED is damaged, not deleted (#1948 close-out R3, F7's redo twin): refused with the
+            // reason, as the human redo is, rather than reported as a step that did not fully apply.
+            const refusal = prefabReadRefusal(at);
+            if (refusal) throw new UndoRefusedError(`${at} was not placed: ${refusal}`, 'the prefab file is damaged — it was not placed');
+            return null;
+          }
           const other = placedPrefabRefusal((prefab as PrefabFile).id, again as PrefabFile, at);
           if (other) throw other;
           // Required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses the redo.

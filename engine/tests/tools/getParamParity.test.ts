@@ -102,7 +102,7 @@ function routerCtx(): BackendContext {
     computeRefEdges: () => ({
       edges: [], entities: [], allFiles: [], seeds: [], warnings: [],
       guidIndex: new Map([['probe', '/assets/probe.png']]),
-      guidOrigin: new Map(),
+      guidOrigin: new Map(), atlasInputs: new Map(),
     }) as ReturnType<BackendContext['computeRefEdges']>,
   } as unknown as BackendContext;
 }

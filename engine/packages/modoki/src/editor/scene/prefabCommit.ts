@@ -394,7 +394,7 @@ export async function commitPrefabChanges(
     if (!c.doc) continue;
     const admitted = admitPrefabDocument(c.doc);
     const refusal = 'refusal' in admitted ? admitted.refusal : frameRepeatRefusal(admitted.doc, readNested);
-    if (refusal) return refuse(`${prefabLabel(prefabPathOf(c.source), c.doc).long} was not written: ${refusal}`, 'the prefab would declare an identifier twice — nothing was written');
+    if (refusal) return refuse(`${prefabLabel(prefabPathOf(c.source), c.doc).long} was not written: ${refusal}`, `the prefab would be damaged (${'malformed' in admitted && admitted.malformed ? 'a value in a shape no reader takes' : 'an identifier declared twice'}) — nothing was written`);
   }
   const release = beginWorldBoundOperation();
   let releaseWrites = () => {};

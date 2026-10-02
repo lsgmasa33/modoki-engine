@@ -627,12 +627,12 @@ const get = (urlPath: string, ctx: BackendContext, query = new URLSearchParams()
  *  here, so they are stubbed to the smallest shape the routes read. */
 const withShaker = (renderer: RendererStub): BackendContext => ({
   ...makeCtx(renderer),
-  computeUnused: () => ({ orphanDetails: [], stats: { scenes: 0 }, warnings: [] }),
+  computeUnused: () => ({ orphanDetails: [], packedIntoAtlas: [], stats: { scenes: 0 }, warnings: [] }),
   // The minimum `buildRefGraph` reads. The shaker is not under test here — only whether the
   // route discloses what it could not see.
   computeRefEdges: () => ({
     edges: [], entities: [], guidIndex: new Map(), guidOrigin: new Map(),
-    allFiles: [], seeds: [], warnings: [],
+    atlasInputs: new Map(), allFiles: [], seeds: [], warnings: [],
   }),
   isUnderOrSame: undefined,
 } as unknown as BackendContext);
@@ -779,7 +779,7 @@ describe('/api/find-references DISCLOSES on the SUCCESS path too (#972 P4)', () 
     ...withShaker(renderer),
     computeRefEdges: () => ({
       edges: [], entities: [], guidIndex: new Map(), guidOrigin: new Map(),
-      allFiles: ['/known.mat.json'], seeds: [], warnings: [],
+      atlasInputs: new Map(), allFiles: ['/known.mat.json'], seeds: [], warnings: [],
     }),
   });
 

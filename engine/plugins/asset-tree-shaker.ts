@@ -38,11 +38,20 @@ export interface TreeShakeResult {
   kept: Set<string>;
   stats: TreeShakeStats;
   warnings: string[];
-  /** Virtual URL paths that exist on disk but were not reached. Informational only. */
+  /** Virtual URL paths that exist on disk but were not reached — every file the build DROPS,
+   *  including an atlas's member sources (`packedIntoAtlas`). Informational only. */
   orphans: string[];
   /** Per-orphan detail (path + asset type + byte size) — powers the editor's
-   *  "Clean Up Unused Assets" dialog. Same set as `orphans`, enriched. */
+   *  "Clean Up Unused Assets" dialog, so it holds only the dropped files NOTHING needs: `orphans`
+   *  minus `packedIntoAtlas`. */
   orphanDetails: OrphanDetail[];
+  /** #1988 — dropped files an ATLAS is packed from. A member's sprite GUID is redirected to the
+   *  built atlas, so the build ships the atlas page and (correctly) not the member's source
+   *  texture; but that texture is the atlas's INPUT, and deleting it breaks the next pack.
+   *  "Not shipped" is not "unused", so these are reported apart from `orphanDetails` and never
+   *  offered for deletion. Includes the sources of an atlas that is itself an orphan: delete the
+   *  atlas first and its members become ordinary orphans on the next scan. */
+  packedIntoAtlas: PackedAtlasSource[];
   /** Font virtual paths kept because a scene/prefab named their CSS family via
    *  `UIElement.fontFamily` (or a `resources[]` `type:'font'` entry) — i.e. a DOM/
    *  PixiJS consumer, resolved by `resolveFontsByFamily`. A font NOT in this set may
@@ -68,7 +77,7 @@ export interface TreeShakeResult {
  *  build hook, beside the `unreachableRefs` guard); a player has no editor to say why its instances are placeholders. */
 export function damagedPrefabBuildError(result: Pick<TreeShakeResult, 'damagedPrefabs'>): Error | null {
   if (!result.damagedPrefabs.length) return null;
-  return new Error(`[asset-shaker] ${result.damagedPrefabs.length} prefab(s) declare an identifier twice and would load as Damaged Prefab placeholders:\n  ${result.damagedPrefabs.join('\n  ')}`);
+  return new Error(`[asset-shaker] ${result.damagedPrefabs.length} prefab(s) are damaged (an identifier declared twice, or a nested owner's value in a shape no reader takes) and would load as Damaged Prefab placeholders:\n  ${result.damagedPrefabs.join('\n  ')}`);
 }
 
 export interface OrphanDetail {
@@ -78,6 +87,12 @@ export interface OrphanDetail {
   type: string;
   /** File size in bytes. */
   bytes: number;
+}
+
+/** An atlas member's source file (#1988) — see `TreeShakeResult.packedIntoAtlas`. */
+export interface PackedAtlasSource extends OrphanDetail {
+  /** Virtual paths of every `.atlas.json` whose `members[]` packs this file. */
+  atlases: string[];
 }
 
 export interface TreeShakeStats {
@@ -407,6 +422,10 @@ function buildGuidIndex(
   // a throwaway a future caller could pass into silently, swallowing every parse warning this
   // function raises exactly the fail-open shape #731 exists to close.
   warnings: string[],
+  // #1988 — filled with source file → the atlases packed from it. Required for the same reason
+  // `warnings` is: the orphan report reads it to keep an atlas's inputs off the deletable list, so a
+  // throwaway default is a caller that silently offers them for deletion again.
+  atlasInputs: Map<string, Set<string>>,
 ): Map<string, string> {
   const index = new Map<string, string>();
   // Collected in the first pass, applied after: a packed atlas MEMBER's slice GUID is
@@ -464,9 +483,30 @@ function buildGuidIndex(
       }
     }
   }
+  // #1988 — before the redirect erases it, record what each member resolved to: its SOURCE (the
+  // sliced texture, or the texture whose whole-image sprite it is). All read first, then applied,
+  // so a member two atlases share records its source for both rather than the first atlas.
+  // ⚠️ SPRITE members only — a slice or a whole-image sprite. The packer (`reimport-atlas.ts`
+  // `resolveMembers`) resolves manifest `sprite` entries and skips anything else as "member sprite
+  // not found", so a member naming an asset's OWN guid packs nothing: it is neither recorded (that
+  // would hide a real orphan from Clean Up) NOR redirected below (the runtime never redirects it
+  // either, so redirecting dropped a texture a scene still uses from the build and offered it for
+  // deletion). An unindexed member still redirects, as before — it names no file, so it can only keep
+  // the atlas. This is a slight SUPERSET of what packs (the scanner emits a whole-image sprite only for
+  // an unsliced, converted texture; `derived-sprite` here covers every 2d/ui one) — the safe side,
+  // hiding an orphan rather than offering a pack input.
+  const redirected = atlasMemberOverrides.filter(({ memberGuid }) => origin.get(memberGuid.toLowerCase()) !== 'own');
+  for (const { memberGuid, atlasVirtual } of redirected) {
+    const source = index.get(memberGuid.toLowerCase());
+    const how = origin.get(memberGuid.toLowerCase());
+    if (source === undefined || (how !== 'slice' && how !== 'derived-sprite')) continue;
+    const atlases = atlasInputs.get(source) ?? new Set<string>();
+    atlases.add(atlasVirtual);
+    atlasInputs.set(source, atlases);
+  }
   // Apply atlas overrides last so they win over the slice→texture mapping regardless of
   // file iteration order.
-  for (const { memberGuid, atlasVirtual } of atlasMemberOverrides) {
+  for (const { memberGuid, atlasVirtual } of redirected) {
     index.set(memberGuid.toLowerCase(), atlasVirtual);
     origin.set(memberGuid.toLowerCase(), 'atlas-member');
   }
@@ -1163,7 +1203,7 @@ export function computeKeptAssets(
      *  stats every shippable file and reads every `.meta.json` sidecar, so building it
      *  twice for one query doubles the expensive half of the walk — which is what
      *  `enumerateRefEdges` did before it passed its own index in here. */
-    guidIndex?: { index: Map<string, string>; origin: Map<string, GuidOrigin> };
+    guidIndex?: { index: Map<string, string>; origin: Map<string, GuidOrigin>; atlasInputs: Map<string, Set<string>> };
     /** #934 — the build target, when it has asset rules of its own. Reads that target's section of
      *  `asset-keep.json`: its `keep` is seeded alongside the base list, and its `drop` is removed
      *  from the finished set below. Left undefined by every caller that is not a production build
@@ -1172,6 +1212,7 @@ export function computeKeptAssets(
   } = {},
 ): TreeShakeResult {
   const guidOrigin = opts.guidIndex?.origin ?? new Map<string, GuidOrigin>();
+  const atlasInputs = opts.guidIndex?.atlasInputs ?? new Map<string, Set<string>>();
   // Declared before `state` so `buildGuidIndex` (below, only when no index was handed in) can
   // push straight into the SAME array `state.warnings` ends up holding (#731).
   const warnings: string[] = [];
@@ -1183,7 +1224,7 @@ export function computeKeptAssets(
     domFontPaths: new Set(),
     warnings,
     queue: [],
-    guidIndex: opts.guidIndex?.index ?? buildGuidIndex(roots, guidOrigin, warnings),
+    guidIndex: opts.guidIndex?.index ?? buildGuidIndex(roots, guidOrigin, warnings, atlasInputs),
     guidOrigin,
     onRef: opts.onRef,
     onEntity: opts.onEntity,
@@ -1489,6 +1530,9 @@ export function computeKeptAssets(
   let droppedBytes = 0;
   const orphans: string[] = [];
   const orphanDetails: OrphanDetail[] = [];
+  const packedIntoAtlas: PackedAtlasSource[] = [];
+  const atlasesBySourceNfc = new Map<string, Set<string>>();
+  for (const [source, atlases] of atlasInputs) atlasesBySourceNfc.set(source.normalize('NFC'), atlases);
 
   const countedNfc = new Set<string>();
   for (const { virtual, abs } of allShippable) {
@@ -1503,7 +1547,9 @@ export function computeKeptAssets(
     } else {
       droppedBytes += size;
       orphans.push(virtual);
-      orphanDetails.push({ path: virtual, type, bytes: size });
+      const atlases = atlasesBySourceNfc.get(virtual.normalize('NFC'));
+      if (atlases) packedIntoAtlas.push({ path: virtual, type, bytes: size, atlases: [...atlases].sort() });
+      else orphanDetails.push({ path: virtual, type, bytes: size });
     }
   }
 
@@ -1572,6 +1618,7 @@ export function computeKeptAssets(
     warnings: state.warnings,
     orphans,
     orphanDetails,
+    packedIntoAtlas,
     domFontFiles,
     unreachableRefs,
     damagedPrefabs: damaged,
@@ -1600,6 +1647,10 @@ export interface RefEdgeEnumeration {
   guidIndex: Map<string, string>;
   /** guid (lowercase) → how it got into `guidIndex` (implicit-edge provenance). */
   guidOrigin: Map<string, GuidOrigin>;
+  /** #1988 — source file → the atlases packed from it. The member redirect leaves no edge from an
+   *  atlas to its sources (the member guid now resolves to the atlas itself), so without this the
+   *  graph calls a packed source "unreferenced" — the answer that reads as "safe to delete". */
+  atlasInputs: Map<string, Set<string>>;
   /** Every shippable file on disk, as a virtual path.
    *
    *  Needed because the edge list alone cannot tell "this file exists and nothing
@@ -1651,13 +1702,14 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
   // parse warning it raises (#731) would otherwise miss `result.warnings` — collected separately
   // and merged into the returned `warnings` below.
   const guidWarnings: string[] = [];
-  const guidIndex = buildGuidIndex(roots, guidOrigin, guidWarnings);
+  const atlasInputs = new Map<string, Set<string>>();
+  const guidIndex = buildGuidIndex(roots, guidOrigin, guidWarnings, atlasInputs);
 
   const result = computeKeptAssets(projectRoot, roots, {
     seedAllWalkable: true,
     tolerateBadKeepList: true,
     // Built once, above, and handed in — see the option's comment.
-    guidIndex: { index: guidIndex, origin: guidOrigin },
+    guidIndex: { index: guidIndex, origin: guidOrigin, atlasInputs },
     onRef: (e) => { edges.push(e); },
     onEntity: (virtual, e) => { entities.push({ virtual, ...e }); },
   });
@@ -1675,6 +1727,7 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
     entities,
     guidIndex,
     guidOrigin,
+    atlasInputs,
     allFiles: listAllShippableFiles(roots)
       .filter(f => classify(f.virtual) !== 'meta')
       .map(f => f.virtual),

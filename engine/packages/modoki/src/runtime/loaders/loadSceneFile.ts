@@ -924,9 +924,10 @@ export function applyStructureCore(
       let missing: Record<string, unknown> | undefined;
       for (const [traitName, data] of Object.entries(node.traits)) {
         const meta = getTraitByName(traitName);
-        // A scene node's component this build does not register is kept for it, verbatim (#1933 N1b). A TEMPLATE node's
-        // (no guid of its own) is its prefab's, which keeps it.
-        if (!meta) { if (node.guid) (missing ??= {})[traitName] = data; continue; }
+        // A component this build does not register is kept for the node, verbatim (#1933 N1b) — a TEMPLATE node's too
+        // (#1948 F2): its prefab keeps it only while nothing rebuilds the node from the live world, and the prefab-edit
+        // save does exactly that.
+        if (!meta) { (missing ??= {})[traitName] = data; continue; }
         if (meta.name === 'PrefabInstance') continue;
         if (data === true) { traitArgs.push(meta.trait()); continue; }
         const d = { ...(data as Record<string, unknown>) };
@@ -944,7 +945,10 @@ export function applyStructureCore(
       // `keySceneNodes`), and dropping the key there made the next template save mint a new one (#1567).
       if (node.key) traitArgs.push(TemplateAddedKey({ key: node.key }));
       const newId = ops.spawnAdded(traitArgs);
+      // A template node's guid is derived per instance (#1387), so its record waits for the derive; set or cleared either
+      // way, so a component taken out of the file outside the editor stays out.
       if (node.guid) setMissingComponents(node.guid, missing, newId);
+      else afterDeriveQueue(ops.world).missing.push({ entity: findEntityById(newId, ops.world), bag: missing });
       // The fields the writer's own node row states are the node's record (#1914 R3a, `NODE_RECORDS`), as a member's are.
       const recorded = recordedFieldsOf(node);
       if (recorded.length) {
@@ -987,11 +991,15 @@ type AfterDerive = {
    *  names both by path in the frame rooted at `frameRoot`: `memberPath`, and a member token. */
   moves: { ecsId?: number; memberPath?: string; parentGuid: string; frameRoot: number; base?: boolean; logPrefix: string }[];
   deletes: { ecsIds: number[]; ops: StructureApplyOps }[];
+  /** A template node's unregistered components (#1948 F2), recorded under the guid the derive gives it. By HANDLE, which
+   *  carries koota's generation: a node destroyed later in the load (its anchor removed) frees its id, the next spawn
+   *  takes it, and a bare id recorded the dead node's bag onto that entity, over its own (close-out review R1). */
+  missing: { entity: Entity | undefined; bag: Record<string, unknown> | undefined }[];
 };
 const afterDerive = new WeakMap<World, AfterDerive>();
 function afterDeriveQueue(world: World): AfterDerive {
   let q = afterDerive.get(world);
-  if (!q) { q = { moves: [], deletes: [] }; afterDerive.set(world, q); }
+  if (!q) { q = { moves: [], deletes: [], missing: [] }; afterDerive.set(world, q); }
   return q;
 }
 
@@ -1036,6 +1044,11 @@ function drainAfterDerive(world: World): void {
   afterDerive.delete(world);
   for (const m of q.moves) releaseFileGuid(world, m);
   const attrMeta = getTraitByName('EntityAttributes');
+  if (attrMeta) for (const { entity, bag } of q.missing) {
+    // The same live entity, or nothing: a recycled id names another one.
+    if (!entity || findEntityById(entity.id(), world) !== entity || !entity.has(attrMeta.trait)) continue;
+    setMissingComponents(String((entity.get(attrMeta.trait) as { guid?: unknown }).guid ?? ''), bag, entity.id());
+  }
   const links: [number, number][] = [];
   if (attrMeta) for (const e of world.entities as Iterable<EntityHandle>) {
     links.push([e.id(), e.has(attrMeta.trait) ? ((e.get(attrMeta.trait) as { parentId?: number }).parentId ?? 0) : 0]);

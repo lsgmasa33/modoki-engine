@@ -7,7 +7,6 @@
  *  rejection. One flow, so a fourth gesture cannot forget it. The agent's `prefab instantiate` reads through
  *  `getPrefabSource` and answers in its reply rather than a toast, so it stays in `agentEditorOps.ts`. */
 import { admitPrefabDocument } from '../../runtime/loaders/documentIdentity';
-import { frameRepeatRefusal, nestedDocReader } from '../../runtime/loaders/frameRepeat';
 import { deleteEntity } from '../../runtime/core/ecs/entityUtils';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
@@ -15,7 +14,7 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { useEditorStore } from '../store/editorStore';
 import { type PrefabFile } from './prefab';
-import { parkedPrefabRead, getPrefabSource } from './prefabCache';
+import { parkedPrefabRead } from './prefabCache';
 import { instantiatePrefabInstance } from './prefabInstantiate';
 import { entityRef } from '../undo/entityRef';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
@@ -60,9 +59,7 @@ async function readPrefabFile(path: string): Promise<PrefabFile | null> {
       throw new UndoRefusedError(`${path} was not placed: ${admitted.refusal}`, 'the prefab file is damaged — it was not placed');
     }
     const prefab = admitted.doc;
-    // …and a key two prefab files give one frame (#1933 L5), refused as the scene load refuses it.
-    const repeat = frameRepeatRefusal(prefab, await nestedDocReader(prefab, (g) => getPrefabSource(g)));
-    if (repeat) throw new UndoRefusedError(`${path} was not placed: ${repeat}`, 'the prefab file is damaged — it was not placed');
+    // A key two prefab files give one frame (#1933 L5) is refused by `instantiatePrefabInstance`, for every placement.
     for (const entry of prefab.entities ?? []) migrateUIAnchorZIndexStructured(entry);
     return prefab;
   } catch (e) {

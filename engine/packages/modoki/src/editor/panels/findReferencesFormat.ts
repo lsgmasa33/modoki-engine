@@ -76,6 +76,7 @@ export function originBadge(origin: string): string {
     case 'derived-sprite': return 'derived sprite';
     case 'slice': return 'slice';
     case 'atlas-member': return 'atlas member';
+    case 'atlas-source': return 'packed into atlas';
     case 'entity-ref': return 'entity ref';
     default: return origin;
   }

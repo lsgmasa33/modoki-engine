@@ -43,6 +43,7 @@ function result(over: Partial<TreeShakeResult>): TreeShakeResult {
     warnings: [],
     orphans: [],
     orphanDetails: [],
+    packedIntoAtlas: [],
     domFontFiles: new Set(),
     unreachableRefs: [],
     damagedPrefabs: [],
@@ -88,6 +89,28 @@ describe('GET /api/unused-assets', () => {
     const r = (await get(ctx)) as { body: { orphans: { path: string }[]; totalBytes: number } };
     expect(r.body.orphans.map((o) => o.path)).toEqual(['/assets/textures/unused.png']);
     expect(r.body.totalBytes).toBe(100); // the big engine font is excluded from the total
+  });
+
+  // #1988 — an atlas's member sources are dropped from the build but are the next pack's input.
+  it('reports packedIntoAtlas APART from orphans, outside totalBytes, project-scoped', async () => {
+    const ctx = makeCtx(() => result({
+      orphanDetails: [{ path: '/assets/textures/unused.png', type: 'texture', bytes: 100 }],
+      packedIntoAtlas: [
+        { path: '/assets/textures/piece-0.png', type: 'texture', bytes: 700, atlases: ['/assets/textures/fx.atlas.json'] },
+        { path: '/assets/textures/piece-1.png', type: 'texture', bytes: 900, atlases: ['/assets/textures/fx.atlas.json'] },
+        { path: '/modoki/assets/textures/engine.png', type: 'texture', bytes: 5, atlases: ['/modoki/assets/a.atlas.json'] },
+      ],
+    }));
+    const r = (await get(ctx)) as { body: { orphans: { path: string }[]; totalBytes: number; packedIntoAtlas?: { path: string; atlases: string[] }[] } };
+    expect(r.body.orphans.map((o) => o.path)).toEqual(['/assets/textures/unused.png']);
+    expect(r.body.totalBytes).toBe(100);
+    expect(r.body.packedIntoAtlas?.map((p) => p.path)).toEqual(['/assets/textures/piece-1.png', '/assets/textures/piece-0.png']);
+    expect(r.body.packedIntoAtlas?.[0].atlases).toEqual(['/assets/textures/fx.atlas.json']);
+  });
+
+  it('omits packedIntoAtlas when there is none (absent, never an empty array)', async () => {
+    const r = (await get(makeCtx(() => result({})))) as { body: Record<string, unknown> };
+    expect('packedIntoAtlas' in r.body).toBe(false);
   });
 
   it('returns 500 when the shaker throws', async () => {
