@@ -1,6 +1,6 @@
 /**
  * The WRITER of the prefab instance model (#2001 S3, #2008): an `InstanceRecord` → the scene v20 entry, and a template
- * list → a prefab v10 reference row's `members`.
+ * list → what a prefab v10 reference row states (`members`, plus held values).
  *
  * Rule 4 (docs/prefabs.md § High-level rules): **Save writes the list. It does not diff the live tree.** So this reads
  * the record and nothing else: no live entity, no template, no mark, no frame record (design § 3.4). Three inputs come
@@ -12,9 +12,8 @@
  * - `held` (on the record): what the load could not interpret, written back verbatim.
  *
  * Format rule (docs/prefabs.md): only the new form is written. The two exceptions are verbatim pass-through of values
- * no reader could interpret yet (`held.unparsed`, `held.pendingLegacy`). No legacy content is ever produced.
- * ⚠️ SCENE form only: a template list (`TemplateOverrideList`) has no `held` slot, so a prefab reference row or node whose
- * channels cannot be converted (its nested prefab missing) has nowhere to keep them yet. Open with the hub (#2008).
+ * no reader could interpret yet (`held.unparsed`, `held.pendingLegacy`), in both forms: a scene owner's, and a template
+ * owner's (a reference row's list, a template reference node; hub ruling 2026-10-02). No legacy content is ever produced.
  *
  * Byte stability (rule 4: load → save is verbatim from v20 on): rows are written sorted by key, as today's row writer
  * sorts them (`moveChannelsOntoRows`); each row's fields in one fixed order; traits and fields in the record's own order.
@@ -30,6 +29,7 @@ import {
   type SceneOwnedNode,
   type SceneTargetRecord,
   type TemplateAddedNode,
+  type TemplateHeldData,
   type TemplateOverrideList,
   type TemplateTargetRecord,
 } from './instanceRecord';
@@ -93,9 +93,10 @@ interface Report {
 /**
  * The scene v20 entry for a stored instance root (design § 2.2, § 3.4).
  *
- * - **Placement** (parent, sortOrder, editorFolder) goes on the entry's own `traits.EntityAttributes`, where a plain
- *   entity keeps it. `sortOrder` is ALWAYS written: F7, the root always records its order (Unity's `m_RootOrder`).
- *   `sourceScene` is a load-time stamp of base-scene provenance, which today's writer never writes either.
+ * - **Placement** (parent, sortOrder, editorFolder, sourceScene) goes on the entry's own `traits.EntityAttributes`,
+ *   where a plain entity keeps it. `sortOrder` is ALWAYS written: F7, the root always records its order (Unity's
+ *   `m_RootOrder`). `editorFolder` and `sourceScene` only when non-empty (`''` is absent). `sourceScene` holds only what
+ *   the file stated, never the load-time stamp that marks a base scene's entities (design § 10.4b).
  * - **The root's name** is a default override (hub ruling 2026-10-02, rule 1 + U10b): ALWAYS written, on the `"/"`
  *   row's `traits.EntityAttributes.name`. Its in-memory home is `placement.name` alone (`Placement`), so it wins over
  *   anything the `"/"` row holds. The entry-level `name` repeats it for a readable file; nothing reads it.
@@ -107,6 +108,7 @@ export function serializeInstanceRecord(rec: InstanceRecord, ctx: SerializeConte
   if (rec.placement.parent) ea.parentId = rec.placement.parent;
   ea.sortOrder = rec.placement.sortOrder;
   if (rec.placement.editorFolder) ea.editorFolder = rec.placement.editorFolder;
+  if (rec.placement.sourceScene) ea.sourceScene = rec.placement.sourceScene;
 
   const report: Report = { superseded: [], danglingOwn: [] };
   const members: Record<RowKey, SceneMemberRow> = {};
@@ -122,30 +124,39 @@ export function serializeInstanceRecord(rec: InstanceRecord, ctx: SerializeConte
     guid: rec.rootGuid,
     members,
   };
-  // Held values go back where the written form states nothing (today's `restoreMalformed` rule, owner ruling F-CB1(a)):
-  // where it does state something, a later record superseded the value, and the caller reports it.
-  if (rec.held.pendingLegacy) putBack(entry as Record<string, unknown>, rec.held.pendingLegacy, [], report.superseded);
-  if (rec.held.unparsed) putBack(entry as Record<string, unknown>, rec.held.unparsed, [], report.superseded);
+  putHeld(entry as Record<string, unknown>, rec.held, [], report.superseded);
   // Rows in key order, as today's row writer writes them (`moveChannelsOntoRows`), held rows included.
   if (isPlainObject(entry.members)) entry.members = sortedByKey(entry.members) as Record<RowKey, SceneMemberRow>;
   return { entry, ...report };
 }
 
 /**
- * A prefab v10 reference row's `members`: its nested instance's list in TEMPLATE form (design § 2.2).
+ * What a prefab v10 reference row states about its nested instance: its list in TEMPLATE form as `members` (design
+ * § 2.2), plus what the parse could not name or interpret (`list.held`), written back verbatim. The caller (S6's
+ * document writer) puts `fields` on the row beside the row's own identity and traits; a held value whose channel the
+ * row's own fields also state is the caller's to report.
  *
  * - No identity pins (I8): a template that carried member guids would hand every instance the same ones.
  * - The `"/"` row holds the nested root's `name` and `sortOrder` as records (§ 10.4: one home each).
- * - Added nodes are stored in the row itself, keyed by their template key; a template reference node's own list is
- *   written the same way, recursively.
+ * - Added nodes are stored in the row itself, keyed by their template key; a template reference node's own list, and
+ *   its own held values, are written the same way, recursively.
  */
-export function serializeTemplateMembers(list: TemplateOverrideList): Record<RowKey, TemplateRowJson> {
-  const out: Record<RowKey, TemplateRowJson> = {};
-  for (const key of [...list.rows.keys()].sort()) {
-    const row = templateRow(list.rows.get(key)!);
-    if (row) out[key] = row;
-  }
-  return out;
+export function serializeTemplateOwner(list: TemplateOverrideList): { fields: Record<string, unknown>; superseded: SupersededValue[] } {
+  const superseded: SupersededValue[] = [];
+  const fields: Record<string, unknown> = { members: templateMembers(list.rows, ['members'], superseded) };
+  if (list.held) putHeld(fields, list.held, [], superseded);
+  // A held row can add a key: rows in key order, as the scene form writes them.
+  if (isPlainObject(fields.members)) fields.members = sortedByKey(fields.members);
+  return { fields, superseded };
+}
+
+/**
+ * A prefab document's own held values (`parseTemplateLists(doc).docHeld`): v4 document-level `moved` entries that name
+ * no nested member, which belong to no row's list. S6's document writer spreads the result onto the document, verbatim
+ * (design § 10.4b).
+ */
+export function serializeTemplateDocHeld(docHeld: { moved: Record<string, string> } | undefined): { moved?: Record<string, string> } {
+  return docHeld && Object.keys(docHeld.moved).length ? { moved: { ...docHeld.moved } } : {};
 }
 
 // ── Scene form ──────────────────────────────────────────────────────────────────────────────────────────
@@ -212,27 +223,40 @@ function ownNodes(
 
 // ── Template form ───────────────────────────────────────────────────────────────────────────────────────
 
-function templateRow(r: TemplateTargetRecord): TemplateRowJson | undefined {
+/** A template list's rows as `members`: sorted by key, empty rows not written. */
+function templateMembers(rows: ReadonlyMap<RowKey, TemplateTargetRecord>, at: string[], superseded: SupersededValue[]): Record<RowKey, TemplateRowJson> {
+  const out: Record<RowKey, TemplateRowJson> = {};
+  for (const key of [...rows.keys()].sort()) {
+    const row = templateRow(rows.get(key)!, [...at, key], superseded);
+    if (row) out[key] = row;
+  }
+  return out;
+}
+
+function templateRow(r: TemplateTargetRecord, at: string[], superseded: SupersededValue[]): TemplateRowJson | undefined {
   const row: TemplateRowJson = {};
   if (r.parent !== undefined) row.parent = r.parent;
   if (r.traits) row.traits = cloneTraits(r.traits);
   if (r.traitRemovals) row.traitRemovals = { ...r.traitRemovals };
   if (r.removed !== undefined) row.removed = r.removed;
-  if (r.own) row.own = r.own.map(templateNode);
+  if (r.own) row.own = r.own.map((n, i) => templateNode(n, [...at, 'own', String(i)], superseded));
   return Object.keys(row).length ? row : undefined;
 }
 
-function templateNode(n: TemplateAddedNode): TemplateNodeJson {
+function templateNode(n: TemplateAddedNode, at: string[], superseded: SupersededValue[]): TemplateNodeJson {
   const node: TemplateNodeJson = {
     parentLocalId: 0,
     guid: '',
     key: n.key,
     name: n.name,
     traits: cloneTraits(n.traits),
-    children: n.children.map(templateNode),
+    children: n.children.map((c, i) => templateNode(c, [...at, 'children', String(i)], superseded)),
   };
   if (n.prefab !== undefined) node.prefab = n.prefab;
-  if (n.members) node.members = serializeTemplateMembers({ rows: new Map(Object.entries(n.members)) });
+  if (n.members) node.members = templateMembers(new Map(Object.entries(n.members)), [...at, 'members'], superseded);
+  // A template reference node is an owner too: what its parse could not name or interpret goes back on the node.
+  if (n.held) putHeld(node as unknown as Record<string, unknown>, n.held, at, superseded);
+  if (isPlainObject(node.members)) node.members = sortedByKey(node.members) as Record<RowKey, TemplateRowJson>;
   return node;
 }
 
@@ -241,6 +265,14 @@ function templateNode(n: TemplateAddedNode): TemplateNodeJson {
 /** A copy the caller may mutate without reaching into the record. Trait and field order are the record's own. */
 function cloneTraits(traits: RecordTraits): RecordTraits {
   return structuredClone(traits);
+}
+
+/** An owner's held values back into what the writer states for it: `pendingLegacy` first, then `unparsed`. Each goes
+ *  where the written form states nothing (today's `restoreMalformed` rule, owner ruling F-CB1(a)); where it does state
+ *  something, a later record superseded the value, and the caller reports it. */
+function putHeld(target: Record<string, unknown>, held: TemplateHeldData, at: string[], superseded: SupersededValue[]): void {
+  if (held.pendingLegacy) putBack(target, held.pendingLegacy, at, superseded);
+  if (held.unparsed) putBack(target, held.unparsed, at, superseded);
 }
 
 /** Put each `held` value into `target` where `target` states nothing at its place, recursing into plain objects both

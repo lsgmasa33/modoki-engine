@@ -90,8 +90,14 @@ const INNER: OpKind[] = ['editField', 'addComponent', 'removeComponent', 'addChi
 
 const U_PER_OP = 8;
 
+/** The seeds and length the fuzzer verifies on every run (`prefabFuzz.test.ts`); the round-trip over its saved scenes
+ *  uses the same ones (`instanceRecordRoundTripFuzz.test.ts`). */
+export const VERIFY_SEEDS: readonly number[] = [1, 2, 3, 4, 5, 6, 7, 8];
+export const VERIFY_LEN = 25;
+
 /** The whole list for one seed, drawn up front from the engine's seeded RNG (`runtime/core/rng.ts`) on a throwaway
  *  world: the RNG's state is per world, and a run replaces its world many times. `exclude` drops kinds (KNOWN_OPEN). */
+
 export function generate(seed: number, length: number, exclude: ReadonlySet<OpKind> = new Set()): Op[] {
   const world = createWorld();
   try {

@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  serializeInstanceRecord, serializeTemplateMembers, type MemberIdentity, type SerializeContext,
+  serializeInstanceRecord, serializeTemplateOwner, serializeTemplateDocHeld, type MemberIdentity, type SerializeContext, type TemplateRowJson,
 } from '../../src/runtime/prefab/serializeInstanceRecord';
 import type {
   InstanceRecord, SceneOwnedNode, SceneTargetRecord, TemplateTargetRecord,
@@ -47,9 +47,9 @@ describe('serializeInstanceRecord: the scene v20 entry (#2008)', () => {
     expect(superseded).toEqual([]);
   });
 
-  it('placement lives on the entry: parentId and editorFolder when set, sortOrder ALWAYS (F7), sourceScene never', () => {
+  it('placement lives on the entry: parentId, editorFolder and sourceScene when set, sortOrder ALWAYS (F7)', () => {
     const rec = record({}, { placement: { parent: G1, sortOrder: 4, name: 'Ship', editorFolder: 'Fleet', sourceScene: 'base.scene.json' } });
-    expect(serializeInstanceRecord(rec, ctx()).entry.traits).toEqual({ EntityAttributes: { parentId: G1, sortOrder: 4, editorFolder: 'Fleet' } });
+    expect(serializeInstanceRecord(rec, ctx()).entry.traits).toEqual({ EntityAttributes: { parentId: G1, sortOrder: 4, editorFolder: 'Fleet', sourceScene: 'base.scene.json' } });
   });
 
   it("the root's name is a default override: placement.name is written on the \"/\" row first, over any name the row holds", () => {
@@ -163,6 +163,19 @@ describe('serializeInstanceRecord: the scene v20 entry (#2008)', () => {
       expect(superseded).toEqual([]);
     });
 
+    it('a held remainder of a whole list goes back with its `heldRemainder: true` marker, in both forms (hub ruling C, #2006)', () => {
+      // The parser converts a container carrying the marker ADDITIVELY on reload; without it, the remainder reads as the
+      // whole list and the siblings it omits are removed. The exact key is the contract.
+      const slot = { heldRemainder: true, removed: [99] };
+      const row = { heldRemainder: true, added: [{ parentLocalId: 0, guid: '', key: 'k2', name: 'K2', traits: {}, children: [] }] };
+      const { entry } = serializeInstanceRecord(record({}, { held: { pendingLegacy: { nestedStructure: { '3': slot }, members: { [`/${M1}`]: row } } } }), ctx());
+      expect(entry.nestedStructure).toEqual({ '3': { heldRemainder: true, removed: [99] } });
+      expect(entry.members![`/${M1}`]).toEqual(row);
+      const { fields } = serializeTemplateOwner({ rows: new Map(), held: { pendingLegacy: { nestedStructure: { '3': slot }, members: { [`/${M1}`]: row } } } });
+      expect(fields.nestedStructure).toEqual({ '3': { heldRemainder: true, removed: [99] } });
+      expect((fields.members as Record<string, unknown>)[`/${M1}`]).toEqual(row);
+    });
+
     it('pending legacy goes back before unparsed: an unparsed value at the same place is the one reported', () => {
       const { entry, superseded } = serializeInstanceRecord(record({}, { held: { pendingLegacy: { removed: [5] }, unparsed: { removed: 'x' } } }), ctx());
       expect(entry.removed).toEqual([5]);
@@ -210,11 +223,12 @@ describe('serializeInstanceRecord: the scene v20 entry (#2008)', () => {
   });
 });
 
-describe('serializeTemplateMembers: a prefab v10 reference row\'s list (#2008)', () => {
+describe('serializeTemplateOwner: what a prefab v10 reference row states (#2008)', () => {
   const tmpl = (rows: Record<string, TemplateTargetRecord>) => ({ rows: new Map(Object.entries(rows)) });
+  const tm = (l: ReturnType<typeof tmpl>) => serializeTemplateOwner(l).fields.members as Record<string, TemplateRowJson>;
 
   it('writes the "/" row\'s name and sortOrder as records, sorted rows, one fixed field order', () => {
-    const out = serializeTemplateMembers(tmpl({
+    const out = tm(tmpl({
       [`/${M2}`]: { removed: true },
       '/': { traits: { EntityAttributes: { name: 'Flames', sortOrder: 2 } } },
       [`/${M1}`]: { removed: false, traitRemovals: { Light: true }, traits: { Sprite: { tint: '#0f0' } }, parent: '@member:3' },
@@ -225,12 +239,12 @@ describe('serializeTemplateMembers: a prefab v10 reference row\'s list (#2008)',
   });
 
   it('carries no identity pins (I8), even if a record somehow holds one', () => {
-    const out = serializeTemplateMembers(tmpl({ [`/${M1}`]: { guid: G1, name: 'Pin', removed: true } as TemplateTargetRecord }));
+    const out = tm(tmpl({ [`/${M1}`]: { guid: G1, name: 'Pin', removed: true } as TemplateTargetRecord }));
     expect(out[`/${M1}`]).toEqual({ removed: true });
   });
 
   it('writes added nodes in template shape (guid \'\', parentLocalId 0, key), a reference node\'s own list recursively', () => {
-    const out = serializeTemplateMembers(tmpl({
+    const out = tm(tmpl({
       '/': {
         own: [{
           key: 'lamp', name: 'Lamp', traits: { Light: { intensity: 3 } },
@@ -251,6 +265,52 @@ describe('serializeTemplateMembers: a prefab v10 reference row\'s list (#2008)',
   });
 
   it('an empty row writes nothing', () => {
-    expect(serializeTemplateMembers(tmpl({ [`/${M1}`]: {} }))).toEqual({});
+    expect(tm(tmpl({ [`/${M1}`]: {} }))).toEqual({});
+  });
+
+  it('a reference row\'s held values go back beside `members`, pending legacy first, a superseded one reported', () => {
+    const list = {
+      ...tmpl({ [`/${M1}`]: { removed: true } }),
+      held: {
+        pendingLegacy: { overrides: { 1: { Transform: { x: 3 } } }, members: { [`/${M2}`]: { removedTraits: ['Light'] } } },
+        unparsed: { removed: 'x', overrides: 7 },
+      },
+    };
+    const { fields, superseded } = serializeTemplateOwner(list);
+    expect(fields).toEqual({
+      members: { [`/${M1}`]: { removed: true }, [`/${M2}`]: { removedTraits: ['Light'] } },
+      overrides: { 1: { Transform: { x: 3 } } },
+      removed: 'x',
+    });
+    expect(superseded).toEqual([{ path: ['overrides'], value: 7 }]);
+  });
+
+  it('a template reference node\'s held values go back on the node; a superseded one is reported with its path', () => {
+    const { fields, superseded } = serializeTemplateOwner(tmpl({
+      '/': { own: [{ key: 'gun', name: 'Gun', traits: {}, children: [], prefab: SRC, held: { pendingLegacy: { nestedOverrides: { '2': { 1: { L: { on: true } } } } }, unparsed: { name: 5 } } }] },
+    }));
+    const gun = (fields.members as Record<string, TemplateRowJson>)['/'].own![0] as unknown as Record<string, unknown>;
+    expect(gun.nestedOverrides).toEqual({ '2': { 1: { L: { on: true } } } });
+    expect(gun.name).toBe('Gun');
+    expect(superseded).toEqual([{ path: ['members', '/', 'own', '0', 'name'], value: 5 }]);
+  });
+
+  it('shares nothing with the list: mutating the output leaves the held values as they were', () => {
+    const held = { pendingLegacy: { overrides: { 1: { T: { x: 1 } } } } };
+    const { fields } = serializeTemplateOwner({ ...tmpl({}), held });
+    (fields.overrides as Record<number, Record<string, Record<string, unknown>>>)[1].T.x = 99;
+    expect(held.pendingLegacy.overrides[1].T.x).toBe(1);
+  });
+});
+
+describe('serializeTemplateDocHeld: a prefab document\'s own held moves (#2008, design § 10.4b)', () => {
+  it('writes the held document-level moves back verbatim, and nothing when there are none', () => {
+    const docHeld = { moved: { 'a.b': '@member:3' } };
+    const out = serializeTemplateDocHeld(docHeld);
+    expect(out).toEqual({ moved: { 'a.b': '@member:3' } });
+    out.moved!['a.b'] = 'changed';
+    expect(docHeld.moved['a.b']).toBe('@member:3');
+    expect(serializeTemplateDocHeld(undefined)).toEqual({});
+    expect(serializeTemplateDocHeld({ moved: {} })).toEqual({});
   });
 });

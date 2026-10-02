@@ -74,7 +74,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
-import { generate, describe as describeOp, type Op } from './prefabFuzz/ops';
+import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
 import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
 import { writeFileSync } from 'node:fs';
@@ -200,8 +200,6 @@ vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { consoleE
 for (const k of ['log', 'warn', 'info', 'debug'] as const) vi.spyOn(console, k).mockImplementation(() => {});
 const expectedError = (m: string, prev?: string) => EXPECTED_ERRORS.some((e) => e.pattern.test(m) && (!e.after || (prev !== undefined && e.after.test(prev))));
 
-const VERIFY_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
-const VERIFY_LEN = 25;
 
 /** Hunts and REGRESSIONS tolerate what a KNOWN_OPEN entry tolerates; the self-test runs STRICT, so an entry whose repro
  *  stops reproducing goes red there. */
