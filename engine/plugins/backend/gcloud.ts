@@ -74,7 +74,7 @@ export function deriveGcsBucketFromBaseUrl(baseUrl: string): string | null {
 // charset, before interpolating them into a shell command — a `.ts` module here can't be
 // imported by that `.mjs` CLI, so the regexes now live once in a `.mjs` module both sides
 // import.
-export { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from '../../scripts/ota/otaSafeTokens.mjs';
+export { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET, isOtaKeyName } from '../../scripts/ota/otaSafeTokens.mjs';
 
 /** Did `gcloud storage cat <bucket>/release.json` fail because the object genuinely ISN'T THERE,
  *  or because we COULD NOT LOOK?

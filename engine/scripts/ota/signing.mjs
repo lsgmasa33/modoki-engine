@@ -31,6 +31,25 @@ function privateKeyObjectFromRaw(rawBase64url, publicKeyBase64url) {
   return createPrivateKey({ key: { kty: 'OKP', crv: 'Ed25519', d: rawBase64url, x: publicKeyBase64url }, format: 'jwk' });
 }
 
+/** The DER prefix of an Ed25519 PKCS#8 private key, before its 32-byte seed (RFC 8410 § 7). */
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+/** The public half a raw (base64url) Ed25519 private key DERIVES, or null when it is not one. The
+ *  only check that a keypair file is a pair: its `publicKey` field is just a claim, and a file whose
+ *  private half belongs to another key signs releases every installed app rejects (#1993). Built from
+ *  the seed alone on purpose — the JWK import wants `x` beside `d`, i.e. the very claim being checked. */
+export function derivePublicKey(privateKey) {
+  if (typeof privateKey !== 'string') return null;
+  const seed = Buffer.from(privateKey, 'base64url');
+  if (seed.length !== 32 || seed.toString('base64url') !== privateKey) return null;
+  try {
+    const key = createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]), format: 'der', type: 'pkcs8' });
+    return createPublicKey(key).export({ format: 'jwk' }).x;
+  } catch {
+    return null;
+  }
+}
+
 /** Returns a NEW release object equal to `unsignedRelease` plus a `sig` field:
  *  the Ed25519 signature (base64url) over `signingPayload(unsignedRelease)`. */
 export function signRelease(unsignedRelease, { privateKey, publicKey }) {

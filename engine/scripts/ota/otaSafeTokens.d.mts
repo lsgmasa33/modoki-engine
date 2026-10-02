@@ -4,3 +4,6 @@
 
 export const OTA_SAFE_TOKEN: RegExp;
 export const OTA_SAFE_BUCKET: RegExp;
+
+/** A signing-key name: a safe token not starting with `-` (it reaches argv as a positional, #1993). */
+export function isOtaKeyName(name: unknown): name is string;

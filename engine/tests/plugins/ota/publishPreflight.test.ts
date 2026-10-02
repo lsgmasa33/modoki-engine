@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { otaPublishPreflight, readRawOtaBlock, OTA_PUBLISH_REFUSALS } from '../../../scripts/ota/publishPreflight.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { generateKeypair } from '../../../scripts/ota/signing.mjs';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -23,7 +24,8 @@ const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 let scratch: string;
 let repoRoot: string; // the PROJECT (named for the config-reading half of this file)
 let editorRoot: string;
-const KEY = { publicKey: 'pub-A', privateKey: 'priv-A' };
+const KEY = generateKeypair();
+const OTHER = generateKeypair();
 const keyFile = (root: string, name = 'default') => path.join(root, 'build', 'ota-keys', `${name}.json`);
 
 beforeEach(() => {
@@ -36,7 +38,7 @@ beforeEach(() => {
 });
 afterEach(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 
-const OTA = { enabled: true, bundleName: 'shell', subgames: ['mini'], publicKey: 'pub-A' };
+const OTA = { enabled: true, bundleName: 'shell', subgames: ['mini'], publicKey: KEY.publicKey };
 const req = (over: Record<string, unknown> = {}) => ({
   ota: OTA, name: 'shell', version: 'v1', keyName: 'default', bucket: 'gs://b/p', projectRoot: repoRoot, editorRoot, ...over,
 }) as Parameters<typeof otaPublishPreflight>[0];
@@ -74,7 +76,7 @@ describe('otaPublishPreflight — accept side', () => {
   });
 
   it('an ABSENT bundleName is the default ("shell"), and absent subgames are none — what Project Settings writes', () => {
-    const raw = { enabled: true, publicKey: 'pub-A' };
+    const raw = { enabled: true, publicKey: KEY.publicKey };
     expect(otaPublishPreflight(req({ ota: raw }))).toMatchObject({ ok: true, target: { kind: 'shell' }, bundleName: 'shell', subgames: [] });
   });
 });
@@ -97,11 +99,16 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
     ['key-missing', { keyName: 'nope' }],
     ['no-key-public-half', {}],
     ['project-public-key-empty', { ota: { ...OTA, publicKey: '' } }],
-    ['mismatch', { ota: { ...OTA, publicKey: 'pub-B' } }],
+    ['mismatch', { ota: { ...OTA, publicKey: OTHER.publicKey } }],
+    ['key-pair-mismatch', {}],
   ];
 
   for (const [refusal, over] of cases) {
     it(refusal, () => {
+      if (refusal === 'key-pair-mismatch') {
+        // The project's public half on a file whose private half is another key's (#1993).
+        fs.writeFileSync(keyFile(repoRoot), JSON.stringify({ publicKey: KEY.publicKey, privateKey: OTHER.privateKey }));
+      }
       if (refusal === 'no-key-public-half') {
         fs.writeFileSync(keyFile(repoRoot), JSON.stringify({ privateKey: 'x' }));
       }
@@ -116,6 +123,21 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
       expect(refusalOf(over)).toBe(refusal);
     });
   }
+
+  it('a not-a-pair key is refused as such even when ota.publicKey is EMPTY, and its claimed public half is never echoed (#1993 review)', () => {
+    // Before: `project-public-key-empty`, whose message said to bake the claimed half into a store build.
+    fs.writeFileSync(keyFile(repoRoot), JSON.stringify({ publicKey: KEY.publicKey, privateKey: OTHER.privateKey }));
+    for (const publicKey of ['', OTHER.publicKey]) {
+      const r = otaPublishPreflight(req({ ota: { ...OTA, publicKey } }));
+      expect(r.ok ? 'ok' : r.refusal, publicKey || '(empty)').toBe('key-pair-mismatch');
+      expect(r).not.toHaveProperty('keyPublicKey');
+    }
+  });
+
+  it('a key name that starts with "-" is bad-key-name: it would reach a printed keygen line as a flag (#1993 re-review)', () => {
+    // `--rotate` is a safe token, and every remedy line prints `ota-keygen.mjs <key> --project …`.
+    for (const keyName of ['--rotate', '-x']) expect(refusalOf({ keyName }), keyName).toBe('bad-key-name');
+  });
 
   it('key-unparseable', () => {
     fs.writeFileSync(keyFile(repoRoot), '{ nope');
@@ -134,7 +156,7 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
   it('reads the PROJECT\'s key, not the editor root\'s (#1983)', () => {
     // A different key at the editor root is never read while the project has its own.
     fs.mkdirSync(path.dirname(keyFile(editorRoot)), { recursive: true });
-    fs.writeFileSync(keyFile(editorRoot), JSON.stringify({ publicKey: 'pub-B', privateKey: 'priv-B' }));
+    fs.writeFileSync(keyFile(editorRoot), JSON.stringify(OTHER));
     const r = otaPublishPreflight(req());
     expect(r.ok && r.keyPath).toBe(keyFile(repoRoot));
   });

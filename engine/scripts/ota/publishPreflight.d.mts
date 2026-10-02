@@ -17,7 +17,8 @@ export type OtaPublishRefusal =
   | 'key-unparseable'
   | 'no-key-public-half'
   | 'project-public-key-empty'
-  | 'mismatch';
+  | 'mismatch'
+  | 'key-pair-mismatch';
 
 export const OTA_PUBLISH_REFUSALS: readonly OtaPublishRefusal[];
 

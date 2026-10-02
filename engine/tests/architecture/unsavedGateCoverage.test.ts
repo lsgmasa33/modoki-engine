@@ -206,7 +206,6 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   '/api/adopt-file': { reason: 'copies an OUTSIDE file into the project. Its source is not under an asset root, so no registry can be keyed to it, and its destination is new.' },
   '/api/layout': { reason: 'reads editor WINDOW layouts from the user profile — chrome state, not project content, and not under any asset root.' },
   '/api/layout-delete': { reason: 'same store as /api/layout.' },
-  '/api/ota/keys': { reason: "reads the project's OTA signing keypair (build/ota-keys, #1983), copying one in from an earlier editor's root on first read. Not under any asset root and never opened in a panel." },
   // ── One of the three `docs/mcp-persistence.md` named and this guard could not previously see
   //    (#889 phase 3). Its two siblings are in KNOWN_GAPS below — they repair MOST of what they
   //    touch, and "most" is a gap, not an exemption. ──

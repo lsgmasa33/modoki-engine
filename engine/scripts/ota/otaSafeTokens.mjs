@@ -13,4 +13,12 @@
  *  `validateBuildConfig`. */
 export const OTA_SAFE_TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
 /** A `gs://bucket[/prefix]` URL, similarly constrained before shell interpolation. */
+/** A signing-key NAME: a safe token that does not start with `-`. The key name is the one token that
+ *  reaches an argv as a positional (`ota-keygen.mjs <name>`, and every remedy line that prints one),
+ *  where `--rotate` — a perfectly safe token — parses as the flag that mints past a shipped key (#1993).
+ *  The ONE check: the preflight's `bad-key-name`, both key routes and keygen all call it. */
+export function isOtaKeyName(name) {
+  return typeof name === 'string' && OTA_SAFE_TOKEN.test(name) && !name.startsWith('-');
+}
+
 export const OTA_SAFE_BUCKET = /^gs:\/\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._/-]*)?$/;

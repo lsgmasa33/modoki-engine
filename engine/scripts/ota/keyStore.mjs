@@ -20,6 +20,11 @@
  *  into projects that never used it. A project that shipped with the shared `default` therefore gets a
  *  copy of that same key, never a fresh one; keygen refuses once a copy exists.
  *
+ *  A key file is checked to be a PAIR wherever it is read (`readKeypair`, #1993): the `publicKey` field is
+ *  a claim, and a file whose private half is another key's would be adopted and then sign releases no
+ *  installed app accepts. `heldKeyFor` answers "does this project hold the key it shipped with", which
+ *  keygen asks before minting.
+ *
  *  ⚠️ What this CANNOT rescue: a key inside a packaged editor's bundle is deleted by the update that
  *  installs the editor carrying this code (the updater replaces the whole bundle first). That key must
  *  be copied out by hand BEFORE updating (docs/ota-updates.md § Signing key).
@@ -31,6 +36,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readJsonFile } from '../jsonFile.mjs';
+import { derivePublicKey } from './signing.mjs';
+import { isUnderOrSame, samePath } from '../pathIdentity.mjs';
 
 /** The project's key file. */
 export function projectKeyPath(projectRoot, name) {
@@ -38,10 +45,20 @@ export function projectKeyPath(projectRoot, name) {
 }
 
 /** Create the project's key folder, carrying its own `.gitignore` of `*` (never replacing one that is
- *  there), so the key is ignored in any project, whatever its own ignore rules say. */
+ *  there), so the key is ignored in any project, whatever its own ignore rules say.
+ *
+ *  EXCEPT a folder that really lives OUTSIDE the project's repo — `build/ota-keys`, or `build/` itself,
+ *  symlinked to a backup repo, say. That `*` exists to keep the key out of THIS project's repo, which
+ *  cannot see a file behind a symlink, and written into the backup it would silently stop new keys
+ *  reaching it. Judged here, in the one writer, by where the folder REALLY is (#1994): a check on the
+ *  last component alone missed a symlinked `build/`, and a check in one caller missed the other two.
+ *  "Outside the project" alone is not enough: a link to a sibling folder in the SAME work tree
+ *  (`games/foo/build -> ../foo-build`) puts the key where `git add` sees it. */
 export function ensureKeyDir(projectRoot) {
   const dir = path.dirname(projectKeyPath(projectRoot, 'x'));
   fs.mkdirSync(dir, { recursive: true });
+  // Both sides canonicalised, so a symlink anywhere on the way counts.
+  if (!isUnderOrSame(projectRoot, dir) && !insideProjectRepo(projectRoot, dir)) return dir;
   const ignore = path.join(dir, '.gitignore');
   if (!fs.existsSync(ignore)) {
     try {
@@ -51,6 +68,33 @@ export function ensureKeyDir(projectRoot) {
     }
   }
   return dir;
+}
+
+/** The top of the git work tree holding `dir`; `null` when git says it is in none; `undefined` when git
+ *  could not say (absent, dubious ownership, overflow). Run in the C locale, because "not a git
+ *  repository" is the one answer read from text, and a translated git words it otherwise. */
+function gitTopLevel(dir) {
+  try {
+    return execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, env: { ...process.env, LC_ALL: 'C', LANGUAGE: 'C' },
+    }).trim() || undefined;
+  } catch (e) {
+    return typeof e?.status === 'number' && /not a git repository/i.test(String(e?.stderr ?? '')) ? null : undefined;
+  }
+}
+
+/** Whether `dir` (really) belongs to the same git REPO as `projectRoot`. Inside its work tree is not
+ *  enough: a gitignored nested repo there — a backup — has its own top. The project in no repo, or
+ *  `dir` in none → false: nothing of the project's can commit it. Any answer git cannot give → true,
+ *  so the `*` is written: an ignore too many costs a backup one file, a missing one can commit a
+ *  signing key. */
+function insideProjectRepo(projectRoot, dir) {
+  const projectTop = gitTopLevel(projectRoot);
+  if (projectTop === undefined) return true;
+  if (projectTop === null) return false;
+  const dirTop = gitTopLevel(dir);
+  if (dirTop === undefined) return true;
+  return dirTop !== null && samePath(projectTop, dirTop);
 }
 
 /** The directories earlier editors wrote keys to, for this project: the editor's root, then each
@@ -87,24 +131,56 @@ export function restrictToOwner(file) {
   execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${user}:F`], { stdio: 'pipe' });
 }
 
-function readPublicHalf(file) {
+/** Read a key file as a keypair, checking it IS one: `{ ok: true, keypair }`, or `{ ok: false, reason }`
+ *  with `unreadable` (no file, no access, not JSON), `no-public-half` (no `publicKey` string) or
+ *  `not-a-pair` (the private half does not derive that public half). The `publicKey` field is only a
+ *  claim, so matching on it alone adopted — and would have signed with — a corrupt or planted file
+ *  whose private half is another key's (#1993). */
+export function readKeypair(file) {
+  let k;
   try {
-    const k = readJsonFile(file);
-    return typeof k?.publicKey === 'string' && typeof k?.privateKey === 'string' ? k.publicKey : null;
+    k = readJsonFile(file);
+  } catch (e) {
+    return { ok: false, reason: 'unreadable', error: e instanceof Error ? e.message : String(e) };
+  }
+  if (typeof k?.publicKey !== 'string' || !k.publicKey) return { ok: false, reason: 'no-public-half' };
+  if (derivePublicKey(k.privateKey) !== k.publicKey) return { ok: false, reason: 'not-a-pair', publicKey: k.publicKey };
+  return { ok: true, keypair: { publicKey: k.publicKey, privateKey: k.privateKey } };
+}
+
+const PASSED_OVER = {
+  unreadable: 'not a readable keypair',
+  'no-public-half': 'not a readable keypair',
+  'not-a-pair': 'its privateKey does not derive its publicKey (a corrupt or foreign file)',
+};
+
+/** The project's own key file whose pair is `publicKey`'s, or null. Any name: a project that holds the
+ *  key it shipped with may mint a SECOND identity; one that holds no such key may not (ota-keygen.mjs). */
+export function heldKeyFor(projectRoot, publicKey) {
+  if (typeof publicKey !== 'string' || !publicKey) return null;
+  const dir = path.dirname(projectKeyPath(projectRoot, 'x'));
+  let names;
+  try {
+    names = fs.readdirSync(dir);
   } catch {
     return null;
   }
+  for (const n of names.filter((f) => f.endsWith('.json')).sort()) {
+    const r = readKeypair(path.join(dir, n));
+    if (r.ok && r.keypair.publicKey === publicKey) return path.join(dir, n);
+  }
+  return null;
 }
 
-/** A key folder that already holds a key gets its `.gitignore` if it lacks one (a key copied in by hand
- *  to a second machine, per the docs). Best effort: the key is already there and valid, so failing a
- *  publish over a hygiene write would protect nothing — a failure is logged. A SYMLINKED folder is left
- *  alone: it points somewhere the user chose (a backup repo, say), where a `*` would silently stop new
- *  keys reaching it. */
+/** An existing key folder gets its `.gitignore` if it lacks one (a key copied in by hand to a second
+ *  machine, per the docs) — whichever key the caller asked about, so a hand-copied `release.json` is
+ *  healed by a read of `default` too (#1994). Best effort: a key already there is valid, so failing a
+ *  publish over a hygiene write would protect nothing — a failure is logged. Where the folder really
+ *  lives is `ensureKeyDir`'s call. */
 function healKeyDir(projectRoot, log) {
   const dir = path.dirname(projectKeyPath(projectRoot, 'x'));
+  if (!fs.existsSync(dir)) return;
   try {
-    if (fs.lstatSync(dir).isSymbolicLink()) return;
     ensureKeyDir(projectRoot);
   } catch (e) {
     log(`[ota-keys] warning: could not write ${path.join(dir, '.gitignore')} (${e instanceof Error ? e.message : String(e)}); make sure git ignores this folder`);
@@ -123,17 +199,16 @@ export function adoptLegacyKey({ projectRoot, editorRoot, name, expectedPublicKe
   if (typeof configReadable !== 'boolean') throw new TypeError('adoptLegacyKey: configReadable is required (true/false)');
   const keyPath = projectKeyPath(projectRoot, name);
   const passedOver = [];
-  if (fs.existsSync(keyPath)) {
-    healKeyDir(projectRoot, log);
-    return { keyPath, copiedFrom: null, passedOver };
-  }
+  healKeyDir(projectRoot, log);
+  if (fs.existsSync(keyPath)) return { keyPath, copiedFrom: null, passedOver };
   const expected = typeof expectedPublicKey === 'string' && expectedPublicKey ? expectedPublicKey : null;
   let source = null;
   for (const dir of legacyKeyDirs({ projectRoot, editorRoot })) {
     const candidate = path.join(dir, `${name}.json`);
     if (!fs.existsSync(candidate)) continue;
-    const pub = readPublicHalf(candidate);
-    if (pub === null) { passedOver.push({ from: candidate, reason: 'not a readable keypair' }); continue; }
+    const read = readKeypair(candidate);
+    if (!read.ok) { passedOver.push({ from: candidate, reason: PASSED_OVER[read.reason] }); continue; }
+    const pub = read.keypair.publicKey;
     // UNKNOWN is not EMPTY: with an unreadable project.config.json this may be the key the project
     // shipped with, and the caller's next step (keygen) would mint over it. Refuse instead.
     if (!configReadable) {

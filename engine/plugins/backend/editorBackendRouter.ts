@@ -42,7 +42,7 @@ import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
+import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET, isOtaKeyName } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { renderAvailability, renderJobs, renderScriptPath } from './recordRenderJob';
 import { fingerprintAssets } from '../takeAssets';
@@ -367,7 +367,7 @@ import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
 import { checkOpenProjectRequest, openProjectReply, sameRootVerdict, inFlightReply, withExpectedToken, type ProjectSwitchHost } from './openProjectRoute';
 import { parseJsonText, readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
-import { adoptLegacyKey } from '../../scripts/ota/keyStore.mjs';
+import { adoptLegacyKey, readKeypair } from '../../scripts/ota/keyStore.mjs';
 import { readRawOtaBlock } from '../../scripts/ota/publishPreflight.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
@@ -6444,7 +6444,7 @@ async function describeUnresolvedAgainstLiveWorld(
   // key folder's own `.gitignore` when it lacks one.
   if (urlPath === '/api/ota/keys' && method === 'GET') {
     const name = query.get('name') || 'default';
-    if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
+    if (!isOtaKeyName(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN} and not start with "-"` }, 400);
     let keyPath: string;
     let copiedFrom: string | null;
     try {
@@ -6454,12 +6454,16 @@ async function describeUnresolvedAgainstLiveWorld(
       return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500);
     }
     if (!fs.existsSync(keyPath)) return json({ ok: true, name, exists: false, publicKey: null });
-    try {
-      const { publicKey } = readJsonFile(keyPath) as { publicKey?: string };
-      return json({ ok: true, name, exists: true, publicKey: publicKey ?? null, ...(copiedFrom ? { copiedFrom } : {}) });
-    } catch (e) {
-      return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${e instanceof Error ? e.message : String(e)}` }, 500);
+    // Read as a PAIR (#1993): a file whose privateKey is not its publicKey's would otherwise be shown as
+    // "matches Project Settings", and its public half offered to Sync.
+    const read = readKeypair(keyPath);
+    if (!read.ok) {
+      const why = read.reason === 'unreadable' ? read.error
+        : read.reason === 'no-public-half' ? 'it has no publicKey'
+        : 'its privateKey is not the pair of its publicKey (a corrupt or foreign file — restore it from your backup)';
+      return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${why}` }, 500);
     }
+    return json({ ok: true, name, exists: true, publicKey: read.keypair.publicKey, ...(copiedFrom ? { copiedFrom } : {}) });
   }
 
   // ── POST /api/ota/keygen?name=<name> (M, exec) ── generate the OTA signing keypair
@@ -6471,12 +6475,14 @@ async function describeUnresolvedAgainstLiveWorld(
   // as JSON instead of a CLI exit code.
   if (urlPath === '/api/ota/keygen' && method === 'POST') {
     const name = query.get('name') || 'default';
-    if (!OTA_SAFE_TOKEN.test(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN}` }, 400);
+    if (!isOtaKeyName(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN} and not start with "-"` }, 400);
     try {
       // `--project` explicitly, the SAME root `/api/ota/keys` above reads back with (#582's
       // "Related" finding); `--editor-root` is where an earlier editor may have left the key, which
       // the script copies in rather than minting over (#1983). `cwd` only locates the script.
-      const keygenArgs = ['engine/scripts/ota-keygen.mjs', name, '--project', ctx.projectRoot, ...(ctx.editorRoot ? ['--editor-root', ctx.editorRoot] : [])];
+      // The name goes AFTER `--`: it is a token the caller chose, and `--rotate` is a valid token that the
+      // script would otherwise read as the flag that mints past a shipped key (#1993 review).
+      const keygenArgs = ['engine/scripts/ota-keygen.mjs', '--project', ctx.projectRoot, ...(ctx.editorRoot ? ['--editor-root', ctx.editorRoot] : []), '--', name];
       const out = execFileSync('node', keygenArgs, { cwd: ctx.editorRoot || ctx.projectRoot, encoding: 'utf8' });
       const publicKey = out.match(/^\s*(\S+)\s*$/m)?.[1] ?? null;
       return json({ ok: true, name, publicKey, log: out });

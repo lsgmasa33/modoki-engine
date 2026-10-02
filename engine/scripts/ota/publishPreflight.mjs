@@ -29,10 +29,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './otaSafeTokens.mjs';
+import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET, isOtaKeyName } from './otaSafeTokens.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME, otaRetainVersions, otaSigningKeyRefusal } from './publishGuards.mjs';
 import { readJsonFile } from '../jsonFile.mjs'; // #1799: a BOM is read through
-import { adoptLegacyKey } from './keyStore.mjs';
+import { adoptLegacyKey, readKeypair } from './keyStore.mjs';
 
 /** Every refusal {@link otaPublishPreflight} can return, in the order it checks them. */
 export const OTA_PUBLISH_REFUSALS = Object.freeze([
@@ -50,6 +50,7 @@ export const OTA_PUBLISH_REFUSALS = Object.freeze([
   'key-copy-failed',
   'key-missing',
   'key-unparseable',
+  'key-pair-mismatch',
   'no-key-public-half',
   'project-public-key-empty',
   'mismatch',
@@ -109,7 +110,7 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, proje
   // is joined into a path, so its exposure is traversal.
   if (typeof version !== 'string' || !OTA_SAFE_TOKEN.test(version)) return { ok: false, refusal: 'bad-version' };
   if (typeof name !== 'string' || !OTA_SAFE_TOKEN.test(name)) return { ok: false, refusal: 'bad-name' };
-  if (typeof keyName !== 'string' || !OTA_SAFE_TOKEN.test(keyName)) return { ok: false, refusal: 'bad-key-name' };
+  if (!isOtaKeyName(keyName)) return { ok: false, refusal: 'bad-key-name' };
   if (typeof bucket !== 'string' || !OTA_SAFE_BUCKET.test(bucket)) return { ok: false, refusal: 'bad-bucket' };
 
   // An ABSENT bundleName is the default, not a defect: `pruneProjectConfig` omits a field equal to its
@@ -142,15 +143,17 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, proje
     return { ok: false, refusal: 'key-copy-failed', bundleName, subgames, error: e instanceof Error ? e.message : String(e) };
   }
   if (!fs.existsSync(keyPath)) return { ok: false, refusal: 'key-missing', bundleName, subgames, keyPath };
-  let keypair;
-  try {
-    keypair = readJsonFile(keyPath);
-  } catch {
-    return { ok: false, refusal: 'key-unparseable', bundleName, subgames, keyPath };
-  }
-  const keyPublicKey = keypair?.publicKey ?? null;
+  const read = readKeypair(keyPath);
+  if (!read.ok && read.reason === 'unreadable') return { ok: false, refusal: 'key-unparseable', bundleName, subgames, keyPath };
+  // A file whose private half is not its public half's (#1993) is refused BEFORE the identity check, and
+  // its public half is never echoed: that is an unverified claim, and the refusals below offer the key's
+  // public half as the one to bake into a store build, which would strand that build from its first
+  // install.
+  if (!read.ok && read.reason === 'not-a-pair') return { ok: false, refusal: 'key-pair-mismatch', bundleName, subgames, keyPath };
+  const keyPublicKey = read.ok ? read.keypair.publicKey : null;
   const keyRefusal = otaSigningKeyRefusal(keyPublicKey, ota.publicKey);
-  if (keyRefusal) return { ok: false, refusal: keyRefusal, bundleName, subgames, keyPath, keyPublicKey };
+  if (keyRefusal || !read.ok) return { ok: false, refusal: keyRefusal ?? 'no-key-public-half', bundleName, subgames, keyPath, keyPublicKey };
+  const { keypair } = read;
 
   return { ok: true, target, keypair, keyPath, bundleName, subgames, retainVersions, name, version, keyName, bucket };
 }

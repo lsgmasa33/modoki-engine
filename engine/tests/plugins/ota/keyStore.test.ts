@@ -8,9 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { adoptLegacyKey, ensureKeyDir, projectKeyPath } from '../../../scripts/ota/keyStore.mjs';
+import { generateKeypair } from '../../../scripts/ota/signing.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
-const KEY = { publicKey: 'pub-K', privateKey: 'priv-K' };
+const KEY = generateKeypair();
 let scratch: string;
 let projectRoot: string;
 let editorRoot: string;
@@ -76,6 +77,99 @@ describe('keyStore (#1983)', () => {
     fs.symlinkSync(path.join(backup, 'build', 'ota-keys'), path.join(projectRoot, 'build', 'ota-keys'), 'junction');
     adopt();
     expect(fs.existsSync(path.join(backup, 'build', 'ota-keys', '.gitignore'))).toBe(false);
+  });
+
+  it('a symlinked build/ (not just build/ota-keys) is a folder outside the project too: no .gitignore lands in it (#1994 A)', () => {
+    const backup = path.join(scratch, 'build-backup');
+    fs.mkdirSync(path.join(backup, 'ota-keys'), { recursive: true });
+    fs.writeFileSync(path.join(backup, 'ota-keys', 'default.json'), JSON.stringify(KEY));
+    fs.symlinkSync(backup, path.join(projectRoot, 'build'), 'junction');
+    adopt();
+    expect(fs.existsSync(path.join(backup, 'ota-keys', '.gitignore'))).toBe(false);
+  });
+
+  it('the COPY path writes no .gitignore through a symlinked key folder either (#1994 B)', () => {
+    const backup = path.join(scratch, 'key-backup');
+    fs.mkdirSync(backup, { recursive: true });
+    fs.mkdirSync(path.join(projectRoot, 'build'), { recursive: true });
+    fs.symlinkSync(backup, path.join(projectRoot, 'build', 'ota-keys'), 'junction');
+    plant(editorRoot);
+    const { copiedFrom } = adopt();
+    expect(copiedFrom).not.toBeNull();
+    expect(fs.existsSync(path.join(backup, 'default.json'))).toBe(true); // the backup still receives the key
+    expect(fs.existsSync(path.join(backup, '.gitignore'))).toBe(false);
+  });
+
+  it('ensureKeyDir — what keygen\'s mint calls — leaves a symlinked folder alone, and still ignores a real one (#1994 B)', () => {
+    const backup = path.join(scratch, 'key-backup');
+    fs.mkdirSync(backup, { recursive: true });
+    fs.mkdirSync(path.join(projectRoot, 'build'), { recursive: true });
+    fs.symlinkSync(backup, path.join(projectRoot, 'build', 'ota-keys'), 'junction');
+    ensureKeyDir(projectRoot);
+    expect(fs.existsSync(path.join(backup, '.gitignore'))).toBe(false);
+    const other = path.join(scratch, 'other-project');
+    fs.mkdirSync(other);
+    ensureKeyDir(other);
+    expect(fs.existsSync(path.join(other, 'build', 'ota-keys', '.gitignore'))).toBe(true);
+  });
+
+  it('a link to a sibling folder in the SAME work tree still gets the `*`: git would see the key there (#1994 review)', () => {
+    const repo = path.join(scratch, 'repo');
+    const game = path.join(repo, 'games', 'foo');
+    fs.mkdirSync(game, { recursive: true });
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    fs.mkdirSync(path.join(repo, 'games', 'foo-build'));
+    fs.symlinkSync(path.join(repo, 'games', 'foo-build'), path.join(game, 'build'), 'junction');
+    ensureKeyDir(game);
+    fs.writeFileSync(path.join(repo, 'games', 'foo-build', 'ota-keys', 'default.json'), JSON.stringify(KEY));
+    expect(spawnSync('git', ['check-ignore', '-q', 'games/foo-build/ota-keys/default.json'], { cwd: repo }).status).toBe(0);
+  });
+
+  it('a backup that is its OWN repo nested (gitignored) inside the project\'s tree gets no `*`: same tree, different repo (#1994 re-review)', () => {
+    const repo = path.join(scratch, 'repo');
+    const game = path.join(repo, 'games', 'foo');
+    const backup = path.join(repo, '.ota-backup');
+    fs.mkdirSync(game, { recursive: true });
+    fs.mkdirSync(backup, { recursive: true });
+    expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['init', '-q'], { cwd: backup }).status).toBe(0);
+    fs.writeFileSync(path.join(repo, '.gitignore'), '.ota-backup/\n');
+    fs.symlinkSync(backup, path.join(game, 'build'), 'junction');
+    ensureKeyDir(game);
+    expect(fs.existsSync(path.join(backup, 'ota-keys', '.gitignore'))).toBe(false);
+  });
+
+  it('a project IN git whose key folder links OUT of its work tree gets no `*` there', () => {
+    expect(spawnSync('git', ['init', '-q'], { cwd: projectRoot }).status).toBe(0);
+    const backup = path.join(scratch, 'key-backup');
+    fs.mkdirSync(backup, { recursive: true });
+    fs.mkdirSync(path.join(projectRoot, 'build'), { recursive: true });
+    fs.symlinkSync(backup, path.join(projectRoot, 'build', 'ota-keys'), 'junction');
+    ensureKeyDir(projectRoot);
+    expect(fs.existsSync(path.join(backup, '.gitignore'))).toBe(false);
+  });
+
+  it('a hand-copied key of ANOTHER name is healed by a read of default (#1994: the docs promise "the first OTA Keys read")', () => {
+    expect(spawnSync('git', ['init', '-q'], { cwd: projectRoot }).status).toBe(0);
+    const release = projectKeyPath(projectRoot, 'release');
+    fs.mkdirSync(path.dirname(release), { recursive: true });
+    fs.writeFileSync(release, JSON.stringify(KEY));
+    const rel = path.relative(projectRoot, release);
+    expect(spawnSync('git', ['check-ignore', '-q', rel], { cwd: projectRoot }).status).toBe(1); // committable
+    adopt(); // asks about `default`, which does not exist
+    expect(spawnSync('git', ['check-ignore', '-q', rel], { cwd: projectRoot }).status).toBe(0);
+  });
+
+  it('a file that only CLAIMS the project\'s public half is passed over, and the real key further up is adopted (#1993)', () => {
+    // The editor root is searched first: the planted file shadowed the real key there.
+    fs.mkdirSync(path.dirname(projectKeyPath(editorRoot, 'default')), { recursive: true });
+    fs.writeFileSync(projectKeyPath(editorRoot, 'default'), JSON.stringify({ publicKey: KEY.publicKey, privateKey: generateKeypair().privateKey }));
+    const real = plant(scratch); // an ancestor of the project
+    const lines: string[] = [];
+    const r = adopt((l) => lines.push(l));
+    expect(r.copiedFrom).toBe(projectKeyPath(scratch, 'default'));
+    expect(fs.readFileSync(r.keyPath).equals(real)).toBe(true);
+    expect(lines.join('\n')).toMatch(/not copying .*privateKey does not derive its publicKey/);
   });
 
   it('configReadable is required: forgetting it cannot silently mean "no public key"', () => {

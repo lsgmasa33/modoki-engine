@@ -10,9 +10,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { generateKeypair } from '../../scripts/ota/signing.mjs';
 
 const CHECKOUT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const LEGACY = { publicKey: 'legacy-pub', privateKey: 'legacy-priv' };
+const LEGACY = generateKeypair();
 
 let scratch: string;
 let projectRoot: string;
@@ -70,9 +71,20 @@ describe('GET /api/ota/keys (#1983)', () => {
   it('answers about the project\'s key, never the editor root\'s, once the project has one', async () => {
     plant(bundle);
     fs.mkdirSync(path.dirname(keyAt(projectRoot)), { recursive: true });
-    fs.writeFileSync(keyAt(projectRoot), JSON.stringify({ publicKey: 'project-own', privateKey: 'x' }));
+    const own = generateKeypair();
+    fs.writeFileSync(keyAt(projectRoot), JSON.stringify(own));
     const r = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
-    expect(r.body).toMatchObject({ exists: true, publicKey: 'project-own' });
+    expect(r.body).toMatchObject({ exists: true, publicKey: own.publicKey });
+  });
+
+  it('a project key whose privateKey is not its publicKey\'s pair is an error, never "matches Project Settings" (#1993)', async () => {
+    bake(LEGACY.publicKey);
+    fs.mkdirSync(path.dirname(keyAt(projectRoot)), { recursive: true });
+    fs.writeFileSync(keyAt(projectRoot), JSON.stringify({ publicKey: LEGACY.publicKey, privateKey: generateKeypair().privateKey }));
+    const r = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
+    expect(r.status).toBe(500);
+    expect(r.body).toMatchObject({ ok: false });
+    expect(String(r.body.error)).toMatch(/privateKey is not the pair of its publicKey/);
   });
 
   it('an UNREADABLE project.config.json with an earlier key present is refused, not passed over', async () => {
@@ -121,6 +133,17 @@ describe('POST /api/ota/keygen (#1983)', () => {
     expect(r.status).toBe(409);
     expect(String(r.body.error)).toMatch(/already exists — refusing to overwrite/);
     expect(fs.readFileSync(keyAt(projectRoot, 'route-own')).equals(original)).toBe(true);
+  });
+
+  it('a name that is a FLAG is 400 — `--rotate` never reaches the script\'s argv as one (#1993 review)', async () => {
+    bake(LEGACY.publicKey); // a shipped key this project does not hold: the refusal --rotate would skip
+    for (const name of ['--rotate', '-x']) {
+      const r = await call(ctxWith(CHECKOUT), 'POST', '/api/ota/keygen', name);
+      expect(r.status, name).toBe(400);
+      const g = await call(ctxWith(CHECKOUT), 'GET', '/api/ota/keys', name);
+      expect(g.status, name).toBe(400);
+    }
+    expect(fs.existsSync(path.join(projectRoot, 'build', 'ota-keys'))).toBe(false);
   });
 
   it('a name that is not a safe token is 400, and no key is written anywhere (#1985)', async () => {

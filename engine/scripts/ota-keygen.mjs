@@ -8,7 +8,7 @@
  *  PUBLIC key is printed for the project's `ota.publicKey`.
  *
  *  Usage:
- *    node engine/scripts/ota-keygen.mjs [name] --project <dir> [--editor-root <dir>]
+ *    node engine/scripts/ota-keygen.mjs [name] --project <dir> [--editor-root <dir>] [--rotate]
  *  `name` defaults to "default". `--editor-root` (default: this checkout) is only where an
  *  earlier editor may have written the key; see keyStore.mjs.
  *
@@ -16,22 +16,33 @@
  *  that already has the old public key baked in), and refuses to mint one when an earlier
  *  editor's key of that name can be copied in instead: a project that signed with it must
  *  keep signing with it.
+ *
+ *  And refuses to mint while the project bakes an `ota.publicKey` that NO key it holds is the pair
+ *  of (#1993): a second machine, a project copied out of the repo, an earlier key that could not be
+ *  read. Not finding the shipped key is not the same as there being none, and a new key's public
+ *  half is one OTA Keys "Sync" away from replacing the shipped one, which strands every installed
+ *  build. Once the shipped key IS held, another name is a deliberate second identity and is minted.
+ *  `--rotate` mints anyway — the one deliberate way to give a shipped project a new key; the editor
+ *  route never passes it.
  */
 import { existsSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { generateKeypair } from './ota/signing.mjs';
-import { adoptLegacyKey, ensureKeyDir, projectKeyPath, restrictToOwner } from './ota/keyStore.mjs';
+import { adoptLegacyKey, ensureKeyDir, heldKeyFor, projectKeyPath, restrictToOwner } from './ota/keyStore.mjs';
 import { readRawOtaBlock } from './ota/publishPreflight.mjs';
+import { OTA_SAFE_TOKEN, isOtaKeyName } from './ota/otaSafeTokens.mjs';
 
 const defaultEditorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const rawArgs = process.argv.slice(2);
 let projectRoot = null;
 let editorRoot = defaultEditorRoot;
+let rotate = false;
 const positional = [];
 for (let i = 0; i < rawArgs.length; i++) {
   const flag = rawArgs[i];
+  if (flag === '--') { positional.push(...rawArgs.slice(i + 1)); break; } // the route passes the name after it
   if (flag === '--project' || flag === '--editor-root') {
     // A bare trailing flag would otherwise reach `path.resolve(undefined)` — for a flag that decides
     // WHERE a private key lands, say what is wrong instead of crashing.
@@ -42,6 +53,10 @@ for (let i = 0; i < rawArgs.length; i++) {
     }
     if (flag === '--project') projectRoot = path.resolve(value);
     else editorRoot = path.resolve(value);
+    continue;
+  }
+  if (flag === '--rotate') {
+    rotate = true;
     continue;
   }
   if (flag === '--repo-root') {
@@ -59,6 +74,12 @@ if (!projectRoot) {
   process.exit(1);
 }
 const name = positional[0] || 'default';
+// A name is a file name, never a flag: the route used to put `?name=--rotate` straight into argv, which
+// this loop then read as the flag that mints past a shipped key (#1993 review).
+if (positional.length > 1 || !isOtaKeyName(name)) {
+  console.error(`[ota-keygen] the key name must be ONE name matching ${OTA_SAFE_TOKEN} that does not start with "-" (got ${JSON.stringify(positional)}).`);
+  process.exit(1);
+}
 const keyPath = projectKeyPath(projectRoot, name);
 
 // A key an earlier editor wrote outside the project is copied in, never replaced by a new one.
@@ -88,9 +109,28 @@ if (existsSync(keyPath)) {
   process.exit(1);
 }
 
+const shipped = raw.ok && typeof raw.ota?.publicKey === 'string' && raw.ota.publicKey ? raw.ota.publicKey : null;
+if (shipped && !rotate && !heldKeyFor(projectRoot, shipped)) {
+  console.error(`[ota-keygen] This project's ota.publicKey (${shipped}) is baked into every build it shipped, and no key in`);
+  console.error(`[ota-keygen] ${path.dirname(keyPath)} is its pair. Not minting: a new key would sign nothing those builds accept.`);
+  for (const p of adopted.passedOver) console.error(`[ota-keygen]   passed over ${p.from}: ${p.reason}`);
+  console.error('[ota-keygen] Copy the original key in from your backup or the machine that made it (docs/ota-updates.md § Signing key).');
+  console.error('[ota-keygen] To replace it deliberately — every installed build then stops receiving updates until a new store');
+  console.error(`[ota-keygen] release — run: node engine/scripts/ota-keygen.mjs ${name} --project ${JSON.stringify(projectRoot)} --rotate`);
+  process.exit(1);
+}
+
 const { publicKey, privateKey } = generateKeypair();
 ensureKeyDir(projectRoot);
-writeFileSync(keyPath, JSON.stringify({ publicKey, privateKey }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+try {
+  // EXCL, not just the existsSync above: a second keygen (the dialog and an agent at once) can write
+  // between that check and this line, and its key must not be silently replaced.
+  writeFileSync(keyPath, JSON.stringify({ publicKey, privateKey }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+} catch (e) {
+  if (e?.code !== 'EEXIST') throw e;
+  console.error(`[ota-keygen] ${keyPath} appeared while this key was being made (another keygen?) — refusing to overwrite it.`);
+  process.exit(1);
+}
 
 // An ERROR path, not a warning: an unprotected private signing key that only *looks* protected
 // is the silent-failure class this guards (Windows has no POSIX bits — `restrictToOwner` uses an

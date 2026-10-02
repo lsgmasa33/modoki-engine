@@ -8,7 +8,9 @@
  *  A typed-confirmation guard only makes sense for a capability that exists; since this
  *  one doesn't, the dialog's job is just to make that refusal LEGIBLE, not to route
  *  around it. Rotating a key on purpose is a decision for the project owner, made by
- *  choosing a different key NAME (a second identity), not by forcing this one.
+ *  choosing a different key NAME (a second identity), not by forcing this one — and its
+ *  last step, "Sync to Project Settings" over a non-empty `ota.publicKey`, asks first
+ *  (`otaKeySync.ts`, #1993).
  *
  *  Gated by editorStore.otaKeysOpen (opened from Build → OTA Keys…). */
 
@@ -16,8 +18,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
 import { ModalShell } from '../components/ModalShell';
+import { confirmInEditor } from '../utils/saveDialog';
+import { otaKeySyncConfirmation } from './otaKeySync';
 
-interface KeyStatus { exists: boolean; publicKey: string | null }
+interface KeyStatus { name: string; exists: boolean; publicKey: string | null }
 
 const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', padding: '4px 8px',
@@ -61,7 +65,7 @@ export default function OtaKeysDialog() {
       if (!keyRes.ok || !keyJson.ok) throw new Error(keyJson.error || `check failed (${keyRes.status})`);
       const settings = await settingsRes.json() as { ota?: { publicKey?: string } };
       if (seq !== refreshSeq.current) return; // a newer refresh() superseded this one
-      setStatus({ exists: !!keyJson.exists, publicKey: keyJson.publicKey ?? null });
+      setStatus({ name: checkName, exists: !!keyJson.exists, publicKey: keyJson.publicKey ?? null });
       setConfigPublicKey(settings?.ota?.publicKey ?? null);
     } catch (e) {
       if (seq !== refreshSeq.current) return;
@@ -99,6 +103,14 @@ export default function OtaKeysDialog() {
     setError(null);
     setNotice(null);
     try {
+      // Decide on the value on disk NOW, not the one read when the dialog opened: an agent or another
+      // window may have set ota.publicKey since, and a stale empty would replace it unasked.
+      const settingsRes = await backendFetch('/api/project-settings');
+      if (!settingsRes.ok) throw new Error(`could not read Project Settings (${settingsRes.status})`);
+      const current = ((await settingsRes.json()) as { ota?: { publicKey?: string } })?.ota?.publicKey ?? null;
+      setConfigPublicKey(current);
+      const ask = otaKeySyncConfirmation(current, status.publicKey, status.name);
+      if (ask && !(await confirmInEditor(ask.title, ask.message, ask.okLabel))) return;
       // A PARTIAL post: it relies on /api/project-settings deep-merging onto the
       // on-disk config and leaving every other section alone. It used to merge onto
       // the DEFAULTS instead, so this button reset the whole project config (app

@@ -8,6 +8,10 @@ import type { OtaRelease, OtaReleaseUnsigned } from './schema.mjs';
  *  JWK `x`/`d` field), not PEM/DER. */
 export function generateKeypair(): { publicKey: string; privateKey: string };
 
+/** The public half a raw (base64url) Ed25519 private key derives, or null when it is not one —
+ *  the check that a keypair file is a PAIR, not merely a file claiming a `publicKey` (#1993). */
+export function derivePublicKey(privateKey: unknown): string | null;
+
 /** Returns a NEW release object equal to `unsignedRelease` plus a `sig` field — the
  *  Ed25519 signature (base64url) over `signingPayload(unsignedRelease)`. */
 export function signRelease(

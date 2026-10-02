@@ -8,9 +8,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { generateKeypair } from '../../scripts/ota/signing.mjs';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -31,9 +32,9 @@ function makeScratchRepo(): string {
   return repoRoot;
 }
 
-function runNode(repoRoot: string, scriptRelPath: string, args: string[]): { status: number; stdout: string; stderr: string } {
+function runNode(repoRoot: string, scriptRelPath: string, args: string[], nodeArgs: string[] = [], env?: NodeJS.ProcessEnv): { status: number; stdout: string; stderr: string } {
   try {
-    const stdout = execFileSync('node', [scriptRelPath, ...args], { cwd: repoRoot, encoding: 'utf8' });
+    const stdout = execFileSync('node', [...nodeArgs, scriptRelPath, ...args], { cwd: repoRoot, encoding: 'utf8', ...(env ? { env } : {}) });
     return { status: 0, stdout, stderr: '' };
   } catch (e) {
     const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -193,7 +194,7 @@ describe('ota-keygen.mjs', () => {
   });
 
   describe('a key an earlier editor wrote outside the project (#1983)', () => {
-    const LEGACY = { publicKey: 'legacy-pub', privateKey: 'legacy-priv' };
+    const LEGACY = generateKeypair();
 
     // The scratch repo is both the script's default editor root and the project's ancestor; the
     // ancestor walk on its own is pinned by otaKeyRoutes.test.ts.
@@ -257,15 +258,94 @@ describe('ota-keygen.mjs', () => {
       expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
     });
 
-    it('a same-named key whose public half is NOT the project\'s is left alone, and a fresh key is minted', () => {
+    it('a same-named key whose public half is NOT the project\'s is left alone — and nothing is minted past the shipped key (#1993)', () => {
       const original = plantKey(repoRoot, LEGACY);
-      bake('some-other-public-half');
+      bake(generateKeypair().publicKey);
       const r = keygen([]);
-      expect(r.status).toBe(0);
-      expect(r.stdout).toMatch(/not copying .*is not this project's ota.publicKey/);
-      expect(JSON.parse(fs.readFileSync(keyAt(projectDir), 'utf8')).publicKey).not.toBe(LEGACY.publicKey);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/passed over .*is not this project's ota.publicKey/);
+      expect(fs.existsSync(keyAt(projectDir))).toBe(false);
       expect(fs.readFileSync(keyAt(repoRoot)).equals(original)).toBe(true);
     });
+  });
+
+  describe('a project that bakes an ota.publicKey it does not hold the key for (#1993)', () => {
+    const SHIPPED = generateKeypair();
+
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('an UNREADABLE earlier key is not "no key": keygen mints no blocker, and copies the key in once it can read it', () => {
+      const original = plantKey(repoRoot, SHIPPED);
+      fs.chmodSync(keyAt(repoRoot), 0o000);
+      bake(SHIPPED.publicKey);
+      try {
+        const r = keygen([]);
+        expect(r.status).toBe(1);
+        expect(r.stderr).toMatch(/is baked into every build it shipped[^]*is its pair/);
+        expect(r.stderr).toMatch(/passed over .*default\.json: not a readable keypair/);
+        expect(fs.existsSync(keyAt(projectDir))).toBe(false);
+      } finally {
+        fs.chmodSync(keyAt(repoRoot), 0o600);
+      }
+      // Readable again: the real key comes in — it used to be blocked for good by the minted one.
+      const again = keygen([]);
+      expect(again.stderr).toMatch(/copied from .*Not minting a new one/);
+      expect(fs.readFileSync(keyAt(projectDir)).equals(original)).toBe(true);
+    });
+
+    it('a second machine (the key is nowhere here) refuses, and --rotate is the one deliberate way to mint', () => {
+      bake(SHIPPED.publicKey);
+      const r = keygen([]);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/Copy the original key in from your backup/);
+      expect(r.stderr).toMatch(/--rotate/);
+      expect(fs.existsSync(keyAt(projectDir))).toBe(false);
+      const rotated = keygen(['--rotate']);
+      expect(rotated.status, rotated.stderr).toBe(0);
+      expect(JSON.parse(fs.readFileSync(keyAt(projectDir), 'utf8')).publicKey).not.toBe(SHIPPED.publicKey);
+    });
+
+    it('a name after `--` is a name, never a flag: `-- --rotate` is refused, not read as --rotate (#1993 review)', () => {
+      bake(SHIPPED.publicKey);
+      const r = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--project', projectDir, '--', '--rotate']);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/key name must be ONE name/);
+      expect(fs.existsSync(path.join(projectDir, 'build', 'ota-keys'))).toBe(false);
+    });
+
+    it('a project that HOLDS its shipped key may still mint a second identity under another name', () => {
+      plantKey(projectDir, SHIPPED);
+      bake(SHIPPED.publicKey);
+      const r = keygen(['release']);
+      expect(r.status, r.stderr).toBe(0);
+      expect(fs.existsSync(keyAt(projectDir, 'release'))).toBe(true);
+    });
+
+    it('holding a file that only CLAIMS the shipped public half is not holding the key', () => {
+      plantKey(projectDir, { publicKey: SHIPPED.publicKey, privateKey: generateKeypair().privateKey });
+      bake(SHIPPED.publicKey);
+      const r = keygen(['release']);
+      expect(r.status).toBe(1);
+      expect(fs.existsSync(keyAt(projectDir, 'release'))).toBe(false);
+    });
+  });
+
+  it('a keygen that loses the race to another one never replaces the winner\'s key (flag wx, #1993)', () => {
+    // A preloaded hook stands in for the second keygen: it writes the key file in the window between
+    // keygen's existsSync refusal and its own write — the only window `wx` guards.
+    const hook = path.join(repoRoot, 'rival-hook.mjs');
+    fs.writeFileSync(hook, [
+      "import fs from 'node:fs';",
+      "import { syncBuiltinESMExports } from 'node:module';",
+      'const real = fs.writeFileSync;',
+      'fs.writeFileSync = function (file, ...rest) {',
+      "  if (file === process.env.RIVAL_AT && !fs.existsSync(file)) real.call(fs, file, 'the rival keygen\\'s key');",
+      '  return real.call(this, file, ...rest);',
+      '};',
+      'syncBuiltinESMExports();',
+    ].join('\n'));
+    const r = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--project', projectDir], ['--import', pathToFileURL(hook).href], { ...process.env, RIVAL_AT: keyAt(projectDir) });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/appeared while this key was being made .*refusing to overwrite/);
+    expect(fs.readFileSync(keyAt(projectDir), 'utf8')).toBe('the rival keygen\'s key');
   });
 });
 

@@ -86,11 +86,35 @@ One audited library shared by both platforms is strictly better.
 preflight, the editor's Build → OTA Keys… (`/api/ota/keys`, `/api/ota/keygen`) and
 `modoki_ota_keygen` all read and write that one path (`engine/scripts/ota/keyStore.mjs`). The folder
 ignores itself: keygen and the copy write a `build/ota-keys/.gitignore` of `*` when they create it,
-and every read (OTA Keys, a publish) writes it into a key folder that lacks one, so a key is not
-committable in any project, including one scaffolded before #1983 with no `.gitignore` of its own.
+and every read (OTA Keys, a publish) writes it into a key folder that lacks one, whichever key name it
+asked about, so a key is not committable in any project, including one scaffolded before #1983 with
+no `.gitignore` of its own. The one exception is a folder that really lives OUTSIDE the project's git
+work tree (`build/ota-keys` or `build/` symlinked to a backup repo, say): no `*` is written there,
+since the project's repo cannot see through the link and a `*` in the backup would silently stop it
+receiving keys. `ensureKeyDir`, the one writer, judges that by canonical path (#1994). A link to a
+sibling folder in the SAME work tree still gets the `*`, and so does any folder when git cannot say.
 A config that cannot be read is not taken to mean "no public key": with a same-named earlier key
 present, keygen and the OTA Keys read refuse until `project.config.json` is fixed, rather than mint
 over what may be the shipped key.
+
+**A key file is a PAIR, checked.** Its `publicKey` field is only a claim, so every reader
+(`readKeypair`: the copy below, the publish preflight, `/api/ota/keys`) derives the public half from
+`privateKey` and treats a file where they disagree as broken (a corrupt or foreign file). Such a file
+is passed over by the copy, refused by publish as `key-pair-mismatch` (before the identity check, and
+without echoing its claimed public half, which the other refusals would offer as the key to bake into a
+store build), and shown as an error by OTA Keys, never as "matches Project Settings" (#1993).
+
+**Keygen will not mint past a shipped key it does not hold.** While `ota.publicKey` is set and no key
+in the project's `build/ota-keys/` is its pair (after the copy below has had its chance), keygen
+refuses and lists what it passed over and why. That covers a second machine, a project copied out of
+the repo, and an earlier key it could not read: "could not find it" is not "there is none", and a key
+minted then used to be one OTA Keys "Sync" away from replacing the shipped public half. Once the
+shipped key IS held, another name is a deliberate second identity and is minted.
+`ota-keygen.mjs … --rotate` is the one deliberate way past the refusal; the editor route never passes
+it: it refuses a key name starting with `-` and puts the name after `--`, and keygen refuses a name
+that is not one safe token. (`?name=--rotate` used to reach the script's argv as the flag.) And OTA
+Keys' **Sync to Project Settings** asks first whenever it would REPLACE a non-empty `ota.publicKey`,
+judged on the value re-read at click time (`otaKeySync.ts`), since that strands every installed build.
 Belt and braces on top: the repo's `.gitignore` (`games/*/build/ota-keys/`, `demos/*/build/ota-keys/`),
 a scaffolded project's own `.gitignore` (the template's `gitignore`), an OTA-enabled game's own
 `.gitignore`, and an `electron-builder.yml` exclude so no key can ride into the signed app. `otaKeyIgnored.test.ts` fails the suite when any
@@ -130,9 +154,9 @@ for every build already shipped: those binaries can only be fixed by a new store
 machine included), copy the whole `<project>/build/ota-keys/` folder there over a channel you trust,
 into the same place in that machine's checkout of the project, and check the key's `publicKey` equals
 the project's `ota.publicKey` before the first publish. (A key file dropped in on its own is healed on
-the first OTA Keys read or publish, which writes the folder's `.gitignore`; until then it is
-committable, so copy the folder.) Never run keygen on the second machine for a
-project that already shipped.
+the first OTA Keys read or publish, under any key name, which writes the folder's `.gitignore`; until
+then it is committable, so copy the folder.) Never run keygen on the second machine for a
+project that already shipped. It refuses there anyway while the key is missing, rather than mint one.
 
 ### The trust chain
 
@@ -873,7 +897,8 @@ questions, recorded so they are not re-opened by accident.
   `v12` forever. It looks fine to the publisher and silently isn't for affected players.
 - **Never regenerate the signing key** for a published app. Every installed binary has the
   old public key baked in and will reject everything you publish afterwards. `ota-keygen.mjs`
-  refuses to overwrite for this reason.
+  refuses to overwrite for this reason, and refuses to mint at all while the project bakes a key it
+  does not hold (§ Signing key).
 - **The deploy step must be additive; the only delete is the bounded prune.** The normal site
   deploy uses `--delete-unmatched-destination-objects`, which would wipe every version and bundle in
   the namespace, including the live one. `ota-publish.mjs` uploads additively and removes old

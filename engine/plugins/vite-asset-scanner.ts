@@ -3698,6 +3698,7 @@ export function assetScannerPlugin(): Plugin {
               'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
               'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
               mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${cfg.ota.publicKey}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
+              'key-pair-mismatch': `Signing key "${keyName}" (${r.keyPath}) is not a keypair: its privateKey does not derive its publicKey (a corrupt or foreign file), so every release it signed would be rejected by every installed app, and its publicKey is not one to bake into a build. Restore the key from your backup (docs/ota-updates.md § Signing key) — do not regenerate it: a new key is one no shipped build trusts.`,
             };
             refuseBeforeStream(res, 'OTA publish refused', why[r.refusal]);
             return;

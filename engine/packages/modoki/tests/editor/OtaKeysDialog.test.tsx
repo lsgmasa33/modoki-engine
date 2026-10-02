@@ -14,7 +14,10 @@ import { render, fireEvent, cleanup, waitFor } from '@testing-library/react';
 const h = vi.hoisted(() => ({
   backendFetch: vi.fn(),
   backendPostJson: vi.fn(),
+  confirmInEditor: vi.fn(),
 }));
+
+vi.mock('../../src/editor/utils/saveDialog', () => ({ confirmInEditor: h.confirmInEditor }));
 
 vi.mock('../../src/editor/backend/editorBackend', () => ({
   backendFetch: h.backendFetch,
@@ -75,6 +78,39 @@ describe('OtaKeysDialog', () => {
     const { getByText } = render(<OtaKeysDialog />);
     await waitFor(() => getByText(/does not match this key/));
     expect(() => getByText('Sync to Project Settings')).not.toThrow();
+  });
+
+  it('Sync decides on Project Settings as they are NOW: a key set since the dialog opened is not replaced unasked (#1993 review)', async () => {
+    let settingsReads = 0;
+    h.backendFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith('/api/ota/keys')) return jsonResponse({ ok: true, exists: true, publicKey: 'pk-new' });
+      settingsReads++;
+      return jsonResponse({ ota: { publicKey: settingsReads === 1 ? '' : 'pk-shipped' } }); // set by an agent meanwhile
+    });
+    h.confirmInEditor.mockResolvedValue(false);
+    useEditorStore.setState({ otaKeysOpen: true });
+
+    const { getByText } = render(<OtaKeysDialog />);
+    await waitFor(() => getByText('Sync to Project Settings'));
+    fireEvent.click(getByText('Sync to Project Settings'));
+    await waitFor(() => expect(h.confirmInEditor).toHaveBeenCalledTimes(1));
+    expect(String(h.confirmInEditor.mock.calls[0][1])).toContain('pk-shipped');
+    expect(h.backendPostJson).not.toHaveBeenCalled();
+  });
+
+  it('Sync into an EMPTY ota.publicKey (first-time setup) asks nothing and saves', async () => {
+    h.backendFetch.mockImplementation(async (path: string) =>
+      path.startsWith('/api/ota/keys')
+        ? jsonResponse({ ok: true, exists: true, publicKey: 'pk-new' })
+        : jsonResponse({ ota: { publicKey: '' } }));
+    h.backendPostJson.mockResolvedValue(jsonResponse({ ok: true }));
+    useEditorStore.setState({ otaKeysOpen: true });
+
+    const { getByText } = render(<OtaKeysDialog />);
+    await waitFor(() => getByText('Sync to Project Settings'));
+    fireEvent.click(getByText('Sync to Project Settings'));
+    await waitFor(() => expect(h.backendPostJson).toHaveBeenCalledWith('/api/project-settings', { ota: { publicKey: 'pk-new' } }));
+    expect(h.confirmInEditor).not.toHaveBeenCalled();
   });
 
   it('does NOT show a mismatch warning once the keys match', async () => {
