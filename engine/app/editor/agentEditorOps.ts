@@ -2930,7 +2930,15 @@ export function registerEditorAgentOps(): void {
     const sceneFails = (r.failed ?? []).map((f) => `scene ${f.path} (${f.reason})`);
     const assetFails = (r.assets?.failed ?? []).map((f) => `asset ${f.path} (${f.error})`);
     const baseSceneFails = (r.baseScenes?.failed ?? []).map((f) => `base-scene ref on ${f.path} (${f.error})`);
-    const metaFails = (r.importSettings?.failed ?? []).map((f) => `import settings for ${f.path} (${f.error})`);
+    const metaFails = (r.importSettings?.failed ?? []).filter((f) => !f.dropped).map((f) => `import settings for ${f.path} (${f.error})`);
+    // A DROPPED one (#1959: an engine built-in in the packaged editor) is not pending at all: no save could land it, so
+    // it was discarded. Said apart, or "stay marked dirty … call save_all again" is false for it — the retry answers ok.
+    const metaDropped = (r.importSettings?.failed ?? []).filter((f) => f.dropped).map((f) => f.path);
+    const droppedNote = metaDropped.length
+      ? ` ${metaDropped.length} import-settings edit(s) were DISCARDED, not deferred: ${metaDropped.join(', ')} — the engine's `
+        + 'built-in assets are read-only in this editor, so nothing about them is pending. To change one for this project, '
+        + 'copy it into the project (modoki_duplicate_asset), edit the copy, and point its references at the copy.'
+      : '';
     const allFails = [...sceneFails, ...assetFails, ...baseSceneFails, ...metaFails];
     if (allFails.length) {
       throw new OpRefusal(
@@ -2938,7 +2946,7 @@ export function registerEditorAgentOps(): void {
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
         `${allFails.length} item(s) did NOT: ${allFails.join('; ')}. Those changes are still in the ` +
         `live world / pending only, and stay marked dirty — a build reads FILES and would ship ` +
-        `WITHOUT them. Fix the cause and call save_all again.${r.saved ? '' : landedNote}`,
+        `WITHOUT them. Fix the cause and call save_all again.${droppedNote}${r.saved ? '' : landedNote}`,
       );
     }
     // A Save As whose copy landed but could not be reopened (#1414): the copy is on disk under a
@@ -2947,7 +2955,12 @@ export function registerEditorAgentOps(): void {
     if (r.saved && r.savedAs && !r.savedAs.reopened) {
       throw new OpRefusal('PARTIAL',
         `save-all: the scene WAS written to ${r.path} as a copy with a fresh scene id, but ${r.savedAs.note ?? 'it could not be reopened'}. ` +
-        `${r.savedAs.from} itself was not written.${landedNote}`);
+        `${r.savedAs.from} itself was not written.${landedNote}${droppedNote}`);
+    }
+    // Only where the save otherwise SUCCEEDED (close-out review 3): every exit below and above says why the scene did not
+    // save, with the dropped edit as a rider — raised first, this sentence hid `needs-path`, `playing`, `write-failed`.
+    if (r.saved && metaDropped.length) {
+      throw new OpRefusal('PARTIAL', `save-all: the primary scene saved to ${r.path}, but${droppedNote}`);
     }
     if (r.saved) {
       return {
@@ -2973,7 +2986,7 @@ export function registerEditorAgentOps(): void {
         partialOr('REFUSED_BY_OP'),
         `save-all: "${r.path}" is another scene loaded under the open one (a base scene in its chain). Saving the ` +
         'open scene over it would replace a file the live world is built from. The scene was NOT written. Choose another path.'
-        + landedNote,
+        + landedNote + droppedNote,
       );
     }
     if (r.reason === 'needs-path') {
@@ -2981,12 +2994,12 @@ export function registerEditorAgentOps(): void {
         partialOr('REFUSED_BY_OP'),
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
         'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.scene.json" }.'
-        + landedNote,
+        + landedNote + droppedNote,
       );
     }
     if (r.reason === 'switching') {
       // #1750: refused, not queued — the world on screen is not the one the editor's path names yet.
-      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — a scene is still loading, so the editor's scene path does not describe the world on screen yet. Save again once it's open.${landed.length ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}).` : ''}`);
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — a scene is still loading, so the editor's scene path does not describe the world on screen yet. Save again once it's open.${landed.length ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}).` : ''}${droppedNote}`);
     }
     if (r.reason === 'playing') {
       // The SCENE half only. Parked asset docs already flushed above (#259) — say so, or an agent
@@ -3001,7 +3014,7 @@ export function registerEditorAgentOps(): void {
       // The REASON, not a fixed "stop the editor" (#1548 close-out review): a preview restore still
       // landing is cleared by retrying, not by Stop, which is a no-op there.
       const why = whyWorldNotAuthored() ?? 'the live world is not authored';
-      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing (${why}). Saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene. Stop Play (modoki_play_control {action:"stop"}), exit a preview (modoki_exit_pose_envelope), or — if a restore is landing — retry in a moment.${note}`);
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing (${why}). Saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene. Stop Play (modoki_play_control {action:"stop"}), exit a preview (modoki_exit_pose_envelope), or — if a restore is landing — retry in a moment.${note}${droppedNote}`);
     }
     // ⚠️ "NOTHING was written" was a claim about the WHOLE save, and a failed scene write does not
     // undo the parked flushes — so with anything in `landed` it was a real write reported as a
@@ -3011,7 +3024,7 @@ export function registerEditorAgentOps(): void {
     throw new OpRefusal(
       partialOr('REFUSED_BY_OP'),
       `save-all FAILED (${r.error ? `${r.reason}: ${r.error}` : r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
-      + (landed.length ? landedNote : ' Nothing was written.'),
+      + (landed.length ? landedNote : ' Nothing was written.') + droppedNote,
     );
   });
 

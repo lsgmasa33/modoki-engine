@@ -13,7 +13,7 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { whyWorldNotAuthored, notAuthoredAdvice } from '../scene/authoredWorld';
-import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, callBackend, postBackend, type BackendAnswer } from '../backend/editorBackend';
+import { backendFetch, writeAssetFile, writeAssetFileGuarded, jsonFileBody, callBackend, postBackend, type BackendAnswer, type DroppedSidecar } from '../backend/editorBackend';
 import { warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
 import {
   preloadNestedPrefabsForSubtree, getCachedPrefabSync, primeEditorPrefabCache, classifyExistingDocumentId,
@@ -110,19 +110,57 @@ export function planImports(
   fileNames: ReadonlyArray<string>,
   targetFolder: string,
   taken: Set<string>,
-): { name: string; dest: string; convert: boolean }[] {
-  return fileNames.map((name) => {
+): { name: string; dest: string; convert: boolean; sidecarOf?: { index: number; suffix: string }; ambiguous?: true }[] {
+  const pairs = pairDroppedSidecars(fileNames);
+  const plan: { name: string; dest: string; convert: boolean; sidecarOf?: { index: number; suffix: string }; ambiguous?: true }[] = fileNames.map((name, i) => {
+    if (pairs[i] === 'ambiguous') return { name, dest: '', convert: false, ambiguous: true };
+    if (pairs[i]) return { name, dest: '', convert: false };
     const dest = pastePathIn(targetFolder, `/${name}`, taken);
     taken.add(dest);
     return { name, dest, convert: CONVERTIBLE_RE.test(dest) };
+  });
+  // A paired sidecar follows its file's dest, " copy" suffix included: it IS that file's identity, wherever it lands.
+  pairs.forEach((pair, i) => { if (pair && pair !== 'ambiguous') plan[i] = { ...plan[i], dest: plan[pair.index].dest + pair.suffix, sidecarOf: pair }; });
+  return plan;
+}
+
+/** The sidecar suffixes a dropped file pairs with its own file by (#2048): the pair `writeMetaSidecar` writes. */
+const DROP_SIDECAR_SUFFIXES = ['.meta.json', '.meta.local.json'];
+
+/** Which dropped files are SIDECARS of another file in the same drop (#2048): entry `i` names its file's index and the
+ *  suffix, or is null. Matched by name (`hero.png` + `.meta.json`), ignoring case as the disks a drop comes from do.
+ *  A sidecar whose file is not in the drop is null: it is imported on its own, as before.
+ *  `'ambiguous'`: a sidecar whose file IS in the drop but cannot be told apart — the file's name or the sidecar's
+ *  appears more than once (two folders' worth of `hero.png` + `hero.png.meta.json`, flattened by the drop). It is NOT
+ *  imported: on its own it would land beside whichever png took the plain name, a GUID on another file's pixels. */
+export function pairDroppedSidecars(fileNames: ReadonlyArray<string>): Array<{ index: number; suffix: string } | 'ambiguous' | null> {
+  const count = new Map<string, number>();
+  for (const n of fileNames) count.set(n.toLowerCase(), (count.get(n.toLowerCase()) ?? 0) + 1);
+  const indexOf = new Map(fileNames.map((n, i) => [n.toLowerCase(), i] as const));
+  return fileNames.map((name) => {
+    const lower = name.toLowerCase();
+    for (const suffix of DROP_SIDECAR_SUFFIXES) {
+      if (!lower.endsWith(suffix)) continue;
+      const base = lower.slice(0, -suffix.length);
+      // Only a FILE pairs: a sidecar of a sidecar is not a pair (`x.meta.json.meta.json`).
+      if (!count.has(base) || DROP_SIDECAR_SUFFIXES.some((s) => base.endsWith(s))) continue;
+      if (count.get(lower) !== 1 || count.get(base) !== 1) return 'ambiguous';
+      return { index: indexOf.get(base)!, suffix };
+    }
+    return null;
   });
 }
 
 /** Write one dropped file's bytes to the `dest` {@link planImports} chose — only into an EMPTY path (#1784). `dest` was planned against the panel's in-memory listing, not the
  *  disk, so a file that landed there since (another import, an agent, a `git pull`) was otherwise overwritten with no
- *  word. `'taken'` is that case: the file there is left as it is. A `'failed'` carries the route's reason (#1811). */
-export async function writeDroppedImport(dest: string, base64: string): Promise<{ result: 'ok' | 'taken' } | { result: 'failed'; error: string }> {
-  const w = await writeAssetFileGuarded(dest, base64, { encoding: 'base64', createOnly: true });
+ *  word. `'taken'` is that case: the file there is left as it is. A `'failed'` carries the route's reason (#1811).
+ *  `sidecars` are the file's own sidecars from the same drop (#2048), written in the SAME request, so the pair lands as
+ *  one: the scan's heal can never mint the file an identity in a gap between them, and an orphan at the sidecar's path
+ *  is replaced rather than refused. */
+export async function writeDroppedImport(
+  dest: string, base64: string, sidecars: readonly DroppedSidecar[] = [],
+): Promise<{ result: 'ok' | 'taken' } | { result: 'failed'; error: string }> {
+  const w = await writeAssetFileGuarded(dest, base64, { encoding: 'base64', createOnly: true, sidecars });
   return w.result === 'conflict' ? { result: 'taken' } : w;
 }
 

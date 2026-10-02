@@ -59,7 +59,7 @@ import { getReimportHandler, getReimportTypes, type ReimportContext, type Reimpo
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
 import { classifyPrefabIdentityWrite, admittedPrefab } from './prefabIdentityGuard';
-import { JSON_ASSET_SUFFIX_TYPE, classifyBinaryExt, classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
+import { JSON_ASSET_SUFFIX_TYPE, classifyBinaryExt, classifyJsonAssetPath, classifyJsonAssetSuffix, ENGINE_ASSETS_URL_PREFIX } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -724,6 +724,47 @@ function assetRootOperandRefusal(ctx: BackendContext, absPath: string, input: st
   }, 400);
 }
 
+/** True when `absPath` is the ENGINE's built-in asset root (`/modoki/assets`) or anything inside it (#1959). Decided by the
+ *  url the path maps to, so an asset url and an in-project `/@fs` path answer alike. */
+function inEngineAssetRoot(ctx: BackendContext, absPath: string): boolean {
+  const url = ctx.absToAssetUrl(absPath);
+  if (url !== null) return url.startsWith(ENGINE_ASSETS_URL_PREFIX + '/');
+  // `absToAssetUrl` answers null for a root folder itself (`assetRootOperandRefusal`'s rule).
+  const engineRoot = ctx.resolveAssetPath(ENGINE_ASSETS_URL_PREFIX + '/');
+  return engineRoot !== null && samePath(engineRoot, absPath);
+}
+
+/** True when this backend runs inside the PACKAGED editor (`main.ts` exports it from `app.isPackaged`), where the engine
+ *  root is inside the signed bundle (#326). */
+const runningPackaged = (): boolean => process.env.MODOKI_PACKAGED === '1';
+
+/** A write, move or delete whose operand or destination is inside the ENGINE's built-in asset root, or null (#1959, hub
+ *  ruling 2026-10-03). That root is READ-ONLY through the project routes, as Unity's registry packages are immutable:
+ *  its files are shared by every project, and in the packaged editor they sit inside the signed app bundle, where a
+ *  write breaks #326's "the app writes nothing into its own bundle". `/api/unused-assets` (never offers them),
+ *  `defaultSaveRootDir` (never saves there) and the scan's collision heal (never re-mints a built-in, #2003) already
+ *  kept to it; every write route accepted it, and `modoki_delete_asset` trashed the engine's own font, `ok:true`.
+ *
+ *  `devOnly`: the route stays open in a DEV clone and refuses only in the packaged editor. That is the import-settings
+ *  pair (`/api/write-meta`, `/api/reimport`), the one editor feature that edits a built-in on purpose: the Inspector
+ *  shows a built-in's import settings, and an engine developer applying them in a clone is editing the engine repo,
+ *  which is where a built-in is changed. Nothing else writes the root through a route. */
+function engineAssetRootRefusal(
+  ctx: BackendContext, absPath: string, input: string, verb: string, opts: { devOnly?: boolean } = {},
+): BackendResult | null {
+  if (opts.devOnly && !runningPackaged()) return null;
+  if (!inEngineAssetRoot(ctx, absPath)) return null;
+  return json({
+    ok: false, code: 'REFUSED_BY_OP' satisfies ErrorCode, reason: 'engine-asset-root', engineAssetRoot: true,
+    error: `Refusing to ${verb} ${input}: it is inside the engine's built-in asset root (${ENGINE_ASSETS_URL_PREFIX}), which is read-only `
+      + 'through the editor. Nothing was changed.',
+    options: [
+      "to change an engine built-in, edit its files directly in the engine repo (engine/packages/modoki/src/runtime/assets/), not through the editor",
+      "to use a changed copy in this project, copy it into the project's own asset root and reference the copy: modoki_duplicate_asset {from: <the built-in>, to: /assets/…}, or Reveal in Finder and drop the file into the Assets panel",
+    ],
+  }, 400); // `refusalStatus('REFUSED_BY_OP')`, spelled as the literal `getOkFalseGuard` reads
+}
+
 /** True when a move or copy to `absTo` would overwrite something (the never-clobber rule of move-file and
  *  duplicate-asset). A case-only rename (`Sprites` → `sprites`) on a case-insensitive disk resolves to the SAME entry
  *  as the source, which is not a collision, so "same entry" is decided by inode+device, never by string compare.
@@ -867,6 +908,42 @@ function sidecarWrittenAheadOfFile(sidecarAbs: string): boolean {
 function removeOrphanSidecarsBefore(absTarget: string): string[] {
   return removeOrphanSidecars(absTarget, sidecarWrittenAheadOfFile);
 }
+/** `/api/write-file`'s `sidecars` (#2048): the file's OWN sidecars, `[{suffix, content}]`, written in the same request
+ *  so an OS drop of a file and its `.meta.json` lands as one unit. Two ways a drop of the pair lost the dropped GUID
+ *  when it took two requests: png first, the watcher's heal minted the png a sidecar in the gap and the dropped one was
+ *  refused as taken; `.meta.json` first over an orphan, the sidecar's create was refused and the png's create then
+ *  removed the orphan. Create-only (`ifNoneMatch:'*'`): a pair is an import, never an overwrite of a live identity.
+ *  `content` is UTF-8 text (a sidecar is JSON). An absent or empty list is `{list: []}`, the plain single-file write. */
+function pairedSidecars(absPath: string, raw: unknown, ifNoneMatch: unknown): { list: Array<{ abs: string; bytes: Buffer }> } | { error: string } {
+  if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) return { list: [] };
+  if (!Array.isArray(raw)) return { error: 'sidecars must be an array of { suffix, content }' };
+  if (ifNoneMatch !== '*') return { error: "sidecars ride only on a create-only write (ifNoneMatch: '*'): a pair is an import, never an overwrite" };
+  if (SIDECAR_SUFFIXES.some((s) => absPath.toLowerCase().endsWith(s))) return { error: 'a sidecar has no sidecars of its own' };
+  const list: Array<{ abs: string; bytes: Buffer }> = [];
+  for (const entry of raw) {
+    const { suffix, content } = (entry ?? {}) as { suffix?: unknown; content?: unknown };
+    if (typeof suffix !== 'string' || !SIDECAR_SUFFIXES.includes(suffix)) return { error: `sidecars[].suffix must be one of ${SIDECAR_SUFFIXES.join(', ')}` };
+    if (typeof content !== 'string') return { error: `sidecars[].content must be a string (the ${suffix} text)` };
+    if (list.some((p) => p.abs === absPath + suffix)) return { error: `sidecars names ${suffix} twice` };
+    list.push({ abs: absPath + suffix, bytes: Buffer.from(content) });
+  }
+  return { list };
+}
+
+/** The sidecar at `absPath` is an ORPHAN a create-only write may REPLACE (#2048, Unity's rule): its file is absent and
+ *  this backend did not write it ahead of that file. That is exactly the sidecar `removeOrphanSidecars` deletes when the
+ *  file is created, so refusing the create (`if-none-match`) only made the drop lose the sidecar it carried: the png's
+ *  create then removed the orphan and the png got a fresh GUID. False for anything that is not a sidecar, for a sidecar
+ *  whose file is there, for one still waiting for its file (`sidecarsAheadOfFile`), and for a non-file entry. */
+function replaceableOrphanSidecar(absPath: string): boolean {
+  const suffix = SIDECAR_SUFFIXES.find((s) => absPath.toLowerCase().endsWith(s));
+  if (suffix === undefined) return false;
+  const base = absPath.slice(0, -suffix.length);
+  if (fs.existsSync(base)) return false;
+  try { if (!fs.statSync(absPath).isFile()) return false; } catch { return false; }
+  return !sidecarWrittenAheadOfFile(base + suffix);
+}
+
 /** The file a sidecar was written ahead of has ARRIVED: use the record up. ⚠️ Called right after the route's commit (its
  *  rename, copy or move), never with the removal before it (close-out review): a create that failed after using the
  *  record up left the dropped sidecar unvouched for, and the drop's retry then deleted it, #1992 one retry later. */
@@ -3684,7 +3761,7 @@ async function describeUnresolvedAgainstLiveWorld(
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
         if (!absPath) return outsideAssetRoots('Path outside allowed directories');
-        const rootRefusal = assetRootOperandRefusal(ctx, absPath, p, 'delete');
+        const rootRefusal = assetRootOperandRefusal(ctx, absPath, p, 'delete') ?? engineAssetRootRefusal(ctx, absPath, p, 'delete');
         if (rootRefusal) return rootRefusal;
         absOf.set(p, absPath);
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
@@ -4145,6 +4222,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // `reason` is the token the caller branches on, `error` the sentence a person reads (R1, #1824): `error` held the
       // token, which any reader that states `error` would have put on screen as it was.
       if (!reply) return json({ reason: 'outside-asset-roots', error: `${outcome.path} is outside this project's asset roots`, abs: outcome.path });
+      // The engine root maps to a url, but nothing may be saved there (#1959): every write route would refuse it.
+      if (inEngineAssetRoot(ctx, outcome.path)) {
+        return json({ reason: 'engine-asset-root', error: `${reply.path} is inside the engine's built-in assets, which are read-only`, abs: outcome.path });
+      }
       return json(reply);
     } catch (e) {
       return json({ error: String(e) }, 500);
@@ -4395,6 +4476,8 @@ async function describeUnresolvedAgainstLiveWorld(
       const resolved = ctx.resolveAssetPath(assetPath);
       // Was an EMPTY-bodied 403, which the MCP read as the wrong-editor refusal (#1212 A-5).
       if (!resolved) return outsideAssetRoots(`path outside allowed directories: ${assetPath}`);
+      const engineRefusal = engineAssetRootRefusal(ctx, resolved, assetPath, 'write the import settings of', { devOnly: true });
+      if (engineRefusal) return engineRefusal;
       // ⚠️ A sidecar belongs to an ASSET, and `resolveAssetPath` only maps a url — it never looks
       // (#1215 A-2). So a typo'd path wrote an orphan `.meta.json` next to nothing and answered ok,
       // and the named verification read, `get_asset_meta`, then read the orphan back and "confirmed"
@@ -4644,10 +4727,29 @@ async function describeUnresolvedAgainstLiveWorld(
       };
       let targets: ManifestEntry[];
       if (recursive) {
+        // A recursive re-import AT the engine root or inside it, in the packaged editor, is the coded refusal (#1959),
+        // not the empty match below, which would tell the caller it mistyped the path.
+        const folderAbs = target === '/' ? null : ctx.resolveAssetPath(target.replace(/\/*$/, '/'));
+        const engineRefusal = folderAbs ? engineAssetRootRefusal(ctx, folderAbs, target, 're-import', { devOnly: true }) : null;
+        if (engineRefusal) return engineRefusal;
         const prefix = target === '/' ? '' : target.replace(/\/+$/, '');
         targets = manifest.assets.filter((a) => a.path.startsWith(prefix + '/'));
       } else {
         targets = manifest.assets.filter((a) => a.path === target);
+        const abs = targets.length === 1 ? ctx.resolveAssetPath(target) : null;
+        const engineRefusal = abs ? engineAssetRootRefusal(ctx, abs, target, 're-import', { devOnly: true }) : null;
+        if (engineRefusal) return engineRefusal;
+      }
+      // A recursive re-import is the PROJECT's: a packaged editor leaves the engine's built-ins out (#1959), since their
+      // sidecars are inside its bundle. A dev clone keeps them (`engineAssetRootRefusal`'s `devOnly`).
+      if (recursive && runningPackaged()) {
+        const before = targets.length;
+        targets = targets.filter((a) => !a.path.startsWith(ENGINE_ASSETS_URL_PREFIX + '/'));
+        // Everything it matched was a built-in (`/modoki`): the coded refusal, not "check the path/casing" below. Not for
+        // `/`, which is not inside the engine root (a project with no assets of its own keeps the 404 that says so).
+        const engineRoot = before > 0 && targets.length === 0 && target !== '/' ? ctx.resolveAssetPath(ENGINE_ASSETS_URL_PREFIX + '/') : null;
+        const engineRefusal = engineRoot ? engineAssetRootRefusal(ctx, engineRoot, target, 're-import') : null;
+        if (engineRefusal) return engineRefusal;
       }
       // No manifest asset matched the path (typo / casing / a derived or non-manifest file). With an
       // empty target list the loop is skipped and `ok` below would be `converted>0 || errors.length===0`
@@ -4848,6 +4950,8 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
+      const engineRefusal = engineAssetRootRefusal(ctx, abs, assetPath, 'write');
+      if (engineRefusal) return engineRefusal;
       // `type` only picks the schema `data` is validated against; the FILE decides what it is (#1472).
       const kindRefusal = wrongKindRefusal(ctx, abs, type);
       if (kindRefusal) return kindRefusal;
@@ -5123,6 +5227,8 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
       if (!abs) return outsideAssetRoots('path outside allowed directories');
+      const engineRefusal = engineAssetRootRefusal(ctx, abs, assetPath, 'create');
+      if (engineRefusal) return engineRefusal;
       if (fs.existsSync(abs)) return json({ error: `destination exists: ${assetPath}` }, 409);
       // A name the manifest would type as another kind (#1472) — `x.scene.json` from `type:'material'`.
       const kindRefusal = wrongKindRefusal(ctx, abs, type);
@@ -5157,7 +5263,9 @@ async function describeUnresolvedAgainstLiveWorld(
   // under an asset root. Suppresses the watcher hot-reload for the editor's own save.
   if (urlPath === '/api/write-file' && method === 'POST') {
     try {
-      const { path: filePath, content, encoding, ifMatch, ifNoneMatch } = (body ?? {}) as { path: string; content: unknown; encoding?: string; ifMatch?: string; ifNoneMatch?: string };
+      const { path: filePath, content, encoding, ifMatch, ifNoneMatch, sidecars: rawSidecars } = (body ?? {}) as {
+        path: string; content: unknown; encoding?: string; ifMatch?: string; ifNoneMatch?: string; sidecars?: unknown;
+      };
       // Asset URL or in-project /@fs path; null → 403 (see resolveWritableFilePath), with the reason (#1776): an empty
       // body reached the agent's prefab create as ok:false and nothing else. Not `outsideAssetRoots` — this route also
       // takes an in-project /@fs path, which that advice calls unaccepted.
@@ -5168,6 +5276,12 @@ async function describeUnresolvedAgainstLiveWorld(
           options: ["pass an asset-root URL of THIS project (e.g. /assets/prefabs/enemy.prefab.json) — modoki_list_assets lists the roots' paths"],
         }, 403);
       }
+      const engineRefusal = engineAssetRootRefusal(ctx, absPath, filePath, 'write');
+      if (engineRefusal) return engineRefusal;
+      // `sidecars`: the file's own sidecars, written in the SAME request (#2048) — the Assets panel's OS drop of a file
+      // together with its `.meta.json`. See `pairedSidecars`.
+      const paired = pairedSidecars(absPath, rawSidecars, ifNoneMatch);
+      if ('error' in paired) return json({ error: paired.error }, 400);
       // Optional `ifMatch` precondition (#469) — a server-side conditional write, so a
       // compare-and-swap caller gets the compare and the write as ONE atomic operation instead
       // of doing its own read-then-write with a gap a second write can land in between. Absent
@@ -5215,12 +5329,17 @@ async function describeUnresolvedAgainstLiveWorld(
       // purpose. The caller that needs it is a "New X" create, which would otherwise replace an
       // existing asset under a freshly minted guid and dangle every ref to the old one. Checked in
       // the same synchronous window as `ifMatch`, for the same reason.
-      if (ifNoneMatch === '*' && fs.existsSync(absPath)) {
+      // A create-only write of a SIDECAR replaces an orphan there (#2048): `replaceableOrphanSidecar`.
+      // …and each paired sidecar's path is judged by the same rule, so a pair over a LIVE sidecar is refused whole.
+      const takenAt = ifNoneMatch !== '*' ? null
+        : fs.existsSync(absPath) && !replaceableOrphanSidecar(absPath) ? absPath
+          : paired.list.find((p) => fs.existsSync(p.abs) && !replaceableOrphanSidecar(p.abs))?.abs ?? null;
+      if (takenAt !== null) {
         // `existingPath` is the url of what is REALLY there, spelled the way the disk spells it
         // (#1273). `existsSync` is case-insensitive on APFS/NTFS, so `enemy.prefab.json` 409s over
         // `Enemy.prefab.json` — and a caller that then asked the manifest about its OWN spelling found
         // no asset, no kind to refuse, and replaced a prefab with a scene. Null for a `/@fs` path.
-        const existingPath = ctx.absToAssetUrl(absPath, { onDisk: true });
+        const existingPath = ctx.absToAssetUrl(takenAt, { onDisk: true });
         return json({
           ok: false, conflict: true, reason: 'if-none-match', existingPath,
           // The sentence (R1, #1824) — the client reads `error` first; `reason` stays the token callers branch on.
@@ -5248,15 +5367,33 @@ async function describeUnresolvedAgainstLiveWorld(
       // #1975: a file created where none existed never adopts a dead asset's sidecar (a no-op when the file exists).
       // AFTER the tmp write (#1992 part 2), where ENOSPC/EACCES happen, so a failed write removes nothing; the rename
       // is the commit. A sidecar written ahead of this file by this backend is kept (#1992).
-      writeFileAtomic(absPath, bytes, () => removeOrphanSidecarsBefore(absPath));
+      // A PAIR (#2048) lands its sidecars inside the same commit window, BEFORE the file's rename: every scan that sees
+      // the file sees its sidecar, so the heal never mints the file a second identity, whichever order the OS dropped
+      // them in. The orphans go first (the pair's own paths among them, replaced anyway), then the pair is written. A
+      // failure anywhere after that (a sidecar's write, the file's rename) takes the pair's sidecars back out, so a
+      // failed pair leaves no sidecar waiting for a file that never came.
+      const pairWritten: string[] = [];
+      try {
+        writeFileAtomic(absPath, bytes, () => {
+          removeOrphanSidecarsBefore(absPath);
+          for (const p of paired.list) { writeFileAtomic(p.abs, p.bytes); pairWritten.push(p.abs); }
+        });
+      } catch (e) {
+        for (const w of pairWritten) fs.rmSync(w, { force: true });
+        throw e;
+      }
       sidecarsAheadArrived(absPath);
       ctx.markEditorWrite(absPath, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
+      for (const p of paired.list) ctx.markEditorWrite(p.abs, fingerprintBytes(p.bytes));
       if (ifNoneMatch === '*') noteSidecarAheadOfFile(absPath);
       // `path`: the url of the file just written, spelled the way the DISK does (#1273 close-out review).
       // A create at `/assets/SCENES/new.json` lands in an existing `scenes/` folder on APFS/NTFS, and the
       // scanner keys it `/assets/scenes/new.json` — a caller registering the spelling it asked for would
       // give the manifest a key the scan never produces. Null for a `/@fs` path.
-      return json({ ok: true, path: ctx.absToAssetUrl(absPath, { onDisk: true }) });
+      return json({
+        ok: true, path: ctx.absToAssetUrl(absPath, { onDisk: true }),
+        ...(paired.list.length ? { sidecars: paired.list.map((p) => ctx.absToAssetUrl(p.abs, { onDisk: true })) } : {}),
+      });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -5283,6 +5420,8 @@ async function describeUnresolvedAgainstLiveWorld(
           options: ['pass an asset-root URL of THIS project (e.g. /assets/scenes/main.scene.json) — modoki_list_scenes lists valid values'],
         }, 403);
       }
+      const engineRefusal = engineAssetRootRefusal(ctx, absPath, filePath, 'save a scene to');
+      if (engineRefusal) return engineRefusal;
       // The open scene's OWN file under another spelling — `%20`, `./`, a `/@fs/` form, a case
       // variant — which the client's string compare cannot see. Writing a copy here would give the
       // ORIGINAL a fresh id and reminted entity guids, the very damage this route exists to prevent.
@@ -5340,6 +5479,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const absTo = ctx.resolveAssetPath(to);
       if (!absFrom || !absTo) return outsideAssetRoots('Path outside allowed directories');
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
+      // Copying a built-in OUT is the remedy the refusal names; only a copy INTO the engine root is refused.
+      const engineRefusal = engineAssetRootRefusal(ctx, absTo, to, 'copy anything to');
+      if (engineRefusal) return engineRefusal;
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
       // ── The unsaved-work gate (#882 for the sidecar, #889 for the DOCUMENT) ──────────────
       // `duplicateAssetFile` has TWO branches and #882 gated only one of them. The binary branch
@@ -5424,7 +5566,8 @@ async function describeUnresolvedAgainstLiveWorld(
       const absTo = ctx.resolveAssetPath(to);
       if (!absFrom || !absTo) return outsideAssetRoots('Path outside allowed directories');
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
-      const rootRefusal = assetRootOperandRefusal(ctx, absFrom, from, 'move');
+      const rootRefusal = assetRootOperandRefusal(ctx, absFrom, from, 'move')
+        ?? engineAssetRootRefusal(ctx, absFrom, from, 'move') ?? engineAssetRootRefusal(ctx, absTo, to, 'move anything to');
       if (rootRefusal) return rootRefusal;
       // Never clobber an existing asset on move/rename (renameSync would silently destroy it), except a case-only
       // rename — see `destinationTaken`. Asked here so a collision refuses before the renderer probe below, and
@@ -5549,6 +5692,8 @@ async function describeUnresolvedAgainstLiveWorld(
       const { path: folderPath } = (body ?? {}) as { path: string };
       const absPath = ctx.resolveAssetPath(folderPath);
       if (!absPath) return outsideAssetRoots('Path outside allowed directories');
+      const engineRefusal = engineAssetRootRefusal(ctx, absPath, folderPath, 'create a folder at');
+      if (engineRefusal) return engineRefusal;
       if (fs.existsSync(absPath)) return json({ error: 'Folder exists' }, 409);
       createFolderAt(absPath);
       return json({ ok: true, saved: true });
@@ -6641,6 +6786,8 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!fs.existsSync(srcPath) || !fs.statSync(srcPath).isFile()) return json({ error: `source not found or not a file: ${srcPath}` }, 404);
       const destDirAbs = ctx.resolveAssetPath(destFolder);
       if (!destDirAbs) return outsideAssetRoots('destFolder outside allowed directories');
+      const engineRefusal = engineAssetRootRefusal(ctx, destDirAbs, destFolder, 'import into');
+      if (engineRefusal) return engineRefusal;
       const base = path.basename(srcPath);
       const destAbs = path.join(destDirAbs, base);
       if (fs.existsSync(destAbs)) return json({ error: `destination exists: ${base}` }, 409);

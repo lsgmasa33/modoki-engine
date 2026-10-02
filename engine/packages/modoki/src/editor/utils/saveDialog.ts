@@ -170,7 +170,12 @@ export async function chooseNewAssetPath(
   }
   // The token is `reason` since #1824 (`error` is the sentence); a backend from before that sent it as `error`.
   if (res.reason === 'outside-asset-roots' || res.error === 'outside-asset-roots') {
-    await alertInEditor('Outside the project', 'Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
+    await alertInEditor('Outside the project', 'Please choose a location inside the project (a game\'s assets/ folder).');
+    return null;
+  }
+  // The engine's built-in assets are read-only (#1959): every write route refuses them, so the dialog says so now.
+  if (res.reason === 'engine-asset-root') {
+    await alertInEditor('Engine assets are read-only', 'The engine\'s built-in assets cannot be changed from the editor. Please choose a location inside the project (a game\'s assets/ folder).');
     return null;
   }
   // Fallback: no native panel (a browser dev tab off macOS), a failed panel, or a server error —

@@ -390,3 +390,109 @@ describe('#1992 a sidecar written ahead of its file is kept by that file\'s crea
     expect(fs.existsSync(path.join(root, 'x.png.meta.json'))).toBe(true);
   });
 });
+
+describe('#2048 an OS drop of a file and its .meta.json keeps the dropped GUID, in either order and over an orphan', () => {
+  const b64 = (s: string) => Buffer.from(s).toString('base64');
+  const create = (ctx: BackendContext, p: string, content: string, sidecars?: unknown) =>
+    post(ctx, '/api/write-file', { path: p, content: b64(content), encoding: 'base64', ifNoneMatch: '*', ...(sidecars ? { sidecars } : {}) });
+  const META = '{"id":"dropped-guid","sprite":{"slices":[{"id":"s1"}]}}';
+  const ORPHAN = '{"id":"dead-guid"}';
+
+  describe('(1) a create-only write of a sidecar REPLACES an orphan', () => {
+    it('case 2, meta first over an orphan (OBSERVED in the issue): the png ends up with the dropped GUID', async () => {
+      const root = scratch('orphan-meta-first');
+      fs.writeFileSync(path.join(root, 'x.png.meta.json'), ORPHAN);   // its png was deleted in Finder
+      const ctx = makeCtx(root);
+      expect((await create(ctx, '/x.png.meta.json', META)).body.ok).toBe(true);
+      expect((await create(ctx, '/x.png', 'png')).body.ok).toBe(true);
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe(META);
+    });
+
+    it('REFUSE SIDE: a sidecar whose file is there is a live identity, and stays taken', async () => {
+      const root = scratch('live');
+      fs.writeFileSync(path.join(root, 'x.png'), 'png');
+      fs.writeFileSync(path.join(root, 'x.png.meta.json'), '{"id":"live-guid"}');
+      const r = await create(makeCtx(root), '/x.png.meta.json', META);
+      expect(r.status).toBe(409);
+      expect(r.body.reason).toBe('if-none-match');
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe('{"id":"live-guid"}');
+    });
+
+    it('REFUSE SIDE: a sidecar this backend wrote AHEAD of its file is still waiting for it, not an orphan', async () => {
+      const root = scratch('ahead');
+      const ctx = makeCtx(root);
+      await create(ctx, '/x.png.meta.json', META);
+      const r = await create(ctx, '/x.png.meta.json', ORPHAN);
+      expect(r.status).toBe(409);
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe(META);
+    });
+
+    it('REFUSE SIDE: a create-only write of an ordinary file is not relaxed', async () => {
+      const root = scratch('plain');
+      fs.writeFileSync(path.join(root, 'x.png'), 'old');
+      expect((await create(makeCtx(root), '/x.png', 'new')).status).toBe(409);
+      expect(fs.readFileSync(path.join(root, 'x.png'), 'utf-8')).toBe('old');
+    });
+  });
+
+  describe('(2) the file and its sidecars as ONE request', () => {
+    it('the sidecar is on disk BEFORE the file appears — no scan can see the file alone (case 1)', async () => {
+      const root = scratch('pair-order');
+      const seenAtCommit: boolean[] = [];
+      const real = fs.renameSync;
+      const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+        if (String(to) === path.join(root, 'x.png')) seenAtCommit.push(fs.existsSync(path.join(root, 'x.png.meta.json')));
+        return real(from, to);
+      });
+      try {
+        const r = await create(makeCtx(root), '/x.png', 'png', [{ suffix: '.meta.json', content: META }]);
+        expect(r.body).toMatchObject({ ok: true, path: '/x.png', sidecars: ['/x.png.meta.json'] });
+      } finally { rename.mockRestore(); }
+      expect(seenAtCommit).toEqual([true]);
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe(META);
+    });
+
+    it('case 2 in the pair: an orphan at the sidecar path is replaced, other orphans of the file are removed', async () => {
+      const root = scratch('pair-orphan');
+      fs.writeFileSync(path.join(root, 'x.png.meta.json'), ORPHAN);
+      fs.writeFileSync(path.join(root, 'x.png.meta.local.json'), '{"stats":"dead"}');
+      expect((await create(makeCtx(root), '/x.png', 'png', [{ suffix: '.meta.json', content: META }])).body.ok).toBe(true);
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe(META);
+      expect(fs.existsSync(path.join(root, 'x.png.meta.local.json'))).toBe(false);
+    });
+
+    it('a pair whose sidecar path holds one still waiting for its file is refused WHOLE: nothing written', async () => {
+      const root = scratch('pair-ahead');
+      const ctx = makeCtx(root);
+      await create(ctx, '/x.png.meta.json', ORPHAN);   // a lone .meta.json dropped earlier, its png not yet here
+      const r = await create(ctx, '/x.png', 'png', [{ suffix: '.meta.json', content: META }]);
+      expect(r.status).toBe(409);
+      expect(r.body.existingPath).toBe('/x.png.meta.json');
+      expect(fs.existsSync(path.join(root, 'x.png'))).toBe(false);
+      expect(fs.readFileSync(path.join(root, 'x.png.meta.json'), 'utf-8')).toBe(ORPHAN);
+    });
+
+    it('a pair whose FILE fails at its commit leaves no sidecar behind', async () => {
+      const root = scratch('pair-fails');
+      const real = fs.renameSync;
+      const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+        if (String(to) === path.join(root, 'x.png')) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+        return real(from, to);
+      });
+      try {
+        expect((await create(makeCtx(root), '/x.png', 'png', [{ suffix: '.meta.json', content: META }])).status).toBe(500);
+      } finally { rename.mockRestore(); }
+      expect(fs.readdirSync(root)).toEqual([]);
+    });
+
+    it('sidecars are refused on anything but a create-only write, and with an unknown suffix', async () => {
+      const root = scratch('pair-bad');
+      const ctx = makeCtx(root);
+      const plain = await post(ctx, '/api/write-file', { path: '/x.png', content: b64('png'), encoding: 'base64', sidecars: [{ suffix: '.meta.json', content: META }] });
+      expect(plain.status).toBe(400);
+      expect((await create(ctx, '/x.png', 'png', [{ suffix: '.txt', content: 'x' }])).status).toBe(400);
+      expect((await create(ctx, '/x.png.meta.json', META, [{ suffix: '.meta.json', content: META }])).status).toBe(400);
+      expect(fs.readdirSync(root)).toEqual([]);
+    });
+  });
+});

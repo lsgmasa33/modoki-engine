@@ -60,7 +60,7 @@ import {
   SIDECAR_FORMAT_VERSION,
 } from './meta-sidecar';
 import { classifyPrefabWrite } from './prefabWriteGuard';
-import { classifyJsonAssetPath, ID_BEARING_TYPES, BINARY_EXT_TYPE } from './assetTypes';
+import { classifyJsonAssetPath, ID_BEARING_TYPES, BINARY_EXT_TYPE, ENGINE_ASSETS_URL_PREFIX } from './assetTypes';
 import { getCacheDir, cachePathFor } from './texture-cache';
 import { getAudioCacheDir, audioCachePathFor } from './audio-cache';
 import { convertAudio } from './audio-convert';
@@ -1768,8 +1768,8 @@ export function resolveModokiAssetsDir(
   ].find((d): d is string => !!d && exists(d));
 }
 
-/** URL prefix of the engine's built-in, read-only asset root. */
-export const ENGINE_ASSETS_URL_PREFIX = '/modoki/assets';
+/** URL prefix of the engine's built-in, read-only asset root (defined in `assetTypes.ts`, which the router can import). */
+export { ENGINE_ASSETS_URL_PREFIX };
 
 /** Where a Save dialog opens when its caller names no folder: the first PROJECT root, never the
  *  engine's. `findAssetRoots` pushes the engine root FIRST (it must resolve whatever project is

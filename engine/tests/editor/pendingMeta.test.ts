@@ -166,6 +166,28 @@ describe('flushing', () => {
     expect(hasUnsavedChanges()).toBe(true);
   });
 
+  it('#1959: a write the editor can NEVER make (a built-in in the packaged editor) is DROPPED, not re-parked', async () => {
+    // Re-parked, it could never save: `hasUnsavedChanges()` would stay true for good, and every gate keyed on it with it.
+    reply = { status: 400, body: { ok: false, code: 'REFUSED_BY_OP', reason: 'engine-asset-root', error: 'Refusing to write the import settings of a built-in' } };
+    const BUILTIN = '/modoki/assets/fonts/Inter.ttf';
+    parkAsPanel(BUILTIN, { font: { size: 48 } });
+
+    const r = await flushPendingMeta();
+
+    const { hasUnsavedChanges } = await import('../../packages/modoki/src/editor/scene/serialize');
+    expect(r.failed).toEqual([{ path: BUILTIN, error: 'Refusing to write the import settings of a built-in', dropped: true }]);
+    expect(isMetaDirty(BUILTIN)).toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+  });
+
+  it('#1959: flushPendingMetaFor drops it the same way', async () => {
+    reply = { status: 400, body: { ok: false, code: 'REFUSED_BY_OP', reason: 'engine-asset-root', error: 'read-only' } };
+    const BUILTIN = '/modoki/assets/fonts/Inter.ttf';
+    parkAsPanel(BUILTIN, { font: { size: 48 } });
+    expect(await flushPendingMetaFor(BUILTIN)).toEqual({ saved: [], failed: [{ path: BUILTIN, error: 'read-only', dropped: true }] });
+    expect(isMetaDirty(BUILTIN)).toBe(false);
+  });
+
   it('one rejected write does not block the others', async () => {
     let n = 0;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {

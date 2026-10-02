@@ -1497,17 +1497,24 @@ export default function Assets() {
     try {
       for (let i = 0; i < list.length; i++) {
         const file = list[i];
-        const { dest, convert } = plan[i];
+        const { dest, convert, sidecarOf, ambiguous } = plan[i];
+        // A sidecar dropped WITH its file is written in that file's request (#2048), not on its own.
+        if (sidecarOf) continue;
+        if (ambiguous) { refused.push(`${file.name}: the drop holds more than one ${file.name} or more than one of the file it belongs to, so which file it is the sidecar of cannot be told. Any such file was imported with a new identity; delete it, then drop each file with its .meta.json on its own`); continue; }
         setImportStatus(true, file.name, i, list.length);
         // A JSON asset's identity is decided BEFORE the write (#1713), as modoki_import_file decides it — and these
         // are the bytes the redo re-writes, so it never brings the source's id back.
+        // Its paired sidecars are named with it in a refusal: they were not imported either.
+        const pairedOf = plan.flatMap((p, j) => (p.sidecarOf?.index === i ? [j] : []));
+        const named = pairedOf.length ? `${file.name} (with ${pairedOf.map((j) => list[j].name).join(', ')})` : file.name;
         const bytes = await importedFileBytes(dest, await fileToBase64(file), claimed);
-        if ('error' in bytes) { refused.push(`${file.name}: ${bytes.error}`); continue; }
+        if ('error' in bytes) { refused.push(`${named}: ${bytes.error}`); continue; }
         const content = bytes.content;
+        const sidecars = await Promise.all(pairedOf.map((j) => list[j].text().then((text) => ({ suffix: plan[j].sidecarOf!.suffix, content: text }))));
         // Only into an EMPTY path (#1784): `dest` was planned against the listing, not the disk.
-        const wrote = await writeDroppedImport(dest, content);
-        if (wrote.result === 'taken') { refused.push(`${file.name}: a file appeared at ${dest} since the panel listed the folder, and it was left as it is — drop it again to import it as a copy`); continue; }
-        if (wrote.result === 'failed') { refused.push(`${file.name}: ${wrote.error}`); continue; }
+        const wrote = await writeDroppedImport(dest, content, sidecars);
+        if (wrote.result === 'taken') { refused.push(`${named}: a file appeared at ${dest} since the panel listed the folder, and it was left as it is — drop it again to import it as a copy`); continue; }
+        if (wrote.result === 'failed') { refused.push(`${named}: ${wrote.error}`); continue; }
         imported.push({ path: dest, content, convert });
         setImportStatus(true, file.name, i + 1, list.length);
       }

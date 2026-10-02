@@ -645,7 +645,7 @@ flow falls back to the in-app prompt, Browse… alerts. Before #1440 both routes
 
 **Where the save panel opens.** The caller's `defaultFolder` (an Assets-panel folder, or a kind's
 own, e.g. scenes → `/assets/scenes`); with none, `firstRootDir()` = `defaultSaveRootDir`: the first
-PROJECT asset root, never the engine's `/modoki/assets`. Until #1441 it was `assetRoots[0]`, which is
+PROJECT asset root, never the engine's `/modoki/assets` (a location picked there is refused, #1959). Until #1441 it was `assetRoots[0]`, which is
 the engine root, so Create ▸ Particle (and every toolbar create with no `defaultFolder`) opened in
 `engine/packages/modoki/src/runtime/assets/`, and the default name wrote there. macOS had hidden it:
 osascript reopened at its remembered location, while Electron's panel honours the directory it is
@@ -4216,6 +4216,31 @@ nothing. A step that runs after the data has landed never turns that success int
   answers its "copied, not finished" 422 instead. The raw form stays only on `/api/rescan-assets`,
   where the rebuild IS the operation.
 
+#### The engine's built-in asset root is read-only (#1959)
+
+`/modoki/assets` (`ENGINE_ASSETS_URL_PREFIX`, `assetTypes.ts`) is the engine's own fonts, HDRs and
+icons, shared by every project and, in the packaged editor, inside the signed app bundle (#326). It
+is **read-only through every project route** (hub ruling 2026-10-03; Unity's registry packages are
+immutable): `engineAssetRootRefusal` (`editorBackendRouter.ts`) refuses a delete, a move out of or
+into it, a write, a create, a new folder, a copy or an import into it, and a Save As there, with
+`REFUSED_BY_OP` and `reason: 'engine-asset-root'`, whose remedy is to edit the engine's files in the
+repo. The save dialog answers the same reason for a location picked there. A copy OUT of it is
+allowed, and is how one project gets a changed built-in: `modoki_duplicate_asset` with a `to` in the
+project, or Reveal in Finder and drop the file into the Assets panel (the Engine section itself
+offers no Duplicate). Drop the file without its `.meta.json`, so the copy gets a GUID of its own. It joins what
+already kept away: `/api/unused-assets` never offers a built-in, `defaultSaveRootDir` never saves
+there, and the scan's collision heal never re-mints one (#2003).
+
+⚠️ **One deliberate exception: the import-settings pair, `/api/write-meta` and `/api/reimport`, stays
+open in a DEV clone and refuses only in the packaged editor** (`devOnly`). The Inspector shows a
+built-in's import settings, and an engine developer applying them in a clone is editing the engine
+repo, which is where a built-in is changed. A packaged recursive re-import leaves the built-ins out,
+and one aimed at the engine root or a folder in it is refused like a single one. Open (#2060): the
+Font and Environment views' "re-import to fill in the stats" hint still shows for a packaged
+built-in, whose re-import is refused.
+A packaged refusal of a parked edit is DROPPED, not re-parked (`MetaWriteResult.readOnly`): no save
+could ever land it, so re-parked it would hold `hasUnsavedChanges()` true for good.
+
 #### A sidecar's identity belongs to exactly one live file (#1956, #1974, #1975)
 
 A binary asset's identity lives in its sidecar, not in the file: the `.meta.json` holds the GUID, the
@@ -4242,11 +4267,25 @@ unvouched, and the drop's retry deleted it. A file deleted later leaves an ordin
 is process memory: after a restart a sidecar still waiting reads as an orphan, which is Unity's
 answer for a sidecar nothing vouches for. write-file also removes orphans only after its tmp write
 lands, so a write that fails there removes nothing.
-⚠️ **The drop writes in drop order — do not "fix" it to sidecars-first.** That was tried (to close
-the png-first window below) and lost the dropped GUID EVERY time an orphan sat at the sidecar's path:
-the create-only sidecar write 409s over the orphan, then the png's create removes the orphan, and the
-png ends up with no sidecar. Still open, reasoned and not observed: with the png first (Finder's
-sort), the watcher's heal can mint the png a sidecar before the dropped one is written.
+⚠️ **A dropped file and its own sidecars go in ONE request (#2048), not in drop order and not
+sidecars-first.** Two requests lost the dropped GUID two ways. Png first (Finder's sort), the
+watcher's heal could mint the png a sidecar in the gap, and the dropped `.meta.json` was then refused
+as taken. Meta first over an ORPHAN, the sidecar's create 409'd, the png's create removed the orphan,
+and the png got a fresh GUID (observed). Reordering the drop to sidecars-first was built and reverted
+(59d3a5412): it makes the second case happen every time an orphan is there. So the Assets panel
+pairs each dropped sidecar with its file by name (`pairDroppedSidecars`, `assetOps.ts`; it follows
+the file's ` copy` name), and create-only write-file takes them as `sidecars: [{suffix, content}]`,
+written inside the file's commit window BEFORE its rename: every scan that sees the file sees its
+sidecar. A failure after that (a sidecar's write, the file's rename) takes the pair's sidecars back
+out. Chosen over the alternative (the heal skips a binary whose pair is in flight) because that one
+needs the client to announce a pair to a scan in another module and a timing window to expire it;
+the request already holds both halves.
+⚠️ **A create-only write of a SIDECAR replaces an ORPHAN there** (`replaceableOrphanSidecar`, #2048,
+Unity's rule): its file is absent and this backend did not write it ahead (`sidecarsAheadOfFile`).
+That is exactly the sidecar the file's create would delete, so refusing it only lost the one the drop
+carried. A sidecar whose file is there, or one still waiting for its file, stays taken, and a pair
+over one is refused whole. A `.meta.json` dropped WITHOUT its file still goes on its own, and this
+rule is what keeps it over an orphan.
 
 - **The copy census** (`remintSubAssetGuids`, `meta-sidecar.ts`): `id` and `sprites[].guid` are the GUIDs a
   sidecar defines. The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`. ⚠️ A new field

@@ -225,6 +225,24 @@ describe('toastForSave — the assets-only save (preview held, scene clean)', ()
     expect(t.text).not.toContain('Nothing to save');
   });
 
+  it('#1959: a DROPPED import-settings edit is said as discarded, never as "still unsaved"', () => {
+    // A built-in's edit refused by the packaged editor is not re-parked, so "still unsaved" would send the human to a
+    // Save that does nothing. A plain failure keeps its own wording beside it.
+    const t = toastForSave({
+      assets: { saved: [], failed: [] },
+      importSettings: { saved: [], failed: [
+        { path: '/modoki/assets/fonts/Inter.ttf', error: 'read-only', dropped: true },
+        { path: '/assets/tex.png', error: 'disk full' },
+      ] },
+      target: 'assets',
+    });
+    expect(t.text).toContain('1 import-setting edit(s) DISCARDED');
+    expect(t.text).toContain('copy it into the project');
+    expect(t.text).toContain('1 import-setting write(s) FAILED and are still unsaved: /assets/tex.png');
+    expect(t.text).not.toContain('still unsaved: /modoki');
+    expect(t.kind).toBe('warn');
+  });
+
   it('still says "Nothing to save" when nothing of ANY kind was written', () => {
     // The negative half — otherwise the fix above could be "always claim something saved".
     const t = toastForSave({ assets: { saved: [], failed: [] }, target: 'assets' });

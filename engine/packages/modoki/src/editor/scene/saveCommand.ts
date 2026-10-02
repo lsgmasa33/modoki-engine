@@ -330,7 +330,10 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   // Split by REMEDY, not by severity: a conflict must not be retried blindly, a plain
   // failure should be. `conflict` is set only by a 409 from the `ifMatch` precondition.
   const metaConflicts = metaFails.filter((f) => f.conflict);
-  const metaPlainFails = metaFails.filter((f) => !f.conflict);
+  // A write the editor can never make (#1959: a built-in in the packaged editor) was DROPPED, not re-parked — saying
+  // "still unsaved" would send the human to press Save again, which does nothing.
+  const metaDropped = metaFails.filter((f) => f.dropped);
+  const metaPlainFails = metaFails.filter((f) => !f.conflict && !f.dropped);
   // A conflict the human chose to keep (Cancel on Overwrite, #1868) is said as what it is: the file changed on disk.
   const assetConflicts = assetFails.filter((f) => f.conflict);
   const assetPlainFails = assetFails.filter((f) => !f.conflict);
@@ -364,6 +367,10 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       : '')
     + (metaPlainFails.length
       ? ` — ${metaPlainFails.length} import-setting write(s) FAILED and are still unsaved: ${metaPlainFails.map((f) => f.path).join(', ')}`
+      : '')
+    + (metaDropped.length
+      ? ` — ${metaDropped.length} import-setting edit(s) DISCARDED: the engine's built-in assets are read-only in this editor `
+        + `(${metaDropped.map((f) => f.path).join(', ')}). To change one for this project, copy it into the project's assets, edit the copy, and point its references at the copy.`
       : '');
   // A failed write is a WARNING in every branch, including the ones whose own outcome is benign.
   // A cancelled Save-As over a failed asset write was reporting 'info', so the sentence said FAILED

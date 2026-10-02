@@ -184,7 +184,7 @@ export function postWriteFile(
    *  `ifMatch` is the sha256 (`sha256Hex`) of the bytes the caller expects the file to hold NOW: the
    *  route answers 409 `reason:'if-match'` instead of writing when they differ or the file is gone
    *  (`ifMatchRefusal`, editorBackendRouter.ts). Apply-to-Prefab's undo/redo pass it (#1664). */
-  opts?: { createOnly?: boolean; ifMatch?: string },
+  opts?: { createOnly?: boolean; ifMatch?: string; sidecars?: readonly DroppedSidecar[] },
 ): Promise<Response> {
   return backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -192,6 +192,7 @@ export function postWriteFile(
       path: filePath, content, encoding,
       ...(opts?.createOnly ? { ifNoneMatch: '*' } : {}),
       ...(opts?.ifMatch !== undefined ? { ifMatch: opts.ifMatch } : {}),
+      ...(opts?.sidecars?.length ? { sidecars: opts.sidecars } : {}),
     }),
   });
 }
@@ -339,6 +340,10 @@ export async function writeAssetFile(filePath: string, content: string, encoding
   return { ok: false, error: r.error, ...(r.options ? { options: r.options } : {}) };
 }
 
+/** One of a file's own sidecars, written in the SAME create-only request as the file (#2048): `suffix` is `.meta.json`
+ *  or `.meta.local.json`, `content` its text. The route lands it before the file, so no scan ever sees the file alone. */
+export interface DroppedSidecar { suffix: string; content: string }
+
 /** What `writeAssetFileGuarded` answers. */
 export type GuardedWriteOutcome =
   | { result: 'ok' }
@@ -353,12 +358,12 @@ export type GuardedWriteOutcome =
  *  same one `prefabCommit`'s writes read. */
 export async function writeAssetFileGuarded(
   filePath: string, content: string,
-  opts: { encoding?: 'base64' } & ({ ifMatch: string } | { createOnly: true }),
+  opts: { encoding?: 'base64' } & ({ ifMatch: string } | { createOnly: true; sidecars?: readonly DroppedSidecar[] }),
 ): Promise<GuardedWriteOutcome> {
   let r: BackendAnswer;
   try {
     r = await readBackendAnswer(await postWriteFile(filePath, content, opts.encoding,
-      'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true }));
+      'ifMatch' in opts ? { ifMatch: opts.ifMatch } : { createOnly: true, sidecars: opts.sidecars }));
   } catch (e) { r = thrownRefusal(e); }
   if (r.ok) return { result: 'ok' };
   if (r.conflict) return { result: 'conflict', error: r.error };

@@ -66,6 +66,10 @@ export interface MetaWriteResult {
    *  vouched for (the rule `flushDirtyAssets` already follows). */
   sha256?: string;
   error?: string;
+  /** The path can NEVER be written by this editor (#1959: an engine built-in in the packaged editor, whose sidecar is
+   *  inside the app bundle). Retrying cannot succeed, so a flush must not re-park the edit: re-parked, it would stay
+   *  pending forever and every gate keyed on unsaved work would refuse with it. */
+  readOnly?: true;
 }
 
 /** The conditional form — the one definition of the `/api/write-meta` POST.
@@ -136,6 +140,10 @@ export async function writeMetaConditional(path: string, meta: unknown, ifMatch?
     if (a.conflict) {
       console.warn(`[Inspector] /api/write-meta REFUSED for ${path}: the file changed on disk since it was read. The edit is still pending — reopen the asset to see the current values.`);
       return { ok: false, conflict: true, error: 'the .meta.json changed on disk since this edit was based on it' };
+    }
+    if (a.reason === 'engine-asset-root') {
+      console.error(`[Inspector] /api/write-meta refused for ${path}: ${a.error}`);
+      return { ok: false, conflict: false, readOnly: true, error: a.error };
     }
     console.error(`[Inspector] /api/write-meta ${a.status ? `refused (HTTP ${a.status})` : 'network error'} for ${path}: ${a.error}`);
     return { ok: false, conflict: false, error: a.error };

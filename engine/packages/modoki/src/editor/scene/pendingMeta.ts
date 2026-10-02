@@ -720,6 +720,9 @@ export interface MetaFlushResult {
      *  unconditional (the batch flush drops the baseline) and would overwrite whatever changed the
      *  file. `toastForSave` splits on this, and the two sentences it produces say opposite things. */
     conflict?: boolean;
+    /** The path can never be written here (`MetaWriteResult.readOnly`, #1959), so the edit was DROPPED rather than
+     *  re-parked — the one failure that is not left pending, because no later save could land it. */
+    dropped?: true;
   }>;
 }
 
@@ -739,7 +742,7 @@ let inFlight: Promise<unknown> | null = null;
  *  Independent failures: one rejected write does not block the others. */
 export async function flushPendingMeta(): Promise<MetaFlushResult> {
   const saved: string[] = [];
-  const failed: Array<{ path: string; error: string }> = [];
+  const failed: MetaFlushResult['failed'] = [];
   // Take the whole batch out BEFORE issuing anything — the dirty-asset/base-scene flushes both do
   // this, and for the same reason here: a `flushPendingMetaFor` call landing mid-flush must see an
   // empty map for every path this flush is already holding, not a doc it is about to overwrite.
@@ -784,6 +787,12 @@ export async function flushPendingMeta(): Promise<MetaFlushResult> {
       // than a loophole: the human has been shown one refusal naming the path, so a second,
       // explicit Cmd+S is them choosing to overwrite. Refuse once and report; do not refuse
       // forever and offer no way out.
+      if (r.readOnly) {
+        // Never re-parked: no save can land it, so a re-park would hold `hasUnsavedChanges()` true for good (#1959).
+        baselines.delete(path);
+        failed.push({ path, error: r.error ?? 'this asset cannot be written by the editor', dropped: true });
+        continue;
+      }
       if (r.conflict) baselines.delete(path);
       failed.push({
         path,
@@ -852,6 +861,11 @@ export async function flushPendingMetaFor(path: string): Promise<MetaFlushResult
   if (r.ok) {
     if (r.sha256) baselines.set(path, r.sha256);
     return { saved: [path], failed: [] };
+  }
+  if (r.readOnly) {
+    baselines.delete(path);
+    bump();
+    return { saved: [], failed: [{ path, error: r.error ?? 'this asset cannot be written by the editor', dropped: true }] };
   }
   if (!pending.has(path)) pending.set(path, meta);
   bump();

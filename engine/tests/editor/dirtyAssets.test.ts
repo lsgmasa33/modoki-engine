@@ -261,6 +261,54 @@ describe('save_all flushes the dirty-asset registry alongside the scene write', 
     clearPendingMeta(); clearMetaBaselines();
   });
 
+  // #1959 close-out review: a DROPPED write (an engine built-in, packaged editor) is not pending, so the agent must be
+  // told it was DISCARDED — not "stay marked dirty … call save_all again", which the toast had already stopped saying.
+  it('the save_all AGENT OP says a DROPPED import-settings edit was discarded, never "call save_all again"', async () => {
+    const { parkMetaEdit, stampMetaReadPath, clearPendingMeta, clearMetaBaselines, getPendingMetaPaths } =
+      await import('../../packages/modoki/src/editor/scene/pendingMeta');
+    clearPendingMeta(); clearMetaBaselines();
+    setCurrentScenePath('/assets/scenes/dirty-meta-drop.json');
+    markSceneSaved();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/write-meta')) {
+        return { ok: false, status: 400, json: async () => ({ ok: false, code: 'REFUSED_BY_OP', reason: 'engine-asset-root', error: 'read-only' }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    const BUILTIN = '/modoki/assets/fonts/Inter.ttf';
+    parkMetaEdit(BUILTIN, stampMetaReadPath({ font: { size: 48 } }, BUILTIN));
+
+    const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as Error);
+    expect(err?.message).toMatch(/DISCARDED, not deferred: \/modoki\/assets\/fonts\/Inter\.ttf/);
+    expect(err?.message).not.toMatch(/call save_all again/);
+    expect(getPendingMetaPaths()).toEqual([]);
+    clearPendingMeta(); clearMetaBaselines();
+  });
+
+  // Close-out review 3: the dropped edit is a RIDER on a scene save that failed, never the whole answer — raised first,
+  // it hid needs-path's "pass an explicit path" (and playing's Stop, write-failed's disk error).
+  it('a DROPPED import-settings edit does not hide WHY the scene did not save', async () => {
+    const { parkMetaEdit, stampMetaReadPath, clearPendingMeta, clearMetaBaselines } =
+      await import('../../packages/modoki/src/editor/scene/pendingMeta');
+    clearPendingMeta(); clearMetaBaselines();
+    setCurrentScenePath(null);   // never saved: needs-path
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/write-meta')) {
+        return { ok: false, status: 400, json: async () => ({ ok: false, code: 'REFUSED_BY_OP', reason: 'engine-asset-root', error: 'read-only' }) } as unknown as Response;
+      }
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+    const BUILTIN = '/modoki/assets/fonts/Inter.ttf';
+    parkMetaEdit(BUILTIN, stampMetaReadPath({ font: { size: 48 } }, BUILTIN));
+
+    const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as Error);
+    expect(err?.message).toMatch(/Pass an explicit path/);
+    expect(err?.message).toMatch(/DISCARDED, not deferred/);
+    clearPendingMeta(); clearMetaBaselines();
+  });
+
   // "A real write reported as a no-op" — the toast had it, and so did FOUR exits of this op.
   it('a FAILED scene save still names the parked items that DID land', async () => {
     setCurrentScenePath('/assets/scenes/dirty-scene-writefail.json');
