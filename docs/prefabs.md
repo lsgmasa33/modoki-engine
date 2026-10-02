@@ -38,11 +38,16 @@ The table after the list says how far each rule is built.
    rebuild, Revert, undo and Apply's fan-out all call it. Nothing reads the live tree back to work
    out what an instance is.
 3. **Only a gesture changes the list.** An edit records each field it changes; typing the value a
-   field already has records nothing (F2). Once a record exists, only Revert, Apply, undo or Remove
-   Unused take it away. A record is never dropped because its value later equals the base (#1914).
-   Deleting a member is itself a record (`removed`): the records on and under it stay, so reverting
-   the deletion brings the member back as it was. Children the user added under it are scene
-   content and are deleted with it, as in Unity; undo restores them (hub refinement, 2026-10-02).
+   field already has records nothing (F2). Once a record exists, it leaves the list only through
+   Revert, Apply, undo or Remove Unused, or through a gesture that deletes or reverses the very thing
+   the record IS: removing a component the list added, deleting a user-added node, or re-adding a
+   component the list removed. A record is never dropped because its value later equals the base
+   (#1914). Deleting a member or removing a component is itself a record (`removed`,
+   `traitRemovals`), and the records on and under it stay, inert. So reverting the deletion or the
+   removal brings it back as it was, edits included. Children the user added under a deleted member
+   are scene content and are deleted with it, as in Unity; undo restores them. (Hub refinements,
+   2026-10-02. Unity's paired "removed + added" component overrides do not apply, because Modoki has
+   one trait per type, #2014 G1–G3.)
 4. **Save writes the list. It does not diff the live tree.** So load → save is verbatim, and the
    prefab wins every field the list does not name. A scene can beat its prefab only with a record.
 5. **Identity is minted once and never guessed.** Only a write mints identity; a reader never does.
