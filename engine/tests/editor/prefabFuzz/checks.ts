@@ -33,7 +33,7 @@ export interface Failure {
 }
 
 /** Owner ruling R's refusal reasons (`require`, entityRef.ts): the target no longer resolves, or changed kind. Shared by
- *  the allowlist (a refusal line) and KNOWN_OPEN #2010's stop (a composite's refused subs). */
+ *  the allowlist's refusal lines, a single step's and a composite's (#2010: its pre-pass refuses in its sub's words). */
 export const RULING_R = 'is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again';
 
 /** Whether the node a diff names as gone (`X vs undefined`) is still in `b`, or as new (`undefined vs X`) was in `a`. */

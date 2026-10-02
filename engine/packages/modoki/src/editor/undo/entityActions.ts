@@ -29,6 +29,7 @@ import { packedOf, type PackedEntity } from '../../runtime/core/ecs/entityTable'
 import { currentFieldGesture } from './fieldGesture';
 import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
+import { arrive, checkRef, refsCheck, type StepCheck, type CheckPass } from './stepCheck';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
 import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
@@ -203,6 +204,7 @@ export function writeTraitFieldWithUndo(entityId: number, meta: TraitMeta, field
     // `require` (I19): a target a world swap removed, or turned into a placeholder, refuses rather than reading as done.
     undo: () => { const id = ref.require(); writeTraitField(id, meta, field, oldValue); putMarkState(id, meta.name, oldMarks); },
     redo: () => { const id = ref.require(); writeTraitField(id, meta, field, value); putMarkState(id, meta.name, newMarks); },
+    check: refsCheck(() => [ref]), // #2010: the same `require`, askable before a batch runs
     coalesceKey,
     detail: editDetail([ref], meta, field, [oldValue], [value]),
     affectedScenes,
@@ -247,6 +249,7 @@ export function writeTraitFieldMultiWithUndo(entityIds: number[], meta: TraitMet
     // Every ref required before the first write (I19): one missing entity refuses the whole entry, never half of it.
     undo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, oldValues[i]); putMarkState(id, meta.name, oldMarks[i]!); }); },
     redo: () => { const ids = requireAll(refs); ids.forEach((id, i) => { writeTraitField(id, meta, field, value); putMarkState(id, meta.name, newMarks[i]!); }); },
+    check: refsCheck(() => refs), // #2010
     coalesceKey,
     detail: editDetail(refs, meta, field, oldValues, refs.map(() => value)),
     affectedScenes,
@@ -298,6 +301,7 @@ export function writeTraitFieldPerEntityWithUndo(
     // Resolved by guid each invocation, so undo/redo survive a rebuild; every ref before the first write (I19).
     undo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ oldValue, oldMarks }, i) => { writeTraitField(ids[i], meta, field, oldValue); putMarkState(ids[i], meta.name, oldMarks); }); },
     redo: () => { const ids = requireAll(entries.map((e) => e.ref)); entries.forEach(({ newValue }, i) => { writeTraitField(ids[i], meta, field, newValue); putMarkState(ids[i], meta.name, newMarks[i]!); }); },
+    check: refsCheck(() => entries.map((e) => e.ref)), // #2010
     coalesceKey,
     detail: editDetail(entries.map((e) => e.ref), meta, field, entries.map((e) => e.oldValue), entries.map((e) => e.newValue)),
     affectedScenes,
@@ -359,6 +363,7 @@ export function writeTraitFieldsPerEntityWithUndo(
       });
     },
     redo: applyAll,
+    check: refsCheck(() => entries.map((e) => e.ref)), // #2010
     affectedScenes,
   });
   entries.forEach(({ id, patch }) => { for (const [field, value] of Object.entries(patch)) notifyFieldEdited(id, meta.name, field, value); });
@@ -428,6 +433,7 @@ export function addTraitToEntitiesWithUndo(
     label: `${label}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: revert,
     redo: apply,
+    check: refsCheck(() => refs), // #2010
     affectedScenes,
   });
   // Prefilled fields are real field edits: tell the animation recorder, exactly as the
@@ -484,6 +490,7 @@ export function removeTraitFromEntitiesWithUndo(entityIds: number[], meta: Trait
     label: `Remove ${meta.name}${targets.length > 1 ? ` (${targets.length})` : ''}`,
     undo: revert,
     redo: apply,
+    check: refsCheck(() => targets.map((t) => t.ref)), // #2010
     affectedScenes,
   });
   return null;
@@ -525,7 +532,7 @@ export function pasteTraitAsNewWithUndo(entityIds: number[], meta: TraitMeta, va
 
 // ── Action callback (for backward compat during migration) ──
 
-type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: EditorJournalType; journalPayload?: Record<string, unknown>; affectedScenes?: string[] }) => void;
+type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: EditorJournalType; journalPayload?: Record<string, unknown>; affectedScenes?: string[]; check?: StepCheck }) => void;
 
 /** GUID for a parent id in a structural journal payload: 'root' for 0, else the
  *  entity's stable guid (`id:<n>` only for an un-guidable entity — see `journalRefOf`). */
@@ -834,20 +841,33 @@ function snapshotGuids(snap: EntitySnapshot, out: Set<string> = new Set()): Set<
  *  to, outside what the undo itself respawns, must still be a live INSTANCE root. After a world swap it can be gone,
  *  or a Missing Prefab placeholder (no `PrefabInstance`), and relinking a member to it leaves a member whose root is
  *  not an instance, which the next reload drops (I6). Throws `UndoRefusedError`, so nothing has been respawned yet. */
-function requireRootLinks(links: readonly { guid: string; rootGuid: string }[], respawned: ReadonlySet<string>, renamed?: ReadonlyMap<string, string>): void {
+function requireRootLinks(links: readonly { guid: string; rootGuid: string }[], respawned: ReadonlySet<string>, renamed?: ReadonlyMap<string, string>, pass?: CheckPass): void {
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta || !links.length) return;
-  const idx = buildGuidIndex();
+  // Asked by a batch's pre-pass (#2010): against the pass, where a root an earlier sub brings back is not a miss.
+  const idx = pass?.index ?? buildGuidIndex();
   for (const { rootGuid } of links) {
     if (respawned.has(rootGuid)) continue;
     let g = rootGuid;
     for (let hops = 0; renamed?.has(g) && hops < renamed.size; hops++) g = renamed.get(g)!;
+    if (pass?.arriving.has(g)) continue;
     const root = idx.get(g);
     const ref = root != null ? entityRef(root, false) : null;
     if (!ref) throw new UndoRefusedError(`The prefab instance (${rootGuid}) a deleted member belongs to is no longer in the scene, so its members would come back linked to nothing.`, 'the prefab instance its members belong to is no longer in the scene');
     // `require` names the placeholder case in its own words; the check covers a root that is plain now (detached).
     ref.require({ kind: 'entity', check: (id) => (findEntity(id)?.has(piMeta.trait) ? null : 'is no longer a prefab instance, so its deleted members cannot be linked back to it') });
   }
+}
+
+/** The check of a step that spawns one subtree from `snap` (create, duplicate, paste; #2010): the undo deletes it, so it
+ *  needs the spawned root; the redo respawns it, so it needs the parent and brings the subtree back. A null `snap`
+ *  respawns nothing. */
+function spawnCheck(selfRef: EntityRef, parentRef: EntityRef | null, snap: EntitySnapshot | null): StepCheck {
+  const guids = snap ? [...snapshotGuids(snap)] : [];
+  return {
+    undo: (pass) => checkRef(pass, selfRef),
+    redo: (pass) => { if (!snap) return; if (parentRef) checkRef(pass, parentRef); arrive(pass, guids); },
+  };
 }
 
 // ── Create with undo ──
@@ -905,6 +925,7 @@ export function createEntityWithUndo(
     undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
     // The parent is required, never the scene root (#1793's fork, owner ruling R): a parent that is gone refuses.
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
+    check: spawnCheck(selfRef, parentRef, snap),
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
@@ -973,6 +994,7 @@ export function createEntitySubtreeWithUndo(
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
     undo: () => { deleteEntity(selfRef.require()); selectEntity(null); },
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef ? parentRef.require() : 0); selectEntity(currentId); } },
+    check: spawnCheck(selfRef, parentRef, snap),
     kind: '!create',
     journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
@@ -1036,6 +1058,7 @@ export function duplicateEntity(
       currentId = liveIdOf(guid, currentId);
       selectEntity(currentId);
     },
+    check: spawnCheck(selfRef, parentRef, snapshot),
     kind: '!duplicate',
     // Source guid from the attrData already read above — do NOT entityRef(entityId) here:
     // that mints+writes a guid to the SOURCE, dirtying authored data purely to log it.
@@ -1124,7 +1147,7 @@ function survivingFrameRows(snapshots: readonly EntitySnapshot[]) {
 
   /** Every check, before anything respawns (I19); a refusal throws. Returns the re-record to run after the respawn and
    *  its relinks, which answers the sources the rebase must include. */
-  const prepare = (idx: Map<string, number>, renames: ReadonlyMap<string, string>): (() => string[]) => {
+  const prepare = (idx: Map<string, number>, renames: ReadonlyMap<string, string>, pass?: CheckPass): (() => string[]) => {
     // The world the undo runs in: leaving prefab edit replaces the one the delete was taken in.
     const world = getCurrentWorld();
     const plans: { root: number; source: string; doc: TemplateDoc; rows: { guid: string; owned: boolean; to: number }[] }[] = [];
@@ -1132,11 +1155,22 @@ function survivingFrameRows(snapshots: readonly EntitySnapshot[]) {
       let g = f.rootGuid;
       for (let hops = 0; renames.has(g) && hops < renames.size; hops++) g = renames.get(g)!;
       const root = idx.get(g);
-      const handle = root != null ? findEntity(root) : undefined;
-      const rec = handle ? frameRootDoc(world, handle) : undefined;
-      // A root that is gone or no longer this frame is `requireRootLinks`' refusal, not this one.
-      if (root == null || !rec || rec.source !== f.source || rec.doc === f.doc) continue;
-      const now = rec.doc;
+      let now: TemplateDoc;
+      if (root == null && pass?.arriving.has(g)) {
+        // A batch's pre-pass (#2010), where an earlier sub brings this frame's root back: respawned, it is rebased onto
+        // its prefab's CURRENT document (`rebaseRespawned`), which is what this undo will find, so the rows are judged
+        // against that. Not cached: what it will hold cannot be told, and the pass goes blind.
+        const current = getCachedPrefabSync(f.source) as TemplateDoc | null;
+        if (!current) { pass.blind = true; continue; }
+        if (current === f.doc) continue;
+        now = current;
+      } else {
+        const handle = root != null ? findEntity(root) : undefined;
+        const rec = handle ? frameRootDoc(world, handle) : undefined;
+        // A root that is gone or no longer this frame is `requireRootLinks`' refusal, not this one.
+        if (root == null || !rec || rec.source !== f.source || rec.doc === f.doc) continue;
+        now = rec.doc;
+      }
       const lid = translateLocalIds(f.doc, now) ?? ((n: number) => n);
       const nowRows = new Set((now.entities ?? []).map((e) => e.localId));
       const oldRows = new Map((f.doc.entities ?? []).map((e) => [e.localId, e]));
@@ -1158,7 +1192,7 @@ function survivingFrameRows(snapshots: readonly EntitySnapshot[]) {
         rows.push({ guid: r.guid, owned: r.owned, to });
       }
       const doc: TemplateDoc = { ...now, entities: (now.entities ?? []).map((e) => (e.localId !== undefined && replaced.get(e.localId)) || e) };
-      plans.push({ root, source: f.source, doc, rows });
+      if (root != null) plans.push({ root, source: f.source, doc, rows });
     }
     return () => {
       if (!piMeta) return [];
@@ -1222,6 +1256,7 @@ export function pasteEntityCopy(
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
     undo: () => { deleteEntity(selfRef!.require()); selectEntity(null); },
     redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0); selectEntity(currentId); },
+    check: spawnCheck(selfRef!, parentRef, copy),
     affectedScenes,
   });
   return currentId;
@@ -1293,6 +1328,12 @@ export function deleteEntitiesWithUndo(
   commitRecord();
   setSelection?.([]);
 
+  // The redo's refusal: a target that is gone. Asked by the redo and by a batch's pre-pass (#2010), through `has`.
+  const requireTargets = (has: (guid: string) => number | undefined): number[] => snaps.map((s) => {
+    const id = s.guid ? has(s.guid) : undefined;
+    if (id == null) throw new UndoRefusedError(`"${s.name}" (${journalRefOf(s.guid, s.snapshot.id)}) is no longer in the scene, so there is nothing to delete again.`, `"${s.name}" is no longer in the scene`);
+    return id;
+  });
   _pushAction({
     label: snaps.length > 1 ? `Delete ${snaps.length} Entities` : 'Delete Entity',
     undo: () => {
@@ -1325,13 +1366,27 @@ export function deleteEntitiesWithUndo(
       // Resolve each entity by its (restored) root guid — robust across rebuild + id reuse. All of them before the first
       // delete (I19): a target that is gone refuses the redo rather than deleting the rest and reading as done.
       const idx = buildGuidIndex();
-      const ids = snaps.map(s => {
-        const id = s.guid ? idx.get(s.guid) : undefined;
-        if (id == null) throw new UndoRefusedError(`"${s.name}" (${journalRefOf(s.guid, s.snapshot.id)}) is no longer in the scene, so there is nothing to delete again.`, `"${s.name}" is no longer in the scene`);
-        return id;
-      });
+      const ids = requireTargets((g) => idx.get(g));
       detached = recordDetachedMarks(ids.flatMap(id => deleteEntity(id)));
       setSelection?.([]);
+    },
+    // #2010: the undo's checks above, in its order, against a batch's pass; then what the undo brings back (the deleted
+    // subtrees, and each promoted member's pre-delete guid in place of the one the frame-ending gave it).
+    check: {
+      undo: (pass) => {
+        const renames = renamesOf(detached);
+        for (const s of snaps) if (s.parentRef) checkRef(pass, s.parentRef, undefined, renames);
+        requireRootLinks(rootLinks, respawnedGuids, renames, pass);
+        requireDetachedMembers(detached, pass.index, renames, new Set([...respawnedGuids, ...pass.arriving]));
+        survivors.prepare(pass.index, renames, pass);
+        arrive(pass, [...respawnedGuids, ...renames.keys()]);
+      },
+      redo: (pass) => {
+        // A target an earlier sub brings back is there when this runs; its guid has no id yet, so any number stands in.
+        requireTargets((g) => (pass.arriving.has(g) ? -1 : pass.index.get(g)));
+        // A promotion renames the members it frees (#1447), and a redo's names are minted fresh, which nothing can name yet.
+        if (detached.some((d) => d.renamed?.length)) pass.blind = true;
+      },
     },
     kind: '!delete',
     journalPayload: { entities: snaps.map(s => journalRefOf(s.guid, s.snapshot.id)) },
@@ -1759,6 +1814,21 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
       if (savedOldLocal && savedNewLocal) markCompensatedTransform(id, savedOldLocal, savedNewLocal);
       markStructureDirty();
     },
+    // #2010: each half's refs, as above. A move that detaches changes which entities are instance members, and a
+    // promotion renames them, which no later check can read off the pass: it ends the pre-pass.
+    check: {
+      undo: (pass) => {
+        const renames = detaching ? renamesOf(orphans, new Map(renamed)) : undefined;
+        checkRef(pass, ref, undefined, renames);
+        if (oldParentRef) checkRef(pass, oldParentRef, undefined, renames);
+        if (detaching) pass.blind = true;
+      },
+      redo: (pass) => {
+        checkRef(pass, ref);
+        if (newParentRef) checkRef(pass, newParentRef);
+        if (detaching) pass.blind = true;
+      },
+    },
     kind: '!reparent',
     // `from`/`to` are parent guids ('root' for scene root); equal when this is a pure
     // reorder (sortOrder change under the same parent).
@@ -1967,15 +2037,18 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   // Every entity of the moved tree and the parent it goes under, required before the first write (I19): a member or a
   // parent that is gone refuses the step, rather than stamping part of the tree or landing the root at the scene root.
   // `minted` translates a rekeyed guid, for the undo, which runs while those entities still carry the rekey's guid.
-  const requireMove = (parentRef: EntityRef | null, minted?: ReadonlyMap<string, string>): { ids: number[]; parent: number } => {
-    const idx = buildGuidIndex();
+  const requireMove = (parentRef: EntityRef | null, minted?: ReadonlyMap<string, string>, pass?: CheckPass): { ids: number[]; parent: number } => {
+    // Asked by a batch's pre-pass too (#2010): against the pass, where an entity an earlier sub brings back is not a miss.
+    const idx = pass?.index ?? buildGuidIndex();
     const ids = perEntity.map(({ ref }) => {
       const now = minted?.get(ref.guid);
+      if (pass && pass.arriving.has(now ?? ref.guid)) return -1;
       if (!now) return requireWith(ref, idx);
       const id = idx.get(now);
       if (id == null) throw new UndoRefusedError(`"${ref.name}" (${now}) is no longer in the scene.`, `"${ref.name}" is no longer in the scene`);
       return id;
     });
+    if (pass) { if (parentChanged && parentRef) checkRef(pass, parentRef); return { ids, parent: 0 }; }
     return { ids, parent: parentChanged && parentRef ? parentRef.require() : 0 };
   };
   const applyStamps = () => {
@@ -2055,6 +2128,17 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
       applyStamps();
       applyRekeys();
       markStructureDirty(); markUIDirty();
+    },
+    // #2010: each half's `requireMove`, against the pass; then the guids the half's rekey puts on.
+    check: {
+      undo: (pass) => {
+        requireMove(oldParentRef, new Map(rekeyPairs.map((p) => [p.oldGuid, p.newGuid])), pass);
+        arrive(pass, rekeyPairs.map((p) => p.oldGuid));
+      },
+      redo: (pass) => {
+        requireMove(newParentRef, undefined, pass);
+        arrive(pass, rekeyPairs.map((p) => p.newGuid));
+      },
     },
     kind: '!sceneMove',
     journalPayload: {

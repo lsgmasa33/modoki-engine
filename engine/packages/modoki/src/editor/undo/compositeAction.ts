@@ -24,6 +24,14 @@
  *  instantiate redo awaits), so sequencing is mandatory: running them concurrently would
  *  let a later op's undo observe a world the earlier op has not finished reverting.
  *
+ *  ONE STEP, ALL OR NOTHING (#2010). Before the first sub runs, every sub's CHECK is asked, in run order, against one
+ *  pass (`stepCheck.ts`): a sub that would refuse (its target gone, I19 / ruling R) refuses the whole entry with
+ *  nothing changed, as one `UndoRefusedError`, and the entry is dropped like any refused step. The pre-pass ends where
+ *  it cannot see: a sub with no check (an asset-doc step, a prefab instantiate, an animation-record clip edit), a
+ *  detaching reparent, a delete's redo that promotes members, a respawned frame root whose prefab is not cached. A sub
+ *  at or after that point that fails mid-run is reported as a `CompositeStepError`, which says it may have applied
+ *  partway.
+ *
  *  RE-ENTRANCY. A composite's own `undo`/`redo` run INSIDE an already-serialized
  *  `undoManager.undo()`/`redo()` call — `_executing` is true and the `_inFlight` tail is
  *  held. So this file must never call the exported `undo()`/`redo()` and never tries to
@@ -38,6 +46,8 @@ import {
   type UndoAction,
 } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
+import { newCheckPass, type CheckPass } from './stepCheck';
+import { buildGuidIndex } from './entityRef';
 import type { EditorJournalType } from '../editorJournal';
 
 export interface CompositeActionOptions {
@@ -98,7 +108,42 @@ export class CompositeStepError extends AggregateError {
   }
 }
 
+/** Ask each sub's check for `what`, in the order the subs will run, against one pass (#2010, `stepCheck.ts`). A sub
+ *  with no check makes the pass blind (a selection change excepted: it touches no entity), and so does a check that
+ *  cannot state its own effect; nothing after a blind point is asked. A refusal throws, before any sub has run. */
+function checkSubs(subs: UndoAction[], what: 'undo' | 'redo', pass: CheckPass): void {
+  for (const sub of subs) {
+    if (pass.blind) return;
+    const check = sub.check?.[what];
+    if (check) check(pass);
+    else if (!sub._isSelection) pass.blind = true;
+  }
+}
+
+/** The composite's pre-pass (#2010): ONE step refuses as a whole, before any change (rule 8; I19 / ruling R; Unity's undo
+ *  group). Without it a sub that refused ran after the subs before it had applied, and the entry half-applied. The
+ *  refusal names the sub and keeps its own toast, so the agent reads REFUSED_BY_OP with the sub's reason. A nested
+ *  composite is one sub here: its own subs are asked through its `check`, against this same pass. */
+function precheck(subs: UndoAction[], what: 'undo' | 'redo'): void {
+  const pass = newCheckPass(buildGuidIndex());
+  for (const sub of subs) {
+    try {
+      checkSubs([sub], what, pass);
+    } catch (e) {
+      if (!(e instanceof UndoRefusedError)) throw e;
+      // The sub's own words first, as a single step's refusal reads; then which sub, and that nothing ran.
+      throw new UndoRefusedError(
+        `${e.message} (sub-action "${sub.label}" of this batch; the batch refuses as a whole, and nothing in it was ${what === 'undo' ? 'undone' : 'redone'})`,
+        e.toast,
+      );
+    }
+    if (pass.blind) return;
+  }
+}
+
 /** Run each sub-action's `undo`/`redo` strictly one at a time, in the given order.
+ *  Reached only past {@link precheck}, so a sub fails here when the pre-pass could not ask it (no check, or a blind
+ *  point before it), or when its half throws for a reason no check covers.
  *  A failing sub does NOT abort the rest: a half-reverted batch is worse than a fully
  *  attempted one, and the entry has already left its stack by the time this runs.
  *  Failures are collected and rethrown so `undo()`'s promise still rejects visibly (matching a
@@ -173,13 +218,20 @@ export function composeUndoActions(
 ): UndoAction | null {
   if (subActions.length === 0) return null;
   const subs = [...subActions]; // frozen: the frame array must not mutate under us
+  const reversed = subs.slice().reverse();
   const action: UndoAction = {
     label: opts.label,
     kind: opts.kind ?? '!batch',
     // Reverse order: later ops undo first (an op that depends on an earlier op's
     // result must be reverted before that result is taken away).
-    undo: () => runSequential(subs.slice().reverse(), (a) => a.undo(), 'undo'),
-    redo: () => runSequential(subs, (a) => a.redo(), 'redo'),
+    // Every sub's check first (#2010): a sub that would refuse refuses the whole entry, before any sub has run.
+    undo: async () => { precheck(reversed, 'undo'); await runSequential(reversed, (a) => a.undo(), 'undo'); },
+    redo: async () => { precheck(subs, 'redo'); await runSequential(subs, (a) => a.redo(), 'redo'); },
+    // Nested in another composite, this batch is one of its subs: the outer pass asks these subs, in this order.
+    check: {
+      undo: (pass) => checkSubs(reversed, 'undo', pass),
+      redo: (pass) => checkSubs(subs, 'redo', pass),
+    },
     journalPayload: { ...summarizeSubActions(subs), ...(opts.journalPayload ?? {}) },
   };
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;

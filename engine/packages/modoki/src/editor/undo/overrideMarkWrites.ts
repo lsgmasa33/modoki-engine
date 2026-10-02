@@ -44,6 +44,7 @@ import { valuesEqual } from '../scene/prefab';
 import { makeReorderSiblingsAction, type SiblingSortChange } from './reorderSiblingsUndo';
 import type { UndoAction } from './undoManager';
 import { entityRef, buildGuidIndex, requireWith } from './entityRef';
+import { refsCheck } from './stepCheck';
 import * as instanceEdits from '../instance/instanceEdits';
 
 interface MemberPi { source?: string; localId?: number; rootInstanceId?: number }
@@ -245,7 +246,8 @@ export function makeSortOrderRenumberAction(changes: SiblingSortChange[], label 
     changes, (id, sort) => writeTraitFieldMarked(at(id), attrMeta, 'sortOrder', sort), label,
     (id, sort) => restore(id, sort, at(id)),
   );
-  return { ...inner, undo: () => { pin(); inner.undo(); }, redo: () => { pin(); inner.redo(); } };
+  // #2010: `pin`'s refs, askable before a batch runs. The renumber changes no entity's presence.
+  return { ...inner, undo: () => { pin(); inner.undo(); }, redo: () => { pin(); inner.redo(); }, check: refsCheck(() => refs) };
 }
 
 /** The UNDO of a `sortOrder` rewrite on `ids`: a writer that restores the value AND the `sortOrder` mark each entity

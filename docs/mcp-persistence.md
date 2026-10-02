@@ -110,6 +110,14 @@ different entities would collapse into an entry whose undo reverts only the firs
 - **Re-entrancy**: a composite's own `undo`/`redo` run INSIDE an already-serialized
   `undoManager.undo()`/`redo()` call, so it must never call the exported `undo()`/`redo()` or
   try to re-acquire that lock — it's just a well-behaved single `UndoAction`.
+- **Undo/redo = one step, all or nothing** (#2010): before the first sub runs, every sub's
+  `check` (`stepCheck.ts`: the refusals its half would throw, asked without running it) is
+  asked in run order against one pass, which also tracks the guids the earlier subs bring back
+  (a create's redo spawns the entity the next write needs). One refusal refuses the whole
+  entry with nothing changed (I19 / ruling R). The pre-pass ends where it cannot see: a sub
+  with no check (an asset-doc step, a prefab instantiate, an animation-record clip edit), a
+  detaching reparent, a delete's redo that promotes members, a respawned frame root whose
+  prefab is not cached. A failure at or after that point is a `CompositeStepError`.
 - **Failure = nothing happened**: if `body` throws mid-batch, already-applied sub-actions roll
   back (reverse order, best-effort) and NO entry is pushed — a half-applied batch whose undo
   only covers the applied half is worse than either fully succeeding or fully failing.

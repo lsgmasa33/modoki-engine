@@ -4380,7 +4380,8 @@ its side now (`baseSceneHeldBy`: a park, else the open scene's live value, else 
 - The step is async now, so an edit made during its file read (one localhost round trip) applies with no undo entry,
   because `pushAction` ignores pushes while a step executes. The step then refuses, because the park moved.
 - A composite of asset-doc steps (`evalApi.composite`) wraps a refusal in an `AggregateError`, so the other subs still
-  apply. All-or-nothing holds within ONE step (the material batch), not across a composite.
+  apply. All-or-nothing holds within ONE step (the material batch), not across a composite: an asset-doc step has no
+  `check` for #2010's pre-pass to ask, since its refusals come from reading files.
 - A panel opened on a MISSING file (the particle editor's default-effect fallback) refuses a redo after an undo,
   because an absent file holds nothing.
 - A `.meta.json` import-settings park is #1696's.

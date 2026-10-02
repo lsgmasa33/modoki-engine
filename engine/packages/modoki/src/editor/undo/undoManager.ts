@@ -12,6 +12,7 @@ import { createTeardownToken } from '../../runtime/core/liveness';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
 import { markStale } from '../../runtime/prefab/instanceStore';
 import { peekCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
+import type { StepCheck } from './stepCheck';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -120,6 +121,10 @@ export interface UndoAction {
    *  for structural actions and the discrete-click coalescing the Particle/
    *  Animation editors do themselves via peekUndo() identity. */
   coalesceKey?: string;
+  /** Each half's refusals, askable before the half runs (#2010, `stepCheck.ts`). A composite asks every sub's before it
+   *  applies any, so a sub that would refuse refuses the whole entry with nothing changed. Absent: a composite holding
+   *  this action cannot pre-check past it. */
+  check?: StepCheck;
 }
 
 // Count-based cap only (review F12). Entries close over their own state: a

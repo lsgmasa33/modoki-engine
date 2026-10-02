@@ -444,19 +444,6 @@ describe('#1789 prefab fuzz', () => {
   // #1840: the watcher looked marks up by a string it built from the url, which on Windows never matched the route's
   // `\`-separated path, so every editor write reloaded under the op and tainted its segment — the undo identity and the
   // clean-segment refusal checks never ran there: 32 KNOWN_OPEN repros ran clean, and #1805 route 2 lost its reach.
-  // #2010's stop claims the mechanism in both of the forms a run reports it: the end walk's (`undo threw`, the hunt's seed
-  // 1153) and an `undo` op's (`op threw`, the review's replay with one more undo), each with every failed sub refused
-  // under ruling R. Its reject side is in "KNOWN_OPEN claims no failure of a mechanism it does not name".
-  it('KNOWN_OPEN #2010 claims a ruling-R half-applied composite from the end walk and from an undo op', () => {
-    const k = KNOWN_OPEN.find((x) => x.issue === 2010)!;
-    const ops = [...k.repro, { kind: 'undo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] } as Op];
-    const sub = '"M905" refused ("M905" is no longer in the scene)';
-    expect(k.stops!({ check: 'undo threw', detail: `Mutate Scene (2 ops): 1 of 2 sub-action(s) failed during undo: ${sub}`, step: ops.length, op: 'undo/redo to the ends' }, ops)).toBe(true);
-    expect(k.stops!({ check: 'op threw', detail: `undo "Mutate Scene (2 ops)" threw: 1 of 2 sub-action(s) failed during undo: ${sub} |     at undoStep`, step: ops.length - 1, op: 'undo(0.5)' }, ops)).toBe(true);
-    // Two failed subs, both under ruling R.
-    expect(k.stops!({ check: 'undo threw', detail: `Set Traits: 2 of 3 sub-action(s) failed during undo: ${sub}; "N1" refused ("N1" is a Missing Prefab now)`, step: ops.length, op: 'undo/redo to the ends' }, ops)).toBe(true);
-  });
-
   // The fake watcher decides a raise as the host guard's `check` does (editorWriteGuard.ts, POSIX): a mark vouches for
   // the bytes it hashed, a TTL-only mark for anything, and an absent file only under the delete mark (#2009 review).
   it('harness: a mark vouches for its own bytes; a changed or a deleted write-marked file is raised (#2009)', () => {
@@ -1138,7 +1125,7 @@ describe('#1789 prefab fuzz', () => {
         f('redo to the end does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
         f('undo to the start does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
         // #2009 review: a composite that half-applied because a sub's GUARD refused (not ruling R), in both forms, and one
-        // whose failed sub threw. #2010's stop is about ruling R only.
+        // whose failed sub threw. (#2010's retired stop was about ruling R only; these stay as the reject side.)
         f('undo threw', 'Set Traits: 1 of 2 sub-action(s) failed during undo: "Edit Transform.x" refused (/fuzz/r0/prefabs/R.prefab.json is not what this step left there)', walk),
         f('op threw', 'undo "Set Traits" threw: 1 of 2 sub-action(s) failed during undo: "Edit Transform.x" refused (/fuzz/r0/prefabs/R.prefab.json is not what this step left there) |     at x', 'undo(0.5)'),
         f('undo threw', 'Mutate Scene (2 ops): 1 of 2 sub-action(s) failed during undo: "M905" threw (boom)', walk),

@@ -12,7 +12,7 @@
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
-import { type Failure, RULING_R } from './checks';
+import { type Failure } from './checks';
 
 export interface KnownOpen {
   issue: number;
@@ -65,18 +65,6 @@ const partialAddedWidened = (f: StepFailure): boolean => {
     && (f.touched?.fileDirect ?? []).includes(m[1]!);
 };
 
-/** #2010's shape: an undo or redo of a composite (one agent call's entry) where some subs REFUSED beside subs that applied —
- *  never one that threw for another reason. */
-const compositeHalfApplied = (f: StepFailure): boolean => {
-  // From the end walk (`undo threw`, the detail led by the entry's label) or an `undo`/`redo` op (`op threw`, the
-  // message then ` | ` and the stack) — the same mechanism either way (review: the op form went unclaimed).
-  if (!/^(undo|redo) threw$/.test(f.check) && f.check !== 'op threw') return false;
-  const m = /(\d+) of (\d+) sub-action\(s\) failed during (?:undo|redo): (.*?)(?: \| |$)/.exec(f.detail);
-  if (!m || Number(m[1]) >= Number(m[2])) return false;
-  // Each failed sub REFUSED under ruling R; a throw, or a refusal for any other reason (a guard's), is not #2010.
-  const subs = m[3]!.split(/; (?=")/);
-  return subs.every((s) => new RegExp(String.raw`^"[^"]*" refused \((?:"[^"]*"(?: \([^)]*\))? )?(?:${RULING_R})`).test(s));
-};
 
 /** #1820's paste assertion after a trash (seed 1012): the pasted frame is still expanded from an older document. */
 const pastedFrameStale = (f: StepFailure): boolean =>
@@ -141,20 +129,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => partialAddedWidened(f),
     stops: (f, ops) => partialAddedWidened(f) && ops.slice(0, f.step).some((o) => o.kind === 'fileMutate'),
   },  {
-    issue: 2010,
-    what: "#2010 (hunt seed 1153, #2009): an agent call's ONE undo entry (a composite) HALF-applies when one sub's target is gone (ruling R) and another's is not — a CompositeStepError, the entry dropped from both stacks. Hub ruling 2026-10-02: a composite refuses WHOLE before any change (rule 8, ruling R, Unity's undo groups, Create Prefab's W5); not patched on the old model, an acceptance criterion of S7's undo step",
-    repro: [
-      {kind: 'duplicate', u: [0.06184223503805697, 0.016401618951931596, 0.4260118736419827, 0.9952845550142229, 0.754150097258389, 0.933946989942342, 0.10883641964755952, 0.8018948379904032]},
-      {kind: 'instantiate', u: [0.5674041979946196, 0.5850283564068377, 0.48810928617604077, 0.5204959260299802, 0.6030646823346615, 0.04302460653707385, 0.17528071580454707, 0.20929821371100843]},
-      {kind: 'agentSceneOps', u: [0.15362343448214233, 0.38407423673197627, 0.23320098500698805, 0.7974971465300769, 0.9292557146400213, 0.9054889436811209, 0.26010975521057844, 0.33315321896225214]},
-      {kind: 'editField', u: [0.5271977682132274, 0.5825724361930043, 0.2588861286640167, 0.05811204249039292, 0.2129378216341138, 0.6562503795139492, 0.47226678184233606, 0.3576792587991804]},
-      {kind: 'prefabEdit', u: [0.7204824090003967, 0.5535659797023982, 0.2216329409275204, 0.8557709041051567, 0.1865801983512938, 0.9647123455069959, 0.690936912316829, 0.6503027405124158], inner: [{kind: 'delete', u: [0.4812680569011718, 0.6051278768572956, 0.5707945781759918, 0.35522824386134744, 0.0693927661050111, 0.15888829249888659, 0.9739731524605304, 0.6058842276688665]}]},
-      {kind: 'undo', u: [0.9296851067338139, 0.5846737751271576, 0.049499761778861284, 0.42648099130019546, 0.8821541699580848, 0.15550759225152433, 0.961956514744088, 0.30397607292979956]},
-    ],
-    reproduces: (f) => compositeHalfApplied(f),
-    stops: (f, ops) => compositeHalfApplied(f) && ops.slice(0, f.step + 1).some((o) => o.kind === 'agentSceneOps' || o.kind === 'agentSetTraits'),
-  },
-  {
     issue: 2013,
     what: "#2013 (hunt seed 1062; #2009's P1 by the fold): today's load keeps a member's `removed` in its orphan store AND applies it, and the fold applies it too (the oracle marks it `(applied)`). Hub ruling 2026-10-02: a record is projected or unused, never both, so today is wrong; not patched on the old model, retired by #2001 S6 (save writes the record). Its `own` rows, first waived here, are #2018",
     repro: [
@@ -276,6 +250,20 @@ export interface Reach {
 }
 
 export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[] }[] = [
+  {
+    issue: 2010,
+    what: "#2010 (hunt seed 1153, #2009; was KNOWN_OPEN): an agent call's ONE undo entry (a composite) whose added entity went with a member a saved prefab edit deleted. Its undo half-applied (the other op undone, the added one refused). Now every sub's check is asked first and the entry refuses whole, before any change (rule 8, ruling R); the extra undo reaches it as an op",
+    reaches: { op: 6, outcome: 'refused', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo op refusal forgiven', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'duplicate', u: [0.06184223503805697, 0.016401618951931596, 0.4260118736419827, 0.9952845550142229, 0.754150097258389, 0.933946989942342, 0.10883641964755952, 0.8018948379904032]},
+      {kind: 'instantiate', u: [0.5674041979946196, 0.5850283564068377, 0.48810928617604077, 0.5204959260299802, 0.6030646823346615, 0.04302460653707385, 0.17528071580454707, 0.20929821371100843]},
+      {kind: 'agentSceneOps', u: [0.15362343448214233, 0.38407423673197627, 0.23320098500698805, 0.7974971465300769, 0.9292557146400213, 0.9054889436811209, 0.26010975521057844, 0.33315321896225214]},
+      {kind: 'editField', u: [0.5271977682132274, 0.5825724361930043, 0.2588861286640167, 0.05811204249039292, 0.2129378216341138, 0.6562503795139492, 0.47226678184233606, 0.3576792587991804]},
+      {kind: 'prefabEdit', u: [0.7204824090003967, 0.5535659797023982, 0.2216329409275204, 0.8557709041051567, 0.1865801983512938, 0.9647123455069959, 0.690936912316829, 0.6503027405124158], inner: [{kind: 'delete', u: [0.4812680569011718, 0.6051278768572956, 0.5707945781759918, 0.35522824386134744, 0.0693927661050111, 0.15888829249888659, 0.9739731524605304, 0.6058842276688665]}]},
+      {kind: 'undo', u: [0.9296851067338139, 0.5846737751271576, 0.049499761778861284, 0.42648099130019546, 0.8821541699580848, 0.15550759225152433, 0.961956514744088, 0.30397607292979956]},
+      {kind: 'undo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+    ],
+  },
   {
     issue: 1939,
     what: "#1939 (hunt seed 1012, #1934 F4/M-b): Create Prefab on a member makes a scene-added reference node of the new prefab; the prefab trashed, the save carries its copy; since #2001 S5 (ruling B: no copy expands) the reload gives its Missing Prefab placeholder WITH the list the save wrote, where before #1939 it gave an empty one",
