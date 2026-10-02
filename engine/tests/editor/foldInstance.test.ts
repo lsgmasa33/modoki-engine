@@ -118,7 +118,8 @@ describe('foldInstance — scene-owned nodes and placeholders', () => {
 
   it('a missing nested prefab: a placeholder at its key, and the records under it wait (unresolved)', () => {
     const f = fold(entry({ nestedOverrides: { 3: { 3: { Sprite: { tint: '#0f0' } } } }, members: { [`/${N3}/${NQ3}`]: { guid: G(61), traits: { Light: { intensity: 2 } } } } }), new Map([['P', P]]));
-    expect(f.placeholders.get(`/${N3}`)).toEqual({ source: 'Q', reason: 'missing', parent: { key: '/' } });
+    // Realize's (S5): where it opens (the row in the outer frame), and the row's name, shown as the placeholder's.
+    expect(f.placeholders.get(`/${N3}`)).toEqual({ source: 'Q', reason: 'missing', parent: { key: '/' }, name: 'Engine', opens: { outer: '/', row: { localId: 3, nodeGuid: N3 } } });
     expect(causes(f)).toContain(`/${N3}/${NQ3} field:Light.intensity unresolved`);
   });
 
@@ -196,7 +197,7 @@ describe('foldInstance — the close-out review\'s cases (#2007), each one the c
   it('item 3: a placeholder hangs where its row would, and goes with a removed ancestor; its records then follow rule 3', () => {
     const PR: PrefabDoc = { id: 'PR', rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'A', 1), row(3, 'R', 2, { prefab: 'GONE' })] };
     const m = docsOf(PR);
-    expect(at(m, 'PR').placeholders.get(K(3))).toEqual({ source: 'GONE', reason: 'missing', parent: { key: K(2) } });
+    expect(at(m, 'PR').placeholders.get(K(3))).toEqual({ source: 'GONE', reason: 'missing', parent: { key: K(2) }, name: 'R', opens: { outer: '/', row: { localId: 3, nodeGuid: K(3).slice(1) } } });
     const cut = at(m, 'PR', { removed: [2], nestedOverrides: { 3: { 1: { Light: { intensity: 2 } } } } });
     expect([...cut.placeholders.keys()]).toEqual([]);
     expect(cut.unused).toEqual([]);

@@ -37,7 +37,8 @@
  *  reader its caller hands in rather than importing `prefab.ts`. */
 
 import { getAllEntities, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { keptOrphanRowsOf } from '../../runtime/core/ecs/keptOrphanRows';
 import { PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { PREFAB_EDIT_SCENE_PREFIX, prefabEditWorldPath } from './prefabEditWorld';
 import { prefabNests, type NestingReader } from '../../runtime/loaders/prefabNesting';
@@ -63,6 +64,7 @@ export const PREFAB_EDIT_REFUSAL_TEXT: Record<PrefabEditRefusalReason, string> =
   'self-nesting': 'A prefab cannot contain itself: this holds an instance of the prefab being edited.',
   'scaffold': 'The prefab-edit lights, environment and stage are editor scaffolding, not part of the prefab: they stay outside the root, where the save does not write them.',
   'under-missing-prefab': 'Nothing can be put under a Missing Prefab: its save writes only what its file held for it, so a new child would be lost or saved in the wrong place. Restore the prefab (the reload re-expands it), then add to it.',
+  'missing-prefab-row': 'This is part of a Missing Prefab: its save writes what its file held for it, so a delete would come back on reload. Restore the prefab (the reload re-expands it), then delete it.',
 };
 
 /** Why `gesture` is refused, or null when it may run: a new link under a Missing Prefab placeholder anywhere, and the rest
@@ -74,6 +76,8 @@ export function prefabEditRefusal(gesture: PrefabEditGesture): PrefabEditRefusal
   // In the scene and in prefab edit alike (the header): a NEW link under a placeholder. A reorder is not one.
   if (gesture.kind !== 'delete' && gesture.parentId && underMissingPrefab(gesture.parentId, byId)
     && !(gesture.kind === 'reparent' && byId.get(gesture.id)?.parentId === gesture.parentId)) return refuse('under-missing-prefab');
+  // In the scene and in prefab edit alike: a delete the kept list cannot hold (rule 9; #2028 close-out review).
+  if (gesture.kind === 'delete' && missingRowDelete(gesture.ids, byId)) return refuse('missing-prefab-row');
   const world = prefabEditWorldPath();
   if (!world) return null;
   const root = all.find((e) => e.guid === PREFAB_EDIT_ROOT_GUID);
@@ -114,6 +118,58 @@ function underMissingPrefab(id: number, byId: ReadonlyMap<number, EntityInfo>): 
   for (let cur = byId.get(id); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
     seen.add(cur.id);
     if (unresolvedRefOf(findEntity(cur.id) as Parameters<typeof unresolvedRefOf>[0])) return true;
+  }
+  return false;
+}
+
+/** A delete that a missing nested row's kept list cannot hold (#2001 S5, ruling D; rule 9): the row's placeholder
+ *  itself (its save restates the row from the file), or a node under it that the kept rows state (#2018: shown there,
+ *  but written back from the file, so it returned on reload). Only the delete's ROOTS are asked: deleting an ancestor
+ *  member or the instance takes the row with it, which its own save records. A node the user added under the
+ *  placeholder this session is the live capture's, which a delete removes, and is not refused. */
+function missingRowDelete(ids: readonly number[], byId: ReadonlyMap<number, EntityInfo>): boolean {
+  const picked = new Set(ids);
+  const isRow = (id: number) => !!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0]);
+  for (const id of picked) {
+    const above: number[] = [];
+    const seen = new Set<number>([id]);
+    for (let cur = byId.get(byId.get(id)?.parentId ?? 0); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
+      seen.add(cur.id);
+      above.push(cur.id);
+    }
+    if (above.some((a) => picked.has(a))) continue;
+    if (isRow(id)) return true;
+    const row = above.findIndex(isRow);
+    if (row < 0) continue;
+    const subtree = guidsUnder(id, byId);
+    for (const owner of above.slice(row + 1)) {
+      const kept = keptOrphanRowsOf(byId.get(owner)?.guid ?? '');
+      if (kept && statesAny(kept, subtree)) return true;
+    }
+  }
+  return false;
+}
+
+/** The guids of `id` and everything under it. */
+function guidsUnder(id: number, byId: ReadonlyMap<number, EntityInfo>): Set<string> {
+  const out = new Set<string>();
+  const kids = new Map<number, number[]>();
+  for (const e of byId.values()) if (e.parentId) (kids.get(e.parentId) ?? kids.set(e.parentId, []).get(e.parentId)!).push(e.id);
+  for (const stack = [id]; stack.length;) {
+    const cur = stack.pop()!;
+    const g = byId.get(cur)?.guid;
+    if (g) out.add(g);
+    stack.push(...(kids.get(cur) ?? []));
+  }
+  return out;
+}
+
+/** Whether a kept row states a node with one of `guids` (its `own` links or `added` nodes). */
+function statesAny(rows: Record<string, object>, guids: ReadonlySet<string>): boolean {
+  for (const row of Object.values(rows)) {
+    for (const list of [(row as { own?: unknown }).own, (row as { added?: unknown }).added]) {
+      if (Array.isArray(list) && list.some((n) => typeof (n as { guid?: unknown })?.guid === 'string' && guids.has((n as { guid: string }).guid))) return true;
+    }
   }
   return false;
 }

@@ -1,7 +1,7 @@
 /** #2009: the fuzzer's checks against the #2001 instance model, P1 and I25 (`prefabFuzz/shadow.ts`), held to both sides
  *  BEFORE the model exists. Nothing implements the store, the parser or the projection yet (S1 landed its types only), so
  *  each check runs here through FAKE seams: a fake door that records what the capture reads and one that misses a write, a
- *  fake reprojection that is the identity and one that is not. Each check must pass on the first and fail on the second;
+ *  fake projection that is the live instance and one that is not. Each check must pass on the first and fail on the second;
  *  a check that cannot fail on a broken model guards nothing (docs/falsifiable-tests.md).
  *
  *  The fake capture reads an instance root's MARKED fields off the live world (today's override marks), into the `"/"`
@@ -119,7 +119,7 @@ describe('#2009 I25 (the shadow): a record equals the capture, modulo identity p
 
   it('a store that lacks a live stored instance fails, rather than comparing nothing and counting it as run', async () => {
     expect(liveStoredRoots().length).toBeGreaterThan(0);
-    const empty = await run({ records: () => [], captureList, reproject: () => {}, doors: new Set(['copy']) }, [copyAny]);
+    const empty = await run({ records: () => [], captureList, project: async () => undefined, doors: new Set(['copy']) }, [copyAny]);
     expect(empty.failure?.check).toBe('a live stored instance has no record');
     const oneShort = await run({ records: () => liveStoredRoots().slice(1).map((g) => record(g, structuredClone(captureList(g)!))), captureList, doors: new Set(['copy']) }, [copyAny]);
     expect(oneShort.failure?.check).toBe('a live stored instance has no record');
@@ -216,18 +216,38 @@ describe('#2009 I25 (the shadow): a record equals the capture, modulo identity p
   }, 60_000);
 });
 
-describe('#2009 P1: reprojecting every record leaves the world as it was', () => {
-  it('an identity reprojection passes and is counted; one that moves a root fails, naming the field', async () => {
+describe('#2009 P1: each record\'s projection is its live instance', () => {
+  /** The live root's Transform, as a one-entity tree keyed by guid. */
+  const tree = (rec: InstanceRecord): Record<string, unknown> => {
+    const e = findEntityByGuid(rec.rootGuid);
+    return { [rec.rootGuid]: { traits: { Transform: e ? readTraitData(e.id(), getTraitByName('Transform')!) : null } } };
+  };
+  it('a projection that is the live instance passes and is counted; one that moves a root fails, naming the field', async () => {
     const records = () => liveRoots().map((g) => record(g, list({})));
-    const ok = await run({ records, reproject: () => {}, doors: new Set() }, [copyAny]);
+    const ok = await run({ records, project: async (rec) => ({ live: tree(rec), projected: tree(rec) }), doors: new Set() }, [copyAny]);
     expect(ok.failure, ok.failure ? `${ok.failure.check}: ${ok.failure.detail}` : '').toBeUndefined();
     expect(ok.counted).toContain('P1');
 
-    // Not a function of the record: the projection writes something the record does not say.
-    const drift = (rec: InstanceRecord) => { const e = findEntityByGuid(rec.rootGuid); if (e) writeTraitField(e.id(), getTraitByName('Transform')!, 'y', 42); };
-    const bad = await run({ records, reproject: drift, doors: new Set() }, [copyAny]);
-    expect(bad.failure?.check).toBe('P1 reprojecting the records changed the world');
+    // Not a function of the record: the projection states something the live instance does not.
+    const drift = async (rec: InstanceRecord) => {
+      const live = tree(rec);
+      const projected = structuredClone(live) as Record<string, { traits: { Transform: Record<string, unknown> } }>;
+      projected[rec.rootGuid]!.traits.Transform.y = 42;
+      return { live, projected };
+    };
+    const bad = await run({ records, project: drift, doors: new Set() }, [copyAny]);
+    expect(bad.failure?.check).toBe('P1 the projection of a record is not its live instance');
     expect(bad.failure?.detail).toMatch(/Transform\/y/);
+  }, 60_000);
+
+  it('a record the seam does not compare is counted under its reason, and a nested one (with its owner) not at all', async () => {
+    const records = () => liveRoots().map((g) => record(g, list({})));
+    const skipped = await run({ records, project: async () => ({ skip: 'stale (test)' }), doors: new Set() }, [copyAny]);
+    expect(skipped.failure).toBeUndefined();
+    expect(skipped.counted).toContain('P1 not compared: stale (test)');
+    expect(skipped.counted).not.toContain('P1');
+    const nested = await run({ records, project: async () => undefined, doors: new Set() }, [copyAny]);
+    expect(nested.counted.filter((k) => k.startsWith('P1') && !k.startsWith('P1 by the fold'))).toEqual([]);
   }, 60_000);
 
   it('with no seam installed neither check runs, and nothing is counted for them', async () => {

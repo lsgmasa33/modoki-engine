@@ -155,7 +155,7 @@ export interface RunState {
   f: Fixture;
   clip: EntityClipboard | null;
   /** What the round trip inside a save→reload op measured; the checks read it. */
-  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string };
+  roundTrip?: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; settled?: { after: unknown; bytes: string } };
   /** Every prefab DOCUMENT the run has seen, by id: the last path it had and the text the editor last held for it — the
    *  file, or the document an undo parked for Save (#1868). The runner records them after each step. What a deleted
    *  prefab's restore puts back: the document the live world was built on (hunt seed 7023: an Apply's undo is memory-only,
@@ -677,7 +677,21 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (gone) st.note = `${st.note ? `${st.note}; ` : ''}${gone} deleted prefab(s); ${placeholderGuids().size} placeholder(s) on the reload`;
       const s2 = await saveScene({ allowDialog: false });
       if (!s2.saved) throw new Error(`second save: ${s2.reason}`);
-      st.roundTrip = { before, after, firstBytes, secondBytes: st.be.read(st.f.scenePath) ?? '' };
+      const secondBytes = st.be.read(st.f.scenePath) ?? '';
+      // With a prefab deleted, a frame of it live at the save reloads as its placeholder (rule 9, ruling B), so the first
+      // save states a world the reload does not hold: the round trip runs once more from the reloaded world's save, and
+      // the checks read that one where the ruling applied (`checkRoundTrip`).
+      let settled: { after: unknown; bytes: string } | undefined;
+      if (gone) {
+        const again = await loadSceneReporting(st.f.scenePath);
+        if (again.outcome !== 'loaded') throw new Error(`second reload: ${again.outcome}`);
+        const after2 = worldTree();
+        const s3 = await saveScene({ allowDialog: false });
+        if (!s3.saved) throw new Error(`third save: ${s3.reason}`);
+        settled = { after: after2, bytes: st.be.read(st.f.scenePath) ?? '' };
+      }
+      st.roundTrip = { before, after, firstBytes, secondBytes, ...(settled ? { settled } : {}) };
+      if (process.env.DBG_DUMP) { const fs = await import('fs'); fs.writeFileSync(`${process.env.DBG_DUMP}/s1.json`, firstBytes); fs.writeFileSync(`${process.env.DBG_DUMP}/s2.json`, secondBytes); fs.writeFileSync(`${process.env.DBG_DUMP}/before.json`, JSON.stringify(before, null, 1)); fs.writeFileSync(`${process.env.DBG_DUMP}/after.json`, JSON.stringify(after, null, 1)); }
       return 'done';
     }
     case 'trashPrefab': {

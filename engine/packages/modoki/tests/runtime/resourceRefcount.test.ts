@@ -621,20 +621,25 @@ describe('refcount cache — prefab', () => {
       registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fields: {} });
     };
 
-    it('a NESTED-INSTANCE root reads the child root plus the reference row\'s override (#1031)', async () => {
+    // ⚠️ Since #2001 S5 (owner ruling (b), #2042) a root row that is a reference is the Prefab Variant form, which is
+    // not supported: nothing spawns it (`instantiatePrefabIntoWorld` returns 0), so the pool reads no size and no
+    // authored record from it, and it is never cached-as-spawnable — with or without its child. Before S5 these three
+    // read the child's root plus the row's override. Composition through a NESTED (non-root) row is unchanged, and
+    // covered where members are read (`prefabOverrides.test.ts`).
+    // Mutation: make `rootReferenceRefusal` answer null — the composed sizes come back and all three go red.
+    it('a NESTED-INSTANCE root (the variant form) reads nothing, child cached or not (#1031, #2042)', async () => {
       await registerUIElement();
       const { acquirePrefab } = await getCache();
       const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
       await acquirePrefab(1, G('/entry-child.prefab.json'));
       await acquirePrefab(1, G('/entry-nested.prefab.json'));
       expect(entryPrefabProvider.rootSize(G('/entry-nested.prefab.json')))
-        .toEqual({ width: 30, widthUnit: '%', height: 50, heightUnit: 'px' });
-      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-nested.prefab.json')))
-        .toEqual({ width: 30, widthUnit: '%', height: 50, heightUnit: 'px' });
-      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json'))).toBe(true);
+        .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-nested.prefab.json'))).toBeUndefined();
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'never spawnable').toBe(false);
     });
 
-    it('two nested levels: the OUTER reference row\'s override wins (#1031)', async () => {
+    it('two nested levels read nothing either (#1031, #2042)', async () => {
       await registerUIElement();
       const { acquirePrefab } = await getCache();
       const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
@@ -642,20 +647,20 @@ describe('refcount cache — prefab', () => {
       await acquirePrefab(1, G('/entry-nested.prefab.json'));
       await acquirePrefab(1, G('/entry-nested2.prefab.json'));
       expect(entryPrefabProvider.rootSize(G('/entry-nested2.prefab.json')))
-        .toEqual({ width: 30, widthUnit: '%', height: 70, heightUnit: 'px' });
+        .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
+      expect(entryPrefabProvider.isCached(G('/entry-nested2.prefab.json'))).toBe(false);
     });
 
-    it('a nested root whose CHILD is not cached is not cached itself — spawnInstance would return 0 (#1031)', async () => {
+    it('a variant root does not become spawnable when its child arrives (#1031, #2042)', async () => {
+      await registerUIElement();
       const { acquirePrefab } = await getCache();
       const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
       await acquirePrefab(1, G('/entry-nested.prefab.json'));
-      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'the parent file alone cannot spawn a root').toBe(false);
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json'))).toBe(false);
+      await acquirePrefab(1, G('/entry-child.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'the child changes nothing').toBe(false);
       expect(entryPrefabProvider.rootSize(G('/entry-nested.prefab.json')))
         .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
-      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-nested.prefab.json'))).toBeUndefined();
-
-      await acquirePrefab(1, G('/entry-child.prefab.json'));
-      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'and becomes spawnable once the child arrives').toBe(true);
     });
 
     /** #840 (owner decision: refuse) — a pooled row resolves the prefab root's size against the SCROLL

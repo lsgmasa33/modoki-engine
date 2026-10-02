@@ -1,8 +1,10 @@
-/** The repeat a seat cannot see (#1933 L5, hub ruling 2026-10-01): a template key two prefab FILES give one frame. Kept
+/** Why a prefab document cannot be expanded though it loads: the repeat a seat cannot see (#1933 L5, hub ruling
+ *  2026-10-01), a template key two prefab FILES give one frame; and a root that is a reference (the variant form, #2042). Kept
  *  out of `documentIdentity.ts` on purpose: that module is Node-safe and the backend's write guard imports it, while the
  *  derive walk this asks (`memberPaths.ts`) pulls the runtime graph. */
 
 import { repeatedTemplateKeys } from './memberPaths';
+import { rootReferenceRefusal } from './variantForm';
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
@@ -15,6 +17,9 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '');
  *  twice). The walk is the validator's (`repeatedTemplateKeys`, the derive's file twin), with `read` giving the nested
  *  documents — one it cannot give is not checked, as the validator says. Null when every derived path is single. */
 export function frameRepeatRefusal(doc: unknown, read: (guid: string) => unknown): string | null {
+  // Every seat that asks for a repeat asks for the document's other unsupported form too, so one answer covers both.
+  const rootRef = rootReferenceRefusal(doc);
+  if (rootRef) return rootRef;
   const { repeats } = repeatedTemplateKeys(doc, read as never);
   if (!repeats.length) return null;
   const d = doc as { name?: unknown; id?: unknown };

@@ -219,7 +219,9 @@ export const KNOWN_OPEN: KnownOpen[] = [
       {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
       {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
       {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
-      {kind: 'delete', u: [0.6071428571428571, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+      // Aimed at the node: candidate 5 of 13 since #2001 S5 spawns the same entities in another order (7 of 13 before),
+      // which left the old aim on another entity, and the entry passing for that reason alone.
+      {kind: 'delete', u: [0.4230769230769231, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
     ],
     // The deleted node itself comes back (its guid's run-independent part: the run's 12th mint), not some other gain.
     // No `stops`: a stop matching a gained entity would claim every such hunt finding, so a hunt that reaches this
@@ -249,6 +251,13 @@ export const KNOWN_OPEN: KnownOpen[] = [
 //   the case, so it stayed green with the redo handed no root guid. The case is instantiateUndoSiblingIdentity.test.ts
 //   (red with `opts.respawn(undefined)`); win's seed 5785, which reaches the same redo without the taint, goes red too.
 
+// - #2001 S5 (#2028) re-measured seventeen entries: every declared op ends as before; only the WALK's skips moved. A frame of a
+//   deleted prefab now reloads as its placeholder (rule 9, ruling B: no copy expands), so an undo recorded against the
+//   live frame refuses before it changes anything (`requireLinks`, ruling R) where the copy had put the frame back. Eleven
+//   were already tainted (their undo/redo identities skipped); their walk now stops at the refusal instead. Five ruling-R
+//   entries (351, 6030, #1856, 6356, 1027) lose the walk's identities, which none of them guards: each guards an op or the round
+//   trip.
+
 /** What a REGRESSIONS entry must still REACH, besides passing (#1933 K1). A repro that no longer reaches its case passes
  *  for that reason alone: three #1853 entries kept passing once an outside edit started tainting their segment
  *  (#1873 R1), which turned off the very checks that measured them. So each entry states an op and how that op must end,
@@ -269,8 +278,8 @@ export interface Reach {
 export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[] }[] = [
   {
     issue: 1939,
-    what: "#1939 (hunt seed 1012, #1934 F4/M-b): Create Prefab on a member makes a scene-added reference node of the new prefab; the prefab trashed, the save carries its copy; the reload restores the node from it (its frame listed live at the save), where it gave its empty Missing Prefab placeholder",
-    reaches: { op: 1, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    what: "#1939 (hunt seed 1012, #1934 F4/M-b): Create Prefab on a member makes a scene-added reference node of the new prefab; the prefab trashed, the save carries its copy; since #2001 S5 (ruling B: no copy expands) the reload gives its Missing Prefab placeholder WITH the list the save wrote, where before #1939 it gave an empty one",
+    reaches: { op: 1, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       {kind: 'createPrefab', u: [0.07576225162483752, 0.4839742570184171, 0.18013141467235982, 0.984006108250469, 0.7422482529655099, 0.5091050690971315, 0.9696242799982429, 0.537708398886025]},
       {kind: 'trashPrefab', u: [0.6900484366342425, 0.5306535325944424, 0.7126782101113349, 0.8273992876056582, 0.3369053485803306, 0.45967397396452725, 0.8177091341931373, 0.2302168474998325]},
@@ -278,8 +287,8 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1939,
-    what: "#1939 (hunt seed 1027, #1934 F4/M-b): the same node, live after the trash, through an Apply's rebuild\u2261reload: the rebuild keeps it expanded (#1862), and the reload now restores it from the copy too",
-    reaches: { op: 1, outcome: 'done' },
+    what: "#1939 (hunt seed 1027, #1934 F4/M-b): the same node, live after the trash, through an Apply's rebuild\u2261reload: the rebuild keeps it expanded (#1862), and since #2001 S5 the reload gives its placeholder, which keeps the list (ruling B)",
+    reaches: { op: 1, outcome: 'done', skips: ['rulingR: redo to the end identity', 'rulingR: undo to the start identity'] },
     repro: [
       {kind: 'trashPrefab', u: [0.9199938054662198, 0.23703388520516455, 0.35904134321026504, 0.5552934117149562, 0.4747692556120455, 0.17824304103851318, 0.2595838194247335, 0.14314630953595042]},
       {kind: 'apply', u: [0.013209617463871837, 0.7259964346885681, 0.41166331013664603, 0.3558924614917487, 0.569496892625466, 0.45171762513928115, 0.633732000598684, 0.7274762492161244], check: 'rebuild-reload'},
@@ -287,7 +296,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1939,
-    what: "#1939 (hunt seeds 3266, 1269, #1934 C1): a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload and an expanded one comes back expanded, as the copy's list says",
+    what: "#1939 (hunt seeds 3266, 1269, #1934 C1): a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload, and since #2001 S5 an expanded one reloads as a placeholder too, keeping its list (ruling B: no copy expands)",
     reaches: { op: 3, outcome: 'done' },
     repro: [
       {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
@@ -472,7 +481,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1881,
     what: "seed 1012 (Duplicate, Create Prefab, trash a prefab nested in the tree, then the walk's undo): Create Prefab's undo put its links back after the change and counted 2 it could not; #1880 W5's `requireLinks` refuses before any change",
-    reaches: { op: 2, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 2, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'duplicate', u: [0.793059557909146, 0.07850893028080463, 0.8062161759007722, 0.8035517330281436, 0.2764330352656543, 0.8323238401208073, 0.26245217374525964, 0.47499521006830037] },
       { kind: 'createPrefab', u: [0.07576225162483752, 0.4839742570184171, 0.18013141467235982, 0.984006108250469, 0.7422482529655099, 0.5091050690971315, 0.9696242799982429, 0.537708398886025] },
@@ -931,7 +940,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1831,
     what: "(harness, G1 M1) trash P, then instantiate O, which nests P: the live world holds kept P frames beside O's unexpanded P row, and the restored comparison lets that row come back expanded (hunt seed 351, #1856)",
-    reaches: { op: 1, outcome: 'done' },
+    reaches: { op: 1, outcome: 'done', skips: ['rulingR: redo to the end identity', 'rulingR: undo to the start identity'] },
     repro: [
       { kind: 'trashPrefab', u: [0.6031674689147621, 0.32979793287813663, 0.8048893548548222, 0.19987819739617407, 0.7723878214601427, 0.4218790833838284, 0.6704246983863413, 0.05371444392949343] },
       { kind: 'instantiate', u: [0.6069244958925992, 0.263748875586316, 0.16720971977338195, 0.9911824848968536, 0.17673206329345703, 0.3720341839361936, 0.936112288152799, 0.7757013773079962] },
@@ -940,7 +949,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1831,
     what: "(harness, G1 M1) the same two ops (hunt seed 6030)",
-    reaches: { op: 1, outcome: 'done' },
+    reaches: { op: 1, outcome: 'done', skips: ['rulingR: redo to the end identity', 'rulingR: undo to the start identity'] },
     repro: [
       { kind: 'trashPrefab', u: [0.5406942241825163, 0.39389731688424945, 0.8374803350307047, 0.07660906296223402, 0.9091866982635111, 0.5265559710096568, 0.9305080221965909, 0.61383136222139] },
       { kind: 'instantiate', u: [0.4133435436524451, 0.964117540512234, 0.26380765507929027, 0.9943990514148027, 0.7428998670075089, 0.7959617732558399, 0.21524300938472152, 0.7997799264267087] },
@@ -949,7 +958,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1831,
     what: "(harness, G1 M1/M5) a kept frame's reparent and Apply before the round trip, which then failed as M1 (hunt seed 5104)",
-    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'prefabEdit', u: [0.8762713158503175, 0.03239666367881, 0.11954150861129165, 0.9196045729331672, 0.3753566930536181, 0.5589897979516536, 0.26667742733843625, 0.9626793242059648], inner: [{kind: 'delete', u: [0.4095847448334098, 0.32432481413707137, 0.2858915913384408, 0.7823276342824101, 0.36225294740870595, 0.9154196181334555, 0.005848549073562026, 0.35622050357051194]}, {kind: 'undo', u: [0.33388770720921457, 0.572215726133436, 0.012769023422151804, 0.13426355132833123, 0.418521893909201, 0.9623553154524416, 0.28858965658582747, 0.18201336916536093]}, {kind: 'redo', u: [0.5351214946713299, 0.5260254153981805, 0.0020173119846731424, 0.6366104746703058, 0.5911289998330176, 0.2582283711526543, 0.41223555197939277, 0.9923461589496583]}, {kind: 'redo', u: [0.7061207813676447, 0.712686057202518, 0.991152907256037, 0.697692945599556, 0.8350388244725764, 0.9191796996165067, 0.3809151416644454, 0.5443655350245535]}] },
       { kind: 'editField', u: [0.045991167426109314, 0.5878017456270754, 0.21571285114623606, 0.3114997963421047, 0.5819835742004216, 0.6850799140520394, 0.12637460720725358, 0.4519760166294873] },
@@ -1053,7 +1062,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1849,
     what: "(harness) a swap that leaves a nested frame of a trashed prefab UNEXPANDED taints as ruling R — its members are gone, not placeholders (work-ai3 hunt seed 6191; #1849's seeds under prune). With the loader's delete eviction (#1834) the swap and the refusal fall in ONE `undo` op — the Apply's undo reloads, the next undo in the op refuses — so the taint is taken before the op's refusal is judged (#1862)",
-    reaches: { op: 8, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 8, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'instantiate', u: [0.5197782325558364, 0.8788099023513496, 0.7218048402573913, 0.38950273185037076, 0.49659334821626544, 0.4644296036567539, 0.8073571014683694, 0.3525339278858155] },
       { kind: 'instantiate', u: [0.8885502920020372, 0.03978240699507296, 0.5181071648839861, 0.01798194320872426, 0.6372697676997632, 0.9517800977919251, 0.43241823813878, 0.5862065297551453] },
@@ -1069,7 +1078,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1856,
     what: 'prune on: trash → addChild → Apply — the Apply\'s fan-out no longer drops the trashed prefab\'s live nested frame (#1862\'s keep), so the comparison reload with the prefab restored gains nothing',
-    reaches: { op: 2, outcome: 'done' },
+    reaches: { op: 2, outcome: 'done', skips: ['rulingR: redo to the end identity', 'rulingR: undo to the start identity'] },
     repro: [
       { kind: 'trashPrefab', u: [0.9616053267382085, 0.8986614316236228, 0.8458665194921196, 0.10550301731564105, 0.36948610469698906, 0.10419670818373561, 0.14534811885096133, 0.3606053702533245] },
       { kind: 'addChild', u: [0.45433683576993644, 0.06991623109206557, 0.36247888510115445, 0.32349463854916394, 0.9636948064435273, 0.36620242870412767, 0.7672389638610184, 0.7997816174756736] },
@@ -1079,7 +1088,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1850,
     what: 'a Missing Prefab placeholder of an entry that states its root\'s sortOrder as a root OVERRIDE loads with that sortOrder, so save→reload→save keeps the top-level order (prune on, after a trash)',
-    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'addChild', u: [0.9957377251703292, 0.12976732291281223, 0.2103715562261641, 0.9275979360099882, 0.43928383802995086, 0.07324382080696523, 0.19927202980034053, 0.8402995807118714] },
       { kind: 'duplicate', u: [0.21626306232064962, 0.5490222787484527, 0.789051380706951, 0.16266263229772449, 0.5332405406516045, 0.12282868777401745, 0.042075154604390264, 0.1445559342391789] },
@@ -1091,7 +1100,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1866,
     what: "an Apply promoting a live instance of a TRASHED prefab P into Q, which P nests, is refused: I16's reader falls back to the document P's live frame was expanded from, so Q → P → Q is never written (work-ai3 hunt seed 6031)",
-    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'addChild', u: [0.4305641388054937, 0.46192985004745424, 0.9784602834843099, 0.21986035979352891, 0.9370753238908947, 0.33278186176903546, 0.1576756751164794, 0.07622262183576822] },
       { kind: 'renamePrefab', u: [0.4414735846221447, 0.24768190551549196, 0.7650708560831845, 0.8969545839354396, 0.78997323801741, 0.6095375462900847, 0.037518877536058426, 0.5313502037897706] },
@@ -1216,7 +1225,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     what: 'the same, where the world swap is the final save→reload (baseline seed 246)',
     // #1869: this Apply first moved a member within its frame (the fuzzer's retired directed branch), then applied every
     // key. A member no longer moves, so the repro applies every key (`u[1] = 0`) without the move.
-    reaches: { op: 11, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 11, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'renamePrefab', u: [0.29216481326147914, 0.1476494751404971, 0.18551874696277082, 0.07410656800493598, 0.41970898350700736, 0.4152033708523959, 0.13034801022149622, 0.09932499984279275] },
       { kind: 'createPrefab', u: [0.5039114304818213, 0.255739972461015, 0.09370358125306666, 0.7442081868648529, 0.380464835325256, 0.46510340296663344, 0.25256184837780893, 0.05835147784091532] },
@@ -1246,7 +1255,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1798,
     what: "the validator reads a compact entry's top-level guid (a child of a placeholder is not an orphan)",
-    reaches: { op: 9, outcome: 'refused', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 9, outcome: 'refused', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'addChild', u: [0.8400129179935902, 0.47072196402586997, 0.8546695783734322, 0.5384382756892592, 0.7912890370935202, 0.9474262788426131, 0.8190620134118944, 0.5476701280567795] },
       { kind: 'duplicate', u: [0.08395724813453853, 0.5124020783696324, 0.0963418607134372, 0.3281203443184495, 0.6479879403486848, 0.0661356458440423, 0.3539451723918319, 0.9203498638235033] },
@@ -1346,7 +1355,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1831,
     what: "(harness, ruling R) a scene entity moved under an instance of a trashed prefab; the instance deleted: the delete's undo respawns it in the SAME world as a Missing Prefab placeholder that swallows the entity, so the next undo on it refuses by ruling R. The runner taints that segment (`swallowedRecorded`) (hunt seed 6356)",
-    reaches: { op: 6, outcome: 'done' },
+    reaches: { op: 6, outcome: 'done', skips: ['rulingR: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'trashPrefab', u: [0.2729424652643502, 0.4098491012118757, 0.29578961874358356, 0.0715752353426069, 0.3902849357109517, 0.5432256888598204, 0.14779127156361938, 0.7190025397576392] },
       { kind: 'instantiate', u: [0.5839928763452917, 0.6164563843049109, 0.8372499893885106, 0.1193005929235369, 0.3928135307505727, 0.07510777679271996, 0.6468799393624067, 0.9758125292137265] },
@@ -1428,7 +1437,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1738,
     what: "win hunt seed 6136 (instantiate, Create Prefab, trash, a saved prefab edit): the save's by-design #1738 refusal of a reference node whose prefab is missing failed the step as console.error \u2014 its wording was not in EXPECTED_ERRORS",
-    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'instantiate', u: [0.4431566004641354, 0.7968979061115533, 0.40783188841305673, 0.5022549307905138, 0.19927031104452908, 0.6920147859491408, 0.2723008228931576, 0.9618998144287616] },
       { kind: 'createPrefab', u: [0.0038380103651434183, 0.591657679527998, 0.6498477926943451, 0.16832039435394108, 0.2952046236023307, 0.20283732656389475, 0.14619030989706516, 0.46976823825389147] },
@@ -1574,7 +1583,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1895,
     what: "hunt seed 3129: a live instance of a TRASHED prefab, whose root sortOrder equalled its template row's (a Create Prefab copies it) and so was stated nowhere, reloaded as a Missing Prefab placeholder at sortOrder 0 and save→reload→save reordered /entities. The save now states the root's unstated, non-default sortOrder/isActive on the entry's own traits (`placementForMissing`)",
-    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       { kind: 'delete', u: [0.9129093873780221, 0.48112353729084134, 0.6681748542468995, 0.03234542463906109, 0.11518862145021558, 0.9136989440303296, 0.6377161764539778, 0.3317907089367509] },
       { kind: 'addChild', u: [0.2458805199712515, 0.21558656124398112, 0.11938353115692735, 0.8148526235017926, 0.8918901064898819, 0.5355975485872477, 0.9143984671682119, 0.23446833714842796] },
@@ -1597,7 +1606,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1914,
     what: "#1914 R6 (hunt seed 1130, found by R7): a top-level instance whose prefab is missing, made by a detach after a copy-restored reload, its root sortOrder in both `overrides` and `traits.EntityAttributes`. The live save wrote EntityAttributes {parentId, sortOrder}; the placeholder's save (`asSceneEntry`: delete parentId, then assign the placement) wrote {sortOrder, parentId}, so save→reload→save differed in key order only. `asSceneEntry` now rebuilds the attributes in the order the record was read",
-    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: redo refusal forgiven (rest of the walk not run)', 'prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
     repro: [
       {kind: 'trashPrefab', u: [0.7666114093735814, 0.472519604023546, 0.07488158065825701, 0.6996986435260624, 0.9371706352103502, 0.32567527424544096, 0.610981714213267, 0.6603487117681652]},
       {kind: 'saveReload', u: [0.3863253442104906, 0.46820511482656, 0.873514065053314, 0.4368473864160478, 0.12880094349384308, 0.6978627098724246, 0.4603831691201776, 0.37973754992708564]},
@@ -1612,7 +1621,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1914,
     what: "#1914 R7 merge (hunt seed 1212): P trashed, so a reload expands O's nested P frame from the scene's copy (#1867), and an edit of O's added node Extra (Transform.sx) recorded on O's row. The load's R2 orphan test read the runtime cache alone, so that row was kept as an orphan as well as applied; once the edit was undone the save wrote the stale row back under the capture, and a rebuild (a load of the entry) restored the undone value. The load's `settleEntryRows` now reads `runtimeReaderFor(world)`, as its expansion did",
-    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: redo refusal forgiven (rest of the walk not run)', 'prefabEditSave: undo to the start identity'] },
+    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       {kind: 'addChild', u: [0.18742664926685393, 0.30426382343284786, 0.4212738615460694, 0.6239593659993261, 0.2947947233915329, 0.010036298539489508, 0.41152178030461073, 0.17663234402425587]},
       {kind: 'addChild', u: [0.3059104988351464, 0.22330826637335122, 0.022554441587999463, 0.36423116619698703, 0.8034015789162368, 0.7359053157269955, 0.2862185603007674, 0.30399635271169245]},

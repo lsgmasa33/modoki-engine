@@ -4,6 +4,7 @@
 
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { frameRepeatRefusal } from '../../runtime/loaders/frameRepeat';
+import { rootReferenceRefusal } from '../../runtime/loaders/variantForm';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { relinkDetachedMembers } from '../../runtime/core/ecs/memberHome';
 import { worldIdentityParents, frameRootDoc, noteFrameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -14,7 +15,7 @@ import {
   getAllEntities, deleteEntities, readTraitData, writeTraitField, findEntity, markStructureDirty,
 } from '../../runtime/core/ecs/entityUtils';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { newGuid, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -161,6 +162,19 @@ function seatKeptFrames(kept: readonly KeptFrame[], newRootId: number, unnamed: 
     const at = pi?.source ? resolveRef(pi.source) : undefined;
     const lid = row && row.prefab && (row.prefab === pi?.source || (at !== undefined && resolveRef(row.prefab) === at)) ? row.localId : 0;
     if (!rec || !lid || !rec.unexpanded?.includes(lid)) { drop.push(k.id); continue; }
+    // The respawn shows that row as its Missing Prefab placeholder (#2001 S5, ruling D), on the row's guid: the kept frame
+    // takes its place, as it took the empty row's before. Found in the OWNER's tree, where the row hangs: a frame a legacy
+    // move took out of it (#1437) hangs elsewhere, and its placeholder is still at the row (#1880 F7d review 4).
+    const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+    const inOwner = (id: number): boolean => {
+      for (let p = parentOf.get(id), hops = 0; p && hops < 10000; p = parentOf.get(p), hops++) if (p === owner) return true;
+      return false;
+    };
+    for (const e of getAllEntities()) {
+      if (e.id === k.id) continue;
+      const ph = rowPlaceholderOf(findEntity(e.id) as never);
+      if (ph && (row!.nodeGuid ? ph.nodeGuid === row!.nodeGuid : ph.localId === lid) && inOwner(e.id)) drop.push(e.id);
+    }
     noteFrameRootDoc(world, ownerEntity!, { ...rec, unexpanded: rec.unexpanded.filter((n) => n !== lid) });
     if (pi?.parentLocalId !== lid) writeTraitField(k.id, piMeta, 'parentLocalId', lid);
   }
@@ -264,7 +278,7 @@ function entryDocOf(outer: number, source: string): PrefabFile | undefined {
 type RowRef = { localId?: number; nodeGuid?: string; prefab?: string };
 type TemplateRows = { entities?: readonly RowRef[] };
 
-function withFrameRecords(base: ExpansionReader, outer: number): ExpansionReader {
+export function withFrameRecords(base: ExpansionReader, outer: number): ExpansionReader {
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta) return base;
   const world = getCurrentWorld();
@@ -274,7 +288,8 @@ function withFrameRecords(base: ExpansionReader, outer: number): ExpansionReader
   const block = (ref: string | undefined) => { if (ref) { blocked.add(ref); const at = resolveRef(ref); if (at) blocked.add(at); } };
   for (const id of collectSubtreeIds(links, [outer])) {
     const handle = findEntity(id);
-    const placeholder = unresolvedRefOf(handle);
+    // A missing nested row's placeholder too (#2001 S5, ruling D): no document stands behind it.
+    const placeholder = unresolvedRefOf(handle) ?? rowPlaceholderOf(handle as never);
     if (placeholder) { block(placeholder.source); continue; }
     const pi = readTraitData(id, piMeta) as { source?: string; rootInstanceId?: number } | null;
     if (!pi?.source || pi.rootInstanceId !== id || !handle) continue;
@@ -518,12 +533,17 @@ export function rebuildFromEntry(
   /** Filled with every entity the rebuild left as it was inside a frame it KEPT live (`rebuildTeardown`'s `unexpandable`,
    *  #1862): nothing in there was re-expanded, so a caller must not count a target in it as rebuilt. */
   keptOut?: Set<number>,
+  /** The scene format `entry` is stated in: the current one (a capture), or the instance model's v20 (a record the store
+   *  holds, serialized by `serializeInstanceRecord` — `reprojectFromStore`, #2001 S5). */
+  sceneVersion?: number,
 ): number {
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !eaMeta) return rootInstanceId;
-  if (!expandsToRoot(prefab, read as typeof getCachedPrefabSync)) {
-    console.warn(`[Prefab] rebuild of ${source} skipped: the prefab expands to no root`);
+  // The variant form (#2042) is named first: it expands to no root either, but that would not say why.
+  const variant = rootReferenceRefusal(prefab);
+  if (variant || !expandsToRoot(prefab, read as typeof getCachedPrefabSync)) {
+    console.warn(`[Prefab] rebuild of ${source} skipped: ${variant ?? 'the prefab expands to no root'}`);
     return rootInstanceId;
   }
   // A key the expansion would give two nodes (#1933 L5, close-out review #1): left as it was, as one that expands to no
@@ -567,7 +587,9 @@ export function rebuildFromEntry(
   const newRootId = instantiatePrefabIntoWorld(
     world, prefab, parentId, undefined, source, entry.overrides,
     { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits, moved: entry.moved, members: entry.members },
-    undefined, entry.nestedOverrides, entry.nestedStructure, { read: spawnRead, frame: rootFrame },
+    undefined, entry.nestedOverrides, entry.nestedStructure,
+    // A captured entry is the current format's statement (the default version); its root keeps the guid it had.
+    { read: spawnRead, frame: rootFrame, ...(durableGuid(oldRootEa?.guid as string) ? { rootGuid: oldRootEa!.guid as string } : {}), ...(sceneVersion !== undefined ? { sceneVersion } : {}) },
   );
   markStructureDirty();
   markUIDirty();
@@ -578,7 +600,7 @@ export function rebuildFromEntry(
   restoreTemplateKeys(carriedKeys);
   // …and the load's post-pass for this one entry: its rows' pins, R2's kept store, the reference nodes' rows, the derive.
   const settled = entryRowsOf(newRootId, source, entry);
-  settleEntryRows(world, [settled], { pinned: new Set(), read: read as typeof getCachedPrefabSync });
+  settleEntryRows(world, [settled], { pinned: new Set(), read: read as typeof getCachedPrefabSync, ...(sceneVersion !== undefined ? { fromSceneVersion: sceneVersion } : {}) });
   restoreTemplateKeys(carriedKeys);
   // A kept reference node the entry states under a row the new template no longer backs is in that row now (R2, B′), as
   // a load leaves it: it goes with its member rather than being re-seated at the root.

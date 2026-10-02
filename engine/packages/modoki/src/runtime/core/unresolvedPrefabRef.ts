@@ -19,7 +19,7 @@
 import { trait } from 'koota';
 
 /** `record` is JSON, so the marker's data is a value: a copy of it cannot alias the original's. */
-export const UnresolvedPrefabRef = trait({ source: '', kind: '' as '' | 'entry' | 'node', record: '' });
+export const UnresolvedPrefabRef = trait({ source: '', kind: '' as '' | 'entry' | 'node' | 'row', record: '' });
 
 export type UnresolvedKind = 'entry' | 'node';
 
@@ -40,6 +40,41 @@ export function unresolvedRefOf(entity: Handle | undefined | null): { source: st
   if (!d.source || (d.kind !== 'entry' && d.kind !== 'node')) return undefined;
   try {
     return { source: d.source, kind: d.kind, record: JSON.parse(d.record) as Record<string, unknown> };
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a ROW placeholder stands for (#2001 S5, rule 9, ruling D): a nested reference row of a loaded document whose own
+ *  prefab is missing or damaged. Unlike an entry's or a node's, it carries NO record to write back: the row is the
+ *  document's, and every record about the frame it opens stays in the instance's list. It is the frame's stand-in only,
+ *  so `unresolvedRefOf` never answers for it (no writer may treat it as a stored reference); the marker is shared so
+ *  everything that shows a Missing Prefab placeholder shows this one too. */
+export interface RowPlaceholder {
+  source: string;
+  /** The row's localId and minted identity in the document of the frame it hangs in. */
+  localId: number;
+  nodeGuid: string;
+  reason: 'missing' | 'damaged';
+}
+
+/** Mark `entity` as the placeholder of a nested row. */
+export function markRowPlaceholder(entity: Handle | undefined | null, row: RowPlaceholder): void {
+  if (!entity || !row.source) return;
+  const data = { source: row.source, kind: 'row' as const, record: JSON.stringify({ localId: row.localId, nodeGuid: row.nodeGuid, reason: row.reason }) };
+  if (entity.has(UnresolvedPrefabRef)) entity.set(UnresolvedPrefabRef, data);
+  else entity.add(UnresolvedPrefabRef(data));
+}
+
+/** The row `entity` stands in for, when it is a row placeholder. */
+export function rowPlaceholderOf(entity: Handle | undefined | null): RowPlaceholder | undefined {
+  if (!entity || !entity.has(UnresolvedPrefabRef)) return undefined;
+  const d = entity.get(UnresolvedPrefabRef) as { source: string; kind: string; record: string };
+  if (d.kind !== 'row' || !d.source) return undefined;
+  try {
+    const r = JSON.parse(d.record) as { localId?: unknown; nodeGuid?: unknown; reason?: unknown };
+    if (typeof r.localId !== 'number') return undefined;
+    return { source: d.source, localId: r.localId, nodeGuid: typeof r.nodeGuid === 'string' ? r.nodeGuid : '', reason: r.reason === 'damaged' ? 'damaged' : 'missing' };
   } catch {
     return undefined;
   }

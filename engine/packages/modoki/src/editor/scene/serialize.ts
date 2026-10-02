@@ -627,8 +627,14 @@ async function serializeSceneScoped(opts?: {
     ? targetScene.guid
     : (ownLoadedEntry && isGuid(ownLoadedEntry.guid) ? ownLoadedEntry.guid
       : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid()));
-  // The copies THIS scene's load carried, keyed by the guid its file loaded with (#1934 L1; '' for a file without one).
-  const loadedId = targetScene ? targetScene.guid : ownLoadedEntry?.guid;
+  // The copies THIS scene's load carried, keyed by the guid its file loaded with (#1934 L1; '' for a file without one). A
+  // primary its path does not name — an untitled world an undo reloaded from a snapshot, saved As — is still the content
+  // this save writes, and its copies are under the snapshot's id (`captureSceneCopies`' `primaryAs`, #1948 S2): taken
+  // when THIS world holds copies under it (the store is per world, so a primary entry another world left names none).
+  // Before ruling B its frames were live and carried the copy whatever the key (#2001 S5, #2028).
+  const primaryEntry = [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary');
+  const primaryCopies = !ownLoadedEntry && primaryEntry && isGuid(primaryEntry.guid) && embeddedPrefabGuids(getCurrentWorld(), primaryEntry.guid).length;
+  const loadedId = targetScene ? targetScene.guid : ownLoadedEntry?.guid ?? (primaryCopies ? primaryEntry!.guid : undefined);
   const embedded = await collectEmbeddedPrefabs(entityInfos, entities, loadedId && isGuid(loadedId) ? loadedId : '');
   const embeddedPrefabs = embedded?.docs;
   // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).

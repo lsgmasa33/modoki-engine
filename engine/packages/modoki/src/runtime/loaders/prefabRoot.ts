@@ -1,5 +1,8 @@
 import { prefabContainsItself, type NestingReader } from './prefabNesting';
 import { rowAt } from '../core/prefabRowAt';
+import { rootReferenceRefusal } from './variantForm';
+
+export { rootReferenceRefusal };
 
 /** Whether a prefab document expands to a ROOT (#1768). A document that loads but yields no root — its `rootLocalId`
  *  names no row, or names a reference row whose prefab cannot be read, or one that nests itself — cannot be expanded,
@@ -20,32 +23,19 @@ const rootRowOf = (doc: RootDoc) => {
   return rowAt(doc, rid);
 };
 
-/** `doc` expands to a root, reading a reference root's prefab through `read`. `stack` holds the documents already
- *  being expanded above this one (the walk's cycle stack), which a reference root may not name. */
-export function expandsToRoot(doc: RootDoc, read: (source: string) => RootDoc | null | undefined, stack?: ReadonlySet<string>): boolean {
-  const seen = new Set(stack);
-  for (let d: RootDoc | null | undefined = doc; ;) {
-    if (d.id) seen.add(d.id);
-    const row = rootRowOf(d);
-    if (!row) return false;
-    if (!row.prefab) return true;
-    d = read(row.prefab);
-    if (!d || (d.id && seen.has(d.id))) return false;
-  }
+/** `doc` expands to a root: its root row is a row, and a plain one. A root that is a reference is the Prefab Variant form,
+ *  which nothing expands since #2001 S5 (owner ruling (b), #2042: `rootReferenceRefusal`), so it does not expand here
+ *  either. The predicate and both expansions answer alike (the twin pin, `missingPrefabPassThrough.test.ts`); before S5
+ *  a reference root was followed into its prefab (through `read`, with `stack` as the walk's cycle stack). Those two stay
+ *  in the signature for the variants stage that will follow it again. */
+export function expandsToRoot(doc: RootDoc, _read: (source: string) => RootDoc | null | undefined, _stack?: ReadonlySet<string>): boolean {
+  const row = rootRowOf(doc);
+  return !!row && !row.prefab;
 }
 
-/** The loader's form: a reference root's prefab is FETCHED, as the entry's own document was, so an editor load whose
- *  runtime cache has not seen it yet does not read it as missing. */
-export async function fetchedExpandsToRoot(doc: RootDoc, fetch: (source: string) => Promise<RootDoc | null | undefined>): Promise<boolean> {
-  const seen = new Set<string>();
-  for (let d: RootDoc | null | undefined = doc; ;) {
-    if (d.id) seen.add(d.id);
-    const row = rootRowOf(d);
-    if (!row) return false;
-    if (!row.prefab) return true;
-    d = await fetch(row.prefab);
-    if (!d || (d.id && seen.has(d.id))) return false;
-  }
+/** The loader's form ({@link expandsToRoot}): it fetched a reference root's prefab, as the entry's own document was. */
+export async function fetchedExpandsToRoot(doc: RootDoc, _fetch: (source: string) => Promise<RootDoc | null | undefined>): Promise<boolean> {
+  return expandsToRoot(doc, () => null);
 }
 
 /** Must reference node `node` be refused as a cycle (I16)? Only when its prefab is being expanded ABOVE it (`ancestors`,

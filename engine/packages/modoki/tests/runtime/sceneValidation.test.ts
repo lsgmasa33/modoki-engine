@@ -1564,9 +1564,14 @@ describe('validateSceneData — entry-kind pass (#671)', () => {
   const nestedResolver: PrefabResolver = (ref) =>
     (ref === PREFAB_GUID ? nestedRootPrefab : ref === CHILD_GUID ? childPrefab : undefined);
 
-  it('reads a NESTED-INSTANCE root through its child prefab plus the row override (#1031)', () => {
+  // ⚠️ Since #2001 S5 (owner ruling (b), #2042) a root row that is a reference is the Prefab Variant form, which is not
+  // supported and spawns nothing: the pass reads no root from it, as for an unresolvable child below. Before S5 it read
+  // the child's root plus the row override and warned. Composition through a NESTED member row is unchanged (the
+  // "NESTED member" test above, and #1707's deep rows).
+  // Mutation: make `rootReferenceRefusal` answer null — this and the schema case below warn again and go red.
+  it('a NESTED-INSTANCE root (the variant form) is not read, child resolvable or not (#1031, #2042)', () => {
     const res = validateSceneData(scene([sceneWithView('LevelScroll')]), undefined, nestedResolver);
-    expect(res.warnings.join('\n')).toMatch(/entry prefab '.*'\.UIElement\.marginBottom is inert/);
+    expect(res.warnings.filter((w) => /entry kind|is inert/.test(w))).toEqual([]);
   });
 
   it('a nested root whose child cannot be resolved is NOT read from the reference row\'s own traits (#1031)', () => {
@@ -1586,12 +1591,12 @@ describe('validateSceneData — entry-kind pass (#671)', () => {
     expect(res.warnings.filter((w) => /entry kind/.test(w))).toEqual([]);
   });
 
-  it('with a schema, an override field the trait does not declare is dropped — the spawner drops it too (#1031)', () => {
+  it('with a schema declaring the override field, the variant root is still not read (#1031, #2042)', () => {
     const declaring = (fields: Record<string, unknown>) =>
       ({ traits: { UIElement: { category: 'component', fields } } }) as unknown as SceneSchema;
     const declared = validateSceneData(scene([sceneWithView('LevelScroll')]),
       declaring({ marginBottom: { default: 0 }, width: { default: 0 } }), nestedResolver);
-    expect(declared.warnings.join('\n')).toMatch(/UIElement\.marginBottom is inert/);
+    expect(declared.warnings.join('\n')).not.toMatch(/UIElement\.marginBottom is inert/);
     const undeclared = validateSceneData(scene([sceneWithView('LevelScroll')]),
       declaring({ width: { default: 0 } }), nestedResolver);
     expect(undeclared.warnings.join('\n')).not.toMatch(/UIElement\.marginBottom is inert/);

@@ -222,6 +222,27 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       });
     }
 
+    // #2036: a user node INSIDE a held keyed copy (its `members.<k>.own`, or its keyless `added`), on a row naming a gone
+    // member under the instance's own cut. The fold places it nowhere (ai3's #2036); the load keeps the whole row as an R2
+    // orphan, so today's save writes it back. S5 loads through the fold and still feeds that store (§ 10.1's adapter): the
+    // node must survive two saves here too. Mutation: drop the gone row from `applyStoredMemberRows`' orphans — red.
+    for (const [form, inner] of [['F: the copy\'s member row own', { members: { [`/${row(2, 'QA', 0).nodeGuid}`]: { own: [mine(0)] } } }], ['I: the copy\'s keyless added', { added: [mine(2)] }]] as const) {
+      it(`#2036 ${form}: a user node inside a held keyed copy under the cut is written back by every save`, async () => {
+        install(P, Q);
+        const copy = { key: 'kx', parentLocalId: 0, guid: '', name: 'X', traits: {}, children: [], ...inner };
+        const gone = `${R}/${G(999)}`;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [gone]: { added: [copy] } } })] });
+          expect(JSON.stringify(rowsOf(first.saved)[gone])).toContain(MINE);
+          const second = await loadSave(first.saved);
+          expect(JSON.stringify(rowsOf(second.saved)[gone])).toContain(MINE);
+        } finally {
+          warn.mockRestore();
+        }
+      });
+    }
+
     // A keyed node is a COPY only where it pairs with a template node anchored at the row's member (`pinAdded`). This test
     // stated an UNPAIRED one (P adds no k1) and expected the cut to take it, which is the parse's user node lost (#2041).
     it('the cut takes the row\'s other records and a keyed copy, as before: only the user\'s links are kept', async () => {
@@ -554,10 +575,11 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       return { parsed, f: foldInstance(reader, parsed.record) };
     };
 
-    it('1, a ruled visible FIX: a move into a row today deletes later is refused, and the member stays (today loses it)', async () => {
+    it('1, a ruled visible FIX: a move into a row a later removal deletes is refused, and the member stays (#2028: the load delivers it)', async () => {
       install(P([row(5, 'E', 1)]));
       const e = top({ members: { [`/${g(2, 'A')}`]: { removed: true, guid: G(82) }, [`/${g(4, 'C')}`]: { guid: G(81) }, [`/${g(3, 'B')}`]: { parent: G(81) }, [`/${g(5, 'E')}`]: { parent: G(82) } } });
-      expect(await check([e], e)).toEqual([`fold-only node /${g(5, 'E')}`]);
+      // Before S5 the load lost the member (`fold-only node /E`); the frozen pre-S5 tree keeps that record.
+      expect(await check([e], e)).toEqual([]);
     });
 
     it('2: a plain row under a removed missing-prefab row goes with it, in either form (no dangling parent)', async () => {
@@ -1013,14 +1035,15 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
     expect(seen.ruledOwn).toBe(before + 1);
   });
 
-  it('#2018 (i), a ruled visible fix: a v17 own row at a missing nested row now shows under its placeholder (today hides it)', async () => {
+  it('#2018 (i), a ruled visible fix: a v17 own row at a missing nested row shows under its placeholder (#2028: the load delivers it)', async () => {
     install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'R', 1, { prefab: 'M-missing' })] });
     const R = row(2, 'R', 1).nodeGuid;
     const s = { parentLocalId: 0, guid: G(54), name: 'S', traits: { EntityAttributes: { name: 'S', guid: G(54) }, Transform: tf }, children: [] };
     const e = top({ members: { [`/${R}`]: { own: [s] } } });
     const before = seen.ruledOwnFix;
     expect(await check([e], e)).toEqual([]);
-    expect(seen.ruledOwnFix).toBe(before + 1);
+    // Shown by the load itself now: nothing left for the oracle to translate (before S5 it hid the node, +1).
+    expect(seen.ruledOwnFix).toBe(before);
   });
 
   it('a whole-list row on a gone member is held verbatim and unused at its key, as today keeps the row', async () => {

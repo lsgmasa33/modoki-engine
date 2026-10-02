@@ -38,7 +38,6 @@ import { revertOverridesWithUndo } from '../../packages/modoki/src/editor/undo/r
 import { writeTraitFieldWithUndo, createEntityWithUndo, deleteEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
-import { keptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { commitPrefabWrite } from '../../packages/modoki/src/editor/scene/prefabCommit';
 import { readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -204,26 +203,18 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     return { f, live };
   }
 
-  it('(c) F8: a reload while Q is missing expands its frames from the scene\'s copy, as they were live', async () => {
-    // #1914 F8 = A1 (owner, 2026-10-01; Unity's MergedAsMissingWithSceneBackup). Before it the frames were gone and their
-    // rows unexpanded (#1790 ruling D). Mutation: drop the copy fallback in `runtimeReaderFor` — no Q frame comes back.
-    // Mutation: write no copy (`collectEmbeddedPrefabs` returns undefined) — the same.
-    const { f, live } = await savedAndReloaded('keep-reload-embedded');
-    expect(qFrameGuids(f)).toEqual(live);
-    expect([...unexpandedRows()]).toEqual([]);
-    // Every layer still applies over the copy: P's row C moves M to x=4 and states M.z=9; O's row N states z=7, outermost.
-    const pm = nestedQ(f, p1(f)).m;
-    expect([tx(pm, 'x'), tx(pm, 'z')]).toEqual([4, 9]);
-    const o1 = getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs.O.guid && pi.rootInstanceId === x.id; })!.id;
-    const om = nestedQ(f, o1).m;
-    expect([tx(om, 'x'), tx(om, 'y'), tx(om, 'z')]).toEqual([4, 8, 7]);
+  it('(c) F8: a reload while Q is missing shows each Q row as its placeholder (ruling B), not the copy\'s frames', async () => {
+    // #1914 F8 = A1 (owner, 2026-10-01) expanded the frames from the scene's copy; owner ruling B (#2001 S5, #2028) retires
+    // that: no copy expands anything, and each missing nested row shows its Missing Prefab placeholder (ruling D), keeping
+    // every record under it. Before S5 this reload brought the 4 Q entities back (measured on the pre-S5 load).
+    const { f } = await savedAndReloaded('keep-reload-embedded');
+    expect(qFrameGuids(f)).toEqual([]);
+    expect([...unexpandedRows()].length, 'P1\'s and O1\'s Q rows').toBe(2);
   });
 
-  it('(c) F8: a row the scene states under a frame the copy expanded is applied, not ALSO kept as an R2 orphan (hunt seed 1212)', async () => {
-    // The load's orphan test read the runtime cache alone, so with Q trashed every row under a copy-expanded Q frame was
-    // kept as well as applied, and once its mark was undone the save wrote the stale row back under the capture (the seed:
-    // O's added node Extra, under a copy-expanded P). Mutation: drop `read: runtimeReaderFor(world)` from the load's
-    // `settleEntryRows` — the row is kept as an orphan.
+  it('(c) F8: a row the scene states under a frame of the missing Q is held under its placeholder and saved back (hunt seed 1212)', async () => {
+    // Hunt seed 1212: a row under a copy-expanded Q frame was kept as well as applied. Ruling B (#2028): the frame is Q's
+    // placeholder, and the row is held under it (rule 9) — kept for the save, never applied.
     const f = await editTrashApply('keep-reload-orphans', true);
     const m = nestedQ(f, p1(f)).m;
     expect(writeTraitFieldWithUndo(m, getTraitByName('Transform')!, 'y', 6)).toBeFalsy();
@@ -237,8 +228,11 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(rowKey, 'premise: the scene states the edit on M\'s row').toBeTruthy();
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(tx(getAllEntities().find((x) => x.guid === mGuid)!.id, 'y')).toBe(6); // applied, from the copy-expanded frame
-    expect(Object.keys(keptMemberOrphans(p1Guid) ?? {})).not.toContain(rowKey);
+    expect(getAllEntities().some((x) => x.guid === mGuid), 'M is not spawned (ruling B)').toBe(false);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    const again = (JSON.parse(be.read(f.scenePath)!) as { entities: { guid?: string; members?: Record<string, { traits?: { Transform?: { y?: number } } }> }[] })
+      .entities.find((e) => e.guid === p1Guid)!;
+    expect(again.members?.[rowKey!]?.traits?.Transform?.y, 'the row, saved back').toBe(6);
   });
 
   it('(c) F8, I23: save → reload → save while Q is missing is byte-identical', async () => {
@@ -253,9 +247,8 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
 
   it('(c) F8, I23: an instance made AFTER the trash (its Q row unexpanded live) round-trips byte-identically', async () => {
     // Hunt seeds 351 / 6030's shape: P1 and O1 keep live Q frames, so the save copies Q; P2, instantiated with Q already
-    // gone, holds row C unexpanded. The copy restores only a frame that was live at the save (Unity's line: a backup is of
-    // an instance merged before its asset went), so P2's row stays unexpanded and the reload is the saved world.
-    // Mutation: `copyStandsIn` answers true — P2's row expands from the copy and the second save adds its QR and M rows.
+    // gone, holds row C unexpanded. Ruling B (#2028): no copy expands anything, so every Q row reloads as its placeholder,
+    // P2's with P1's and O1's, and the second save is the first.
     const f = await editTrashApply('keep-reload-late-instance', true);
     expect(await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.P.path)!), f.prefabs.P.path, 0)).toBeTruthy();
     await settle();
@@ -264,17 +257,17 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     const first = be.read(f.scenePath)!;
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(qFrameGuids(f).length).toBe(4); // P1's and O1's, from the copy
-    expect([...unexpandedRows()].length).toBe(1); // P2's
+    expect(qFrameGuids(f).length).toBe(0);
+    expect([...unexpandedRows()].length).toBe(3); // P1's, O1's and P2's
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(be.read(f.scenePath)!).toBe(first);
   });
 
-  it('(c) F8, I23: a missing TOP-level instance live at the save is copied with its nested missing prefab, and reloads expanded (#1935)', async () => {
-    // P1's Q frames are live, then P goes too, so P1 is a live top-level instance of a missing prefab. The owner's F8 = A1
-    // covers top level as well as nested (#1935; R7 had built only the nested half): the save copies P and the Q its
-    // frame expanded, and the reload expands P1 from P's copy and its Q frame from Q's. Mutation: leave top-level frames
-    // out of `collectEmbeddedPrefabs` again — the first save writes no copy and P1 reloads as a placeholder.
+  it('(c) F8, I23: a missing TOP-level instance live at the save is copied with its nested missing prefab, and reloads as its placeholder (ruling B)', async () => {
+    // P1's Q frames are live, then P goes too, so P1 is a live top-level instance of a missing prefab. The save copies P and
+    // the Q its frame expanded (#1935, written until S6). Ruling B (#2028): the reload expands neither — P1 is its
+    // placeholder — and the next save is the first. Mutation: leave top-level frames out of `collectEmbeddedPrefabs`
+    // again — the first save writes no copy of P.
     const f = await startRun(be, noNest, 'keep-top-level-missing');
     const o1 = getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs.O.guid && pi.rootInstanceId === x.id; })!.id;
     deleteEntitiesWithUndo([o1]);
@@ -287,16 +280,16 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(Object.keys(JSON.parse(first).embeddedPrefabs ?? {}).sort()).toEqual([f.prefabs.P.guid, f.prefabs.Q.guid].sort());
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(placeholderGuids().size).toBe(0);
-    expect(qFrameGuids(f).length).toBe(2); // P1's, from the copies
+    expect(placeholderGuids().size).toBe(1); // P1
+    expect(qFrameGuids(f).length).toBe(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(be.read(f.scenePath)!).toBe(first);
   });
 
-  it('(c) F8, I23: a ROOT-only prefab\'s top-level instance reloads from the copy too — no member rows to ask (#1935, hunt seed 1011)', async () => {
-    // H is one entity, so its live instance H1 states no member rows; it holds a scene-added Q node. Mutation: let the
-    // loader expand a top-level entry only when it states member rows (the first version of #1935) — H1 reloads as a
-    // placeholder beside its own copy, and the Q node under it leaves the world.
+  it('(c) F8, I23: a ROOT-only prefab\'s top-level instance reloads as its placeholder, the Q node it holds still shown (ruling B; #1935, hunt seed 1011)', async () => {
+    // H is one entity, so its live instance H1 states no member rows; it holds a scene-added Q node. Hunt 1011's loss was
+    // that node leaving the world with H1's expansion. Ruling B (#2028): H1 is its placeholder, and the node it links AT
+    // the placeholder shows there (#2018), so the world keeps its size and the next save is the first.
     const f = await startRun(be, noNest, 'keep-top-level-root-only');
     const h1 = () => getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs.H.guid && pi.rootInstanceId === x.id; });
     const h1Guid = h1()!.guid!;
@@ -307,33 +300,34 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(Object.keys(JSON.parse(first).embeddedPrefabs ?? {})).toEqual([f.prefabs.H.guid]);
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(placeholderGuids().has(h1Guid)).toBe(false);
-    expect(h1()).toBeTruthy();
+    expect(placeholderGuids().has(h1Guid)).toBe(true);
     expect(getAllEntities().length).toBe(liveCount);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(be.read(f.scenePath)!).toBe(first);
   });
 
-  it('(c) F8, I3: a TOP-level instance expanded from the copy refuses Revert and Apply as a missing prefab does (#1935)', async () => {
-    // The copy reaches only the expansion: Revert and Apply ask `getPrefabSource`, so the reloaded P1 is refused with the
-    // missing-prefab reason, not reverted onto or applied into a copy. Mutation: let `getPrefabSource` answer from the
-    // scene's copies — Revert finds a base and returns no refusal.
+  it('(c) F8, I3: a TOP-level instance of a missing prefab reloads as its placeholder, which no Revert or Apply treats as an instance (#1935)', async () => {
+    // #1935 expanded P1 from the copy and refused Revert and Apply on it with the missing-prefab reason, so neither went
+    // onto or into a copy. Ruling B (#2028): P1 reloads as its placeholder, which carries no PrefabInstance — the copy is
+    // never a base because nothing is expanded from it, and the agent's Apply names the entity as no instance.
     const f = await startRun(be, noNest, 'keep-top-level-refusals');
     const o1 = getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs.O.guid && pi.rootInstanceId === x.id; })!.id;
     deleteEntitiesWithUndo([o1]);
     await settle();
     expect(writeTraitFieldWithUndo(p1(f), getTraitByName('Transform')!, 'x', 7)).toBeFalsy();
     await settle();
+    const guid = getAllEntities().find((e) => e.id === p1(f))!.guid!;
     await trashQ(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(placeholderGuids().size).toBe(0); // premise: P1 expanded from the copy
-    expect(await revertRefusal(p1(f))).toMatch(/is an instance of "P", a prefab that is missing \(/);
-    const guid = getAllEntities().find((e) => e.id === p1(f))!.guid!;
+    expect(placeholderGuids().size).toBe(1); // ruling B: P1 its placeholder
+    const ph = getAllEntities().find((e) => e.guid === guid)!.id;
+    expect(piOf(ph), 'the placeholder is no instance: nothing reverts onto or applies into the copy').toBeFalsy();
+    expect(await revertRefusal(ph)).toBeNull();
     const err = await runAgentOp('prefab', { prefabAction: 'apply', entityGuid: guid }).catch((e: Error) => e) as Error;
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toMatch(/a prefab that is missing \(/);
+    expect(err.message).toMatch(/is not a prefa/);
   });
 
   it('(c) F8, I23: a copy only a top-level PLACEHOLDER nests is not written — hunt seed 1031', async () => {
@@ -365,9 +359,9 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(be.read(f.scenePath)!).toBe(first);
   });
 
-  it('(c) F8: a SCENE-ADDED Q node live at the save reloads expanded from the copy (#1939, #1934 M-b)', async () => {
-    // Unity backs every PrefabInstance up (`MergedAsMissingWithSceneBackup`); before #1939 the node reloaded as #1699's empty
-    // placeholder. Mutation: `spawnReferenceNode` answers `copyBacksFrame` false for every node → it reloads a placeholder.
+  it('(c) F8: a SCENE-ADDED Q node live at the save reloads as its placeholder (ruling B; #1939, #1934 M-b)', async () => {
+    // #1939 expanded it from the copy; ruling B (#2028) shows #1699's placeholder again, as for every frame of a missing
+    // prefab.
     const f = await startRun(be, noNest, 'keep-reload-added-node');
     const hr = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!.id;
     expect(await instantiatePrefabInstance(JSON.parse(be.read(f.prefabs.Q.path)!), f.prefabs.Q.path, hr)).toBeTruthy();
@@ -378,19 +372,19 @@ describe('#1862: an in-place rebuild keeps a nested frame whose prefab is missin
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs)).toEqual([f.prefabs.Q.guid]); // P1's and O1's frames
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    expect(placeholderGuids().has(nodeGuid)).toBe(false);
-    expect(qFrameGuids(f).length).toBe(6); // P1's and O1's rows, and the node, from the copy
+    expect(placeholderGuids().has(nodeGuid)).toBe(true);
+    expect(qFrameGuids(f).length).toBe(0);
   });
 
-  it('(c) F8, I3: a frame expanded from the copy is refused by Revert and Apply as a missing prefab is', async () => {
-    // The copy stands in for the expansion only: the "is the prefab there" checks still ask for the real file.
-    // Mutation: serve the copy from the editor cache too (a fallback in `getPrefabSource`) — both refusals go.
-    const { f } = await savedAndReloaded('keep-reload-refuse');
-    const { qr, m } = nestedQ(f, p1(f));
-    expect(await revertRefusal(qr)).toMatch(/^"QR" is an instance of "Q", a prefab that is missing \(/);
-    expect(writeTraitFieldWithUndo(m, getTraitByName('Transform')!, 'x', 42)).toBeFalsy();
-    await settle();
-    expect((await previewApply(qr, new Set(['x']))).refused).toMatch(/nothing to apply it to\. Restore the prefab to apply to it, or Detach Prefab/);
+  it('(c) F8, I3: a Q row of a missing prefab reloads as its placeholder, which no Revert or Apply treats as an instance', async () => {
+    // #1914 F8 expanded the frame from the copy, and Revert and Apply refused it with the missing-prefab reason. Ruling B
+    // (#2028): the row is its placeholder, carrying no PrefabInstance, so neither reaches a copy; the rows under it are
+    // held for the save.
+    await savedAndReloaded('keep-reload-refuse');
+    const rowPh = getAllEntities().find((e) => placeholderGuids().has(e.guid ?? '') && e.parentId !== 0)!.id;
+    expect(piOf(rowPh)).toBeFalsy();
+    expect(await revertRefusal(rowPh)).toBeNull();
+    expect((await previewApply(rowPh, new Set(['x']))).refused).toBeUndefined();
   });
 
   it('(c) F8, I18: every save while Q is missing carries the copy verbatim, and a scene that no longer reaches Q drops it', async () => {

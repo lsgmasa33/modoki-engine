@@ -25,7 +25,7 @@ import { useEditorStore } from '../../../packages/modoki/src/editor/store/editor
 import { clearKeptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { clearReservedLocalIds } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
-import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../../../packages/modoki/src/runtime/core/notifyListeners';
@@ -306,9 +306,15 @@ export const isInstanceRoot = (id: number) => { const pi = piOf(id); return !!pi
 
 export function editing(): boolean { return isEditingPrefab(); }
 
-/** The guids of the live Missing Prefab placeholders (I18). Read off the marker itself: `UnresolvedPrefabRef` is not a
- *  registered trait, so `getAllEntities().traits` never lists it. */
+/** The guids of the live Missing Prefab placeholders (I18), a missing nested row's included (#2001 S5, ruling D). Read off
+ *  the marker itself: `UnresolvedPrefabRef` is not a registered trait, so `getAllEntities().traits` never lists it. */
 export function placeholderGuids(): Set<string> {
+  return new Set(getAllEntities().filter((e) => e.guid && (unresolvedRefOf(findEntity(e.id) as never) || rowPlaceholderOf(findEntity(e.id) as never))).map((e) => e.guid!));
+}
+
+/** {@link placeholderGuids} that carry a RECORD (an entry's or a reference node's, #1699): a missing nested row's
+ *  placeholder carries none — its records are the instance's own rows. */
+export function recordPlaceholderGuids(): Set<string> {
   return new Set(getAllEntities().filter((e) => e.guid && unresolvedRefOf(findEntity(e.id) as never)).map((e) => e.guid!));
 }
 
@@ -381,7 +387,8 @@ export function worldTree(): Record<string, unknown> {
     const marks = ent && e.traits.includes('PrefabInstance')
       ? [...(getOverrideMarkSet(ent as never) ?? [])].filter((m) => e.traits.includes(m.split('.')[0]) && !blankRef(m)).sort()
       : [];
-    const unresolved = ent ? unresolvedRefOf(ent as never) : undefined;
+    const rowPlaceholder = ent ? rowPlaceholderOf(ent as never) : undefined;
+    const unresolved = ent ? unresolvedRefOf(ent as never) ?? rowPlaceholder : undefined;
     // A node's template key (`TemplateAddedKey`, #1809): not a registered trait, so the walk above never lists it, and a
     // reload or a rebuild that lost or re-minted one read as identical (#1877's fuzz blind spots, #1880 T1). A guid is
     // derived FROM the key, so a key change often shows as a guid change too, but not under a pinned guid.
@@ -390,7 +397,7 @@ export function worldTree(): Record<string, unknown> {
     // A placeholder is compared by the prefab it names. Its record's FORM follows where it sits (a scene entry, or a node
     // under a parent), so a reparent legitimately turns one into the other; the byte-identity of a second save is what
     // holds the record's content.
-    out[out[key] ? `${key}#dup${e.id}` : key] = { traits, marks, ...(templateKey ? { templateKey } : {}), ...(unresolved ? { unresolved: unresolved.source } : {}) };
+    out[out[key] ? `${key}#dup${e.id}` : key] = { traits, marks, ...(templateKey ? { templateKey } : {}), ...(unresolved ? { unresolved: unresolved.source } : {}), ...(rowPlaceholder ? { row: true } : {}) };
   }
   return out;
 }

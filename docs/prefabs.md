@@ -717,14 +717,20 @@ mechanically:
 - **P1 and I25 against the #2001 model** (`prefabFuzz/shadow.ts`, #2009). They are written against S1's types, before
   anything implements them, so they run only once the build installs their SEAMS through `installShadow`:
   - S4 installs the store's `records`, the capture's `captureList` (`parse(captureInstanceEntry(live))`) and `doors`;
-  - S5 installs `reproject`.
+  - S5 installs `project` (`prefabFuzz/s5Seams.ts`, #2028).
 
   I25 compares each record with the capture, modulo identity pins, and only after an op whose door exists (§ 10.5).
   Any other op is counted as "not compared (no door yet)". It refuses to compare a record with itself: a capture that
-  hands back the store's own list or row is a harness error. P1 reprojects every record after every op and holds the
-  world unchanged.
-  ⚠️ Installing `reproject` renumbers ids between ops, so every seed's path changes from S5 on. Both checks are held
-  red and green through fake seams in `prefabFuzzShadow.test.ts`, until the real ones exist.
+  hands back the store's own list or row is a harness error. P1 projects every FRESH outermost record after every op
+  into a SCRATCH world, never made current, and compares that tree with the live instance by guid. The entry is the
+  record serialized as v20, with each node's identity from the live instance's keys. Inline scene-owned content comes
+  from the capture until S6's own-content adapter. A record it cannot project is counted by reason, not compared:
+  stale, an unresolved or trashed prefab, a trashed nested frame (#1862), no live root.
+  ⚠️ The first S5 build reprojected into the LIVE world. That renumbered ECS ids between ops and moved every seed off
+  its path. The scratch world leaves the walk exactly as it was. Two differences are set aside, and counted: the
+  stored root's placement-field marks (hub ruling, design § 10.7, checked from S6), and `Placement.sourceScene`. Both
+  checks are held red and green through fake seams in `prefabFuzzShadow.test.ts`, and P1 has a non-vacuity floor
+  (`prefabFuzz.test.ts`: more than 50 comparisons, at least one of them a nested reference node with its own record).
   The store also has to cover every live stored root, Missing Prefab placeholders included. Without that, an empty store
   would pass both checks while counting them as run.
 - **P1 by the fold** (`runner.ts` `foldCheck`, #2009 part 2) needs no seam, because S1's parser and S2's fold are real.
@@ -3735,7 +3741,8 @@ the file.**
   entry-prefab pass. It mirrors `instantiatePrefabIntoWorld` step for step:
   - the root is `rootLocalId ?? 1` — **not** "the first row", which the provider and
     the validator used to fall back to and the spawner never did;
-  - a **nested-instance root row** resolves to the CHILD prefab's root, composed by
+  - a **nested-instance root row** (the Prefab Variant form) reads `null` since #2001 S5: the form is not supported
+    yet (see below). Before S5 it resolved to the CHILD prefab's root, composed by
     `foldRowStep` (#1707), the step the editor's effective base folds with: the row's
     `overrides` merged UNDER whatever an outer layer addresses at that row (outer
     wins), its `nestedOverrides` threaded on, its `removedTraits` unless an outer
@@ -3797,6 +3804,21 @@ the file.**
   by, registered once on entry: a first draft registered the child's ref in the
   parent before recursing, and since a real prefab's `id` IS that ref, every nested
   child resolved to `null` as a self-cycle.
+
+  **The variant form is unsupported but preserved (owner ruling, 2026-10-02, #2028; #2042).** A prefab whose ROOT row is
+  a reference is how Unity stores a Prefab Variant (U3). The pre-S5 spawner built it correctly, but the first scene save
+  wrote the instance as its BASE prefab and lost the variant's own nodes (#2042, measured). Since #2001 S5 the document
+  is DAMAGED (`rootReferenceRefusal`, `runtime/loaders/prefabRoot.ts`, asked through `frameRepeatRefusal` by every
+  seat):
+  - a scene entry of it loads as a Damaged Prefab placeholder, and its list round-trips verbatim (rule 9;
+    `engine/tests/editor/variantFormPreserved.test.ts`);
+  - a nested row of it is a damaged row placeholder;
+  - a pool or timeline spawn builds nothing;
+  - the pure readers above answer `null`;
+  - Instantiate refuses it with the damaged reason. Prefab edit does not ask (it checks only the read's refusal), a
+    hand-written-only path left as it was.
+  A variants stage will expand it. The #1031 composition tests now hold the same steps on the supported shape (a nested
+  row under a plain root). `asOuterMember`'s climb through a frame whose root is a reference waits for that stage.
 
 **Not yet done — stated honestly:**
 

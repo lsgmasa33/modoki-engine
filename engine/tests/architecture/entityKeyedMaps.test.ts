@@ -1023,6 +1023,10 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
  *  within one call or frame, the owner's "brief use is fine by id"), `rebuilt:` (reassigned from a live
  *  query before each use) and `empty:` (a constant that never holds an entity). */
 const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::AfterDerive{}.moves',
+    reason: 'alive-checked: a realized move\'s target node, queued by handle for one load\'s after-derive drain (#2001 S5, `queueRealizedMove`); the drain resolves it only while the entity index still maps its id to that handle (generation-aware), else the move names nothing; engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts:1098' },
+  { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::moves{}.parentEntity',
+    reason: 'alive-checked: the same queue entry\'s target handle, the one `AfterDerive{}.moves` row names; checked against the entity index by generation before any get; engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts:1098' },
   { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::AfterDerive{}.missing',
     reason: 'alive-checked: a template node\'s handle queued for one load\'s after-derive drain (#1948 F2); the drain skips a handle the entity index no longer maps its id to (`findEntityById(entity.id(), world) !== entity`, generation-aware), before any get; engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts:1049' },
   { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::missing{}.entity',

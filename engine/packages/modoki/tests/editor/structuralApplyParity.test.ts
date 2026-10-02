@@ -319,7 +319,9 @@ describe('#1247 — a removal reaching a nested instance (editor + runtime insta
     );
     const { editorSide, runtimeSide } = await throughBoth(outer, undefined);
     for (const side of [editorSide, runtimeSide]) {
-      expect(side.log.get('CMember'), 'premise: the removed member holds B\'s raw file parent number').toBe(5);
+      // From #2001 S5 the fold applies the removal before anything spawns, so the removed member never spawns and the
+      // collision cannot arise (the old premise, CMember spawned on B's raw parent number 5, is unreachable).
+      expect(side.log.has('CMember'), 'the removed member is never spawned').toBe(false);
       expect(side.tree).toEqual({ Root: '<root>', A: 'Root', B: 'A', CRoot: 'Root' });
     }
   });
@@ -336,7 +338,7 @@ describe('#1247 — a removal reaching a nested instance (editor + runtime insta
     };
     const { editorSide, runtimeSide } = await throughBoth(outer, undefined, prepare);
     for (const side of [editorSide, runtimeSide]) {
-      expect(side.log.get('CMember'), 'premise: the removed member reclaimed index 1').toBe(1);
+      expect(side.log.has('CMember'), 'the removed member is never spawned (#2001 S5: the fold removes it first)').toBe(false);
       expect(side.tree).toEqual({ Root: '<root>', A: 'Root', CRoot: 'Root' });
     }
   });

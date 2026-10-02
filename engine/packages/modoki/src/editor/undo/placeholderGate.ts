@@ -14,7 +14,7 @@
 
 import { findEntity, readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { PLACEHOLDER_PLACEMENT_FIELDS } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { isSuppliedByPrefab, repeatedTemplateKeyRefusal } from '../scene/restructureRefusal';
 
@@ -59,10 +59,20 @@ export function placeholderRefusalWords(name: string): string {
  *  or null when it may go ahead. Refuses on a placeholder unless the writer that saves it keeps the field
  *  ({@link placeholderSavedFields}). */
 export function placeholderWriteRefusal(id: number, traitName: string, field?: string): string | null {
+  // A missing nested ROW's placeholder (#2001 S5, ruling D) is the document's row standing in for its frame: its writer
+  // saves nothing from the live entity (the kept rows restate the row), so every edit on it is refused (rule 9: an edit
+  // the list cannot hold is refused, I21). A rename showed live and came back on reload (#2028 review F2). From S6 the
+  // list can hold a rename and a removal of the row; revisit this there.
+  if (isRowPlaceholder(id)) return placeholderRefusalWords(entityNameOf(id));
   // A template node whose key its frame repeats (#1937 C-A step 4): no row can record the edit, so none is taken.
   if (!isMissingPrefabPlaceholder(id)) return repeatedTemplateKeyRefusal(id);
   if (traitName === 'EntityAttributes' && field !== undefined && placeholderSavedFields(id).has(field)) return null;
   return placeholderRefusalWords(entityNameOf(id));
+}
+
+/** True when the live entity `id` is a missing nested row's placeholder (#2001 S5, ruling D). */
+export function isRowPlaceholder(id: number): boolean {
+  return !!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0]);
 }
 
 /** The first refusal among `ids` for the same write, or null. A multi-entity writer refuses as a whole: writing the

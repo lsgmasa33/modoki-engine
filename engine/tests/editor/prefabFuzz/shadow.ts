@@ -6,14 +6,14 @@
  *  installs one step at a time (`installShadow`):
  *  - S4 installs `records` (the `InstanceStore`), `captureList` (`parse(captureInstanceEntry(live))`) and `doors` — and, for
  *    its stale-record staging, `judge` and `unrecorded` (`s4Seams.ts`, #2014);
- *  - S5 installs `reproject` (`projectInstance(world, rec, reader, { mode: 'reproject', … })`);
+ *  - S5 installs `project`: each record projected from the store into a scratch world, beside the live subtree
+ *    (`s5Seams.ts`);
  *  - each later step widens `doors` as an op's door lands. S8 removes `captureList` with the capture, and I25 with it.
  *  Until a seam is installed, its check does not run, and the runner counts that instead (`checksRun`): a check that never
  *  runs guards nothing, and must say so.
  *
- *  ⚠️ P1 reprojects every record after every op, which renumbers the members' ECS ids, and the ops pick their targets in
- *  id order: installing `reproject` changes every seed's path from there on (the respawn identity runs at the END of a run
- *  for that reason). Expected, and a reason to re-measure the verify seeds' reach when S5 lands. */
+ *  P1 projects into a SCRATCH world, never the live one: a live reprojection renumbers the members' ECS ids, and the ops
+ *  pick their targets in id order, so it moved every seed and every pinned repro off its path (#2028, measured). */
 
 import type { InstanceRecord, OverrideList, SceneTargetRecord } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
 import type { OpKind } from './ops';
@@ -30,8 +30,9 @@ export interface ShadowSeams {
   /** S4: the list today's capture gives for the stored root `rootGuid`, parsed by S1's parser. null when the live world
    *  has no such root. It must be built from the LIVE tree, never from the store (§ 10.5: never compared with itself). */
   captureList?: (rootGuid: string) => OverrideList | null;
-  /** S5: reproject one record in place, from the store. */
-  reproject?: (rec: InstanceRecord) => void | Promise<void>;
+  /** S5: the live subtree of record `rec` and its projection from the store, as trees keyed by guid; `{ skip }` with the
+   *  reason it is not compared; undefined for a record projected with its owner (a nested one). */
+  project?: (rec: InstanceRecord) => Promise<{ live: Record<string, unknown>; projected: Record<string, unknown> } | { skip: string } | undefined>;
   /** The op kinds whose door writes the list at this step. I25 is meaningful only after them (§ 10.5): any other op
    *  changes the live tree with no door to record it, so a divergence there is the step's known gap, not a finding. */
   doors: ReadonlySet<OpKind>;

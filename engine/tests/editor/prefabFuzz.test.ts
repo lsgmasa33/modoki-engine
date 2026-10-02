@@ -83,6 +83,7 @@ import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize
 import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { boot, bridge, memoryStorage, flushWatcher, editorOwns, authored, piOf } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
+import { projectFromStore, s5Seen } from './prefabFuzz/s5Seams';
 import { s4Seams, s4Seen, DOOR_OPS } from './prefabFuzz/s4Seams';
 import { installShadow } from './prefabFuzz/shadow';
 import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
@@ -101,7 +102,9 @@ vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
 // #2014 (S4): the real store, capture and doors behind the #2009 shadow harness — I25 and the store's coverage run after
 // every op from here on (`prefabFuzz/s4Seams.ts`).
-installShadow(s4Seams);
+// #2028 (S5): P1 — every record projected from the store after every op, compared with its live instance
+// (`prefabFuzz/s5Seams.ts`).
+installShadow({ ...s4Seams, project: projectFromStore });
 
 /** console.error lines that are the editor TELLING the user something expected, each with why it is expected. A bare
  *  pattern is not allowed: every entry names the issue or the rule behind it. */
@@ -345,6 +348,13 @@ describe('#1789 prefab fuzz', () => {
   it('#2014 I25: the shadow judged records after every door op (non-vacuity)', () => {
     expect(checksRun.get('I25 compared a record') ?? 0).toBeGreaterThan(50);
     for (const k of DOOR_OPS) expect(checksRun.get(`I25 compared after ${k}`) ?? 0, `I25 compared a record after ${k}`).toBeGreaterThan(0);
+  });
+
+  // #2028 (S5): P1 must COMPARE projections, not merely run — a seam that skips every record passes vacuously — and a
+  // scene-added reference node's list must have come from the store at least once, not only from the capture.
+  it('#2028 P1: records were projected from the store and compared with their live instances (non-vacuity)', () => {
+    expect(checksRun.get('P1') ?? 0).toBeGreaterThan(50);
+    expect(s5Seen.nestedWithOwner).toBeGreaterThan(0);
   });
 
   // #1845: what the taints turned off, said on every verify run, so a platform where it grows is visible. A report, not a
@@ -784,16 +794,23 @@ describe('#1789 prefab fuzz', () => {
   // #1934 F4: a live instance of a DELETED prefab stays expanded, and the reload expands every frame its scene's copy lists
   // as live at the save (#1935, #1939), so the round trip is the plain one, with no waiver: a scene-added node that comes
   // back a placeholder, or a placeholder entry that comes back expanded, is a failure KNOWN_OPEN tolerates nothing of.
-  it('harness: a node placeholder or an expanded entry of a deleted prefab is a plain round-trip failure (#1939 waivers gone)', () => {
+  it('harness: a deleted prefab\'s live frame reloads as its placeholder (ruling B, applied); anything else of it is a plain round-trip failure', () => {
     const same = { firstBytes: '{}', secondBytes: '{}' };
     const gone = (src: string) => src === 'P';
     const ea = (name: string, parentId: string | number = 0) => ({ EntityAttributes: { name, parentId } });
     const pi = (source: string, rootInstanceId: string) => ({ PrefabInstance: { source, rootInstanceId } });
     const o = { traits: { ...ea('OR'), ...pi('O', 'o') } };
     const live = { o, n: { traits: { ...ea('N', 'o'), ...pi('P', 'n') } }, nm: { traits: { ...ea('A', 'n'), ...pi('P', 'n') } } };
-    const nodeBack = checkRoundTrip({ before: live, after: { o, n: { traits: ea('N', 'o'), unresolved: 'P' } }, ...same }, gone);
+    // #2001 S5, rule 9 / owner ruling B: no copy is expanded, so the frame comes back as its placeholder, in its place, its
+    // members gone (their records are the placeholder's, which the byte check holds). Mutation: return `before` from
+    // `ruledMissing` — the node reads as lost again.
+    expect(checkRoundTrip({ before: live, after: { o, n: { traits: ea('N', 'o'), unresolved: 'P' } }, ...same }, gone)).toEqual([]);
+    // …but only in its place: a placeholder that came back under another parent is the root not given back.
+    const moved = checkRoundTrip({ before: live, after: { o, n: { traits: ea('N', 0), unresolved: 'P' } }, ...same }, gone);
+    expect(moved).toHaveLength(1);
+    // …and only for a prefab that is gone: the same reload of a prefab still there is a loss.
+    const nodeBack = checkRoundTrip({ before: live, after: { o, n: { traits: ea('N', 'o'), unresolved: 'P' } }, ...same }, () => false);
     expect(nodeBack).toHaveLength(1);
-    expect(nodeBack[0]!.detail).toMatch(/\(an entity of a deleted prefab was lost\)$/);
     expect(KNOWN_OPEN.some((k) => k.tolerates?.(nodeBack[0]!))).toBe(false);
     const g = { traits: ea('G') };
     const entryBack = checkRoundTrip({ before: { g, e: { traits: ea('E', 'g'), unresolved: 'P' } }, after: { g, e: { traits: { ...ea('E', 'g'), ...pi('P', 'e') } }, em: { traits: { ...ea('A', 'e'), ...pi('P', 'e') } } }, ...same }, gone);
@@ -806,8 +823,8 @@ describe('#1789 prefab fuzz', () => {
   });
 
   it('harness: a prefab created and then deleted in one run passes the final round trip (#1805 route 2, allowed)', async () => {
-    // The created prefab's top-level instance stays expanded, and the reload expands it from the scene's copy (#1935).
-    // Mutation: drop the loader's top-level copy fallback — the reload gives its placeholder and the round trip fails.
+    // The created prefab's top-level instance stays expanded, and the reload gives its placeholder (rule 9, ruling B: the
+    // scene's copy is never expanded, #2001 S5), which the round trip applies to the live side (`ruledMissing`).
     const ops: Op[] = [
       { kind: 'instantiate', u: [0.5075831420253962, 0.8186536263674498, 0.4673538957722485, 0.9546289832796901, 0.39170667389407754, 0.5493532461114228, 0.4505586097948253, 0.8853592379018664] },
       { kind: 'duplicate', u: [0.39032594044692814, 0.04696453106589615, 0.3570088869892061, 0.40155923343263566, 0.5113228356931359, 0.29383464995771646, 0.025902038207277656, 0.7472156076692045] },
@@ -816,7 +833,7 @@ describe('#1789 prefab fuzz', () => {
     ];
     const r = await runOps(be, ops, OPTS);
     expect(r.trace.slice(0, 4).every((l) => l.includes('→ done')), r.trace.join('\n')).toBe(true); // precondition: all ran
-    expect(r.trace[4], r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toBe('4: final save→reload → done (1 deleted prefab(s); 0 placeholder(s) on the reload)');
+    expect(r.trace[4], r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toBe('4: final save→reload → done (1 deleted prefab(s); 1 placeholder(s) on the reload)');
     // The round trip passed. The walk after it runs undo against the placeholder the reload made — #1819's class (group 1
     // of #1789: the owner ruled such an undo refuses and drops its step; not built yet), which this test does not judge.
     expect(r.failure === undefined || r.failure.op === 'undo/redo to the ends', r.failure ? `${r.failure.op} — ${r.failure.check}: ${r.failure.detail}` : '').toBe(true);

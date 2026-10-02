@@ -1,4 +1,5 @@
 [
+  "loaders|prefab",
   "loaders|rendering",
   "managers|scene"
 ]

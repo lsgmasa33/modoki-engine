@@ -30,6 +30,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { frameDocReader, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
+import { rowPlaceholderOf } from '../../runtime/core/unresolvedPrefabRef';
 import { isOwnedRoot, isMemberDerivation, parseSteps, type MemberPi } from '../../runtime/core/assetRefRules';
 import { deriveMemberChain, repeatedTemplateKeys } from '../../runtime/loaders/memberPaths';
 import { templateKeysOf, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
@@ -198,6 +199,9 @@ function query(): Query | null {
  *    document declares its key. A keyed node none declares is the edited prefab's own added node in prefab edit, or one
  *    whose declaring prefab is gone. */
 function supplierOf(id: number, q: Query): number {
+  // A missing nested row's placeholder (#2001 S5, ruling D) carries no PrefabInstance, but its row is the document's:
+  // the instance above it supplies it, so it is not moved or reordered on its own (#2028 review F2).
+  if (rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0])) return nearestRootAbove(id, q);
   const p = q.piOf(id);
   const root = p?.rootInstanceId ?? 0;
   if (root && root !== id) return findEntity(root) ? root : 0;

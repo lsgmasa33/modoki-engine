@@ -5,9 +5,9 @@ import { undoDepth, canRedo, undoStep } from '../../../packages/modoki/src/edito
 import { serializeScene, saveScene, loadSceneReporting } from '../../../packages/modoki/src/editor/scene/serialize';
 import { instantiatePrefabInstance } from '../../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { getAllEntities, getCurrentWorld, findEntity } from '@modoki/engine/runtime';
-import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
+import { startRun, settle, flushWatcher, editing, piOf, placeholderGuids, recordPlaceholderGuids, unexpandedRows, swallowedGuids, worldTree, authored, type Fixture } from './harness';
 import { execute, describe as describeOp, type Op, type RunState } from './ops';
-import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
+import { checkWorld, checkFiles, checkMarks, forgetHistoryOf, checkScene, checkRoundTrip, ruledMissing, canonScene, firstDiff, markFree, nodeMoved, signature, alignEqualOrientations, recordKeys, RECORD_NEUTRAL, type Failure, type LocalIdHistory, type MarkHistory } from './checks';
 import type { FuzzBackend } from './backend';
 import fs from 'fs';
 import { resolveGuidToPath } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -182,7 +182,8 @@ const parkedPaths = (): Set<string> => new Set(getDirtyAssetPaths().filter((p) =
  *  from it, with the undo stack reset as a save→reload leaves it. */
 async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Promise<Failure | null> {
   // Every skip is COUNTED by its reason (close-out review): a check whose guards quietly return reads as coverage it is not.
-  const skip = editing() ? 'prefab edit open' : placeholderGuids().size ? 'a placeholder live' : null;
+  // A placeholder carrying a record (an entry's, a node's); a missing ROW's carries none, and is compared as any node.
+  const skip = editing() ? 'prefab edit open' : recordPlaceholderGuids().size ? 'a placeholder live' : null;
   if (skip) { ran(`rebuild≡reload after ${kind}: skipped (${skip})`); return null; }
   const except = st.appliedTop;
   const live = worldTree();
@@ -206,9 +207,13 @@ async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Pr
     return Object.fromEntries(Object.entries(tree).filter(([k]) => top(k) !== except));
   };
   dump('t2-before', sBefore); dump('t2-live', live); dump('t2-reloaded', reloaded); dump('t2-except', except ?? null);
-  const [a, b] = [without(live), alignEqualOrientations(without(live), without(reloaded))];
-  // A prefab the run deleted reloads from the scene's copy, every frame its list names live (#1935, #1939), as the live
-  // instance stays expanded.
+  // A frame of a prefab the run deleted, kept live (#1862), reloads as its placeholder (rule 9, ruling B): applied to the
+  // live side as the round trip applies it (`ruledMissing`).
+  const files = st.be.snapshot();
+  const gone = (src: string) => { const p = resolveGuidToPath(src); return !p || !files.has(p); };
+  const reloadedSide = without(reloaded);
+  const a = ruledMissing(without(live), reloadedSide, gone) as Record<string, unknown>;
+  const b = alignEqualOrientations(a, reloadedSide);
   const d = firstDiff(a, b);
   ran(`rebuild≡reload after ${kind}`);
   st.note = `rebuild≡reload checked${except ? ' (the Apply\'s own instance left out)' : ''}`;
@@ -293,15 +298,16 @@ async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]
       }
     }
   }
-  if (seams.reproject) {
-    const before = worldTree();
-    for (const rec of [...seams.records()]) await seams.reproject(rec);
-    await settle();
-    const after = worldTree();
-    ran('P1');
-    dump('p1-before', before); dump('p1-after', after);
-    const d = firstDiff(before, alignEqualOrientations(before, after));
-    if (d) out.push({ check: 'P1 reprojecting the records changed the world', detail: d, moved: nodeMoved(d, before, after) });
+  if (seams.project) {
+    for (const rec of [...seams.records()]) {
+      const p = await seams.project(rec);
+      if (!p) continue;
+      if ('skip' in p) { ran(`P1 not compared: ${p.skip}`); continue; }
+      ran('P1');
+      dump('p1-live', p.live); dump('p1-projected', p.projected);
+      const d = firstDiff(p.live, alignEqualOrientations(p.live, p.projected));
+      if (d) { out.push({ check: 'P1 the projection of a record is not its live instance', detail: `${rec.rootGuid} ${d}`, moved: nodeMoved(d, p.live, p.projected) }); break; }
+    }
   }
   return out;
 }
@@ -322,6 +328,8 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
     try { return { doc: JSON.parse(text) as PrefabDoc }; } catch (e) { return { damaged: String(e) }; }
   };
   const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
+  // Every top-level entry's guid, a plain entity's (in its EntityAttributes) too: a node stated by its own entry.
+  const entries = new Set((scene.entities ?? []).map((e) => e.guid || (e.traits?.EntityAttributes as { guid?: string } | undefined)?.guid).filter((g): g is string => !!g));
   const copies = new Set(Object.keys((scene.embeddedPrefabs ?? {}) as object));
   const opts = { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
   // Every stored instance: the top-level entries, then each reference node the scene added (its own record, § 2.5),
@@ -356,7 +364,7 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
       const root = findEntityByGuid(record.rootGuid);
       if (!root && !placed) { ran('P1 by the fold: a reference node not projected (not compared)'); continue; }
       if (!root) { out.push({ check: 'P1 a stored instance has no live root', detail: record.rootGuid }); continue; }
-      const d = checkRecord(record, read, root.id(), copies, owner);
+      const d = checkRecord(record, read, root.id(), copies, owner, (g) => entries.has(g));
       // Counted once a comparison RAN, under where the instance was found: a step with no stored instance compares
       // nothing, and an instance found but never compared (a missing root, a throw) must not read as checked.
       ran(counter);

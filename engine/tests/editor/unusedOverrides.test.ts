@@ -335,18 +335,21 @@ describe("a scene's copy that does not stand in for a frame leaves the frame's l
     });
   }
 
-  // ACCEPT side: where the copy DOES stand in (the scene states a row under N, as a frame live at the save does), the frame
-  // is reached: A takes the channel's x, the save states it as A's row, and only the record of a localId P lacks (9) stays.
-  it("where the copy stands in (a row under N), the frame is reached: only the unused record stays a channel", async () => {
+  // Where the copy stood in (the scene states a row under N, as a frame live at the save did), the frame was reached:
+  // A took the channel's x and the save moved it onto A's row. Ruling B (#2001 S5, #2028): the copy is ignored, N shows a
+  // Missing Prefab placeholder, and every record under it is held verbatim (rule 9) — the channel whole, and the row.
+  it("where the copy stood in (a row under N): ruling B holds the channel and the row verbatim", async () => {
     install(oDoc({}));
     prefabs.delete(P);
     setPrefabCache(P, null);
+    const channel = { 2: { 2: { Transform: { x: 5 } }, 9: { Transform: { x: 9 } } } };
     const s = { ...scene({ members: { [`/${g(8)}/${g(3)}`]: { traits: { Transform: { y: 4 } } } },
-      nestedOverrides: { 2: { 2: { Transform: { x: 5 } }, 9: { Transform: { x: 9 } } } } }, O), version: 19, embeddedPrefabs: { [P]: pDoc() } } as SceneData;
+      nestedOverrides: channel }, O), version: 19, embeddedPrefabs: { [P]: pDoc() } } as SceneData;
     await load(s);
     const first = await saved();
-    expect(entryOf(first).nestedOverrides).toEqual({ 2: { 9: { Transform: { x: 9 } } } });
-    expect((entryOf(first).members as Record<string, { traits?: unknown }>)[`/${g(8)}/${g(2)}`]?.traits).toEqual({ Transform: { x: 5 } });
+    expect(entryOf(first).nestedOverrides).toEqual(channel);
+    expect((entryOf(first).members as Record<string, { traits?: unknown }>)[`/${g(8)}/${g(3)}`]?.traits).toEqual({ Transform: { y: 4 } });
+    expect((entryOf(first).members as Record<string, { traits?: unknown }>)[`/${g(8)}/${g(2)}`]?.traits).toBeUndefined();
   });
 });
 

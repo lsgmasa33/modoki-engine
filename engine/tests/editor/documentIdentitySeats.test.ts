@@ -217,11 +217,13 @@ describe('a malformed channel on a prefab\'s nested row refuses the instance (#1
   });
 
   // The accept side: the same channels well-formed. Mutation: refuse every nested row that states a channel.
-  it('the same channels well-formed: D expands, no placeholder', async () => {
+  it('the same channels well-formed: D expands, no Damaged placeholder', async () => {
     onDisk = withNestedRow({ removed: [3], added: [], members: { '/x': { traits: { Transform: { x: 2 } } } } });
     await load(scene({ members }));
-    expect(getAllEntities().some((e) => e.missingPrefab)).toBe(false);
+    expect(getAllEntities().some((e) => e.damagedPrefab)).toBe(false);
     expect(getAllEntities().some((e) => e.name === 'R')).toBe(true);
+    // NESTED is on no disk here: its row shows a Missing Prefab placeholder (rule 9, ruling D; #2028), the one placeholder.
+    expect(getAllEntities().filter((e) => e.missingPrefab).map((e) => e.name)).toEqual(['N']);
   });
 });
 

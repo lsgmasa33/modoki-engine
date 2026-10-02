@@ -48,6 +48,7 @@ import { getTraitByName } from './traitRegistry';
 import { durableGuid, formatMemberRowKey, isOwnedRoot, isStoredRoot, memberNodeId, type MemberPi } from '../assetRefRules';
 import { worldIdentityParents } from './identityParents';
 import { templateKeyOf } from '../templateIdentity';
+import { rowPlaceholderOf } from '../unresolvedPrefabRef';
 
 type RowPi = (NonNullable<MemberPi> & { nodeGuid?: string; parentNodeGuid?: string }) | null;
 
@@ -268,7 +269,18 @@ export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld
   for (let grew = true; grew;) {
     grew = false;
     for (const [id] of under) {
-      if (keyOf.has(id) || !tk(id)) continue;
+      if (keyOf.has(id)) continue;
+      // A missing nested row's placeholder (#2001 S5, ruling D) is that row's node: keyed at its row, in the frame of the
+      // member it hangs under, as the fold keys it. A node the user hung AT it is anchored there (#2018).
+      const row = rowPlaceholderOf(byId.get(id) as never);
+      if (row) {
+        const p = parentOf(id);
+        if (!keyOf.has(p) || !row.nodeGuid) continue;
+        keyOf.set(id, `${frameOf(p)}/${row.nodeGuid}`);
+        grew = true;
+        continue;
+      }
+      if (!tk(id)) continue;
       let p = parentOf(id);
       while (p && !keyOf.has(p) && !foreign(p)) p = parentOf(p);
       if (!p || !keyOf.has(p)) continue;

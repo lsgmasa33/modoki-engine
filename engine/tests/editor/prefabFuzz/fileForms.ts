@@ -119,3 +119,64 @@ export function fileForms(scene: Scene, read: PrefabReader, placeholdersOf: (ent
   });
   return out;
 }
+
+/** #2028: the scene as an editor BEFORE S5 wrote it. From S5 a load shows rule B's placeholder (a missing prefab's frame,
+ *  the copy no longer expanded), and the save writes a plain node the user hung there as a top-level entry parented to it
+ *  — the old save's form for any child of a placeholder (`serialize.ts`). Before, the same node sat under the expanded
+ *  copy and was saved in the instance's record: at a missing root in the legacy `added` at the root localId (the `/` row's
+ *  v17 `own` when the entry states none), at a nested placeholder row in that row's v17 `own`. This restates each such
+ *  entry in that form, so the record forms the rules place "in every file form" (§ 10.4b) are still judged from saved
+ *  scenes, and `fileForms` derives the older ones from it. Null when the scene has no such entry. A placeholder is found
+ *  by the guid its entity carries: the entry's for `/`, the row's guid pin for a nested row (an unpinned one is skipped). */
+export function entriesAtPlaceholders(scene: Scene, read: PrefabReader, placeholdersOf: (entry: SceneEntityEntry) => readonly string[]): Scene | null {
+  const s = structuredClone(scene) as Scene;
+  const at = new Map<string, { entry: Bag; key: string; rootLid: number | null }>();
+  let moved = false;
+  for (const entry of s.entities ?? []) {
+    if (!entry.prefab || !entry.guid) continue;
+    const e = entry as unknown as Bag;
+    const pi = isBag(e.traits) && isBag(e.traits.PrefabInstance) ? e.traits.PrefabInstance : undefined;
+    const rootLid = typeof pi?.localId === 'number' ? pi.localId : null;
+    const keys = placeholdersOf(scene.entities![s.entities!.indexOf(entry)]!);
+    for (const key of keys) {
+      const pin = key === '/' ? entry.guid : isBag(e.members) && isBag((e.members as Bag)[key]) ? ((e.members as Bag)[key] as Bag).guid : undefined;
+      if (typeof pin === 'string' && pin) at.set(pin, { entry: e, key, rootLid });
+    }
+    // A node at a placeholder ROW of the top frame: the compatibility save cannot key the row (no PrefabInstance on the
+    // placeholder) and states it in the legacy `added` at the row's localId; before S5 it was that row's v17 `own`.
+    const top = read(entry.prefab);
+    if (!('doc' in top) || !Array.isArray(e.added)) continue;
+    const f = frameOf('', top.doc, entry.prefab);
+    const rowKeyOf = (lid: unknown) => (typeof lid === 'number' && f.byLid.get(lid)?.prefab ? `/${componentOf(f, lid)}` : null);
+    e.added = (e.added as unknown[]).filter((n) => {
+      const key = isUserNode(n) ? rowKeyOf(n.parentLocalId) : null;
+      if (!key || !keys.includes(key)) return true;
+      const m = isBag(e.members) ? e.members as Bag : (e.members = {}) as Bag;
+      const row = isBag(m[key]) ? m[key] as Bag : (m[key] = {}) as Bag;
+      row.own = [...(Array.isArray(row.own) ? row.own : []), { ...structuredClone(n as Bag), parentLocalId: 0 }];
+      moved = true;
+      return false;
+    });
+    if (!(e.added as unknown[]).length) delete e.added;
+  }
+  s.entities = (s.entities ?? []).filter((n) => {
+    const b = n as unknown as Bag;
+    const ea = isBag(b.traits) && isBag(b.traits.EntityAttributes) ? b.traits.EntityAttributes : undefined;
+    const hit = !b.prefab && typeof ea?.parentId === 'string' && typeof ea.guid === 'string' && ea.guid ? at.get(ea.parentId) : undefined;
+    if (!hit) return true;
+    const { name, parentId: _p, guid, ...restEa } = ea as Bag;
+    const traits = { ...(b.traits as Bag) };
+    if (Object.keys(restEa).length) traits.EntityAttributes = restEa; else delete traits.EntityAttributes;
+    const node = { guid, name: typeof name === 'string' ? name : b.name, traits, children: [] };
+    if (hit.key === '/' && hit.rootLid !== null) {
+      hit.entry.added = [...(Array.isArray(hit.entry.added) ? hit.entry.added : []), { parentLocalId: hit.rootLid, ...node }];
+    } else {
+      const m = isBag(hit.entry.members) ? hit.entry.members as Bag : (hit.entry.members = {}) as Bag;
+      const row = isBag(m[hit.key]) ? m[hit.key] as Bag : (m[hit.key] = {}) as Bag;
+      row.own = [...(Array.isArray(row.own) ? row.own : []), { parentLocalId: 0, ...node }];
+    }
+    moved = true;
+    return false;
+  });
+  return moved ? s : null;
+}

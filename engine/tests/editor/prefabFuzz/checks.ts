@@ -12,7 +12,7 @@ import { assertNoRuntimeGuids } from '../../../packages/modoki/src/editor/scene/
 import { PREFAB_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { findEntity } from '@modoki/engine/runtime';
-import { unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf, UnresolvedPrefabRef } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { piOf } from './harness';
 import { sameOrientation } from '../../../packages/modoki/src/runtime/scene/transformSpace';
 import { storedLocalIdCounter } from '../../../packages/modoki/src/runtime/core/localIdCounter';
@@ -115,6 +115,13 @@ export function checkWorld(): Failure[] {
   for (const e of all) {
     const ent = findEntity(e.id);
     if (!ent || !(ent as { has?: (t: unknown) => boolean }).has?.(UnresolvedPrefabRef)) continue;
+    // A missing nested ROW's placeholder (#2001 S5, ruling D) carries its row, not a record: the records under it are
+    // the instance's own rows, which the settle keeps and the save writes (`settleEntryRows`, the capture).
+    const row = rowPlaceholderOf(ent as never);
+    if (row) {
+      if (!row.source || !row.localId) out.push({ check: 'I18 row placeholder without its row', detail: e.name });
+      continue;
+    }
     const rec = unresolvedRefOf(ent as never);
     if (!rec || !rec.source || !rec.record || typeof rec.record !== 'object') out.push({ check: 'I18 placeholder without its record', detail: e.name });
   }
@@ -360,12 +367,24 @@ export function alignEqualOrientations(before: unknown, after: unknown): unknown
  *  that leaves a frame unexpanded still holds it unexpanded after the reload. (Until #1934 F4 this compared against a reload with the deleted prefabs put back, and forgave
  *  frames that came back expanded, which hid every instance the copy failed to restore: hunt seeds 1011 and 3004.) */
 export function checkRoundTrip(
-  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string },
+  rt: { before: unknown; after: unknown; firstBytes: string; secondBytes: string; settled?: { after: unknown; bytes: string } },
   prefabGone: (source: string) => boolean = () => false,
 ): Failure[] {
   const out: Failure[] = [];
   const reloaded = alignEqualOrientations(rt.before, rt.after);
-  const sides = { before: rt.before, after: reloaded };
+  const ruled = ruledMissing(rt.before, reloaded, prefabGone);
+  // Where ruling B turned a live frame into its placeholder, the first save stated the frame and the second its
+  // placeholder (and the nodes it shows as entries of their own): the byte identity, I23's "save → reload → save", holds
+  // from the save of the reloaded world on — and that world must reload as itself.
+  if (ruled !== rt.before && rt.settled) {
+    const d2 = firstDiff(reloaded, alignEqualOrientations(reloaded, rt.settled.after));
+    if (d2) out.push({ check: 'save→reload is not the identity', detail: `${d2} (the reloaded world's own round trip)` });
+    if (rt.secondBytes !== rt.settled.bytes) {
+      out.push({ check: 'save→reload→save is not byte-identical', detail: `${firstDiff(JSON.parse(rt.secondBytes), JSON.parse(rt.settled.bytes)) ?? 'formatting or key order only'} (from the reloaded world's save)` });
+    }
+  }
+  const bytes = ruled !== rt.before && rt.settled ? null : [rt.firstBytes, rt.secondBytes] as const;
+  const sides = { before: ruled, after: reloaded };
   const d = firstDiff(sides.before, sides.after);
   if (d) {
     // Whether a whole entity went missing, and if so whether one with its name took a NEW guid on the other side (a guid
@@ -397,9 +416,43 @@ export function checkRoundTrip(
       : becamePlaceholder ? (prefabGone(placeholderSource!) ? ' (it came back a Missing Prefab placeholder of a deleted prefab)' : ' (it came back a Missing Prefab placeholder)') : '';
     out.push({ check: 'save→reload is not the identity', detail: `${d}${kind}` });
   }
-  if (rt.firstBytes !== rt.secondBytes) {
-    const a = JSON.parse(rt.firstBytes); const b = JSON.parse(rt.secondBytes);
+  if (bytes && bytes[0] !== bytes[1]) {
+    const a = JSON.parse(bytes[0]); const b = JSON.parse(bytes[1]);
     out.push({ check: 'save→reload→save is not byte-identical', detail: firstDiff(a, b) ?? 'formatting or key order only' });
+  }
+  return out;
+}
+
+/** `before` (a live world) as the rules show it once reloaded (#2001 S5): every frame of a DELETED prefab live at the save
+ *  — kept live by #1862, as Unity keeps it — reloads as its Missing Prefab placeholder (rule 9, owner ruling B: a scene's
+ *  copy is never expanded). Applied, not pardoned (design § 10.4b): the frame's members and everything anchored inside it
+ *  go (their records are the placeholder's, which the byte check holds), the nodes the scene linked AT its root stay
+ *  under it (#2018), and the root is the reloaded placeholder, compared by its prefab and its place, not its fields (a
+ *  placeholder shows the row's or the record's name and order). Anything else still differs. */
+export function ruledMissing(before: unknown, after: unknown, prefabGone: (source: string) => boolean): unknown {
+  type Node = { traits?: { EntityAttributes?: { parentId?: unknown }; PrefabInstance?: { source?: string; rootInstanceId?: unknown; parentLocalId?: number } }; unresolved?: string; row?: boolean };
+  const b = before as Record<string, Node>;
+  const a = after as Record<string, Node>;
+  if (!b || typeof b !== 'object') return before;
+  const piOfKey = (k: string) => b[k]?.traits?.PrefabInstance;
+  const roots = Object.keys(b).filter((k) => { const pi = piOfKey(k); return !!pi?.source && pi.rootInstanceId === k && !b[k]!.unresolved && prefabGone(pi.source); });
+  if (!roots.length) return before;
+  const children = new Map<string, string[]>();
+  for (const k of Object.keys(b)) { const p = b[k]!.traits?.EntityAttributes?.parentId; if (typeof p === 'string') children.set(p, [...(children.get(p) ?? []), k]); }
+  const out: Record<string, Node> = { ...b };
+  const drop = (k: string): void => { if (!(k in out)) return; delete out[k]; for (const c of children.get(k) ?? []) drop(c); };
+  for (const r of roots) {
+    if (!(r in out)) continue; // inside a frame already taken
+    for (const c of children.get(r) ?? []) {
+      const pi = piOfKey(c);
+      // A scene node, or a scene-added reference node (a stored root of its own), linked AT the root stays. A missing
+      // ROW's placeholder (ruling D) is the frame's own content, and goes with it.
+      const linked = !b[c]!.row && (!pi || (pi.rootInstanceId === c && !pi.parentLocalId));
+      if (!linked) drop(c);
+    }
+    for (const k of Object.keys(out)) if (k !== r && piOfKey(k)?.rootInstanceId === r) drop(k); // members moved out
+    const shown = a?.[r];
+    if (shown?.unresolved === piOfKey(r)!.source && shown.traits?.EntityAttributes?.parentId === b[r]!.traits?.EntityAttributes?.parentId) out[r] = shown;
   }
   return out;
 }
@@ -421,7 +474,25 @@ export function recordKeys(sceneBytes: string): Set<string> {
   // A component bag IS a record, with fields or none: `{T: {}}` adds the component (F6 counts it as one, #1933). So each
   // bag keys its own path besides its leaves; an empty bag that later fills keeps that key, and the seed-1247 case holds.
   const isComponent = (path: string) => /\/traits\/[^/]+$/.test(path) || /^overrides\/[^/]+\/[^/]+$/.test(path) || /^nestedOverrides\/[^/]+\/[^/]+\/[^/]+$/.test(path);
+  // A scene node is keyed by its OWN guid, whichever container states it (#2001 S5): a node in an entry's `added`, a row's
+  // `own`/`added` or a node's `children` is the same record as a top-level entry with that guid. A frame of a deleted
+  // prefab reloads as its placeholder (ruling B) and the nodes linked AT it show (#2018), so a save after the reload
+  // writes each as its own entry; keyed by place in a list, every one read as lost. Its placement (where it hangs) is
+  // not a record.
+  const nodeWalk = (n: Record<string, unknown>, g: string) => {
+    out.add(`${g} node`);
+    for (const c of CHANNELS) if (n[c] !== undefined) walk(n[c], c, g);
+    if (n.prefab === undefined && n.traits && typeof n.traits === 'object') {
+      const { EntityAttributes: ea, ...rest } = n.traits as Record<string, unknown>;
+      const own = ea && typeof ea === 'object' ? (({ parentId: _p, guid: _g, ...r }) => r)(ea as Record<string, unknown>) : ea;
+      walk({ ...rest, ...(own !== undefined ? { EntityAttributes: own } : {}) }, 'traits', g);
+    }
+  };
   const walk = (v: unknown, path: string, guid: string) => {
+    if (Array.isArray(v) && /(^|\/)(added|own|children)$/.test(path) && v.every((x) => isRecordNode(x))) {
+      for (const x of v) nodeWalk(x as Record<string, unknown>, (x as { guid: string }).guid);
+      return;
+    }
     if (v && typeof v === 'object' && !Array.isArray(v) && isComponent(path)) out.add(`${guid} ${path}`);
     if (Array.isArray(v) && v.length && v.every((x) => !x || typeof x !== 'object')) {
       for (const x of v) out.add(`${guid} ${path}[${String(x)}]`);
@@ -430,8 +501,10 @@ export function recordKeys(sceneBytes: string): Set<string> {
     } else if (!v || typeof v !== 'object') out.add(`${guid} ${path}`); // an EMPTY object or list is no record (it may fill)
   };
   for (const e of scene.entities ?? []) {
-    const guid = typeof e.guid === 'string' ? e.guid : '?';
-    for (const c of CHANNELS) if (e[c] !== undefined) walk(e[c], c, guid);
+    const guid = typeof e.guid === 'string' ? e.guid
+      : typeof (e.traits as { EntityAttributes?: { guid?: unknown } } | undefined)?.EntityAttributes?.guid === 'string' ? (e.traits as { EntityAttributes: { guid: string } }).EntityAttributes.guid : '?';
+    nodeWalk(e, guid);
   }
   return out;
 }
+const isRecordNode = (x: unknown): boolean => !!x && typeof x === 'object' && typeof (x as { guid?: unknown }).guid === 'string';

@@ -243,13 +243,14 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
   });
 
   it('a put-back re-expands the Missing Prefab placeholders in place, keeping unsaved work', async () => {
-    // The scene loaded while X was missing: I1 and I2 are entry placeholders, and H's X row did not expand.
+    // The scene loaded while X was missing: I1 and I2 are entry placeholders, and H's X row shows one too (ruling D, #2028:
+    // before S5 it expanded to nothing).
     route.disk.delete(X_PATH);
     for (const k of [X, X_PATH]) setPrefabCache(k, null);
     await quietly(() => load(emptyScene()));
     await quietly(() => load(scene()));
     markSceneSaved();
-    expect(placeholders(), 'premise: I1 and I2 are placeholders').toBe(2);
+    expect(placeholders(), 'premise: I1, I2 and H\'s X row are placeholders').toBe(3);
     writeTraitFieldWithUndo(rootOf(HOLDER), getTraitByName('Transform')!, 'x', 3);
     // I2 belongs to a BASE scene (R1 review F5): its re-expanded subtree keeps that scene. Mutation: drop the stamp — red.
     const BASE = '/assets/scenes/Base1873.scene.json';
@@ -303,12 +304,12 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
     await quietly(() => load(emptyScene()));
     await quietly(() => load(scene()));
     markSceneSaved();
-    expect(placeholders(), 'premise').toBe(2);
+    expect(placeholders(), 'premise (I1, I2, H\'s X row: ruling D)').toBe(3);
     if (dirty) markSceneDirty('g-r1-dirty');
     try {
       route.disk.set(X_PATH, jsonFileBody({ id: X, version: 6, name: 'X', rootLocalId: 1, entities: [] } as never));
       await quietly(() => reloadPrefabFromDisk(X_PATH));
-      expect(placeholders(), 'premise: still placeholders').toBe(2);
+      expect(placeholders(), 'premise: still placeholders').toBe(3);
       if (dirty) {
         expect(loadScene, 'unsaved work is never reloaded away').not.toHaveBeenCalled();
         expect(useEditorStore.getState().toast?.message ?? '').toMatch(/could not be updated in place/);

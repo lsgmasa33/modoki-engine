@@ -12,9 +12,8 @@ import { durableGuid } from '../../runtime/core/assetRefRules';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { adoptParentScene } from './sceneDirty';
-import type { AddedEntity, ExpansionReader, NestedOverridePaths, NestedStructureDelta, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import type { AddedEntity, ExpansionReader, NestedOverridePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { applyStructureCore, deriveInstanceMemberGuids, instantiatePrefabIntoWorld, spawnReferenceNode } from '../../runtime/loaders/loadSceneFile';
-import type { StructureLayer as StructLayer } from '../../runtime/loaders/prefabOverrides';
 import { type PrefabFile } from './prefab';
 import {
   getCachedPrefabSync, getPrefabSource, prefabNestingReader, preloadNestedPrefabs, primeEditorPrefabCache, setPrefabSource,
@@ -38,10 +37,6 @@ export function instantiatePrefab(
   stack?: Set<string>,
   /** Overrides an OUTER layer applies to this prefab's nested descendants (path-keyed); outermost layer wins. */
   nestedOverrides?: NestedOverridePaths,
-  /** The structural layers the frames ENCLOSING this instance forward into it (a rebuild's `frameForward`, #1737). They
-   *  reach its nested rows only: the call hands no `structure` of its own, so their rows at the root's frame fold into
-   *  nothing, and the root's own frame comes back through the rebuild's capture. */
-  layers?: StructLayer<NestedStructureDelta, SceneMemberRow>[],
 ): number {
   // ⚠️ A raw parent id that no live entity holds REFUSES, before anything is spawned (#1793 defence in depth, hub
   // 2026-09-29). The placements hand `instantiatePrefabInstance` their parent as a guid ref it resolves after its own
@@ -59,7 +54,7 @@ export function instantiatePrefab(
   // The source is a guid or nothing (I22): `setPrefabSource`'s rule, for the one document a caller hands in.
   const source = prefab.id && isGuid(prefab.id) ? prefab.id : '';
   const rootEcsId = instantiatePrefabIntoWorld(getCurrentWorld(), prefab, parentId, undefined, source, undefined, undefined,
-    stack, nestedOverrides, undefined, { read: getCachedPrefabSync as ExpansionReader, layers });
+    stack, nestedOverrides, undefined, { read: getCachedPrefabSync as ExpansionReader });
   if (parentHandle && findEntity(parentId) !== parentHandle) {
     // Refused loudly, with what this call spawned taken back out: parenting the root under whatever holds the id now is
     // how a redo once parented an instance under its own member.

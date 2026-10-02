@@ -25,7 +25,7 @@ import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { keptUnusedRows, keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap, foldStructureLayers, frameKeyIndex } from '../../runtime/loaders/prefabOverrides';
 import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
@@ -908,9 +908,25 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // (`moveChannelsOntoRows`), but a prefab file's nested REFERENCE row writes the whole list (`serializePrefab`), and Apply
   // All numbers its promoted rows in this order. TRACED by the close-out review, not driven: the fuzzer has no prefab-edit
   // save → reopen → save identity check, so no test can make this line fail today.
+  const skip = (id: number): boolean => isMember(id) || movedIn(id) || foreign(id) || editRow(id);
   for (const [ecsId, localId] of [...ecsToLocal].sort((a, b) => a[1] - b[1])) {
     for (const child of childrenOf.get(ecsId) || []) {
-      if (isMember(child.id) || movedIn(child.id) || foreign(child.id) || editRow(child.id)) continue;
+      if (skip(child.id)) continue;
+      // A missing nested ROW's placeholder (#2001 S5, ruling D) is the row, not a node: its document states it, so it is
+      // written nowhere, and the records under it are the kept rows' (`settleEntryRows`). The user's nodes shown under it
+      // are anchored AT the row (#2018), so they are captured there, in this frame's numbering (the row's localId is).
+      const row = rowPlaceholderOf(findEntity(child.id));
+      if (row) {
+        consumedEcsIds.add(child.id);
+        if (opts.template) continue;
+        // The kept rows may restate one too, from the file: the save writes it here only (`captureInstanceMembers`).
+        for (const grand of childrenOf.get(child.id) || []) {
+          if (skip(grand.id)) continue;
+          const node = captureChild(grand.id, row.localId);
+          if (node) added.push(node);
+        }
+        continue;
+      }
       const node = captureChild(child.id, localId);
       if (node) added.push(node);
     }

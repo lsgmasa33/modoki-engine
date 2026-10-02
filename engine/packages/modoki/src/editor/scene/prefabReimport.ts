@@ -179,7 +179,7 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
       const read = load?.read;
       const cached = read?.(source);
       if (!cached) return undefined;
-      const rootId = instantiatePrefabIntoWorld(world, cached as never, parentId, rootTf, source, overrides, structure, undefined, nestedOverrides, nestedStructure, { read, frame: load?.frame });
+      const rootId = instantiatePrefabIntoWorld(world, cached as never, parentId, rootTf, source, overrides, structure, undefined, nestedOverrides, nestedStructure, { read, frame: load?.frame, ...(load?.sceneVersion !== undefined ? { sceneVersion: load.sceneVersion } : {}), ...(rootGuid ? { rootGuid } : {}) });
       const root = rootId ? findEntity(rootId) : undefined;
       if (!root) return undefined;
       if (rootGuid || rootEditorFolder) root.set(eaMeta.trait, { ...(root.get(eaMeta.trait) as object), ...(rootGuid ? { guid: rootGuid } : {}), ...(rootEditorFolder ? { editorFolder: rootEditorFolder } : {}) });

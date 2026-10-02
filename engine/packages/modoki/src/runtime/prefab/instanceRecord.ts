@@ -89,6 +89,23 @@ export interface TemplateAddedNode {
   held?: TemplateHeldData;
 }
 
+/** The file's own form of a parsed template node (`AddedEntity`), held beside it, NON-ENUMERABLE so no comparison or
+ *  writer sees it (`rawTemplateNodeOf`). Realize (S5) needs it where today's load handed the raw node on: a template
+ *  reference node's Missing Prefab placeholder carries it (`spawnUnresolvedReference`), and its `templateMoved` is its
+ *  frame record's (`noteNodeMoves`), which the old capture reads until S8. */
+/** On a scene-owned node's content (`ParsedInstance.ownContent`) whose guid the parse DERIVED (the file states none, rule
+ *  5): the link's identity, not the node's statement. Realize (S5) spawns such a node guid-less, as today's load does, and
+ *  the load's derive gives it its guid (`deriveInstanceMemberGuids`; a template-keyed node derives from its key). */
+export const DERIVED_NODE_GUID: unique symbol = Symbol.for('modoki.prefab.derivedNodeGuid');
+export function hasDerivedGuid(node: object): boolean {
+  return !!(node as Record<symbol, unknown>)[DERIVED_NODE_GUID];
+}
+
+export const RAW_TEMPLATE_NODE: unique symbol = Symbol.for('modoki.prefab.rawTemplateNode');
+export function rawTemplateNodeOf(node: TemplateAddedNode): AddedEntity | undefined {
+  return (node as unknown as Record<symbol, AddedEntity | undefined>)[RAW_TEMPLATE_NODE];
+}
+
 export type SceneTargetRecord = TargetRecordOf<AddedNodeRef>;
 /** Template form carries no identity pins (I8). */
 export type TemplateTargetRecord = Omit<TargetRecordOf<TemplateAddedNode>, 'guid' | 'name'>;
@@ -304,12 +321,32 @@ export interface DesiredNode {
   sortOrder: number;
   /** The template row's minted identity, or a pre-v5 document's in-memory derivation (§ 2.7). */
   nodeGuid?: string;
-  /** Set on a template-added node. */
+  /** Set on a template-added node that carries a key (a frame-unique one, #1809). */
   templateKey?: string;
+  /** Set on a template-added node, and on a template reference node's frame root: the node as its template list states
+   *  it. Realize spawns such a node with no `PrefabInstance`, and with the guid its template states, if any (#1567: a node
+   *  can carry both; the old spawner stamped it). A keyless one (a legacy document's) has no `templateKey`. */
+  template?: TemplateAddedNode;
   localId?: number;
   /** The frame that supplies this node: the document it comes from and that frame's root key. Stamps
    *  `PrefabInstance`. */
   frame: { source: string; rootKey: RowKey };
+  /** Set on a node whose place is not its row's (a move the fold settled, or a failed one lifted): the parent its row
+   *  gives it. Realize (S5) spawns it there and moves it once every guid is derived, as today's load does, because a
+   *  member's guid derives at its row (#1437). */
+  rowParent?: { key: RowKey } | { guid: string } | null;
+  /** Set on a nested FRAME root (key ≠ `/`): the frame it hangs in (`outer`, that frame's root key) and, for a frame a
+   *  reference ROW expands, that row's localId and identity in the outer document (`PrefabInstance.parentLocalId` /
+   *  `parentNodeGuid`). A template-added reference node's frame has no row (its `templateKey` names it). */
+  opens?: FrameOpening;
+}
+
+/** Where a nested frame opens: see {@link DesiredNode.opens}. */
+export interface FrameOpening {
+  outer: RowKey;
+  row?: { localId: number; nodeGuid?: string };
+  /** A template-added reference node's frame: the node, as its template list states it. */
+  node?: TemplateAddedNode;
 }
 
 export interface Placeholder {
@@ -319,11 +356,33 @@ export interface Placeholder {
   /** Where the placeholder hangs, as its row would (`DesiredNode.parent`): what realize (S5) parents it by, and what the
    *  removal cascade follows (#2007 review, item 3). */
   parent?: DesiredNode['parent'];
+  /** The frame the placeholder stands in for, as {@link DesiredNode.opens} (absent at the instance root `/`). */
+  opens?: FrameOpening;
+  /** A row placeholder's place among its siblings, and the name its row states (shown as the placeholder's). */
+  name?: string;
+  sortOrder?: number;
+  /** A template-added reference node's placeholder: its key (none for a keyless one), and the node as its template
+   *  states it. */
+  templateKey?: string;
+  node?: TemplateAddedNode;
+  /** A reference node whose document contains itself (I16): the containing-document chain it sits in. Realize spawns
+   *  nothing for it and logs the refusal, as today's `refuseCyclicReferenceNode` does — a placeholder would write the
+   *  cycle back on the next save. */
+  cycle?: readonly string[];
 }
 
 /** The definition of "what this instance is": a pure function of (reader, record). */
 export interface FoldedInstance {
   nodes: Map<RowKey, DesiredNode>;
+  /** Removed nodes a surviving node still sits under at its ROW, because it moved out: realize (S5) spawns them so the
+   *  moved node derives its guid at its row, and deletes them once the moves have applied — today's deferred removal
+   *  (`applyStructureCore`, #1437). Never part of the instance. */
+  transit?: Map<RowKey, DesiredNode>;
+  /** The compatibility adapter's view (§ 10.1; deleted with the old stores in S8): the rows of the instance's own list
+   *  whose member a LOWER layer removed, itself or by the cascade — the instance's own removal of it too, which restates the
+   *  lower one (kept, as today keeps it, so the save still writes it until S6: #2013). The old settle keeps such a row whole
+   *  by a tag the old fold set on the stored row object (`isUntargetedRow`); the spawner sets it from this. */
+  innerRemoved?: Set<RowKey>;
   /** A Missing/Damaged Prefab placeholder per unresolvable frame (the root's `"/"` when the source
    *  itself does not resolve). Records under it are unused with cause `unresolved` (U9, ruling D). */
   placeholders: Map<RowKey, Placeholder>;

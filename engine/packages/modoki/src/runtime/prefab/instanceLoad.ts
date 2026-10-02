@@ -12,7 +12,13 @@ import type { AddedEntity, SceneEntityEntry } from '../loaders/loadSceneFile';
 import { getCachedPrefab } from '../loaders/meshTemplateCache';
 import type { ParsedInstance, PrefabDoc, PrefabReader, SceneOwnedNode } from './instanceRecord';
 import { parseInstanceRecord, parseReferenceNode, type ParseOptions } from './parseInstanceRecord';
-import { markStale, setInstanceRecord } from './instanceStore';
+import { markStale, setInstanceRecord, storedInstance } from './instanceStore';
+import { getTraitByName } from '../core/ecs/traitRegistry';
+import { findEntityById, findEntityByGuid } from '../core/ecs/world';
+import { instanceRowKeysIn } from '../core/ecs/memberRows';
+import { isStoredRoot, type MemberPi } from '../core/assetRefRules';
+import { templateKeyOf } from '../core/templateIdentity';
+import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
 
 /** The runtime cache as a `PrefabReader`. A document the cache does not hold is `missing`. */
 export const cachedPrefabReader: PrefabReader = (guid) => {
@@ -81,28 +87,79 @@ export function fillInstanceStore(
       out.push(p);
     }
   }
-  markParentLinked(world, data, opts);
+  buildParentLinks(world, data, opts);
   return out;
 }
 
 /** A plain scene entity a file parents INTO an instance by its `parentId` (a file-direct agent write, a hand edit) hangs
- *  there live, and today's save writes it as that node's `own` link, but no one owner's parse sees a sibling entity, so
- *  the record lacks the link. Until it is built at load (open with the hub, #2014), the records are marked stale: the
- *  door re-seeds them from the capture, which states the link, before it writes. */
-function markParentLinked(world: World, data: { entities?: SceneEntityEntry[] }, opts: ParseOptions): void {
+ *  there live, and today's save writes it as that node's `own` link, but no one owner's parse sees a sibling entity. Hub
+ *  ruling (2026-10-02, design § 10.7): the LOADER builds the link, scene-wide, as a load-time conversion — the guid the
+ *  file names is keyed through the live instance (`instanceRowKeysIn`, rule 5's guid → key), and the link goes on that
+ *  key's row of the nearest record whose keys hold it (#2028, hunt seed 1061). A parent the walk cannot name — a node the
+ *  user added, which no key names, or one in no record — leaves that tree's records stale, as before: the door re-seeds
+ *  them from the capture, which states the link. A parentId naming nothing is the loader's (today's placement, warned). */
+function buildParentLinks(world: World, data: { entities?: SceneEntityEntry[] }, opts: ParseOptions): void {
   const entities = Array.isArray(data.entities) ? data.entities : [];
-  const plain = new Set<string>();
-  for (const e of entities) {
-    if (isInstanceEntry(e)) continue;
+  const guidOf = (e: SceneEntityEntry): string => {
     const g = (e.traits?.EntityAttributes as Record<string, unknown> | undefined)?.guid ?? e.guid;
-    if (typeof g === 'string' && g) plain.add(g);
+    return typeof g === 'string' ? g : '';
+  };
+  const plain = new Set(entities.filter((e) => !isInstanceEntry(e)).map(guidOf).filter(Boolean));
+  const ea = getTraitByName('EntityAttributes')?.trait;
+  const pi = getTraitByName('PrefabInstance')?.trait;
+  if (!ea || !pi) return;
+  const parentOf = (id: number): number => ((findEntityById(id, world)?.get(ea) as { parentId?: number } | undefined)?.parentId ?? 0);
+  const ownsRecord = (id: number): boolean => {
+    const e = findEntityById(id, world);
+    if (!e || templateKeyOf(e as never)) return false;
+    return e.has(pi) ? isStoredRoot(e.get(pi) as MemberPi, id) : !!unresolvedRefOf(e as never);
+  };
+  const rootGuidOf = (id: number): string => ((findEntityById(id, world)?.get(ea) as { guid?: string } | undefined)?.guid ?? '');
+  // One key walk per owner, not per linked entity (#2028 review F3: a walk is a world scan).
+  const keysOf = new Map<number, Map<number, string>>();
+  const keysIn = (owner: number) => keysOf.get(owner) ?? keysOf.set(owner, instanceRowKeysIn(owner, world)).get(owner)!;
+  // Marked once, after the walk: a mark scans the world (#2028 close-out review). `all`: some link could not be built.
+  let all = false;
+  const enclosing = new Set<string>();
+  try {
+    for (const e of entities) {
+      if (isInstanceEntry(e)) continue;
+      const ref = (e.traits?.EntityAttributes as Record<string, unknown> | undefined)?.parentId;
+      const parent = ref === undefined || ref === 0 || ref === '' ? '' : (opts.parentGuid?.(ref) ?? (typeof ref === 'string' ? ref : ''));
+      if (!parent || plain.has(parent)) continue;
+      const at = findEntityByGuid(parent, world)?.id();
+      const child = guidOf(e);
+      if (at === undefined || !child) continue;
+      let linked = 0;
+      for (let a = at, n = 0; a && n < 1024; a = parentOf(a), n++) {
+        if (!ownsRecord(a)) continue;
+        if (linked) {
+          // An enclosing record restates the node the link went into (a scene-added reference node owns a record inside
+          // its instance's, § 2.5): it is re-seeded before it is read, as #2037's copy stales every enclosing record.
+          enclosing.add(rootGuidOf(a));
+          continue;
+        }
+        const key = keysIn(a).get(at);
+        if (key === undefined) continue;
+        const st = storedInstance(world, rootGuidOf(a));
+        if (!st || st.stale) break;
+        const rows = new Map(st.record.list.rows);
+        const row = rows.get(key) ?? {};
+        if (!(row.own ?? []).some((o) => o.guid === child)) rows.set(key, { ...row, own: [...(row.own ?? []), { guid: child }] });
+        setInstanceRecord(world, { ...st.record, list: { ...st.record.list, rows } });
+        linked = a;
+      }
+      // Not linked: every record is re-seeded from the capture before it is read, as before S5 (review F3: marking the
+      // nearest owner alone left an enclosing record fresh without the link).
+      if (!linked) all = true;
+    }
+  } catch (err) {
+    // A throw part-way leaves later links unbuilt: nothing is read fresh then.
+    markStale(world, 'sceneParentLink');
+    throw err;
   }
-  for (const e of entities) {
-    if (isInstanceEntry(e)) continue;
-    const ref = (e.traits?.EntityAttributes as Record<string, unknown> | undefined)?.parentId;
-    const parent = ref === undefined || ref === 0 || ref === '' ? '' : (opts.parentGuid?.(ref) ?? (typeof ref === 'string' ? ref : ''));
-    if (parent && !plain.has(parent)) { markStale(world, 'sceneParentLink'); return; }
-  }
+  if (all) markStale(world, 'sceneParentLink');
+  else if (enclosing.size) markStale(world, 'sceneParentLink', [...enclosing]);
 }
 
 /** {@link fillInstanceStore} for the load path, one owner at a time: an owner the parser throws on is reported and left
@@ -118,5 +175,5 @@ export function fillInstanceStoreReporting(world: World, data: { entities?: Scen
       console.error(`[instanceStore] could not parse the instance record of "${entry.name ?? entry.guid}" (#2001 S4): ${(err as Error)?.message ?? err}`);
     }
   }
-  try { markParentLinked(world, data, opts); } catch (err) { console.error(`[instanceStore] could not check the scene's parent links (#2001 S4): ${(err as Error)?.message ?? err}`); }
+  try { buildParentLinks(world, data, opts); } catch (err) { console.error(`[instanceStore] could not build the scene's parent links (#2028): ${(err as Error)?.message ?? err}`); }
 }

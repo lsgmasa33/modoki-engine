@@ -305,7 +305,8 @@ describe('parseReferenceNode — a nested instance the scene added', () => {
       overrides: { 1: { EntityAttributes: { sortOrder: 2 } }, 2: { Light: { intensity: 4 } } },
     };
     const { record } = parseReferenceNode(node, reader(), { ...V15, parent: G(41) });
-    expect(record).toMatchObject({ rootGuid: G(40), source: 'Q', placement: { parent: G(41), sortOrder: 2, name: 'Inner' } });
+    // The node's own `name` is not its root's name: today's load never applies it (#2028); the template root's shows.
+    expect(record).toMatchObject({ rootGuid: G(40), source: 'Q', placement: { parent: G(41), sortOrder: 2, name: 'QRoot' } });
     expect(row(record.list.rows, `/${NQ2}`)?.traits).toEqual({ Light: { intensity: 4 } });
     expect(row(record.list.rows, '/')).toBeUndefined();
   });

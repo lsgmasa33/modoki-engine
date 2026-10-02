@@ -11,6 +11,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { UndoRefusedError } from '../undo/undoFailure';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { clearOverrideMarks, restoreOverrideMarks, unmarkOverride, getStoredOverrideMarks } from '../../runtime/loaders/overrideMarks';
@@ -469,7 +470,11 @@ function reattachPrefabInstanceUnmarked(
 export async function requireLinks(detached: DetachSnapshot, what: string): Promise<void> {
   const unresolved = new Map<string, number>();
   for (const l of detached.links) {
-    if (l.ref.resolve() != null && l.rootRef.resolve() != null) continue;
+    const id = l.ref.resolve();
+    // The entity resolves but is a Missing Prefab placeholder now (a reload since: rule 9, rulings B and D — #2001 S5): it
+    // holds no frame, so its link cannot be put back either.
+    const placeholder = id != null && (unresolvedRefOf(findEntity(id)) || rowPlaceholderOf(findEntity(id) as never));
+    if (id != null && l.rootRef.resolve() != null && !placeholder) continue;
     const source = l.data.source as string | undefined;
     if (source) unresolved.set(source, (unresolved.get(source) ?? 0) + 1);
   }

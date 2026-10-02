@@ -38,7 +38,6 @@ import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/app
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
@@ -50,7 +49,6 @@ boot(be);
 
 const noNest = async () => {};
 const TF = () => getTraitByName('Transform')!;
-const ty = (id: number) => (readTraitData(id, TF()) as Record<string, number> | null)?.y;
 
 /** Trash a fixture prefab as the Assets panel does, and let the watcher see it. */
 async function trash(f: Fixture, which: 'P' | 'Q'): Promise<void> {
@@ -69,6 +67,14 @@ function mUnder(f: Fixture, root: number): number | undefined {
   const under = new Set<number>([root]);
   for (let grew = true; grew;) { grew = false; for (const e of all) if (!under.has(e.id) && under.has(e.parentId)) { under.add(e.id); grew = true; } }
   return all.find((x) => under.has(x.id) && x.name === 'M' && piOf(x.id)?.source === f.prefabs.Q.guid)?.id;
+}
+/** The Missing Prefab placeholders inside the subtree of `root` (its own excluded). */
+function placeholdersUnder(root: number): number {
+  const all = getAllEntities();
+  const under = new Set<number>([root]);
+  for (let grew = true; grew;) { grew = false; for (const e of all) if (!under.has(e.id) && under.has(e.parentId)) { under.add(e.id); grew = true; } }
+  const ph = placeholderGuids();
+  return all.filter((x) => x.id !== root && under.has(x.id) && x.guid && ph.has(x.guid)).length;
 }
 type Entry = { guid?: string; members?: Record<string, { traits?: { Transform?: { y?: number } } }> };
 /** The member-row key of P1's entry (by guid) that states Transform.y = `y`, in the saved file. */
@@ -106,33 +112,37 @@ async function missingBoth(key: string) {
   return { f, p1Guid, rowKey: rowKey!, pText };
 }
 
-describe('#1934 S1: one reader per load — a placeholder returning in place reads the scene\'s copies', () => {
-  it('P put back through the outside-change hold: P1 re-expands its Q frame from the copy, as a reload does, and the save keeps the edit', async () => {
+// Owner ruling B (#2001 S5, #2028): no copy expands anything, so the return of P shows P1 with its Q row as Q's Missing
+// Prefab placeholder — by the in-place path and by a reload alike, which is S1's point — and the edit under it (M.y = 6)
+// is held as the row and saved back.
+describe('#1934 S1: one reader per load — a placeholder returning in place meets the scene\'s copies as a reload does', () => {
+  it('P put back through the outside-change hold: P1 re-expands with its Q row a placeholder, as a reload does, and the save keeps the edit', async () => {
     // Mutation: in `reexpandEntryPlaceholder` drop `read:` from the load's options and expand with `getCachedPrefabSync`
-    // again (the pre-fix reader, no copies) → the expansion is refused (the guard below); remove the guard as well → M is
-    // absent under P1 and the saved row is gone (`expected undefined to be '/…'`), the reviewer's observed defect.
+    // again (the pre-fix reader) → the expansion is refused (the guard below).
     const { f, p1Guid, rowKey, pText } = await missingBoth('s1-inplace');
     const before = be.snapshot();
     be.write(f.prefabs.P.path, pText);
     await flushWatcher(be, before); // the outside put-back, released at once (focus / `modoki_refresh`)
     await settle();
     expect(placeholderGuids().has(p1Guid), 'premise: P1 re-expanded in place').toBe(false);
-    const m = mUnder(f, getAllEntities().find((x) => x.guid === p1Guid)!.id);
-    expect(m, 'the Q frame expands from the copy, as the reload in the next case does').toBeTruthy();
-    expect(ty(m!)).toBe(6);
+    const p1 = getAllEntities().find((x) => x.guid === p1Guid)!.id;
+    expect(mUnder(f, p1), 'the Q frame does not expand from the copy (ruling B)').toBeUndefined();
+    expect(placeholdersUnder(p1), 'Q\'s row is its placeholder, as the reload in the next case shows').toBe(1);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(rowWithY(f, p1Guid, 6)).toBe(rowKey);
   });
 
-  it('control: the same return by a RELOAD expands P1\'s Q frame from the copy with M.y = 6', async () => {
-    const { f, p1Guid, pText } = await missingBoth('s1-reload');
+  it('control: the same return by a RELOAD shows P1\'s Q row as its placeholder, and the save keeps M.y = 6', async () => {
+    const { f, p1Guid, rowKey, pText } = await missingBoth('s1-reload');
     be.write(f.prefabs.P.path, pText);
     registerAsset(f.prefabs.P.guid, f.prefabs.P.path, 'prefab');
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    const m = mUnder(f, getAllEntities().find((x) => x.guid === p1Guid)!.id);
-    expect(m).toBeTruthy();
-    expect(ty(m!)).toBe(6);
+    const p1 = getAllEntities().find((x) => x.guid === p1Guid)!.id;
+    expect(mUnder(f, p1)).toBeUndefined();
+    expect(placeholdersUnder(p1)).toBe(1);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect(rowWithY(f, p1Guid, 6)).toBe(rowKey);
   });
 });
 
@@ -224,8 +234,10 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
   // Hunt seed 1268's route, directed. The Apply's snapshot is taken while Q is present, so it carries no copy of Q; Q is
   // trashed after (its live frames kept, the save carries its copy); the Apply's undo reloads the snapshot. Without the
   // carry, Q's frames came back unexpanded and the next save wrote no copy for them.
-  // Mutation: drop `sceneCopies` from `applyPrefabUndo.ts`' three restores → `expected 2 to be 0` (unexpanded rows).
-  it('undoing an Apply after a nested prefab was trashed keeps that prefab\'s live frames and its copy', async () => {
+  // Owner ruling B (#2001 S5, #2028): the swap is a load, and no copy expands anything — Q's frames come back as their
+  // rows' Missing Prefab placeholders. The carry still matters until S6 stops writing copies: the next save writes Q's.
+  // Mutation: drop `sceneCopies` from `applyPrefabUndo.ts`' three restores → the save after the undo has no copy of Q.
+  it('undoing an Apply after a nested prefab was trashed shows its frames as placeholders and keeps its copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-swap');
     const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
     const p1 = p1Id(f);
@@ -243,8 +255,8 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {}), 'premise: the save carries Q').toContain(f.prefabs.Q.guid);
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
-    expect(unexpandedRows().size).toBe(0);
-    expect(qCount()).toBe(live);
+    expect(qCount(), 'ruling B: no Q frame expands').toBe(0);
+    expect(unexpandedRows().size, 'each Q row its placeholder').toBeGreaterThan(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
@@ -252,8 +264,9 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
   // #1948 S2: the same route in an UNTITLED world (New Scene, P placed). Its snapshot's id is minted at the Apply's
   // serialize, and a New Scene world has no loaded scene, so a carry keyed by the world it came from matched nothing the
   // reload loads and the swap's chain filter dropped all of it.
-  // Mutation: `SceneManager.captureSceneCopies` ignores `primaryAs` → `expected 1 to be +0` (unexpanded rows); the re-key alone a no-op → `redo: expected 1 to be +0`; the titled case above stays green.
-  it('an untitled world: the undo keeps the live frames, and Save As writes the copy', async () => {
+  // Ruling B as above: the frames come back as placeholders on every swap, and the copy survives each to the Save As.
+  // Mutation: `SceneManager.captureSceneCopies` ignores `primaryAs` → the Save As writes no copy of Q.
+  it('an untitled world: each swap shows the frames as placeholders, and Save As writes the copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-untitled');
     await newScene();
     await settle();
@@ -272,18 +285,15 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
-    expect(unexpandedRows().size).toBe(0);
-    expect(qCount()).toBe(live);
+    expect(qCount()).toBe(0);
     // The redo reloads the OTHER side's snapshot, under another minted id, from a world that now has a loaded primary:
     // the re-key branch (close-out review). Then the undo again.
     expect((await undoStep('redo')).did).toBe(true);
     await settle();
-    expect(unexpandedRows().size, 'redo').toBe(0);
-    expect(qCount(), 'redo').toBe(live);
+    expect(qCount(), 'redo').toBe(0);
     expect((await undoStep('undo')).did).toBe(true);
     await settle();
-    expect(unexpandedRows().size, 'second undo').toBe(0);
-    expect(qCount(), 'second undo').toBe(live);
+    expect(qCount(), 'second undo').toBe(0);
     const asPath = f.scenePath.replace(/[^/]+$/, 'untitled-c2.json');
     expect((await saveScene({ path: asPath, allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(asPath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);

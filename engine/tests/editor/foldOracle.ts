@@ -11,7 +11,7 @@ import { getCurrentWorld, getTraitByName } from '@modoki/engine/runtime';
 import { getAllTraits } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { keptMemberOrphans, keptLegacyChannels, keptUnusedRows, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
-import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, preV5NodeGuid, frameOf, componentOf, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -51,7 +51,7 @@ export function liveTree(rootId: number): Live {
       if (pk) out.anchors.set(pk, [...(out.anchors.get(pk) ?? []), (e.get(ea) as { guid: string }).guid]);
       continue;
     }
-    if (unresolvedRefOf(e as never)) out.placeholders.add(key);
+    if (unresolvedRefOf(e as never) || rowPlaceholderOf(e as never)) out.placeholders.add(key);
     const traits: LiveNode['traits'] = {};
     for (const meta of getAllTraits()) {
       if (SKIP_TRAITS.has(meta.name) || !e.has(meta.trait)) continue;
@@ -79,7 +79,10 @@ const IGNORED_FIELDS: Record<string, Set<string>> = { EntityAttributes: new Set(
 
 /** What the comparisons reached, for the non-vacuity pins. */
 export const seen = {
-  ruledB: 0, ruledD: 0, ruledOwn: 0, ruledOwnFix: 0, defaults: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0,
+  ruledB: 0, ruledD: 0,
+  // …and the same placeholders where the live side ALREADY shows them (#2028: a load through realize shows the rulings,
+  // so the translation above has nothing to do there).
+  shownB: 0, shownD: 0, ruledOwn: 0, ruledOwnFix: 0, defaults: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0,
   // `placementDiverge` (#2021): own links by where the rules put them, and the records it held to `unresolved`.
   ownProjected: 0, ownAtPlaceholder: 0, ownInPlaceholder: 0, ownHeld: 0, ownDuplicate: 0, heldNodeUnjudged: 0, unresolvedUnderPlaceholder: 0,
   // #2030: #2025's held forms judged — an entry-level legacy `added` node under a missing root, a slot's under a missing
@@ -218,7 +221,25 @@ export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceh
   }
   // Today's kept copy of a link the rules now SHOW (#2018 (i), `checkRecord`), where today kept one.
   for (const key of ruledKept) { const at = kept.findIndex((k) => k.key === key && k.leaf === 'own'); if (at >= 0) kept.splice(at, 1); }
-  const compared = fold.unused.filter((u) => !(u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k))));
+  const atPlaceholder = (u: UnusedRecord) => u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k));
+  const compared = fold.unused.filter((u) => !atPlaceholder(u));
+  // …on either side: a held LEGACY record there is today's kept legacy leaf, which names no row and so is not skipped by
+  // key above (#2028: a `nestedStructure` slot's node at a nested rule-B placeholder, kept verbatim for the save).
+  for (const u of fold.unused) {
+    if (!atPlaceholder(u) || u.part.kind !== 'legacy') continue;
+    // The held value at the record's path, re-wrapped in its channels, read as today's store reads it.
+    const path = u.part.path;
+    const chain: unknown[] = [held];
+    for (const step of path) chain.push((chain[chain.length - 1] as Bag | undefined)?.[step]);
+    let v: unknown = chain[path.length];
+    for (let i = path.length - 1; i >= 0; i--) v = Array.isArray(chain[i]) ? [v] : { [path[i]!]: v };
+    const leaves: string[] = [];
+    legacyLeaves(v as Bag, leaves);
+    for (const leaf of leaves) {
+      const at = kept.findIndex((k) => k.key === '(legacy)' && k.leaf === leaf);
+      if (at >= 0) kept.splice(at, 1);
+    }
+  }
   // A held MEMBER ROW's record (part path `['members', k, field?, i?]`) is today's kept row, verbatim: paired as the
   // leaves that row shows in today's store, at `k` (close-out review round 4).
   const out: string[] = [];
@@ -555,8 +576,8 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
  *    Prefab placeholder (owner ruling B, design § 5.4; rule 9: no copy);
  *  - D: a nested reference row whose prefab is missing, with no copy: today spawns nothing there; the rule puts the
  *    placeholder at the row (design § 2.4 item 5, ruling D; rule 9). */
-export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions, copies: ReadonlySet<string> = new Set()): string[] {
-  return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies, entry);
+export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions, copies: ReadonlySet<string> = new Set(), ownEntry?: (guid: string) => boolean): string[] {
+  return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies, entry, ownEntry);
 }
 
 /** The root localId a stored owner (a scene entry, or a scene-added reference node) states, `null` when none. */
@@ -567,39 +588,9 @@ export function statedRootLid(owner: { traits?: unknown }): number | null {
 
 /** {@link checkInstance} for a record already parsed — a scene reference node's (`parseReferenceNode`, #2009). `owner` is
  *  the entry or node as stored, which judges its root forms under a missing root; left out, the legacy `added` there
- *  stays unjudged (`placementDiverge`). */
-export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), owner?: StoredOwner): string[] {
-  const fold = foldInstance(read, rec);
-  const live = liveTree(rootId);
-  // What today shows, anchored anywhere, before any translation moves a subtree out.
-  const shownToday = new Set([...live.anchors.values()].flat());
-  for (const [k, ph] of fold.placeholders) {
-    if (ph.reason !== 'missing' || live.placeholders.has(k)) continue;
-    const today = [...live.nodes.keys()].filter((n) => under(n, k));
-    if (copies.has(ph.source)) seen.ruledB++;
-    else if (k !== '/' && !today.length) seen.ruledD++;
-    else continue;
-    for (const n of today) live.nodes.delete(n);
-    for (const a of [...live.anchors.keys()]) if (under(a, k)) live.anchors.delete(a);
-    live.placeholders.add(k);
-  }
-  // Every scene-owned node the record links AT a placeholder hangs from it (#2018; hub ruling 2026-10-02 (i), a visible
-  // FIX): today shows it under the copy's root (B) or the instance root (D) — or, in the v17+ `own` form and under a
-  // template-added reference node, HIDES it (kept as an unused row, or in no store, lost on the next save).
-  const ruledKept: string[] = [];
-  for (const k of fold.placeholders.keys()) {
-    const linked = new Set(((rec.list.rows.get(k) as { own?: { guid: string }[] } | undefined)?.own ?? []).map((o) => o.guid));
-    if (!linked.size) continue;
-    const shown = new Set([...linked].filter((g) => shownToday.has(g)));
-    for (const [a, gs] of [...live.anchors]) {
-      const rest = gs.filter((g) => !linked.has(g));
-      if (rest.length === gs.length) continue;
-      if (rest.length) live.anchors.set(a, rest); else live.anchors.delete(a);
-    }
-    live.anchors.set(k, [...linked]);
-    if (shown.size) seen.ruledOwn++;
-    if (shown.size < linked.size) { seen.ruledOwnFix++; for (let i = shown.size; i < linked.size; i++) ruledKept.push(k); }
-  }
+ *  stays unjudged (`placementDiverge`). `ownEntry`: see {@link translatedLive}. */
+export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), owner?: StoredOwner, ownEntry?: (guid: string) => boolean): string[] {
+  const { fold, live, ruledKept } = translatedLive(rec, read, rootId, copies, ownEntry);
   const removedRows = [...rec.list.rows].filter(([, r]) => r.removed).map(([k]) => k);
   const projectsWhenRestored = (key: string): boolean => {
     const rows = new Map(rec.list.rows);
@@ -628,4 +619,99 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
     return last.startsWith('a+') || nodeGuids.has(last);
   };
   return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept), ...placementDiverge(fold, rec, { read, owner })];
+}
+
+/** The live tree of the instance rooted at `rootId`, with the rules' visible changes applied to it (what
+ *  {@link checkRecord} compares the fold with). Exported for the frozen baseline (`foldOracleFrozen.test.ts`): at S5 the
+ *  load IS fold + realize, so comparing the fold with the live tree no longer says anything about today (design
+ *  § 10.4b); the translated tree of the pre-S5 load is frozen instead. `ruledKept`: the own links the rules now show
+ *  where today kept a copy of the link (#2018 (i)). */
+export function translatedLive(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), ownEntry?: (guid: string) => boolean): { fold: FoldedInstance; live: Live; ruledKept: string[] } {
+  const fold = foldInstance(read, rec);
+  const live = liveTree(rootId);
+  // `ownEntry`: a node the scene states as an entry of its OWN, not in this record (a live scene, `foldCheck`). It hangs
+  // at a Missing Prefab placeholder once a save after the reload wrote the node the placeholder shows (#2018) where a
+  // scene entity under a placeholder goes: a scene entry parented to it. Not one of this record's anchors.
+  if (ownEntry) {
+    for (const [k, gs] of [...live.anchors]) {
+      const rest = gs.filter((g) => !ownEntry(g));
+      if (rest.length) live.anchors.set(k, rest); else live.anchors.delete(k);
+    }
+  }
+  // What today shows, anchored anywhere, before any translation moves a subtree out.
+  const shownToday = new Set([...live.anchors.values()].flat());
+  for (const [k, ph] of fold.placeholders) {
+    if (ph.reason !== 'missing') continue;
+    if (live.placeholders.has(k)) { if (copies.has(ph.source)) seen.shownB++; else if (k !== '/') seen.shownD++; continue; }
+    const today = [...live.nodes.keys()].filter((n) => under(n, k));
+    if (copies.has(ph.source)) seen.ruledB++;
+    else if (k !== '/' && !today.length) seen.ruledD++;
+    else continue;
+    for (const n of today) live.nodes.delete(n);
+    for (const a of [...live.anchors.keys()]) if (under(a, k)) live.anchors.delete(a);
+    // A placeholder today shows INSIDE the frame (a missing nested row of it, ruling D) goes with the frame's nodes.
+    for (const p of [...live.placeholders]) if (p !== k && under(p, k)) live.placeholders.delete(p);
+    live.placeholders.add(k);
+  }
+  // Every scene-owned node the record links AT a placeholder hangs from it (#2018; hub ruling 2026-10-02 (i), a visible
+  // FIX): today shows it under the copy's root (B) or the instance root (D) — or, in the v17+ `own` form and under a
+  // template-added reference node, HIDES it (kept as an unused row, or in no store, lost on the next save).
+  const ruledKept: string[] = [];
+  for (const k of fold.placeholders.keys()) {
+    const linked = new Set(((rec.list.rows.get(k) as { own?: { guid: string }[] } | undefined)?.own ?? []).map((o) => o.guid));
+    if (!linked.size) continue;
+    const shown = new Set([...linked].filter((g) => shownToday.has(g)));
+    for (const [a, gs] of [...live.anchors]) {
+      const rest = gs.filter((g) => !linked.has(g));
+      if (rest.length === gs.length) continue;
+      if (rest.length) live.anchors.set(a, rest); else live.anchors.delete(a);
+    }
+    live.anchors.set(k, [...linked]);
+    if (shown.size) seen.ruledOwn++;
+    if (shown.size < linked.size) { seen.ruledOwnFix++; for (let i = shown.size; i < linked.size; i++) ruledKept.push(k); }
+  }
+  return { fold, live, ruledKept };
+}
+
+/** Numbers rounded to the oracle's tolerance (`close`), keys sorted: a value that `close` calls equal prints the same. */
+const canon = (v: unknown): unknown => {
+  if (typeof v === 'number') return Number.isFinite(v) ? Number(v.toPrecision(7)) : String(v);
+  if (Array.isArray(v)) return v.map(canon);
+  if (v && typeof v === 'object') return Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon((v as Bag)[k])]));
+  return v;
+};
+
+/** Today's kept stores for the instance `rootGuid`, as sorted `<row> <leaf>` lines: what the old save writes back. */
+export function keptLeavesOf(rootGuid: string): string[] {
+  const out: string[] = [];
+  const legacy: string[] = [];
+  legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
+  for (const leaf of legacy) out.push(`(legacy) ${leaf}`);
+  for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
+    for (const [key, r] of Object.entries(rows ?? {})) {
+      const leaves: string[] = [];
+      rowLeaves({ [key]: r }, leaves);
+      for (const leaf of leaves) out.push(`${key} ${leaf}`);
+    }
+  }
+  return out.sort();
+}
+
+/** The frozen form of one instance (design § 10.4b): its translated live tree ({@link translatedLive}) and today's kept
+ *  stores, as one stable text. Equal texts mean the same nodes, parents, components and values (to `close`'s tolerance),
+ *  the same placeholders and anchors, and the same kept records. EntityAttributes' `guid` is left out, as `diverge`
+ *  leaves it out: identity is the derive's, and the S4 shadow checks it. */
+export function frozenForm(t: { live: Live; ruledKept: readonly string[] }, rootGuid: string): string {
+  const nodes = [...t.live.nodes.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)).map((n) => {
+    const traits: Bag = {};
+    for (const [name, d] of Object.entries(n.traits)) {
+      if (d === true) { traits[name] = true; continue; }
+      const kept = { ...d };
+      for (const f of IGNORED_FIELDS[name] ?? []) delete kept[f];
+      traits[name] = kept;
+    }
+    return [n.key, n.parent, traits];
+  });
+  const anchors = [...t.live.anchors].map(([k, gs]) => [k, [...gs].sort()]).sort((a, b) => ((a[0] as string) < (b[0] as string) ? -1 : 1));
+  return JSON.stringify(canon({ nodes, anchors, placeholders: [...t.live.placeholders].sort(), kept: keptLeavesOf(rootGuid), ruledKept: [...t.ruledKept].sort() }));
 }

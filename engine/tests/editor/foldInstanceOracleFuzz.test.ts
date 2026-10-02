@@ -14,11 +14,13 @@ import { getTraitByName, setRunMode } from '@modoki/engine/runtime';
 import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { checkInstance, seen } from './foldOracle';
-import { fileForms, FILE_FORMS, type FileForm } from './prefabFuzz/fileForms';
+import { fileForms, entriesAtPlaceholders, FILE_FORMS, type FileForm } from './prefabFuzz/fileForms';
 import { parseInstanceRecord } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { getCachedPrefab } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
-import { writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // The backend's trash route must not reach Finder (#2033): every fuzz delete would go to the real Trash with its sound,
 // and Finder's `.DS_Store` in the scratch tree failed the run as an outside write, which once supplied rule D (below).
@@ -49,17 +51,34 @@ const LEN = VERIFY_LEN;
 const OPTS = { expectedError: () => true, tolerate: () => true };
 
 const report: Record<string, string[]> = {};
+
+/** `foldOracleFrozen.test.ts`'s fixed input for this seed (#2028): the scene the run saved, and every prefab document its
+ *  load can read, as the load read it (the runtime cache's parked write over the disk bytes, #1868). */
+function freezeInputs(seed: number, scene: unknown, files: Map<string, string>): void {
+  const docs = new Map<string, unknown>();
+  for (const [p, text] of files) {
+    if (!p.endsWith('.prefab.json')) continue;
+    const doc = JSON.parse(text) as { id?: string };
+    if (doc.id) docs.set(doc.id, getCachedPrefab(doc.id) ?? doc);
+  }
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'foldOracleFrozen');
+  mkdirSync(dir, { recursive: true });
+  const prefabs = [...docs.keys()].sort().map((k) => docs.get(k));
+  writeFileSync(path.join(dir, `seed-${String(seed).padStart(4, '0')}.json`), `${JSON.stringify({ scene, prefabs })}\n`);
+}
 /** What the SAVED scenes' comparisons reached (#2021). `seen` also counts the fuzzer's per-step P1 inside `runOps`, which
  *  would pin a shape a run reached and then lost before its save. A HELD own link is reached only per step (seeds 1-1500
  *  leave none in a saved scene): `prefabFuzz.test.ts` pins it on #2018's repro. */
 const PLACED = ['ownProjected', 'ownAtPlaceholder', 'ownInPlaceholder', 'unresolvedUnderPlaceholder', 'heldUnderPlaceholder'] as const;
-/** Rule D reached on the copy-less form of a saved scene (#2033), not on a run that stopped early. */
+/** Rule D reached (shown) on the copy-less form of a saved scene (#2033), not on a run that stopped early. */
 let ruledDNoCopies = 0;
+/** Rule B or D TRANSLATED on a loaded scene's comparison: today's side lacked a placeholder the fold has. */
+let translatedOnLoad = 0;
+/** Saved scenes restated in the pre-S5 form and judged (`entriesAtPlaceholders`). */
+let preS5Forms = 0;
 const reached = Object.fromEntries(PLACED.map((k) => [k, 0])) as Record<(typeof PLACED)[number], number>;
 /** #2030: the variant scenes checked per #2025 file form (`prefabFuzz/fileForms.ts`). */
 const forms = Object.fromEntries(FILE_FORMS.map((k) => [k, 0])) as Record<FileForm, number>;
-/** …and the held slot nodes among them `placementDiverge` judged rather than left unjudged (a slot's placeholder is a walk). */
-let slotJudged = 0;
 /** …and the user nodes of a stored entry's legacy `added` under a missing root, judged from the entry as stored (Q3). */
 let entryJudged = 0;
 
@@ -94,35 +113,62 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
       const copies = new Set(Object.keys((scene.embeddedPrefabs ?? {}) as object));
       const ea = getTraitByName('EntityAttributes')!.trait;
       const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
+      // Every node the scene states as an entry of its own — a plain one carries its guid in EntityAttributes. S5's save
+      // writes a node shown AT a placeholder as such an entry, parented to it (#2028), so it is in no record.
+      const ownEntryOf = (sc: { entities?: SceneEntityEntry[] }) => {
+        const own = new Set((sc.entities ?? []).map((e) => e.guid ?? (e.traits as { EntityAttributes?: { guid?: string } } | undefined)?.EntityAttributes?.guid).filter((g): g is string => !!g));
+        return (g: string): boolean => own.has(g);
+      };
+      if (process.env.MODOKI_FOLD_ORACLE_FREEZE === '1') freezeInputs(seed, scene, files);
       const lines: string[] = [];
       const seen0 = { ...seen };
       const opts = { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
+      let ownEntry = ownEntryOf(scene);
       const check = (entry: SceneEntityEntry, prefix = '', withCopies = copies, parse = opts) => {
+        const t0 = seen.ruledB + seen.ruledD;
+        try { checkLoaded(entry, prefix, withCopies, parse); } finally { translatedOnLoad += seen.ruledB + seen.ruledD - t0; }
+      };
+      const checkLoaded = (entry: SceneEntityEntry, prefix: string, withCopies: ReadonlySet<string>, parse: typeof opts) => {
         const root = [...getCurrentWorld().entities].find((e) => (e.get(ea) as { guid?: string } | undefined)?.guid === entry.guid);
         if (!root) { lines.push(`${prefix}${entry.name}: no live root`); return; }
-        for (const d of checkInstance(entry, read, root.id(), parse, withCopies)) lines.push(`${prefix}${entry.name}: ${d}`);
+        for (const d of checkInstance(entry, read, root.id(), parse, withCopies, ownEntry)) lines.push(`${prefix}${entry.name}: ${d}`);
       };
       for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) check(entry);
+      // The same scene as the editor wrote it before S5 (#2028, `entriesAtPlaceholders`): the user's nodes at a rule-B
+      // placeholder back in the instance's record. The variants below are derived from it.
+      const placeholdersOf = (entry: SceneEntityEntry) => [...foldInstance(read, parseInstanceRecord(entry, read, opts).record).placeholders.keys()];
+      const pre = entriesAtPlaceholders(scene as never, read, placeholdersOf) as typeof scene | null;
+      const base = pre ?? scene;
+      if (pre) {
+        const p = scenePath!.replace(/\.json$/, '.preS5.json');
+        be.write(p, JSON.stringify(pre));
+        const got = await loadSceneReporting(p);
+        if (got.outcome !== 'loaded') lines.push(`pre-S5 form: the scene did not load (${got.outcome})`);
+        else {
+          ownEntry = ownEntryOf(pre);
+          for (const entry of pre.entities ?? []) if (entry.prefab && entry.guid) check(entry, 'pre-S5 form: ');
+          preS5Forms++;
+        }
+      }
       for (const k of PLACED) reached[k] += seen[k] - seen0[k];
       // Rule D (a nested reference row whose prefab is missing and the scene holds no copy of) is a file the editor wrote
       // without copies: one saved before v19 (`embeddedPrefabs` arrived then), or open elsewhere while the prefab went.
       // The run's own save writes the copies, so the same scene is judged once more without them (#2033).
-      if (scene.embeddedPrefabs) {
-        const bare = { ...scene, embeddedPrefabs: undefined, embeddedPrefabFrames: undefined };
+      if (base.embeddedPrefabs) {
+        const bare = { ...base, embeddedPrefabs: undefined, embeddedPrefabFrames: undefined };
         const path = scenePath!.replace(/\.json$/, '.nocopies.json');
         be.write(path, JSON.stringify(bare));
         const got = await loadSceneReporting(path);
         if (got.outcome !== 'loaded') lines.push(`no copies: the scene did not load (${got.outcome})`);
         else {
-          const d0 = seen.ruledD;
-          for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) check(entry, 'no copies: ', new Set(), { ...opts, sceneHadCopies: false });
-          ruledDNoCopies += seen.ruledD - d0;
+          const d0 = seen.shownD;
+          for (const entry of base.entities ?? []) if (entry.prefab && entry.guid) check(entry, 'no copies: ', new Set(), { ...opts, sceneHadCopies: false });
+          ruledDNoCopies += seen.shownD - d0;
         }
       }
       // #2030: the same scene with each user node AT a placeholder restated in each of #2025's older file forms, loaded
       // and judged as it is (the rulings place it the same in every form).
-      const variants = fileForms(scene as never, read, (entry) => [...foldInstance(read, parseInstanceRecord(entry, read, opts).record).placeholders.keys()]);
-      const slot0 = seen.heldSlotAdded;
+      const variants = fileForms(base as never, read, placeholdersOf);
       const entry0 = seen.heldEntryAdded;
       for (const [n, v] of variants.entries()) {
         const path = scenePath!.replace(/\.json$/, `.form${n}.json`);
@@ -132,7 +178,6 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
         check(v.scene.entities![v.entry]!, `${v.form}: `);
         forms[v.form]++;
       }
-      slotJudged += seen.heldSlotAdded - slot0;
       entryJudged += seen.heldEntryAdded - entry0;
       report[`seed ${seed}`] = lines;
       expect(lines).toEqual([]);
@@ -142,8 +187,14 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
   it('checked the fuzzer\'s structure (non-vacuity)', () => {
     if (process.env.ORACLE_OUT) writeFileSync(process.env.ORACLE_OUT, JSON.stringify({ seen, forms, report }, null, 1));
     expect(seen.instances).toBeGreaterThan(SEEDS.length);
-    // Both rule translations are reached, so each is exercised rather than merely written (foldOracle.ts).
-    expect(seen.ruledB).toBeGreaterThan(0);
+    // The load runs through realize (#2028), which shows rules B and D itself: the translations of today's side never
+    // fire on a loaded scene — one that did would delete what the live side shows under a placeholder it failed to spawn, and hide
+    // that. `foldOracleFrozen.test.ts` exercises them on the frozen pre-S5 side.
+    // (The fuzzer's per-step P1 inside `runOps` still translates: a trashed prefab's frames stay live until a reload.)
+    expect(translatedOnLoad).toBe(0);
+    // Both rulings are reached, as shown placeholders, so each is judged rather than merely written.
+    expect(seen.shownB).toBeGreaterThan(0);
+    expect(preS5Forms).toBeGreaterThan(0);
     // Rule D on the copy-less forms (#2033): never on a run that stopped early, which the seeds now fail.
     expect(ruledDNoCopies).toBeGreaterThan(0);
     // The defaults arm checked something: a broken schema lookup would otherwise pass, checking nothing.
@@ -151,9 +202,11 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     // #2021: the placement check reached an own link on a projected member, AT and INSIDE a placeholder, and list and
     // held records under one.
     for (const k of PLACED) expect(reached[k], k).toBeGreaterThan(0);
-    // #2030: every one of #2025's file forms was generated from a saved scene and judged.
-    for (const k of FILE_FORMS) expect(forms[k], k).toBeGreaterThan(0);
-    expect(slotJudged).toBeGreaterThan(0);
+    // #2030: #2025's file forms generated from a saved scene and judged. From S5 a nested rule-B placeholder shows from the
+    // first reload, where before the copy's live member stood and took the node: these seeds' S5 runs save a node only at
+    // a ROOT placeholder (measured), so only the root forms are reached here. Every form, the slot ones included, is
+    // judged on the frozen pre-S5 saves (`foldOracleFrozen.test.ts`).
+    for (const k of ['v16RootAdded', 'v17RootOwn', 'legacyRootAdded'] as const) expect(forms[k], k).toBeGreaterThan(0);
     expect(entryJudged).toBeGreaterThan(0);
     // A guid stated twice is left unjudged (#1937), so a regression that states links twice would turn the check off.
     expect(seen.ownDuplicate).toBe(0);

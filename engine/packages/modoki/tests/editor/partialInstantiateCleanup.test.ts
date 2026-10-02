@@ -9,6 +9,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
+import { rowPlaceholderOf } from '../../src/runtime/core/unresolvedPrefabRef';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0 });
@@ -99,7 +100,7 @@ function expectNoOrphans(rootId: number) {
 }
 
 describe('Missing Test 9 — partial instantiate leaves no orphaned subtree', () => {
-  it('uncached GRANDCHILD: middle expands, deepest row skipped, no dangling subtree', async () => {
+  it('uncached GRANDCHILD: middle expands, deepest row is its placeholder, no dangling subtree', async () => {
     // Outer nests Mid (cached) nests Deep (NOT cached). Expansion expands Outer +
     // Mid fully; Deep's row is skipped. Nothing should dangle off the absent Deep.
     const OUTER = 'aaaaaaaa-0000-4000-8000-00000partial1';
@@ -127,19 +128,21 @@ describe('Missing Test 9 — partial instantiate leaves no orphaned subtree', ()
     const root = instantiatePrefab(outer as any);
     expect(root).toBeGreaterThan(0);
 
-    // Outer + Mid expanded; Deep skipped.
+    // Outer + Mid expanded; Deep's row shows its Missing Prefab placeholder (#2001 S5, ruling D: today skipped it).
     expect(findByName('OuterRoot')).toBe(root);
     expect(findByName('MidRoot')).toBeGreaterThan(0);
-    expect(findByName('DeepRoot')).toBe(0);
-    // Exactly the two resolvable roots — no partial Deep fragment spawned.
-    expect(getAllEntitiesImpl()).toHaveLength(2);
+    const deep = findByName('DeepRoot');
+    expect(rowPlaceholderOf(index.get(deep))).toMatchObject({ source: DEEP, reason: 'missing' });
+    expect((index.get(deep).get(EntityAttributes) as any).parentId).toBe(findByName('MidRoot'));
+    // The two resolvable roots and the placeholder — no partial Deep fragment spawned.
+    expect(getAllEntitiesImpl()).toHaveLength(3);
     // Mid hangs under Outer; nothing dangles off the absent Deep.
     const midId = findByName('MidRoot');
     expect((index.get(midId).get(EntityAttributes) as any).parentId).toBe(root);
     expectNoOrphans(root);
   });
 
-  it('reference CYCLE: self-nesting aborts the inner expand, outer stays clean', async () => {
+  it('reference CYCLE: the self-nested row is a damaged placeholder, outer stays clean', async () => {
     // A prefab that nests ITSELF. The inner recursion hits the _stack guard and
     // returns 0; the outer row is skipped (if (!childRoot) continue). The single
     // top-level root spawns; no partial cyclic subtree accumulates.
@@ -157,9 +160,11 @@ describe('Missing Test 9 — partial instantiate leaves no orphaned subtree', ()
 
     const root = instantiatePrefab(self as any);
     expect(root).toBeGreaterThan(0);
-    // Only the top SelfRoot — the self-nested row aborted on the cycle guard.
+    // The top SelfRoot, and the self-nested row as a DAMAGED placeholder (#2001 S5, rule 9 + ruling D, hub 2026-10-02):
+    // today skipped the row silently; the cycle is now shown, and the row round-trips verbatim.
     expect(findByName('SelfRoot')).toBe(root);
-    expect(getAllEntitiesImpl()).toHaveLength(1);
+    expect(rowPlaceholderOf(index.get(findByName('SelfNested')))).toMatchObject({ source: SELF, reason: 'damaged' });
+    expect(getAllEntitiesImpl()).toHaveLength(2);
     expectNoOrphans(root);
   });
 });

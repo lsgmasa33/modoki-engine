@@ -922,7 +922,7 @@ class SceneManagerImpl implements SceneManager {
               nestedOverrides,
               nestedStructure,
               // The load's one reader, the scene's copies included — what its settle reads too (#1934 S1).
-              { read, frame: load?.frame },
+              { read, frame: load?.frame, ...(load?.sceneVersion !== undefined ? { sceneVersion: load.sceneVersion } : {}), ...(rootGuid ? { rootGuid } : {}) },
             );
             // Re-apply the scene-authored stable guid to the instance root. The prefab
             // template clears member guids, so the freshly-spawned root has none; without

@@ -31,7 +31,8 @@ import { writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/enti
 import { fillInstanceStore } from '../../packages/modoki/src/runtime/prefab/instanceLoad';
 import { freshInstanceRecord, storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { instanceDrift } from '../../packages/modoki/src/editor/instance/instanceDrift';
-import { capturedRecordsOf } from '../../packages/modoki/src/editor/instance/instanceSync';
+import { capturedRecordsOf, reseedFromCapture } from '../../packages/modoki/src/editor/instance/instanceSync';
+import { captureEntrySide, rebuildEntrySide } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { inFieldGesture } from '../../packages/modoki/src/editor/undo/fieldGesture';
 import { s4Seams } from './prefabFuzz/s4Seams';
@@ -135,19 +136,58 @@ describe('the load parses every instance into the store (S4 build 1)', () => {
 });
 
 // A plain entity a file parents INTO an instance by its parentId (a file-direct agent write): no owner's parse sees the
-// link, so the load marks the records stale and the door re-seeds them from the capture (hunt seed 1061, open with the
-// hub). Mutation: drop `markParentLinked` in `fillInstanceStore`.
+// link, so the LOADER builds it on the record, at the key of the node the file names (hub ruling 2026-10-02, design § 10.7;
+// #2028, hunt seed 1061). Before S5 the load marked the records stale and the door re-seeded them from the capture.
+// Mutation: make `buildParentLinks` mark the records stale instead (its pre-S5 body) — no fresh record, red.
 describe('a file that parents a plain entity into an instance', () => {
+  const KID = 'ffffffff-0000-4000-8000-000000002099';
   const withKid = (parentId: string): SceneData => {
     const d = scene() as unknown as { entities: unknown[] };
-    d.entities.push({ id: 3, traits: { EntityAttributes: { name: 'Kid', parentId, guid: 'ffffffff-0000-4000-8000-000000002099', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
+    d.entities.push({ id: 3, traits: { EntityAttributes: { name: 'Kid', parentId, guid: KID, sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } });
     return d as unknown as SceneData;
   };
-  it('marks the records stale; one parented to a plain entity leaves them fresh', async () => {
+  it('links it on the root\'s row: the record stays fresh and states what the capture does', async () => {
     await load(withKid(ROOT1));
-    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('sceneParentLink');
+    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
+    expect(ownOf('/')).toEqual([KID]);
+    matchesCapture();
+  });
+  it('links it on a member\'s row, keyed through the live instance', async () => {
+    const b = guidOf(byName('B'))!;
+    await load(withKid(b));
+    expect(ownOf(key(3))).toEqual([KID]);
+    matchesCapture();
+  });
+  it('one parented to a plain entity links nothing', async () => {
     await load(withKid(OTHER));
     expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
+    expect([...rec().list.rows.values()].some((r) => (r.own ?? []).some((o) => o.guid === KID))).toBe(false);
+  });
+});
+
+// `Placement.sourceScene` holds ONLY what the file stated (design § 10.4b, #2008): the load-time stamp that marks a BASE
+// scene's entities (SceneManager's post-pass) never reaches a record, or the writer would persist base-scene provenance
+// into the scene that saves the root. The live stamp is the rebuild's to keep (`rebuildFromEntry` re-stamps).
+describe('a base scene\'s sourceScene stamp (#2028, § 10.4b)', () => {
+  const BASE = 'abababab-0000-4000-8000-000000002028';
+  const stamp = () => {
+    for (const e of getAllEntities()) if (e.guid !== OTHER) writeTraitField(e.id, meta('EntityAttributes'), 'sourceScene', BASE);
+  };
+  const stampOf = (id: number) => (findEntity(id)!.get(meta('EntityAttributes').trait) as { sourceScene?: string }).sourceScene;
+  it('the parsed record, a capture re-seed and a rebuild leave it out of the record; the rebuild keeps it live', () => {
+    stamp();
+    fillInstanceStore(getCurrentWorld(), JSON.parse(JSON.stringify(scene())) as SceneData);
+    expect(rec().placement.sourceScene).toBeUndefined();
+    markStale(getCurrentWorld(), 'test');
+    expect(reseedFromCapture(rootId())).toBe(true);
+    expect(rec().placement.sourceScene).toBeUndefined();
+    const side = captureEntrySide(rootId())!;
+    expect(rebuildEntrySide(side)).toBeGreaterThan(0);
+    expect(stampOf(rootId())).toBe(BASE);
+    expect(stampOf(byName('C'))).toBe(BASE);
+    markStale(getCurrentWorld(), 'test');
+    expect(reseedFromCapture(rootId())).toBe(true);
+    expect(rec().placement.sourceScene).toBeUndefined();
   });
 });
 

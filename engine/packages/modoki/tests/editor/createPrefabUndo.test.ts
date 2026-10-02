@@ -97,7 +97,9 @@ vi.mock('../../src/editor/scene/prefabSerialize', () => ({
     // The real serializer's cycle guard (`planPrefabRows`), reduced to its direct case: serialized FOR the prefab a row
     // nests, it refuses — logged, and null.
     if (existing === 'g-child') { console.error('[Prefab] refusing: it would nest "g-child" inside itself'); return null; }
-    return { id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] };
+    // A plain root with a reference row under it: a root row that is itself a reference is the Prefab Variant form,
+    // which the commit refuses (#2042) and the real serializer never writes.
+    return { id: 'g-new', root: {}, rootLocalId: 1, entities: [{ localId: 1 }, { localId: 2, prefab: 'g-child', traits: { EntityAttributes: { parentId: 1 } } }] };
   },
   // A Replace hands the replaced bytes to the matcher (#1686); what they parse to does not matter to this mocked serialize.
   parsedPrefabRows: () => undefined,

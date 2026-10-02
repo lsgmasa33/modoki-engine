@@ -42,7 +42,7 @@ import { placedAnchor } from '../loaders/memberTranslation';
 import { isMemberToken, memberToken, parseMemberToken } from '../core/templateRefs';
 import { foldStructureLayers, frameKeyIndex, overRowsOf } from '../loaders/prefabOverrides';
 import {
-  HELD_REMAINDER, ROOT_ROW_KEY,
+  DERIVED_NODE_GUID, HELD_REMAINDER, RAW_TEMPLATE_NODE, ROOT_ROW_KEY,
   type AddedNodeRef, type HeldData, type TemplateHeldData, type InstanceRecord, type LegacyChannels, type ParsedInstance, type ParseWarning,
   type Placement, type PrefabDoc, type PrefabDocRow, type PrefabReader, type RecordTraits, type RowKey,
   type SceneOwnedNode, type TargetRecordOf, type TemplateAddedNode, type TemplateOverrideList, type TemplateTargetRecord,
@@ -466,7 +466,8 @@ function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[]
   const index = frameKeyIndex(lower as (AddedEntity & { key?: string })[]);
   const paired = new Set<AddedEntity>();
   const keyOfNode = (n: AddedEntity): string => (typeof (n as { key?: string }).key === 'string' ? (n as { key: string }).key : '');
-  const removeNode = (n: AddedEntity): void => { const k = keyOfNode(n); if (k) ctx.out.removed(`${f.prefix}/${nodeRowComponent(k)}`, true, 'legacy'); };
+  // A replaced keyless node is removed by the name the fold shows it under (`keylessNodeKey`), when it has one.
+  const removeNode = (n: AddedEntity): void => { const k = keyOfNode(n) || keylessNodeKey(n); if (k) ctx.out.removed(`${f.prefix}/${nodeRowComponent(k)}`, true, 'legacy'); };
 
   const visit = (node: AddedEntity, anchorKey: RowKey, candidates: readonly AddedEntity[]): void => {
     const k = keyOfNode(node);
@@ -741,6 +742,61 @@ function placeholderRow<Own>(ctx: Ctx<Own>, key: RowKey): boolean {
  *  `rowTarget` cannot name it, and that is no reason to hold the row (close-out review round 3). */
 const ownAddedKey = <Own>(ctx: Ctx<Own>, key: RowKey): boolean => ctx.form.template && !!nodeRowKey(key.split('/').filter(Boolean)[0] ?? '');
 
+/** The guid of the ONE scene-owned node a row on a template-node key (`…/a+<k>`) reaches, in scene form, when the chain at
+ *  that frame names no node `k` — or undefined. A key on a scene's own node is no writer's (a hand edit or merge into an
+ *  entry's legacy `added`); today's fold listed the scene's nodes with the template's (`frameKeyIndex`), so the row
+ *  applied to it, and a key two nodes carry named neither (#1937 T6). Format rule: the record converts to what today
+ *  shows. */
+function ownKeyedNode<Own>(ctx: Ctx<Own>, key: RowKey): string | undefined {
+  if (ctx.form.template) return undefined;
+  const comps = key.split('/').filter(Boolean);
+  const k = nodeRowKey(comps[comps.length - 1] ?? '');
+  if (!k) return undefined;
+  const chain = chainAt(ctx.top, comps.length > 1 ? `/${comps.slice(0, -1).join('/')}` : '', ctx.read);
+  if ('frame' in chain && frameKeyIndex(chain.lists.added as (AddedEntity & { key?: string })[] | undefined).has(k)) return undefined;
+  const holders = [...ctx.ownContent].filter(([, n]) => (n as { key?: unknown }).key === k);
+  return holders.length === 1 ? holders[0]![0] : undefined;
+}
+
+/** A row whose key runs THROUGH a scene-owned reference node {@link ownKeyedNode} names (`…/a+<k>/<rest>`): the row is
+ *  the node's own, stated from its frame (`rest`), as a scene-added reference node's rows are (`parseReferenceNode`). The
+ *  shape an entry's legacy `added` of keyed template nodes takes in a prefab's own edit world (#1914 R3b F2), which
+ *  today's load read as the entry's root frame. Undefined when the key does not run through one. */
+function ownKeyedReach<Own>(ctx: Ctx<Own>, key: RowKey): { guid: string; rest: string } | undefined {
+  if (ctx.form.template) return undefined;
+  const comps = key.split('/').filter(Boolean);
+  const at = comps.findIndex((c) => !!nodeRowKey(c));
+  if (at < 0 || at === comps.length - 1) return undefined;
+  const guid = ownKeyedNode(ctx, `/${comps.slice(0, at + 1).join('/')}`);
+  if (!guid || typeof (ctx.ownContent.get(guid) as { prefab?: unknown }).prefab !== 'string') return undefined;
+  return { guid, rest: `/${comps.slice(at + 1).join('/')}` };
+}
+
+/** Row `row` stated into the scene-owned reference node `guid`'s own rows at `rest` ({@link ownKeyedReach}): merged
+ *  field by field over any row the node states there. A copy: the file's node object is not written to. */
+function foldRowIntoOwnNode<Own>(ctx: Ctx<Own>, guid: string, rest: string, row: Record<string, unknown>): void {
+  const node = ctx.ownContent.get(guid)! as SceneOwnedNode & { members?: Record<string, unknown> };
+  const members: Record<string, unknown> = { ...(isRecord(node.members) ? node.members : {}) };
+  const was = isRecord(members[rest]) ? members[rest] as Record<string, unknown> : {};
+  const traits = { ...(isRecord(was.traits) ? was.traits : {}) } as Record<string, unknown>;
+  for (const [t, data] of Object.entries(isRecord(row.traits) ? row.traits : {})) traits[t] = isRecord(data) && isRecord(traits[t]) ? { ...traits[t] as object, ...data } : data;
+  members[rest] = { ...was, ...row, ...(Object.keys(traits).length ? { traits } : {}) };
+  const copy = { ...node, members } as SceneOwnedNode;
+  if ((node as unknown as Record<symbol, unknown>)[DERIVED_NODE_GUID]) Object.defineProperty(copy, DERIVED_NODE_GUID, { value: true, enumerable: false });
+  ctx.ownContent.set(guid, copy);
+}
+
+/** A row's trait values folded into the statement of the scene-owned node `guid` ({@link ownKeyedNode}): the node is
+ *  scene content, stated whole, so its values carry no records. A copy: the file's node object is not written to. */
+function foldIntoOwnNode<Own>(ctx: Ctx<Own>, guid: string, traits: Record<string, unknown>): void {
+  const node = ctx.ownContent.get(guid)!;
+  const merged: Record<string, unknown> = { ...(isRecord(node.traits) ? node.traits : {}) };
+  for (const [t, data] of Object.entries(traits)) merged[t] = isRecord(data) && isRecord(merged[t]) ? { ...merged[t] as object, ...data } : data;
+  const copy = { ...node, traits: merged } as SceneOwnedNode;
+  if ((node as unknown as Record<symbol, unknown>)[DERIVED_NODE_GUID]) Object.defineProperty(copy, DERIVED_NODE_GUID, { value: true, enumerable: false });
+  ctx.ownContent.set(guid, copy);
+}
+
 /** v16/v17 member rows (`members`), keyed from frame `prefix`: field records, removals, own nodes and pins carry over;
  *  the two whole-list fields convert as pins against the chain (§ 5.2 rows "row `added`", "member-row `removedTraits`").
  *  `parent` is the legacy move. Applied AFTER the owner's legacy channels: a row wins (§ 10.3). */
@@ -748,11 +804,15 @@ function convertRows<Own>(ctx: Ctx<Own>, prefix: string, rows: Record<string, Sc
   for (const [rawKey, row] of Object.entries(rows ?? {})) {
     if (!isRecord(row) || !rawKey.startsWith('/')) continue;
     const key = canonicalKey(ctx, prefix + rawKey);
+    const into = ownKeyedReach(ctx, key);
+    if (into) { foldRowIntoOwnNode(ctx, into.guid, into.rest, row as Record<string, unknown>); continue; }
     if (pins) {
       if (typeof row.guid === 'string') ctx.out.pin(key, 'guid', row.guid);
       if (typeof row.name === 'string') ctx.out.pin(key, 'name', row.name);
     }
-    if (isRecord(row.traits)) for (const [t, data] of Object.entries(row.traits)) ctx.out.traitData(key, t, data, 'row');
+    const own = isRecord(row.traits) ? ownKeyedNode(ctx, key) : undefined;
+    if (own) foldIntoOwnNode(ctx, own, row.traits as Record<string, unknown>);
+    else if (isRecord(row.traits)) for (const [t, data] of Object.entries(row.traits)) ctx.out.traitData(key, t, data, 'row');
     // The two whole lists convert AGAINST the chain. A target no chain names — in a frame no document gives (missing or
     // damaged), or a gone member — leaves them nothing to convert against: held verbatim, marker kept, as today keeps
     // the row (rule 9; close-out review rounds 2-4: converting it pinned a template copy as a scene-owned node and
@@ -935,7 +995,7 @@ function sceneForm(ownContent: Map<string, SceneOwnedNode>, warnings: ParseWarni
         return { guid };
       }
       if (ownContent.has(guid) && ownContent.get(guid) !== node) warnings.push({ code: 'unparsed', message: `scene-owned node ${guid} is stated twice; the first statement is kept` });
-      else ownContent.set(guid, stated ? node : { ...node, guid });
+      else ownContent.set(guid, stated ? node : Object.defineProperty({ ...node, guid }, DERIVED_NODE_GUID, { value: true, enumerable: false }));
       return { guid };
     },
   };
@@ -976,6 +1036,15 @@ function addedNodeDeriver(
   };
 }
 
+/** The name a KEYLESS template-added node (a legacy document's) is addressed by in its frame: the guid it states, if any.
+ *  Not a template key — the node carries none, and the capture mints one — only what the fold shows it under and a whole
+ *  list above it removes it by (#2028: the old fold dropped such a node, today's load shows it). */
+export function keylessNodeKey(node: { key?: unknown; guid?: unknown }): string {
+  const raw = (node as Record<symbol, unknown>)[RAW_TEMPLATE_NODE] as { guid?: unknown } | undefined;
+  const guid = raw ? raw.guid : node.guid;
+  return !(typeof node.key === 'string' && node.key) && typeof guid === 'string' ? guid : '';
+}
+
 function templateForm(read: PrefabReader, warnings: ParseWarning[]): Form<TemplateAddedNode> {
   const convert = (node: AddedEntity): TemplateAddedNode => {
     const out: TemplateAddedNode = {
@@ -984,6 +1053,7 @@ function templateForm(read: PrefabReader, warnings: ParseWarning[]): Form<Templa
       traits: (isRecord(node.traits) ? node.traits : {}) as RecordTraits,
       children: (node.children ?? []).map(convert),
     };
+    Object.defineProperty(out, RAW_TEMPLATE_NODE, { value: node, enumerable: false });
     if (typeof node.prefab === 'string') {
       out.prefab = node.prefab;
       const nested = parseTemplateOwner(node, node.prefab, read, node.templateMoved, 'templateMoved');
@@ -1222,9 +1292,11 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
   const templateName = (typeof tAttrs?.name === 'string' ? tAttrs.name : undefined) ?? (typeof templateRoot?.name === 'string' ? templateRoot.name : '');
   const rowDefaults = takeRootDefaults(out, held, warnings);
   // Root name (hub ruling 2026-10-02, rule 1 + U10b): the "/" row (v20; a row wins over a legacy channel, § 10.3), else
-  // the root override, else the entry's own name (before v20 only), else the template root's.
+  // the root override, else the entry's own name (before v20 only), else the template root's. A reference NODE's own
+  // `name` is not one: today's load never applies it to an expanded node (only its placeholder shows it), so the name it
+  // shows now is the template root's (#2028).
   rootNamed(rowDefaults);
-  const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? templateName;
+  const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? (entry ? ownName : undefined) ?? templateName;
   // sortOrder: the "/" row, else the override, else the entry's stored order (where v20 writes the placement, § 2.2;
   // #2008 P2 D2), else the template root's (§ 10.4, review L4).
   // From v20 the entry's stored order IS the placement the writer wrote: it outranks a legacy root override still held
@@ -1291,7 +1363,7 @@ function parseTemplateOwner(
   owner: PrefabDocRow | AddedEntity, childGuid: string, read: PrefabReader, moves: Record<string, string> | undefined, movesChannel: string,
 ): { list: TemplateOverrideList; warnings: ParseWarning[] } {
   const warnings: ParseWarning[] = [];
-  const { clean, unparsed } = unparsedOf(owner as SceneEntityEntry, warnings);
+  const { clean, unparsed } = unparsedOf(withTagsAsBags(owner) as SceneEntityEntry, warnings);
   if (movesChannel === 'templateMoved') moves = (clean as unknown as AddedEntity).templateMoved;
   const held: TemplateHeldData = {};
   const list = (): TemplateOverrideList => ({ rows: out.rows as Map<RowKey, TemplateTargetRecord>, ...(Object.keys(held).length ? { held } : {}) });
@@ -1311,6 +1383,30 @@ function parseTemplateOwner(
   templateMoves(ctx, childGuid, clean as OwnerChannels, moves, (path) => [movesChannel, path]);
   if (!pending.empty) held.pendingLegacy = pending.channels as LegacyChannels;
   return { list: list(), warnings };
+}
+
+/** A TEMPLATE owner's tag values spelled `true` as the empty bag every writer produces: today's spawner reads a document's
+ *  rows unsplit and adds the tag for either spelling (#1673's T1), where the shared split takes `true` for malformed (it is,
+ *  in a scene owner, which today keeps it unapplied). A copy; the document is not touched. */
+function withTagsAsBags<T extends object>(owner: T): T {
+  const bags = (by: unknown): unknown => {
+    if (!isRecord(by)) return by;
+    let out: Record<string, unknown> | undefined;
+    for (const [lid, bag] of Object.entries(by)) {
+      if (!isRecord(bag) || !Object.values(bag).includes(true)) continue;
+      (out ??= { ...by })[lid] = Object.fromEntries(Object.entries(bag).map(([t, v]) => [t, v === true ? {} : v]));
+    }
+    return out ?? by;
+  };
+  const o = owner as Record<string, unknown>;
+  const overrides = bags(o.overrides);
+  let nested = o.nestedOverrides;
+  if (isRecord(nested)) {
+    let copy: Record<string, unknown> | undefined;
+    for (const [k, frame] of Object.entries(nested)) { const b = bags(frame); if (b !== frame) (copy ??= { ...nested })[k] = b; }
+    nested = copy ?? nested;
+  }
+  return overrides === o.overrides && nested === o.nestedOverrides ? owner : { ...o, overrides, nestedOverrides: nested } as T;
 }
 
 /** Every reference row of prefab document `doc` (guid `docGuid`) → its nested instance's TEMPLATE list (§ 5.2, the

@@ -1,6 +1,11 @@
 /** #1939: a scene's copy of a missing prefab lists the frames it was LIVE for at the save (`embeddedPrefabFrames`, scene
  *  v19, `frameAddress.ts`), and the copy store is carried across a world swap.
  *
+ *  Owner ruling B (#2001 S5, #2028): no copy expands anything. Every frame of a missing prefab loads as its Missing Prefab
+ *  placeholder, listed or not, keeping every record under it, and the list is written back as the file held it until
+ *  S6 stops writing copies. What item 1 decided (which frames a copy restores) is retired with the expansion; what is
+ *  left is the round trip, the validator's warnings, and the records under the placeholders.
+ *
  *  Item 1 — the list. Before it, "live at the save" was read off the member rows the save happened to write, and the
  *  writer writes none inside a stored root's expansion (`memberRows` exclusion 2), so a frame inside a TEMPLATE reference
  *  node came back unexpanded (F3, T14: 6 Q entities live, 4 reloaded); a scene-added node never read a copy (M-b); and a
@@ -64,16 +69,18 @@ async function trash(f: Fixture, which: 'P' | 'Q'): Promise<void> {
   await settle();
 }
 
+/** The guid of the top-level entry of `prefab` in scene file `sc`. */
+const topRootGuidOf = (sc: SceneFile, prefab: string) => sc.entities.find((e) => e.prefab === prefab && e.guid)!.guid!;
+
 async function reload(f: Fixture): Promise<void> {
   expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
   await settle();
 }
 
 describe('#1939 item 1: a copy restores exactly the frames its scene listed live at the save', () => {
-  it('F3/T14: a Q frame inside a TEMPLATE reference node of O comes back from the copy (6 Q entities live, 6 reloaded)', async () => {
+  it('F3/T14: three Q frames live at the save, one inside a TEMPLATE reference node of O, are listed; each reloads its placeholder; the file round-trips', async () => {
     // O's row N states a keyed reference node PN of P under N's A, so O1 holds three Q frames: P1's C, N's C, and PN's C.
-    // Mutation: in `spawnReferenceNode`, hand the node's expansion no `frame` → PN's C answers by the rows rule, which the
-    // writer never feeds inside a stored root's expansion → `expected 4 to be 6`.
+    // Mutation: in `liveFrameAddresser`, give a frame inside a reference node no address → the list holds 2.
     const f = await startRun(be, noNest, 'lf-template-node');
     const o = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: unknown[] }> };
     o.entities[1]!.added!.push({ parentLocalId: 2, guid: '', key: 'k-pn', name: 'PN', prefab: f.prefabs.P.guid, traits: { EntityAttributes: { name: 'PN', parentId: 0 } }, children: [] });
@@ -89,16 +96,14 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     expect(listed).toHaveLength(3);
     expect(listed.filter((a) => a.includes('/+k-pn/'))).toHaveLength(1);
     await reload(f);
-    expect(countOf(f.prefabs.Q.guid)).toBe(6);
-    expect(unexpandedRows().size).toBe(0);
+    expect(countOf(f.prefabs.Q.guid), 'ruling B: no Q frame expands').toBe(0);
+    expect(unexpandedRows().size, 'each Q row its placeholder').toBe(3);
     const bytes = be.read(f.scenePath)!;
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(be.read(f.scenePath)).toBe(bytes); // I23
   });
 
-  it('C1: a placeholder ENTRY saved beside a live instance of its prefab stays a placeholder; the live one comes back', async () => {
-    // Mutation: in `loadSceneFile`'s prefab loop, ask `copyBacksFrame` with no `entryFrame` (the pre-#1939 rule, always) →
-    // the placeholder entry reloads expanded.
+  it('C1: a placeholder ENTRY saved beside a live instance of its prefab, and the listed one, both reload as placeholders', async () => {
     const f = await startRun(be, noNest, 'lf-c1');
     await trash(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
@@ -111,10 +116,10 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     write(f, sc);
     await reload(f);
     expect(placeholderGuids().has(p2Guid)).toBe(true);
-    expect(placeholderGuids().has(p1Guid)).toBe(false);
+    expect(placeholderGuids().has(p1Guid), 'ruling B: listed live, still a placeholder').toBe(true);
   });
 
-  it('an address that resolves to nothing is ignored, and the validator names an unanchored one; the listed frames still come back', async () => {
+  it('an address that resolves to nothing is ignored, and the validator names an unanchored one; the load completes', async () => {
     // Mutation: drop `embeddedPrefabFrameWarnings` from `validateSceneData` → the anchor warning is not reported.
     const f = await startRun(be, noNest, 'lf-unresolved');
     await trash(f, 'P');
@@ -128,30 +133,16 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
       `embeddedPrefabFrames['${f.prefabs.P.guid}']: the frame '${ghost}' is anchored on no entity of this scene — the loader matches no frame to it`,
     ]);
     await reload(f);
-    expect(placeholderGuids().size).toBe(0);
-    expect(countOf(f.prefabs.P.guid)).toBeGreaterThan(0);
+    expect(placeholderGuids().has(topRootGuidOf(sc, f.prefabs.P.guid)), 'ruling B: P1 its placeholder').toBe(true);
+    expect(countOf(f.prefabs.P.guid)).toBe(0);
   });
 
-  it('a frame with no address answers by the rows rule; a list that is not a list is ignored with a warning, never a throw', async () => {
-    // An entry with no durable guid has no address: with an EMPTY list for P it still expands (the entry's rows rule,
-    // always). Mutation: in `copyBacksFrame`, answer from the list whenever there is one (`live ? live.has(frame ?? '')`) →
-    // the guid-less entry reloads a placeholder.
+  it('a list that is not a list is ignored with a warning, never a throw', async () => {
+    // (A frame with no address answered by the rows rule; ruling B retired that with every expansion from a copy.)
     const f = await startRun(be, noNest, 'lf-unaddressable');
     await trash(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const p1Guid = topRoot(f, 'P').guid!;
-    const sc = file(f);
-    sc.embeddedPrefabFrames![f.prefabs.P.guid] = [];
-    write(f, sc);
-    await reload(f);
-    expect(placeholderGuids().has(p1Guid), 'premise: listed none → a placeholder').toBe(true);
-    const bare = file(f);
-    bare.embeddedPrefabFrames![f.prefabs.P.guid] = [];
-    delete bare.entities.find((e) => e.guid === p1Guid)!.guid;
-    write(f, bare);
-    await reload(f);
-    expect(countOf(f.prefabs.P.guid)).toBeGreaterThan(0);
-    // A malformed list: warned and ignored (that copy answers by the rows rule again), and the load completes.
+    // A malformed list: warned and ignored, and the load completes.
     const bad = file(f);
     (bad.embeddedPrefabFrames as Record<string, unknown>)[f.prefabs.P.guid] = 'not a list';
     write(f, bad);
@@ -162,11 +153,9 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     warn.mockRestore();
   });
 
-  it('the settle asks the same list: a legacy channel into a frame with rows but not listed is kept, not dropped (S1 class)', async () => {
-    // P1's row C (localId 4) expands Q. The file lists O1's Q frame but not P1's, while P1's own rows still state members
-    // under C: the expansion leaves P1's C unexpanded (the list), so the settle must not read the frame as reached (the
-    // rows). Mutation: revert `legacyPathDoc`'s stand-in line to the rows rule → the channel reads as reached, nothing
-    // keeps it, and the save drops P1's `nestedOverrides`.
+  it('a legacy channel into a frame of a missing prefab is kept under its placeholder, not dropped (S1 class)', async () => {
+    // P1's row C (localId 4) expands Q, and P1's own rows still state members under C. Ruling B: C is Q's placeholder, and
+    // every record under it is held verbatim (rule 9), the legacy `nestedOverrides` channel too, so the save keeps it.
     const f = await startRun(be, noNest, 'lf-legacy-reach');
     await trash(f, 'Q');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
@@ -175,13 +164,10 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     const p1 = sc.entities.find((e) => e.guid === p1Guid)! as Record<string, unknown> & { members?: Record<string, unknown> };
     const cRow = Object.keys(p1.members ?? {}).find((k) => k.split('/').length === 2);
     expect(cRow, 'premise: P1 states a row at its C frame').toBeTruthy();
-    const list = sc.embeddedPrefabFrames![f.prefabs.Q.guid]!;
-    sc.embeddedPrefabFrames![f.prefabs.Q.guid] = list.filter((a) => !a.startsWith(`${p1Guid}/`));
-    expect(sc.embeddedPrefabFrames![f.prefabs.Q.guid], 'premise: O1\'s Q frame stays listed').toHaveLength(1);
     p1.nestedOverrides = { 4: { 2: { Transform: { y: 11 } } } };
     write(f, sc);
     await reload(f);
-    expect(unexpandedRows().size, 'premise: P1\'s C frame is unexpanded').toBe(1);
+    expect(unexpandedRows().size, 'premise: P1\'s and O1\'s Q frames are placeholders').toBe(2);
     expect(writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Plain')!.id, TF(), 'x', 2)).toBeFalsy();
     await settle();
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
@@ -204,11 +190,11 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
 });
 
 describe('#1939 item 2: the copy store crosses a world swap', () => {
-  it('a frame of a missing prefab destroyed during Play still expands after Stop (Unity discards Play state)', async () => {
-    // Held twice: by the snapshot taken at Play (its copy and list), and by the edit world's carry (`AuthoredSnapshot.copies`).
-    // Mutation, compound (the carry alone): strip the snapshot's `embeddedPrefabs`/`embeddedPrefabFrames` in
-    // `captureAuthoredSnapshot` → still green; then also restore with no carry, or with one captured from the PLAY world at
-    // Stop → red (O1's Q frame, destroyed in Play, is in neither).
+  it('a frame of a missing prefab destroyed during Play is back after Stop, as its placeholder, and its copy is kept (Unity discards Play state)', async () => {
+    // Stop reloads the edit world's snapshot: a load, so ruling B shows every Q frame as its row's placeholder (#2001 S5,
+    // #2028). The copy is held twice: by the snapshot taken at Play, and by the edit world's carry
+    // (`AuthoredSnapshot.copies`). Mutation, compound: strip the snapshot's `embeddedPrefabs` in `captureAuthoredSnapshot`
+    // and restore with no carry → the save after Stop writes no copy of Q.
     const f = await startRun(be, noNest, 'lf-stop');
     await trash(f, 'Q');
     const live = countOf(f.prefabs.Q.guid);
@@ -220,8 +206,10 @@ describe('#1939 item 2: the copy store crosses a world swap', () => {
     expect(countOf(f.prefabs.Q.guid), 'premise: O1\'s Q frame is gone in Play').toBe(2);
     await stopPlay();
     await settle();
-    expect(countOf(f.prefabs.Q.guid)).toBe(live);
-    expect(unexpandedRows().size).toBe(0);
+    expect(countOf(f.prefabs.Q.guid)).toBe(0);
+    expect(unexpandedRows().size, 'O1\'s Q frame is back, as a placeholder, with P1\'s').toBe(live / 2);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect(Object.keys(file(f).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
 
   it('H1: a kept base keeps its copies across a level switch and back, and its next save still writes them', async () => {
@@ -260,10 +248,12 @@ describe('#1939 item 2: the copy store crosses a world swap', () => {
 
 describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by the rules a reload does', () => {
   it('1031, rule 1: a kept TEMPLATE reference node of a missing prefab survives a no-op rebuild expanded (met by its frame address)', async () => {
-    // O's row N states two keyed reference nodes of Q. Both were live at the save; the list keeps only k-q1's address, so
-    // k-q2 reloads a placeholder, which blocks Q's record (`withFrameRecords`), and the rebuild of O1 KEEPS k-q1 live.
-    // Mutation: key `rebuildFromEntry`'s kept nodes by guid again (`[durableGuid(guid), k]`) → the spawner never meets
-    // k-q1, spawns a placeholder of it, and the kept frame is dropped as unnamed: 2 placeholders, and the tree changes.
+    // O's row N states two keyed reference nodes of Q, both live; Q is trashed mid-session, which keeps them live (#1738),
+    // and the rebuild of O1 KEEPS them. Hunt 1031 reached it by a reload from the copy that left k-q2 a placeholder, which
+    // blocked Q's frame record; ruling B (#2028) makes both placeholders at any load, so only the session reaches it, and
+    // there two carriers meet the frames: Q's frame record (`withFrameRecords`) and the kept nodes by frame address.
+    // Mutation, compound: `withFrameRecords` returns its base reader, AND key `rebuildFromEntry`'s kept nodes by entity
+    // instead of address → 2 placeholders (either alone stays green).
     const f = await startRun(be, noNest, 'lf-kept-template-node');
     const o = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: unknown[] }> };
     for (const key of ['k-q1', 'k-q2']) {
@@ -274,21 +264,14 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     await flushWatcher(be, before);
     await reload(f);
     await trash(f, 'Q');
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const sc = file(f);
-    const list = sc.embeddedPrefabFrames![f.prefabs.Q.guid]!;
-    expect(list.filter((a) => /\/\+k-q[12]$/.test(a)), 'premise: both nodes listed live').toHaveLength(2);
-    sc.embeddedPrefabFrames![f.prefabs.Q.guid] = list.filter((a) => !a.endsWith('/+k-q2'));
-    write(f, sc);
-    await reload(f);
     const qPlaceholders = () => authored().filter((e) => unresolvedRefOf(findEntity(e.id) as never)?.source === f.prefabs.Q.guid).length;
-    expect(qPlaceholders(), 'premise: k-q2 is a placeholder, k-q1 expanded').toBe(1);
+    expect(qPlaceholders(), 'premise: both nodes live').toBe(0);
     const tree = () => Object.fromEntries(Object.entries(worldTree()).sort(([a], [b]) => a.localeCompare(b)));
     const was = tree();
     const oDoc = getCachedPrefabSync(f.prefabs.O.guid)!;
-    refreshInstances(f.prefabs.O.guid, [topRoot(f, 'O').id], oDoc, oDoc);
+    expect(refreshInstances(f.prefabs.O.guid, [topRoot(f, 'O').id], oDoc, oDoc), 'premise: O1 is rebuilt').toBe(1);
     await settle();
-    expect(qPlaceholders()).toBe(1);
+    expect(qPlaceholders()).toBe(0);
     expect(tree()).toEqual(was);
   });
 
@@ -334,7 +317,8 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
   it('3081, rule 2: an undo on a frame of a missing prefab takes an unmarked field from the document the frame was built from', async () => {
     // P1's root is set to x 7 (an override), P's template is then changed outside to x 7 too, and P is trashed: P1 is kept
     // live on its record, which says 7. Undoing the edit drops the mark, so the field is unmarked and must show the
-    // template's value, as it does with P present, and as the save → reload (from the scene's copy) gives.
+    // template's value, as it does with P present. (A reload showed the same from the scene's copy; ruling B, #2028: it
+    // shows P1's placeholder now.)
     // Mutation: `takeUnmarkedFromBase` reads `getCachedPrefabSync(source)` again → P1 keeps the undo's restored 0.
     const f = await startRun(be, noNest, 'lf-unmarked-from-record');
     const p1 = () => topRoot(f, 'P');
@@ -352,9 +336,6 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     expect(getCachedPrefabSync(f.prefabs.P.guid), 'premise: P is out of the cache').toBeNull();
     expect((await undoStep('undo')).did, 'premise: the edit undoes').toBe(true);
     await settle();
-    expect(x()).toBe(7);
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    await reload(f);
     expect(x()).toBe(7);
   });
 });

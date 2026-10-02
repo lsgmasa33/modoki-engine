@@ -25,6 +25,7 @@ import { docRows, placedAnchor } from './memberTranslation';
 export type OverrideMap = Record<number, Record<string, Record<string, unknown>>>;
 
 import { rowAt, referenceRowAt } from '../core/prefabRowAt';
+import { rootReferenceRefusal } from './variantForm';
 import { removalFate } from './overrideFate';
 export { rowAt, referenceRowAt };
 
@@ -560,6 +561,19 @@ export function foldMemberRowChannels<A extends { parentLocalId: number }>(
  *  the save states a removal as "the base has it, the member does not". Set or cleared each time an own row is applied. */
 const unusedRemovals = new WeakMap<object, Pick<MemberRowChannels<unknown>, 'removedTraits' | 'traitRemovals'>>();
 
+/** Record (or clear) `row`'s unused removals as the old fold did ({@link unusedRemovals}): the compatibility adapter's
+ *  (#2001 S5 § 10.1, `instantiatePrefabIntoWorld`), from the new fold, until the old stores go (S8). */
+export function noteUnusedRemovalsOf(row: object, unused: Pick<MemberRowChannels<unknown>, 'removedTraits' | 'traitRemovals'> | undefined): void {
+  if (unused && (unused.removedTraits?.length || Object.keys(unused.traitRemovals ?? {}).length)) unusedRemovals.set(row, unused);
+  else unusedRemovals.delete(row);
+}
+
+/** Mark `row` untargeted ({@link untargetedRows}): the compatibility adapter's, as {@link noteUnusedRemovalsOf}. Only ever
+ *  sets, as the old fold's marking only ever set. */
+export function noteUntargetedRow(row: object): void {
+  untargetedRows.add(row);
+}
+
 /** What {@link unusedRemovals} recorded for the stored row `row`, when its last fold applied it. */
 export function unusedRemovalsOf(row: object): Pick<MemberRowChannels<unknown>, 'removedTraits' | 'traitRemovals'> | undefined {
   return unusedRemovals.get(row);
@@ -1025,11 +1039,26 @@ export function effectivePrefabMemberTraitsAt(
   opts: EffectiveMemberOptions = {},
 ): Record<string, unknown> | null {
   if (!isRecord(prefab) || !Array.isArray(prefab.entities)) return null;
+  // A document on the path in the variant form (a root that is a reference, #2042) is not expanded: the spawner builds
+  // nothing from it (the top) or a Damaged Prefab placeholder that carries none of its traits (a nested row).
+  if (variantOnPath(prefab, path, getPrefab)) return null;
   try {
     const at = asOuterMember(prefab, path, localId, getPrefab);
     return resolveMember(prefab, at.path, at.localId, getPrefab, topFrame(foldDocOf(prefab), opts), opts, new Set<string>(), 0);
   } catch {
     return null; // a shape the fold cannot read; the spawner could not either
+  }
+}
+
+/** Whether `prefab`, or the document any step of `path` names, is in the variant form (`rootReferenceRefusal`). */
+function variantOnPath(prefab: Record<string, unknown>, path: readonly number[], getPrefab: (ref: string) => unknown): boolean {
+  let doc: unknown = prefab;
+  for (let i = 0; ; i++) {
+    if (rootReferenceRefusal(doc)) return true;
+    if (i >= path.length || i >= MAX_NEST_DEPTH || !isRecord(doc) || !Array.isArray(doc.entities)) return false;
+    const row = [...doc.entities].reverse().find((e) => isRecord(e) && ((e.localId as number | undefined) ?? 0) === path[i]) as Record<string, unknown> | undefined;
+    if (!row || typeof row.prefab !== 'string' || !row.prefab) return false;
+    try { doc = getPrefab(row.prefab); } catch { return false; }
   }
 }
 

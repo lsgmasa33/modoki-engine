@@ -10,6 +10,7 @@ import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../.
 import { filterAuthoringVisible } from './authoringScope';
 import { durableGuid, isOwnedRoot, isFrameStep, memberPathSteps, appliedMoves, type MemberPi } from '../../runtime/core/assetRefRules';
 import type { SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
 import { keptMemberOrphans, memberPathIndex } from '../../runtime/loaders/loadSceneFile';
 import { levelDoc } from './prefabBase';
 import { parseMemberToken, memberPathLookup } from '../../runtime/core/templateRefs';
@@ -294,11 +295,27 @@ export function captureInstanceMembers(rootInstanceId: number, prefab?: PrefabFi
   // rather than dropped, so an undone template edit (or a re-import that matches again) restores
   // the scene's identity for that member. A live member always wins the key, so a row that comes
   // back stops being an orphan on the next load without anything here noticing.
-  const rootGuid = durableGuid((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid);
-  for (const [key, row] of Object.entries(rootGuid ? keptMemberOrphans(rootGuid) ?? {} : {})) {
-    if (!out[key]) out[key] = row;
-  }
+  for (const [key, row] of keptOrphansWritten(rootInstanceId, out)) out[key] = withoutLiveNodes(row);
   return out;
+}
+
+/** The kept orphan rows {@link captureInstanceMembers} writes back for `rootInstanceId`: those at a key no live member
+ *  took (`written`). */
+function keptOrphansWritten(rootInstanceId: number, written: Record<string, SceneMemberRow>): [string, SceneMemberRow][] {
+  const eaMeta = getTraitByName('EntityAttributes');
+  const rootGuid = eaMeta ? durableGuid((readTraitData(rootInstanceId, eaMeta) as { guid?: string } | null)?.guid) : '';
+  return Object.entries(rootGuid ? keptMemberOrphans(rootGuid) ?? {} : {}).filter(([key]) => !written[key]);
+}
+
+/** A kept orphan row less each user node it states that is LIVE now (#2028 review F1). The live world's writer states
+ *  such a node where it lives: one shown at a missing nested row's placeholder is the node the user hung AT that row
+ *  (#2018), captured there with its live content; one moved elsewhere is captured where it went. Written by the row as
+ *  well, both copies expanded once the prefab returned — the node twice, one guid. A node not live stays as the file
+ *  held it (a member under a missing frame, which shows nothing). */
+function withoutLiveNodes(row: SceneMemberRow): SceneMemberRow {
+  const live = (n: { guid?: unknown } | undefined) => typeof n?.guid === 'string' && !!n.guid && !!findEntityByGuid(n.guid);
+  const own = row.own?.filter((n) => !live(n)), added = row.added?.filter((n) => !live(n));
+  return { ...row, ...(own ? { own } : {}), ...(added ? { added } : {}) };
 }
 
 /** The world-wide half of {@link instanceRowDomain}, built ONCE per identity resolver: every instance's members,

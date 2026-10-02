@@ -6,7 +6,7 @@
  *  `SceneManager` into the undo layer, past the partial `world` mock of a suite that imports that step, which then
  *  failed to load (`onWorldSwap` missing). */
 
-export type PrefabEditRefusalReason = 'root-removed' | 'root-moved' | 'outside-root' | 'self-nesting' | 'scaffold' | 'under-missing-prefab';
+export type PrefabEditRefusalReason = 'root-removed' | 'root-moved' | 'outside-root' | 'self-nesting' | 'scaffold' | 'under-missing-prefab' | 'missing-prefab-row';
 
 export interface PrefabEditRefusal {
   reason: PrefabEditRefusalReason;

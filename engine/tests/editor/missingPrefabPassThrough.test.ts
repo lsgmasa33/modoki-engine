@@ -528,7 +528,9 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
 
   /** Is the instance's member A live (expanded), rather than the instance a Missing Prefab placeholder? */
   const expanded = () => getAllEntities().some((e) => e.name === 'A');
-  for (const [how, asLoaded, isExpanded] of [['expanded from the copy (#1935)', (s: SceneData) => s, true], ['as a placeholder (no copy)', beforeTopCopies, false]] as const) {
+  // With the copy: the file a #1935 build writes. Owner ruling B (#2001 S5, #2028): the copy no longer expands, so both
+  // files reload as the placeholder, seated by `placementForMissing`; the copy is still written back until S6.
+  for (const [how, asLoaded, isExpanded] of [['with the copy: a placeholder (ruling B)', (s: SceneData) => s, false], ['as a placeholder (no copy)', beforeTopCopies, false]] as const) {
     it(`a root at its template's sortOrder reloads there, and save → reload → save writes the same bytes: ${how}`, async () => {
       // Since F7 (#1914 R6) the order is the root override every scene instance records, not the traits #1895 wrote; before
       // F7, mutation: drop `unresolvedRoots.add` in `serializeScene` — the placeholder reloaded at 0, before Sib, and the
@@ -1272,7 +1274,7 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
 
   it('the predicate agrees with both expansions on every shape (the twin pin)', () => {
     // `expandsToRoot` is a second spelling of the expansion's root rule; this holds the three together. Mutation: make
-    // it answer true for a reference root without reading the child — the "L missing" and "cycle" shapes disagree;
+    // it answer true for a reference root — the three reference shapes disagree;
     // drop either expansion's early return — "no root row" spawns P's A parentless, and its last column goes false.
     const self = 'cccccccc-0000-4000-8000-000000001766';
     const shapes: Array<[string, () => void, { id: string }]> = [
@@ -1301,7 +1303,8 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
     expect(verdicts).toEqual([
       ['plain root', true, true, true, true],
       ['no root row', false, false, false, true],
-      ['reference root, child present', true, true, true, true],
+      // The Prefab Variant form: not expanded since #2001 S5 (owner ruling (b), #2042), by the predicate or either expansion.
+      ['reference root, child present', false, false, false, true],
       ['reference root, child missing', false, false, false, true],
       ['reference root naming itself', false, false, false, true],
     ]);
@@ -2199,10 +2202,11 @@ describe('Create Prefab from an instance ROOT drops the old prefab\'s kept rows 
 describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the explicit choice)', () => {
   // The delete now evicts the editor cache (`applyAssetPathMoves`' delete branch). The live instance is left EXPANDED —
   // #1738's evicted state — and every writer captures it from its frame record, so the save writes what it wrote before
-  // the delete, plus the copy of P (F8 = A1, top level since #1935), and the reload expands the instance from that copy
-  // with its edit, as Unity restores an instance from its scene backup (`MergedAsMissingWithSceneBackup`). Mutation: drop
-  // `evictDeletedEditorPrefabs` from the delete branch — the editor cache still answers for the deleted prefab. Mutation
-  // (#1935): leave top-level frames out of `collectEmbeddedPrefabs` again — no copy, and the reload is a placeholder.
+  // the delete, plus the copy of P (F8 = A1, top level since #1935; written until S6). Owner ruling B (#2001 S5, #2028):
+  // the reload does not expand the copy — the instance is its Missing Prefab placeholder, keeping its edit as a record —
+  // and the next save writes the same bytes. Mutation: drop `evictDeletedEditorPrefabs` from the delete branch — the
+  // editor cache still answers for the deleted prefab. Mutation (#1935): leave top-level frames out of
+  // `collectEmbeddedPrefabs` again — no copy.
   const P_PATH = '/assets/p1805.prefab.json';
   it('the editor cache forgets it, the live instance stays, and the save writes the entry byte for byte', async () => {
     registerAsset(P, P_PATH, 'prefab');
@@ -2217,8 +2221,11 @@ describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the e
     const saved = await save();
     expectSameBytes(entryOf(saved, INST), before);
     expect(Object.keys(saved.embeddedPrefabs ?? {})).toEqual([P]); // the scene's backup of P
-    await load(saved);
-    expect(x(inside(INST, 'A'))).toBe(6); // the reload: expanded from the copy, the edit with it
+    // The editor saves under the id its load read (`ownLoadedEntry`), so the copies the load kept pair with the save's. This
+    // harness keeps no loaded entry and saves under '' — reloaded under a non-guid id, the load keys them '' too. Before S5
+    // the reload expanded the copy, and the live frame carried it whatever the key.
+    await load({ ...saved, id: 's1699' });
+    expect(getAllEntities().some((e) => e.name === 'A'), 'the reload: a placeholder, not expanded (ruling B)').toBe(false);
     const body = (sc: SceneData) => JSON.stringify([sc.entities, sc.embeddedPrefabs]); // this harness mints the scene id per save
     expect(body(await save())).toBe(body(saved)); // I23
     install(pDoc());

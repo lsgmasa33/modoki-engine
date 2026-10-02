@@ -17,6 +17,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
+import { rowPlaceholderOf } from '../../src/runtime/core/unresolvedPrefabRef';
 import { markUIDirty } from '../../src/runtime/ui/uiTreeStore';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -134,14 +135,16 @@ describe('preload contract — instantiatePrefab needs nested children cached fi
     ],
   };
 
-  it('WITHOUT preload: the nested row is silently skipped (children not expanded)', async () => {
+  it('WITHOUT preload: the nested row shows its placeholder (children not expanded)', async () => {
     fileServer.set(INNER, inner);
     const { instantiatePrefab } = await getModule();
     const root = instantiatePrefab(outer as any);
     expect(root).toBeGreaterThan(0);
     expect(countByName('OuterRoot')).toBe(1);
-    // Nested child was never cached → row skipped → no InnerRoot in the world.
-    expect(countByName('InnerRoot')).toBe(0);
+    // Nested child was never cached → the row is its Missing Prefab placeholder (#2001 S5, ruling D: today skipped it),
+    // never the child's expansion.
+    expect(countByName('InnerRoot')).toBe(1);
+    expect(rowPlaceholderOf(index.get(findByName('InnerRoot')))).toMatchObject({ source: INNER, reason: 'missing' });
   });
 
   it('WITH preloadNestedPrefabs: the nested child expands under its outer member', async () => {
