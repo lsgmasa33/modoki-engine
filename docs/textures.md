@@ -177,6 +177,18 @@ an unchanged texture is never re-encoded and a settings change invalidates only
 that texture. `cacheHit()` is true when every variant the format produces
 already exists for the hash.
 
+**A move carries the cache (#2054).** The entry is keyed by content but LOCATED by url path, and every other
+conversion cache (`modoki-models`, `-audio`, `-env`, `-fonts`, `-video`) is laid out the same way. The hash moves
+with the file in its sidecar, so before #2054 a moved or renamed asset looked under its new path, missed, and the
+serve (`staticAssets.ts`, `autoBakeThenServe`) re-encoded bytes it already had. `/api/move-file` now calls
+`moveConversionCaches` (`plugins/asset-fs-ops.ts`), which renames each cache's subtree from the old url path to
+the new one, including an atlas's pages, which are cached BESIDE it at `<atlasUrl>~page<N>`. It is best-effort: a
+cache that fails to move only re-encodes on next use. A move made OUTSIDE the editor (Finder, `git mv`) does not
+reach the route, so its cache still misses once. `conversionCacheDirs` must name every such cache; a guard in
+`tests/plugins/moveCarriesConversionCache.test.ts` derives the list from the `*-cache.ts` modules and fails when
+one is missing. Why the panel no longer re-imports a moved asset at all:
+[editor.md](editor.md) § "Import-on-add, and why a move is not an add".
+
 Derived files are **LOCAL-ONLY and gitignored**. `vite build` regenerates the
 variants into `dist/` and **drops the source PNG**; per-texture settings are
 baked into the dist `assets.manifest.json` so the runtime resolves variant URLs

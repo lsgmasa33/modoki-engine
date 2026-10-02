@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   splitAssetPath, duplicatePathFor, pastePathIn, remapPrefix, buildFolderTree, planAutoImports,
-  effectiveAssetsRoot, collectFolderPaths,
+  autoImportBaseline, diffAutoImportScan, markAutoImported, effectiveAssetsRoot, collectFolderPaths,
   type AssetEntry,
 } from '../../src/editor/utils/assetPaths';
 
@@ -189,6 +189,85 @@ describe('planAutoImports', () => {
 
   it('handles an empty diff', () => {
     expect(planAutoImports([], setOf('/a/x.glb'))).toEqual({ models: [], textures: [] });
+  });
+});
+
+// #2054 — a MOVED asset is not a new one. Mutations, each checked red here:
+// - judge by path only (drop the GUID clause in `diffAutoImportScan`): both move cases, the vacated-path case (its
+//   moved `b.png` reappears as new), and "once a scan has seen an asset…".
+// - judge by GUID only (drop the path clause): "an asset the last scan did not know…".
+// - keep the queued GUIDs in `next` (`keepGuid` → always true): "a model moved while its import is still QUEUED".
+// - leave out every ADDED GUID, not just the queued ones (`queued` → `new Set(added)`): "an added model the plan does not
+//   queue…".
+// - `markAutoImported` returns the baseline unchanged: "…moved AFTER its import finished, in the same batch, is a move".
+describe('diffAutoImportScan (#2054)', () => {
+  const added = (prev: ReturnType<typeof autoImportBaseline>, assets: AssetEntry[]) => diffAutoImportScan(prev, assets).added;
+  const g = (path: string, type: string, guid?: string): AssetEntry => ({ ...typed(path, type), ...(guid ? { guid } : {}) });
+
+  it('a renamed folder`s textures are moves, not adds — nothing to convert', () => {
+    const before = [g('/assets/old/wood.png', 'texture', 'g-wood'), g('/assets/old/metal.png', 'texture', 'g-metal')];
+    const after = [g('/assets/new/wood.png', 'texture', 'g-wood'), g('/assets/new/metal.png', 'texture', 'g-metal')];
+    expect(added(autoImportBaseline(before), after)).toEqual([]);
+  });
+
+  it('a .glb moved WITHOUT its prefab is not imported again (no second prefab minted)', () => {
+    const before = [g('/assets/models/kit/cone.glb', 'model', 'g-cone'), g('/assets/models/kit/cone.prefab.json', 'prefab', 'g-pf')];
+    const after = [g('/assets/models/cone.glb', 'model', 'g-cone'), g('/assets/models/kit/cone.prefab.json', 'prefab', 'g-pf')];
+    const r = diffAutoImportScan(autoImportBaseline(before), after);
+    expect({ models: r.models, textures: r.textures }).toEqual({ models: [], textures: [] });
+  });
+
+  it('an asset the last scan did not know is new, at a new path or one a moved asset vacated', () => {
+    const before = [g('/assets/a.png', 'texture', 'g-a')];
+    const after = [g('/assets/b.png', 'texture', 'g-a'), g('/assets/a.png', 'texture', 'g-fresh'), g('/assets/c.png', 'texture', 'g-c')];
+    // `a.png` is a known PATH, so it is not new even with a fresh GUID (a replaced file is the scanner's business).
+    expect(added(autoImportBaseline(before), after).map((a) => a.path)).toEqual(['/assets/c.png']);
+  });
+
+  it('a copy carries a FRESH GUID, so it is new', () => {
+    const before = [g('/assets/wood.png', 'texture', 'g-wood')];
+    const after = [...before, g('/assets/wood copy.png', 'texture', 'g-copy')];
+    expect(added(autoImportBaseline(before), after).map((a) => a.path)).toEqual(['/assets/wood copy.png']);
+  });
+
+  // The batch, as Assets.tsx runs it: scan 1 queues a.glb and b.glb; a's import FINISHES (marked); then, before b's turn,
+  // both are dragged into kit/. Mid-batch scans bail, so the post-batch scan diffs against scan 1's `next` + the marks.
+  const batch = () => {
+    const r1 = diffAutoImportScan(autoImportBaseline([]), [g('/assets/a.glb', 'model', 'g-a'), g('/assets/b.glb', 'model', 'g-b')]);
+    expect(r1.models.map((m) => m.path)).toEqual(['/assets/a.glb', '/assets/b.glb']);
+    const afterBatch = markAutoImported(r1.next, r1.models[0]);
+    return diffAutoImportScan(afterBatch, [
+      g('/assets/kit/a.glb', 'model', 'g-a'), g('/assets/a.prefab.json', 'prefab', 'g-apf'), g('/assets/kit/b.glb', 'model', 'g-b'),
+    ]);
+  };
+
+  it('a model moved while its import is still QUEUED is new at its new path, so it is imported there', () => {
+    // b's queued import of /assets/b.glb failed (the file had gone), so its GUID was never marked.
+    expect(batch().models.map((m) => m.path)).toContain('/assets/kit/b.glb');
+  });
+
+  it('a model moved AFTER its import finished, in the same batch, is a move — no second prefab', () => {
+    expect(batch().models.map((m) => m.path)).not.toContain('/assets/kit/a.glb');
+  });
+
+  it('an added model the plan does not queue (its prefab came with it) is known at once, so a move of it is a move', () => {
+    const r1 = diffAutoImportScan(autoImportBaseline([]), [g('/assets/a.glb', 'model', 'g-a'), g('/assets/a.prefab.json', 'prefab', 'g-apf')]);
+    expect(r1.models).toEqual([]);
+    const r2 = diffAutoImportScan(r1.next, [g('/assets/kit/a.glb', 'model', 'g-a'), g('/assets/a.prefab.json', 'prefab', 'g-apf')]);
+    expect(r2.models).toEqual([]);
+  });
+
+  it('once a scan has seen an asset where it sits, a later move of it is a move', () => {
+    const r1 = diffAutoImportScan(autoImportBaseline([]), [g('/assets/b.glb', 'model', 'g-b')]);
+    const r2 = diffAutoImportScan(r1.next, [g('/assets/b.glb', 'model', 'g-b')]);
+    expect(r2.added).toEqual([]);
+    expect(added(r2.next, [g('/assets/kit/b.glb', 'model', 'g-b')])).toEqual([]);
+  });
+
+  it('an entry with no GUID falls back to the path test', () => {
+    const before = [g('/assets/x.png', 'texture')];
+    const after = [g('/assets/x.png', 'texture'), g('/assets/y.png', 'texture')];
+    expect(added(autoImportBaseline(before), after).map((a) => a.path)).toEqual(['/assets/y.png']);
   });
 });
 

@@ -54,7 +54,7 @@ import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, 
 import { readFontAxes } from '../font-instance';
 // A leaf: the watcher's guard module imports nothing from the Vite plugin, so this router stays host-agnostic.
 import { EDITOR_DELETE_FINGERPRINT, fingerprintBytes, fingerprintFile } from '../editorWriteGuard';
-import { createFolderAt, moveAssetFile, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, removeOrphanSidecars, SIDECAR_SUFFIXES } from '../asset-fs-ops';
+import { createFolderAt, moveAssetFile, moveConversionCaches, duplicateAssetFile, importedAssetBytes, importDecidesIdentity, moveToTrash, remintSceneEntityGuids, removeOrphanSidecars, SIDECAR_SUFFIXES } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
@@ -5645,6 +5645,10 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!isDir) removeOrphanSidecarsBefore(absTo);
       moveAssetFile(absFrom, absTo);
       sidecarsAheadArrived(absTo);
+      const canonTo = ctx.absToAssetUrl(absTo, { onDisk: true });
+      // #2054: the converted bytes (KTX2/WebP/GLB/…) are cached under the url path, so they move too — else the
+      // next serve at the new path misses and re-encodes bytes it already had. Best-effort; never throws.
+      if (canonFrom && canonTo) moveConversionCaches(ctx.projectRoot, canonFrom, canonTo, isDir);
       // Before the renderer repair, not after: the manifest is what `modoki_list_assets` reads to
       // verify this move, and the watcher would otherwise catch up on its own 150ms debounce.
       const manifestRebuilt = rebuildManifestInline(ctx);
@@ -5664,7 +5668,6 @@ async function describeUnresolvedAgainstLiveWorld(
       // already warned that both sides must originate from the same string "if that ever stops
       // being true this needs a shared canonicalizer" — `absToAssetUrl` is it. (`canonFrom` is taken
       // above, before the move; `canonTo` after it, once the destination is on disk to spell it.)
-      const canonTo = ctx.absToAssetUrl(absTo, { onDisk: true });
       // ⚠️ No `?? from` fallback. Falling back to the raw string ships exactly the defect the
       // canonicalization fixes — a path the renderer cannot match — just one size smaller, and
       // reports it as a successful repair. `absToAssetUrl` returns null for a path

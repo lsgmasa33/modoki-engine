@@ -25,6 +25,12 @@ import { findDeleteBoundaries } from '../scripts/deleteBoundary.mjs';
 import { classifyJsonAssetPath, ID_BEARING_TYPES } from './assetTypes';
 import { parseJsonText, readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 import { assertSceneFormatReadable, unparsableSceneError } from '../packages/modoki/src/runtime/loaders/sceneFormatGate';
+import { getCacheDir as getTextureCacheDir } from './texture-cache';
+import { getModelCacheDir } from './model-cache';
+import { getAudioCacheDir } from './audio-cache';
+import { getEnvCacheDir } from './env-cache';
+import { getFontCacheDir } from './font-cache';
+import { getVideoCacheDir } from './video-cache';
 
 /** The sidecars an asset carries, as SUFFIXES. Spelled once: `moveAssetFile` renames them and
  *  `moveToTrash`'s refusal predicate must hold them back, and a second hand-kept copy of the list
@@ -71,6 +77,71 @@ export function moveAssetFile(absFrom: string, absTo: string): void {
     for (const [from, to] of moved.reverse()) { try { fs.renameSync(to, from); } catch { /* keep the original error */ } }
     throw e;
   }
+}
+
+/** Every conversion cache whose entries are stored UNDER the source's url path
+ *  (`<cacheDir>/<url>/<hash>/…`). Content-addressed by hash, but located by path. */
+export function conversionCacheDirs(projectRoot: string): string[] {
+  return [
+    getTextureCacheDir(projectRoot), getModelCacheDir(projectRoot), getAudioCacheDir(projectRoot),
+    getEnvCacheDir(projectRoot), getFontCacheDir(projectRoot), getVideoCacheDir(projectRoot),
+  ];
+}
+
+/** Carry a moved asset's conversion-cache entries from its old url path to its new one (#2054).
+ *
+ *  Each cache keys its entry on a content hash (source bytes + settings + encoder), but STORES it under
+ *  the source's url path, and the hash travels with the file in its sidecar. So a move left the cached
+ *  KTX2/WebP/GLB under the old path, the lookup at the new path missed, and the serve path re-encoded
+ *  bytes it already had. Moving the subtree makes the move cost nothing, as it did not cost the GUID.
+ *
+ *  A file move also carries `<name>~page<N>` siblings: an atlas caches each page at `<atlasUrl>~page<N>`
+ *  (`atlasPageUrlPath`), beside its own entry rather than under it.
+ *
+ *  An entry already at the destination belongs to a dead asset: the route refuses a move onto an
+ *  existing file, so whatever is cached there was left by a file that no longer exists. It is replaced.
+ *  A case-only rename resolves to the same directory on macOS/Windows and is renamed in place.
+ *
+ *  BEST-EFFORT, and it never throws: a cache that fails to move only means the next serve re-encodes,
+ *  which is what every move did before. Returns the destination directories it moved. */
+export function moveConversionCaches(projectRoot: string, fromUrl: string, toUrl: string, isDir: boolean): string[] {
+  const fromRel = fromUrl.replace(/^\/+/, '');
+  const toRel = toUrl.replace(/^\/+/, '');
+  if (!fromRel || !toRel || fromRel === toRel) return [];
+  const moved: string[] = [];
+  for (const cacheDir of conversionCacheDirs(projectRoot)) {
+    const pairs: Array<[string, string]> = [[path.join(cacheDir, fromRel), path.join(cacheDir, toRel)]];
+    if (!isDir) {
+      const fromParent = path.dirname(pairs[0][0]);
+      const prefix = path.basename(pairs[0][0]) + '~';
+      let siblings: string[] = [];
+      // Only the atlas page form: a bare prefix match would take a live `a.png~1.png`'s entry along with `a.png`'s.
+      try { siblings = fs.readdirSync(fromParent).filter((n) => n.startsWith(prefix) && /^~page\d+$/.test(n.slice(prefix.length - 1))); } catch { /* no cache here */ }
+      for (const n of siblings) {
+        pairs.push([path.join(fromParent, n), path.join(path.dirname(pairs[0][1]), path.basename(pairs[0][1]) + n.slice(prefix.length - 1))]);
+      }
+    }
+    for (const [src, dst] of pairs) {
+      try {
+        if (!fs.existsSync(src)) continue;
+        if (fs.existsSync(dst) && !sameEntry(src, dst)) fs.rmSync(dst, { recursive: true, force: true });
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.renameSync(src, dst);
+        moved.push(dst);
+      } catch (e) {
+        console.warn(`[asset-fs-ops] could not move the conversion cache ${src} → ${dst}; it will re-encode on next use:`, e);
+      }
+    }
+  }
+  return moved;
+}
+
+/** Same filesystem entry: a case-only rename's destination on a case-folding disk. */
+function sameEntry(a: string, b: string): boolean {
+  try {
+    const sa = fs.statSync(a), sb = fs.statSync(b);
+    return sa.ino === sb.ino && sa.dev === sb.dev;
+  } catch { return false; }
 }
 
 /** **A sidecar's identity belongs to exactly one live file.** This is the CREATE half (#1975). The COPY half is

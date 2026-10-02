@@ -82,18 +82,65 @@ export function splitAssetPath(p: string): { dir: string; base: string; ext: str
   return { dir, base: filename.substring(0, dot), ext: filename.substring(dot) };
 }
 
+/** What the auto-import diff remembers of the previous scan: the paths it saw, and the GUIDs. */
+export interface AutoImportBaseline {
+  paths: ReadonlySet<string>;
+  guids: ReadonlySet<string>;
+}
+
+/** `keepGuid` decides which entries' GUIDs the baseline remembers; every path is kept. */
+export function autoImportBaseline(
+  assets: ReadonlyArray<AssetEntry>,
+  keepGuid: (a: AssetEntry) => boolean = () => true,
+): AutoImportBaseline {
+  const paths = new Set<string>();
+  const guids = new Set<string>();
+  for (const a of assets) {
+    paths.add(a.path);
+    if (a.guid && keepGuid(a)) guids.add(a.guid);
+  }
+  return { paths, guids };
+}
+
+/** Diff one scan against the last and plan its imports (#2054): which entries are NEW ASSETS, not merely new paths,
+ *  what of them to import, and the baseline to keep for the next diff. A path whose GUID the previous scan held
+ *  elsewhere is a MOVE; an entry with no GUID falls back to the path test. Why identity and not path, and what still
+ *  counts as new: [editor.md](../../../../../../docs/editor.md) § "Import-on-add, and why a move is not an add".
+ *
+ *  `next` remembers every GUID EXCEPT those of the entries this plan queues. A queued import is not done yet: moved
+ *  before its turn (Finder, an agent), its import of the old path fails, and only an unknown GUID lets the new path
+ *  read as new. The batch hands each GUID back with `markAutoImported` once its import FINISHES, so an asset moved
+ *  after its import is a move again. An added entry the plan does not queue (an import output, a model whose prefab
+ *  came with it) is known at once. */
+export function diffAutoImportScan(
+  prev: AutoImportBaseline,
+  assets: ReadonlyArray<AssetEntry>,
+): { added: AssetEntry[]; models: AssetEntry[]; textures: AssetEntry[]; next: AutoImportBaseline } {
+  const added = assets.filter((a) => !prev.paths.has(a.path) && !(a.guid && prev.guids.has(a.guid)));
+  const paths = new Set(assets.map((a) => a.path));
+  const { models, textures } = planAutoImports(added, paths);
+  const queued = new Set<AssetEntry>([...models, ...textures]);
+  return { added, models, textures, next: autoImportBaseline(assets, (a) => !queued.has(a)) };
+}
+
+/** The baseline once `entry`'s import has finished: its GUID is known, so a later move of it is a move. */
+export function markAutoImported(baseline: AutoImportBaseline, entry: AssetEntry): AutoImportBaseline {
+  if (!entry.guid || baseline.guids.has(entry.guid)) return baseline;
+  return { paths: baseline.paths, guids: new Set([...baseline.guids, entry.guid]) };
+}
+
 /** Plan which freshly-discovered assets to auto-import with default config
  *  (Unity-style import-on-add). PURE so the policy is unit-tested without IO.
  *
- *  `added` = the entries that just appeared on disk (the diff vs the previous
- *  scan). `allPaths` = the full current path set, used to spot existing import
+ *  `added` = the NEW ASSETS of this scan (`diffAutoImportScan` — a moved one is not
+ *  new). `allPaths` = the full current path set, used to spot existing import
  *  OUTPUTS so a model isn't re-imported.
  *
  *   - MODEL → import (creates a prefab; FBX/OBJ/DAE bake to GLB first), UNLESS a
  *     sibling `<name>.prefab.json` already exists — that's the import output, so
  *     the model has already been imported.
- *   - TEXTURE → import (convert with default config). No sibling marker, but only
- *     genuinely-new entries are ever passed, so each converts exactly once.
+ *   - TEXTURE → import (convert with default config). No sibling marker: each
+ *     converts once because a moved texture is not in `added`.
  *
  *  Everything else (prefab / mesh / material / scene / sidecars / …) is an import
  *  OUTPUT, not a source — ignored, so import results never re-trigger imports. The

@@ -55,9 +55,9 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { startDragGhost, endDragGhost, setAssetDragPayload, completeAssetDrop, armGrabCursor } from '../utils/dragGhost';
 import {
-  splitAssetPath, duplicatePathFor, pastePathIn, buildFolderTree, planAutoImports,
+  splitAssetPath, duplicatePathFor, pastePathIn, buildFolderTree, autoImportBaseline, diffAutoImportScan, markAutoImported,
   effectiveAssetsRoot, collectFolderPaths, planFilesDropMoves, isFolderPath,
-  type AssetEntry, type FolderNode, type RelocateMove,
+  type AssetEntry, type AutoImportBaseline, type FolderNode, type RelocateMove,
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
 import {
@@ -165,7 +165,10 @@ function firstFromEntries(assets: AssetEntry[]): string | null {
 
 /** Import a model using its .meta.json settings — creates prefab file without instantiating in scene.
  *  Shows modal progress via editor store. */
-async function importModelWithMeta(assetPath: string, assetName: string, onDone?: () => void) {
+/** Resolves false when the import was refused, aborted or failed (each says so itself), true otherwise: the source
+ *  baked to a GLB, or the model imported and its prefab, if it produced one, written. Import-on-add reads it to know
+ *  the asset is imported (#2054). */
+async function importModelWithMeta(assetPath: string, assetName: string, onDone?: () => void): Promise<boolean> {
   const { setImportStatus, setImportError, refreshAssets } = useEditorStore.getState();
   setImportStatus(true, `Importing ${assetName}...`);
   try {
@@ -185,7 +188,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
       refreshAssets(); // surface the newly-baked GLB in the panel
       onDone?.();
       setImportStatus(false);
-      return;
+      return true;
     }
 
     const dir = assetPath.substring(0, assetPath.lastIndexOf('/'));
@@ -202,7 +205,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     const existing = await classifyExistingPrefabId(prefabPath);
     if (existing.kind === 'refuse') {
       setImportError(`Import of "${assetName}" was aborted — ${existing.reason}`);
-      return;
+      return false;
     }
     // A RE-import replaces the prefab already there, so its undo must put those bytes back rather than trash the file
     // (#1264's shape, found by #1679's sweep). Read now, before anything is written, and decided by the FILE, not the
@@ -213,7 +216,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // blind. Refused before anything is spawned or written.
     if (previousContent === null) {
       setImportError(`Import of "${assetName}" was aborted — ${prefabPath} is there but could not be read, so it was not overwritten.`);
-      return;
+      return false;
     }
 
     // Temporarily spawn entities to serialize as prefab, then clean up
@@ -235,7 +238,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     // and which would now send a user to check disk permissions for a dev-server blip.
     if (!rootId) {
       setImportError(`Import of "${assetName}" was aborted — nothing was written. See the notification and console for the reason.`);
-      return;
+      return false;
     }
 
     // ⚠️ KEEP the existing prefab's stable id (#1468). This call used to be `serializePrefab(rootId)`
@@ -280,6 +283,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     onDone?.();
     // Not over a failed prefab write: `setImportStatus` clears the modal's failed state, which is what shows it.
     if (!prefabFailed) setImportStatus(false);
+    return !prefabFailed;
   } catch (e) {
     // Surface conversion/import failures (e.g. unsupported FBX) as a dismissible
     // modal instead of an unhandled rejection — this runs from a fire-and-forget
@@ -287,6 +291,7 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`[Assets] Import failed for "${assetName}":`, e);
     setImportError(msg);
+    return false;
   }
 }
 
@@ -653,10 +658,10 @@ export default function Assets() {
   // OS import: hidden file <input> + the folder a picker/drop targets.
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importTargetRef = useRef<string>('/');
-  // Auto-import-on-discovery: the last seen asset-path set (null until the first
+  // Auto-import-on-discovery: the last scan's paths + GUIDs (null until the first
   // scan, which is baseline-only — never bulk-import an existing project on open),
   // and a flag serializing import batches (importModel mutates the live world).
-  const seenAssetPathsRef = useRef<Set<string> | null>(null);
+  const seenAssetsRef = useRef<AutoImportBaseline | null>(null);
   const autoImportingRef = useRef(false);
 
   // "Current folder" — the last folder the user interacted with (clicked a
@@ -718,9 +723,16 @@ export default function Assets() {
   // under the asset roots and can take a while, so guard it behind a dialog.
   const [confirmReimportAll, setConfirmReimportAll] = useState(false);
 
+  // Scans resolve in any order, and a refresh is issued from many places at once (an import's own refresh, the
+  // batch's, a watcher bump). Only the LATEST one applies: an older scan landing after a newer one shows a disk
+  // that is already gone, and import-on-add would diff it (#2054 review: a model moved mid-batch read as a move of
+  // an asset the stale scan had just made known, and was never imported).
+  const refreshSeqRef = useRef(0);
   const refresh = useCallback(() => {
     setLoading(true);
+    const seq = ++refreshSeqRef.current;
     fetchAssets().then(({ assets: aRaw, folders }) => {
+      if (seq !== refreshSeqRef.current) return; // superseded — the newer scan applies, and clears `loading`
       // Fonts must load from the FULL scan (engine fonts live under /modoki/assets).
       loadAllFonts(aRaw);
       // Engine built-ins (/modoki/assets: fonts, favicon, icons, white.hdr, …) are
@@ -735,7 +747,7 @@ export default function Assets() {
       // authoritative "scan done" point) rather than in the effect, where the
       // initial empty `assets` would otherwise baseline as empty and make the
       // first real scan look like every asset was just added (bulk import on open).
-      if (seenAssetPathsRef.current === null) seenAssetPathsRef.current = new Set(a.map((x) => x.path));
+      if (seenAssetsRef.current === null) seenAssetsRef.current = autoImportBaseline(a);
       setAssets(a);
       setDiskFolders(folders);
       // Reconcile the optimistic pendingFolders set against disk reality: drop any entry
@@ -873,6 +885,9 @@ export default function Assets() {
         channel,
       );
       if (!summary.errors.length) console.log('[Assets] Re-import:', summary);
+      // `attempted`: a target the scan no longer lists resolves to no work and an empty error list, which is not a
+      // success. (A texture moved mid-batch is still listed here and fails at the server, which errors.)
+      return { ...summary, attempted: targets.length };
     } finally {
       setImportStatus(false);
       refresh();
@@ -885,20 +900,20 @@ export default function Assets() {
   // current scan against the last seen set so ONLY assets that just appeared are
   // imported — never a bulk import of an existing project on open (the first scan
   // is baseline-only), never a re-import (a model is skipped once its sibling
-  // prefab exists; a texture is seen-once). Import OUTPUTS (prefab/mesh/mat/
+  // prefab exists; a texture is seen-once), and never a MOVED asset: a path whose
+  // GUID the last scan knew elsewhere is a move, not an add (#2054). Import OUTPUTS (prefab/mesh/mat/
   // converted texture) that appear on the next scan aren't model/texture SOURCES,
   // so planAutoImports ignores them — no loop. The baseline is only advanced when
   // not mid-batch, so a rapid second drop during an import isn't dropped silently.
   useEffect(() => {
-    const prev = seenAssetPathsRef.current;
+    const prev = seenAssetsRef.current;
     if (prev === null) return; // first scan not done yet — refresh() sets the baseline
     if (autoImportingRef.current) return; // a batch is running; re-diff after it finishes (don't advance the baseline, so nothing dropped during it is missed)
-    const current = new Set(assets.map((a) => a.path));
-    const added = assets.filter((a) => !prev.has(a.path));
-    seenAssetPathsRef.current = current;
-    if (added.length === 0) return;
-    const { models, textures } = planAutoImports(added, current);
+    const { models, textures, next } = diffAutoImportScan(prev, assets);
+    seenAssetsRef.current = next;
     if (models.length === 0 && textures.length === 0) return;
+    // A finished import makes its GUID known, so a move of it during the rest of the batch is a move (#2054).
+    const imported = (a: AssetEntry) => { if (seenAssetsRef.current) seenAssetsRef.current = markAutoImported(seenAssetsRef.current, a); };
     autoImportingRef.current = true;
     void (async () => {
       try {
@@ -908,9 +923,12 @@ export default function Assets() {
         // when done; the resulting prefab/mesh/mat are not model/texture SOURCES,
         // and a model with a sibling prefab is skipped — so the chain converges and
         // never re-imports.
-        for (const m of models) await importModelWithMeta(m.path, m.name, refresh);
+        for (const m of models) if (await importModelWithMeta(m.path, m.name, refresh)) imported(m);
         // Import-on-add is background work — nobody clicked for these (#1824, ruling FA): a failure is the console's.
-        for (const t of textures) await reimport(t.path, false, 'background');
+        for (const t of textures) {
+          const r = await reimport(t.path, false, 'background');
+          if (r.attempted > 0 && r.errors.length === 0) imported(t);
+        }
       } catch (e) {
         console.error('[Assets] auto-import failed:', e);
       } finally {

@@ -3991,6 +3991,38 @@ its id, #1468) with no way back from the editor either.
 **What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
 in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
 
+### Import-on-add, and why a move is not an add (#2054)
+
+The Assets panel imports what newly lands on disk with default settings, Unity's import-on-add: a model becomes a
+prefab (`importModelWithMeta`), a texture is converted (`reimport(…, 'background')`). The first scan after the
+panel mounts is a baseline only, so opening a project never bulk-imports it. Each later scan is diffed against the
+previous one (`Assets.tsx`, the effect beside `seenAssetsRef`), and `planAutoImports`
+(`editor/utils/assetPaths.ts`) picks the model and texture SOURCES out of what is new. A model with a sibling
+`<name>.prefab.json` counts as imported already, and import outputs (prefab, mesh, material) are never sources, so
+the FBX → GLB → prefab chain converges without a loop.
+
+**"New" is decided by IDENTITY, not by path** (`diffAutoImportScan`). An entry is new only if the previous scan held
+neither its path nor its GUID. A move or rename (the panel's Rename, a drag, `modoki_move_asset`, or a Finder move
+that carried the sidecar) keeps the GUID, so it is a move.
+- **Why.** The diff used to be by path alone, so a moved asset read as added. A folder rename re-converted every
+  texture in it. A `.glb` moved WITHOUT its prefab failed the sibling test at its new path and was imported again:
+  a second prefab with a new GUID, a duplicate material set beside it, and the model's sidecar `generated` list
+  rewritten to claim the duplicates (observed on `games/3d-test`, 2026-10-03). Nothing dangled, since refs are
+  GUIDs, but the project gained assets nobody asked for.
+- **What is still new.** A file that arrives without its `.meta.json` is minted a fresh GUID by the scan, and an
+  editor duplicate or a Finder copy has its copy re-minted (`copiedSidecarIdentity`). Those import, as they should.
+  An entry with no GUID at all falls back to the path test.
+- **A queued import is not yet known; a finished one is.** The baseline keeps every GUID except those the plan just
+  QUEUED, and the batch hands each one back (`markAutoImported`) when its import finishes: `importModelWithMeta`
+  resolves true once the prefab is written (or the source baked), and a texture counts once its reimport ran
+  without errors. A model moved by Finder or an agent while it waited its turn fails at its old path and is
+  imported at its new one. A model moved after its import finished, still inside the batch, is a move, because
+  mid-batch scans bail and the post-batch diff reads the marks. An added entry the plan does not queue (its prefab
+  arrived with it) is known at once. Leaving out every ADDED GUID instead, the first shape of this fix, re-opened
+  the duplicate prefab for both of those (#2054 close-out review).
+- **The conversion cache moves too.** Skipping the import was only half of the texture cost: the cache was
+  located by path, so the serve re-encoded anyway. See [textures.md](textures.md) § "Local-only cache".
+
 ### An undo/redo that discards a failed filesystem op — the whole class (#308)
 
 ⚠️ **This class was never confined to asset delete.** The helpers are the trap: `writeAssetFile`,

@@ -18,7 +18,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 
-import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { handleBackendRequest, toFsUrl, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { relEscapes } from '../../plugins/backend/projectPaths';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -104,6 +104,8 @@ describe('item 4: a failed atomic write leaves no .tmp behind', () => {
   });
 });
 
+// The /@fs urls go through `toFsUrl`, never `'/@fs' + abs` — that is `/@fsC:/…` on Windows, which the route does not
+// read as a /@fs path at all, so the accept test went red there (public CI) and the refuse test passed for the wrong reason.
 describe('item 6: only a `..` SEGMENT escapes', () => {
   it('relEscapes', () => {
     expect(relEscapes('..')).toBe(true);
@@ -116,14 +118,14 @@ describe('item 6: only a `..` SEGMENT escapes', () => {
 
   it('/api/write-file accepts a /@fs path inside a `..art` folder (it was refused as an escape)', async () => {
     const abs = path.join(projectRoot, '..art', 'x.json');
-    const r = await call('POST', '/api/write-file', { path: `/@fs${abs.split(path.sep).join('/')}`, content: '{}' });
+    const r = await call('POST', '/api/write-file', { path: toFsUrl(abs), content: '{}' });
     expect(r.status ?? 200).toBe(200);
     expect(fs.existsSync(abs)).toBe(true);
   });
 
   it('…and still refuses a real escape', async () => {
     const abs = path.join(path.dirname(projectRoot), 'outside.json');
-    const r = await call('POST', '/api/write-file', { path: `/@fs${abs.split(path.sep).join('/')}`, content: '{}' });
+    const r = await call('POST', '/api/write-file', { path: toFsUrl(abs), content: '{}' });
     expect(r.status).toBeGreaterThanOrEqual(400);
     expect(fs.existsSync(abs)).toBe(false);
   });
