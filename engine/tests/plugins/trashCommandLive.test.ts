@@ -156,6 +156,22 @@ describe.skipIf(!onWin)('moveToTrash on real Windows', () => {
     expect(fs.existsSync(survivor)).toBe(false);
   });
 
+  it('never splits a group: a sidecar whose file was refused stays with it (#1977)', () => {
+    // win32 recycles per path, so a locked file kept its place while its `.meta.json` went to the bin, and the route's
+    // rebuild minted the file a fresh GUID. A missing file is the refusal this file can produce without a lock; the
+    // script cannot tell the two apart. Listed sidecar-first on purpose: `trashGroups` must put the file before it.
+    const { root, files } = fixture();
+    const refused = path.join(root, 'never-existed.png');
+    const itsSidecar = `${refused}.meta.json`;
+    fs.writeFileSync(itsSidecar, '{"id":"g"}');
+    const unrelated = files[0];
+    const result = moveToTrash([itsSidecar, refused, unrelated]);
+    expect(result.failed.sort()).toEqual([itsSidecar, refused].sort());
+    expect(fs.existsSync(itsSidecar)).toBe(true);
+    // ACCEPT SIDE, in the same run: a path outside the group still went.
+    expect(fs.existsSync(unrelated)).toBe(false);
+  });
+
   it('names a NON-ASCII failing path readably — the FAILED line is the only place it appears', () => {
     // The thrown/emitted diagnostic is the only place a failing path is named, and without
     // `[Console]::OutputEncoding` it encodes through the OEM code page: `にほんご.json` was

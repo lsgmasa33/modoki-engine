@@ -153,8 +153,36 @@ export function projectConfigUnionErrors(root: string = process.cwd()): string[]
  *  (pruned) config on purpose — the file records only what the project chose; see
  *  the file-stays-minimal invariant in project-config.ts. */
 export function writeProjectConfig(config: RawProjectConfig | ProjectConfig, root: string = process.cwd()): void {
-  const file = path.join(root, PROJECT_CONFIG_FILENAME);
-  fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+  writeConfigAtomic(path.join(root, PROJECT_CONFIG_FILENAME), JSON.stringify(config, null, 2) + '\n');
+}
+
+/** tmp + rename, so a write that fails part way (ENOSPC, EIO) leaves the previous file whole (#1958 close-out review).
+ *  A plain `writeFileSync` truncates first: under project-settings' user-first order, a full disk then destroyed the
+ *  private values `project.user.json` already held, and its 500 said the committed file was "not written" while it lay
+ *  truncated. A tmp left by a failed write is removed.
+ *  ⚠️ The rename must not cost what the in-place write kept: the file's MODE (`project.user.json` holds the keystore
+ *  passwords, and a 0600 one came back 0644) and a SYMLINK (replaced by a plain file, its target never updated). So the
+ *  write goes to the link's target, and the tmp takes the old file's permission bits before it replaces it. */
+function writeConfigAtomic(file: string, text: string): void {
+  let target = file;
+  try { target = fs.realpathSync.native(file); } catch {   // `.native`: the #881 canonicaliser, which also throws when absent
+    // No file yet: create it where it is named — or, for a DANGLING link, where the link points.
+    try { if (fs.lstatSync(file).isSymbolicLink()) target = path.resolve(path.dirname(file), fs.readlinkSync(file)); } catch { /* nothing there */ }
+  }
+  const tmp = `${target}.tmp`;
+  let mode: number | undefined;
+  try { mode = fs.statSync(target).mode & 0o7777; } catch { /* no old file: the default mode */ }
+  try {
+    // A stale tmp (a file, or a link that would be FOLLOWED) goes first, so the tmp is created fresh with the old mode
+    // from its first byte: it holds the keystore passwords too. A folder there is left, and the write fails on it.
+    try { if (!fs.lstatSync(tmp).isDirectory()) fs.rmSync(tmp); } catch { /* no stale tmp */ }
+    fs.writeFileSync(tmp, text, mode === undefined ? undefined : { mode });
+    if (mode !== undefined) fs.chmodSync(tmp, mode);   // exact bits, past the umask
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { if (fs.lstatSync(tmp).isFile()) fs.rmSync(tmp); } catch { /* nothing left behind */ }
+    throw e;
+  }
 }
 
 /** Read <root>/project.user.json (gitignored, per-machine) merged over defaults.
@@ -175,8 +203,7 @@ export function loadProjectUserConfig(root: string = process.cwd()): ProjectUser
 /** Write the per-machine settings to <root>/project.user.json. Partial, same
  *  rationale as {@link writeProjectConfig}. */
 export function writeProjectUserConfig(user: RawProjectConfig | ProjectUserConfig, root: string = process.cwd()): void {
-  const file = path.join(root, PROJECT_USER_CONFIG_FILENAME);
-  fs.writeFileSync(file, JSON.stringify(user, null, 2) + '\n');
+  writeConfigAtomic(path.join(root, PROJECT_USER_CONFIG_FILENAME), JSON.stringify(user, null, 2) + '\n');
 }
 
 /** Allowlist rules for the values that get interpolated into build shell

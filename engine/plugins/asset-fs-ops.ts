@@ -53,9 +53,23 @@ export function moveAssetFile(absFrom: string, absTo: string): void {
   // exact thing this loop exists to stop being stranded under the old filename (QA-CTX-0005, for
   // `.meta.local.json`). It is gitignored, so a stranding is invisible to `git status` and would
   // only surface when someone went looking for data they had already lost.
-  for (const suffix of SIDECAR_SUFFIXES) {
-    const metaFrom = absFrom + suffix;
-    if (fs.existsSync(metaFrom)) fs.renameSync(metaFrom, absTo + suffix);
+  //
+  // ⚠️ ALL OR NOTHING (#1958): a sidecar rename that throws (a Windows lock is the plausible one) used to leave the asset
+  // at its new path and its `.meta.json` at the old one, and the next scan minted the moved asset a fresh GUID, so
+  // every ref to it dangled. So a failure puts back what this call already moved, newest first, and rethrows: the
+  // route's error then means what it says, that nothing moved. A rollback step that fails too is left as it is; the
+  // original error is the one worth reporting.
+  const moved: Array<[string, string]> = [[absFrom, absTo]];
+  try {
+    for (const suffix of SIDECAR_SUFFIXES) {
+      const metaFrom = absFrom + suffix;
+      if (!fs.existsSync(metaFrom)) continue;
+      fs.renameSync(metaFrom, absTo + suffix);
+      moved.push([metaFrom, absTo + suffix]);
+    }
+  } catch (e) {
+    for (const [from, to] of moved.reverse()) { try { fs.renameSync(to, from); } catch { /* keep the original error */ } }
+    throw e;
   }
 }
 
@@ -76,13 +90,18 @@ export function moveAssetFile(absFrom: string, absTo: string): void {
  *  events, and a rescan between them would delete a LIVE asset's identity. Only a create, which is about to put a new
  *  file at that exact path, can tell an orphan from a sidecar whose file is still on its way.
  *
- *  Synchronous, so a caller can keep its check-then-write span free of awaits. Returns the paths it removed. */
-export function removeOrphanSidecars(absTarget: string): string[] {
+ *  Synchronous, so a caller can keep its check-then-write span free of awaits. Returns the paths it removed.
+ *
+ *  ⚠️ `keep` names a sidecar that is NOT an orphan although its file is absent: one written AHEAD of its file (#1992).
+ *  The Assets panel's OS drop writes each dropped file in drop order, sidecars included, so a `.meta.json` dropped before
+ *  its png sat at the path when the png was created, and this deleted the GUID, settings and slices just dropped. The
+ *  router answers it from what it wrote itself (`sidecarWrittenAheadOfFile`), since only the writer knows. */
+export function removeOrphanSidecars(absTarget: string, keep: (sidecarAbs: string) => boolean = () => false): string[] {
   if (fs.existsSync(absTarget)) return [];
   const removed: string[] = [];
   for (const suffix of SIDECAR_SUFFIXES) {
     const side = absTarget + suffix;
-    if (!fs.existsSync(side)) continue;
+    if (!fs.existsSync(side) || keep(side)) continue;
     fs.rmSync(side, { force: true });
     removed.push(side);
   }
@@ -165,11 +184,11 @@ export function trashCommand(
     // `DeleteFile` throws "Could not find file" on a directory, so branch on what the path
     // IS: `DeleteDirectory` is the folder API. Both recycle rather than hard-delete.
     for (const p of paths) {
-      if (/[\r\n]/.test(p)) {
-        // A newline would split one path into two lines and delete something else. Windows
-        // does not permit control characters in a filename, so this is unreachable in
-        // practice — it is here because the line protocol's failure mode is a WRONG delete.
-        throw new Error(`trashCommand: path contains a newline, refusing to build a delete for it: ${JSON.stringify(p)}`);
+      if (/[\r\n\t]/.test(p)) {
+        // A newline would split one path into two lines and delete something else, and a tab would split a line into a
+        // path and a group base (see `trashGroups`). Windows does not permit control characters in a filename, so this
+        // is unreachable in practice — it is here because the line protocol's failure mode is a WRONG delete.
+        throw new Error(`trashCommand: path contains a newline or tab, refusing to build a delete for it: ${JSON.stringify(p)}`);
       }
     }
     return {
@@ -200,22 +219,45 @@ export function trashCommand(
         // ⚠️ Do NOT reach for `$ErrorActionPreference='Stop'` instead — that abandons every
         // remaining path, turning one failure into a batch that half-happened. try/catch per
         // path keeps the batch going AND reports; the good paths are still deleted (measured).
-        + '$failed = 0; '
-        + 'foreach ($p in ([Console]::In.ReadToEnd() -split "`n")) { '
-        + '$p = $p.TrimEnd("`r"); if ($p -eq \'\') { continue } '
+        // ⚠️ A GROUP is never split (#1977): a line `<sidecar>\t<its file>` is held back, and reported, when its file was
+        // refused earlier in this run. win32 recycles per path, so without this a locked file kept its place on disk
+        // while its `.meta.json` went to the bin, and the route's own rebuild minted the file a new GUID. `trashGroups`
+        // orders every file before its sidecars. `$bad` is a PowerShell hashtable, whose keys compare ignoring case, as
+        // NTFS does.
+        + '$failed = 0; $bad = @{}; '
+        + 'foreach ($line in ([Console]::In.ReadToEnd() -split "`n")) { '
+        + '$line = $line.TrimEnd("`r"); if ($line -eq \'\') { continue } '
+        + '$parts = $line -split "`t", 2; $p = $parts[0]; '
+        + 'if ($parts.Count -gt 1 -and $bad.ContainsKey($parts[1])) '
+        + "{ $failed++; [Console]::Error.WriteLine('modoki-trash: FAILED ' + $p + ' :: its file was not trashed, so it stays with it'); continue } "
         + 'try { '
         + 'if (Test-Path -LiteralPath $p -PathType Container) '
         + "{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } "
         + "else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } "
-        + "} catch { $failed++; [Console]::Error.WriteLine('modoki-trash: FAILED ' + $p + ' :: ' + $_.Exception.Message) } } "
+        + "} catch { $failed++; $bad[$p] = $true; [Console]::Error.WriteLine('modoki-trash: FAILED ' + $p + ' :: ' + $_.Exception.Message) } } "
         + 'if ($failed -gt 0) { exit $failed }',
       ],
-      input: `${paths.join('\n')}\n`,
+      input: `${trashGroups(paths).map((g) => (g.base === undefined ? g.path : `${g.path}\t${g.base}`)).join('\n')}\n`,
     };
   }
   // Linux + anything else: the `trash-cli` tool (commonly present on desktops)
   // takes a list of paths in a single invocation.
   return { command: 'trash-put', args: [...paths] };
+}
+
+/** The win32 trash's line order and grouping (#1977): each path, with `base` set when it is a sidecar (`SIDECAR_SUFFIXES`)
+ *  of a file in the SAME batch. Every path without a base comes first, in request order, then the sidecars, so the
+ *  script has already tried a sidecar's file when it reaches the sidecar. A sidecar whose file is not in the batch (the
+ *  route sends an orphan's sidecar alone, its file already gone) has no base and is trashed on its own, as before.
+ *  Matched by exact string: the route spells a sidecar as its file's path plus the suffix. Pure, so it is unit-tested. */
+export function trashGroups(paths: readonly string[]): Array<{ path: string; base?: string }> {
+  const inBatch = new Set(paths);
+  const lines = paths.map((p) => {
+    const suffix = SIDECAR_SUFFIXES.find((s) => p.endsWith(s));
+    const base = suffix === undefined ? undefined : p.slice(0, -suffix.length);
+    return base !== undefined && inBatch.has(base) ? { path: p, base } : { path: p };
+  });
+  return [...lines.filter((l) => l.base === undefined), ...lines.filter((l) => l.base !== undefined)];
 }
 
 /** The per-path failure marker the win32 script writes to stderr. Parsed rather than inferred,
@@ -233,7 +275,9 @@ export interface TrashResult {
    *  trash, which MOVES rather than unlinks, so they still report only what the OS itself refused.
    *
    *  A refused path holds back its SIDECARS too (`<path>.meta.json` &c), so a group is never split
-   *  — see `moveToTrash`'s fallback for why splitting it is worse than the bug it guards. */
+   *  — see `moveToTrash`'s fallback for why splitting it is worse than the bug it guards. That holds on every platform:
+   *  darwin's Finder delete is all-or-nothing (measured), the Linux fallback holds them back, and the win32 script holds
+   *  back a sidecar whose file it could not recycle (`trashGroups`, #1977). */
   failed: string[];
   /** What the OS said, when it refused something and said anything (darwin: Finder's AppleScript
    *  error). A short first line, for the refusal's prose — never a path list; `failed` is that. */

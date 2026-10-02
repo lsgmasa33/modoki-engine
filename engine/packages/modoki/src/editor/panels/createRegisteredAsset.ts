@@ -59,8 +59,8 @@ export async function createRegisteredAssetAskingToReplace(
  *  `count:0` while the file was already on disk.
  *
  *  This is the same defect `/api/delete-asset` had (#288 Phase 1) reached from the other side, and
- *  the sibling create route `/api/create-asset` avoids it by calling `ctx.rebuildManifest()`
- *  inline. A renderer cannot call that, so it asks for the rescan instead. A failure is reported,
+ *  the sibling create route `/api/create-asset` avoids it by rebuilding the manifest
+ *  inline (`rebuildManifestInline`, #1963). A renderer cannot call that, so it asks for the rescan instead. A failure is reported,
  *  not thrown: the file IS written, and a 500 here would read as "nothing was created". */
 async function rebuildBackendManifest(): Promise<boolean> {
   try { return (await backendFetch('/api/rescan-assets')).ok; } catch { return false; }

@@ -4109,6 +4109,15 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   the caller's `ifMatch`. write-meta has
   the same check for its asset: a rename during its park probe minted an orphan sidecar carrying the
   live asset's GUID. This is the check-then-act rule `ifMatch` already documents for write-file.
+  reimport records which targets EXIST before `unsavedGate` and asks once, after it, before the first
+  handler: a target renamed away (or one that appeared) during the probe is not baked, and every target
+  changed is `409 {reason:'changed'}` (#2045). Existence only, not the entry: a re-import is addressed by
+  path and its identity lives in the sidecar, so an atomic re-save of the same asset holds exactly the
+  bytes it should bake, and the panel's one-shot auto-import of a new texture was refused for it. ⚠️ Asked once, not before each handler: a handler legitimately
+  rewrites files a LATER target names (a model's extracted textures, in a recursive run), so a per-asset
+  re-check refused those. scene-mutate re-checks that its scene still exists before the read (a 404, not
+  the ENOENT 500), and asset-write already judged existence after its await. Neither re-judges the
+  KIND: it comes from the path's name, which an await cannot change.
   ⚠️ **A test of this rule must change the disk INSIDE the last awaited probe** (the stub renderer's
   reply), or a check placed before the await passes it too.
 - **A delete takes the named file's sidecars with it.** A binary's GUID lives in its `.meta.json`.
@@ -4121,6 +4130,33 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   did: whichever request ran second 404'd, and the prune logged a false "may still be on disk". One
   request per asset, or both in one `paths` list.
   This is the delete half of [the sidecar rule below](#a-sidecars-identity-belongs-to-exactly-one-live-file-1956-1974-1975).
+
+#### A write with several steps leaves the disk as its reply says (#1958, #1963, #1977)
+
+A router write that takes several steps either writes the SOURCE OF TRUTH first, or is all or
+nothing. A step that runs after the data has landed never turns that success into a failure.
+
+- **project-settings writes `project.user.json` BEFORE `project.config.json`.** The committed write
+  blanks every private build value (the migration), so committed-first, a failed user write answered
+  500 with the committed Team ID gone and the new one nowhere. User-first, a failed committed write
+  answers `500 {written:['project.user.json'], notWritten:['project.config.json']}`, with the new value
+  in the user file, which the overlay reads first. Both writes are tmp + rename (`writeConfigAtomic`),
+  because a plain `writeFileSync` truncates first: a full disk mid-write destroyed the file the order
+  was protecting. A value CLEARED in that failed Apply still reads the committed one, since the overlay
+  falls through an empty user value.
+- **`moveAssetFile` rolls back.** A sidecar rename that throws (a Windows lock) left the asset at its
+  new path and its `.meta.json` at the old one, and the next scan minted a fresh GUID. It now puts back
+  what it moved, newest first, and rethrows.
+- **The trash never splits a file from its sidecars, on any platform** (`TrashResult.failed`). darwin's
+  Finder delete is all-or-nothing (measured), and the Linux fallback holds sidecars back. win32
+  recycles per path, so its script reads lines from `trashGroups`: every file first, and each sidecar
+  as `<sidecar>\t<its file>`, held back and reported when its file was refused. Only the Windows live
+  test (`trashCommandLive.test.ts`) can run the script half.
+- **A manifest rebuild after a landed write goes through `rebuildManifestInline`.** A failure becomes
+  `manifestRebuilt:false` (the watcher's rescan catches up). A raw `ctx.rebuildManifest()` answered 500,
+  which read as "nothing happened", and the retry was refused as "destination exists". import-file
+  answers its "copied, not finished" 422 instead. The raw form stays only on `/api/rescan-assets`,
+  where the rebuild IS the operation.
 
 #### A sidecar's identity belongs to exactly one live file (#1956, #1974, #1975)
 
@@ -4135,6 +4171,24 @@ owner:
 | **Delete** | the file went, the sidecar stayed, and the next file at that path inherited the dead GUID | `/api/delete-asset` takes the named file's sidecars with it (#1956, the bullet above) |
 | **Copy** | Duplicate and Paste re-minted `meta.id` and kept `sprites[].guid`, so two textures defined every slice GUID, and slice refs drew whichever texture registered last | `freshSidecarIdentity` (`asset-fs-ops.ts`) re-mints every GUID a sidecar DEFINES (#1974) |
 | **Create** | a file deleted OUTSIDE the editor (Finder, git) left its sidecar, and an import or drop of a same-named file inherited the dead GUID and slices | `removeOrphanSidecars` runs before import-file, write-file, adopt-file, and the move and duplicate destinations (#1975) |
+
+⚠️ **A sidecar written AHEAD of its file is not an orphan** (#1992). The OS drop writes each dropped
+file through create-only write-file in drop order, sidecars included. With the `.meta.json` first, the
+png's create removed the sidecar just dropped, and the dropped GUID, settings and slices were lost.
+Only the writer can tell that sidecar from a dead one, so a CREATE-only write-file records each
+sidecar it creates for a path with no file, by directory entry (`sidecarsAheadOfFile`). An overwrite
+does not, or a dead orphan rewritten in place would be vouched for. The file's create keeps a sidecar
+whose entry still matches (`removeOrphanSidecarsBefore`), and uses the record up only AFTER its commit
+(`sidecarsAheadArrived`): used up before it, a create that failed at its rename left the sidecar
+unvouched, and the drop's retry deleted it. A file deleted later leaves an ordinary orphan. A sidecar replaced since is judged like any other. The record
+is process memory: after a restart a sidecar still waiting reads as an orphan, which is Unity's
+answer for a sidecar nothing vouches for. write-file also removes orphans only after its tmp write
+lands, so a write that fails there removes nothing.
+⚠️ **The drop writes in drop order — do not "fix" it to sidecars-first.** That was tried (to close
+the png-first window below) and lost the dropped GUID EVERY time an orphan sat at the sidecar's path:
+the create-only sidecar write 409s over the orphan, then the png's create removes the orphan, and the
+png ends up with no sidecar. Still open, reasoned and not observed: with the png first (Finder's
+sort), the watcher's heal can mint the png a sidecar before the dropped one is written.
 
 - **The copy census** (`remintSubAssetGuids`, `meta-sidecar.ts`): `id` and `sprites[].guid` are the GUIDs a
   sidecar defines. The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`. ⚠️ A new field

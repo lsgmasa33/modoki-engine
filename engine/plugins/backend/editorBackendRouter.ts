@@ -807,6 +807,40 @@ function changedSince(snap: PathSnapshot): string[] {
   }).map(([p]) => p);
 }
 
+/** **Sidecars this backend wrote AHEAD of their file** (#1992): sidecar path → the directory entry it wrote. A create-only
+ *  `/api/write-file` of `x.png.meta.json` while `x.png` is absent records it (only a create: an overwrite of a dead
+ *  orphan would otherwise vouch for it, and the next file there would inherit the dead GUID), and the create of `x.png` then keeps it,
+ *  rather than `removeOrphanSidecars` deleting it as a dead asset's (the OS drop writes files in drop order, sidecars
+ *  included). Keyed by ENTRY, not path alone: a sidecar replaced since is not the one written, and it is judged as any
+ *  other. Used up by the create, so a file deleted later (Finder) leaves an ordinary orphan that the next create
+ *  removes. ⚠️ Process memory, deliberately: after a restart a sidecar still waiting for its file reads as an orphan,
+ *  the conservative answer (Unity's) for a sidecar nothing alive vouches for. */
+const sidecarsAheadOfFile = new Map<string, string>();
+function noteSidecarAheadOfFile(absPath: string): void {
+  // Matched ignoring case and keyed as `removeOrphanSidecars` asks (`<file> + <suffix>`): `C.PNG.META.JSON` is
+  // `C.PNG`'s sidecar on APFS/NTFS, where that removal finds it by `existsSync` (close-out review).
+  const suffix = SIDECAR_SUFFIXES.find((s) => absPath.toLowerCase().endsWith(s));
+  if (suffix === undefined) return;
+  const base = absPath.slice(0, -suffix.length);
+  if (fs.existsSync(base)) return;
+  try { sidecarsAheadOfFile.set(base + suffix, pathEntryId(fs.statSync(absPath, { bigint: true }))); } catch { /* gone already */ }
+}
+function sidecarWrittenAheadOfFile(sidecarAbs: string): boolean {
+  const entry = sidecarsAheadOfFile.get(sidecarAbs);
+  if (entry === undefined) return false;
+  try { return pathEntryId(fs.statSync(sidecarAbs, { bigint: true })) === entry; } catch { return false; }
+}
+/** `removeOrphanSidecars` for a route about to create `absTarget`: keeps a sidecar this backend wrote ahead of it. */
+function removeOrphanSidecarsBefore(absTarget: string): string[] {
+  return removeOrphanSidecars(absTarget, sidecarWrittenAheadOfFile);
+}
+/** The file a sidecar was written ahead of has ARRIVED: use the record up. ⚠️ Called right after the route's commit (its
+ *  rename, copy or move), never with the removal before it (close-out review): a create that failed after using the
+ *  record up left the dropped sidecar unvouched for, and the drop's retry then deleted it, #1992 one retry later. */
+function sidecarsAheadArrived(absTarget: string): void {
+  for (const suffix of SIDECAR_SUFFIXES) sidecarsAheadOfFile.delete(absTarget + suffix);
+}
+
 function rebuildManifestInline(ctx: BackendContext): boolean {
   try { ctx.rebuildManifest(); return true; } catch { return false; }
 }
@@ -3526,6 +3560,12 @@ async function describeUnresolvedAgainstLiveWorld(
         reason: `scene-format-${reason}`,
         error: `scene-mutate refused ${scenePath}: ${message} Nothing was applied and nothing was written.`,
       }, 409);
+      // The commit point (#2045): existence was judged before the awaits above, so it is judged again here, synchronously
+      // from this line to the write. A scene renamed away meanwhile answered a 500 (ENOENT from the read). The KIND is not
+      // re-judged: it comes from the path's name, which an await cannot change.
+      if (!fs.existsSync(absPath)) {
+        return json({ error: `scene not found: ${scenePath} — it was moved or deleted while scene-mutate waited for the editor. Nothing was written.` }, 404);
+      }
       let scene: MutableScene;
       try {
         scene = readJsonFile(absPath) as MutableScene;
@@ -4346,11 +4386,12 @@ async function describeUnresolvedAgainstLiveWorld(
           return json({ error: 'destination escapes the project' }, 403);
         }
         fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-        removeOrphanSidecars(destAbs); // #1975: a new file never adopts a dead asset's sidecar (a no-op over an existing one)
+        removeOrphanSidecarsBefore(destAbs); // #1975: a new file never adopts a dead asset's sidecar (a no-op over an existing one)
         const tmpPath = `${destAbs}.tmp`;
         try {
           fs.writeFileSync(tmpPath, bytes);
           fs.renameSync(tmpPath, destAbs);
+          sidecarsAheadArrived(destAbs);
           ctx.markEditorWrite(destAbs, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
         } catch (writeErr) {
           // Leave no half-written `.tmp` behind for the asset scanner to find: the write already
@@ -4652,6 +4693,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // routes below, whose path comes straight off the request body.
       // Scoped to `pendingMeta`: the bake reads the SIDECAR, and nothing else it touches lives in
       // another registry.
+      // Which targets EXIST, decided before the gate's await, so the commit point can ask again (#2045). Existence only,
+      // not the entry `snapshotPaths` compares for a delete: a re-import is addressed by path and its identity lives in
+      // the sidecar, so an atomic re-save of the same asset during the probe holds exactly the bytes it should bake
+      // (close-out review: the Assets panel's one-shot auto-import of a texture that just landed was refused for that).
+      const existedAt = new Map(targets.flatMap((a) => { const p = ctx.resolveAssetPath(a.path); return p ? [[p, fs.existsSync(p)] as const] : []; }));
       const reGate = await unsavedGate(ctx, targets.map((a) => a.path), { registries: ['pendingMeta'] });
       const reRefused = (body as { force?: boolean } | undefined)?.force === true ? null : unsavedRefusal(reGate, {
         verb: 're-import',
@@ -4676,11 +4722,23 @@ async function describeUnresolvedAgainstLiveWorld(
       // fix, so they are counted apart.
       const noHandler: string[] = [];
       const unresolved: string[] = [];
+      const changed: string[] = [];   // #2045: gone or appeared while the gate waited — not baked
+      // The commit point (#2045): asked ONCE, synchronously after the gate's await and before the first handler, against
+      // what each target was when the route chose it. A file renamed away during the probe is not baked, so
+      // no handler writes a sidecar or a variant for a path whose file has gone (#1975's orphan shape). A file swapped in
+      // at the same path IS baked: the re-import is addressed by path. ⚠️ Not re-asked inside the loop: a handler legitimately rewrites files a LATER target names
+      // (a model's extracted textures in a recursive run), and that would read as "changed" and refuse them.
+      const movedDuringGate = new Set([...existedAt].filter(([p, was]) => fs.existsSync(p) !== was).map(([p]) => p));
       for (const a of targets) {
         const handler = getReimportHandler(a.type);
         const abs = handler ? ctx.resolveAssetPath(a.path) : null;
         if (!handler) { summary.skipped++; noHandler.push(`${a.path} (${a.type})`); continue; }
         if (!abs) { summary.skipped++; unresolved.push(a.path); continue; }
+        if (movedDuringGate.has(abs)) {
+          changed.push(a.path);
+          summary.errors.push(`${a.path}: changed on disk while the re-import waited for the editor (moved or deleted, or a file appeared) — not re-imported`);
+          continue;
+        }
         try {
           // Fail fast on a too-new sidecar BEFORE running any conversion work for this
           // asset — checked per-asset rather than pre-walking the whole `targets` list,
@@ -4706,7 +4764,9 @@ async function describeUnresolvedAgainstLiveWorld(
           if (e instanceof SidecarTooNewError) tooNew.push(a.path);
         }
       }
-      ctx.rebuildManifest(); // pick up baked import settings
+      // Inline (#1963): the bakes have landed, and a raw rebuild that threw answered 500 and skipped `invalidate-assets`, so
+      // the live viewport kept the stale GPU cache of assets that WERE re-baked.
+      const manifestRebuilt = rebuildManifestInline(ctx); // pick up baked import settings
       // Tell the renderer to drop the cached geometry/texture for the re-baked assets.
       // Best-effort: a headless/disconnected renderer just times out — the bake already
       // landed on disk, so a later scene load still picks it up.
@@ -4739,11 +4799,14 @@ async function describeUnresolvedAgainstLiveWorld(
       // #1212 A-9's sibling: when EVERY failure was a newer-format sidecar, nothing is broken — the
       // run was refused, for a reason the caller resolves by merging. A 500 read as "relaunch".
       const refusedOnly = !ok && tooNew.length > 0 && tooNew.length === summary.errors.length;
+      // Every failure a target that moved during the gate: a conflict for the caller to re-read, not a server fault.
+      // Mixed with too-new sidecars too: both are refusals for the caller to resolve, and neither is a server fault.
+      const changedOnly = !ok && changed.length > 0 && changed.length + tooNew.length === summary.errors.length;
       // Say WHY anything was skipped. A bare `skipped:N` is a number the caller cannot act on.
       return json({
         // A bake writes the derived files (KTX2/WebP, GLB) and the sidecar's cache block, so
         // anything converted is on disk (§8). A run that converted nothing wrote nothing.
-        ...summary, ok, saved: summary.converted > 0,
+        ...summary, ok, saved: summary.converted > 0, manifestRebuilt,
         ...(refusedOnly ? {
           code: 'REFUSED_BY_OP',
           error: `every asset that failed has a sidecar written by a NEWER build (format > ${SIDECAR_FORMAT_VERSION}): ${tooNew.join(', ')} — nothing was converted`,
@@ -4751,6 +4814,14 @@ async function describeUnresolvedAgainstLiveWorld(
         } : {}),
         ...(noHandler.length ? { noHandler } : {}),
         ...(unresolved.length ? { unresolved } : {}),
+        ...(changed.length ? { changed } : {}),
+        ...(changedOnly ? {
+          conflict: true, reason: 'changed',
+          error: `nothing was re-imported: ${changed.join(', ')} changed on disk while the re-import waited for the editor. List the assets again before re-importing.`
+            // A mix with too-new sidecars says both (close-out review): `errors[]` alone left the caller a round trip short.
+            + (tooNew.length ? ` And ${tooNew.join(', ')} ${tooNew.length === 1 ? 'has a sidecar' : 'have sidecars'} written by a NEWER build (format > ${SIDECAR_FORMAT_VERSION}).` : ''),
+          ...(tooNew.length ? { code: 'REFUSED_BY_OP', options: [`merge the branch that raised SIDECAR_FORMAT_VERSION past ${SIDECAR_FORMAT_VERSION}, restart the editor, then reimport`] } : {}),
+        } : {}),
         // The forced path is the one that needs saying out loud: the bake DID run and it did NOT
         // use the human's newest settings. Reporting only on the refusal would make `force:true`
         // a silent downgrade, which is the false success §0 ranks worst (#882).
@@ -4770,7 +4841,7 @@ async function describeUnresolvedAgainstLiveWorld(
               + 'unknown — not "there was none".',
           }
           : {}),
-      }, ok ? 200 : refusedOnly ? refusalStatus('REFUSED_BY_OP') : 500);
+      }, ok ? 200 : refusedOnly ? refusalStatus('REFUSED_BY_OP') : changedOnly ? 409 : 500);
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -5093,8 +5164,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // so there is no stale cached def the invalidation needs to clear.
       writeJsonAtomic(abs, assetJsonBytes(data));
       ctx.markEditorWrite(abs, fingerprintBytes(assetJsonBytes(data))); // after the write lands — `markWrittenFile`'s rule (#1911)
-      ctx.rebuildManifest(); // register the new asset's GUID
-      return json({ ok: true, saved: true, path: assetPath, id });
+      // Inline, never raw (#1963): the file has landed, so a failed rebuild is `manifestRebuilt:false` (the watcher's
+      // rescan registers it), not a 500 that reads as "nothing happened" and whose retry is refused as "destination exists".
+      const manifestRebuilt = rebuildManifestInline(ctx); // register the new asset's GUID
+      return json({ ok: true, saved: true, path: assetPath, id, manifestRebuilt });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -5192,12 +5265,16 @@ async function describeUnresolvedAgainstLiveWorld(
       // covers every event of the tmp + rename burst (see its "write+rename"
       // handling), so this doesn't change hot-reload suppression behavior — same
       // pattern as writeJsonAtomic in this file.
-      // #1975: a file created where none existed never adopts a dead asset's sidecar (a no-op when the file exists).
-      removeOrphanSidecars(absPath);
       const tmpPath = `${absPath}.tmp`;
       fs.writeFileSync(tmpPath, bytes);
+      // #1975: a file created where none existed never adopts a dead asset's sidecar (a no-op when the file exists).
+      // AFTER the tmp write (#1992 part 2), where ENOSPC/EACCES happen, so a failed write removes nothing; the rename
+      // below is the commit. A sidecar written ahead of this file by this backend is kept (#1992).
+      removeOrphanSidecarsBefore(absPath);
       fs.renameSync(tmpPath, absPath);
+      sidecarsAheadArrived(absPath);
       ctx.markEditorWrite(absPath, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
+      if (ifNoneMatch === '*') noteSidecarAheadOfFile(absPath);
       // `path`: the url of the file just written, spelled the way the DISK does (#1273 close-out review).
       // A create at `/assets/SCENES/new.json` lands in an existing `scenes/` folder on APFS/NTFS, and the
       // scanner keys it `/assets/scenes/new.json` — a caller registering the spelling it asked for would
@@ -5325,8 +5402,9 @@ async function describeUnresolvedAgainstLiveWorld(
         if (retype) return retype;
       }
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
-      removeOrphanSidecars(absTo); // #1975: the copy must not adopt a dead asset's sidecar at its new path
+      removeOrphanSidecarsBefore(absTo); // #1975: the copy must not adopt a dead asset's sidecar at its new path
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
+      sidecarsAheadArrived(absTo);
       // The editor's own write (#1702) — see `markWrittenFile`. The sidecars it may write never broadcast.
       markWrittenFile(ctx, absTo);
       const manifestRebuilt = rebuildManifestInline(ctx);
@@ -5443,8 +5521,9 @@ async function describeUnresolvedAgainstLiveWorld(
       const canonFrom = ctx.absToAssetUrl(absFrom, { onDisk: true });
       // #1975: a moved file without sidecars of its own must not adopt a dead asset's at the destination. A case-only
       // rename resolves to the source itself, which exists, so nothing is removed.
-      if (!isDir) removeOrphanSidecars(absTo);
+      if (!isDir) removeOrphanSidecarsBefore(absTo);
       moveAssetFile(absFrom, absTo);
+      sidecarsAheadArrived(absTo);
       // Before the renderer repair, not after: the manifest is what `modoki_list_assets` reads to
       // verify this move, and the watcher would otherwise catch up on its own 150ms debounce.
       const manifestRebuilt = rebuildManifestInline(ctx);
@@ -5813,14 +5892,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // value past by omitting the field it lands next to. Nothing is written on error.
       const errors = validateBuildConfig(merged, mergedUser);
       if (errors.length) return json({ error: errors.join('; ') }, 400);
-      writeProjectConfig(
-        pruneProjectConfig(
-          merged as unknown as RawProjectConfig,
-          prevRaw,
-          DEFAULT_PROJECT_CONFIG as unknown as RawProjectConfig,
-        ),
-        ctx.projectRoot,
-      );
+      // ⚠️ The USER file first (#1958): it is where a private value LIVES, and the committed write below BLANKS that
+      // value (the migration above). Committed-first, a failed user write answered 500 with the committed Team ID
+      // already gone and the new one nowhere. User-first, a failed committed write leaves both halves readable: the new
+      // value in the user file, which the overlay reads first, and the old committed file untouched. The 500 then
+      // names which file landed, since "nothing happened" is not true either.
       writeProjectUserConfig(
         pruneProjectConfig(
           mergedUser as unknown as RawProjectConfig,
@@ -5829,6 +5905,24 @@ async function describeUnresolvedAgainstLiveWorld(
         ),
         ctx.projectRoot,
       );
+      try {
+        writeProjectConfig(
+          pruneProjectConfig(
+            merged as unknown as RawProjectConfig,
+            prevRaw,
+            DEFAULT_PROJECT_CONFIG as unknown as RawProjectConfig,
+          ),
+          ctx.projectRoot,
+        );
+      } catch (e) {
+        ctx.invalidateProjectConfig(); // the user file DID change
+        return json({
+          error: `project.user.json was saved, but project.config.json was not: ${String(e)}. A private build value set here `
+            + 'is in project.user.json; one CLEARED here still reads the committed value until project.config.json is written. '
+            + 'Apply again once it is writable.',
+          written: ['project.user.json'], notWritten: ['project.config.json'],
+        }, 500);
+      }
       ctx.invalidateProjectConfig();
       return json({ ok: true });
     } catch (e) {
@@ -6547,10 +6641,22 @@ async function describeUnresolvedAgainstLiveWorld(
       // Decided before the folder is made: a scene this build cannot read throws here, and a refusal leaves nothing behind.
       const decided = importDecidesIdentity(scanUrl) ? importIdentity(ctx, scanUrl, fs.readFileSync(srcPath)).bytes : null;
       if (!fs.existsSync(destDirAbs)) fs.mkdirSync(destDirAbs, { recursive: true });
-      removeOrphanSidecars(destAbs); // #1975: a file that did not exist never adopts a dead asset's sidecar
+      removeOrphanSidecarsBefore(destAbs); // #1975: a file that did not exist never adopts a dead asset's sidecar
       if (decided) fs.writeFileSync(destAbs, decided, { flag: 'wx' });
       else fs.copyFileSync(srcPath, destAbs);
-      ctx.rebuildManifest();
+      sidecarsAheadArrived(destAbs);
+      // Inline (#1963): the copy has landed. A raw rebuild that threw answered 500, and the retry was refused as
+      // "destination exists"; read through a stale manifest, the entry lookup below would call it "registered no asset".
+      if (!rebuildManifestInline(ctx)) {
+        markWrittenFile(ctx, destAbs);
+        const landedUrl = ctx.absToAssetUrl(destAbs, { onDisk: true });
+        return json({
+          ok: false, path: landedUrl ?? null, imported: false, manifestRebuilt: false,
+          error: `copied to ${landedUrl ?? base}, but the asset manifest rebuild failed, so it is not registered yet and its `
+            + 'import pipeline did not run. The file is on disk: do not import it again.',
+          hint: 'The watcher\'s rescan registers it. Then run modoki_reimport_asset on the path above to produce its derived form.',
+        }, 422);
+      }
       // The editor's own write (#1702), after the rebuild: its GUID heal may rewrite the copy, and the mark must
       // fingerprint the bytes that stay. Nothing between the copy and here awaits — see `markWrittenFile`.
       markWrittenFile(ctx, destAbs);
@@ -6579,7 +6685,7 @@ async function describeUnresolvedAgainstLiveWorld(
             resolveAssetPath: (p) => ctx.resolveAssetPath(p),
             ssrLoadModule: (url) => ctx.ssrLoadModule(url),
           };
-          try { await handler(destUrl, destAbs, reCtx); imported = true; ctx.rebuildManifest(); }
+          try { await handler(destUrl, destAbs, reCtx); imported = true; rebuildManifestInline(ctx); } // #1963: the bake landed
           catch (e) {
             // PARTIAL IS A FAILURE unless the tool documents partial success (conventions §5), and
             // this one does not. It used to answer `{ok:true, imported:false, importError}` — a
