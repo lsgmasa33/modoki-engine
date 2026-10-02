@@ -212,6 +212,16 @@ const unusedLeaf = (u: UnusedRecord): string => {
   }
 };
 
+/** A kept row's leaves, each link with its guid (`pairUnused`'s `(applied)` reads it): `rowLeaves`' order, so its
+ *  `added` links, then its `own`. `skip` is per row and leaf, so it keeps all of a row's links or none. */
+export function keptRowLeaves(key: string, r: Bag, skip: (key: string, leaf: string) => boolean = () => false): { key: string; leaf: string; guid?: string }[] {
+  const leaves: string[] = [];
+  rowLeaves({ [key]: r }, leaves, skip);
+  const links = [...((r.added ?? []) as Bag[]), ...((r.own ?? []) as Bag[])].map((n) => n?.guid as string | undefined);
+  let i = 0;
+  return leaves.map((leaf) => (leaf === 'own' ? { key, leaf, guid: links[i++] } : { key, leaf }));
+}
+
 /** The fold's unused records against what today's load keeps for the save, as two leaf multisets.
  *  - A record `unresolved` under a placeholder is kept by that placeholder's verbatim record, so it is not compared — on
  *    EITHER side: under a placeholder only the rules put there (`checkInstance`'s translation B: today expands a copy),
@@ -223,18 +233,14 @@ const unusedLeaf = (u: UnusedRecord): string => {
  *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
  *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
 export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true, held?: Bag, ruledKept: readonly string[] = []): string[] {
-  const kept: { key: string; leaf: string }[] = [];
+  const kept: { key: string; leaf: string; guid?: string }[] = [];
   const legacy: string[] = [];
   legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
   for (const leaf of legacy) kept.push({ key: '(legacy)', leaf });
   const skip = (key: string, leaf: string) => [...livePlaceholders].some((k) => under(key, k))
     || removedRows.some((k) => under(key, k) && !(key === k && leaf === 'removed'));
   for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
-    for (const [key, r] of Object.entries(rows ?? {})) {
-      const leaves: string[] = [];
-      rowLeaves({ [key]: r }, leaves, skip);
-      for (const leaf of leaves) kept.push({ key, leaf });
-    }
+    for (const [key, r] of Object.entries(rows ?? {})) kept.push(...keptRowLeaves(key, r, skip));
   }
   // Today's kept copy of a link the rules now SHOW (#2018 (i), `checkRecord`), where today kept one.
   for (const key of ruledKept) { const at = kept.findIndex((k) => k.key === key && k.leaf === 'own'); if (at >= 0) kept.splice(at, 1); }
@@ -255,13 +261,14 @@ export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceh
     }
     return false;
   });
-  return [...out, ...pairUnused(rest, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments)];
+  return [...out, ...pairUnused(rest, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments, (k) => (fold.anchors.get(k as never) ?? []).map((r) => r.guid))];
 }
 
 /** The pairing half of {@link unusedDiverge}, pure: the fold's unused records against today's kept leaves, by row.
  *  `projected` is the fold's node set; `projectsWhenRestored(key)` re-folds the record with that row's removal turned
- *  into a restore; `memberInDocuments(key)` says a document the instance reaches still holds the row's member. */
-export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly { key: string; leaf: string }[], projected: (key: string) => boolean, removedRows: readonly string[], projectsWhenRestored: (key: string) => boolean, memberInDocuments: (key: string) => boolean = () => true): string[] {
+ *  into a restore; `memberInDocuments(key)` says a document the instance reaches still holds the row's member;
+ *  `anchoredAt(key)` is the guids the fold links at that row. */
+export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly { key: string; leaf: string; guid?: string }[], projected: (key: string) => boolean, removedRows: readonly string[], projectsWhenRestored: (key: string) => boolean, memberInDocuments: (key: string) => boolean = () => true, anchoredAt: (key: string) => readonly string[] = () => []): string[] {
   const kept = [...keptIn];
   const out: string[] = [];
   for (const u of foldUnused) {
@@ -278,12 +285,17 @@ export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly
     // what took it out. A gone member does not project after the restore either (and an ambiguous one is projected
     // already), so a fold that lost its "removed, gone" record cannot read as applied (#2009 re-reviews: that loss was waived as #2013, first unkeyed, then marked
     // applied by a document-membership test, which an inner layer's removal also passes).
-    const applied = k.leaf === 'removed' && removedRows.includes(k.key) && !projected(k.key) && projectsWhenRestored(k.key);
+    const applied = (k.leaf === 'removed' && removedRows.includes(k.key) && !projected(k.key) && projectsWhenRestored(k.key))
+      // A kept LINK the fold links at the same row, by guid: today keeps the row as an orphan and also spawns the node,
+      // the same double booking on a link (#1931 member 1: its orphan test misses a template member row's `own`, #2023).
+      // A link the fold lost, or links elsewhere, is not an application, and prints unmarked. The line names the guid,
+      // so a waiver can tie the fold's link at that row to this kept one and to nothing else.
+      || (k.leaf === 'own' && k.key !== '(legacy)' && !!k.guid && anchoredAt(k.key).includes(k.guid));
     // `(unprojected)`: an own link on a row whose member no document holds any more (#2018's mechanism: the fold never
     // registers it). A member a document still holds but a layer removed is HELD, and its link is the fold's `own
     // heldNode` record; losing that is not #2018 (#2009 re-review), so it prints unmarked.
     const unprojected = k.leaf === 'own' && k.key !== '(legacy)' && !projected(k.key) && !memberInDocuments(k.key);
-    out.push(`kept-only unused ${k.key} ${k.leaf}${applied ? ' (applied)' : unprojected ? ' (unprojected)' : ''}`);
+    out.push(`kept-only unused ${k.key} ${k.leaf}${applied ? (k.leaf === 'own' ? ` (applied ${k.guid})` : ' (applied)') : unprojected ? ' (unprojected)' : ''}`);
   }
   return out;
 }

@@ -736,6 +736,8 @@ mechanically:
   - Kept-only lines name their row and carry a marker that separates the waived shapes from loss:
     - `(applied)` only when the record, with that removal turned into a restore, projects the member. A gone member
       does not project after the restore either, so the fold losing its "removed, gone" record cannot read as applied.
+      On an own link, `(applied <guid>)` means the fold links the SAME guid at the SAME row (#1931 member 1, #2023). A
+      link the fold lost or put elsewhere stays unmarked. The guid is printed so a waiver can tie a line to that link.
     - `(unprojected)` for an own link on a row whose member no document holds any more (#2018's mechanism). A member a
       document still holds but a layer removed is held, and its link is the fold's `own heldNode` record. Losing that
       is a different defect, so its line stays unmarked and unwaived.
@@ -793,6 +795,18 @@ mechanically:
       record removes (#1914 R4).
   - They also found one old-model defect, #2013: today keeps a member's `removed` in its orphan store and also applies
     it (`(applied)`).
+  - The length-40 hunt (#2023) reached a second one, #1931 member 1. Today's orphan test misses a template member row's
+    `own`, so the scene row linking a user node under that template-added node is kept AND applied. Delete the node,
+    save, reload: it comes back. Two KNOWN_OPEN entries pin it:
+    - The double booking. Its waiver (`linkBookedTwice`) admits, on a template-added row only, `own (applied <guid>)`
+      lines plus the `anchors` line of the deleted node. Every guid the fold has there beyond today's must be one of
+      those kept links and shown nowhere at that row, so a node lost there with no kept link of its own, or one
+      anchored twice, stays red.
+    - The resurrection, pinned to the deleted node's guid. After the delete, S4's door drops the node's record (rule 3),
+      but the old capture still links it from the kept row. I25 translates exactly that link (`keptDeletedLinks`: a
+      kept `a+` row the fold still declares, its node not live, the record not linking it; counted as `known1931`), so the run reaches the save, which writes the link, and the reload, which brings the
+      node back. It is #2001 S6's acceptance case. A fix to `templateFrameNodes` itself would end both entries first.
+  - #2023's other seeds had no oracle gap: fold and parser defects (#2027, #2029), and one more #2013 double booking.
   - And five fold defects:
     - #2015: a document-level move of a template's own row into a nested instance's member was held and never projected.
     - #2016: a held reference copy's unused record is keyed at `/` instead of the node it stands for.

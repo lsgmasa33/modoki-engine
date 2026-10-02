@@ -13,7 +13,8 @@
  *  - hub ruling G2: a removed BASE component keeps its field records; the old capture drops them;
  *  - #1942 (open): the old capture writes only the non-default fields of a component on a template-added plain node;
  *  - KNOWN_OPEN #1829: the old capture writes a component the base lacks WHOLE, and a rotation as its whole group,
- *    where a file may state either partially.
+ *    where a file may state either partially;
+ *  - KNOWN_OPEN #1931 member 1 (#2023): the old capture writes back a kept orphan row's link to a node deleted since.
  *  (`own` order is not a record either; the harness compares `own` as a set.)
  *  As the S2 oracle translates rulings B/D: the rule's side is applied, not pardoned, and the comparison stays exact
  *  everywhere else. */
@@ -28,7 +29,8 @@ import { soaSchema } from '../../../packages/modoki/src/runtime/core/ecs/traitSc
 import { allStoredRoots, guidOfEntity, outermostStoredRoot } from '../../../packages/modoki/src/editor/instance/instanceKeys';
 import type { ShadowSeams } from './shadow';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
-import { findEntityById } from '../../../packages/modoki/src/runtime/core/ecs/world';
+import { findEntityByGuid, findEntityById } from '../../../packages/modoki/src/runtime/core/ecs/world';
+import { keptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import type { OpKind } from './ops';
 
@@ -37,7 +39,7 @@ import type { OpKind } from './ops';
 export const DOOR_OPS: ReadonlySet<OpKind> = new Set<OpKind>(['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'reparent', 'duplicate', 'paste', 'instantiate']);
 
 /** What the translations reached, for the non-vacuity pins (the harness counts the comparisons and skips itself). */
-export const s4Seen = { removedKept: 0, removedComponentKept: 0, known1942: 0, known1829: 0 };
+export const s4Seen = { removedKept: 0, removedComponentKept: 0, known1942: 0, known1829: 0, known1931: 0 };
 
 type Bag = Record<string, unknown>;
 
@@ -73,7 +75,33 @@ function translated(rec: InstanceRecord): OverrideList {
     }
     rows.set(k, row);
   }
+  // KNOWN_OPEN #1931 member 1: the capture's link to a deleted node, from today's kept orphan row (`keptDeletedLinks`).
+  for (const [k, g] of keptDeletedLinks(keptMemberOrphans(rec.rootGuid), rows, (x) => !!findEntityByGuid(x), (k) => (folded ??= foldInstance(editorPrefabReader, rec).nodes).has(k))) {
+    const row = rows.get(k);
+    rows.set(k, { ...(row ?? {}), own: [...(row?.own ?? []), { guid: g }] } as SceneTargetRecord);
+    s4Seen.known1931++;
+  }
   return { rows };
+}
+
+/** KNOWN_OPEN #1931 member 1 (#2023, recorded, not fixed): today's orphan test misses a template member row's `own`,
+ *  so it keeps the scene row linking a user node on a template-added node as an orphan, and the old capture writes that
+ *  kept row back. Once the node is deleted, the door drops its record (rule 3: the gesture removes what the record IS)
+ *  and the capture still links it; the save writes the link and the reload brings the node back. The record is right.
+ *  The links the capture states for that reason, as `[row, guid]`: held in a kept orphan row on an `a+` row the fold
+ *  still DECLARES (kept AND applied is #1931's; a row whose node the template dropped is a real orphan, and one under a
+ *  removed member is not reached), the node not live, and the record not linking it there. A link to a live node, one
+ *  the record keeps, or one on another row is compared as it is. */
+export function keptDeletedLinks(kept: Record<string, { own?: readonly { guid?: string }[] }> | undefined, recorded: ReadonlyMap<string, { own?: readonly { guid: string }[] }>, live: (guid: string) => boolean, declared: (key: string) => boolean): [string, string][] {
+  const out: [string, string][] = [];
+  for (const [k, row] of Object.entries(kept ?? {})) {
+    if (!/\/a\+[^/]+$/.test(k) || !declared(k)) continue;
+    for (const n of row.own ?? []) {
+      const g = n?.guid;
+      if (g && !live(g) && !recorded.get(k)?.own?.some((o) => o.guid === g)) out.push([k, g]);
+    }
+  }
+  return out;
 }
 
 /** Whether a row lies UNDER a member the record removes (strictly). Member keys are flat within a frame (§ 2.1), so

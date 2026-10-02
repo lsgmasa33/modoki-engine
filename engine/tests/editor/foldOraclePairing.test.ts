@@ -2,7 +2,7 @@
  *  real fold never takes the branches that tell them apart. Each case is a close-out re-review finding. */
 
 import { describe, it, expect } from 'vitest';
-import { pairUnused } from './foldOracle';
+import { keptRowLeaves, pairUnused } from './foldOracle';
 import type { UnusedRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 const removedGone = (key: string): UnusedRecord => ({ key, part: { kind: 'removed' }, cause: 'gone' } as UnusedRecord);
@@ -28,6 +28,32 @@ describe('#2009 P1 oracle: pairing the fold\'s unused records with today\'s kept
     expect(pairUnused([], kept, (k) => k === '/m', ['/m'], () => true)).toEqual(['kept-only unused /m removed']);
     // The record does not remove it.
     expect(pairUnused([], kept, none, [], () => true)).toEqual(['kept-only unused /m removed']);
+  });
+
+  it('(applied) marks a kept link only where the fold links the same guid at the same row (#1931 member 1, #2023)', () => {
+    const kept = [{ key: '/m', leaf: 'own', guid: 'g' }];
+    const at = (k: string) => (k === '/m' ? ['g'] : []);
+    expect(pairUnused([], kept, () => true, [], none, () => true, at)).toEqual(['kept-only unused /m own (applied g)']);
+    // Before `(unprojected)`: the fold links it, so it was not lost with its member.
+    expect(pairUnused([], kept, none, [], none, none, at)).toEqual(['kept-only unused /m own (applied g)']);
+    // Another guid at that row, the same guid at another row, a link with no guid, a legacy channel: not an application.
+    expect(pairUnused([], kept, () => true, [], none, () => true, () => ['h'])).toEqual(['kept-only unused /m own']);
+    expect(pairUnused([], kept, () => true, [], none, () => true, (k) => (k === '/n' ? ['g'] : []))).toEqual(['kept-only unused /m own']);
+    expect(pairUnused([], [{ key: '/m', leaf: 'own' }], () => true, [], none, () => true, at)).toEqual(['kept-only unused /m own']);
+    expect(pairUnused([], [{ key: '(legacy)', leaf: 'own', guid: 'g' }], none, [], none, none, () => ['g'])).toEqual(['kept-only unused (legacy) own']);
+    // Another leaf on that row is not a link.
+    expect(pairUnused([], [{ key: '/m', leaf: 'parent', guid: 'g' }], () => true, [], none, () => true, at)).toEqual(['kept-only unused /m parent']);
+  });
+
+  it('a kept row\'s links carry their own guids, in rowLeaves\' order (its added, then its own)', () => {
+    const row = { removed: true, added: [{ guid: 'a' }], own: [{ guid: 'b' }, { name: 'no guid' }, { guid: 'c' }] };
+    expect(keptRowLeaves('/m', row)).toEqual([
+      { key: '/m', leaf: 'removed' },
+      { key: '/m', leaf: 'own', guid: 'a' }, { key: '/m', leaf: 'own', guid: 'b' },
+      { key: '/m', leaf: 'own', guid: undefined }, { key: '/m', leaf: 'own', guid: 'c' },
+    ]);
+    // `skip` takes a row's links together, and leaves the rest.
+    expect(keptRowLeaves('/m', row, (_k, leaf) => leaf === 'own')).toEqual([{ key: '/m', leaf: 'removed' }]);
   });
 
   it('(unprojected) marks an own link only on a row whose member no document holds, never a legacy one', () => {

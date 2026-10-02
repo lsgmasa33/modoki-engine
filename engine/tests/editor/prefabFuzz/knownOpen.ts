@@ -91,6 +91,33 @@ const orphanBookedTwice = (f: StepFailure): boolean => {
   return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
 };
 
+/** #1931 member 1's P1 shape (#2023): on a TEMPLATE-ADDED row (`…/a+…`, the rows `templateFrameNodes` decides), today
+ *  keeps the row linking a user node as an orphan AND spawns the node. Each line is that kept link, marked
+ *  `(applied <guid>)` because the fold links the same guid at the same row, or, once the node is deleted, the record's
+ *  link to it at that row: the kept row restates the deleted node, which the save writes and the reload brings back.
+ *  That `anchors` line only ADDS to today's list, and only kept links' guids that today shows nowhere at that row, so a
+ *  second node lost there, or a fold that anchors one twice, stays red (close-out review). */
+const linkBookedTwice = (f: StepFailure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
+  const KEPT = /^kept-only unused (\S*\/a\+[^/\s]+) own \(applied (\S+)\)$/;
+  const kept = new Map<string, string[]>();
+  for (const l of lines) { const m = KEPT.exec(l); if (m) kept.set(m[1], [...(kept.get(m[1]) ?? []), m[2]]); }
+  const restated = (l: string): boolean => {
+    const m = /^anchors (\S+): fold (\[.*\]) live (\[.*\])$/.exec(l);
+    if (!m || !kept.has(m[1])) return false;
+    try {
+      const fold = JSON.parse(m[2]) as string[], live = JSON.parse(m[3]) as string[];
+      const rest = [...fold];
+      for (const g of live) { const at = rest.indexOf(g); if (at < 0) return false; rest.splice(at, 1); }
+      const links = [...kept.get(m[1])!];
+      for (const g of rest) { const at = links.indexOf(g); if (at < 0 || live.includes(g)) return false; links.splice(at, 1); }
+      return rest.length > 0;
+    } catch { return false; } // a list `show` cut short
+  };
+  return lines.every((l) => KEPT.test(l) || restated(l));
+};
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
     issue: 1951,
@@ -152,6 +179,52 @@ export const KNOWN_OPEN: KnownOpen[] = [
     ],
     reproduces: (f) => pastedFrameStale(f),
     stops: (f, ops) => pastedFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
+  },
+  {
+    issue: 1931,
+    what: "#1931 member 1, the double booking (#2023, hunt seed 424 at length 40, minimized): a user-added node under a TEMPLATE-ADDED node that a template member row's `own` states. Today's orphan test (`templateFrameNodes`) reads only `added`, so the scene row linking the node is kept as an orphan while it is also applied: P1 reads a kept link the fold links at the same row, `(applied)`",
+    repro: [
+      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
+      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
+      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
+      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
+      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
+      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
+      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
+      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
+      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
+      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
+      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
+      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
+      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
+    ],
+    reproduces: (f) => linkBookedTwice(f),
+    // Tolerated, not a stop: the run goes on, and the resurrection below needs it to reach the delete and the reload.
+    tolerates: (f) => linkBookedTwice(f as StepFailure),
+  },
+  {
+    issue: 1931,
+    what: "#1931 member 1, the resurrection (#2023): the same kept orphan row, then delete the node, save, reload: it comes BACK (rule 3: deleting a user-added node removes its record). S4's door drops the record; the old capture still links the node (I25 translates it, `keptDeletedLinks`), and the save writes that link. Acceptance case for #2001 S6 (the save writes the list): when it passes, delete this entry. The translation stays while the capture does (S8), or until a `templateFrameNodes` fix",
+    repro: [
+      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
+      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
+      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
+      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
+      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
+      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
+      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
+      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
+      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
+      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
+      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
+      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
+      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
+      {kind: 'delete', u: [0.6071428571428571, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+    ],
+    // The deleted node itself comes back (its guid's run-independent part: the run's 12th mint), not some other gain.
+    // No `stops`: a stop matching a gained entity would claim every such hunt finding, so a hunt that reaches this
+    // reports it.
+    reproduces: (f) => f.check === 'save→reload is not the identity' && /^\/1000000b-0000-4000-8000-[0-9a-f]+: undefined vs .*\(an entity was gained\)/.test(f.detail),
   },
 ];
 
