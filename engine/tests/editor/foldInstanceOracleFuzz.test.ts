@@ -37,10 +37,12 @@ vi.stubGlobal('window', { __modokiElectron: { bridge } });
 vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
 
-/** The fuzzer's verify seeds and length (`prefabFuzz.test.ts`), and two more (#2009's generator, 2026-10-02): 103 holds
+/** The fuzzer's verify seeds and length (`prefabFuzz.test.ts`), and three more (#2009's generator, 2026-10-02): 103 holds
  *  an unused row under a rule-B placeholder on both sides (kept rows were compared there while the fold's were skipped),
- *  and 235 is the only seed of 1-300 that reaches translation D once #2009's op kinds changed every seed's list. */
-const SEEDS = [...VERIFY_SEEDS, 103, 235];
+ *  235 is the only seed of 1-300 that reaches translation D once #2009's op kinds changed every seed's list, and 178 holds
+ *  a user-added reference node on a member under the scene's own removal of its row, which both sides keep (#2032: the
+ *  pairing skipped today's kept link there while it compared the fold's `heldNode`). */
+const SEEDS = [...VERIFY_SEEDS, 103, 235, 178];
 const LEN = VERIFY_LEN;
 /** The oracle needs the run's saved files; the fuzzer judges the run's checks, so every one is tolerated here. A failure
  *  `tolerate` cannot waive still ends the run, and is red below (#2033). */

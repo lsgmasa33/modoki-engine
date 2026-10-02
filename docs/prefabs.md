@@ -733,6 +733,12 @@ mechanically:
   own node the owner's fold anchors, including one inside a plain added node's `children`. The comparison is #2007's
   oracle (`foldOracle.ts` `checkRecord`), so a difference is a state S5's reload would change.
   - The unused comparison reads two multisets, paired by row. Only a legacy leaf, which names no row, pairs by leaf alone.
+    Under a row the record removes, only that row's `removed` and its user-added nodes are paired. Both sides drop a
+    gone member's other unused parts (#1914 R4), and a keyed copy there is inert in the fold. A user node is `heldNode`
+    (§ 10.4b), and today keeps it wherever the load orphans the row: an inner layer removed the member, the member is
+    gone, or it sits in a missing frame. Skipping the links too turned hunt seed 178 red as
+    `fold-only … own (heldNode)` (#2032). Where the scene's removal alone cuts the member, today keeps the node in no
+    store (#2035).
   - Kept-only lines name their row and carry a marker that separates the waived shapes from loss:
     - `(applied)` only when the record, with that removal turned into a restore, projects the member. A gone member
       does not project after the restore either, so the fold losing its "removed, gone" record cannot read as applied.

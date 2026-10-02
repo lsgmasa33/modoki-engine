@@ -156,7 +156,10 @@ const legacyLeaves = (c: Bag | undefined, out: string[]) => {
   for (const _ of (c.added ?? []) as unknown[]) out.push('own');
   for (const _ of (c.malformed ?? []) as unknown[]) out.push('legacy');
 };
-const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[], skip: (key: string, leaf: string) => boolean = () => false) => {
+/** `skip`'s `keyed`: the leaf is a legacy `added` element with a template key, a statement about a template-added node
+ *  (a keyed copy), not a user-added node, though it reads as an `own` leaf too. */
+type LeafSkip = (key: string, leaf: string, keyed?: boolean) => boolean;
+const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[], skip: LeafSkip = () => false) => {
   for (const [key, r] of Object.entries(rows ?? {})) {
     const leaves: string[] = [];
     leavesOfTraits(r.traits, leaves);
@@ -164,8 +167,9 @@ const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[], skip: (
     for (const n of Object.keys((r.traitRemovals ?? {}) as Bag)) leaves.push(`-${n}`);
     if (r.removed !== undefined) leaves.push('removed');
     if (r.parent) leaves.push('parent');
-    for (const _ of [...((r.added ?? []) as unknown[]), ...((r.own ?? []) as unknown[])]) leaves.push('own');
     for (const leaf of leaves) if (!skip(key, leaf)) out.push(leaf);
+    for (const n of (r.added ?? []) as Bag[]) if (!skip(key, 'own', !!n?.key)) out.push('own');
+    for (const _ of (r.own ?? []) as unknown[]) if (!skip(key, 'own')) out.push('own');
   }
 };
 const unusedLeaf = (u: UnusedRecord): string => {
@@ -179,11 +183,12 @@ const unusedLeaf = (u: UnusedRecord): string => {
 };
 
 /** A kept row's leaves, each link with its guid (`pairUnused`'s `(applied)` reads it): `rowLeaves`' order, so its
- *  `added` links, then its `own`. `skip` is per row and leaf, so it keeps all of a row's links or none. */
-export function keptRowLeaves(key: string, r: Bag, skip: (key: string, leaf: string) => boolean = () => false): { key: string; leaf: string; guid?: string }[] {
+ *  `added` links, then its `own`. `skip` is per row and leaf, and tells a keyed copy from a user node. */
+export function keptRowLeaves(key: string, r: Bag, skip: LeafSkip = () => false): { key: string; leaf: string; guid?: string }[] {
   const leaves: string[] = [];
   rowLeaves({ [key]: r }, leaves, skip);
-  const links = [...((r.added ?? []) as Bag[]), ...((r.own ?? []) as Bag[])].map((n) => n?.guid as string | undefined);
+  const links = [...((r.added ?? []) as Bag[]).filter((n) => !skip(key, 'own', !!n?.key)), ...((r.own ?? []) as Bag[]).filter(() => !skip(key, 'own'))]
+    .map((n) => n?.guid as string | undefined);
   let i = 0;
   return leaves.map((leaf) => (leaf === 'own' ? { key, leaf, guid: links[i++] } : { key, leaf }));
 }
@@ -194,8 +199,12 @@ export function keptRowLeaves(key: string, r: Bag, skip: (key: string, leaf: str
  *    today keeps the same records as unused rows or applies them to the copy, at a granularity a leaf multiset cannot
  *    match (#2009). What this cannot see, a fold that loses or misplaces a record under a placeholder, `placementDiverge`
  *    checks against the record by the rules (#2021).
- *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf: the save drops a gone
- *    member's kept unused part (#1914 R4's fix), and so does the record.
+ *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf and its links: the save
+ *    drops a gone member's kept unused part (#1914 R4's fix), and so does the record. A user-added node there is not
+ *    skipped: the record keeps it `heldNode` (design § 10.4b), and where today orphans the row (its member gone, or
+ *    untargeted because an inner layer removed it, or in a missing frame) it keeps the link and writes it back (#2032,
+ *    hunt seed 178). Where the scene's removal alone cuts the member, today keeps the link in no store (#2035), and the
+ *    fold's record prints `fold-only` whether or not the kept side is skipped.
  *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
  *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
 export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true, held?: Bag, ruledKept: readonly string[] = []): string[] {
@@ -203,8 +212,7 @@ export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceh
   const legacy: string[] = [];
   legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
   for (const leaf of legacy) kept.push({ key: '(legacy)', leaf });
-  const skip = (key: string, leaf: string) => [...livePlaceholders].some((k) => under(key, k))
-    || removedRows.some((k) => under(key, k) && !(key === k && leaf === 'removed'));
+  const skip: LeafSkip = (key, leaf, keyed) => keptLeafSkipped(key, leaf, livePlaceholders, removedRows, keyed);
   for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
     for (const [key, r] of Object.entries(rows ?? {})) kept.push(...keptRowLeaves(key, r, skip));
   }
@@ -228,6 +236,14 @@ export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceh
     return false;
   });
   return [...out, ...pairUnused(rest, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments, (k) => (fold.anchors.get(k as never) ?? []).map((r) => r.guid))];
+}
+
+/** Which kept leaves {@link unusedDiverge} leaves out of the pairing, pure: everything under a live placeholder, and under a
+ *  row the record removes everything but that row's own `removed` leaf and the user-added nodes linked on any row there.
+ *  A keyed copy is skipped there like the rest: under the instance's own removal the fold holds it inert, unreported. */
+export function keptLeafSkipped(key: string, leaf: string, livePlaceholders: ReadonlySet<string>, removedRows: readonly string[], keyed = false): boolean {
+  return [...livePlaceholders].some((k) => under(key, k))
+    || (!(leaf === 'own' && !keyed) && removedRows.some((k) => under(key, k) && !(key === k && leaf === 'removed')));
 }
 
 /** The pairing half of {@link unusedDiverge}, pure: the fold's unused records against today's kept leaves, by row.
