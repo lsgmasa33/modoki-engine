@@ -15,6 +15,16 @@ import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInsta
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { asData, ownAsLinked, roundTripEntry, roundTripTemplateRow, toV10Docs } from './instanceRecordRoundTrip';
+import { rmSync } from 'node:fs';
+// The OS trash, stubbed as in `prefabFuzz.test.ts`: without it every fuzz delete runs Finder's `delete` on the scratch
+// directory, which plays the system trash sound and fills the machine's real Trash. Every user of `makeFuzzBackend` needs it.
+vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
+  ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
+  moveToTrash: (paths: string | string[]) => {
+    for (const p of Array.isArray(paths) ? paths : [paths]) rmSync(p, { recursive: true, force: true });
+    return { failed: [] };
+  },
+}));
 
 setRunMode('stopped');
 const be = makeFuzzBackend();
