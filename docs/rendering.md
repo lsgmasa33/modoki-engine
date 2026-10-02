@@ -4121,6 +4121,22 @@ time-to-content is unchanged. The splash itself stays up longer: on the iPad the
 on screen. The owner accepted "~0.5 s" (2026-10-02), before the texture hold showed the full gap,
 so that ruling covers only part of this number.
 
+**Known gaps.** The close-out reviews raised these and none were reproduced; they are recorded so
+the next reader does not have to rediscover them:
+- **A texture that never settles holds every boot to the 5 s ceiling.** Where the Pixi worker
+  cannot report an error (iOS 16), a KTX2 that fetches but fails to transcode is documented to hang
+  rather than reject. Before #1928 that blanked one sprite; now its `texture2d` token keeps the
+  splash up for the full ceiling on every launch. It needs a broken KTX2 asset, and no shipping
+  game has one.
+- **A particle texture can register a microtask too late.** `pixiParticleBackend` reaches
+  `loadPixiTexture` through `import()`, so an emitter created in the same frame as the board's
+  first render registers after `settleIfEmpty` has already run. Emitters are normally created
+  while the slot is still initialising, so this window is narrow.
+- **After a game-to-game switch, the new board may not be waited for.** A Canvas2D node whose
+  `entityId:generation` key matches one in the old world keeps its fiber, so `Canvas2DMount`'s
+  effect does not re-run and does not register. The `DefaultGameUILayer` remount on the new game's
+  store hook probably covers it, but nobody traced the order.
+
 ⚠️ **Not done: the native WebView `backgroundColor`.** It would only cover the WKWebView's frames
 before its first paint, after the early native-splash hide, and that gap was never observed. The
 colour also must not be a hand-authored hex, because the boot splash derives its own from the art
