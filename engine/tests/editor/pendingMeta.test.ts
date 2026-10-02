@@ -273,6 +273,24 @@ describe('readMetaPreferringPark', () => {
     expect(pendingRef).toBeUndefined();
   });
 
+  // #2057: the modal editors pass the sha their save-time re-read returned as `ifMatch`. Mutation (measured): drop `sha`
+  // from either return — the matching test goes red.
+  it('returns the sha the GET reported, and a passive read records no baseline from it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, headers: new Headers({ 'X-Meta-Sha256': 'disk-sha' }), json: async () => ({ id: 'g' }),
+    }) as unknown as Response));
+    const { sha } = await readMetaPreferringPark(TEX, { passive: true });
+    expect(sha).toBe('disk-sha');
+    expect(peekMetaBaseline(TEX), 'passive reads must not move the shared baseline').toBeUndefined();
+  });
+
+  it("returns a parked doc's baseline as its sha — the bytes that park was built on", async () => {
+    noteMetaReadResult(TEX, { ok: true, headers: new Headers({ 'X-Meta-Sha256': 'base-sha' }) });
+    parkAsPanel(TEX, { texture: { format: 'webp' } });
+    const { sha } = await readMetaPreferringPark(TEX, { passive: true });
+    expect(sha).toBe('base-sha');
+  });
+
   /** The body of a non-ok reply is never read — the fallback stands in for it. Since #880 that
    *  fallback is `metaReadFallback()` rather than a bare `{}`: string-key-identical (so every
    *  call site still merges onto an empty document), but tagged, so a park or wholesale write

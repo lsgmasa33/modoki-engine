@@ -172,10 +172,18 @@ export default AssetLoadRefusedBanner;
  *  ⚠️ **`role="alert"` is load-bearing, not decoration.** The message appears in a modal the human
  *  is already looking at, but it appears *after* a click on a control that visibly did nothing —
  *  the exact case a screen reader user gets no signal for otherwise. */
-export function SaveRefusedNotice({ message, uiId }: { message: string; uiId: string }) {
+export function SaveRefusedNotice({ message, uiId, action }: {
+  message: string; uiId: string;
+  /** One remedy the notice can run in place — the modal editors' Overwrite (#2057). */
+  action?: { label: string; onClick: () => void };
+}) {
   return (
     <div data-ui-id={uiId} role="alert" style={{ ...wrap, margin: 0, flex: 1, textAlign: 'left' }}>
       <span>{message}</span>
+      {action && (
+        <button data-ui-id={`${uiId}.action`} data-ui-kind="button" data-ui-label={action.label} onClick={action.onClick}
+          style={{ marginLeft: 8 }}>{action.label}</button>
+      )}
     </div>
   );
 }

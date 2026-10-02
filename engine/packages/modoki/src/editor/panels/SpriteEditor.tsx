@@ -19,6 +19,7 @@ import { spriteSheetDigest } from './spriteSheetDigest';
 import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
 import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
+import { planModalMetaSave } from './modalMetaSave';
 import {
   gridSlices, makeSlice, inferGridFromRects, DEFAULT_PIVOT,
   type SpriteSlice, type SpriteRect,
@@ -134,12 +135,6 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
   const refreshAssets = useEditorStore((s) => s.refreshAssets);
-  // #845 close-out: the pending-registry value `readMetaPreferringPark` observed for `path` at
-  // load time (or `undefined` when nothing was parked) — carried to `save()` so it can tell
-  // `metaWrittenToDisk` apart "the park this Save already incorporated" from "an Inspector edit
-  // parked while this modal was still open", which must survive to the next Cmd+S. See
-  // pendingMeta.ts's header addendum.
-  const pendingRefAtLoadRef = useRef<unknown>(undefined);
   /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
    *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
    *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
@@ -175,14 +170,12 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // overlay, so this is hardening rather than a demonstrated bug — but the cost is three lines
     // and the failure is silent.)
     metaLoadedRef.current = false;
-    pendingRefAtLoadRef.current = undefined;
     readMetaPreferringPark(path, { signal: ac.signal })
-      .then(({ meta: m, pendingRef, ok }) => {
+      .then(({ meta: m, ok }) => {
         // A superseded path's result must not land on the current one: it would set
         // `metaLoadedRef` and `meta` (with the OLD asset's id) under the new path — the duplicate-GUID
         // save the reset above exists to prevent (#1213 review).
         if (ac.signal.aborted) return;
-        pendingRefAtLoadRef.current = pendingRef;
         metaLoadedRef.current = ok;
         setMeta(m);
         setLoadedPath(path);
@@ -695,24 +688,24 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   };
 
   // ── Persist ──
-  const save = async () => {
+  /** `overwrite`: keys the human chose to replace after a `changed-underneath` refusal (#2057). */
+  const save = async (opts?: { overwrite?: string[] }) => {
     // ⚠️ Clear FIRST, on every attempt — see NineSliceEditor.save for why a stale refusal standing
     // under a later successful write is the same lie in the opposite direction.
     setSaveRefusal(null);
     if (!imgDims) return;
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
-    const nextMeta = {
-      ...(meta ?? {}),
+    // The keys this editor OWNS in the sidecar; `undefined` means absent (#2057 — see modalMetaSave.ts).
+    const owned = {
       spriteMode: clean.length ? 'multiple' : 'single',
-      sprites: clean,
-      spriteSheet: { width: imgDims.w, height: imgDims.h },
+      sprites: clean.length ? clean : undefined,
+      spriteSheet: clean.length ? { width: imgDims.w, height: imgDims.h } : undefined,
       // Persist the editor's slicing controls so reopening keeps the last grid /
       // auto-alpha settings (Unity-style sticky import params).
       spriteGrid: grid,
       spriteAlphaThreshold: alphaThreshold,
     };
-    if (clean.length === 0) { delete (nextMeta as Record<string, unknown>).sprites; delete (nextMeta as Record<string, unknown>).spriteSheet; }
     // AWAIT before onClose() — same race as the 9-slice editor: the Inspector re-reads this
     // file on close, and an un-awaited POST let that GET win and report the pre-edit slices.
     // ⚠️ REFUSE rather than write a document built on a failed read. `/api/write-meta` replaces
@@ -731,7 +724,38 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
     // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     let refusedWhy: string | undefined; // the route's reason, for the dialog (#1824)
-    const persisted = await writeMetaOrWarn(path, nextMeta, (e) => { refusedWhy = e; });
+    // #2057: lay only what THIS editor changed over a FRESH read, conditioned on that read's sha — never the document
+    // read on open, whose every other key would go back as its open-time value (see modalMetaSave.ts).
+    const fresh = await readMetaPreferringPark(path, { passive: true }).catch(() => undefined);
+    if (!fresh?.ok) {
+      // Same remedy as a failed write: nothing was lost, and Save can simply be pressed again.
+      const refusal: SaveRefusal = { kind: 'write-failed', error: 'the import settings could not be re-read before writing' };
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
+    // Untouched since load → the OPEN values, not this editor's normalised rendering of them (see planModalMetaSave).
+    const openMeta: Record<string, unknown> = meta ?? {};
+    const next = dirty ? owned : Object.fromEntries(Object.keys(owned).map((k) => [k, openMeta[k]]));
+    const plan = planModalMetaSave(openMeta, fresh.meta, next, opts?.overwrite);
+    if (!plan.ok) {
+      const refusal: SaveRefusal = { kind: 'changed-underneath', keys: plan.conflict };
+      console.warn(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
+    const nextMeta = { ...fresh.meta, ...plan.set };
+    for (const k of plan.remove) delete (nextMeta as Record<string, unknown>)[k];
+    let preconditionRefused = false;
+    const persisted = await writeMetaOrWarn(path, nextMeta, (e, conflict) => { refusedWhy = e; preconditionRefused = conflict; }, fresh.sha);
+    if (!persisted && preconditionRefused) {
+      // The file moved after the document this save was built on was read. A retry only helps when that read was the
+      // DISK: a park is returned again by every re-read, so its remedy is ⌘S, not Save (#2057 close-out).
+      const refusal: SaveRefusal = { kind: 'changed-underneath', keys: [], fromPark: fresh.pendingRef !== undefined };
+      console.warn(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
     // The save IS the new baseline — otherwise the modal stays dirty after writing and the move
     // gate keeps refusing over work that is already on disk.
     if (persisted) baselineDigestRef.current = spriteSheetDigest(sprites, { grid, alphaThreshold });
@@ -746,12 +770,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
     // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
     // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
-    metaWrittenToDisk(path, pendingRefAtLoadRef.current);
+    metaWrittenToDisk(path, fresh.pendingRef);
 
     // Live-register the slices so existing references resolve without a rescan, and
-    // drop entries for slices that were removed in this session.
+    // drop entries for slices that were removed in this session. From what was WRITTEN, not this editor's state: an
+    // untouched Save keeps the slices on disk, which another writer may have changed (#2057 close-out).
+    const writtenSprites = Array.isArray((nextMeta as Record<string, unknown>).sprites)
+      ? (nextMeta as Record<string, unknown>).sprites as SpriteSlice[] : [];
     if (textureGuid && isGuid(textureGuid)) {
-      for (const s of clean) {
+      for (const s of writtenSprites) {
         registerSprite(s.guid, textureGuid, path, {
           texture: textureGuid, name: s.name, rect: s.rect, pivot: s.pivot,
           ...(s.border ? { border: s.border } : {}),
@@ -759,7 +786,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         });
       }
     }
-    const liveGuids = new Set(clean.map((s) => s.guid));
+    const liveGuids = new Set(writtenSprites.map((s) => s.guid));
     for (const g of initialGuidsRef.current) if (!liveGuids.has(g)) unregisterAsset(g);
 
     // Re-slicing bumps the sprite epoch (in registerSprite); nudge the idle 2D
@@ -869,10 +896,13 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
               in this editor to re-author, and a transient toast is exactly what someone mid-drag
               in the slicer misses. */}
           {saveRefusal && (
-            <SaveRefusedNotice uiId="spriteEditor.saveRefused" message={saveRefusalMessage(saveRefusal)} />
+            <SaveRefusedNotice uiId="spriteEditor.saveRefused" message={saveRefusalMessage(saveRefusal)}
+              action={saveRefusal.kind === 'changed-underneath' && saveRefusal.keys.length
+                ? { label: 'Overwrite', onClick: () => { void save({ overwrite: saveRefusal.keys }); } }
+                : undefined} />
           )}
           <button data-ui-id="spriteEditor.cancel" style={btn} onClick={onClose}>Cancel</button>
-          <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
+          <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={() => { void save(); }}>Save</button>
         </div>
       </div>
     </ModalShell>

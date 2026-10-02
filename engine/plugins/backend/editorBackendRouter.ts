@@ -285,7 +285,7 @@ import {
   readProjectConfigParseErrors,
 } from '../load-project-config';
 import {
-  mergeProjectConfig, mergeProjectUserConfig, deepMergeConfigPatch, pruneProjectConfig, projectConfigIssues,
+  mergeProjectConfig, mergeProjectUserConfig, deepMergeConfigPatch, pruneProjectConfig, projectConfigIssues, REPLACE_WHOLESALE,
   PROJECT_CONFIG_FILENAME, PRIVATE_BUILD_FIELDS,
   findNullPatchPaths, DEFAULT_PROJECT_CONFIG, DEFAULT_PROJECT_USER_CONFIG, type RawProjectConfig,
 } from '../../project-config';
@@ -491,14 +491,21 @@ const isPlainObjectLocal = (v: unknown): v is Record<string, unknown> =>
 
 /** The dotted paths where `expected` (a POST /api/project-settings precondition, shaped like the GET reply) names a value
  *  `current` does not hold (#2049). A nested object is walked; anything else is a leaf compared as JSON, so an expected
- *  `''` matches only `''`. */
-function staleExpectedPaths(expected: Record<string, unknown>, current: unknown, prefix = ''): string[] {
+ *  `''` matches only `''`. Two refinements (#2053 close-out review):
+ *   - a `REPLACE_WHOLESALE` path is compared WHOLE, not walked: the post replaces it, so a member written meanwhile that
+ *     `expected` does not name (a tier an agent added) is lost exactly as surely as a changed one.
+ *   - a value that already equals what `patch` posts there is not stale — nothing would be replaced. That is the retry
+ *     after a partial write (the route writes `project.user.json` first, so a 500 can leave the user half landed) and
+ *     two writers agreeing; refusing either blamed "another writer" for the caller's own value. */
+function staleExpectedPaths(expected: Record<string, unknown>, current: unknown, patch: unknown, prefix = ''): string[] {
   const stale: string[] = [];
+  const at = (o: unknown, k: string) => isPlainObjectLocal(o) && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined;
   for (const [k, want] of Object.entries(expected)) {
-    const at = prefix ? `${prefix}.${k}` : k;
-    const have = isPlainObjectLocal(current) && Object.prototype.hasOwnProperty.call(current, k) ? current[k] : undefined;
-    if (isPlainObjectLocal(want)) stale.push(...staleExpectedPaths(want, have, at));
-    else if (JSON.stringify(want) !== JSON.stringify(have)) stale.push(at);
+    const path = prefix ? `${prefix}.${k}` : k;
+    const have = at(current, k);
+    const posted = at(patch, k);
+    if (isPlainObjectLocal(want) && !REPLACE_WHOLESALE.has(path)) stale.push(...staleExpectedPaths(want, have, posted, path));
+    else if (JSON.stringify(want) !== JSON.stringify(have) && (posted === undefined || JSON.stringify(posted) !== JSON.stringify(have))) stale.push(path);
   }
   return stale;
 }
@@ -5721,10 +5728,10 @@ async function describeUnresolvedAgainstLiveWorld(
   // silently dropped (see the tiers-completeness check further down). This is deliberate — the
   // Project Settings "Remove tier" button needs a way to express deletion, which "omission means
   // untouched" cannot express.
-  // This is load-bearing: the Project Settings
-  // dialog posts the WHOLE object (so every key is present and blanking a field
-  // still works), but `modoki_project_settings action=set` and the OTA-keys
-  // "sync public key" button post a single section. This route used to merge onto
+  // This is load-bearing: every caller posts a PARTIAL body — the Project Settings
+  // dialog only the leaves it changed, with their open-time values as `expected`
+  // (#2053, `planSettingsSave`), and `modoki_project_settings action=set` and the
+  // OTA-keys "sync public key" button a single section. This route used to merge onto
   // the DEFAULTS instead (mergeProjectConfig is the LOAD-time resolver), so those
   // partial callers silently reset app identity to com.modokiengine.prototype and
   // blanked appleTeamId. Absence must mean "don't touch", never "reset to default".
@@ -5741,8 +5748,8 @@ async function describeUnresolvedAgainstLiveWorld(
   if (urlPath === '/api/project-settings' && method === 'POST') {
     try {
       // `configErrors` and `configWarnings` are the GET's read-only diagnostics, not
-      // sections. The dialog posts back the WHOLE object it loaded, so either would
-      // otherwise come straight back here and trip the unknown-section 400 below — a
+      // sections. A caller that round-trips the GET reply (the dialog did, before #2053) would
+      // otherwise send either straight back here and trip the unknown-section 400 below — a
       // confusing refusal for something the caller never authored. Drop both before
       // anything else looks.
       //
@@ -5761,19 +5768,19 @@ async function describeUnresolvedAgainstLiveWorld(
       const { user: userPartIn, ...configPart } = bodyIn;
       let userPart = userPartIn;
       // Private build.* fields (see PRIVATE_BUILD_FIELDS) must never land in
-      // project.config.json — the Project Settings dialog posts back the WHOLE
-      // resolved object (which is the OVERLAID config, see loadProjectConfig), so
-      // without this split a private value would round-trip straight back into the
-      // committed file on the very next save and undo the migration. Move each
-      // private field present in `configPart.build` into the user patch, and force
-      // it to '' in the committed patch so Apply also CLEARS any pre-existing
-      // committed value: a save becomes an automatic migration off the committed file.
+      // project.config.json — the dialog edits the OVERLAID config (see loadProjectConfig), so
+      // without this split a private value it posts would land straight back in the committed
+      // file and undo the migration. Move each private field present in `configPart.build` into
+      // the user patch, and force it to '' in the committed patch so the save also CLEARS any
+      // pre-existing committed value. (Before #2053 the dialog posted every field, so every Apply
+      // migrated; now only an Apply that edits the field does — `migrate:private-config` covers
+      // the rest.)
       //
       // `build.<field>` present in the patch WINS over anything in `user.build` —
       // it is the field the Project Settings dialog actually edits (see the
-      // `build.appleTeamId` / `build.webBucket` entries in app/editor/setup.ts), and
-      // the dialog posts the WHOLE object, so the `user` subtree it sends back is
-      // whatever it LOADED, never the edit. Deferring to it instead would silently
+      // `build.appleTeamId` / `build.webBucket` entries in app/editor/setup.ts), and a
+      // `user` subtree that comes back beside it (a caller round-tripping the GET reply, as the
+      // dialog did before #2053) is whatever was LOADED, never the edit. Deferring to it instead would silently
       // discard every change: type a new Team ID, press Apply, and the stale
       // round-tripped `user.build.appleTeamId` would win and the dialog would reload
       // showing the old value — and clearing a field would be impossible. A caller
@@ -5854,7 +5861,9 @@ async function describeUnresolvedAgainstLiveWorld(
         if (!isPlainObjectLocal(expected)) {
           return json({ error: '`expected` must be an object shaped like the GET /api/project-settings reply — nothing was written.' }, 400);
         }
-        const changed = staleExpectedPaths(expected, { ...loadProjectConfig(ctx.projectRoot), user: loadProjectUserConfig(ctx.projectRoot) });
+        // "What the post writes", in the GET's shape: `userPart` AFTER the private-field move above, so a `build.<field>`
+        // that overrides a posted `user.build.<field>` is compared as the value that will land, not the overridden one.
+        const changed = staleExpectedPaths(expected, { ...loadProjectConfig(ctx.projectRoot), user: loadProjectUserConfig(ctx.projectRoot) }, { ...bodyIn, user: userPart });
         if (changed.length) {
           return json({
             error: `${changed.join(', ')} changed since it was read — nothing was written. Read Project Settings again and decide against the value there now.`,

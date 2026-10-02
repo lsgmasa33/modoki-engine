@@ -152,10 +152,16 @@ export async function writeMetaConditional(path: string, meta: unknown, ifMatch?
  *
  *  `onRefused` hands a refusal's reason to a caller that states it (#1824, R4): the boolean stays, because several
  *  source-scanning guards key on these call sites by name, and an object return would be silently truthy at every
- *  `if (await writeMetaOrWarn(…))`. */
-export function writeMetaOrWarn(path: string, meta: unknown, onRefused?: (error: string) => void): Promise<boolean> {
-  return writeMetaConditional(path, meta).then((r) => {
-    if (!r.ok) onRefused?.(r.error ?? 'the .meta.json write was refused');
+ *  `if (await writeMetaOrWarn(…))`.
+ *
+ *  `ifMatch` as on `writeMetaConditional`: the modal editors pass the sha their save-time re-read returned (#2057), and
+ *  `onRefused`'s `conflict` tells them a precondition refusal — which pressing Save again cannot get past — from a
+ *  failure a retry can. */
+export function writeMetaOrWarn(
+  path: string, meta: unknown, onRefused?: (error: string, conflict: boolean) => void, ifMatch?: string,
+): Promise<boolean> {
+  return writeMetaConditional(path, meta, ifMatch).then((r) => {
+    if (!r.ok) onRefused?.(r.error ?? 'the .meta.json write was refused', r.conflict);
     return r.ok;
   });
 }

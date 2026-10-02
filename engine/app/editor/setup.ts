@@ -730,15 +730,21 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
         },
       ],
       load: () => backendFetch('/api/project-settings').then((r) => r.json()),
-      save: (values) =>
+      save: (values, opts) =>
         backendFetch('/api/project-settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(values),
+          body: JSON.stringify(opts?.expected ? { ...values, expected: opts.expected } : values),
         }).then(async (r) => {
           // Apply physics layers live so the editor reflects matrix/name edits without
           // a reload — colliders rebuild next tick (resolved bits are in their signature).
-          if (r.ok && values.physics) setPhysicsLayers(values.physics as Parameters<typeof setPhysicsLayers>[0]);
+          // Re-read rather than use `values.physics`: the dialog posts only what it changed (#2053), so the patch can
+          // carry `layers` without `collisionMatrix`, and setPhysicsLayers reads an absent matrix as "all collide".
+          if (r.ok && values.physics) {
+            void backendFetch('/api/project-settings').then((g) => g.json())
+              .then((s: { physics?: Parameters<typeof setPhysicsLayers>[0] }) => setPhysicsLayers(s.physics))
+              .catch((e) => console.error('[Editor] could not re-read physics layers after Apply:', e));
+          }
           // The dialog can edit the same `user.device` ids the Build menu shows (#170) — re-read
           // them so the menu's label and ✓ can't contradict the dialog the user just saved.
           if (r.ok && values.user) void refreshDeviceTargets();
@@ -746,8 +752,13 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
           // Surface the server's reason. The route refuses a save for things the user
           // can fix (an unsafe build field, a config file that no longer parses), and
           // dropping the message left the dialog just not closing, with no explanation.
-          const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
-          return msg || `Save failed (${r.status})`;
+          const j = await r.json().catch(() => undefined) as { error?: string; conflict?: boolean; changed?: string[] } | undefined;
+          // A precondition refusal (#2053): `expected` named a value written underneath the dialog. Hand back the paths so
+          // the dialog can name them and offer to re-read.
+          if (r.status === 409 && j?.conflict && Array.isArray(j.changed)) {
+            return { conflict: j.changed, message: j.error || `${j.changed.join(', ')} changed since Project Settings opened` };
+          }
+          return j?.error || `Save failed (${r.status})`;
         }),
       pickPath: async (mode) => {
         try {

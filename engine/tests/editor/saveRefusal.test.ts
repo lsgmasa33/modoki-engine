@@ -69,3 +69,32 @@ describe('saveRefusalConsoleMessage — the debugging half, which is NOT dropped
     expect(nine).toContain('[NineSliceEditor]');
   });
 });
+
+// #2057: a key this editor changed was also written on disk since it opened. Pressing Save again is refused again, so the
+// remedy must not be "press Save again", and the key must be named.
+describe('changed-underneath (#2057)', () => {
+  const r: SaveRefusal = { kind: 'changed-underneath', keys: ['border'] };
+  it('names the key and does not advise a retry', () => {
+    expect(saveRefusalMessage(r)).toContain('border');
+    expect(saveRefusalMessage(r)).not.toContain('press Save again');
+    expect(saveRefusalConsoleMessage(r, 'NineSliceEditor', 'ui/panel.png')).toContain('border');
+  });
+
+  // With no keys the write's own precondition refused it, and the remedy depends on what the save-time read was
+  // (close-out review): a DISK read just needs a retry; a PARK is returned again by every re-read and by a reopen, so
+  // only ⌘S resolves it. Neither may advise reopening, which throws the slicing away. Mutation (measured): drop the
+  // `fromPark` branch — the second goes red.
+  it('no keys, read from disk: press Save again', () => {
+    const r: SaveRefusal = { kind: 'changed-underneath', keys: [] };
+    expect(saveRefusalMessage(r)).toContain('press Save again');
+    expect(saveRefusalMessage(r)).not.toContain('reopen');
+    expect(saveRefusalMessage(r)).not.toContain('Overwrite');
+  });
+
+  it('no keys, read from a park: ⌘S first, never reopen', () => {
+    const r: SaveRefusal = { kind: 'changed-underneath', keys: [], fromPark: true };
+    expect(saveRefusalMessage(r)).toContain('⌘S');
+    expect(saveRefusalMessage(r)).not.toContain('reopen');
+  });
+});
+

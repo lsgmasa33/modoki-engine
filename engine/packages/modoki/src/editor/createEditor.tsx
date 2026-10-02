@@ -481,8 +481,8 @@ export interface ProjectSettingsField {
   committedPath?: boolean;
   /** `readonly-text` renders a disabled input showing the current value — for a
    *  setting that's DERIVED (e.g. `ota.publicKey`, written by a dedicated flow
-   *  like the OTA Keys dialog), never hand-typed. NOT posted back on Apply
-   *  (`draftForSave`, #2049): the value shown is the one read when the dialog
+   *  like the OTA Keys dialog), never hand-typed. NEVER posted on Apply
+   *  (`planSettingsSave`, #2049): the value shown is the one read when the dialog
    *  opened, and writing it back replaced whatever that flow wrote since. */
   /** Conditional visibility: show this field only when the current value at
    *  `key` (a dot-path into the settings object) is one of `in`. Used e.g. to
@@ -508,6 +508,13 @@ export interface ProjectSettingsTab {
   groups: ProjectSettingsGroup[];
 }
 
+/** A save refused because a value `expected` named changed on disk since the dialog read it (#2053). `changed` holds
+ *  the route's dotted paths — never values, since a path may be a signing password. */
+export interface ProjectSettingsConflict {
+  conflict: string[];
+  message: string;
+}
+
 /** Project-specific Project Settings definition, injected by the host so the
  *  reusable engine stays free of project-specific fields. */
 export interface ProjectSettingsSchema {
@@ -518,8 +525,11 @@ export interface ProjectSettingsSchema {
    *  the refusal so the dialog can show it. The backend rejects a save for reasons
    *  the user can act on (an unsafe build field, a hand-edited config that no longer
    *  parses); returning a bare `false` for those left the dialog silently refusing
-   *  to close with the reason stranded in the console. */
-  save: (values: Record<string, unknown>) => Promise<boolean | string>;
+   *  to close with the reason stranded in the console.
+   *
+   *  `values` is a PATCH — only what the dialog changed (#2053) — and `opts.expected` is the route's precondition:
+   *  each changed value as the dialog read it. A host that posts it resolves a 409 as a `ProjectSettingsConflict`. */
+  save: (values: Record<string, unknown>, opts?: { expected?: Record<string, unknown> }) => Promise<boolean | string | ProjectSettingsConflict>;
   /** Open a native file/folder chooser for `path` fields. Resolves the chosen
    *  path (project-relative when inside the project, else absolute), or null on
    *  cancel/unsupported. Host-provided so the package stays backend-agnostic. */

@@ -30,7 +30,7 @@
  *  staying open is the second case — and a toast over an open dialog can be missed entirely by
  *  someone mid-drag in the slicer, which is exactly when a slice set is most expensive to lose. */
 
-/** The two ways a modal editor's Save declines to write.
+/** The ways a modal editor's Save declines to write.
  *
  *  ⚠️ A union rather than a boolean or a bare string: the two have DIFFERENT remedies (reopen the
  *  dialog vs. press Save again), and a caller that cannot tell them apart cannot say which. */
@@ -40,7 +40,14 @@ export type SaveRefusal =
   | { kind: 'meta-never-read' }
   /** The read was fine and the POST failed (dev server down, 500). The edit is intact and pressing
    *  Save again is exactly the right move. `error` is the route's reason when it gave one (#1824). */
-  | { kind: 'write-failed'; error?: string };
+  | { kind: 'write-failed'; error?: string }
+  /** A key this editor changed was ALSO written on disk since the editor opened (an agent or another window), to a
+   *  different value (#2057). Pressing Save again would be refused again. With `keys`, the dialog offers Overwrite (keep
+   *  this edit, replace theirs); with none, the write's own precondition refused it, and the remedy depends on what
+   *  the save-time read returned. `fromPark`: it was an unsaved Inspector edit built on an older copy of the file, which
+   *  every re-read (and a reopen) returns again — only ⌘S resolves it (its flush reports the conflict once and drops the
+   *  stale baseline). Not parked: a write landed between this save's read and its write, and Save simply re-reads. */
+  | { kind: 'changed-underneath'; keys: string[]; fromPark?: boolean };
 
 /** The sentence shown IN the dialog, beside the Save button that did nothing.
  *
@@ -56,6 +63,19 @@ export function saveRefusalMessage(refusal: SaveRefusal): string {
       // The route's own sentence when it gave one (#1824) — "see the console" only when there is none.
       return `⚠ Not saved — ${refusal.error ? `the write was refused: ${refusal.error}.` : 'the write failed (see the console for the server\'s reason).'} `
         + 'Your edit is intact and the dialog is staying open, so press Save again.';
+    case 'changed-underneath':
+      if (refusal.keys.length === 0 && refusal.fromPark) {
+        return '⚠ Not saved — an unsaved Inspector edit to this asset\'s import settings was made against an older copy '
+          + 'of the file, which has changed since. Press ⌘S to save or resolve that edit first, then press Save here '
+          + 'again; your edit here is kept while this dialog stays open.';
+      }
+      if (refusal.keys.length === 0) {
+        return '⚠ Not saved — the file changed between this save\'s read and its write (another writer). Your edit is '
+          + 'intact; press Save again, which re-reads the file first.';
+      }
+      return `⚠ Not saved — ${refusal.keys.join(', ')} changed on disk since this editor opened (an agent or another `
+        + 'window wrote it). Your edit is still here: press Overwrite to replace that value with yours, or close and '
+        + 'reopen this dialog to see the value there now.';
   }
 }
 
@@ -82,5 +102,11 @@ export function saveRefusalConsoleMessage(refusal: SaveRefusal, tag: string, pat
     case 'write-failed':
       return `[${tag}] save failed for ${path} — the dialog is staying open so the edit is not lost. `
         + 'See the sidecar write error logged just above for the server\'s reason.';
+    case 'changed-underneath':
+      return refusal.keys.length
+        ? `[${tag}] refusing to save ${path} — ${refusal.keys.join(', ')} changed on disk since the editor opened, `
+          + 'and this save changes it too. Nothing was written.'
+        : `[${tag}] refusing to save ${path} — the sidecar changed after the document this save was built on was read `
+          + '(ifMatch precondition). Nothing was written.';
   }
 }

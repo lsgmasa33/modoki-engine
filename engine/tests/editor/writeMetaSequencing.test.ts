@@ -102,7 +102,8 @@ describe('the asset-editor modals await the write before closing', () => {
     });
 
     it(`${rel}'s save is async, so the await actually suspends it`, () => {
-      expect(read(rel)).toMatch(/const save = async \(\) =>/);
+      // Parameters allowed: `save(opts?)` carries the notice's Overwrite keys since #2057.
+      expect(read(rel)).toMatch(/const save = async \([^)]*\) =>/);
     });
 
     it(`${rel} does NOT close when the write fails — the edit must survive a dev-server blip`, () => {

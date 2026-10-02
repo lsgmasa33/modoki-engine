@@ -13,6 +13,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
+import { planModalMetaSave } from './modalMetaSave';
 import { BufferedNumberInput } from './fields';
 import { registerSprite, isGuid, deriveGuid, type SpriteAssetRef } from '../../runtime/loaders/assetManifest';
 import { captureSpriteSnapshot, revertSpritePreview } from './nineSliceRevert';
@@ -77,12 +78,6 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // `undefined` = not captured yet.
   const entrySnapshotRef = useRef<SpriteAssetRef | null | undefined>(undefined);
   const savedRef = useRef(false);
-  // #845 close-out: the pending-registry value `readMetaPreferringPark` observed for `path` at
-  // load time (or `undefined` when nothing was parked) — carried to `save()` so it can tell
-  // `metaWrittenToDisk` apart "the park this Save already incorporated" from "an Inspector edit
-  // parked while this modal was still open", which must survive to the next Cmd+S. See
-  // pendingMeta.ts's header addendum.
-  const pendingRefAtLoadRef = useRef<unknown>(undefined);
   /** #845 close-out: did the load actually READ the sidecar, or is `meta` the `{}` fallback from a
    *  failed GET? `save()` writes the document WHOLESALE, so spreading a fallback would drop the
    *  asset's `id` and the scanner would mint a new GUID for it — orphaning every ref. Starts
@@ -109,10 +104,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     // overlay, so this is hardening rather than a demonstrated bug — but the cost is three lines
     // and the failure is silent.)
     metaLoadedRef.current = false;
-    pendingRefAtLoadRef.current = undefined;
     readMetaPreferringPark(path, { signal: ac.signal })
-      .then(({ meta: m, pendingRef, ok }) => {
-        pendingRefAtLoadRef.current = pendingRef;
+      .then(({ meta: m, ok }) => {
         metaLoadedRef.current = ok;
         setMeta(m);
         const b = m.border as (Partial<NineSliceBorder> & { scale?: number }) | undefined;
@@ -372,15 +365,14 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   });
 
   // ── Persist ──
-  const save = async () => {
+  /** `overwrite`: keys the human chose to replace after a `changed-underneath` refusal (#2057). */
+  const save = async (opts?: { overwrite?: string[] }) => {
     // ⚠️ Clear FIRST, on every attempt. A refusal left standing under a later outcome is worse than
     // no refusal: press Save again after the dev server recovers and a stale "not saved" would sit
     // there while the write actually landed, which is the same lie in the opposite direction.
     setSaveRefusal(null);
     const hasBorder = border.l || border.r || border.t || border.b;
     const borderOut = { ...border, ...(edgeScale !== 1 ? { scale: edgeScale } : {}) };
-    const nextMeta = { ...(meta ?? {}), ...(hasBorder ? { border: borderOut } : {}) };
-    if (!hasBorder) delete (nextMeta as Record<string, unknown>).border;
     // AWAIT the write before onClose(): the Inspector's onClose handler re-reads this exact file,
     // so an un-awaited POST raced that GET and the Inspector kept showing the pre-edit numbers
     // (the reported "editing the 9-slice doesn't change the Inspector values").
@@ -405,7 +397,39 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
     // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     let refusedWhy: string | undefined; // the route's reason, for the dialog (#1824)
-    const persisted = await writeMetaOrWarn(path, nextMeta, (e) => { refusedWhy = e; });
+    // #2057: lay only what THIS editor changed over a FRESH read, conditioned on that read's sha — never the document
+    // read on open, whose every other key would go back as its open-time value (see modalMetaSave.ts).
+    const fresh = await readMetaPreferringPark(path, { passive: true }).catch(() => undefined);
+    if (!fresh?.ok) {
+      // Same remedy as a failed write: nothing was lost, and Save can simply be pressed again.
+      const refusal: SaveRefusal = { kind: 'write-failed', error: 'the import settings could not be re-read before writing' };
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
+    // Untouched since load → the OPEN value, not this editor's normalised rendering of it (see planModalMetaSave).
+    const owned = dirty
+      ? { border: hasBorder ? borderOut : undefined }
+      : { border: (meta ?? {}).border };
+    const plan = planModalMetaSave(meta ?? {}, fresh.meta, owned, opts?.overwrite);
+    if (!plan.ok) {
+      const refusal: SaveRefusal = { kind: 'changed-underneath', keys: plan.conflict };
+      console.warn(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
+    const nextMeta = { ...fresh.meta, ...plan.set };
+    for (const k of plan.remove) delete (nextMeta as Record<string, unknown>)[k];
+    let preconditionRefused = false;
+    const persisted = await writeMetaOrWarn(path, nextMeta, (e, conflict) => { refusedWhy = e; preconditionRefused = conflict; }, fresh.sha);
+    if (!persisted && preconditionRefused) {
+      // The file moved after the document this save was built on was read. A retry only helps when that read was the
+      // DISK: a park is returned again by every re-read, so its remedy is ⌘S, not Save (#2057 close-out).
+      const refusal: SaveRefusal = { kind: 'changed-underneath', keys: [], fromPark: fresh.pendingRef !== undefined };
+      console.warn(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
+      return;
+    }
     if (!persisted) {
       // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
       // for a reason that has nothing to do with the edit — a dev-server blip — and the user has
@@ -425,16 +449,18 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
     // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
     // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
-    metaWrittenToDisk(path, pendingRefAtLoadRef.current);
+    metaWrittenToDisk(path, fresh.pendingRef);
 
     // Live-update the texture's auto whole-image sprite so UINode's border-image
-    // reflects the edit without waiting for a rescan.
+    // reflects the edit without waiting for a rescan. From what was WRITTEN, not this editor's state: an untouched
+    // Save keeps the border on disk, which another writer may have changed (#2057 close-out).
     const texGuid = typeof meta?.id === 'string' ? meta.id : undefined;
+    const writtenBorder = (nextMeta as Record<string, unknown>).border as typeof borderOut | undefined;
     if (texGuid && isGuid(texGuid) && imgDims) {
       registerSprite(deriveGuid('sprite:' + texGuid), texGuid, path, {
         texture: texGuid, name, rect: { x: 0, y: 0, w: imgDims.w, h: imgDims.h }, pivot: { x: 0.5, y: 0.5 },
         sheetW: imgDims.w, sheetH: imgDims.h,
-        ...(hasBorder ? { border: borderOut } : {}),
+        ...(writtenBorder ? { border: writtenBorder } : {}),
       });
     }
     markUIDirty();
@@ -500,10 +526,13 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
           {/* #901: beside the Save button that did nothing — not a toast over the dialog, which
               someone mid-drag in the border handles can miss entirely. */}
           {saveRefusal && (
-            <SaveRefusedNotice uiId="nineSlice.saveRefused" message={saveRefusalMessage(saveRefusal)} />
+            <SaveRefusedNotice uiId="nineSlice.saveRefused" message={saveRefusalMessage(saveRefusal)}
+              action={saveRefusal.kind === 'changed-underneath' && saveRefusal.keys.length
+                ? { label: 'Overwrite', onClick: () => { void save({ overwrite: saveRefusal.keys }); } }
+                : undefined} />
           )}
           <button data-ui-id="nineSlice.cancel" style={btn} onClick={onClose}>Cancel</button>
-          <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
+          <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={() => { void save(); }}>Save</button>
         </div>
       </div>
     </ModalShell>

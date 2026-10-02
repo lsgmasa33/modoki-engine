@@ -511,6 +511,11 @@ export interface PreferredMetaRead {
    *  (`writeMetaSidecar` salvages the `id` textually before quarantining), so do not re-derive a
    *  "safe to spread" argument from this flag alone. It distinguishes a failed READ, nothing more. */
   ok: boolean;
+  /** The sha256 of the sidecar bytes `meta` was built from — the server's `X-Meta-Sha256` for a disk read, the park's
+   *  own baseline for a parked doc — or `undefined` when unknown (a failed read, an older backend, a park with no
+   *  baseline). It is what a caller writing `meta` back passes as `ifMatch`, so a write landing between this read and
+   *  that one is refused instead of replaced (#2057). Returned even for a `passive` read, which records nothing. */
+  sha?: string;
 }
 
 /** Read `path`'s `.meta.json`, preferring a parked edit over disk (#845 close-out — see this
@@ -530,7 +535,7 @@ export async function readMetaPreferringPark(
   opts?: { signal?: AbortSignal; reimportEpoch?: number; passive?: boolean },
 ): Promise<PreferredMetaRead> {
   const parked = peekPendingMeta(path);
-  if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true };
+  if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true, sha: baselines.get(path) };
   const url = cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, opts?.reimportEpoch ?? 0);
   const r = await backendFetch(url, opts?.signal ? { signal: opts.signal } : undefined);
   // ⚠️ `passive` reads record NOTHING (#872 review). A baseline is a claim about the bytes a
@@ -555,7 +560,8 @@ export async function readMetaPreferringPark(
   // The missing-stats hint (#1305) is NOT returned: it lives in `missingLocalStats.ts`, recorded
   // above, and panels read it through `useMissingLocalStats`. A second copy here could disagree
   // with the store (a park landing mid-GET), and nothing read it.
-  return { meta, pendingRef: undefined, ok: r.ok };
+  const sha = r.ok ? r.headers?.get?.('X-Meta-Sha256') ?? undefined : undefined;
+  return { meta, pendingRef: undefined, ok: r.ok, ...(sha ? { sha } : {}) };
 }
 
 /** Write `path`'s FULL `.meta.json` and, ONLY IF it landed, forget the baseline it invalidated

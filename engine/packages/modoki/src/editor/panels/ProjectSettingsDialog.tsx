@@ -19,7 +19,8 @@ import PhysicsLayersEditor from './PhysicsLayersEditor';
 import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
 import QualityTiersEditor from './QualityTiersEditor';
-import { committedPathWarning, imagePreviewPath, shouldAcceptSettingsDrop, draftForSave } from './projectSettingsPaths';
+import { committedPathWarning, imagePreviewPath, shouldAcceptSettingsDrop } from './projectSettingsPaths';
+import { planSettingsSave, rebaseSettingsDraft } from './projectSettingsSave';
 import { parseStringList, stringListText } from './stringListText';
 import { Info } from './fields';
 import { fileToBase64 } from './fileBytes';
@@ -452,37 +453,78 @@ export default function ProjectSettingsDialog() {
   const open = useEditorStore((s) => s.projectSettingsOpen);
   const close = useEditorStore((s) => s.closeProjectSettings);
   const schema = getProjectSettings();
+  // `base` is what the dialog READ on open (or on the last Re-read); Apply posts only where `draft` differs from it, with
+  // its values as the route's precondition (#2053) — see projectSettingsSave.ts.
+  const [base, setBase] = useState<Values | null>(null);
   const [draft, setDraft] = useState<Values | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  /** The paths a 409 named, while the Re-read offer stands. */
+  const [conflict, setConflict] = useState<string[] | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(0);
 
   useEffect(() => {
     if (!open || !schema) return;
     let cancelled = false;
     setDraft(null);
+    setBase(null);
+    setConflict(null);
+    setNotice(null);
+    setSaveError(null);
     setActiveTab(0);
     schema.load()
-      .then((v) => { if (!cancelled) setDraft(v ?? {}); })
-      .catch((e) => { if (!cancelled) { console.error('[Editor] Failed to load project settings:', e); setDraft({}); } });
+      .then((v) => { if (!cancelled) { setBase(v ?? {}); setDraft(v ?? {}); } })
+      .catch((e) => { if (!cancelled) { console.error('[Editor] Failed to load project settings:', e); setBase({}); setDraft({}); } });
     return () => { cancelled = true; };
   }, [open, schema]);
 
   if (!open || !schema) return null;
 
   const apply = async () => {
-    if (!draft) return;
+    if (!draft || !base) return;
+    // Only what this dialog changed, conditioned on what it read (#2053): a setting an agent wrote meanwhile is kept.
+    const plan = planSettingsSave(base, draft, schema);
+    if (plan.changed.length === 0) { close(); return; }
     setSaving(true);
     setSaveError(null);
-    const res = await schema.save(draftForSave(draft, schema)); // never a readonly field's open-time value (#2049)
+    setNotice(null);
+    const res = await schema.save(plan.patch, { expected: plan.expected });
     setSaving(false);
     if (res === true) { close(); return; }
+    if (typeof res === 'object') {
+      // Written underneath the dialog. Nothing was saved; name the fields and offer to re-read, since pressing Apply
+      // again would only be refused again.
+      setConflict(res.conflict);
+      setSaveError(`Not saved — ${res.conflict.join(', ')} changed since Project Settings opened (an agent or another `
+        + 'window wrote it). Re-read to see the value there now; your other edits are kept.');
+      console.warn('[Editor]', res.message);
+      return;
+    }
     // Keep the dialog open AND say why: the draft is still in the fields, so the
     // user can fix the offending value in place. Failing silently here meant a
     // refused save looked identical to a click that did nothing.
     const msg = typeof res === 'string' ? res : 'Failed to save project settings';
     setSaveError(msg);
     console.error('[Editor]', msg);
+  };
+
+  const reread = async () => {
+    if (!draft || !base || !conflict) return;
+    let fresh: Values;
+    try { fresh = (await schema.load()) ?? {}; } catch (e) {
+      setSaveError(`Could not re-read Project Settings: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const { draft: next, dropped } = rebaseSettingsDraft(fresh, base, draft, schema, conflict);
+    setBase(fresh);
+    setDraft(next);
+    setConflict(null);
+    setSaveError(null);
+    setNotice(dropped.length
+      ? `Re-read. ${dropped.join(', ')} now ${dropped.length === 1 ? 'shows' : 'show'} the value written since this dialog `
+        + 'opened, and your edit to it was dropped. Enter it again and Apply to replace that value.'
+      : 'Re-read. Your edits are kept.');
   };
 
   const tab = schema.tabs[Math.min(activeTab, schema.tabs.length - 1)];
@@ -615,7 +657,19 @@ export default function ProjectSettingsDialog() {
           <div style={{
             marginTop: 12, padding: '8px 10px', background: '#3a1e1e', border: '1px solid #a33',
             color: '#f2b8b8', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-          }}>{saveError}</div>
+          }}>{saveError}{conflict && (
+            <div style={{ marginTop: 8 }}>
+              <button data-ui-id="projectSettings.conflict.reread" data-ui-kind="button" data-ui-label="Re-read" onClick={() => { void reread(); }}
+                style={footerBtn}>Re-read</button>
+            </div>
+          )}</div>
+        )}
+
+        {notice && (
+          <div data-testid="settings-notice" style={{
+            marginTop: 12, padding: '8px 10px', background: '#1e2a3a', border: '1px solid #357',
+            color: '#c8d8f0', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          }}>{notice}</div>
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>

@@ -389,6 +389,29 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   a duplicate of the endpoint's — it fires at EDIT time rather than save time, so the human is told
   while looking at the control instead of N edits later at Cmd+S.
 
+  ⚠️ **The two modal editors' Save is conditional and key-scoped since #2057.** They read the
+  sidecar when they OPEN, and Save used to write that whole open-time document back (their own keys
+  laid over it) with no `ifMatch`. So an import setting an agent wrote while the modal was open was
+  reverted. That was observed live: `maxSize` written to 512 came back as the open-time 1024 under
+  the pre-fix 9-Slice Editor. Save now re-reads (`readMetaPreferringPark`, passive, which returns
+  the read's `sha`), and lays over the FRESH document only the owned keys this editor changed
+  (`planModalMetaSave`, `panels/modalMetaSave.ts`). Sprite owns `spriteMode`/`sprites`/
+  `spriteSheet`/`spriteGrid`/`spriteAlphaThreshold`; 9-slice owns `border`. The write carries that
+  sha as `ifMatch`. An owned key both changed is refused with a `changed-underneath` notice naming
+  it (`saveRefusal.ts`), which offers **Overwrite**: re-plan with that key forced, keeping the
+  slicing work. Reopening would throw it away. An editor that is not `dirty` passes the OPEN values
+  as its owned keys, not its own rendering of them. 9-slice normalises a border on load (missing
+  sides become 0, `scale: 1` is dropped), and that rendering would otherwise read as an edit. That
+  edit would either be refused for no reason or written back over the other writer. A refusal by
+  the write's own `ifMatch` is a `changed-underneath` with no keys, and its remedy depends on what
+  the save-time read returned. If it was the DISK, a write landed between the read and the write,
+  and Save simply re-reads. If it was a PARK (`fromPark`), the Inspector edit was built on an older
+  file. Every re-read returns that park again, and so does a reopen, which would also throw the
+  slicing away. So the notice names ⌘S, whose flush reports the conflict once and drops the stale
+  baseline. The live sprite registry is updated from the document WRITTEN, not from the editor's
+  state, because an untouched Save keeps what is on disk. This is #2053's ruling on Project
+  Settings, applied to a sidecar.
+
   ⚠️ **The remaining door is `scene/modelImport.ts`, and it is guarded from the OUTSIDE.** It POSTs
   `/api/write-meta` directly at three sites, through neither `parkMetaEdit` nor
   `writeMetaWholesale` — and its hazard is a different shape: it reads the sidecar precisely to

@@ -10,25 +10,6 @@
  *  in place instead of refusing; `tests/architecture/trackedConfigPaths.test.ts` is the backstop
  *  that stops one reaching a commit. */
 
-import type { ProjectSettingsSchema } from '../createEditor';
-
-/** What Apply posts: the draft WITHOUT the paths of the schema's `readonly-text` fields (#2049's sibling). The dialog
- *  posts the whole object it loaded on open, and the route deep-merges it, so a field the form never edits went back as
- *  the value read on OPEN: an `ota.publicKey` an agent set while the dialog was open was replaced by the stale one on
- *  the next Apply, stranding every build that trusts the new key. Left out, the route leaves it as the file has it; the
- *  flow that derives the value (OTA Keys → Sync) is its only writer. */
-export function draftForSave(draft: Record<string, unknown>, schema: Pick<ProjectSettingsSchema, 'tabs'>): Record<string, unknown> {
-  const out = structuredClone(draft);
-  for (const tab of schema.tabs) for (const group of tab.groups) for (const field of group.fields) {
-    if (field.type !== 'readonly-text') continue;
-    const keys = field.key.split('.');
-    let node: unknown = out;
-    for (const k of keys.slice(0, -1)) node = node && typeof node === 'object' ? (node as Record<string, unknown>)[k] : undefined;
-    if (node && typeof node === 'object') delete (node as Record<string, unknown>)[keys[keys.length - 1]!];
-  }
-  return out;
-}
-
 /** A value that will not survive being read on another machine or in a copied-out project:
  *  absolute (POSIX or Windows), home-relative, UNC, spelled with `\` (dead on macOS/Linux, and the
  *  only route into the field on `win`, where `/api/pick-path` returns `{unsupported:true}` and the

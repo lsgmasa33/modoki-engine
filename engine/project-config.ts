@@ -1186,7 +1186,7 @@ const FORBIDDEN_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
  *  meaningful data rather than "leave it alone".
  *
  *  ⚠️ **`rendering.three.tiers` is here because without it the Project Settings "Remove" button
- *  is a lie.** The dialog posts the whole draft and the backend deep-merges it, so a removed
+ *  is a lie.** The dialog posts the tiers block and the backend deep-merges it, so a removed
  *  `low` is simply an absent key — which every other map-like section reads as "don't touch". The
  *  dialog would close cleanly, report success, and the tier would still be in the file on the next
  *  load. Found by testing the real merge rather than the component (`deepMergeConfigPatch` with a
@@ -1196,8 +1196,11 @@ const FORBIDDEN_PATCH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
  *  It is also the ONE map here whose emptiness is semantic: no `tiers` (or an empty one) means the
  *  project authored a single quality config, which is what tells the boot probe not to run at all
  *  (docs/rendering.md § "Quality tiers"). A section that cannot express removal cannot
- *  express that. */
-const REPLACE_WHOLESALE = new Set(['rendering.three.tiers']);
+ *  express that.
+ *
+ *  Exported for one reader: the Project Settings dialog's own copy (`WHOLESALE_PATHS`, `projectSettingsSave.ts` — the
+ *  editor package cannot import this file) is pinned equal to it by `projectSettingsSave.test.ts`. */
+export const REPLACE_WHOLESALE: ReadonlySet<string> = new Set(['rendering.three.tiers']);
 
 export function deepMergeConfigPatch(
   base: RawProjectConfig,

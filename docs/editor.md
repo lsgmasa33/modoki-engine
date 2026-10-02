@@ -366,10 +366,33 @@ listings live in `engine/app/editor/setup.ts`.
 (`editorBackendRouter.ts`), and both exist because breaking them silently corrupted real
 projects:
 
+- **Apply posts only what the dialog changed, conditioned on what it read (#2053).**
+  `planSettingsSave` (`panels/projectSettingsSave.ts`) diffs the draft against the open-time read
+  leaf by leaf (an array is one leaf; `rendering.three.tiers` is one leaf because the route
+  replaces it wholesale, and `WHOLESALE_PATHS` is pinned to the route's `REPLACE_WHOLESALE`). It
+  posts those leaves, with each one's open-time value as the route's `expected` precondition
+  (#2049). The route compares an `expected` at a `REPLACE_WHOLESALE` path WHOLE, so a tier added
+  meanwhile refuses a tiers edit rather than being deleted by it. It also accepts a leaf that
+  already holds the posted value, so a retry after a half-landed write is not blamed on
+  "another writer". Apply used to post the WHOLE open-time object, so a setting an agent wrote while the
+  dialog was open went back as its open-time value on the next Apply of an unrelated field,
+  with nothing reported. Now a field only someone else changed is kept. A field both changed is
+  refused 409 (nothing written), and the dialog names it and offers **Re-read**:
+  `rebaseSettingsDraft` lays the user's other edits over the fresh read and drops every edit
+  whose value MOVED on disk since the dialog read it — not only the 409's paths. A write can land
+  after the refusal, and an edit kept over it would post with `expected` = that write and replace
+  it. A dropped field shows the value now on disk. An untouched draft closes without posting.
+  `readonly-text` fields are never posted at all (#2049).
+  ⚠️ Bounds: a leaf ABSENT from the open-time read carries no `expected` (JSON cannot say
+  "absent"). And an Apply no longer migrates an untouched committed private `build.*` value into
+  `project.user.json` as a side effect — `npm run migrate:private-config` is the path for that.
+  The same mechanism on a `.meta.json` was the Sprite and 9-Slice Editors' Save (#2057) —
+  [mcp-persistence.md](mcp-persistence.md) § the sidecar writers.
+
 - **The body is a PATCH, deep-merged onto the file ON DISK.** A section you omit is left as
-  the file had it — absence never means "reset to default". This matters because the dialog
-  posts the *whole* object while `modoki_project_settings action=set` and OtaKeysDialog's
-  "sync public key" post a *single* section. The route used to merge onto
+  the file had it — absence never means "reset to default". Every caller posts a partial body:
+  the dialog posts only what it changed (below), and `modoki_project_settings action=set` and
+  OtaKeysDialog's "sync public key" post a *single* section. The route used to merge onto
   `DEFAULT_PROJECT_CONFIG` instead (`mergeProjectConfig` is the **load-time** resolver, not a
   write-time merge), so every partial caller reset app identity to
   `com.modokiengine.prototype` and blanked `appleTeamId`. Keep the two merges separate:
@@ -470,7 +493,9 @@ is fine and editing a lie is not. Two rules that are easy to get wrong:
   claiming "these are all defaults" there would be the same overclaim the banner exists to
   fix. (Editing is still disabled wholesale, because one Apply writes both.)
 - **`configErrors` is a diagnostic, not a section.** The POST drops it before the
-  unknown-section check, since the dialog posts back the whole object it loaded.
+  unknown-section check, since a caller that round-trips the GET reply would otherwise send it
+  back. (The dialog posts only changed leaves since #2053, so it no longer does; the drop stays for
+  any other caller.)
 
 **`configWarnings` is the same diagnostic one notch down** — the file *parsed*, but a field
 holds a value no consumer handles, so the resolved config substituted a default
