@@ -377,6 +377,20 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
     for (const [p, r] of cutPlaceholders) if (key === p || key.startsWith(`${p}/`)) return r;
     return undefined;
   };
+  /** The cascade's verdict on a row with NO node (a gone member): its nearest ancestor by key prefix that has one. Under
+   *  the instance's own removal a record is inert, whatever its row names (rule 3; § 10.4b's #2022 ruling, extended to a
+   *  gone member's row by the hub on #2029); an inner removal leaves it `gone`. Keys are flat within a frame (§ 2.1), so a
+   *  gone member's nearest keyed ancestor is its frame's root. A placeholder on the way stops the walk: one the cascade
+   *  took is `underCut`'s, and one that survived it (a scene move, an orphan row) keeps its records waiting (review). */
+  const cutAbove = (key: RowKey): 'inner' | 'scene' | undefined => {
+    for (let k = key; ;) {
+      if (st.placeholders.has(k)) return undefined;
+      const i = k.lastIndexOf('/');
+      if (i <= 0) return undefined;
+      k = k.slice(0, i);
+      if (st.nodes.has(k)) return removed.get(k);
+    }
+  };
   const underPlaceholder = (key: RowKey): boolean => {
     for (const p of st.placeholders.keys()) if (p === ROOT_ROW_KEY || key === p || key.startsWith(`${p}/`)) return true;
     return false;
@@ -490,6 +504,7 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
     const cutBy = underCut(key);
     if (cutBy === 'scene') continue;
     if (cutBy === 'inner') { whole('gone'); continue; }
+    if (!n && cutAbove(key) === 'scene') continue;
     if (!n || st.ambiguous.has(key)) {
       // A removal AT a placeholder row targets the reference ROW, in a document that loaded: it decides whether the
       // placeholder shows, so it is applied, never unused — as `removed: true` there is (cut, inert; #2024, hub ruling).
@@ -524,7 +539,7 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
       }
     }
   }
-  for (const u of heldUnused(st, rec, 'doc' in top ? top.doc : null, underCut, (k) => removed.get(k))) unused.push(u);
+  for (const u of heldUnused(st, rec, 'doc' in top ? top.doc : null, underCut, (k) => (st.nodes.has(k) ? removed.get(k) : cutAbove(k)))) unused.push(u);
 
   // A stable order (by key, then part, then cause), not the rows' insertion order: a legacy record and its v20 spelling
   // hold the same rows in a different order, and the two folds must agree (#2008 P2).
@@ -561,7 +576,10 @@ function heldUnused(
     for (const step of parseSteps(path)) {
       const row = typeof step === 'number' && Number.isInteger(step) ? f.byLid.get(step) : undefined;
       if (!row?.prefab) return 'gone';
-      const cut = underCut(`${f.prefix}/${componentOf(f, step as number)}`);
+      // The nested row's own cascade too, not only a cut placeholder's: under the instance's own removal a held slot is
+      // inert, as a held member row is (#2029 review).
+      const at = `${f.prefix}/${componentOf(f, step as number)}`;
+      const cut = underCut(at) ?? removedBy(at);
       if (cut) return cut === 'scene' ? null : 'gone';
       const got = st.read(row.prefab);
       if (!('doc' in got)) return 'unresolved';

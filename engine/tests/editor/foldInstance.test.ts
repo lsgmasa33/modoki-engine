@@ -539,3 +539,60 @@ describe('foldInstance — G2 (hub rule): a field and a removal of the same comp
     expect(run({ traits: { Light: { intensity: 5 } }, traitRemovals: { Light: false } }).nodes.get(`/${G(802)}/${NQ2}`)?.traits.Light).toEqual({ intensity: 5 });
   });
 });
+
+describe('#2029: a record on a GONE member\'s row takes the cascade of its nearest ancestor that has a node', () => {
+  const G99 = G(99); // no member of Q
+  const cut = { [`/${N3}`]: { removed: true } };
+  it('under the instance\'s OWN removal it is inert, as every record there (rule 3; § 10.4b, #2022): no unused', () => {
+    expect(causes(fold(entry({ members: { ...cut, [`/${N3}/${G99}`]: { removed: true } } })))).toEqual([]);
+    expect(causes(fold(entry({ members: { ...cut, [`/${N3}/${G99}`]: { traits: { Light: { intensity: 3 } } } } })))).toEqual([]);
+    // Without the cut its target is gone, as before.
+    expect(causes(fold(entry({ members: { [`/${N3}/${G99}`]: { removed: true } } })))).toEqual([`/${N3}/${G99} removed gone`]);
+  });
+  it('a HELD whole-list row of a gone member under the cut is inert too (`heldUnused` rowCause)', () => {
+    expect(causes(fold(entry({ members: { ...cut, [`/${N3}/${G99}`]: { added: [] } } })))).toEqual([]);
+    expect(causes(fold(entry({ members: { [`/${N3}/${G99}`]: { added: [] } } })))).toEqual([`/${N3}/${G99} legacy gone`]);
+  });
+  it('under an INNER layer\'s removal it stays gone', () => {
+    const X = G(61);
+    const PP: PrefabDoc = { id: 'PP', rootLocalId: 1, entities: [
+      { localId: 1, nodeGuid: G(60), traits: { EntityAttributes: { name: 'W', sortOrder: 0 } } },
+      { localId: 2, nodeGuid: X, prefab: 'P', traits: { EntityAttributes: { name: 'X', parentId: 1 } }, members: { [`/${N3}`]: { removed: true } } },
+    ] };
+    const m = new Map(docs); m.set('PP', PP);
+    const e = { ...entry({ members: { [`/${X}/${N3}/${G99}`]: { removed: true } } }), prefab: 'PP', traits: { PrefabInstance: { source: 'PP', localId: 1 } } } as SceneEntityEntry;
+    expect(causes(fold(e, m))).toEqual([`/${X}/${N3}/${G99} removed gone`]);
+  });
+});
+
+describe('#2029 review: a surviving placeholder stops the walk; a held slot under the instance\'s own removal is inert', () => {
+  const ea = (name: string, parentId?: number) => ({ EntityAttributes: { name, ...(parentId !== undefined ? { parentId } : { sortOrder: 0 }) } });
+  const A: PrefabDoc = { id: 'A', rootLocalId: 1, entities: [
+    { localId: 1, nodeGuid: G(71), traits: ea('AR') },
+    { localId: 2, nodeGuid: G(72), traits: ea('AM', 1) },
+    { localId: 3, nodeGuid: G(73), prefab: 'MISSING', traits: ea('APH', 2) },
+  ] };
+  const T: PrefabDoc = { id: 'T', rootLocalId: 1, entities: [{ localId: 1, nodeGuid: G(81), traits: ea('TR') }, { localId: 2, nodeGuid: G(82), prefab: 'A', traits: ea('TA', 1) }] };
+  const TA = `/${G(82)}`, AM = `${TA}/${G(72)}`, APH = `${TA}/${G(73)}`;
+  const tEntry = (extra: Partial<SceneEntityEntry>) => entry({ ...extra, prefab: 'T', traits: { PrefabInstance: { source: 'T', localId: 1 } } });
+  const light = { traits: { Light: { intensity: 3 } } };
+  // Mutation: drop the placeholder stop in `cutAbove` — both records read the cut above and turn inert.
+  it('(a) a placeholder a scene move took out of the cut keeps its records waiting, unresolved', () => {
+    const m = new Map(docs); m.set('A', A); m.set('T', T);
+    const f = fold(tEntry({ members: { [TA]: { removed: true }, [AM]: { parent: G(200) }, [APH]: light, [`${APH}/${G(99)}`]: light } }), m);
+    expect(f.placeholders.has(APH as never)).toBe(true);
+    expect(causes(f).sort()).toEqual([`${APH} field:Light.intensity unresolved`, `${APH}/${G(99)} field:Light.intensity unresolved`].sort());
+  });
+  it('(b) an ORPHAN placeholder row (its parent names no row) is not in the cut either', () => {
+    const A2: PrefabDoc = { ...A, entities: [A.entities[0]!, { ...A.entities[2]!, traits: ea('APH', 77) }] };
+    const m = new Map(docs); m.set('A', A2); m.set('T', T);
+    expect(causes(fold(tEntry({ members: { [TA]: { removed: true }, [`${APH}/${G(99)}`]: light } }), m))).toEqual([`${APH}/${G(99)} field:Light.intensity unresolved`]);
+  });
+  // Mutation: `pathCause` asks `underCut` alone — the held slot is `gone` under the cut.
+  it('a held nestedOverrides slot under the instance\'s own removal is inert, as a held member row is', () => {
+    const m = new Map(docs); m.set('A', A); m.set('T', T);
+    const slot = { nestedOverrides: { 2: { 99: { Light: { intensity: 3 } } } } } as Partial<SceneEntityEntry>;
+    expect(causes(fold(tEntry({ ...slot, members: { [TA]: { removed: true } } }), m))).toEqual([]);
+    expect(causes(fold(tEntry(slot), m))).toEqual([`/ legacy gone`]);
+  });
+});
