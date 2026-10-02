@@ -10,8 +10,7 @@ import type { Entity } from 'koota';
 import { getCurrentWorld, getTraitByName } from '@modoki/engine/runtime';
 import { getAllTraits } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { keptMemberOrphans, keptLegacyChannels, keptUnusedRows, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
-import { memberRowKeysIn } from '../../packages/modoki/src/runtime/core/ecs/memberRows';
-import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
+import { instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
 import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, preV5NodeGuid, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
@@ -30,48 +29,11 @@ export function liveTree(rootId: number): Live {
   const byId = new Map<number, Entity>();
   for (const e of world.entities as Iterable<Entity>) byId.set(e.id(), e);
   const parentOf = (id: number) => ((byId.get(id)?.get(ea) as { parentId?: number } | undefined)?.parentId ?? 0);
-  const memberKeys = memberRowKeysIn(rootId, world);
   const under = (id: number): boolean => { for (let p = parentOf(id), n = 0; p && n < 512; p = parentOf(p), n++) if (p === rootId) return true; return false; };
-  const keyOf = new Map<number, string>([[rootId, '/']]);
-  for (const [id, k] of memberKeys) keyOf.set(id, k);
-  /** A TEMPLATE-ADDED reference node: a node a template added that is itself a prefab instance (its own root). */
-  const isTemplateRef = (id: number): boolean =>
-    !!templateKeyOf(byId.get(id) as never) && (byId.get(id)?.get(pi) as { rootInstanceId?: number } | undefined)?.rootInstanceId === id;
-  /** A member's FRAME key: an owned nested root, or a template-added reference node, opens its own frame; any other
-   *  member sits in its key's parent frame. */
-  const frameOfMember = (id: number): string => {
-    if (id === rootId) return '';
-    const k = keyOf.get(id)!;
-    const p = byId.get(id)!.get(pi) as { parentLocalId?: number } | undefined;
-    return p?.parentLocalId || isTemplateRef(id) ? k : k.slice(0, k.lastIndexOf('/'));
-  };
-  const templateKeyed = (id: number): string | undefined => {
-    const tk = templateKeyOf(byId.get(id) as never);
-    if (!tk) return undefined;
-    for (let p = parentOf(id); p; p = parentOf(p)) {
-      if (keyOf.has(p) && (!templateKeyOf(byId.get(p) as never) || isTemplateRef(p))) return `${frameOfMember(p)}/a+${tk}`;
-      // An instance's entity not keyed (yet) on the way up: another STORED instance's — a reference node the scene added
-      // under a member, whose template-added node is its own (#2009: the fuzzer's agent instantiate put a second
-      // `Extra` on this instance's key) — or a template-added reference node not reached yet, retried below.
-      if (!keyOf.has(p) && byId.get(p)?.has(pi)) return undefined;
-    }
-    return undefined;
-  };
-  const candidates = [...byId.keys()].filter((id) => id === rootId || memberKeys.has(id) || under(id));
-  // To a fixpoint: a template-added reference node, once keyed, keys its own members under it (#2009: createPrefab of an
-  // instance holding a scene-added reference node, or an instantiate in prefab edit mode, makes one), and those can
-  // anchor further template-added nodes.
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const id of candidates) {
-      if (keyOf.has(id)) continue;
-      const k = templateKeyed(id);
-      if (!k) continue;
-      keyOf.set(id, k);
-      grew = true;
-      if (isTemplateRef(id)) for (const [m, mk] of memberRowKeysIn(id, world)) if (m !== id && !keyOf.has(m)) keyOf.set(m, `${k}${mk}`);
-    }
-  }
+  // The row keys are S4's own (`instanceKeyMap`, #2026): the root, its members, its template-added nodes, and through each
+  // template-added reference node that frame's keys under `…/a+<key>/…`. The oracle and the door share one definition.
+  const keyOf: ReadonlyMap<number, string> = instanceKeyMap(rootId);
+  const candidates = [...byId.keys()].filter((id) => keyOf.has(id) || under(id));
   const out: Live = { nodes: new Map(), anchors: new Map(), placeholders: new Set() };
   for (const id of candidates) {
     const e = byId.get(id)!;

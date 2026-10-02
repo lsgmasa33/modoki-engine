@@ -59,16 +59,29 @@ export function instanceKeyMap(rootId: number): Map<number, RowKey> {
     return (piOf(id) as { parentLocalId?: number } | null)?.parentLocalId || refNode(id) ? k : k.slice(0, k.lastIndexOf('/'));
   };
   const depthUnder = (id: number): number => { let n = 0; for (let p = parentOf(id); p && n < 512; p = parentOf(p), n++) if (p === rootId) return n + 1; return 0; };
-  // Ancestors first, so a template-added reference node is keyed before its members are reached.
+  // Ancestors first, so a template-added reference node is usually keyed before its members are reached; to a FIXPOINT,
+  // because a member of one can sit above it (moved under the instance root, which keeps it linked) and only keys once the
+  // node does (review of #2026: the old oracle keying's fixpoint, kept).
   const under = [...byId.keys()].map((id) => [id, depthUnder(id)] as const).filter(([, d]) => d > 0).sort((a, b) => a[1] - b[1]);
-  for (const [id] of under) {
-    if (keyOf.has(id) || !tk(id)) continue;
-    let p = parentOf(id);
-    while (p && !keyOf.has(p)) p = parentOf(p);
-    if (!p) continue;
-    const key = `${frameOf(p)}/a+${tk(id)}`;
-    keyOf.set(id, key);
-    if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world)) keyOf.set(m, `${key}${k}`);
+  /** An instance entity this map does not key (yet) is ANOTHER instance's — a reference node the scene added under a
+   *  member, or one of its members — unless the frame it expanded from is keyed here (a member a pre-v5 frame leaves
+   *  unkeyed). A template-keyed node under another instance's entity belongs to that record, never this one (#2009). */
+  const foreign = (id: number): boolean => {
+    const pi = piOf(id);
+    return !!pi && !keyOf.has(pi.rootInstanceId ?? 0);
+  };
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [id] of under) {
+      if (keyOf.has(id) || !tk(id)) continue;
+      let p = parentOf(id);
+      while (p && !keyOf.has(p) && !foreign(p)) p = parentOf(p);
+      if (!p || !keyOf.has(p)) continue;
+      const key = `${frameOf(p)}/a+${tk(id)}`;
+      keyOf.set(id, key);
+      grew = true;
+      if (refNode(id)) for (const [m, k] of memberRowKeysIn(id, world)) if (!keyOf.has(m)) keyOf.set(m, `${key}${k}`);
+    }
   }
   return keyOf;
 }

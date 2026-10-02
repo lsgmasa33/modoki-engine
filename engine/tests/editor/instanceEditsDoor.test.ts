@@ -38,7 +38,7 @@ import { s4Seams } from './prefabFuzz/s4Seams';
 import { listDiff } from './prefabFuzz/shadow';
 import type { OverrideList } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { setTemplateKey } from '../../packages/modoki/src/runtime/core/templateIdentity';
-import { allStoredRoots } from '../../packages/modoki/src/editor/instance/instanceKeys';
+import { allStoredRoots, instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
 import { dropInstanceRecord, markStale, setInstanceRecord, unrecordedBy } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 
@@ -278,6 +278,48 @@ describe('a prefab placed (§ 3.2, the placement row; review § Census: a drop o
     expect(placed?.placement.parent).toBe(''); // a reference node: its link places it (`parseReferenceNode`)
     expect(ownOf(key(2))).toEqual([guidOf(id)]);
     matchesCapture();
+  });
+  // Mutation: let `instanceKeyMap`'s climb pass an unkeyed instance entity — Q's own node keys into P's record.
+  it('a template-added node of the placed instance keys into ITS record, never the instance it hangs under (#2009, #2026)', async () => {
+    const q = qDoc(); prefabs.set(Q, q); setPrefabCache(Q, q as never);
+    const id = await instantiatePrefabInstance(q as never, 'q.prefab.json', byName('A'));
+    const kid = createEntityWithUndo('Create', id, [{ name: 'EntityAttributes', data: { name: 'QKid', parentId: id } }, { name: 'Transform' }], () => {})!;
+    setTemplateKey([...getCurrentWorld().entities].find((e) => e.id() === kid) as never, 'k-x');
+    expect(instanceKeyMap(rootId()).has(kid)).toBe(false);
+    expect(instanceKeyMap(id).get(kid)).toBe('/a+k-x');
+  });
+  const handle = (id: number) => [...getCurrentWorld().entities].find((e) => e.id() === id)!;
+  // Mutation: run `instanceKeyMap`'s template pass once (no fixpoint) — X is reached before T keys its member M.
+  it('a template-added node under a MOVED member of a template-added reference node keys in that node\'s frame (fixpoint)', async () => {
+    const Q2 = 'cccccccc-0000-4000-8000-000000002017';
+    const q2 = { id: Q2, version: 5, name: 'Q2', rootLocalId: 1, entities: [
+      { localId: 1, name: 'T', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002021', traits: { EntityAttributes: { name: 'T', parentId: 0, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+      { localId: 2, name: 'QM', nodeGuid: 'eeeeeeee-0000-4000-8000-000000002022', traits: { EntityAttributes: { name: 'QM', parentId: 1, guid: '', sortOrder: 0 }, Transform: { x: 0, y: 0, z: 0 } } },
+    ] };
+    prefabs.set(Q2, q2); setPrefabCache(Q2, q2 as never);
+    const t = await instantiatePrefabInstance(q2 as never, 'q2.prefab.json', byName('C'));
+    setTemplateKey(handle(t) as never, 'k-t');
+    const m = byName('QM');
+    const ea = meta('EntityAttributes').trait;
+    handle(m).set(ea, { ...(handle(m).get(ea) as object), parentId: rootId() });
+    const x = createEntityWithUndo('Create', m, [{ name: 'EntityAttributes', data: { name: 'X', parentId: m } }, { name: 'Transform' }], () => {})!;
+    setTemplateKey(handle(x) as never, 'k-x');
+    const keys = instanceKeyMap(rootId());
+    expect(keys.get(m)).toBe('/a+k-t/eeeeeeee-0000-4000-8000-000000002022');
+    expect(keys.get(x)).toBe('/a+k-t/a+k-x');
+  });
+  // Mutation: stop the climb at ANY unkeyed instance entity — a pre-v5 frame's unkeyed member is this instance's own.
+  it('a template-added node under this instance\'s UNKEYED member (a pre-v5 row) still keys here', async () => {
+    const d = pDoc();
+    d.entities = d.entities.map((r) => (r.name === 'B' ? { ...r, nodeGuid: '' } : r));
+    prefabs.set(d.id, d); setPrefabCache(d.id, d as never);
+    await load(scene());
+    const b = byName('B');
+    const x = createEntityWithUndo('Create', b, [{ name: 'EntityAttributes', data: { name: 'X', parentId: b } }, { name: 'Transform' }], () => {})!;
+    setTemplateKey(handle(x) as never, 'k-x');
+    const keys = instanceKeyMap(rootId());
+    expect(keys.has(b)).toBe(false);
+    expect(keys.get(x)).toBe('/a+k-x');
   });
 });
 
