@@ -33,6 +33,11 @@ const LEN = VERIFY_LEN;
 const OPTS = { expectedError: () => true, tolerate: () => true };
 
 const report: Record<string, string[]> = {};
+/** What the SAVED scenes' comparisons reached (#2021). `seen` also counts the fuzzer's per-step P1 inside `runOps`, which
+ *  would pin a shape a run reached and then lost before its save. A HELD own link is reached only per step (seeds 1-1500
+ *  leave none in a saved scene): `prefabFuzz.test.ts` pins it on #2018's repro. */
+const PLACED = ['ownProjected', 'ownAtPlaceholder', 'ownInPlaceholder', 'unresolvedUnderPlaceholder', 'heldUnderPlaceholder'] as const;
+const reached = Object.fromEntries(PLACED.map((k) => [k, 0])) as Record<(typeof PLACED)[number], number>;
 
 describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scenes)', () => {
   for (const seed of SEEDS) {
@@ -61,12 +66,14 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
       const ea = getTraitByName('EntityAttributes')!.trait;
       const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
       const lines: string[] = [];
+      const seen0 = { ...seen };
       for (const entry of scene.entities ?? []) {
         if (!entry.prefab || !entry.guid) continue;
         const root = [...getCurrentWorld().entities].find((e) => (e.get(ea) as { guid?: string } | undefined)?.guid === entry.guid);
         if (!root) { lines.push(`${entry.name}: no live root`); continue; }
         for (const d of checkInstance(entry, read, root.id(), { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g) => held.has(g) }, copies)) lines.push(`${entry.name}: ${d}`);
       }
+      for (const k of PLACED) reached[k] += seen[k] - seen0[k];
       report[`seed ${seed}`] = lines;
       expect(lines).toEqual([]);
     }, 120_000);
@@ -80,5 +87,10 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     expect(seen.ruledD).toBeGreaterThan(0);
     // The defaults arm checked something: a broken schema lookup would otherwise pass, checking nothing.
     expect(seen.defaults).toBeGreaterThan(0);
+    // #2021: the placement check reached an own link on a projected member, AT and INSIDE a placeholder, and list and
+    // held records under one.
+    for (const k of PLACED) expect(reached[k], k).toBeGreaterThan(0);
+    // A guid stated twice is left unjudged (#1937), so a regression that states links twice would turn the check off.
+    expect(seen.ownDuplicate).toBe(0);
   });
 });

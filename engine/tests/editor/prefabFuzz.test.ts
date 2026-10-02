@@ -85,6 +85,7 @@ import { boot, bridge, memoryStorage, flushWatcher, editorOwns } from './prefabF
 import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
 import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
+import { seen } from './foldOracle';
 import { writeFileSync } from 'node:fs';
 import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, recordKeys, RULING_R } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -889,6 +890,29 @@ describe('#1789 prefab fuzz', () => {
       expect(res.failure, `${what}: ${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
       expect(grew, what).toContain('P1 by the fold');
     }
+  }, 120_000);
+
+  // #2021: a HELD own link — added under a member the instance no longer projects — is placed `heldNode` (#2018's
+  // ruling, B′), and P1's placement check (foldOracle.ts `placementDiverge`) compares it. Generator seeds reach one only
+  // at hunt length (40; none at the verify length, and none in a saved scene), so the shape is held here, minimized from
+  // hunt seed 246 (#2018's own repro stopped reaching it once the fold's fixes moved its targets).
+  it('#2021: P1 by the fold places a HELD own link (hunt seed 246)', async () => {
+    const ops: Op[] = [
+      { kind: 'duplicate', u: [0.7219006572850049, 0.5483197642024606, 0.30764133017510176, 0.5250595326069742, 0.09884512959979475, 0.40332550974562764, 0.8549339685123414, 0.12889821105636656] },
+      { kind: 'instantiate', u: [0.46533699450083077, 0.3489740223158151, 0.42113381205126643, 0.3490595759358257, 0.5367825583089143, 0.6584286321885884, 0.4939265919383615, 0.9836620986461639] },
+      { kind: 'fileMutate', u: [0.28141955262981355, 0.0669010104611516, 0.11636064387857914, 0.5872549663763493, 0.6053570182994008, 0.006638948572799563, 0.7421369452495128, 0.9577205339446664] },
+      { kind: 'delete', u: [0.34164101001806557, 0.21144867152906954, 0.29246249445714056, 0.6761395719368011, 0.1756759958807379, 0.4217527159489691, 0.6035060549620539, 0.608379076467827] },
+      { kind: 'reparent', u: [0.3341537709347904, 0.3475193327758461, 0.5419025190640241, 0.9471577857621014, 0.6461046554613858, 0.49814249901100993, 0.31486722477711737, 0.9499714151024818] },
+      { kind: 'prefabEdit', u: [0.4120011862833053, 0.9537779504898936, 0.4036154255736619, 0.43466546991840005, 0.38601681031286716, 0.2412711256183684, 0.09834549622610211, 0.639129497576505], inner: [{ kind: 'addChild', u: [0.9393244939856231, 0.4576516943052411, 0.23018345166929066, 0.40157105633988976, 0.16762143652886152, 0.2843701737001538, 0.8595813701394945, 0.24596478277817369] }, { kind: 'instantiate', u: [0.22026996384374797, 0.12059283978305757, 0.2941668222192675, 0.4091447307728231, 0.13556098844856024, 0.8536935087759048, 0.814816486556083, 0.3400204873178154] }, { kind: 'redo', u: [0.24725748295895755, 0.28348000324331224, 0.7228020506445318, 0.9703174650203437, 0.8350812348071486, 0.5344295417889953, 0.8794529172591865, 0.5522513668984175] }, { kind: 'editField', u: [0.6509293727576733, 0.7839175323024392, 0.7955678380094469, 0.42464192933402956, 0.6151037919335067, 0.8330991917755455, 0.19254334270954132, 0.9538525966927409] }] },
+      { kind: 'apply', u: [0.31004549586214125, 0.3223990136757493, 0.25569736980833113, 0.6923409083392471, 0.5388481102418154, 0.8259633409325033, 0.9307957089040428, 0.3583616646938026] },
+    ];
+    const { res, held } = await uncounted(async () => {
+      const before = seen.ownHeld;
+      const r = await runOps(be, ops, STRICT);
+      return { res: r, held: seen.ownHeld - before };
+    });
+    expect(res.failure, `${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
+    expect(held).toBeGreaterThan(0);
   }, 120_000);
 
   // The P1 waivers (#2013, #2015, #2016) TOLERATE, and `claimsOf` reads only `stops`, so their two sides are held here:

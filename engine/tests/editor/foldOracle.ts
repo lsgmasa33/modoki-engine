@@ -15,7 +15,7 @@ import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateId
 import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, preV5NodeGuid, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
-import type { PrefabReader, FoldedInstance, UnusedRecord, InstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
+import { HELD_REMAINDER, type PrefabReader, type FoldedInstance, type UnusedRecord, type InstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 type LiveNode = { key: string; parent: { key: string } | { guid: string } | null; traits: Record<string, Record<string, unknown> | true> };
 export type Live = { nodes: Map<string, LiveNode>; anchors: Map<string, string[]>; placeholders: Set<string> };
@@ -114,7 +114,13 @@ const show = (v: unknown) => JSON.stringify(v)?.slice(0, 160);
 const IGNORED_FIELDS: Record<string, Set<string>> = { EntityAttributes: new Set(['guid', 'parentId']) };
 
 /** What the comparisons reached, for the non-vacuity pins. */
-export const seen = { ruledB: 0, ruledD: 0, ruledOwn: 0, ruledOwnFix: 0, defaults: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0 };
+export const seen = {
+  ruledB: 0, ruledD: 0, ruledOwn: 0, ruledOwnFix: 0, defaults: 0, instances: 0, nodes: 0, fields: 0, templateAdded: 0, nested: 0, anchors: 0, placeholders: 0, unused: 0,
+  // `placementDiverge` (#2021): own links by where the rules put them, and the records it held to `unresolved`.
+  ownProjected: 0, ownAtPlaceholder: 0, ownInPlaceholder: 0, ownHeld: 0, ownDuplicate: 0, heldNodeUnjudged: 0, unresolvedUnderPlaceholder: 0,
+  heldUnderPlaceholder: 0,
+  removedAtPlaceholder: 0,
+};
 
 /** Every way the fold and the live tree disagree, one line each. */
 export function diverge(fold: FoldedInstance, live: Live): string[] {
@@ -210,7 +216,8 @@ const unusedLeaf = (u: UnusedRecord): string => {
  *  - A record `unresolved` under a placeholder is kept by that placeholder's verbatim record, so it is not compared — on
  *    EITHER side: under a placeholder only the rules put there (`checkInstance`'s translation B: today expands a copy),
  *    today keeps the same records as unused rows or applies them to the copy, at a granularity a leaf multiset cannot
- *    match (#2009). What this cannot see — a fold that keeps NOTHING for a record under a placeholder — is #2018's.
+ *    match (#2009). What this cannot see, a fold that loses or misplaces a record under a placeholder, `placementDiverge`
+ *    checks against the record by the rules (#2021).
  *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf: the save drops a gone
  *    member's kept unused part (#1914 R4's fix), and so does the record.
  *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
@@ -283,6 +290,153 @@ export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly
 
 /** `key` is `k` or lies under it. */
 const under = (key: string, k: string) => k === '/' || key === k || key.startsWith(`${k}/`);
+
+/** #2021: where the fold puts what it cannot apply in place, against the RECORD (design § 10.4b, #2018's rulings).
+ *  Under a placeholder today shows nothing and keeps the records at a granularity `unusedDiverge` cannot pair, so this
+ *  side is checked against the rules instead:
+ *  - every user-added node the record states is placed exactly ONCE, in anchors or unused, never neither and never
+ *    both: AT a placeholder it hangs from it, INSIDE a placeholder's frame it is `unresolved`, on a projected member it
+ *    is anchored there, on any other member it is `heldNode` (B′). A node is one guid, whatever states it: a list
+ *    row's `own` link, its content in `held.heldOwn`, or a scene-owned (keyless) node in a held legacy row's `added`
+ *    (§ 10.4b: AT a placeholder it shows "in every file form");
+ *  - every list record at or inside a placeholder is unused `unresolved`, part by part (U9; rule 9), except a `removed`
+ *    AT a nested one, which applies;
+ *  - every held legacy statement of a member row under a placeholder, and every held statement when the instance's own
+ *    prefab is missing, is reported, and only as `unresolved`.
+ *  The fold reports only placeholders no removal cut: a cut one goes with its member (`foldInstance`'s cascade), and
+ *  what is at or inside it is under the instance's own removal, so its links are `heldNode` and its other records are
+ *  inert (hub, 2026-10-02, #2021: the cut dominates the placeholder; rule 3).
+ *  Not judged: a guid stated more than once (a duplicate identifier: #1937 owns what it means; counted); WHERE a held
+ *  node in a form that does not name its anchor row shows, and its cause (#2025's family; counted) — it must still be
+ *  placed exactly once; a nested-channel statement under a missing NESTED prefab; and which of a held statement's parts
+ *  the fold reports — a statement needs one record besides its nodes, so one losing some of its fields passes. */
+export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord): string[] {
+  const out: string[] = [];
+  const phs = [...fold.placeholders.keys()];
+  const atPh = (key: string) => phs.includes(key);
+  const underPh = (key: string) => phs.some((k) => under(key, k));
+  const allowedAt = (key: string): string => (atPh(key) ? `anchor ${key}` : underPh(key) ? `unused ${key} unresolved` : fold.nodes.has(key) ? `anchor ${key}` : `unused ${key} heldNode`);
+  const pending = (rec.held.pendingLegacy ?? {}) as Bag;
+  const pathOf = (path: readonly string[]) => path.join('\u0000');
+
+  // The user-added nodes the record states: guid → where each statement anchors it.
+  const stated = new Map<string, string[]>();
+  const state = (guid: string, key: string) => stated.set(guid, [...(stated.get(guid) ?? []), key]);
+  for (const [key, r] of rec.list.rows) for (const o of r.own ?? []) state(o.guid, key);
+  const linked = new Set(stated.keys());
+  // `heldOwn` holds a node's CONTENT; with a link of the same guid it is that link's node, not a second one.
+  for (const [key, nodes] of rec.held.heldOwn ?? []) for (const n of nodes) { const g = typeof n.guid === 'string' ? n.guid : ''; if (!linked.has(g)) state(g, key); }
+  // A scene-owned node in a held legacy member row's `added`: the fold reports it at that legacy path.
+  const nodePaths = new Map<string, string>();
+  for (const [k, row] of Object.entries((pending.members ?? {}) as Bag)) {
+    const added = row && typeof row === 'object' ? (row as Bag).added : undefined;
+    if (!Array.isArray(added)) continue;
+    added.forEach((el, i) => {
+      const n = el as Bag | null;
+      if (!n || typeof n !== 'object' || (typeof n.key === 'string' && n.key) || typeof n.guid !== 'string') return;
+      state(n.guid, k);
+      nodePaths.set(pathOf(['members', k, 'added', String(i)]), n.guid);
+    });
+  }
+  // A scene-owned node held in a form that does not name its anchor row — the entry-level legacy `added` (by a localId
+  // of the missing document) and a held `nestedStructure` slot's `added` — is the #2025 family: whether and where it
+  // shows is the fold's open question there, so it is neither placed nor held to `unresolved` here (counted). Holding
+  // it to `unresolved` would push a fix that shows it ("every file form", § 10.4b) the wrong way.
+  const unjudged = new Map<string, string>();
+  const keyless = (list: unknown, at: string[]) => {
+    if (Array.isArray(list)) list.forEach((el, i) => {
+      const n = el as Bag | null;
+      if (n && typeof n === 'object' && !(typeof n.key === 'string' && n.key) && typeof n.guid === 'string') unjudged.set(pathOf([...at, String(i)]), n.guid);
+    });
+  };
+  keyless(pending.added, ['added']);
+  for (const [k, slot] of Object.entries((pending.nestedStructure ?? {}) as Bag)) if (slot && typeof slot === 'object') keyless((slot as Bag).added, ['nestedStructure', k, 'added']);
+  const unjudgedGuids = new Set(unjudged.values());
+  seen.heldNodeUnjudged += unjudged.size;
+  // Where the fold put each one.
+  const places = new Map<string, string[]>();
+  const place = (guid: string, where: string) => places.set(guid, [...(places.get(guid) ?? []), where]);
+  for (const [k, refs] of fold.anchors) for (const r of refs) place(r.guid, `anchor ${k}`);
+  for (const u of fold.unused) {
+    if (u.part.kind === 'own') place(u.part.guid, `unused ${u.key} ${u.cause}`);
+    else if (u.part.kind === 'legacy' && nodePaths.has(pathOf(u.part.path))) place(nodePaths.get(pathOf(u.part.path))!, `unused ${u.key} ${u.cause}`);
+  }
+  // An unjudged node is still ONE node: shown once, or held once at its own path — never neither, both or twice.
+  for (const [path, guid] of unjudged) {
+    if (stated.has(guid)) continue;
+    const at = [...(places.get(guid) ?? []).filter((p) => p.startsWith('anchor ')), ...fold.unused.filter((u) => u.part.kind === 'legacy' && pathOf(u.part.path) === path).map((u) => `unused ${u.key} ${u.cause}`)];
+    if (at.length !== 1) out.push(`held node ${guid} (${show(path.split('\u0000'))}): placed ${show(at)}`);
+  }
+  for (const guid of new Set([...stated.keys(), ...places.keys()])) {
+    if (unjudgedGuids.has(guid) && !stated.has(guid)) continue;
+    const keys = stated.get(guid) ?? [];
+    if (keys.length > 1) { seen.ownDuplicate++; continue; }
+    const got = places.get(guid) ?? [];
+    const want = keys.length ? allowedAt(keys[0]!) : undefined;
+    if (keys.length) seen[atPh(keys[0]!) ? 'ownAtPlaceholder' : underPh(keys[0]!) ? 'ownInPlaceholder' : fold.nodes.has(keys[0]!) ? 'ownProjected' : 'ownHeld']++;
+    if (got.length !== 1 || got[0] !== want) out.push(`own link ${guid}: stated ${show(want ? [want] : [])} placed ${show(got)}`);
+  }
+
+  // Every other list record at or under a placeholder is unused `unresolved`, and nothing else the fold keeps there is.
+  const expected: string[] = [];
+  for (const [key, r] of rec.list.rows) {
+    if (!underPh(key)) continue;
+    const leaves: string[] = [];
+    rowLeaves({ [key]: r as Bag }, leaves);
+    // A `removed` AT a nested placeholder targets the reference ROW of a loaded document: it applies (it decides whether
+    // the placeholder shows), so it is not unused (hub, 2026-10-02, #2021: projected or unused, never both).
+    const applies = (leaf: string) => leaf === 'removed' && atPh(key) && key !== '/';
+    for (const leaf of leaves) if (leaf !== 'own' && !applies(leaf)) expected.push(`${key} ${leaf} (unresolved)`);
+    if (atPh(key) && key !== '/' && r.removed !== undefined) seen.removedAtPlaceholder++;
+  }
+  seen.unresolvedUnderPlaceholder += expected.length;
+  const kept = fold.unused.filter((u) => u.part.kind !== 'own' && u.part.kind !== 'legacy' && underPh(u.key)).map((u) => `${u.key} ${unusedLeaf(u)} (${u.cause})`);
+  for (const e of expected) {
+    const i = kept.indexOf(e);
+    if (i >= 0) kept.splice(i, 1);
+    else out.push(`under a placeholder, not unused unresolved: ${e}`);
+  }
+  for (const k of kept) out.push(`under a placeholder, unused but not stated: ${k}`);
+
+  // Every held legacy statement under a placeholder is reported, and only as `unresolved`. A statement is a channel's
+  // entry; a member row's is under a placeholder when its key is, every one is when the instance's own prefab is missing.
+  // NOT judged: a `nestedOverrides`/`nestedStructure` statement whose path runs through a missing NESTED prefab (it is
+  // keyed at `/`; telling which placeholder it waits on is a frame walk this check does not repeat), and a slot that
+  // states nothing (`{}`, or only the remainder marker).
+  const statements: string[][] = [];
+  // Only a member row or a nested slot is a CONTAINER; any other channel's entry is one statement, empty or not.
+  const statesNothing = (channel: string, v: unknown) => (channel === 'members' || channel === 'nestedStructure')
+    && !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every((k) => k === HELD_REMAINDER);
+  const values = new Map<string, unknown>();
+  for (const [channel, value] of Object.entries(pending)) {
+    if (channel === HELD_REMAINDER) continue;
+    if (Array.isArray(value)) value.forEach((v, i) => { statements.push([channel, String(i)]); values.set(pathOf([channel, String(i)]), v); });
+    else if (value && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) if (!statesNothing(channel, v)) { statements.push([channel, k]); values.set(pathOf([channel, k]), v); }
+    } else { statements.push([channel]); values.set(pathOf([channel]), value); }
+  }
+  /** What a statement holds besides user-added nodes (each checked as a node above): it needs a record of its own. */
+  const holdsMore = (st: readonly string[]): boolean => {
+    const v = values.get(pathOf(st));
+    const isNode = (p: string[]) => nodePaths.has(pathOf(p)) || unjudged.has(pathOf(p));
+    if (isNode([...st])) return false;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return true;
+    const added = (v as Bag).added;
+    if (Object.keys(v).some((k) => k !== 'added' && k !== HELD_REMAINDER)) return true;
+    return !Array.isArray(added) || !added.length || added.some((_e, i) => !isNode([...st, 'added', String(i)]));
+  };
+  const legacy = fold.unused.filter((u): u is UnusedRecord & { part: { kind: 'legacy'; path: string[] } } => u.part.kind === 'legacy');
+  const inside = (path: readonly string[], st: readonly string[]) => st.every((x, i) => path[i] === x);
+  for (const st of statements) {
+    if (!(atPh('/') || (st[0] === 'members' && st.length === 2 && underPh(st[1]!)))) continue;
+    seen.heldUnderPlaceholder++;
+    const recs = legacy.filter((u) => inside(u.part.path, st) && !nodePaths.has(pathOf(u.part.path)) && !unjudged.has(pathOf(u.part.path)));
+    if (!recs.length && holdsMore(st)) out.push(`under a placeholder, held ${show(st)} not reported`);
+    for (const u of recs) if (u.cause !== 'unresolved') out.push(`under a placeholder, held ${show(u.part.path)} unused ${u.cause}, not unresolved`);
+  }
+  for (const u of legacy) if (!statements.some((st) => inside(u.part.path, st))) out.push(`unused legacy ${show(u.part.path)} names no held statement`);
+  return out;
+}
 
 /** One instance: parse its entry, fold it, and compare against the live tree rooted at `rootId`. `copies` are the guids
  *  of the scene's `embeddedPrefabs`, which today's load expands a missing prefab from.
@@ -357,5 +511,5 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
     const last = key.slice(key.lastIndexOf('/') + 1);
     return last.startsWith('a+') || nodeGuids.has(last);
   };
-  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept)];
+  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept), ...placementDiverge(fold, rec)];
 }

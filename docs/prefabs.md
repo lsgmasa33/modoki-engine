@@ -744,13 +744,48 @@ mechanically:
     before this. First the lines were unkeyed. Then `(applied)` tested only that a document still held the member,
     which an inner layer's removal also passes. The pairing is a pure function (`pairUnused`) with its own tests
     (`foldOraclePairing.test.ts`), because the real fold never takes the branches that tell these apart.
+  - Where the pairing cannot reach, `placementDiverge` (#2021) holds the fold to the RECORD by the rules (design
+    § 10.4b, #2018's rulings). Under a placeholder, today keeps the records at a granularity a leaf multiset cannot
+    pair, so the pairing skips them. The rules check them instead:
+    - Every list record at or inside a placeholder is unused `unresolved`, part by part. The exception is a `removed`
+      AT a nested placeholder: it targets the reference row of a loaded document and decides whether the placeholder
+      shows, so it APPLIES and is not unused (hub ruling, 2026-10-02; #2024).
+    - Every held legacy statement of a member row under a placeholder is reported, and only as `unresolved`. When the
+      instance's own prefab is missing, that covers every held statement. A statement's user-added nodes are checked
+      as nodes. Whatever else it holds needs a record of its own, so a node cannot vouch for a lost removal beside it.
+      And no unused legacy record names a statement `held` does not hold.
+    - Every user-added node is placed exactly once. AT a placeholder it hangs from the placeholder. INSIDE one it is
+      `unresolved`. On a projected member it is anchored there. Otherwise it is `heldNode` (B′). A node is one guid,
+      whatever states it: a list row's `own` link, its content in `held.heldOwn`, or a scene-owned node in a held
+      legacy row's `added`. § 10.4b's AT-a-placeholder fix covers every file form (#2025).
+    - The fold reports only placeholders no removal cut. A placeholder the instance's own removal cuts goes with its
+      member: its links are `heldNode` and its other records are inert (hub ruling, 2026-10-02: the cut dominates the
+      placeholder, rule 3).
+
+    Its rules have pure tests (`foldOraclePlacement.test.ts`). The saved-scene oracle pins what it reaches: a node on
+    a projected member, AT and INSIDE a placeholder, and list and held records under one. A held own link is reached
+    only at hunt length, so `prefabFuzz.test.ts` pins it on hunt seed 246, minimized. Mutations:
+    - the fold dropping a held link, or marking it `gone` (which Remove Unused would take), turns that pin red; the
+      leaf pairing alone misses the second;
+    - the fold dropping its held `unresolved` legacy records (the close-out review's mutation, green across every
+      suite before the held check) turns saved-scene seeds 5, 103 and 235 red.
   - Not checked:
     - The end walk (undo to the start, redo to the end) and the respawn rebuild.
-    - A record the fold keeps nothing for under a placeholder, because both sides are skipped there (#2018 names
-      that route).
+    - Which part of a held legacy statement the fold reports. The check requires one record, so a statement that loses
+      some of its fields passes.
+    - A guid stated more than once (a duplicate identifier, rule 5): what it means is #1937's. It is counted
+      (`seen.ownDuplicate`, pinned at 0 over the fuzz), not judged.
+    - WHERE a user-added node shows, and its cause, when it is held in a form that does not name its anchor row: the
+      entry-level legacy `added`, or a held `nestedStructure` slot's `added`. That is #2025's open family. Holding it
+      to `unresolved` would push a fix that shows it the wrong way, so only "placed exactly once" is checked: anchored,
+      or held at its own path (counted in `seen.heldNodeUnjudged`).
+    - A held `nestedOverrides`/`nestedStructure` statement whose path runs through a missing NESTED prefab. It is keyed
+      at `/`, and telling which placeholder it waits on is a frame walk the check does not repeat. No fuzz seed reaches
+      it (the re-review counted 0).
+    - A held member row or `nestedStructure` slot that states nothing (`{}`): it is no statement, and the fold reports
+      none. Any other channel's empty entry, such as `overrides: {4: {}}`, is still one held statement.
     - A restore (`removed: false`) under a member an inner layer removed: no verify seed reaches it, so the fold
       dropping that row's `removed` record there goes unseen.
-    - A held own link (the fold's `own heldNode`): no verify seed reaches one.
   - Its first hunt and the close-out review (2026-10-02) found three gaps in the ORACLE, all fixed there:
     - A template-added reference node did not open a frame.
     - A scene-added reference node's own template-added node was claimed by the outer instance.
