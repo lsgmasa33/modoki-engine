@@ -279,6 +279,14 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
       + 'before/after a run — not repo content.',
   },
   {
+    file: 'engine/scripts/packagedDepsSignature.mjs', rule: 'walker', walker: 'walk',
+    reason: 'Hashes what electron-builder COPIES into the packaged node_modules (#2064), and that '
+      + 'includes GITIGNORED build output — the capacitor-* plugins ship their JS only in a gitignored '
+      + 'dist/, which is exactly what Vite pre-bundles. repoFiles() enumerates through `git ls-files '
+      + '--exclude-standard`, so it cannot see those files; using it would make a plugin rebuild '
+      + 'invisible to the cache bust (packagedDepsSignature.test.ts pins the dist/ case).',
+  },
+  {
     file: 'engine/scripts/clean-texture-cache.mjs', rule: 'walker', walker: 'walkSourceDirs',
     reason: 'walkSourceDirs(CACHE_DIR) walks the local BUILD CACHE (.cache/modoki-textures) — its '
       + '"source dirs" are the per-source-texture folders INSIDE the cache, not repo sources. Not '

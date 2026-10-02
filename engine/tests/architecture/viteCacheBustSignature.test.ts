@@ -27,6 +27,9 @@
 import { describe, it, expect } from 'vitest';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { found } from '@modoki/engine/testing/inOrder';
+import { electronOpts, repoRoot } from '../../scripts/electronBuildOpts.mjs';
+import { packagedDepsSignature } from '../../scripts/packagedDepsSignature.mjs';
 import { calledNames, callsTo, declarationOf, findNodes, functionsNamed, parseSource, statementOf, ts, unwrapValue, variablesNamed } from '@modoki/engine/testing/sourceAst';
 
 const mainTs = path.resolve(__dirname, '../../electron/main.ts');
@@ -175,6 +178,53 @@ describe('packaged Vite dep-cache bust signature (#21)', () => {
       'the bust signature should hash the packaged main.cjs so it changes exactly when the '
         + 'build does — and not otherwise',
     ).toBe(true);
+  });
+
+  /** #2064: main.cjs's bytes do not move when only renderer/editor engine source or a registry dep
+   *  changes — it bundles only what the MAIN process imports, deps external — so a signature over
+   *  main.cjs alone kept the stale pre-bundled chunk and the next packaged boot died on a newly-added
+   *  export. The packaged-deps signature is what moves with those; this pins that it reaches
+   *  `buildSig` and that the build actually bakes it. Its own behaviour:
+   *  tests/electron/packagedDepsSignature.test.ts. */
+  it('folds the build-time packaged-deps signature into the signature (#2064)', () => {
+    const { inputs } = bustBlock(main(), 'main.ts');
+    expect(
+      inputs.some((e) => findNodes(e, ts.isIdentifier).some((i) => i.text === '__MODOKI_DEPS_SIG__')),
+      'buildSig must include __MODOKI_DEPS_SIG__ — without it an engine-only rebuild or a dep bump leaves '
+        + 'the signature unchanged and the packaged editor keeps the stale dep chunk (#2064)',
+    ).toBe(true);
+    expect(
+      electronOpts({ logLevel: 'silent' }).define?.__MODOKI_DEPS_SIG__,
+      'the shipped esbuild options must define __MODOKI_DEPS_SIG__ from packagedDepsSignature()',
+    ).toBe(JSON.stringify(packagedDepsSignature(repoRoot)));
+  });
+
+  /** #2064 close-out review: the signature file is the "this bust is done" record, so it must be
+   *  written after BOTH halves of the bust. Written first, a clear that throws (or a kill in between)
+   *  leaves a matching signature and the next boot never retries — #110's stale body, kept. */
+  it('records the signature only after the wipe and the browser-cache clear', () => {
+    // An un-awaited clear runs AFTER the write whatever the statement order says, and its rejection
+    // escapes the try as an unhandled rejection (close-out re-review: `unwrapValue` strips `await`, so
+    // the order checks below cannot tell). Probe both shapes, then the real file.
+    const awaited = (b: ts.Block) => callsTo(b, 'clearBrowserCaches').map((c) => {
+      const st = statementOf(c);
+      return ts.isExpressionStatement(st) && ts.isAwaitExpression(st.expression) && st.expression.expression === c;
+    });
+    const probe = (clear: string) => bustBlock(`async function boot() {\ntry { const buildSig = h; if (prev !== buildSig) { fs.rmSync(d); ${clear} fs.writeFileSync(f, buildSig); } } catch {}\n}`, 'probe.ts').block;
+    expect(awaited(probe('await clearBrowserCaches();'))).toEqual([true]);
+    expect(awaited(probe('clearBrowserCaches();'))).toEqual([false]);
+    expect(awaited(probe('void clearBrowserCaches();'))).toEqual([false]);
+    const { block } = bustBlock(main(), 'main.ts');
+    expect(awaited(block), 'clearBrowserCaches() must be AWAITED, as a statement of its own').toEqual([true]);
+    const wipe = statementOf(callsTo(block, 'rmSync')[0]!);
+    const list = wipe.parent as ts.Block;
+    const at = (n: ts.Node, what: string) => found(list.statements.indexOf(statementOf(n) as ts.Statement), `${what} in the wipe's branch`);
+    const writes = callsTo(block, 'writeFileSync');
+    expect(writes.length, 'expected one signature write (writeFileSync) in the bust block').toBe(1);
+    const clear = callsTo(block, 'clearBrowserCaches')[0]!;
+    const write = at(writes[0]!, 'the signature write');
+    expect(write, 'the signature must be written AFTER clearBrowserCaches()').toBeGreaterThan(at(clear, 'clearBrowserCaches()'));
+    expect(write, 'the signature must be written AFTER the dep-cache wipe').toBeGreaterThan(at(wipe, 'the dep-cache wipe'));
   });
 
   /** #110: wiping `vite-cache` alone accomplishes NOTHING across an app update. Vite serves

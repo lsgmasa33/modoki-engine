@@ -4,8 +4,9 @@
  *
  * Vite keys that cache (`node_modules/.vite/deps/_metadata.json`) on `getLockfileHash` +
  * `getConfigHash` (vite 8.2.0, `node.js` `getDepHash`). The lockfile half reads ONE file — the
- * first lockfile found walking up from Vite's root (`engine/`), i.e. the repo root's — and a
- * project's lockfile is never an ancestor of that root. So a game that DROPS a dependency Vite had
+ * first lockfile found walking up from Vite's root (`engine/`), i.e. the repo root's
+ * `node_modules/.package-lock.json` (in the PACKAGED app it finds none and hashes '' — main.ts's
+ * cache bust covers that, #2064) — and a project's lockfile is never an ancestor of that root. So a game that DROPS a dependency Vite had
  * pre-bundled leaves the cache valid in Vite's eyes; the next re-optimize (the first time a new dep
  * is discovered) rebuilds the cached list, hits the removed package's missing source, fails, and
  * the game boots DEGRADED with 504s on the new dep's chunk. Observed on work-ai when #1495 dropped

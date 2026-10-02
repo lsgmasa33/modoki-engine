@@ -38,6 +38,12 @@ import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptL
 // correct in dev AND packaged; the `typeof` guard falls back if the define is ever absent.
 declare const __APP_VERSION__: string;
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : app.getVersion();
+// A content hash of the root lockfiles + the LINKED workspace packages (`@modoki/engine`, capacitor-*),
+// bundled at build time by electronBuildOpts.mjs — an input of the packaged Vite dep-cache bust below
+// (#2064). The `typeof` guard keeps the rest of the signature (the version, main.cjs) busting if the
+// define is ever absent, rather than a ReferenceError disabling the whole bust.
+declare const __MODOKI_DEPS_SIG__: string;
+const DEPS_SIG = typeof __MODOKI_DEPS_SIG__ !== 'undefined' ? __MODOKI_DEPS_SIG__ : 'no-deps-sig';
 
 // ══ userData MUST be decided FIRST — before ANY app.getPath('userData') ══
 // Electron RESOLVES AND CACHES userData on its first read, so whoever reads first wins.
@@ -2471,15 +2477,22 @@ app.whenReady().then(async () => {
   // spawned Vite. Dev leaves it unset (Vite default under the repo).
   if (app.isPackaged && !process.env.MODOKI_VITE_CACHEDIR) {
     const cacheDir = path.join(app.getPath('userData'), 'vite-cache');
-    // BUST THE STALE CACHE ON AN APP-BUILD CHANGE. Vite keys its dep-optimize cache on the
-    // LOCKFILE, not the @modoki/engine SOURCE (a symlinked workspace dep) — so after an app update
+    // BUST THE STALE CACHE ON AN APP-BUILD CHANGE. Packaged, Vite keys its dep-optimize cache on its
+    // config ONLY — the app ships no lockfile, so its lockfile hash is the empty string (#2064) — and
+    // never on the @modoki/engine SOURCE (a workspace dep copied into node_modules) — so after an app update
     // (new engine code, unchanged deps) it reuses the OLD pre-bundled @modoki/engine chunk and every
     // import of a newly-added export fails ("@modoki_engine_runtime.js does not provide an export
     // named 'Transient'"), crashing the editor renderer. userData survives app updates, so the stale
     // cache persists across them. Fix: wipe the cache whenever the build changes. buildSig = version
-    // + this main.cjs's size + a CONTENT HASH; main.cjs is regenerated on every `build:electron`, so
-    // a rebuild always busts it; same build reuses it (fast relaunch). Best-effort: a re-optimize is
-    // far cheaper than a stale-cache crash.
+    // + the PACKAGED-DEPS signature + this main.cjs's size + a CONTENT HASH of it; same build reuses
+    // the cache (fast relaunch). Best-effort: a re-optimize is far cheaper than a stale-cache crash.
+    //
+    // ⚠️ main.cjs's own bytes are NOT enough (#2064). It bundles only what the MAIN process imports,
+    // so a change confined to renderer/editor engine source rebuilds it byte-identical — and the
+    // pre-bundled chunk that change made stale was kept, killing the next boot on a new export. A
+    // registry-dep bump is the same hazard (main bundles with `packages: 'external'`). The deps
+    // signature hashes the root lockfiles + the source of every workspace package the lockfile
+    // links, so it moves with both. What it covers and skips: engine/scripts/packagedDepsSignature.mjs.
     //
     // ⚠️ Hash the BYTES — never a `fs.stat` timestamp. `__filename` is a path inside app.asar, and
     // Electron's asar shim fabricates stat times, so an mtime-keyed signature never matches itself
@@ -2489,13 +2502,12 @@ app.whenReady().then(async () => {
     try {
       const buf = fs.readFileSync(__filename); // the packaged main.cjs (path is inside app.asar)
       const hash = createHash('sha256').update(buf).digest('hex').slice(0, 16);
-      const buildSig = `${app.getVersion()}:${buf.length}:${hash}`;
+      const buildSig = `${app.getVersion()}:${DEPS_SIG}:${buf.length}:${hash}`;
       const sigFile = path.join(app.getPath('userData'), '.vite-cache-build');
       const prev = fs.existsSync(sigFile) ? fs.readFileSync(sigFile, 'utf8') : '';
       if (prev !== buildSig) {
         fs.rmSync(cacheDir, { recursive: true, force: true });
         fs.mkdirSync(app.getPath('userData'), { recursive: true });
-        fs.writeFileSync(sigFile, buildSig);
         // …AND the renderer's browser caches, or wiping the dep-cache above achieves NOTHING (#110).
         // Vite serves `/deps/*.js?v=<browserHash>` as `Cache-Control: immutable`, and browserHash
         // keys on the LOCKFILE + optimizeDeps config — NOT on @modoki/engine source. So an
@@ -2516,6 +2528,10 @@ app.whenReady().then(async () => {
         // warm cache. The cost is one cold refetch of localhost assets after an update — the same
         // trade the dep re-optimize already makes, and far cheaper than a dead editor.
         await clearBrowserCaches();
+        // The signature is recorded LAST, after both clears: if either throws, or the app dies in
+        // between, the next boot still sees a changed build and retries, instead of trusting a
+        // half-done bust.
+        fs.writeFileSync(sigFile, buildSig);
         console.log(`[modoki-electron] app build changed — cleared stale Vite dep-cache + browser caches (${buildSig})`);
       }
     } catch (e) {

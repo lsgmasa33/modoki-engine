@@ -98,7 +98,8 @@ the real error. Guarded now by `engine/tests/architecture/ambientTypesOptOut.tes
 
 Vite keys its dep-optimizer cache (`node_modules/.vite/deps/_metadata.json`, or `vite-cache` under
 userData when packaged) on its config plus ONE lockfile: the first one found walking up from its
-root, `engine/`, which is the repo root's. A `games/<id>/package-lock.json` is never that lockfile. So when a game **dropped** a dependency the cache had pre-bundled, the cache stayed
+root, `engine/`, which is the repo root's `node_modules/.package-lock.json`. (The packaged app ships
+no lockfile, so there it keys on the config alone; see #2064 below.) A `games/<id>/package-lock.json` is never that lockfile. So when a game **dropped** a dependency the cache had pre-bundled, the cache stayed
 "valid". The next re-optimize, which fires the first time a new dependency is discovered, rebuilt the
 cached list, hit `ENOENT` on the removed package's source, and wrote nothing. The game then booted
 **DEGRADED**, with 504s on the new dependency's chunk. Seen when #1495/#1496 swapped AdMob for
@@ -1474,6 +1475,10 @@ a file timestamp**; hash the bytes — reading + hashing `main.cjs` measures ~0.
 a full cold dep-optimize every launch. Measured after the fix: the wipe fires once per build and
 then never again, and boot drops 9.6s → 7.8s across relaunches.
 
+⚠️ **main.cjs's bytes are not the whole build (#2064).** The signature is now
+`version:depsSig:size:hash`. See "Stale dep chunk after an engine-only rebuild" below for why
+the middle term exists.
+
 Why this loop exists: packaged-only bugs (minimal Finder PATH, asar-sealed `package.json`,
 dereferenced `@modoki/engine` symlink, pruned devDeps, PROD-only CSP) are **invisible to
 `npm run dev`** — the dev env has full PATH, live symlinks, no asar, no CSP. Static guards
@@ -1609,6 +1614,49 @@ after the reload is indistinguishable from no clear at all).
 `userData` carries forward. `smoke:packaged` and `repro-cold-boot.sh` both start from a fresh
 profile, so neither exercises the path. Testing an upgrade means installing the *previous* version,
 running it once, then installing the new one over it.
+
+**Stale dep chunk after an engine-only REBUILD (#2064).** This is #110's crash again
+(`@modoki_engine_editor.js … does not provide an export named …`, painted by `EditorBootBoundary`
+after its one retry). This time the trigger is a local rebuild, not an update. The bust signature
+used to be `version:size:sha256(main.cjs)`, and main.cjs bundles only what the MAIN process imports.
+A change confined to renderer/editor engine source (`engine/packages/modoki/src/editor/**`, say)
+therefore rebuilt main.cjs byte-identical. The signature matched, and neither `vite-cache` nor the
+browser caches were cleared. Electron-builder turns the `@modoki/engine` symlink into a COPY of the
+working tree, and Vite pre-bundles that copy. **In the packaged app Vite keys the bundle on no
+lockfile at all.** Neither `package-lock.json` nor `node_modules/.package-lock.json` ships, so every
+packaged `_metadata.json` records `"lockfileHash": "e3b0c442"`, the sha256 of the empty string. That
+means a **registry-dep bump** (react, three, koota…) is the same hazard as engine source: main
+bundles with `packages: 'external'`, so main.cjs does not move either.
+
+- **Fix:** `engine/scripts/packagedDepsSignature.mjs` hashes the bytes of the root lockfiles,
+  which pin the registry deps. It also hashes every package the lockfile marks `link: true` (paths +
+  bytes, skipping nested `node_modules/` and dot-dir tool state like SwiftPM's `.build`). That set is
+  DERIVED from the lockfile, so a new workspace package joins it unedited. `electronBuildOpts.mjs`
+  bakes the hash into main.cjs as `__MODOKI_DEPS_SIG__`, and `buildSig` folds it in. The signature
+  file is now written only after both the wipe and the browser-cache clear, so a clear that throws
+  is retried on the next boot instead of being trusted. Cost: ~0.1s at build time, nothing at boot.
+- **Measured 2026-10-03** (macOS, games/3d-test, one reused `--user-data-dir`):
+
+  | Build | Bust on boot | Result |
+  |---|---|---|
+  | Fix reverted; build, boot; then add an engine-only export + use it from `engine/app`; rebuild, boot | no (main.cjs identical, `1276181:d0c5…` both times) | **dies in `EditorBootBoundary`**, 0 entities |
+  | Final fix; relaunch the same build | no | boots, 136 entities (still warm, so not #21) |
+  | Final fix; change only `node_modules/.package-lock.json` (one byte); rebuild, boot | yes (deps sig `096e…` → `28a6…`, main.cjs length unchanged) | boots, 136 entities |
+  | Final fix; add the engine-only export as above; rebuild, boot | yes (`28a6…` → `d745…`) | boots, 136 entities, new export in the dep chunk, no console errors |
+
+  The lockfile row proves the lockfile term reaches the bust, not the registry-bump crash itself.
+  Reproducing that crash needs a real dependency upgrade.
+
+- **Who it hits:** the local packaged loop (`editor:packaged`, `test:packaged`, a hand-run
+  `dist:dir`). A shipped update always bumps `app.getVersion()`, because electron-updater offers
+  only a strictly newer version (`allowDowngrade` is never set), so it was already covered. The one
+  user path is a MANUAL reinstall of a release re-cut at an unchanged version (the release skill
+  allows that, though it discourages it). The new term covers that path too. A registry-dep bump in
+  the local loop was equally exposed before this fix.
+- **Gates:** `smoke:packaged` starts from a fresh profile, so it still cannot see this class. The
+  table above is the second-boot check; repeat it by hand after changing this mechanism. Guards:
+  `tests/electron/packagedDepsSignature.test.ts` (the hash's behaviour) and
+  `viteCacheBustSignature.test.ts` (that `buildSig` reads it and the build defines it).
 
 Measured 2026-08-03 (v0.3.6, macOS): **30/30 cold boots clean** via
 `engine/scripts/repro-cold-boot.sh` — no crash, no boundary fire, no console errors. At the observed

@@ -13,13 +13,15 @@
  * staying green. The guard that reads this file needs `packages: 'external'` and the entry points
  * to be the REAL ones, because those two fields are precisely what make #1035 possible.
  *
- * ⚠️ **Nothing may be executed at import time in this file** beyond reading the version out of
- * package.json. That is the property that makes it importable from a test.
+ * ⚠️ **Nothing may be executed at import time in this file.** The version and the packaged-deps
+ * signature are read when `electronOpts()` is CALLED. That is the property that makes it importable
+ * from a test.
  */
 import path from 'node:path';
 
 import { fileURLToPath } from 'node:url';
 import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
+import { packagedDepsSignature } from './packagedDepsSignature.mjs';
 
 /** `engine/electron` — resolved from THIS file, so the build works from any CWD. */
 export const electronDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'electron');
@@ -72,7 +74,12 @@ export function electronOpts(over = {}) {
     packages: 'external',
     sourcemap: over.sourcemap ?? true,
     logLevel: over.logLevel ?? 'info',
-    define: { __APP_VERSION__: JSON.stringify(appVersion()) },
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion()),
+      // #2064: the packaged Vite dep-cache bust signature (main.ts) folds this in, because a
+      // dependency or engine-only change leaves main.cjs's own bytes identical. Computed here, at build time.
+      __MODOKI_DEPS_SIG__: JSON.stringify(packagedDepsSignature(repoRoot)),
+    },
     ...(over.metafile ? { metafile: true } : {}),
   };
 }
