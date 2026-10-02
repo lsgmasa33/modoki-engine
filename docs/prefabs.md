@@ -46,6 +46,8 @@ The table after the list says how far each rule is built.
 4. **Save writes the list. It does not diff the live tree.** So load → save is verbatim, and the
    prefab wins every field the list does not name. A scene can beat its prefab only with a record.
 5. **Identity is minted once and never guessed.** Only a write mints identity; a reader never does.
+   A reader may DERIVE identity deterministically from what the file already states (the existing
+   pin → template → derived order). It never mints a fresh one (hub refinement, 2026-10-02, #2006).
    A document with duplicate identifiers is refused (I5, #1937).
 6. **Nested prefabs: the outer layer wins, field by field.** Restructuring a prefab instance
    (moving or reordering what the prefab supplies) is refused, as in Unity (I1, U7, U29).
