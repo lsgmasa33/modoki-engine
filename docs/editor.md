@@ -4249,6 +4249,11 @@ sort), the watcher's heal can mint the png a sidecar before the dropped one is w
     server saw two. The root that recorded the GUID FIRST keeps it (scoped review of #1996, observed: without `since`, an
     engine font copied into a game re-minted the ENGINE's original). Only a unique earliest record decides that a file
     is the copy; a tie (both first seen in one scan) falls through to the fallback order and keeps `generated`.
+    ⚠️ In THIS repo that editor-side heal must not be how an engine↔game duplicate gets resolved (#2005): the record is
+    machine-local, so every clone's editor heals the same committed pair on its own, each writing its own fresh id into
+    the same committed file, which means git churn and merge conflicts between the worker branches.
+    `crossProjectGuidUniqueness.test.ts` therefore counts the engine built-in root as a root, so `verify` fails on the
+    clone that made the copy, and that clone makes the one deliberate re-mint.
   - **Every host and every test reads the REAL store.** A test that starts a host on a scratch project still scans the
     real engine built-in root beside it, and its heal writes real sidecars, so a scratch store there re-minted by path
     order (re-review of #1996, observed). Instead, `pruneGuidOwnerStore` (once per store per module instance: per

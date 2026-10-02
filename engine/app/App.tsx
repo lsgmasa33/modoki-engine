@@ -565,16 +565,11 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // This boot ends here for the session, and nothing below will release the hold.
         if (!otaShouldProceed) { releaseLoadingTimeHold(); disarmBootContent(); return; }
 
-        // OTA Phase 4 — a sub-game's config.scenePath is a root-relative build-output
-        // literal baked against ITS OWN origin (config.assetBaseUrl, set by
-        // subgameLoader.ts), not the shell's — prefix it here or the fetch 404s
-        // against the shell's webroot instead of the staged bundle. Unset (baked
-        // shell game) is a no-op. See config.ts's assetBaseUrl doc.
-        // The sub-game branch keeps the `?url` value ENCODED: prefixed with an origin it is a full URL,
-        // which assetUrl passes through untouched. Otherwise it is read as a PATH (#1979).
-        const defaultScenePath = config.assetBaseUrl && config.scenePath?.startsWith('/')
-          ? config.assetBaseUrl + config.scenePath
-          : scenePathOfConfig(config);
+        // Read as a PATH (#1979). OTA Phase 4: a sub-game's config.scenePath is a root-relative
+        // build-output literal baked against ITS OWN origin (config.assetBaseUrl, set by
+        // subgameLoader.ts), so bootScenePath prefixes that origin, or the fetch 404s against the
+        // shell's webroot instead of the staged bundle (#2051 moved it there from here).
+        const defaultScenePath = scenePathOfConfig(config);
         const bootScenePath = overridePath ?? defaultScenePath;
         if (bootScenePath) {
           await sceneManager.loadScene(bootScenePath, { gameId });

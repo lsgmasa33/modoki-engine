@@ -83,7 +83,7 @@ const MAX_PARENT_DEPTH = 64;
  *  top-level `id`, so the path is the only scene identity that reaches *this* function.
  *
  *  ⚠️ **"Project-relative" is what the caller normally passes, NOT something enforced here**,
- *  and the difference is a real one: `App.tsx`'s OTA sub-game boot prefixes `assetBaseUrl`
+ *  and the difference is a real one: an OTA sub-game's boot (`bootScenePath`) prefixes `assetBaseUrl`
  *  onto the path before `loadScene`, so the same unmigrated scene seeds differently as a baked
  *  shell game and as an OTA sub-game. Latent today — the runtime never saves a scene, and the
  *  committed corpus is fully migrated — but it means the seed's stability rests on the callers

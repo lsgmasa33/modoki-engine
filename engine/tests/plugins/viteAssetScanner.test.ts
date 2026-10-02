@@ -1614,7 +1614,11 @@ describe('buildManifest auto-heal', () => {
       expect(guidOwnersFile(link, store)).toBe(guidOwnersFile(assetsDir, store));
     });
 
-    it("an engine built-in copied into a game: the root that recorded the GUID FIRST keeps it, though both roots record it", () => {
+    // An OUTCOME check, not a test of `since`: the built-in always comes first in the fallback order too, so here the
+    // record and the fallback agree and no ordering of the scans can make `since` decisive (#2004). What it pins is
+    // the comparison's DIRECTION — keeping the LATEST record re-mints the built-in — and that the repo-root scan,
+    // which records the game's copy as well, does not hand it the id. `since` itself is pinned by the next test.
+    it("an engine built-in copied into a game: the built-in keeps the id, though the repo-root scan records both roots", () => {
       const eng = path.join(tmpDir, 'eng');
       fs.mkdirSync(eng);
       fs.writeFileSync(path.join(eng, 'font.png'), 'pretend-png');

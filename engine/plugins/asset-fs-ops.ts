@@ -628,8 +628,9 @@ export function importDecidesIdentity(destUrl: string): boolean {
  *  already has an asset under a guid.
  *
  *  ⚠️ Decided HERE, before the bytes reach disk, never left to the scanner: a colliding copy written as it came meets
- *  the scanner's heal, which keeps the id for whichever path sorts FIRST — re-minting the ORIGINAL when the import
- *  sorts first, and re-pointing every ref to it at the import.
+ *  the scanner's heal, which keeps the original only when this machine's owner record says which file held the id
+ *  first (#1996). With no decisive record (a first scan, a cleared store) it falls back to the path that sorts first —
+ *  re-minting the ORIGINAL when the import sorts first, and re-pointing every ref to it at the import.
  *
  *  Anything else — a binary (the scan mints its sidecar), a JSON file the scanner types as no asset or as a kind whose
  *  guid is not in the file, JSON that does not parse — is written exactly as it came. Except a SCENE this build cannot

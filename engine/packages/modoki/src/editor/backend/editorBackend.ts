@@ -223,7 +223,7 @@ export async function saveSceneCopy(filePath: string, content: string, openPath:
  *  → `importedAssetBytes`); anything else unchanged, without a round trip. `{error}` with the route's reason when the
  *  backend could not answer (#1824 — it was a console line and `null`) — the caller must NOT fall back to the dropped
  *  bytes, which carry the source's id: written as they are, a copy of an asset already in the project claims its guid,
- *  and the scanner's heal keeps it for whichever path sorts first.
+ *  and with no owner record to decide (#1996) the scanner's heal keeps it for whichever path sorts first.
  *
  *  `claimed` is ONE batch's decided ids, shared across its calls and grown by each (#1713 close-out re-review): the
  *  batch writes through `/api/write-file`, which rebuilds no manifest, so the backend cannot see the batch's earlier

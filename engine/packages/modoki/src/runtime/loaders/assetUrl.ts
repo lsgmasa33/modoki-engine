@@ -1,4 +1,4 @@
-import { encodeAssetUrlPath } from '../core/assetUrlPath';
+import { encodeAssetUrlPath, subgameAssetBaseOf } from '../core/assetUrlPath';
 
 /** Turn a root-absolute asset PATH into the URL that fetches it: percent-encode the characters a
  *  URL path cannot carry literally, then prefix Vite's BASE_URL so runtime fetches resolve when the
@@ -11,6 +11,13 @@ import { encodeAssetUrlPath } from '../core/assetUrlPath';
  *  it its own output, or a `%` is encoded twice. */
 export function assetUrl(path: string): string {
   if (!path) return path;
+  // An OTA sub-game's asset path is its staged bundle's URL base + a root-absolute path (#2051): the
+  // base is already a URL, the rest is still a PATH, so only the rest is encoded. A full URL under no
+  // registered base (an external `https://` ref) passes through untouched, as below.
+  if (path.charCodeAt(0) !== 47 /* '/' */) {
+    const base = subgameAssetBaseOf(path);
+    if (base) return base + encodeAssetUrlPath(path.slice(base.length));
+  }
   // Playable single-file build: the self-extract bootstrap inlines every reachable
   // asset and publishes `globalThis.__PLAYABLE_ASSETS__ = { '/assets/x': 'blob:…' }`.
   // Resolve a root-absolute asset path to its blob: URL — that works uniformly for

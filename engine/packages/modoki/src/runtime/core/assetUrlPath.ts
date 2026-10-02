@@ -25,6 +25,34 @@ export function encodeAssetUrlPath(assetPath: string): string {
   return assetPath.replace(/[%?#]/g, (c) => (c === '%' ? '%25' : c === '?' ? '%3F' : '%23'));
 }
 
+/** URL bases of the OTA sub-game bundles whose manifest fragments were merged (`loadManifestJson`'s
+ *  `pathPrefix`), each without a trailing slash. */
+const subgameBases = new Set<string>();
+
+/** Declare `base` (a sub-game's staged bundle root as a URL, e.g. `Capacitor.convertFileSrc()` of it)
+ *  as the prefix of asset paths: `base + '/assets/50%.png'` is an asset PATH whose part after `base`
+ *  `assetUrl` encodes (#2051). Called by `loadManifestJson` for a `pathPrefix`, the one place such
+ *  paths are made. */
+export function registerSubgameAssetBase(base: string): void {
+  subgameBases.add(base.replace(/\/$/, ''));
+}
+
+/** Forget every sub-game base — with the manifest entries that carried them (`clearManifest`). */
+export function clearSubgameAssetBases(): void {
+  subgameBases.clear();
+}
+
+/** The registered sub-game base `path` starts with, on a `/` boundary, or undefined.
+ *
+ *  ⚠️ The registry lives HERE, in the seam module, not in `loaders/assetUrl.ts`: nineteen tests mock that module with
+ *  an explicit export list, and `clearManifest` reaching a name the mock lacks throws in every one of them. */
+export function subgameAssetBaseOf(path: string): string | undefined {
+  for (const base of subgameBases) {
+    if (path.startsWith(base) && path.charCodeAt(base.length) === 47 /* '/' */) return base;
+  }
+  return undefined;
+}
+
 /** Decode a request's URL pathname back to the asset path it names — once. `null` for a malformed
  *  escape (a stray `%`): no asset URL this engine builds can produce one, so the caller treats it
  *  as "not an asset" and falls through, rather than throwing a 500. */

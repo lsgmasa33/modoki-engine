@@ -1867,7 +1867,7 @@ Three things about it that are easy to get wrong:
   is per file, the 11 are separate apps that are never loaded together, and a project-relative path
   is the identity that survives a game being **copied out of the repo** (#29), which a repo path
   would not. ⚠️ But "project-relative" is what callers happen to pass, **not** something the
-  derivation enforces — `App.tsx`'s OTA sub-game boot prefixes `assetBaseUrl` onto the path, so the
+  derivation enforces — an OTA sub-game's boot (`bootScenePath`) prefixes `assetBaseUrl` onto the path, so the
   same scene seeds differently there. Latent (the runtime never saves) and tracked in #1293, which
   also carries the alternative: seeding on the file's own `id`, which `SceneManager` already computes.
 - ⚠️ **A derived guid is checked against the guids already IN the file, not just against other

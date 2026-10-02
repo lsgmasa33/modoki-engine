@@ -41,7 +41,7 @@ export interface GameConfig {
    *  bundle root). Root-relative build output like `/assets/main-<hash>.json`
    *  otherwise 404s — it resolves against the SHELL's origin, not the bundle's.
    *  Unset for the shell's own (baked) game. Set by `app/subgameLoader.ts`,
-   *  consumed by `App.tsx`'s scene-boot-path resolution. See
+   *  consumed by `bootScenePath(config)`. See
    *  docs/ota-subgame-modules.md §3. */
   assetBaseUrl?: string;
 
@@ -57,10 +57,17 @@ let activeConfig: GameConfig | null = null;
  *  through `encodeURI`, so a boot scene named `level 1.scene.json` arrives as `level%201.scene.json`, and a project under
  *  `My Games/` as `/@fs/…/My%20Games/…`. `loadScene` takes a path and `assetUrl` encodes it again on the way out, so
  *  passing the URL straight through double-encoded it: a 404 in production and an unmatched `/@fs/` root in the editor.
- *  A malformed escape is kept as written — no `?url` value has one. */
-export function bootScenePath(config: Pick<GameConfig, 'scenePath'>): string | undefined {
+ *  A malformed escape is kept as written — no `?url` value has one.
+ *
+ *  An OTA sub-game's root-absolute scene path is prefixed with its `assetBaseUrl` AFTER the decode (#2051), so it is
+ *  spelled the way its manifest spells every other sub-game asset (`loadManifestJson`'s `pathPrefix`): a PATH, which
+ *  `assetUrl` encodes past the registered base. Prefixing the raw `?url` value kept the scene's identity encoded, so a
+ *  scene-name match (`sceneMatches`, `matchingSceneCallbacks`) missed a space or non-ASCII name on a sub-game boot. */
+export function bootScenePath(config: Pick<GameConfig, 'scenePath' | 'assetBaseUrl'>): string | undefined {
   const url = config.scenePath;
-  return url ? decodeAssetUrlPath(url) ?? url : url;
+  if (!url) return url;
+  const path = decodeAssetUrlPath(url) ?? url;
+  return config.assetBaseUrl && path.startsWith('/') ? config.assetBaseUrl.replace(/\/$/, '') + path : path;
 }
 
 export function setGameConfig(config: GameConfig) {

@@ -5244,7 +5244,8 @@ async function describeUnresolvedAgainstLiveWorld(
   // ── POST /api/scene-save-as {path, content} (M) ── an agent Save As of the OPEN scene (#1414).
   // `content` is the open scene as serialized, so it carries the ORIGINAL's scene id and entity
   // guids. Written as-is, two files would claim one guid and the scanner's heal would re-mint one of
-  // them — the committed original, whenever the copy sorts first. So the copy gets the identity
+  // them — the committed original, whenever the copy sorts first and no owner record decides (#1996).
+  // So the copy gets the identity
   // Duplicate gives: a fresh scene id and reminted entity guids (`remintSceneEntityGuids`, with
   // #1293's accepted Persistent cost). It OVERWRITES whatever scene is at `path`, under the fresh id
   // (owner, 2026-09-18) — the deliberate exception to #1264's "a Replace keeps the replaced guid".
@@ -6601,8 +6602,8 @@ async function describeUnresolvedAgainstLiveWorld(
       const destAbs = path.join(destDirAbs, base);
       if (fs.existsSync(destAbs)) return json({ error: `destination exists: ${base}` }, 409);
       // The identity is decided BEFORE the bytes reach disk (#1713): a colliding copy written with its source's id would
-      // meet the scanner's collision heal, which keeps the id for the path that sorts first — the ORIGINAL re-minted, whenever
-      // the import sorts first. A binary is copied as is; the rescan mints its sidecar.
+      // meet the scanner's collision heal, which falls back to the path that sorts first when no owner record decides (#1996)
+      // — the ORIGINAL re-minted, whenever the import sorts first. A binary is copied as is; the rescan mints its sidecar.
       // Classified by the url the SCAN will index it under (`scannerUrlOf`), so a legacy `/scenes/` folder typed in
       // another case still reads as one.
       // Only a file whose identity the import decides is read into memory; everything else is copied as before, so a

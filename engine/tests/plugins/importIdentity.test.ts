@@ -2,16 +2,20 @@
  *  Unity), and that is decided before its bytes reach disk.
  *
  *  `modoki_import_file` copied the file byte for byte and left identity to the scanner. Importing a copy of an asset
- *  the project already has then put two files under one guid, and the scanner's collision heal keeps the id for the
+ *  the project already has then put two files under one guid, and the scanner's collision heal kept the id for the
  *  path that sorts FIRST: an import sorting before its original re-minted the ORIGINAL, and every ref to it silently
- *  re-pointed at the import. The Assets panel's OS drop had the same defect by another route (`/api/write-file`,
+ *  re-pointed at the import. Since #1996 the heal keeps the prior owner its machine-local record names, but path order
+ *  is still the answer whenever no record decides (a first scan, a cleared store) — so this guard is still owed. The Assets panel's OS drop had the same defect by another route (`/api/write-file`,
  *  verbatim); it now takes its bytes from `/api/import-identity`, the same decision.
  *
- *  Over the REAL scan (`scanAllAssets`, which heals a collision exactly as production does), so the harm the fix
- *  prevents is observed rather than assumed: the original sorts AFTER the import folder.
+ *  The route's rebuild runs the REAL heal (`buildManifest(scanAllAssets(…), true)`) with NO owner record, i.e. its
+ *  path-order fallback, the case the import must not be left to. So the harm the fix prevents is observed rather than
+ *  assumed: the original sorts AFTER the import folder. (Before #2004 the stub only scanned, so no heal ran and the
+ *  "original keeps its id" assertions could not fail.)
  *
  *  Mutations, each checked red: `/api/import-file` back to `copyFileSync` — the colliding prefab, colliding scene and
- *  no-id cases go red, and every keep case stays green; `importedAssetBytes` ignoring `guidTaken` (always mint) — the three
+ *  batch cases go red, and every keep case stays green (the no-id case stays green too since #2004: the rebuild's heal
+ *  mints a missing id, as production's does, so that case no longer tells the route's mint from the scan's); `importedAssetBytes` ignoring `guidTaken` (always mint) — the three
  *  keep cases go red; ignoring the collision (never mint) — both colliding cases and the route's colliding case go
  *  red; the route answering the bytes it was given — its colliding case goes red; reading every source whole (the
  *  `importDecidesIdentity` gate dropped) — only the never-read case goes red; the route ignoring `claimed` — only the
@@ -20,7 +24,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
-import { resolveAssetPath, absToAssetUrl, scanAllAssets, type AssetRoot } from '../../plugins/vite-asset-scanner';
+import { resolveAssetPath, absToAssetUrl, scanAllAssets, buildManifest, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
@@ -42,7 +46,9 @@ function makeCtx(): BackendContext {
     absToAssetUrl: (abs: string, opts?: { onDisk?: boolean }) => absToAssetUrl(abs, roots, opts),
     firstRootDir: () => null,
     getManifest: () => manifest,
-    rebuildManifest: () => (manifest = { version: 2, assets: scanAllAssets(roots) } as unknown as Manifest),
+    // The real heal (`heal = true`) with no owner record: the route rebuilds after its write, so a copy it left
+    // colliding meets the path-order fallback here, as on a first scan in production (#2004).
+    rebuildManifest: () => (manifest = buildManifest(scanAllAssets(roots), true) as unknown as Manifest),
     requestBrowser: async () => ({ ok: true }),
     getSchema: () => undefined,
     markEditorWrite: () => {},

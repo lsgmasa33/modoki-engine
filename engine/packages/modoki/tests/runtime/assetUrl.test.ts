@@ -11,7 +11,8 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { assetUrl } from '../../src/runtime/loaders/assetUrl';
-import { decodeAssetUrlPath } from '../../src/runtime/core/assetUrlPath';
+import { loadManifestJson, resolveRef, clearManifest } from '../../src/runtime/loaders/assetManifest';
+import { decodeAssetUrlPath, registerSubgameAssetBase } from '../../src/runtime/core/assetUrlPath';
 import { cssUrl } from '../../src/runtime/core/assetUrlPath';
 import { bootScenePath } from '../../src/runtime/core/config';
 
@@ -110,5 +111,55 @@ describe('bootScenePath — config.scenePath is a `?url` URL, read as a PATH (#1
       const wire = new URL(assetUrl(bootScenePath({ scenePath: viteUrl })!), 'http://localhost').pathname;
       expect(decodeAssetUrlPath(wire), onDisk).toBe(onDisk);
     }
+  });
+});
+
+/** #2051: an OTA sub-game's asset path is its staged bundle's URL base + a root-absolute path. The
+ *  base is a URL, the rest a PATH, and only the rest is encoded — by `assetUrl`, past a base the
+ *  manifest merge registered. The native handler decodes the request path once, like the dev server. */
+describe('an OTA sub-game base: a URL prefix assetUrl encodes past (#2051)', () => {
+  const BASE = 'capacitor://localhost/_capacitor_file_/var/mobile/Library/NoCloud/ota/sub-a';
+  const onWireToDisk = (url: string) => decodeAssetUrlPath(new URL(url).pathname)!;
+  afterEach(() => { vi.unstubAllEnvs(); clearManifest(); });
+
+  it('encodes the path after a registered base, and nothing before it', () => {
+    vi.stubEnv('BASE_URL', '/');
+    registerSubgameAssetBase(BASE + '/');
+    expect(assetUrl(BASE + '/assets/50%.png')).toBe(BASE + '/assets/50%25.png');
+    expect(assetUrl(BASE + '/assets/a?b#c.png')).toBe(BASE + '/assets/a%3Fb%23c.png');
+    expect(assetUrl(BASE + '/assets/my tex.png')).toBe(BASE + '/assets/my tex.png');
+    for (const p of ['/assets/50%.png', '/assets/my%20tex.png', '/assets/a#b.png', '/assets/日本 語.png']) {
+      expect(onWireToDisk(assetUrl(BASE + p)).endsWith('/sub-a' + p), p).toBe(true);
+    }
+  });
+
+  it('KEEP SIDE: a full URL under no registered base passes through, a sibling bundle included', () => {
+    vi.stubEnv('BASE_URL', '/');
+    registerSubgameAssetBase(BASE);
+    expect(assetUrl('https://example.com/a%20b.png')).toBe('https://example.com/a%20b.png');
+    expect(assetUrl(BASE + '-2/assets/50%.png')).toBe(BASE + '-2/assets/50%.png');
+  });
+
+  it('the manifest merge registers its pathPrefix: a sub-game GUID resolves to a PATH that assetUrl encodes', () => {
+    vi.stubEnv('BASE_URL', '/');
+    const guid = '5a1e0c4e-6a43-4d7e-9a35-2f7d8c1e9a01';
+    loadManifestJson({ version: 2, assets: [{ guid, path: '/assets/50%.png', type: 'texture' }] } as never, { pathPrefix: BASE });
+    const path = resolveRef(guid);
+    expect(path, 'the identity stays decoded, as the shell spells its own').toBe(BASE + '/assets/50%.png');
+    expect(assetUrl(path!)).toBe(BASE + '/assets/50%25.png');
+    clearManifest();
+    expect(assetUrl(BASE + '/assets/50%.png'), 'clearManifest forgets the base with its entries').toBe(BASE + '/assets/50%.png');
+  });
+
+  it('bootScenePath decodes the `?url` value, THEN prefixes assetBaseUrl — spelled like the manifest spells it', () => {
+    vi.stubEnv('BASE_URL', '/');
+    registerSubgameAssetBase(BASE);
+    for (const onDisk of ['/assets/level 1.scene.json', '/assets/50%.scene.json', '/assets/ステージ.scene.json']) {
+      const scene = bootScenePath({ scenePath: encodeURI(onDisk), assetBaseUrl: BASE });
+      expect(scene).toBe(BASE + onDisk);
+      expect(onWireToDisk(assetUrl(scene!)).endsWith('/sub-a' + onDisk), onDisk).toBe(true);
+    }
+    expect(bootScenePath({ scenePath: '/assets/a.scene.json', assetBaseUrl: BASE + '/' })).toBe(BASE + '/assets/a.scene.json');
+    expect(bootScenePath({ scenePath: 'https://cdn/x.scene.json', assetBaseUrl: BASE }), 'only a root-absolute path is the bundle\'s').toBe('https://cdn/x.scene.json');
   });
 });

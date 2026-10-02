@@ -378,6 +378,15 @@ them use `runtime/core/assetUrlPath.ts`:
 | URL → path | `serveProjectAsset` (dev/editor server) | `decodeAssetUrlPath` decodes the request pathname **once**. A malformed escape falls through instead of becoming a 500. |
 | URL → path | `bootScenePath(config)` (`core/config.ts`) | `config.scenePath` is a Vite `?url` import, and Vite `encodeURI`s it. It is decoded once here, so `assetUrl` does not encode it a second time. Read it through this helper, never raw. |
 
+**An OTA sub-game's paths are a URL base plus a path (#2051).** Its manifest fragment is merged with
+`pathPrefix` = the staged bundle's URL (`Capacitor.convertFileSrc()`), so its asset path is
+`<base>/assets/50%.png`: the base is already a URL, the rest is still a path. `loadManifestJson`
+registers the base, and `assetUrl` encodes only the part after a registered base. A full URL under
+no registered base, such as an external `https://` ref, passes through untouched. `bootScenePath`
+prefixes the sub-game's `assetBaseUrl` after its decode, so the boot scene is spelled like every
+other sub-game asset. Never glue an encoded path onto the base: the identity would then be spelled
+encoded on a sub-game and decoded on the shell, and a scene-name match would miss on one of them.
+
 So a fetch of a path goes through `assetUrl`, never `fetch(path)` or `src={path}`. The reverse
 holds too: `assetUrl`'s OUTPUT is never an identity. `prefabCache` once registered it as a
 manifest path, and `App.tsx` once ran it twice. A CSS

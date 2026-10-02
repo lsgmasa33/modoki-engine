@@ -1335,8 +1335,9 @@ export interface SaveResult {
  *  identity, then reopen the copy.
  *
  *  The copy cannot carry the open scene's ids. Two files claiming one scene guid is what the dev
- *  scanner heals by re-minting one of them, and it picks by path order, so it re-minted the COMMITTED
- *  original whenever the copy sorted first; the entity guids would be shared too. So the backend
+ *  scanner heals by re-minting one of them. It picked by path order then, so it re-minted the COMMITTED
+ *  original whenever the copy sorted first — and it still does when no owner record decides (#1996: a
+ *  first scan, a cleared store). The entity guids would be shared too. So the backend
  *  stamps a fresh scene id and re-mints the entity guids, exactly as Duplicate does, and overwrites
  *  whatever scene is at `target` (owner, 2026-09-18) — anything that referenced that scene's old id
  *  no longer resolves. That is the one deliberate exception to #1264's "a Replace keeps the replaced

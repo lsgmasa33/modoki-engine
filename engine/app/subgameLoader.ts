@@ -199,8 +199,8 @@ async function loadOneSubgame(bundle: { name: string; version: string; path: str
   // GameConfig.scenePath is a root-relative build-output literal (Vite `?url`
   // import, e.g. "/assets/main-<hash>.json") — correct only when fetched against
   // THIS sub-game's own staged origin, not the shell's. Wrap loadConfig so every
-  // config this sub-game ever produces carries that origin; App.tsx's scene-boot
-  // resolution reads it back off assetBaseUrl. See config.ts's field doc.
+  // config this sub-game ever produces carries that origin; `bootScenePath(config)`
+  // reads it back off assetBaseUrl. See config.ts's field doc.
   const game = mod.game as GameDefinition;
   const originalLoadConfig = game.loadConfig;
   game.loadConfig = async () => ({ ...(await originalLoadConfig()), assetBaseUrl: baseUrl });

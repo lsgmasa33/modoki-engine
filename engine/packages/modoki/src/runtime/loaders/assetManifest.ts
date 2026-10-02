@@ -22,6 +22,7 @@
 
 import { notifyListeners } from '../core/notifyListeners';
 import { assetUrl } from './assetUrl';
+import { registerSubgameAssetBase, clearSubgameAssetBases } from '../core/assetUrlPath';
 import { ASSET_MANIFEST_VERSION } from './assetManifestVersion';
 import { markUIDirty } from '../core/uiDirty';
 import { fireDirtyListeners } from '../core/renderDirty';
@@ -611,10 +612,15 @@ const _manifestGuids = new Set<string>();
  *  (`/assets/x.png`) exactly like a normal per-game build — which would collide with
  *  the shell's own assets and resolve against the shell's root. Prefixing each path
  *  once here, at merge time, is enough: the manifest is a guid→path map consumed only
- *  through `resolveRef` → `assetUrl`, never read again from the source JSON. */
+ *  through `resolveRef` → `assetUrl`, never read again from the source JSON.
+ *
+ *  The prefixed path stays a PATH (#1979, #2051): `base + entry.path`, never encoded. The prefix is
+ *  registered as a sub-game base, so `assetUrl` encodes the part after it — gluing an encoded path on
+ *  here would spell this asset's identity encoded while the shell's is not. */
 export function loadManifestJson(json: AssetManifestFile, opts?: { pathPrefix?: string; prune?: boolean }): void {
   if (!Array.isArray(json.assets)) return;
   const prefix = opts?.pathPrefix ?? '';
+  if (prefix) registerSubgameAssetBase(prefix);
   const present = opts?.prune ? new Set<string>() : null;
   for (const entry of json.assets) {
     if (!entry.guid || !isGuid(entry.guid)) continue;
@@ -740,6 +746,7 @@ export function clearManifest(): void {
   _manifestGuids.clear();
   _spriteEpochByTexture.clear();
   clearAtlasFrames();
+  clearSubgameAssetBases();
   manifestLoadPromise = null;
 }
 
