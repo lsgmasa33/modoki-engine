@@ -781,7 +781,12 @@ mechanically:
       - a held member row's `added` (v16) or `own` (v17), at that row. The fold reports a held `added` node by node,
         so each needs its own record. A row's `own` is one of the row's fields, so its node may also be placed by the
         record that holds the row, or its `own` list, whole. An `added` node may not: one record for a whole list would
-        then place every node in it;
+        then place every node in it. A held KEYED copy in that `added` is walked too (#2036): every list the parser reads a copy's
+        nodes from states user nodes (a plain copy's `children`, a reference copy's `added`, its member rows' `own`/`added`,
+        its slots' `added`), at any depth, and slots are walked as rows are. Each is placed once, in an unused record that
+        keeps it (`heldNode`, or `unresolved` where the copy waits), by its own record or the record of a copy holding it:
+        the copy's key and cause are the fold's (it may sit at a placeholder, or name a missing prefab). Before, only the row's top-level nodes were enumerated, and a fold placing a copy's node
+        nowhere passed;
       - the entry-level legacy `added` under a MISSING ROOT. It is AT `/` only when the entry states the root's
         localId, the node names it, and the `/` row states no whole `added` list. Otherwise it waits, `unresolved`
         (hub ruling Q3: no localId is guessed, rule 5). This is judged from the owner AS STORED (the entry, or a

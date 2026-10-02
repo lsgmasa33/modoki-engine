@@ -286,6 +286,8 @@ export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly
 const under = (key: string, k: string) => k === '/' || key === k || key.startsWith(`${k}/`);
 
 const ROOT_KEY = '/';
+/** {@link placementDiverge}'s want for a user node inside a held keyed copy: held once, by a record that keeps it. */
+const HELD_IN_COPY = 'unused <the copy\'s record> heldNode|unresolved';
 
 /** The placeholder row a held `nestedStructure` slot's path (`'5'`, `'5.3'`: localIds, frame by frame) stops at, where a
  *  document is missing: `/` when the instance's own is; null when the path resolves, names no reference row, or there
@@ -400,11 +402,38 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
   const heldNode = (path: string[], guid: string, key: string, want?: string) => { if (!(key === ROOT_KEY && fromOwner.has(guid))) state(guid, key, want); nodePaths.set(pathOf(path), guid); };
   // A node held in a form the rules do not place (counted): it is still placed exactly once, at its own path.
   const unjudged = new Map<string, string>();
+  // Through a held KEYED copy (held whole, a template copy): every list the parser reads a copy's nodes from states the
+  // user's nodes — a plain copy's `children`, a reference copy's `added`, its member rows' `own`/`added`, its slots'
+  // `added` — at any depth (#2036). Such a node is placed exactly once, in an unused record that keeps it (`heldNode`,
+  // or `unresolved` where the copy waits), by its own record or by the record of a copy holding it: the copy's key and
+  // cause are the fold's to give (the copy may sit at a placeholder or name a missing prefab), so only that is judged.
+  const holders = new Map<string, Set<string>>();
+  const copiesIn = (list: unknown, at: string[], outer: string[] = [], depth = 0): void => {
+    if (depth > 64 || !Array.isArray(list)) return;
+    list.forEach((n, i) => {
+      const p = [...at, String(i)];
+      if (!(n && typeof n === 'object' && typeof (n as Bag).key === 'string' && (n as Bag).key)) {
+        if (outer.length && isUserNode(n)) { state(n.guid, '', HELD_IN_COPY); nodePaths.set(pathOf(p), n.guid); holders.set(pathOf(p), new Set(outer)); }
+        return;
+      }
+      const c = n as Bag, here = [...outer, pathOf(p)];
+      copiesIn(c.added, [...p, 'added'], here, depth + 1);
+      copiesIn(c.children, [...p, 'children'], here, depth + 1);
+      for (const [o, i2] of (Array.isArray(c.own) ? c.own : []).map((x, j) => [x, j] as const)) if (isUserNode(o)) { const q = [...p, 'own', String(i2)]; state(o.guid, '', HELD_IN_COPY); nodePaths.set(pathOf(q), o.guid); holders.set(pathOf(q), new Set(here)); }
+      for (const [mk, r] of Object.entries((c.members ?? {}) as Bag)) if (r && typeof r === 'object') {
+        copiesIn((r as Bag).added, [...p, 'members', mk, 'added'], here, depth + 1);
+        copiesIn((r as Bag).own, [...p, 'members', mk, 'own'], here, depth + 1);
+      }
+      for (const [sk, sl] of Object.entries((c.nestedStructure ?? {}) as Bag)) if (sl && typeof sl === 'object') copiesIn((sl as Bag).added, [...p, 'nestedStructure', sk, 'added'], here, depth + 1);
+    });
+  };
   // A held member row's `added` (v16) and `own` (v17): the row names its anchor.
   for (const [k, row] of Object.entries((pending.members ?? {}) as Bag)) {
     if (!row || typeof row !== 'object') continue;
     for (const list of ['added', 'own'] as const) for (const [i, g] of nodesOf((row as Bag)[list])) heldNode(['members', k, list, i], g, k);
+    copiesIn((row as Bag).added, ['members', k, 'added']);
   }
+  for (const [k, slot] of Object.entries((pending.nestedStructure ?? {}) as Bag)) if (slot && typeof slot === 'object') copiesIn((slot as Bag).added, ['nestedStructure', k, 'added']);
   // The entry-level legacy `added` names its anchor by the localId of a document that, under a missing root, is gone:
   // judged from the stored owner (above), else unjudged.
   for (const [i, g] of nodesOf(pending.added)) {
@@ -436,7 +465,7 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
       // `added` node by node, but a row's `own` is one of its fields. Only there, or one record for a whole list would
       // place every node of it (#2030 review).
       const p = pathOf(u.part.path);
-      for (const [np, g] of nodePaths) if (np === p || (np.split('\u0000')[2] === 'own' && np.startsWith(`${p}\u0000`))) place(g, `unused ${u.key} ${u.cause}`);
+      for (const [np, g] of nodePaths) if (np === p || (np.split('\u0000')[2] === 'own' && np.startsWith(`${p}\u0000`)) || holders.get(np)?.has(p)) place(g, `unused ${u.key} ${u.cause}`);
     }
   }
   // An unjudged node is still ONE node: shown once, or held once at its own path — never neither, both or twice.
@@ -451,8 +480,9 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
     if (st.length > 1) { seen.ownDuplicate++; continue; }
     const got = places.get(guid) ?? [];
     const want = st[0]?.want;
-    if (st.length) seen[atPh(st[0]!.key) ? 'ownAtPlaceholder' : underPh(st[0]!.key) ? 'ownInPlaceholder' : fold.nodes.has(st[0]!.key) ? 'ownProjected' : 'ownHeld']++;
-    if (got.length !== 1 || got[0] !== want) out.push(`own link ${guid}: stated ${show(want ? [want] : [])} placed ${show(got)}`);
+    if (st.length && want !== HELD_IN_COPY) seen[atPh(st[0]!.key) ? 'ownAtPlaceholder' : underPh(st[0]!.key) ? 'ownInPlaceholder' : fold.nodes.has(st[0]!.key) ? 'ownProjected' : 'ownHeld']++;
+    const ok = want === HELD_IN_COPY ? got.length === 1 && /^unused \S+ (heldNode|unresolved)$/.test(got[0]!) : got.length === 1 && got[0] === want;
+    if (!ok) out.push(`own link ${guid}: stated ${show(want ? [want] : [])} placed ${show(got)}`);
   }
 
   // Every other list record at or under a placeholder is unused `unresolved`, and nothing else the fold keeps there is.

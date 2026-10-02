@@ -23,7 +23,7 @@
  * nothing to act on, a legacy keyed move (#1883 C), a held legacy record whose localId names no row. `unresolved`: it
  * waits on a missing or damaged prefab. `unregistered`: a component this build does not register (I24). `unknownField`:
  * a field a registered component does not persist (rule 1, hub 2026-10-02, #2007). `heldNode`: a scene-owned node
- * whose anchor is not projected. Only `gone` and `unknownField` are removable (Remove Unused, S9).
+ * whose anchor is not projected, or a held template copy carrying one (#2036). Only `gone` and `unknownField` are removable (Remove Unused, S9).
  */
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { fieldFate } from '../loaders/overrideFate';
@@ -558,6 +558,29 @@ function tokenParent(st: State, token: string, frames: readonly Frame[], depth =
   return key === null ? null : { key };
 }
 
+/** The paths of the user's own nodes held value `v` states (#2036), in every form the parser reads one from: each keyless
+ *  element of its `added` (a SCENE-OWNED node; its children are its content), and inside each keyed element (a template
+ *  copy, held whole) the same again through every list a copy states nodes in: a plain copy's `children` (an unpaired
+ *  child is the user's, `pinAdded`), a reference copy's `added`, its member rows' `own` and `added`, and its
+ *  `nestedStructure` slots' `added`. `v`'s own `own` is not held (`convertRows` always links it). */
+function heldUserNodes(v: unknown, path: string[], out: string[][], copy = false, depth = 0): void {
+  if (depth > 64 || !isRecord(v)) return;
+  const list = (l: unknown, at: string[]): void => {
+    if (Array.isArray(l)) l.forEach((el, i) => {
+      const p = [...at, String(i)];
+      if (isRecord(el) && typeof el.key === 'string' && el.key) heldUserNodes(el, p, out, true, depth + 1);
+      else out.push(p);
+    });
+  };
+  list(v.added, [...path, 'added']);
+  if (!copy) return;
+  list(v.children, [...path, 'children']);
+  if (Array.isArray(v.own)) v.own.forEach((_, i) => out.push([...path, 'own', String(i)]));
+  for (const ch of ['members', 'nestedStructure'] as const) {
+    if (isRecord(v[ch])) for (const [k, r] of Object.entries(v[ch] as Record<string, unknown>)) heldUserNodes(r, [...path, ch, k], out, true, depth + 1);
+  }
+}
+
 /** The unused records `held` carries (§ 10.4; format rule, hub refinement 2026-10-02): every held legacy record (`gone`
  *  when the document resolves, since then its localId names no row; `unresolved` when it, or the nested path it runs
  *  through, does not), and every held scene-owned node (`heldNode`). */
@@ -649,8 +672,13 @@ function heldUnused(
       const key = prefix !== null ? `${prefix}/a+${el.key}` : restKey;
       // A copy held while the node it stands for SHOWS (a statement it carries names nothing, or a `templateMoved` no
       // record can carry) did not lose its target: it waits, kept, never `gone` (close-out review round 2).
+      // …and one that carries the user's own nodes (any `heldUserNodes` finds in it) is `heldNode`: a user
+      // node is never `gone`, whatever its anchor (round 5), and Remove Unused taking the copy would take them with it
+      // (#2036, ruled under § 10.4b; the record holds them whole, as a held row's record holds its `own`).
       const cause = of(el, c);
-      out.push({ key, part: { kind: 'legacy', path: at }, cause: cause === 'gone' && prefix !== null && st.nodes.has(key) ? 'unresolved' : cause });
+      const nested: string[][] = [];
+      if (cause === 'gone') heldUserNodes(el, [], nested, true);
+      out.push({ key, part: { kind: 'legacy', path: at }, cause: cause === 'gone' && prefix !== null && st.nodes.has(key) ? 'unresolved' : nested.length ? 'heldNode' : cause });
     });
     // A held list stating no element is still a held statement: reported, not invisible.
     if (added && !added.length) out.push({ key: restKey, part: { kind: 'legacy', path: [...path, 'added'] }, cause: c });
@@ -669,11 +697,11 @@ function heldUnused(
         const c = !doc ? 'unresolved' : channel === 'nestedOverrides' || channel === 'nestedStructure' ? pathCause(k) : channel === 'members' ? rowCause(k) : cause;
         if (c === null) {
           // Inert under the instance's own removal (rule 3) — but a user's own node held there is still a node: kept and
-          // reported `heldNode`, as its v20 link is, never neither (#2025 item 4, hub ruling on #2021).
-          const added = isRecord(v) && (channel === 'members' || channel === 'nestedStructure') && Array.isArray(v.added) ? v.added : [];
-          added.forEach((el, i) => {
-            if (!(isRecord(el) && typeof el.key === 'string' && el.key)) out.push({ key: channel === 'members' ? k : slotKey(k) ?? ROOT_ROW_KEY, part: { kind: 'legacy', path: [channel, k, 'added', String(i)] }, cause: 'heldNode' });
-          });
+          // reported `heldNode`, as its v20 link is, never neither (#2025 item 4, hub ruling on #2021). At any depth: a
+          // keyed copy held whole carries the user's nodes in its own statements too (#2036).
+          const paths: string[][] = [];
+          if (channel === 'members' || channel === 'nestedStructure') heldUserNodes(v, [channel, k], paths);
+          for (const path of paths) out.push({ key: channel === 'members' ? k : slotKey(k) ?? ROOT_ROW_KEY, part: { kind: 'legacy', path }, cause: 'heldNode' });
           continue;
         }
         if (!isRecord(v) || (channel !== 'members' && channel !== 'nestedStructure')) {

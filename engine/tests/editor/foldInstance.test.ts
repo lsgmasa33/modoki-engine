@@ -452,6 +452,55 @@ describe('foldInstance — close-out review round 5 (outcomes observed through t
     expect(f.unused).toEqual([{ key: `/${G(999)}`, part: { kind: 'legacy', path: ['members', `/${G(999)}`, 'added', '0'] }, cause: 'heldNode' }]);
   });
 
+  // #2036: a keyed copy is held whole, and its own statements can carry the user's nodes. Under the instance's own removal
+  // each is `heldNode` at the held row, never neither (§ 10.4b, #2021, #2025). Today keeps all of them: the load keeps the
+  // whole row as an R2 orphan and every save writes it back (measured; work-ai measured S5's save the same).
+  // Mutation: skip keyed elements in `heldUserNodes` (the old top-level-only walk) — F, I and the nested case go red.
+  describe('#2036: a user node INSIDE a held keyed copy under the instance\'s own removal is heldNode', () => {
+    const node = (n: number) => ({ parentLocalId: 0, guid: G(n), name: `S${n}`, traits: {}, children: [] });
+    const copy = (inner: object) => ({ key: 'kx', parentLocalId: 0, guid: '', name: 'X', traits: {}, children: [], ...inner });
+    const ROW = `/${N3}/${G(999)}`;
+    const held = (c: object) => fold(entry({ removed: [3], members: { [ROW]: { added: [c] } } as never })).unused;
+    it('F: a node in the copy\'s member row `own`', () => {
+      expect(held(copy({ members: { [`/${G(5)}`]: { own: [node(76)] } } }))).toEqual([
+        { key: ROW, part: { kind: 'legacy', path: ['members', ROW, 'added', '0', 'members', `/${G(5)}`, 'own', '0'] }, cause: 'heldNode' },
+      ]);
+    });
+    it('I: a keyless node in the copy\'s `added`', () => {
+      expect(held(copy({ added: [node(79)] }))).toEqual([
+        { key: ROW, part: { kind: 'legacy', path: ['members', ROW, 'added', '0', 'added', '0'] }, cause: 'heldNode' },
+      ]);
+    });
+    // Outside the cut (qa's G; ruled under § 10.4b round 5: a user node is never `gone`): the held copy is one record at
+    // its row, `heldNode` while it carries the user's node, so Remove Unused never takes it. One carrying none stays `gone`.
+    // Mutation: drop the `heldNode` promotion in `container` — G reads `gone`.
+    it('G: outside the cut, a gone copy carrying the user\'s node is one heldNode record; one carrying none stays gone', () => {
+      const at = (c: object) => fold(entry({ members: { [`/${G(999)}`]: { added: [c] } } as never })).unused;
+      const rec = (cause: string) => [{ key: `/${G(999)}`, part: { kind: 'legacy', path: ['members', `/${G(999)}`, 'added', '0'] }, cause }];
+      expect(at(copy({ members: { [`/${G(5)}`]: { own: [node(76)] } } }))).toEqual(rec('heldNode'));
+      expect(at(copy({ added: [node(79)] }))).toEqual(rec('heldNode'));
+      expect(at(copy({ traits: { Transform: { x: 1 } } }))).toEqual(rec('gone'));
+    });
+    // Every list the parser reads a copy's nodes from (close-out review, HIGH): a plain copy's `children` (an unpaired
+    // child is the user's, `pinAdded`) and a reference copy's `nestedStructure` slot `added`.
+    // Mutation: drop `children` / the `nestedStructure` channel from `heldUserNodes`' copy walk — each case goes red.
+    it('a node in a plain copy\'s children, and in a reference copy\'s slot, under the cut', () => {
+      const paths = (c: object) => held(c).map((u) => `${u.key} ${(u.part as { path: string[] }).path.slice(2).join('.')} ${u.cause}`);
+      expect(paths(copy({ children: [node(84)] }))).toEqual([`${ROW} added.0.children.0 heldNode`]);
+      expect(paths(copy({ prefab: 'Q', nestedStructure: { '2': { added: [node(85)] } } }))).toEqual([`${ROW} added.0.nestedStructure.2.added.0 heldNode`]);
+    });
+    it('…and outside the cut the copy record carrying either is heldNode', () => {
+      const at = (c: object) => fold(entry({ members: { [`/${G(999)}`]: { added: [c] } } as never })).unused.map((u) => u.cause);
+      expect(at(copy({ children: [node(84)] }))).toEqual(['heldNode']);
+      expect(at(copy({ prefab: 'Q', nestedStructure: { '2': { added: [node(85)] } } }))).toEqual(['heldNode']);
+    });
+    it('a copy inside a copy, and a keyless node beside the copy: each user node once, the copies themselves not', () => {
+      const f = fold(entry({ removed: [3], members: { [ROW]: { added: [copy({ added: [{ ...copy({ added: [node(81)] }), key: 'ky' }] }), node(80)] } } as never }));
+      expect(f.unused.map((u) => (u.part as { path: string[] }).path.slice(2).join('.')).sort()).toEqual(['added.0.added.0.added.0', 'added.1']);
+      expect(f.unused.every((u) => u.cause === 'heldNode' && u.key === ROW)).toBe(true);
+    });
+  });
+
   it('a refused move of a member that outlived its removed parent only by moving: lifted to the nearest ancestor that stays', () => {
     const f = at5({ [`/${NA}`]: { removed: true }, [`/${ND}`]: { guid: G(81) }, [`/${NB}`]: { parent: G(81) } });
     expect(f.nodes.has(`/${NA}`)).toBe(false);
@@ -587,6 +636,21 @@ describe('#2029 review: a surviving placeholder stops the walk; a held slot unde
     const A2: PrefabDoc = { ...A, entities: [A.entities[0]!, { ...A.entities[2]!, traits: ea('APH', 77) }] };
     const m = new Map(docs); m.set('A', A2); m.set('T', T);
     expect(causes(fold(tEntry({ members: { [TA]: { removed: true }, [`${APH}/${G(99)}`]: light } }), m))).toEqual([`${APH}/${G(99)} field:Light.intensity unresolved`]);
+  });
+  // #2036, the slot channel: a held `nestedStructure` slot's copies carry user nodes too. Under the instance's own removal
+  // each is `heldNode` at the slot's placeholder row; outside any cut a gone slot's copy carrying one is `heldNode`.
+  // Mutation: walk a held slot under the cut by its top-level keyless nodes only — the copy's node is placed nowhere.
+  it('#2036: a user node inside a copy in a held nestedStructure slot — heldNode under the cut, its copy record outside', () => {
+    const m = new Map(docs); m.set('A', A); m.set('T', T);
+    const node = (n: number) => ({ parentLocalId: 0, guid: G(n), name: `S${n}`, traits: {}, children: [] });
+    const copy = (inner: object) => ({ key: 'kx', parentLocalId: 0, guid: '', name: 'X', traits: {}, children: [], ...inner });
+    const cut = fold(tEntry({ nestedStructure: { '2.3': { added: [copy({ children: [node(90)] }), node(91)] } } as never, members: { [TA]: { removed: true } } }), m);
+    expect(cut.unused.map((u) => `${u.key} ${(u.part as { path: string[] }).path.join('.')} ${u.cause}`).sort()).toEqual([
+      `${APH} nestedStructure.2.3.added.0.children.0 heldNode`, `${APH} nestedStructure.2.3.added.1 heldNode`,
+    ]);
+    const gone = (c: object) => fold(tEntry({ nestedStructure: { '9': { added: [c] } } as never }), m).unused.map((u) => u.cause);
+    expect(gone(copy({ children: [node(92)] }))).toEqual(['heldNode']);
+    expect(gone(copy({ traits: { Transform: { x: 1 } } }))).toEqual(['gone']);
   });
   // Mutation: `pathCause` asks `underCut` alone — the held slot is `gone` under the cut.
   it('a held nestedOverrides slot under the instance\'s own removal is inert, as a held member row is', () => {

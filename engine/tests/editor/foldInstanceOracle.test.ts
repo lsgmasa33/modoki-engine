@@ -306,6 +306,48 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       });
     });
 
+    // #2036: a user node INSIDE a held keyed copy (its member rows' `own`, its keyless `added`). Today keeps the whole row as
+    // an R2 orphan and every save writes it back (measured; S5's save the same, measured by work-ai). The fold reports it
+    // `heldNode` (under the cut each node; outside it the copy record), and the oracle's placement check now enumerates
+    // nodes inside copies: before, it read only a row's top-level keyless nodes, and the fold placing one nowhere was silent.
+    describe('#2036: a user node inside a held keyed copy is kept, and placed once', () => {
+      const node = (n: number) => ({ parentLocalId: 0, guid: G(n), name: `S${n}`, traits: { EntityAttributes: { name: `S${n}` }, Transform: tf }, children: [] });
+      const copy = (inner: object) => ({ key: 'kx', parentLocalId: 0, guid: '', name: 'X', traits: { EntityAttributes: { name: 'X' }, Transform: tf }, children: [], ...inner });
+      const GONE = `${R}/${G(999)}`;
+      const cases: Array<[string, Record<string, object>, number]> = [
+        ['F: in the copy\'s member row own, under the cut', { [R]: { removed: true }, [GONE]: { added: [copy({ members: { [`/${G(5)}`]: { own: [node(76)] } } })] } }, 76],
+        ['I: in the copy\'s keyless added, under the cut', { [R]: { removed: true }, [GONE]: { added: [copy({ added: [node(79)] })] } }, 79],
+        ['G: in the copy\'s member row own, no cut', { [GONE]: { added: [copy({ members: { [`/${G(5)}`]: { own: [node(76)] } } })] } }, 76],
+        ['J: in a plain copy\'s children, under the cut (close-out review)', { [R]: { removed: true }, [GONE]: { added: [copy({ children: [node(84)] })] } }, 84],
+        ['C7: in a copy naming a missing prefab, no cut: it waits, unresolved (close-out review)', { [GONE]: { added: [copy({ prefab: 'ZZ', added: [node(88)] })] } }, 88],
+      ];
+      for (const [name, members, n] of cases) {
+        it(name, async () => {
+          install(P, Q);
+          const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            const first = await loadSave({ version: 15, entities: [top({ members })] });
+            expect(first.lines).toEqual([]);
+            expect(JSON.stringify(rowsOf(first.saved)[GONE])).toContain(G(n));
+            const second = await loadSave(first.saved);
+            expect(second.lines).toEqual([]);
+            expect(JSON.stringify(rowsOf(second.saved)[GONE])).toContain(G(n));
+          } finally { warn.mockRestore(); }
+        });
+      }
+      // AT a placeholder (Q missing, so R is one): the fold keys the copy at R's frame and it waits, `unresolved`. The
+      // oracle judged a node inside a copy at the ROW's key once, and this correct fold read red (close-out review, E1).
+      it('E1: in a copy on a placeholder row: placed once, unresolved, and the oracle agrees', async () => {
+        install(P);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+          const { lines, saved } = await loadSave({ version: 15, entities: [top({ members: { [R]: { added: [copy({ added: [node(79)] })] } } })] });
+          expect(lines).toEqual([]);
+          expect(JSON.stringify(saved)).toContain(G(79));
+        } finally { warn.mockRestore(); }
+      });
+    });
+
     it('the route ordinary editing takes: a template edit orphans the link, the cut row is deleted, the edit is undone — the node is kept', async () => {
       const Q0 = { ...Q, entities: Q.entities.filter((r) => r.localId !== 2) }; // Q's edit drops QA
       install(P, Q0);

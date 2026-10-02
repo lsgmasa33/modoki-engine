@@ -265,7 +265,9 @@ export type UnusedCause =
   | 'unresolved'
   /** It names a component type not yet registered (I24: not a removal). */
   | 'unregistered'
-  /** A scene-owned node held under an anchor that is not projected (`held.heldOwn`). */
+  /** A scene-owned node held under an anchor that is not projected (`held.heldOwn`), or a held legacy record that IS one —
+   *  or a held template COPY carrying one (#2036): never removable, since taking the copy would take the user's node. A
+   *  consumer that re-homes or unlinks a `heldNode` record re-homes the user nodes INSIDE a copy and keeps the copy. */
   | 'heldNode'
   /** A field a REGISTERED component does not persist: renamed or removed in code, written by a newer engine, or on a
    *  component that became a tag (#1933 L2). Unity's Remove Unused Overrides takes a modification whose property no
