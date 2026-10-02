@@ -23,6 +23,14 @@ import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRef
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { shadowSeams, listDiff, liveStoredRoots, type ShadowSeams } from './shadow';
+import { checkRecord } from '../foldOracle';
+import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
+import { parseInstanceRecord, parseReferenceNode } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { getCachedPrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
+import type { SceneEntityEntry, AddedEntity } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import type { PrefabDoc, PrefabReader, ParsedInstance } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
+import type { OpKind } from './ops';
 
 /** `MODOKI_PREFAB_FUZZ_DUMP=<dir>`: write every compared state there, for reading a finding by hand. */
 function dump(name: string, value: unknown): void {
@@ -86,8 +94,12 @@ async function setupNest(f: Fixture): Promise<void> {
  *    trash of a prefab nothing references only leaves the baseline (`rebaseForFileOp`), and every check stays on. A
  *    RENAME is never a taint: a scene names a prefab by guid, so the runner only moves the path in the baseline.
  *    ⚠️ Known limit: a prefab only the undo/redo STACK names (placed, then undone, then trashed) is not seen, so its
- *    redo's refusal reads as one in a clean segment — a false finding a hunt would show, never a hidden one. */
-export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'assetDelete';
+ *    redo's refusal reads as one in a clean segment — a false finding a hunt would show, never a hidden one.
+ *  - `agentFileWrite`: a `fileMutate` op's file-direct `/api/scene-mutate` wrote the SCENE while no renderer answered
+ *    (#2009). The scene file changed outside the editor, as an outside edit changes a prefab: the watcher raises it, the
+ *    editor reloads it, and no entry on the stack can put the old file back, so the walk to the start cannot reach the
+ *    segment's scene. Only that op's own write of the scene may raise. */
+export type TaintCause = 'outsideEdit' | 'prefabEditSave' | 'rulingR' | 'assetDelete' | 'agentFileWrite';
 
 /** `live`: every guid the segment has had live (its start, and after each step) — what the stack's entries can name. */
 interface Segment { scene: unknown; prefabs: Map<string, string>; tainted: TaintCause | null; live: Set<string> }
@@ -237,6 +249,106 @@ async function respawnIdentity(): Promise<Failure | null> {
   ran(`respawn identity (${roots.length ? 'instances' : 'none'})`);
   const d = firstDiff(before, alignEqualOrientations(before, after));
   return d ? { check: 'a no-op rebuild is not the identity', detail: d, moved: nodeMoved(d, before, after) } : null;
+}
+
+/** #2009: the new model's checks (`shadow.ts`), each only once the build has installed its seam, and each run counted.
+ *  ⚠️ I25 compares `rec.list` only, as the design words it: the root's `Placement` (parent, order, name) is not compared
+ *  between S4 and S5, and P1's reprojection is the first check that would see a wrong one (review).
+ *  - I25 (the shadow, S4–S7): after an op whose door exists, every record equals what today's capture reads off the live
+ *    tree, modulo identity pins. After any other op it is NOT compared (§ 10.5), and that is counted per op kind, so the
+ *    tally shows which doors are still missing.
+ *  - P1 (S5 on, permanently): reprojecting every record from the store leaves the world as it was — traits, marks,
+ *    parents, order, guids. A difference is a writer that changed live state without the door, or a fold that is not a
+ *    function of the record. */
+async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]> {
+  const out: Failure[] = [];
+  // Both checks walk the STORE, so a live instance it lacks is one neither compares: a store that holds nothing would
+  // pass both while counting them as run (review). Every live stored root must have a record.
+  const stored = new Set(seams.records().map((r) => r.rootGuid));
+  const missing = liveStoredRoots().filter((g) => !stored.has(g));
+  ran('shadow: the store covers every live stored root');
+  if (missing.length) return [{ check: 'a live stored instance has no record', detail: `${missing[0]}${missing.length > 1 ? ` (+${missing.length - 1} more)` : ''}` }];
+  if (seams.captureList) {
+    if (!seams.doors.has(kind as OpKind)) ran(`I25 after ${kind}: not compared (no door yet)`);
+    else {
+      ran(`I25 after ${kind}`);
+      for (const rec of seams.records()) {
+        const captured = seams.captureList(rec.rootGuid);
+        if (!captured) { out.push({ check: 'I25 a stored record has no live instance', detail: rec.rootGuid }); break; }
+        const d = listDiff(rec.list, captured);
+        if (d) { out.push({ check: 'I25 the record is not the capture', detail: `${rec.rootGuid} ${d}` }); break; }
+      }
+    }
+  }
+  if (seams.reproject) {
+    const before = worldTree();
+    for (const rec of [...seams.records()]) await seams.reproject(rec);
+    await settle();
+    const after = worldTree();
+    ran('P1');
+    dump('p1-before', before); dump('p1-after', after);
+    const d = firstDiff(before, alignEqualOrientations(before, after));
+    if (d) out.push({ check: 'P1 reprojecting the records changed the world', detail: d, moved: nodeMoved(d, before, after) });
+  }
+  return out;
+}
+
+/** #2009, P1 by the FOLD (S1's parser and S2's fold, before S5's `reproject` exists): after every op, each top-level
+ *  instance's LIVE tree is `foldInstance(parse(entry))` of the entry the scene serializes for it now — the comparison
+ *  is #2007's oracle (`foldOracle.ts` `checkInstance`, the rules' two placeholder translations included), asked of
+ *  every state a run passes through rather than of a reloaded scene. "The live entities are a projection of the record"
+ *  (rule 2) is then a claim about every step; S5 makes the load that fold, so a difference here is a state S5 would
+ *  change on its next reload. The reader is what the editor holds: the runtime cache (a parked write, #1868), then disk. */
+export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[]; embeddedPrefabs?: unknown }): Failure[] {
+  const read: PrefabReader = (g) => {
+    const cached = getCachedPrefab(g) as PrefabDoc | undefined;
+    if (cached) return { doc: cached };
+    const p = resolveGuidToPath(g);
+    const text = p ? be.read(p) : undefined;
+    if (!text) return { missing: true };
+    try { return { doc: JSON.parse(text) as PrefabDoc }; } catch (e) { return { damaged: String(e) }; }
+  };
+  const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
+  const copies = new Set(Object.keys((scene.embeddedPrefabs ?? {}) as object));
+  const opts = { sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
+  // Every stored instance: the top-level entries, then each reference node the scene added (its own record, § 2.5),
+  // found in its owner's scene-owned content — which a top-level entry's fold leaves as an anchor and never compares —
+  // or in the `children` of a plain node the scene added there (#2009 review: a list root's children were never walked).
+  // Only under an own node the owner's fold ANCHORS: one under an anchor the fold does not place (a kept orphan row's,
+  // its member gone) is not projected, and whether the fold keeps that record is the owner's unused comparison.
+  const queue: { parsed: ParsedInstance; counter: string }[] = [];
+  const out: Failure[] = [];
+  const parse = (what: string, counter: string, fn: () => ParsedInstance) => {
+    try { queue.push({ parsed: fn(), counter }); } catch (e) { out.push({ check: 'P1 by the fold threw', detail: `parse ${what}: ${String(e)}` }); }
+  };
+  for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) parse(entry.guid, 'P1 by the fold', () => parseInstanceRecord(entry, read, opts));
+  const refsUnder = (node: AddedEntity): AddedEntity[] => node.prefab ? [node] : (node.children ?? []).flatMap(refsUnder);
+  // Every instance's failure, not the first: a KNOWN_OPEN entry tolerates one instance's, and must not hide another's —
+  // and a throw in one instance's parse, fold or comparison is that instance's failure, not `serializeScene threw`.
+  for (let i = 0; i < queue.length; i++) {
+    const { parsed: { record, ownContent }, counter } = queue[i]!;
+    try {
+      const anchored = new Set([...foldInstance(read, record).anchors.values()].flat().map((r) => r.guid));
+      for (const node of ownContent.values()) {
+        if (!node.guid || !anchored.has(node.guid)) continue;
+        for (const ref of refsUnder(node)) {
+          if (!ref.guid) continue;
+          const counter = ref === node ? 'P1 by the fold: a scene-added reference node' : 'P1 by the fold: a reference node inside a plain added node';
+          parse(ref.guid, counter, () => parseReferenceNode(ref, read, opts));
+        }
+      }
+      const root = findEntityByGuid(record.rootGuid);
+      if (!root) { out.push({ check: 'P1 a stored instance has no live root', detail: record.rootGuid }); continue; }
+      const d = checkRecord(record, read, root.id(), copies);
+      // Counted once a comparison RAN, under where the instance was found: a step with no stored instance compares
+      // nothing, and an instance found but never compared (a missing root, a throw) must not read as checked.
+      ran(counter);
+      if (d.length) out.push({ check: 'P1 the live instance is not the fold of its record', detail: `${record.rootGuid} ${d.join(' ; ')}` });
+    } catch (e) {
+      out.push({ check: 'P1 by the fold threw', detail: `${record.rootGuid}: ${String(e)}` });
+    }
+  }
+  return out;
 }
 
 /** The file checks and the mark check over what the editor HOLDS (#1880 T1): the files with each park laid over its
@@ -394,7 +506,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   const trace: string[] = [];
   consoleErrors.length = 0;
   const f = await startRun(be, setupNest, JSON.stringify(ops));
-  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set() }, lastPrefabs: new Map(), created: [] };
+  const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set(), agent: new Set(), fileDirect: new Set() }, lastPrefabs: new Map(), created: [] };
   recordPrefabs(st);
   const history: LocalIdHistory = new Map();
   /** Every file content the run has had, at any path: a write of one of these is a verbatim carry (an undo's restore, a
@@ -412,7 +524,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
   let seg = await segmentHere(be);
 
   const fail = (step: number, op: string, f: Failure): RunResult => ({
-    failure: { ...f, step, op, touched: { drop: [...st.touched.drop], paste: [...st.touched.paste], detach: [...st.touched.detach], create: [...st.touched.create] } }, trace,
+    failure: { ...f, step, op, touched: { drop: [...st.touched.drop], paste: [...st.touched.paste], detach: [...st.touched.detach], create: [...st.touched.create], agent: [...st.touched.agent], fileDirect: [...st.touched.fileDirect] } }, trace,
   });
 
   const all = [...ops, FINAL_ROUND_TRIP];
@@ -429,6 +541,9 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     st.innerOutcomes = undefined;
     st.fileOp = undefined;
     st.appliedTop = undefined;
+    st.envelope = undefined;
+    st.posedEditLanded = undefined;
+    st.agentWrote = undefined;
     // I23 (#1914): the scene's record keys before an op that does not act on its instances (a template change underneath,
     // a member taken out of its template, a trashed or renamed prefab). None is an explicit act on an instance, so the
     // scene must state every record afterwards too (Unity's unused overrides; docs/prefabs.md § I18, I23).
@@ -449,7 +564,10 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // A watcher raise has ONE legitimate cause: an outside edit, of the paths that op itself wrote (#1845). Anything else
     // is a write the router did not mark as the editor's own — the #1840 class (a mark keyed by a string the watcher's
     // lookup never builds) — and it would taint the segment and silently turn the undo checks off. It fails here instead.
-    const opWrote = op.kind === 'outsideEdit' ? new Set([...be.snapshot()].filter(([p, t]) => before.get(p) !== t).map(([p]) => p)) : new Set<string>();
+    // A file-direct scene-mutate (#2009) is the other outside writer: of the scene it wrote, and nothing else.
+    const agentWrote = (st as RunState).agentWrote;
+    const opWrote = op.kind === 'outsideEdit' ? new Set([...be.snapshot()].filter(([p, t]) => before.get(p) !== t).map(([p]) => p))
+      : agentWrote ? new Set([agentWrote]) : new Set<string>();
     const unexpected = raised.filter((p) => !opWrote.has(p));
     if (unexpected.length) {
       return fail(i, label, { check: 'unexpected outside write', detail: `${unexpected[0]} after op ${i} (${label}): the watcher raised a write that no outside edit made${unexpected.length > 1 ? ` (+${unexpected.length - 1} more)` : ''}` });
@@ -496,7 +614,16 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // An outside edit numbers its own rows (it may take a freed number, as a hand edit or a merge does): I4 holds the
     // EDITOR's writes, so the history of each file it touched restarts from what it wrote.
     if (op.kind === 'outsideEdit') for (const [p, t] of after) if (before.get(p) !== t) { forgetHistoryOf(history, t); forgetMarkOf(marks, t); }
+    // #2009, rule 11 and I13: leaving Play or a preview envelope gives back the authored world it was entered from. Read
+    // back through the declared type, as `roundTrip` below: the reset above narrows it to undefined.
+    const env = (st as RunState).envelope;
+    const envDiff = env ? firstDiff(env.before, alignEqualOrientations(env.before, env.after)) : null;
+    if (env) { dump(`step${i}-envelope-before`, env.before); dump(`step${i}-envelope-after`, env.after); }
+    const posedEdit = (st as RunState).posedEditLanded;
     const failures = [
+      ...(env && envDiff ? [{ check: `I13 ${env.what} does not restore the authored world`, detail: envDiff, moved: nodeMoved(envDiff, env.before, env.after) }] : []),
+      // Rule 10 (one door, the same refusals) and rule 11: the posed world refuses an agent's edit, as it refuses the panels'.
+      ...(posedEdit ? [{ check: 'an agent edit of a posed world was not refused', detail: posedEdit }] : []),
       ...checkWorld(),
       ...checkHeld(be, history, marks, written, handTexts),
       ...(rt ? checkRoundTrip(rt, (src) => { const p = resolveGuidToPath(src); return !p || !after.has(p); }) : []),
@@ -508,7 +635,16 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
       if (lost.length) failures.push({ check: 'I23 a record no act removed was dropped', detail: `${lost[0]}${lost.length > 1 ? ` (+${lost.length - 1} more)` : ''}` });
     }
     if (!editing()) {
-      try { failures.push(...checkScene(await serializeScene())); } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
+      try {
+        const scene = await serializeScene();
+        failures.push(...checkScene(scene));
+        failures.push(...foldCheck(be, scene as Parameters<typeof foldCheck>[1]));
+      } catch (e) { failures.push({ check: 'serializeScene threw', detail: String(e) }); }
+    }
+    const seams = shadowSeams();
+    if (seams && !editing()) {
+      // A harness error (the record compared with itself) fails the step as loudly as a finding.
+      try { failures.push(...await shadowChecks(seams, op.kind)); } catch (e) { failures.push({ check: 'shadow check threw', detail: String(e) }); }
     }
     // Owner ruling R (#1819, 2026-09-29): once a WORLD SWAP (a reload, leaving prefab edit, a watcher reload) has expanded
     // as a Missing Prefab placeholder something the stack's entries were recorded against, an undo against it REFUSES and
@@ -540,6 +676,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (failures.length) return fail(i, label, failures[0]);
 
     if (op.kind === 'outsideEdit' && outcome === 'done') taint(seg, 'outsideEdit');
+    if (agentWrote) taint(seg, 'agentFileWrite');
     if (op.kind === 'prefabEdit' && outcome === 'done' && st.prefabEditSaved) taint(seg, 'prefabEditSave');
     // Read back through the declared type, as `roundTrip` above: the reset narrows it to undefined, and `execute` sets it.
     const fileOp = st.fileOp as RunState['fileOp'];

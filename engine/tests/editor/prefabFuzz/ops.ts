@@ -40,17 +40,24 @@ import { answerParkedConflicts } from '../../../packages/modoki/src/editor/scene
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
-import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, getCurrentWorld, type Fixture } from './harness';
+import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, getCurrentWorld, settle, type Fixture } from './harness';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { canonicalJson } from '../../../packages/modoki/src/runtime/core/localIdCounter';
 import type { FuzzBackend } from './backend';
 import { markFree } from './checks';
+import { runAgentOp } from '../../../app/debug/agentBridge';
+import { OpRefusal } from '../../../app/debug/opRefusal';
+import { enterPlay, stopPlay, enterScrubMode, exitPreviewMode } from '../../../packages/modoki/src/editor/scene/playMode';
+import { beginTimelinePreviewSession, endTimelinePreviewSession } from '../../../packages/modoki/src/editor/scene/timelinePreview';
+import { previewTimelineAt, writeTraitField, type TimelineDef } from '@modoki/engine/runtime';
 
 export type OpKind =
   | 'createPrefab' | 'instantiate' | 'detach' | 'duplicate' | 'copy' | 'cut' | 'paste' | 'delete'
   | 'editField' | 'addComponent' | 'removeComponent' | 'addChild' | 'reparent'
   | 'apply' | 'revert' | 'prefabEdit' | 'undo' | 'redo' | 'saveReload'
-  | 'trashPrefab' | 'renamePrefab' | 'outsideEdit';
+  | 'trashPrefab' | 'renamePrefab' | 'outsideEdit'
+  // #2009 (#2001 design § 10.2): the doors the review's census found the fuzzer never drove (review R3).
+  | 'agentSetTraits' | 'agentInstantiate' | 'agentSceneOps' | 'fileMutate' | 'playStop' | 'timelinePreview';
 
 export interface Op {
   kind: OpKind; u: number[]; inner?: Op[];
@@ -83,10 +90,11 @@ const WEIGHTS: Record<OpKind, number> = {
   editField: 12, addComponent: 4, removeComponent: 4, addChild: 5, reparent: 6,
   apply: 9, revert: 5, prefabEdit: 4, undo: 9, redo: 4, saveReload: 8,
   trashPrefab: 1, renamePrefab: 2, outsideEdit: 2,
+  agentSetTraits: 6, agentInstantiate: 3, agentSceneOps: 4, fileMutate: 2, playStop: 3, timelinePreview: 3,
 };
 
 /** What prefab edit may do inside its edit world: the entity ops, instantiate (nesting), undo/redo. */
-const INNER: OpKind[] = ['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'duplicate', 'reparent', 'instantiate', 'undo', 'redo'];
+const INNER: OpKind[] = ['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'duplicate', 'reparent', 'instantiate', 'undo', 'redo', 'agentSetTraits', 'agentInstantiate'];
 
 const U_PER_OP = 8;
 
@@ -163,7 +171,7 @@ export interface RunState {
   innerOutcomes?: Array<{ op: string; outcome: Outcome; note?: string }>;
   /** Every guid a drop or a paste introduced, and every guid a detach or a Create Prefab covered, this run (a failure
    *  carries them). */
-  touched: { drop: Set<string>; paste: Set<string>; detach: Set<string>; create: Set<string> };
+  touched: { drop: Set<string>; paste: Set<string>; detach: Set<string>; create: Set<string>; agent: Set<string>; fileDirect: Set<string> };
   /** The bytes each Create Prefab of a FRESH path wrote, one entry per create: its undo leaves the file (#1795, hub
    *  ruling (i)), so the walk to a segment's start may find it still there — holding exactly this document, at that path
    *  or wherever a Rename moved it. A list, not keyed by path: a later create can reuse the path a rename freed. */
@@ -176,6 +184,16 @@ export interface RunState {
   /** Set by an Assets file op that landed (a trash: `to` null; a rename): it is not undoable (#1868, owner ruling D2), so
    *  the runner carries it into the segment's baseline rather than expecting the walk to put it back. */
   fileOp?: { from: string; to: string | null };
+  /** Set by `playStop` and `timelinePreview` (#2009): the authored world before the envelope was entered and after it was
+   *  left. Rule 11 (only the authored world is saved; Play and posed states never are) and I13: leaving the envelope gives
+   *  back exactly the world it was entered from, which the runner checks. */
+  envelope?: { what: string; before: Record<string, unknown>; after: Record<string, unknown> };
+  /** Set by `timelinePreview` when an agent edit of the POSED world was not refused (#2009): the edit would be applied,
+   *  read back, and discarded on the exit (`refuseEditOfPosedWorld`, rule 10's one door, rule 11). */
+  posedEditLanded?: string;
+  /** Set by `fileMutate` (#2009): the scene the file-direct `/api/scene-mutate` wrote while no renderer answered. That is
+   *  a write from outside the editor, so the watcher's raise of it is legitimate, as an `outsideEdit`'s is. */
+  agentWrote?: string;
 }
 
 const liveGuids = () => new Set(authored().map((e) => e.guid).filter((g): g is string => !!g));
@@ -341,6 +359,73 @@ function outsideVariant(op: Op, st: RunState): Outcome {
   st.be.write(c.path, `${JSON.stringify(doc, null, 2)}\n`);
   st.note = `template ${c.path} row ${row.localId} Transform.${c.f} := the instance's override`;
   return 'done';
+}
+
+// ── #2009: the agent doors, Play/Stop and the timeline preview (#2001 design § 10.2, review R3) ─────────────────────
+
+/** An agent op through `runAgentOp`, as the MCP relay calls it. A deliberate refusal (`OpRefusal`, or a reply with
+ *  `ok:false`) is an outcome with its message in the note; anything else it throws is a failure. */
+async function agentOp(op: string, params: unknown, st: RunState): Promise<{ outcome: Outcome; reply?: Record<string, unknown> }> {
+  try {
+    const reply = (await runAgentOp(op, params)) as Record<string, unknown> | undefined;
+    if (reply && reply.ok === false) { st.note = `${op}: ${String(reply.error ?? reply.code ?? 'ok:false')}`.slice(0, 200); return { outcome: 'refused', reply }; }
+    return { outcome: 'done', reply };
+  } catch (e) {
+    if (!(e instanceof OpRefusal)) throw e;
+    st.note = `${op} refused (${e.code}): ${e.message}`.slice(0, 200);
+    return { outcome: 'refused' };
+  }
+}
+
+/** `modoki_set_traits`' write: a Transform field, or a field of a component the entity lacks (which ADDS it). */
+function setTraitsSet(u: number[], has: readonly string[]): Record<string, unknown> {
+  if (u[3] >= 0.6) {
+    const name = pick(u[4], ADDABLE.filter((t) => !has.includes(t)));
+    if (name === 'Rotate3D') return { 'Rotate3D.speed': Math.round(u[5] * 4) };
+    if (name === 'Renderable3DPrimitive') return { 'Renderable3DPrimitive.mesh': 'cube' };
+  }
+  return { [`Transform.${pick(u[1], TRANSFORM_FIELDS)!}`]: Math.round(u[2] * 20 - 10) };
+}
+
+/** One `/api/scene-mutate` op over the entities `pool` names by guid: a Transform field, a component removed, a child
+ *  added, an entity removed. A file-direct call names what the FILE holds (an entry's guid), the live call what the
+ *  world holds. */
+function sceneOp(u: number[], pool: Array<{ guid: string; traits: readonly string[] }>): Record<string, unknown> | null {
+  const e = pick(u[0], pool);
+  if (!e) return null;
+  const entity = { guid: e.guid };
+  if (u[3] < 0.55) return { op: 'setTrait', entity, trait: 'Transform', fields: { [pick(u[1], TRANSFORM_FIELDS)!]: Math.round(u[2] * 20 - 10) } };
+  if (u[3] < 0.7) {
+    const t = pick(u[4], REMOVABLE.filter((x) => e.traits.includes(x)));
+    return t ? { op: 'removeTrait', entity, trait: t } : { op: 'setTrait', entity, trait: 'Rotate3D', fields: { speed: 2 } };
+  }
+  if (u[3] < 0.9) return { op: 'addEntity', name: `M${Math.floor(u[5] * 1000)}`, parentId: e.guid };
+  return { op: 'removeEntity', entity };
+}
+
+/** A scene file's entries as a scene-mutate addresses them: an instance entry by its top-level guid, a plain entity by
+ *  `EntityAttributes.guid`, with the components the entry states. */
+function fileEntries(text: string): Array<{ guid: string; traits: string[] }> {
+  const scene = JSON.parse(text) as { entities?: Array<{ guid?: string; traits?: Record<string, { guid?: string }> }> };
+  return (scene.entities ?? []).flatMap((e) => {
+    const guid = e.guid ?? e.traits?.EntityAttributes?.guid;
+    return guid ? [{ guid, traits: Object.keys(e.traits ?? {}) }] : [];
+  });
+}
+
+/** What can be done to the world INSIDE an envelope (Play, a preview): an Inspector field edit, a delete, an agent field
+ *  write, a prefab drop. Each is whatever the editor allows there; a refusal is fine, a throw is not. */
+async function envelopeEdit(u: number[], st: RunState): Promise<string> {
+  const ents = authored();
+  const e = pick(u[1], ents);
+  if (!e) return 'nothing';
+  if (u[0] < 0.35) { writeTraitFieldWithUndo(e.id, meta('Transform'), pick(u[2], TRANSFORM_FIELDS)!, Math.round(u[3] * 20 - 10)); return `edit ${e.name}`; }
+  if (u[0] < 0.55) { deleteEntitiesWithUndo([e.id]); return `delete ${e.name}`; }
+  if (u[0] < 0.8 && e.guid) { const r = await agentOp('set-traits', { guid: e.guid, set: setTraitsSet(u, e.traits) }, st); return `set-traits ${e.name} → ${r.outcome}`; }
+  const path = pick(u[2], prefabFiles(st));
+  if (!path) return 'nothing';
+  await dropPrefab(path, e.id);
+  return `drop ${path.split('/').pop()} under ${e.name}`;
 }
 
 /** Run one op. Throws only on a real failure (an exception from the editor); a refusal or a no-op returns. */
@@ -670,6 +755,118 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
         doc.entities.push({ localId, name: 'Pulled', nodeGuid, traits: { EntityAttributes: { name: 'Pulled', parentId: parent.localId, guid: '' }, Transform: { x: 0, y: 0, z: 0 } } } as never);
       }
       st.be.write(path, `${JSON.stringify(doc, null, 2)}\n`);
+      return 'done';
+    }
+    case 'agentSetTraits': {
+      // `modoki_set_traits` (agentEditorOps.ts `set-traits` → `applySetTraits` → `editorTraitWriter`): the agent's field door
+      // (rule 10). By guid, as an agent addresses an entity; a field of a component the entity lacks adds it.
+      const e = pick(u[0], ents.filter((x) => x.guid));
+      if (!e) return 'noop';
+      return (await agentOp('set-traits', { guid: e.guid, set: setTraitsSet(u, e.traits) }, st)).outcome;
+    }
+    case 'agentInstantiate': {
+      // `modoki_prefab {action:'instantiate'}`: the agent's drop. By path, under the root or a guid-named parent.
+      const path = pick(u[0], prefabFiles(st));
+      if (!path) return 'noop';
+      const parent = u[1] < 0.4 ? undefined : pick(u[2], ents.filter((x) => x.guid))?.guid;
+      const pre = liveGuids();
+      const r = await agentOp('prefab', { action: 'instantiate', path, ...(parent ? { parentGuid: parent } : {}) }, st);
+      for (const g of liveGuids()) if (!pre.has(g)) st.touched.drop.add(g);
+      return r.outcome;
+    }
+    case 'agentSceneOps': {
+      // `modoki_mutate_scene` on the open scene: the route probes the renderer, finds the scene live, and relays
+      // `apply-scene-ops` (one composite undo entry). One or two ops per call.
+      if (editing()) return 'noop';
+      const pool = ents.filter((x): x is typeof x & { guid: string } => !!x.guid);
+      const ops = [sceneOp(u, pool), u[6] < 0.3 ? sceneOp([u[7], ...u.slice(1)], pool) : null].filter((o): o is Record<string, unknown> => !!o);
+      if (!ops.length) return 'noop';
+      const pre = liveGuids();
+      const res = await fetch('/api/scene-mutate', { method: 'POST', body: JSON.stringify({ path: st.f.scenePath, ops }) });
+      const body = await res.json() as { ok?: boolean; error?: string; errors?: unknown[]; saved?: boolean };
+      for (const g of liveGuids()) if (!pre.has(g)) st.touched.agent.add(g);
+      if (body.saved) throw new Error(`scene-mutate went file-direct with the renderer answering: ${JSON.stringify(body).slice(0, 200)}`);
+      if (res.status >= 500) throw new Error(`scene-mutate ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+      if (!res.ok || body.ok === false) { st.note = `scene-mutate ${res.status}: ${body.error ?? JSON.stringify(body.errors ?? []).slice(0, 160)}`; return 'refused'; }
+      return 'done';
+    }
+    case 'fileMutate': {
+      // `modoki_mutate_scene` with NO renderer answering: the route writes the scene FILE (`applyOps`,
+      // `traitWriteContainer`: an instance root's write lands in its legacy `overrides[rootLocalId]` channel, review R5).
+      // The PRODUCER is real (the route's file-direct branch, unmarked). The CONSUMER is the open editor taking it as a
+      // held outside change of its own scene on refresh — the flow of a git checkout of the open scene — not a renderer
+      // that truly went away, which would come back to a fresh load and an empty stack. Saved first, so the reload has
+      // nothing unsaved to weigh against it.
+      if (editing()) return 'noop';
+      const saved = await saveScene({ allowDialog: false });
+      if (!saved.saved) { st.note = `save: ${saved.reason}`; return 'refused'; }
+      const text = st.be.read(st.f.scenePath);
+      if (!text) return 'noop';
+      const op1 = sceneOp(u, fileEntries(text));
+      if (!op1) return 'noop';
+      const relay = st.be.relay;
+      st.be.relay = async () => { throw new Error('no renderer attached (fuzz: the window is down)'); };
+      let res: Response;
+      try {
+        res = await fetch('/api/scene-mutate', { method: 'POST', body: JSON.stringify({ path: st.f.scenePath, ops: [op1] }) });
+      } finally {
+        st.be.relay = relay;
+      }
+      const body = await res.json() as { ok?: boolean; error?: string; errors?: unknown[]; saved?: boolean };
+      if (st.be.read(st.f.scenePath) !== text) {
+        st.agentWrote = st.f.scenePath;
+        st.touched.fileDirect.add((op1.entity as { guid?: string } | undefined)?.guid ?? String(op1.parentId));
+      }
+      if (res.status >= 500) throw new Error(`scene-mutate ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+      if (!res.ok || body.ok === false) { st.note = `file-direct scene-mutate ${res.status}: ${body.error ?? JSON.stringify(body.errors ?? []).slice(0, 160)}`; return st.agentWrote ? 'done' : 'refused'; }
+      st.note = `file-direct ${String(op1.op)}`;
+      return 'done';
+    }
+    case 'playStop': {
+      // The toolbar's ▶ and ■ (`pressPlay`/`pressStop` call these), with up to two edits made IN Play between them. Stop
+      // reverts the world to the snapshot Play took (rule 11, I13); the runner holds the two worlds equal.
+      if (editing()) return 'noop';
+      const before = worldTree();
+      const play = await enterPlay();
+      if (play.kind !== 'started') { st.note = `play: ${play.kind}${'message' in play ? ` (${play.message})` : ''}`; return 'refused'; }
+      await settle();
+      const did: string[] = [];
+      // Each edit reads the op's draws rotated to start at u[1 + k], so every edit has all eight.
+      for (let k = 0; k < Math.floor(u[0] * 3); k++) { did.push(await envelopeEdit([...u.slice(1 + k), ...u.slice(0, 1 + k)], st)); await settle(); }
+      const stop = await stopPlay();
+      await settle();
+      st.note = `in Play: [${did.join('; ')}]; stop: ${stop.kind}${'reverted' in stop ? ` reverted=${String(stop.reverted)}` : ''}${'reason' in stop && stop.reason ? ` (${stop.reason})` : ''}`;
+      st.envelope = { what: 'Stop', before, after: worldTree() };
+      return 'done';
+    }
+    case 'timelinePreview': {
+      // The Timeline panel's scrub (`TimelineEditor.tsx`: `enterScrubMode('timeline')`, a session, a pose), with an
+      // activation track posing one entity under a drawn Director root, a posed Transform written as a scrub's readback
+      // writes one, and an agent field write the posed world must refuse. Left by the panel's exit or by toolbar Stop.
+      if (editing()) return 'noop';
+      const root = pick(u[0], ents);
+      if (!root) return 'noop';
+      const before = worldTree();
+      enterScrubMode('timeline');
+      if (!(await beginTimelinePreviewSession())) { exitPreviewMode('timeline'); st.note = 'no preview session'; return 'refused'; }
+      const kids = ents.filter((x) => x.parentId === root.id && x.name);
+      const target = u[1] < 0.3 ? '' : (pick(u[2], kids)?.name ?? '');
+      const def: TimelineDef = { id: 'fuzz-tl', name: 'fuzz', duration: 5, frameRate: 30, tracks: [{ id: 'a', name: 'a', type: 'activation', target, spans: [{ start: 2, end: 3 }] }] };
+      previewTimelineAt(getCurrentWorld(), root.id, def, u[3] * 5);
+      const posed = pick(u[4], authored().filter((x) => x.traits.includes('Transform')));
+      if (posed) writeTraitField(posed.id, meta('Transform'), 'y', Math.round(u[5] * 20 - 10));
+      const probe = pick(u[6], authored().filter((x) => x.guid));
+      let probed = 'no probe';
+      if (probe) {
+        const r = await agentOp('set-traits', { guid: probe.guid, set: { 'Transform.z': 7 } }, st);
+        probed = `set-traits ${r.outcome}`;
+        if (r.outcome === 'done') st.posedEditLanded = `set-traits on ${probe.name} landed in the timeline scrub envelope`;
+      }
+      let exit: string;
+      if (u[7] < 0.5) { const s = await stopPlay(); exit = `stop: ${s.kind}`; } else { await endTimelinePreviewSession({ restore: true }); exitPreviewMode('timeline'); exit = 'panel exit'; }
+      await settle();
+      st.note = `posed ${target || root.name} at t=${(u[3] * 5).toFixed(2)}${posed ? `, ${posed.name}.y` : ''}; ${probed}; ${exit}`;
+      st.envelope = { what: `the preview exit (${exit})`, before, after: worldTree() };
       return 'done';
     }
   }

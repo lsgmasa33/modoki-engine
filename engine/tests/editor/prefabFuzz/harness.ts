@@ -33,6 +33,7 @@ import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/iden
 import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templateIdentity';
 import { ROOT_URL, type FuzzBackend } from './backend';
 import { classifyJsonAssetPath } from '../../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
+import { fingerprintBytes, EDITOR_DELETE_FINGERPRINT } from '../../../plugins/editorWriteGuard';
 
 type Handler = (data: unknown) => void;
 
@@ -185,6 +186,14 @@ export async function settle(maxTurns = 400): Promise<void> {
 
 // ── The watcher ──────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** Is a change to a MARKED file the editor's own? As the host guard's `check` decides it (editorWriteGuard.ts, #1744,
+ *  POSIX): a mark vouches for the bytes it hashed; a mark with no hash is TTL-only, and every flush here is inside the TTL;
+ *  an absent file (`now` undefined) is the editor's only under its delete mark — a write-marked file gone is an outside
+ *  delete. Keyed by path alone, an op's own save swallowed an outside write after it in the same op (#2009). */
+export function editorOwns(mark: string | null, now: string | undefined): boolean {
+  return mark === null || (now === undefined ? mark === EDITOR_DELETE_FINGERPRINT : mark === fingerprintBytes(now));
+}
+
 /** What the host's watcher does after a batch of file events (`vite-asset-scanner.ts`'s `flushPending`): rebuild the
  *  manifest and push it, then send `scene-changed` for each changed scene or prefab file that is NOT the editor's own
  *  write. Returns the files that raised a reload. */
@@ -205,7 +214,7 @@ export async function flushWatcher(be: FuzzBackend, before: Map<string, string>)
   bridge.emit('manifest-updated', { assets });
   const raised: string[] = [];
   for (const url of changed.sort()) {
-    if (be.marked.has(url)) continue;
+    if (be.marked.has(url) && editorOwns(be.marked.get(url)!, after.get(url))) continue;
     raised.push(url);
     // Typed as the host's watcher types it (`classifySceneChange`, over the same classifier), so a particle or material
     // change reaches the asset branch (#1879 review 2, #6); the fuzzer itself only writes scenes and prefabs.

@@ -35,8 +35,12 @@ export interface FuzzBackend {
   dir: string;
   /** The asset urls (`/fuzz/...`) the router marked as the editor's own write, since the watcher last ran. Keyed by url, as
    *  the watcher finds changes, not by the absolute path the route passes: on Windows that path has `\` separators no
-   *  url-built string matches, so every editor write was raised as an outside edit and tainted its segment (#1840). */
-  marked: Set<string>;
+   *  url-built string matches, so every editor write was raised as an outside edit and tainted its segment (#1840).
+   *  The value is the fingerprint the route marked with (`markWrittenFile`'s sha1 of the bytes, or null for a TTL-only
+   *  mark), as the host's guard keeps it: a mark vouches for THOSE bytes, so an outside write of the same file after it
+   *  in one op is still raised (#2009: `fileMutate`'s own Save marked the scene, and its file-direct write was swallowed
+   *  as the editor's). */
+  marked: Map<string, string | null>;
   fetch: (url: string | URL, init?: { method?: string; body?: string }) => Promise<Response>;
   write(url: string, text: string): void;
   read(url: string): string | undefined;
@@ -84,7 +88,7 @@ export function makeFuzzBackend(): FuzzBackend {
 
   const backend: FuzzBackend = {
     dir,
-    marked: new Set(),
+    marked: new Map(),
     routeCounts: new Map(),
     relay: async () => { throw new Error('fuzz backend: no renderer relay installed'); },
     failManifestRebuilds: false,
@@ -136,8 +140,7 @@ export function makeFuzzBackend(): FuzzBackend {
     getSchema: () => undefined,
     markEditorWrite: (p: string, hash?: string | null) => {
       const url = toUrl(p);
-      if (url) backend.marked.add(url);
-      void hash;
+      if (url) backend.marked.set(url, hash ?? null);
     },
     ssrLoadModule: async () => { throw new Error('fuzz backend: no SSR'); },
     invalidateProjectConfig: () => {},

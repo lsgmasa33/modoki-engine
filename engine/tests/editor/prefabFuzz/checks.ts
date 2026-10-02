@@ -23,11 +23,18 @@ export interface Failure {
   check: string; detail: string; console?: string[];
   /** The guids each drop, paste, detach and Create Prefab of the run introduced or covered, so a stop can ask whether
    *  the entity a failure is on is the one its mechanism's op touched (set by the runner on every failure). */
-  touched?: { drop: string[]; paste: string[]; detach: string[]; create: string[] };
+  touched?: { drop: string[]; paste: string[]; detach: string[]; create: string[];
+    /** #2009: what a live agent scene-mutate added, and the entry a file-direct one wrote (its target, or the parent it
+     *  added under). Optional: a stop that reads them treats a failure without them as touched by neither. */
+    agent?: string[]; fileDirect?: string[] };
   /** For a scene diff that names a node gone from (or new to) one place: whether that node is still on the other side
    *  somewhere else — MOVED (a respawn under the wrong parent) rather than lost or replaced (a guid regression). */
   moved?: boolean;
 }
+
+/** Owner ruling R's refusal reasons (`require`, entityRef.ts): the target no longer resolves, or changed kind. Shared by
+ *  the allowlist (a refusal line) and KNOWN_OPEN #2010's stop (a composite's refused subs). */
+export const RULING_R = 'is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again';
 
 /** Whether the node a diff names as gone (`X vs undefined`) is still in `b`, or as new (`undefined vs X`) was in `a`. */
 export function nodeMoved(d: string, a: unknown, b: unknown): boolean {
@@ -397,9 +404,10 @@ export function checkRoundTrip(
   return out;
 }
 
-/** The ops that never act on a scene instance's own records (#1914 I23): they change templates or files. (A save→reload
- *  is held by the round trip's own identity checks.) */
-export const RECORD_NEUTRAL: ReadonlySet<string> = new Set(['outsideEdit', 'prefabEdit', 'trashPrefab', 'renamePrefab']);
+/** The ops that never act on a scene instance's own records (#1914 I23): they change templates or files, or (#2009) enter
+ *  an envelope whose edits Stop or the exit discards (rule 11). (A save→reload is held by the round trip's own identity
+ *  checks.) */
+export const RECORD_NEUTRAL: ReadonlySet<string> = new Set(['outsideEdit', 'prefabEdit', 'trashPrefab', 'renamePrefab', 'playStop', 'timelinePreview']);
 
 /** Every override record a saved scene states, as `<entry guid> <channel path>` leaf keys (values left out: a record is
  *  its key, #1914 I23). An instance entry and a Missing Prefab placeholder's kept record alike; the entry's own `traits`

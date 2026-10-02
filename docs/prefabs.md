@@ -683,18 +683,95 @@ mechanically:
   Apply's own top-level instance is left out (the Apply rewrote its statements too). The round trip cannot see a rebuild
   that drops an edit and then saves the loss consistently (#1877 S3, L4). The check reloads the scene, so the run goes on
   from the post-op scene saved and loaded back, with the undo stack reset; a recorded repro without the field keeps its
-  recorded path. On the 8 verify seeds it checks ONE Apply and four outside edits (of seven marked Applies, five were
-  no-ops and one was skipped for a deleted prefab); its Apply leg is held by hunts, which the summary line's counts make
-  visible.
+  recorded path. On the 8 verify seeds it checks ONE Apply and ONE outside edit (re-measured 2026-10-02, after #2009's
+  six op kinds changed every seed's list; a third marked op was a no-op); both legs are held by hunts, which the summary
+  line's counts make visible.
 - **A no-op rebuild is the identity** (#1880 T4). Each run ends by rebuilding every stored instance from its own capture
   onto the document it was expanded from (`refreshInstances`, what a rebase does). The respawn form of a capture is
   pinned to the live world only by this; the save's rows form is pinned by the round trip.
+- **The agent's doors, Play and the preview are fuzzed** (#2009, #2001 design § 10.2). The #2001 review's census found
+  writers the fuzzer never drove (review R3), so six ops were added:
+  - `agentSetTraits`, `agentInstantiate` and `agentSceneOps` call the agent ops, the last through the live
+    `/api/scene-mutate` route.
+  - `fileMutate` is the same route with no renderer answering. It writes the scene file, and an instance root's write
+    lands in its legacy `overrides[rootLocalId]` channel (review R5).
+  - `playStop` enters Play, makes up to two edits, then presses Stop.
+  - `timelinePreview` is a scrub with an activation pose and a posed Transform, left by the panel's exit or by Stop.
+
+  Leaving Play or a preview must give back the authored world it was entered from (rule 11, I13), and I23 runs around
+  both. An agent edit of a posed world must be refused (rule 10). A file-direct write is an outside write: the watcher
+  raises it, and it taints its segment (`agentFileWrite`).
+  ⚠️ The harness's editor-write mark is keyed by the written bytes' sha1, as the host guard's is. Keyed by path, an
+  op's own Save marked the scene, and the file-direct write after it in the same op was swallowed. The editor never
+  reloaded, and the next save wrote the scene back without the agent's change: a loss in the harness only, which every
+  check passed. A fixed list (`#2009: the agent, Play/Stop and timeline-preview doors are reached…`) holds each op
+  reached, and each check fed; each was shown red on its mechanism's mutation.
+  - What the hunt found (seeds 1000–1199, hub rulings 2026-10-02):
+    - An agent call's composite undo half-applies when one sub's target is gone. That is #2010: a composite refuses
+      whole, built in S7.
+    - A pasted frame stays expanded from a pre-Apply document after its enclosing prefab is trashed (seed 1012). Left
+      to S7's record-based paste.
+    - #1829's partial added component also arrives through a file-direct write, since the save widens it. Fixed by
+      construction in S6.
+    All three are KNOWN_OPEN entries.
+- **P1 and I25 against the #2001 model** (`prefabFuzz/shadow.ts`, #2009). They are written against S1's types, before
+  anything implements them, so they run only once the build installs their SEAMS through `installShadow`:
+  - S4 installs the store's `records`, the capture's `captureList` (`parse(captureInstanceEntry(live))`) and `doors`;
+  - S5 installs `reproject`.
+
+  I25 compares each record with the capture, modulo identity pins, and only after an op whose door exists (§ 10.5).
+  Any other op is counted as "not compared (no door yet)". It refuses to compare a record with itself: a capture that
+  hands back the store's own list or row is a harness error. P1 reprojects every record after every op and holds the
+  world unchanged.
+  ⚠️ Installing `reproject` renumbers ids between ops, so every seed's path changes from S5 on. Both checks are held
+  red and green through fake seams in `prefabFuzzShadow.test.ts`, until the real ones exist.
+  The store also has to cover every live stored root, Missing Prefab placeholders included. Without that, an empty store
+  would pass both checks while counting them as run.
+- **P1 by the fold** (`runner.ts` `foldCheck`, #2009 part 2) needs no seam, because S1's parser and S2's fold are real.
+  After every op, it compares each stored instance's live tree with `foldInstance(parse(entry))` of what the save
+  writes now. "Each stored instance" means every top-level entry, plus every reference node the scene added under an
+  own node the owner's fold anchors, including one inside a plain added node's `children`. The comparison is #2007's
+  oracle (`foldOracle.ts` `checkRecord`), so a difference is a state S5's reload would change.
+  - The unused comparison reads two multisets, paired by row. Only a legacy leaf, which names no row, pairs by leaf alone.
+  - Kept-only lines name their row and carry a marker that separates the waived shapes from loss:
+    - `(applied)` only when the record, with that removal turned into a restore, projects the member. A gone member
+      does not project after the restore either, so the fold losing its "removed, gone" record cannot read as applied.
+    - `(unprojected)` for an own link on a row whose member no document holds any more (#2018's mechanism). A member a
+      document still holds but a layer removed is held, and its link is the fold's `own heldNode` record. Losing that
+      is a different defect, so its line stays unmarked and unwaived.
+
+    The close-out reviews' mutation (the fold drops every removal of a gone member) passed as a waived #2013 twice
+    before this. First the lines were unkeyed. Then `(applied)` tested only that a document still held the member,
+    which an inner layer's removal also passes. The pairing is a pure function (`pairUnused`) with its own tests
+    (`foldOraclePairing.test.ts`), because the real fold never takes the branches that tell these apart.
+  - Not checked:
+    - The end walk (undo to the start, redo to the end) and the respawn rebuild.
+    - A record the fold keeps nothing for under a placeholder, because both sides are skipped there (#2018 names
+      that route).
+    - A restore (`removed: false`) under a member an inner layer removed: no verify seed reaches it, so the fold
+      dropping that row's `removed` record there goes unseen.
+    - A held own link (the fold's `own heldNode`): no verify seed reaches one.
+  - Its first hunt and the close-out review (2026-10-02) found three gaps in the ORACLE, all fixed there:
+    - A template-added reference node did not open a frame.
+    - A scene-added reference node's own template-added node was claimed by the outer instance.
+    - Today's kept rows were compared where the fold's are skipped: under a rule-B placeholder, and under a member the
+      record removes (#1914 R4).
+  - They also found one old-model defect, #2013: today keeps a member's `removed` in its orphan store and also applies
+    it (`(applied)`).
+  - And five fold defects:
+    - #2015: a document-level move of a template's own row into a nested instance's member was held and never projected.
+    - #2016: a held reference copy's unused record is keyed at `/` instead of the node it stands for.
+    - #2017: a scene-added reference node stated once, inside a template-added reference node's `added`, is anchored
+      twice.
+    - #2018: an own link on a row whose member is not projected is neither anchored nor unused. #2013 first waived these,
+      read as applied, because nothing on either side looked like agreement.
+  - Each of these issues has a KNOWN_OPEN waiver that tolerates only its own shape; a test holds both sides of each.
 - The verify run's summary line says how often T2 and T4 ran, and why a marked T2 op did not check (a skip reason, or
   the op a no-op) (`#1880 checks run`), since a check that never runs guards nothing. The fold's precedence has its own oracle, outside the fuzzer:
   `engine/packages/modoki/tests/runtime/prefabFoldOracle.test.ts` (#1880 T3) draws random layer stacks and holds the pure
   fold and the spawner to Unity's rule, outermost layer wins.
 
-The test's header lists what it cannot see (no concurrency, a simulated watcher, one scene, no Play). Read it before
+The test's header lists what it cannot see (no concurrency, a simulated watcher, one scene, no game system running in Play). Read it before
 concluding that an area is covered.
 
 **How to use it.**
@@ -862,7 +939,9 @@ need the undo stack to survive a reload, which the harness did not do at first: 
 The diagnoses found two harness defects that review had not: that history key, and an end walk that judged a
 restored fixture as the editor's own old-version write.
 
-**Re-finds (a known fixed bug put back, measured 2026-09-29).** The generator's weights were NOT tuned against these.
+**Re-finds (a known fixed bug put back, measured 2026-09-29).** ⚠️ Measured on the generator BEFORE #2009 (2026-10-02)
+added six op kinds, which changed every seed's list: the seeds and steps below are that generator's, and were not
+re-measured, so "in the verify seeds" is no longer a claim about today's seeds. The generator's weights were NOT tuned against these.
 Four generator changes came from reading the coverage tally. Three of them were not made for any re-find. The fourth,
 the directed move-then-Apply branch, was added precisely so that #1751 F1's route is reached, so that re-find is by
 construction. The four: Remove Component draws only from

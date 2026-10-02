@@ -5,7 +5,10 @@
  *  then runs a seeded list of ops (`prefabFuzz/ops.ts`): create prefab (and Replace), instantiate (and nest), detach,
  *  duplicate, copy/cut/paste, delete, field edits, add/remove component, add child, reparent, Apply (all, a component,
  *  a key; the default or another target), Revert, prefab edit (open, inner ops, save or discard, exit), undo/redo, save
- *  → reload, trash/rename a prefab file, and an outside edit of one. After every step: I4, I5, I6, I7, I8, I15, I16,
+ *  → reload, trash/rename a prefab file, and an outside edit of one. And (#2009) the agent's doors — `set-traits`,
+ *  `prefab instantiate`, `/api/scene-mutate` live and file-direct (no renderer) — Play → edits → Stop, and a timeline
+ *  scrub (an activation pose, a posed Transform, an agent edit the posed world must refuse) left by its exit or by Stop.
+ *  After every step: I4, I5, I6, I7, I8, I15, I16,
  *  I18 and both validators (`prefabFuzz/checks.ts`); every save→reload is the identity and a second save is
  *  byte-identical; the run ends with a save→reload, then undo to the segment's start (the bytes it began with), then
  *  redo to the end. Any console.error the EXPECTED_ERRORS list does not name fails the step.
@@ -29,7 +32,9 @@
  *  - The React components are not mounted. Each op calls what the component calls (named in `ops.ts`), with modals
  *    answered: a Replace asked or declined by the seed, a scene move and a discard confirmed.
  *  - One scene, no base scenes: cross-scene cut/paste and I14 are not reached (follow-up on #1789).
- *  - Play mode, previews and Transient subtrees (I12, I13) are never entered.
+ *  - Play and a timeline preview are entered (#2009), headlessly: no frame is stepped, so no game system runs in Play,
+ *    and the preview poses through `previewTimelineAt` with an inline activation track, not a timeline asset or an
+ *    Animator. Transient subtrees (I12) are still never made.
  *  - Models, textures and the skin rig are absent: #1782's positional rebuilders are not reached.
  *  - The OS trash is stubbed to a plain delete (`moveToTrash`), so a trash the OS refuses part-way is not reached.
  *  - Override marks are compared only on instance members: a mark left on a detached (plain) entity has no reader.
@@ -53,7 +58,8 @@
  *  - A run's paths and guids come from a 32-bit hash of its op list (plus its occurrence count): two lists can collide in
  *    one process (~N²/2³³ for N lists, including a shrink's replays), sharing a run folder while the caches are not reset.
  *
- *  REACH, measured by putting fixed bugs back (docs/prefabs.md § "The randomized round-trip test" has the table): #1756,
+ *  REACH, measured by putting fixed bugs back on the generator before #2009's six op kinds changed every seed's list (so
+ *  not a claim about today's seeds; docs/prefabs.md § "The randomized round-trip test" has the table): #1756,
  *  #1446 and #1709 fail inside the verify seeds; #1774, #1751 F1 and #1737 only in a 150-seed hunt (#1751 F1 only
  *  through apply's directed move-then-Apply branch, which was ADDED to reach the member-paths route #1751 F1 lives on);
  *  #1777 is not re-found (reusing a number needs a hand edit below the mark, or #1782's rebuilders); #1741 is
@@ -73,13 +79,16 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 import { makeFuzzBackend, ROOT_URL } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, flushWatcher } from './prefabFuzz/harness';
+import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
+import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { boot, bridge, memoryStorage, flushWatcher, editorOwns } from './prefabFuzz/harness';
 import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
-import { runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
 import { writeFileSync } from 'node:fs';
-import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, recordKeys } from './prefabFuzz/checks';
+import { signature, checkRoundTrip, firstDiff, nodeMoved, checkMarks, recordKeys, RULING_R } from './prefabFuzz/checks';
 import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { fingerprintBytes, EDITOR_DELETE_FINGERPRINT, createEditorWriteGuard } from '../../plugins/editorWriteGuard';
 import { setRunMode } from '@modoki/engine/runtime';
 
 const be = makeFuzzBackend();
@@ -151,11 +160,20 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
       + 'not a check, and no taint), so it must fail here (close-out review)',
   },
   {
-    pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — "[^"]*"( \([^)]*\))? (is a Missing Prefab now|is no longer in the scene|is not a Missing Prefab any more|is no longer an instance of|is no longer a prefab instance|is a prefab instance again)/,
+    pattern: new RegExp(String.raw`^\[undo\] (Undo|Redo) of ".*" was REFUSED — "[^"]*"( \([^)]*\))? (${RULING_R})`),
     why: 'owner ruling R (#1819, #1827, #1793, 2026-09-29): an undo or redo whose target no longer resolves, or has become '
       + 'a Missing Prefab placeholder, refuses before any change and is dropped (`require`, entityRef.ts), and says so. A '
       + 'refusal in a segment where no placeholder was expanded and nothing outside the stack touched still fails, as '
       + '"undo/redo refused in a clean segment"',
+  },
+  {
+    // Every sub's reason must be one of the ruling's (the alternation above); one other reason fails the line.
+    pattern: new RegExp(String.raw`^\[undo\] (Undo|Redo) of ".*" was REFUSED — every sub-action refused during (undo|redo): `
+      + String.raw`"[^"]*": "[^"]*"( \([^)]*\))? (${RULING_R})[^|]*( \| "[^"]*": "[^"]*"( \([^)]*\))? (${RULING_R})[^|]*)* The entry was dropped`),
+    why: 'the same ruling, for an AGENT call\'s one undo entry (#2009): `set-traits` and `apply-scene-ops` wrap their writes '
+      + 'in a composite (`runAsCompositeAction`), whose undo refuses as a whole when EVERY sub refused (#1823) and prints '
+      + 'each sub\'s reason. The fuzzer reaches it once an outside edit or a trash takes away an entity an agent edited '
+      + '(hunt seeds 1036, 1042, 1142). A composite that half-applied is NOT this line: it is a CompositeStepError, and fails',
   },
   {
     pattern: /^\[undo\] (Undo|Redo) of ".*" was REFUSED — The prefab instance \(\S+\) a deleted member belongs to is no longer in the scene/,
@@ -364,9 +382,10 @@ describe('#1789 prefab fuzz', () => {
 
   for (const k of KNOWN_OPEN) {
     it(`KNOWN_OPEN #${k.issue} still reproduces — remove its entry once it is fixed (${k.what})`, async () => {
-      // Strict, except for what ANOTHER entry of the same issue tolerates: one issue's shapes can lie on one route (#1939:
-      // the expanded-entry and copy-carry repros pass a node placeholder first). Never a failure this entry reproduces.
-      const siblings = KNOWN_OPEN.filter((o) => o !== k && o.issue === k.issue && o.tolerates);
+      // Strict, except for what ANOTHER entry tolerates, as verify does: one issue's shapes can lie on one route (#1939:
+      // the expanded-entry and copy-carry repros pass a node placeholder first), and a tolerated issue's on another's
+      // (#2013's double-booked orphan row lies on #2010's route). Never a failure this entry reproduces.
+      const siblings = KNOWN_OPEN.filter((o) => o !== k && o.tolerates);
       const tolerate = (f: StepFailure) => !k.reproduces(f) && siblings.some((o) => o.tolerates!(f));
       const r = await runOps(be, k.repro, siblings.length ? { ...STRICT, tolerate: (f) => tolerate({ ...f, step: -1, op: '' }) } : STRICT);
       expect(r.failure, `#${k.issue} no longer reproduces: if it is fixed, delete its KNOWN_OPEN entry`).toBeDefined();
@@ -382,6 +401,39 @@ describe('#1789 prefab fuzz', () => {
   // #1840: the watcher looked marks up by a string it built from the url, which on Windows never matched the route's
   // `\`-separated path, so every editor write reloaded under the op and tainted its segment — the undo identity and the
   // clean-segment refusal checks never ran there: 32 KNOWN_OPEN repros ran clean, and #1805 route 2 lost its reach.
+  // #2010's stop claims the mechanism in both of the forms a run reports it: the end walk's (`undo threw`, the hunt's seed
+  // 1153) and an `undo` op's (`op threw`, the review's replay with one more undo), each with every failed sub refused
+  // under ruling R. Its reject side is in "KNOWN_OPEN claims no failure of a mechanism it does not name".
+  it('KNOWN_OPEN #2010 claims a ruling-R half-applied composite from the end walk and from an undo op', () => {
+    const k = KNOWN_OPEN.find((x) => x.issue === 2010)!;
+    const ops = [...k.repro, { kind: 'undo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] } as Op];
+    const sub = '"M905" refused ("M905" is no longer in the scene)';
+    expect(k.stops!({ check: 'undo threw', detail: `Mutate Scene (2 ops): 1 of 2 sub-action(s) failed during undo: ${sub}`, step: ops.length, op: 'undo/redo to the ends' }, ops)).toBe(true);
+    expect(k.stops!({ check: 'op threw', detail: `undo "Mutate Scene (2 ops)" threw: 1 of 2 sub-action(s) failed during undo: ${sub} |     at undoStep`, step: ops.length - 1, op: 'undo(0.5)' }, ops)).toBe(true);
+    // Two failed subs, both under ruling R.
+    expect(k.stops!({ check: 'undo threw', detail: `Set Traits: 2 of 3 sub-action(s) failed during undo: ${sub}; "N1" refused ("N1" is a Missing Prefab now)`, step: ops.length, op: 'undo/redo to the ends' }, ops)).toBe(true);
+  });
+
+  // The fake watcher decides a raise as the host guard's `check` does (editorWriteGuard.ts, POSIX): a mark vouches for
+  // the bytes it hashed, a TTL-only mark for anything, and an absent file only under the delete mark (#2009 review).
+  it('harness: a mark vouches for its own bytes; a changed or a deleted write-marked file is raised (#2009)', () => {
+    const two = fingerprintBytes('two\n');
+    expect(editorOwns(two, 'two\n')).toBe(true); // the editor's own bytes
+    expect(editorOwns(two, 'three\n')).toBe(false); // an outside write after the editor's
+    expect(editorOwns(null, 'three\n')).toBe(true); // a TTL-only mark
+    expect(editorOwns(two, undefined)).toBe(false); // an outside delete of a file the editor wrote
+    expect(editorOwns(EDITOR_DELETE_FINGERPRINT, undefined)).toBe(true); // the editor's own delete
+    expect(editorOwns(EDITOR_DELETE_FINGERPRINT, 'two\n')).toBe(false); // a file the editor deleted, written back outside
+    // And it IS the host's rule (POSIX), case for case, so the fake cannot drift from the guard it copies (review).
+    for (const mark of [null, two, EDITOR_DELETE_FINGERPRINT]) {
+      for (const now of ['two\n', 'three\n', undefined]) {
+        const guard = createEditorWriteGuard(1500, () => 0, 'linux');
+        guard.mark('/p', mark);
+        expect(guard.isWrite('/p', () => (now === undefined ? null : fingerprintBytes(now))), `${mark} / ${now}`).toBe(editorOwns(mark, now));
+      }
+    }
+  });
+
   it('harness: the editor\'s own write is not raised as an outside edit, and an outside write is (#1840)', async () => {
     const own = `${ROOT_URL}/watcher-selftest/own.txt`; const outside = `${ROOT_URL}/watcher-selftest/outside.txt`;
     // Stopped, as `startRun` leaves it. Until then the editor's reload suppressor (agentEditorOps.ts) defers the outside
@@ -403,10 +455,10 @@ describe('#1789 prefab fuzz', () => {
   // The accept twin: an outside edit's own raise taints, as the one cause a raise may have.
   it('harness: a raise no outside edit made FAILS the step (#1845), and an outside edit\'s own raise taints as outsideEdit', async () => {
     const ops = generate(1, VERIFY_LEN);
-    const add = be.marked.add;
-    be.marked.add = function (this: Set<string>) { return this; } as typeof add;
+    const set = be.marked.set;
+    be.marked.set = function (this: Map<string, string | null>) { return this; } as typeof set;
     let r: RunResult;
-    try { r = await runOps(be, ops, OPTS); } finally { be.marked.add = add; }
+    try { r = await runOps(be, ops, OPTS); } finally { be.marked.set = set; }
     expect(r.failure?.check).toBe('unexpected outside write');
     expect(r.failure?.detail).toMatch(/after op \d+ \(.*\): the watcher raised a write that no outside edit made/);
 
@@ -433,8 +485,8 @@ describe('#1789 prefab fuzz', () => {
       { kind: 'prefabEdit', u: [0.55, 0.1, 0, 0, 0, 0, 0, 0], inner: [{ kind: 'editField', u: [0.5, 0.5, 0.5, 0.5, 0, 0, 0, 0] }] },
       { kind: 'outsideEdit', u: [0.1, 0.2, 0.3, 0.2, 0.5, 0.5, 0.5, 0.5] },
     ];
-    const add = be.marked.add;
-    be.marked.add = function (this: Set<string>) { return this; } as typeof add;
+    const set = be.marked.set;
+    be.marked.set = function (this: Map<string, string | null>) { return this; } as typeof set;
     try {
       const snap = () => JSON.stringify(tallies().map((m) => [...m].sort()));
       const taints = () => JSON.stringify([taintCounts, skippedChecks].map((m) => [...m].sort()));
@@ -447,7 +499,7 @@ describe('#1789 prefab fuzz', () => {
       const s = await shrunk('tally', ops, r);
       expect(s.text, 'premise: the shrinker replayed the list').toMatch(/in [1-9]\d* replays/);
       expect(snap()).toBe(counted);
-    } finally { be.marked.add = add; }
+    } finally { be.marked.set = set; }
   }, 60_000);
 
   // Close-out review of the #1738 entry: the refusal names the prefab by guid only when the manifest no longer resolves
@@ -661,6 +713,13 @@ describe('#1789 prefab fuzz', () => {
     expect(expectedError('[undo] Redo of "Instantiate "P"" did not fully apply — 2 members could not be put back')).toBe(false);
     // The cycle line's follow-up is allowed only right after the cycle line.
     expect(expectedError('[PrefabEdit] cannot save "O" — serialize produced no prefab')).toBe(false);
+    // #2009: an agent composite whose every sub refused under ruling R, as hunt seeds 1036 and 1042 printed it, with one
+    // sub and with two; and its neighbours, a composite with one sub refused for another reason, and one that half-applied.
+    const gone = (label: string, name: string) => `"${label}": "${name}" (8da1aae8-bf38-5159-ea38-39baebd544a3) is no longer in the scene, so the step would act on nothing, or on whatever holds its place now.`;
+    expect(expectedError(`[undo] Undo of "Mutate Scene (1 op)" was REFUSED — every sub-action refused during undo: ${gone('Remove Rotate3D', 'M')} The entry was dropped from the history; nothing was applied.`)).toBe(true);
+    expect(expectedError(`[undo] Redo of "Set Traits" was REFUSED — every sub-action refused during redo: ${gone('Edit Transform.x', 'QR')} | ${gone('Add Rotate3D', 'QR')} The entry was dropped from the history; nothing was applied.`)).toBe(true);
+    expect(expectedError(`[undo] Redo of "Set Traits" was REFUSED — every sub-action refused during redo: ${gone('Edit Transform.x', 'QR')} | "Add Rotate3D": /fuzz/r0/prefabs/R.prefab.json is not what this step left there The entry was dropped from the history; nothing was applied.`)).toBe(false);
+    expect(expectedError('[undo] Undo of "Mutate Scene (2 ops)" threw — 1 of 2 sub-action(s) failed during undo: "M905" refused ("M905" is no longer in the scene)')).toBe(false);
   });
 
   it('harness: a diff names the node or entry it is about, and whether that one MOVED (#1793) or is gone', () => {
@@ -752,6 +811,168 @@ describe('#1789 prefab fuzz', () => {
     expect(newGuid()).toMatch(/^1[0-9a-f]{7}-0000-4000-8000-[0-9a-f]{12}$/);
   }, 120_000);
 
+  // #2009 (#2001 design § 10.2, review R3): the doors the census found the fuzzer never drove. A fixed list, so each is
+  // REACHED (its op lands, not a noop or a refusal) and each check it feeds runs, whatever the generator's weights draw.
+  // Mutations (each goes red here, and only on its own check): Stop restoring nothing (`stopPlay` skipping
+  // `restoreAuthoredSnapshot`) → "I13 Stop does not restore"; the preview session ending without its restore → "I13 the
+  // preview exit"; `refuseEditOfPosedWorld` answering null → "an agent edit of a posed world was not refused"; the runner
+  // not exempting `agentWrote` from the raise check → "unexpected outside write".
+  it('#2009: the agent, Play/Stop and timeline-preview doors are reached, and the checks they feed run', async () => {
+    const u = (set: Record<number, number>) => Array.from({ length: 8 }, (_, i) => set[i] ?? 0.5);
+    const ops: Op[] = [
+      { kind: 'agentSetTraits', u: u({ 3: 0.1 }) }, // a Transform field
+      { kind: 'agentSetTraits', u: u({ 3: 0.9, 4: 0.1 }) }, // a field of a component the entity lacks: added
+      { kind: 'agentInstantiate', u: u({ 1: 0.9 }) }, // under a guid-named parent
+      { kind: 'agentSceneOps', u: u({ 3: 0.1 }) }, // the live route: setTrait
+      { kind: 'agentSceneOps', u: u({ 3: 0.8 }) }, // the live route: addEntity
+      { kind: 'playStop', u: u({ 0: 0.9, 1: 0.1 }) }, // two edits in Play: a field, then a delete
+      // A posed Transform.y of 8 (u[5]): a pose that writes the value the world already holds restores nothing, and the
+      // check could not tell a restore from none (a mutation of the exit's restore stayed green with u[5] = 0.5).
+      { kind: 'timelinePreview', u: u({ 5: 0.9, 7: 0.2 }) }, // left by toolbar Stop
+      { kind: 'timelinePreview', u: u({ 5: 0.9, 7: 0.8 }) }, // left by the panel's exit
+      { kind: 'undo', u: u({ 0: 0.9 }) },
+      { kind: 'fileMutate', u: u({ 0: 0, 2: 0.9, 3: 0.1 }) }, // the first entry, an instance root: the legacy root channel (R5)
+    ];
+    const { res, grew } = await uncounted(async () => {
+      const before = { ...Object.fromEntries(checksRun), ...Object.fromEntries([...taintCounts].map(([k, n]) => [`taint ${k}`, n])) };
+      const r = await runOps(be, ops, STRICT);
+      const after = { ...Object.fromEntries(checksRun), ...Object.fromEntries([...taintCounts].map(([k, n]) => [`taint ${k}`, n])) };
+      return { res: r, grew: Object.keys(after).filter((k) => after[k]! > (before[k] ?? 0)) };
+    });
+    expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}\n${res.trace.join('\n')}` : '').toBeUndefined();
+    const outcomeOf = (i: number) => res.trace.map((l) => /^(\d+): .*? → (\w+)/.exec(l)).find((m) => m && Number(m[1]) === i)?.[2];
+    expect(ops.map((_, i) => `${i} ${ops[i]!.kind} ${outcomeOf(i)}`)).toEqual(ops.map((o, i) => `${i} ${o.kind} done`));
+    expect(grew).toEqual(expect.arrayContaining(['I23 around playStop', 'I23 around timelinePreview', 'taint agentFileWrite']));
+    // The file-direct write REACHED the editor and survived its saves: the first entry (an instance root) still states
+    // Transform.z = 8 in its legacy root channel after the final save→reload. A watcher that took the op's own Save mark
+    // for the outside write too swallowed it, and the final save wrote the scene back without it (#2009's harness fix).
+    const scenePath = [...be.snapshot().keys()].find((p) => p.endsWith('/scenes/Fuzz.json'))!;
+    const entry = (JSON.parse(be.read(scenePath)!) as { entities: Array<{ overrides?: Record<string, { Transform?: { z?: number } }> }> }).entities[0]!;
+    expect(Object.values(entry.overrides ?? {}).some((o) => o.Transform?.z === 8), JSON.stringify(entry.overrides)).toBe(true);
+  }, 120_000);
+
+  // P1 by the fold (#2009 part 2) found a gap in the comparison itself (foldOracle.ts): a template-added REFERENCE node
+  // did not open a frame ("fold-only node /F/a+X/..."). Both minimized routes from the 2026-10-02 hunt must now run clean
+  // with the check counted; shown red by that mutation. Hub ruling 2026-10-02: an oracle gap, not a fold defect — the
+  // live entities sit where the fold puts them, and a save→reload is the same. (The oracle's other gap, kept rows under a
+  // rule-B placeholder, is held by foldInstanceOracleFuzz.test.ts's seed 103.)
+  it('#2009: P1 by the fold holds on template-added reference nodes and foreign stored roots (oracle gaps the hunt found)', async () => {
+    const cases: Record<string, Op[]> = {
+      'an instantiate in prefab edit mode (a template-added reference node)': [
+        { kind: 'prefabEdit', u: [0.3020704125519842, 0.3749536194372922, 0.42213196074590087, 0.40289529715664685, 0.39253392070531845, 0.266626542666927, 0.828643477987498, 0.6243362268432975], inner: [{ kind: 'instantiate', u: [0.90849429811351, 0.8387780718039721, 0.7161983735859394, 0.8973747261334211, 0.14793384936638176, 0.5566688724793494, 0.23754322016611695, 0.07028496148996055] }] },
+      ],
+      'Create Prefab of an instance holding a scene-added reference node': [
+        { kind: 'instantiate', u: [0.9785601259209216, 0.7552136613521725, 0.2955629227217287, 0.10258582420647144, 0.8701307433657348, 0.18878118298016489, 0.6025536984670907, 0.5656476493459195] },
+        { kind: 'createPrefab', u: [0.045867482433095574, 0.7695533491205424, 0.39526152424514294, 0.039226526161655784, 0.9665321970824152, 0.6368354156147689, 0.2166700209490955, 0.9771678755059838] },
+      ],
+      // A template-added node under a template-added REFERENCE node: keyed in the reference node's frame (/F/a+X/a+Y).
+      'Create Prefab of an instance whose scene-added reference node holds another': [
+        { kind: 'instantiate', u: [0.5452670496888459, 0.9185665613040328, 0.10775163257494569, 0.8007432606536895, 0.4144696162547916, 0.8174828256014735, 0.8313712903764099, 0.36589792813174427] },
+        { kind: 'reparent', u: [0.3809924677480012, 0.6887131074909121, 0.227493601385504, 0.5140306104440242, 0.999745735200122, 0.8504236072767526, 0.18166282982565463, 0.5389415095560253] },
+        { kind: 'instantiate', u: [0.04089164547622204, 0.018671562429517508, 0.3143713332246989, 0.0006737359799444675, 0.6996929873712361, 0.7706542836967856, 0.873330732807517, 0.5525062764063478] },
+        { kind: 'timelinePreview', u: [0.9622934160288423, 0.38139918236993253, 0.6873752218671143, 0.007343278266489506, 0.046908345306292176, 0.14558980311267078, 0.7842403906397521, 0.5771834806073457] },
+        { kind: 'createPrefab', u: [0.051619044970721006, 0.19952322961762547, 0.7071757176890969, 0.8638966714497656, 0.8690867677796632, 0.007202112348750234, 0.983666519401595, 0.1085439685266465] },
+      ],
+      // A scene-added reference node's own template-added node: never claimed on the outer instance's key.
+      'an agent instantiate under a member, inside a duplicate': [
+        { kind: 'duplicate', u: [0.48945846571587026, 0.47396950447000563, 0.05526354908943176, 0.4432587781921029, 0.6669238524045795, 0.2945732136722654, 0.2893497431650758, 0.9265729640610516] },
+        { kind: 'duplicate', u: [0.19135557231493294, 0.4103741485159844, 0.14552880264818668, 0.7415867387317121, 0.7291451483033597, 0.005936015164479613, 0.6244459943845868, 0.053858045721426606] },
+        { kind: 'agentInstantiate', u: [0.4222325817681849, 0.8234889090526849, 0.8316709182690829, 0.9349119781982154, 0.3937791904900223, 0.6970346109010279, 0.022497162222862244, 0.38807249744422734] },
+      ],
+    };
+    for (const [what, ops] of Object.entries(cases)) {
+      const { res, grew } = await uncounted(async () => {
+        const before = Object.fromEntries(checksRun);
+        const r = await runOps(be, ops, STRICT);
+        return { res: r, grew: Object.keys(Object.fromEntries(checksRun)).filter((k) => checksRun.get(k)! > (before[k] ?? 0)) };
+      });
+      expect(res.failure, `${what}: ${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
+      expect(grew, what).toContain('P1 by the fold');
+    }
+  }, 120_000);
+
+  // The P1 waivers (#2013, #2015, #2016) TOLERATE, and `claimsOf` reads only `stops`, so their two sides are held here:
+  // each tolerates its own shape, and a near miss — another line beside it, the other direction, another leaf — is
+  // tolerated by nothing, or a fold regression of a neighbouring shape would pass verify.
+  // A reference node inside a PLAIN node the scene added (its `children`) is its own stored instance, and P1 compares it
+  // (#2009 review: only the scene-owned list roots were walked; 20 such nodes in the verify seeds went uncompared).
+  // Minimized from verify seed 2's first 16 ops.
+  it('#2009: P1 by the fold reaches a reference node inside a plain node the scene added', async () => {
+    const ops: Op[] = [
+      { kind: 'duplicate', u: [0.7858669895213097, 0.20154535141773522, 0.42422566725872457, 0.8349974474404007, 0.5813204094301909, 0.14100669883191586, 0.6722272289916873, 0.3666982688009739] },
+      { kind: 'prefabEdit', u: [0.9884103999938816, 0.23279935983009636, 0.4679630333557725, 0.3482415771577507, 0.05263609322719276, 0.5212198328226805, 0.09536325954832137, 0.05781813757494092], inner: [{ kind: 'undo', u: [0.0006261211819946766, 0.9820793268736452, 0.07251844787970185, 0.9723730375990272, 0.5273911911062896, 0.19475854956544936, 0.6778920909855515, 0.05147860595025122] }, { kind: 'undo', u: [0.911587618291378, 0.8271304324734956, 0.4456692119129002, 0.9488384739961475, 0.07114801253192127, 0.7140970125328749, 0.98002965352498, 0.8388770050369203] }, { kind: 'instantiate', u: [0.524419940309599, 0.03313548816367984, 0.8487747020553797, 0.838832515059039, 0.5479850363917649, 0.3125023730099201, 0.9025776439812034, 0.9283567571546882] }, { kind: 'duplicate', u: [0.34926888695918024, 0.018448069458827376, 0.9523306582123041, 0.3133497319649905, 0.4382534313481301, 0.7991957627236843, 0.8673769375309348, 0.9195172667969018] }] },
+      { kind: 'addChild', u: [0.2070961082354188, 0.6462242810521275, 0.6241721531841904, 0.713208394125104, 0.9380248752422631, 0.2051396605093032, 0.2788457141723484, 0.3453041734173894] },
+      { kind: 'duplicate', u: [0.20850570825859904, 0.059333223616704345, 0.6751196074765176, 0.6820617744233459, 0.5880381965544075, 0.789034377085045, 0.37132780719548464, 0.85833081882447] },
+      { kind: 'instantiate', u: [0.674173641949892, 0.6865298799239099, 0.8570264051668346, 0.1643060555215925, 0.5510812881402671, 0.1839873620774597, 0.39782143314369023, 0.3698480911552906] },
+    ];
+    const { res, grew } = await uncounted(async () => {
+      const before = Object.fromEntries(checksRun);
+      const r = await runOps(be, ops, STRICT);
+      return { res: r, grew: Object.keys(Object.fromEntries(checksRun)).filter((k) => checksRun.get(k)! > (before[k] ?? 0)) };
+    });
+    expect(res.failure, `${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
+    expect(grew).toContain('P1 by the fold: a reference node inside a plain added node');
+  }, 60_000);
+
+  // The counter counts a comparison that RAN, not an instance found (#2009 re-review: moved back to discovery, every
+  // verify count stayed the same, because every instance found there is compared). An instance with no live root is
+  // found and not compared.
+  it('#2009: P1 by the fold counts no comparison for a stored instance it could not compare', async () => {
+    const ops: Op[] = [
+      { kind: 'duplicate', u: [0.7858669895213097, 0.20154535141773522, 0.42422566725872457, 0.8349974474404007, 0.5813204094301909, 0.14100669883191586, 0.6722272289916873, 0.3666982688009739] },
+      { kind: 'prefabEdit', u: [0.9884103999938816, 0.23279935983009636, 0.4679630333557725, 0.3482415771577507, 0.05263609322719276, 0.5212198328226805, 0.09536325954832137, 0.05781813757494092], inner: [{ kind: 'undo', u: [0.0006261211819946766, 0.9820793268736452, 0.07251844787970185, 0.9723730375990272, 0.5273911911062896, 0.19475854956544936, 0.6778920909855515, 0.05147860595025122] }, { kind: 'undo', u: [0.911587618291378, 0.8271304324734956, 0.4456692119129002, 0.9488384739961475, 0.07114801253192127, 0.7140970125328749, 0.98002965352498, 0.8388770050369203] }, { kind: 'instantiate', u: [0.524419940309599, 0.03313548816367984, 0.8487747020553797, 0.838832515059039, 0.5479850363917649, 0.3125023730099201, 0.9025776439812034, 0.9283567571546882] }, { kind: 'duplicate', u: [0.34926888695918024, 0.018448069458827376, 0.9523306582123041, 0.3133497319649905, 0.4382534313481301, 0.7991957627236843, 0.8673769375309348, 0.9195172667969018] }] },
+      { kind: 'addChild', u: [0.2070961082354188, 0.6462242810521275, 0.6241721531841904, 0.713208394125104, 0.9380248752422631, 0.2051396605093032, 0.2788457141723484, 0.3453041734173894] },
+      { kind: 'duplicate', u: [0.20850570825859904, 0.059333223616704345, 0.6751196074765176, 0.6820617744233459, 0.5880381965544075, 0.789034377085045, 0.37132780719548464, 0.85833081882447] },
+      { kind: 'instantiate', u: [0.674173641949892, 0.6865298799239099, 0.8570264051668346, 0.1643060555215925, 0.5510812881402671, 0.1839873620774597, 0.39782143314369023, 0.3698480911552906] },
+    ];
+    await uncounted(async () => {
+      await runOps(be, ops, STRICT);
+      const scene = await serializeScene() as { entities?: SceneEntityEntry[] };
+      const stored = (scene.entities ?? []).filter((e) => e.prefab && e.guid);
+      expect(stored.length).toBeGreaterThan(0);
+      const rootless = { ...scene, entities: stored.map((e) => ({ ...e, guid: `${e.guid!.slice(0, -4)}dead` })) };
+      const before = checksRun.get('P1 by the fold') ?? 0;
+      const out = foldCheck(be, rootless);
+      expect(out.filter((f) => f.check === 'P1 a stored instance has no live root')).toHaveLength(stored.length);
+      expect(checksRun.get('P1 by the fold') ?? 0).toBe(before);
+    });
+  }, 60_000);
+
+  it('KNOWN_OPEN\'s P1 waivers each tolerate their own shape and nothing near it (#2013, #2015, #2016, #2017, #2018)', () => {
+    const g = 'aaaaaaaa-0000-4000-8000-000000000001';
+    const P1 = (lines: string[]) => ({ check: 'P1 the live instance is not the fold of its record', detail: `${g} ${lines.join(' ; ')}` });
+    const who = (f: { check: string; detail: string }) => KNOWN_OPEN.filter((k) => k.tolerates?.(f)).map((k) => k.issue);
+    const moved = 'parent /R/A: fold {"key":"/R"} live {"key":"/R/QR/M"}';
+    // Accept: each shape, alone and repeated.
+    expect(who(P1(['kept-only unused /R/A removed (applied)', 'kept-only unused /R/B removed (applied)']))).toEqual([2013]);
+    expect(who(P1([moved, 'parent /A: fold {"key":"/"} live {"key":"/QR/M"}']))).toEqual([2015]);
+    expect(who(P1(['fold-only unused / legacy (gone)']))).toEqual([2016]);
+    expect(who(P1(['anchors /F/a+X: fold ["g1","g1"] live ["g1"]']))).toEqual([2017]);
+    expect(who(P1(['kept-only unused /R/A own (unprojected)', 'kept-only unused /R/QR own (unprojected)']))).toEqual([2018]);
+    // Reject: nothing tolerates these.
+    for (const lines of [
+      ['kept-only unused /R/A -Rotate3D'], // another kept leaf: B1, the oracle's own fix
+      ['kept-only unused /R/A own (unprojected)', 'kept-only unused /R/B removed (applied)'], // #2018's beside #2013's: neither waiver's whole
+      ['kept-only unused /R/A own'], // an own link lost on a PROJECTED member: not #2018's mechanism
+      ['kept-only unused (legacy) own'], // a kept legacy channel's: another route
+      ['kept-only unused /R/A removed'], // a removal the fold did NOT apply
+      ['kept-only unused /R/A removed (applied)', 'fold-only node /R/X'], // #2013's shape beside a node the fold has and today lacks
+      ['parent /R/A: fold {"key":"/R/QR/M"} live {"key":"/R"}'], // the other direction: the fold deeper than today
+      ['parent /R/A: fold {"key":"/R/QR"} live {"key":"/R/QRX/M"}'], // a sibling whose key only shares a prefix
+      ['parent /R/A: fold {"key":"/R"} live {"guid":"bbbbbbbb-0000-4000-8000-000000000001"}'], // today parented outside the instance
+      [moved, 'kept-only unused /R/A removed (applied)'], // #2015's shape beside #2013's: two mechanisms, neither waiver's whole
+      ['parent /R/A: fold {"key":"/R"} live {"key":"/R/B"}'], // one level deeper: a sibling, not a nested instance's member
+      ['fold-only unused /R/A legacy (unresolved)'], // another cause
+      ['fold-only unused /R/a+X legacy (gone)'], // keyed at the node: #2016's fix that left the cause, not #2016
+      ['fold-only unused /R/A removed (gone)'], // another leaf
+      ['anchors /F/a+X: fold ["g1","g2"] live ["g1"]'], // a node the fold has and today lacks, not a repeat
+      ['anchors /F/a+X: fold ["g1"] live ["g1","g1"]'], // the other direction
+      ['anchors /F/a+X: fold ["g1","g1"] live ["g2"]'], // a repeat of a guid today does not anchor there
+    ]) expect(who(P1(lines)), lines.join(' ; ')).toEqual([]);
+    // Another check with a waiver's detail is not the waiver's.
+    expect(who({ check: 'save→reload is not the identity', detail: `${g} kept-only unused own` })).toEqual([]);
+  });
+
   it('KNOWN_OPEN claims no failure of a mechanism it does not name (#1777\'s shape, and regressions planted in review)', () => {
     // Generic failures on entities no drop, paste, detach or Create Prefab of the run touched: nothing may claim them, or
     // a regression would pass verify. #1777's duplicate inside one frame, values and marks that differ across a reload,
@@ -759,7 +980,9 @@ describe('#1789 prefab fuzz', () => {
     // override, an undo that loses a mark, a redo that misplaces a node), and a re-tag refusal logged for another tree —
     // each was once claimed by a predicate keyed on the check and the op list.
     const kinds: Op['kind'][] = ['createPrefab', 'detach', 'reparent', 'instantiate', 'removeComponent', 'undo', 'trashPrefab', 'saveReload', 'apply',
-      'copy', 'cut', 'paste', 'delete', 'duplicate', 'editField', 'addComponent', 'addChild', 'prefabEdit', 'outsideEdit', 'renamePrefab', 'redo', 'revert'];
+      'copy', 'cut', 'paste', 'delete', 'duplicate', 'editField', 'addComponent', 'addChild', 'prefabEdit', 'outsideEdit', 'renamePrefab', 'redo', 'revert',
+      // #2009's doors: a stop keyed on "a fileMutate ran" claimed a generic mark gained on reload until they were listed (review).
+      'agentSetTraits', 'agentInstantiate', 'agentSceneOps', 'fileMutate', 'playStop', 'timelinePreview'];
     const op = (kind: Op['kind']) => ({ kind, u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] });
     // Every op kind, ending in each op a stop keys "last" on, and with each op a stop keys "no …" on left out — so a
     // last-op or negative clause cannot be what keeps a generic failure unclaimed (review: with one list ending in
@@ -778,7 +1001,8 @@ describe('#1789 prefab fuzz', () => {
       // keyed on "an op of that kind ran" rather than on the entity is caught (review: a touchedBy weakened that way
       // stayed green while every generic failure had no touched set at all).
       const other = (n: number) => `bbbbbbbb-0000-4000-8000-00000000000${n}`;
-      const touched = { drop: [other(1)], paste: [other(2)], detach: [other(3)], create: [other(4)] };
+      // #2009's two too (review: with them absent, a stop keyed on "some file-direct write wrote anything" stayed green).
+      const touched = { drop: [other(1)], paste: [other(2)], detach: [other(3)], create: [other(4)], fileDirect: [other(6)], agent: [other(7)] };
       const f = (check: string, detail: string, at = 'revert(0.500)', extra: Partial<StepFailure> = {}) => ({ check, detail, op: at, step: ops.length - 1, touched, moved: true, ...extra });
       return [
         f('I7 duplicate guid', 'G held by M, M (under one top-level root; rows of one frame)'),
@@ -802,6 +1026,19 @@ describe('#1789 prefab fuzz', () => {
         // A lost top-level entity no drop touched.
         f('redo to the end does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
         f('undo to the start does not restore the scene', '/entities/aaaaaaaa-0000-4000-8000-000000000005: {"traits":{}} vs undefined', walk),
+        // #2009 review: a composite that half-applied because a sub's GUARD refused (not ruling R), in both forms, and one
+        // whose failed sub threw. #2010's stop is about ruling R only.
+        f('undo threw', 'Set Traits: 1 of 2 sub-action(s) failed during undo: "Edit Transform.x" refused (/fuzz/r0/prefabs/R.prefab.json is not what this step left there)', walk),
+        f('op threw', 'undo "Set Traits" threw: 1 of 2 sub-action(s) failed during undo: "Edit Transform.x" refused (/fuzz/r0/prefabs/R.prefab.json is not what this step left there) |     at x', 'undo(0.5)'),
+        f('undo threw', 'Mutate Scene (2 ops): 1 of 2 sub-action(s) failed during undo: "M905" threw (boom)', walk),
+        // A CORE trait's mark gained on the very entry a file-direct write wrote: never a partially stated added component.
+        f('save→reload is not the identity', `/${other(6)}/marks/0: undefined vs "Transform.x"`, 'saveReload(0.5)'),
+        // …and an added component's mark gained on an entity NO file-direct write wrote, while one wrote another (review:
+        // a stop keyed on "some file-direct write wrote anything" passed the Transform fixtures, which the trait clause rejects).
+        f('save→reload is not the identity', '/aaaaaaaa-0000-4000-8000-000000000001/marks/0: undefined vs "Rotate3D.axis"', 'saveReload(0.5)'),
+        // Two failed subs, the FIRST under ruling R: every one must be (review: `some`, or reading the first sub only, passed).
+        f('undo threw', 'Set Traits: 2 of 3 sub-action(s) failed during undo: "A" refused ("A" is no longer in the scene); "B" refused (/fuzz/r0/prefabs/R.prefab.json is not what this step left there)', walk),
+        f('undo threw', 'Set Traits: 2 of 3 sub-action(s) failed during undo: "A" refused ("A" is no longer in the scene); "B" threw (boom)', walk),
       ];
     };
     // Fixture stops planted beside the real entries, so the matcher is exercised while KNOWN_OPEN is empty: #1777's shape

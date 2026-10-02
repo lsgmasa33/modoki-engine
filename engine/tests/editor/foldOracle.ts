@@ -14,8 +14,8 @@ import { memberRowKeysIn } from '../../packages/modoki/src/runtime/core/ecs/memb
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
-import { parseInstanceRecord, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
-import type { PrefabReader, FoldedInstance, UnusedRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
+import { parseInstanceRecord, preV5NodeGuid, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import type { PrefabReader, FoldedInstance, UnusedRecord, InstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 type LiveNode = { key: string; parent: { key: string } | { guid: string } | null; traits: Record<string, Record<string, unknown> | true> };
 export type Live = { nodes: Map<string, LiveNode>; anchors: Map<string, string[]>; placeholders: Set<string> };
@@ -34,26 +34,43 @@ export function liveTree(rootId: number): Live {
   const under = (id: number): boolean => { for (let p = parentOf(id), n = 0; p && n < 512; p = parentOf(p), n++) if (p === rootId) return true; return false; };
   const keyOf = new Map<number, string>([[rootId, '/']]);
   for (const [id, k] of memberKeys) keyOf.set(id, k);
-  /** A member's FRAME key: an owned nested root opens its own frame; any other member sits in its key's parent frame. */
+  /** A TEMPLATE-ADDED reference node: a node a template added that is itself a prefab instance (its own root). */
+  const isTemplateRef = (id: number): boolean =>
+    !!templateKeyOf(byId.get(id) as never) && (byId.get(id)?.get(pi) as { rootInstanceId?: number } | undefined)?.rootInstanceId === id;
+  /** A member's FRAME key: an owned nested root, or a template-added reference node, opens its own frame; any other
+   *  member sits in its key's parent frame. */
   const frameOfMember = (id: number): string => {
     if (id === rootId) return '';
     const k = keyOf.get(id)!;
     const p = byId.get(id)!.get(pi) as { parentLocalId?: number } | undefined;
-    return p?.parentLocalId ? k : k.slice(0, k.lastIndexOf('/'));
+    return p?.parentLocalId || isTemplateRef(id) ? k : k.slice(0, k.lastIndexOf('/'));
   };
   const templateKeyed = (id: number): string | undefined => {
     const tk = templateKeyOf(byId.get(id) as never);
     if (!tk) return undefined;
     for (let p = parentOf(id); p; p = parentOf(p)) {
-      if (keyOf.has(p) && !templateKeyOf(byId.get(p) as never)) return `${frameOfMember(p)}/a+${tk}`;
+      if (keyOf.has(p) && (!templateKeyOf(byId.get(p) as never) || isTemplateRef(p))) return `${frameOfMember(p)}/a+${tk}`;
+      // An instance's entity not keyed (yet) on the way up: another STORED instance's — a reference node the scene added
+      // under a member, whose template-added node is its own (#2009: the fuzzer's agent instantiate put a second
+      // `Extra` on this instance's key) — or a template-added reference node not reached yet, retried below.
+      if (!keyOf.has(p) && byId.get(p)?.has(pi)) return undefined;
     }
     return undefined;
   };
   const candidates = [...byId.keys()].filter((id) => id === rootId || memberKeys.has(id) || under(id));
-  for (const id of candidates) {
-    if (keyOf.has(id)) continue;
-    const k = templateKeyed(id);
-    if (k) keyOf.set(id, k);
+  // To a fixpoint: a template-added reference node, once keyed, keys its own members under it (#2009: createPrefab of an
+  // instance holding a scene-added reference node, or an instantiate in prefab edit mode, makes one), and those can
+  // anchor further template-added nodes.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const id of candidates) {
+      if (keyOf.has(id)) continue;
+      const k = templateKeyed(id);
+      if (!k) continue;
+      keyOf.set(id, k);
+      grew = true;
+      if (isTemplateRef(id)) for (const [m, mk] of memberRowKeysIn(id, world)) if (m !== id && !keyOf.has(m)) keyOf.set(m, `${k}${mk}`);
+    }
   }
   const out: Live = { nodes: new Map(), anchors: new Map(), placeholders: new Set() };
   for (const id of candidates) {
@@ -157,14 +174,16 @@ const legacyLeaves = (c: Bag | undefined, out: string[]) => {
   for (const _ of (c.added ?? []) as unknown[]) out.push('own');
   for (const _ of (c.malformed ?? []) as unknown[]) out.push('legacy');
 };
-const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[]) => {
-  for (const r of Object.values(rows ?? {})) {
-    leavesOfTraits(r.traits, out);
-    for (const n of (r.removedTraits ?? []) as string[]) out.push(`-${n}`);
-    for (const n of Object.keys((r.traitRemovals ?? {}) as Bag)) out.push(`-${n}`);
-    if (r.removed !== undefined) out.push('removed');
-    if (r.parent) out.push('parent');
-    for (const _ of [...((r.added ?? []) as unknown[]), ...((r.own ?? []) as unknown[])]) out.push('own');
+const rowLeaves = (rows: Record<string, Bag> | undefined, out: string[], skip: (key: string, leaf: string) => boolean = () => false) => {
+  for (const [key, r] of Object.entries(rows ?? {})) {
+    const leaves: string[] = [];
+    leavesOfTraits(r.traits, leaves);
+    for (const n of (r.removedTraits ?? []) as string[]) leaves.push(`-${n}`);
+    for (const n of Object.keys((r.traitRemovals ?? {}) as Bag)) leaves.push(`-${n}`);
+    if (r.removed !== undefined) leaves.push('removed');
+    if (r.parent) leaves.push('parent');
+    for (const _ of [...((r.added ?? []) as unknown[]), ...((r.own ?? []) as unknown[])]) leaves.push('own');
+    for (const leaf of leaves) if (!skip(key, leaf)) out.push(leaf);
   }
 };
 const unusedLeaf = (u: UnusedRecord): string => {
@@ -177,23 +196,60 @@ const unusedLeaf = (u: UnusedRecord): string => {
   }
 };
 
-/** The fold's unused records against what today's load keeps for the save, as two leaf multisets. A record `unresolved`
- *  under a placeholder today ALSO shows is kept by that placeholder's verbatim record, so it is not compared here. */
-export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set()): string[] {
-  const kept: string[] = [];
-  legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, kept);
-  rowLeaves(keptMemberOrphans(rootGuid) as Record<string, Bag> | undefined, kept);
-  rowLeaves(keptUnusedRows(rootGuid) as Record<string, Bag> | undefined, kept);
+/** The fold's unused records against what today's load keeps for the save, as two leaf multisets.
+ *  - A record `unresolved` under a placeholder is kept by that placeholder's verbatim record, so it is not compared — on
+ *    EITHER side: under a placeholder only the rules put there (`checkInstance`'s translation B: today expands a copy),
+ *    today keeps the same records as unused rows or applies them to the copy, at a granularity a leaf multiset cannot
+ *    match (#2009). What this cannot see — a fold that keeps NOTHING for a record under a placeholder — is #2018's.
+ *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf: the save drops a gone
+ *    member's kept unused part (#1914 R4's fix), and so does the record.
+ *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
+ *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
+export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true): string[] {
+  const kept: { key: string; leaf: string }[] = [];
+  const legacy: string[] = [];
+  legacyLeaves(keptLegacyChannels(rootGuid) as Bag | undefined, legacy);
+  for (const leaf of legacy) kept.push({ key: '(legacy)', leaf });
+  const skip = (key: string, leaf: string) => [...livePlaceholders].some((k) => under(key, k))
+    || removedRows.some((k) => under(key, k) && !(key === k && leaf === 'removed'));
+  for (const rows of [keptMemberOrphans(rootGuid), keptUnusedRows(rootGuid)] as (Record<string, Bag> | undefined)[]) {
+    for (const [key, r] of Object.entries(rows ?? {})) {
+      const leaves: string[] = [];
+      rowLeaves({ [key]: r }, leaves, skip);
+      for (const leaf of leaves) kept.push({ key, leaf });
+    }
+  }
+  const compared = fold.unused.filter((u) => !(u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k))));
+  return pairUnused(compared, kept, (k) => fold.nodes.has(k as never), removedRows, projectsWhenRestored, memberInDocuments);
+}
+
+/** The pairing half of {@link unusedDiverge}, pure: the fold's unused records against today's kept leaves, by row.
+ *  `projected` is the fold's node set; `projectsWhenRestored(key)` re-folds the record with that row's removal turned
+ *  into a restore; `memberInDocuments(key)` says a document the instance reaches still holds the row's member. */
+export function pairUnused(foldUnused: readonly UnusedRecord[], keptIn: readonly { key: string; leaf: string }[], projected: (key: string) => boolean, removedRows: readonly string[], projectsWhenRestored: (key: string) => boolean, memberInDocuments: (key: string) => boolean = () => true): string[] {
+  const kept = [...keptIn];
   const out: string[] = [];
-  const left = [...kept];
-  for (const u of fold.unused) {
-    if (u.cause === 'unresolved' && [...livePlaceholders].some((k) => under(u.key, k))) continue;
+  for (const u of foldUnused) {
     const leaf = unusedLeaf(u);
-    const at = left.indexOf(leaf);
-    if (at >= 0) left.splice(at, 1);
+    // By row; only a kept LEGACY leaf, which names no row, pairs by leaf alone (#2009 re-review: a cross-row fallback let
+    // one row's record consume another's kept leaf, and hide both).
+    let at = kept.findIndex((k) => k.key === u.key && k.leaf === leaf);
+    if (at < 0) at = kept.findIndex((k) => k.key === '(legacy)' && k.leaf === leaf);
+    if (at >= 0) kept.splice(at, 1);
     else out.push(`fold-only unused ${u.key} ${leaf} (${u.cause})`);
   }
-  for (const leaf of left) out.push(`kept-only unused ${leaf}`);
+  for (const k of kept) {
+    // `(applied)`: the fold does not project a member it WOULD project were the removal a restore, so the removal is
+    // what took it out. A gone member does not project after the restore either (and an ambiguous one is projected
+    // already), so a fold that lost its "removed, gone" record cannot read as applied (#2009 re-reviews: that loss was waived as #2013, first unkeyed, then marked
+    // applied by a document-membership test, which an inner layer's removal also passes).
+    const applied = k.leaf === 'removed' && removedRows.includes(k.key) && !projected(k.key) && projectsWhenRestored(k.key);
+    // `(unprojected)`: an own link on a row whose member no document holds any more (#2018's mechanism: the fold never
+    // registers it). A member a document still holds but a layer removed is HELD, and its link is the fold's `own
+    // heldNode` record; losing that is not #2018 (#2009 re-review), so it prints unmarked.
+    const unprojected = k.leaf === 'own' && k.key !== '(legacy)' && !projected(k.key) && !memberInDocuments(k.key);
+    out.push(`kept-only unused ${k.key} ${k.leaf}${applied ? ' (applied)' : unprojected ? ' (unprojected)' : ''}`);
+  }
   return out;
 }
 
@@ -210,7 +266,12 @@ const under = (key: string, k: string) => k === '/' || key === k || key.startsWi
  *  - D: a nested reference row whose prefab is missing, with no copy: today spawns nothing there; the rule puts the
  *    placeholder at the row (design § 2.4 item 5, ruling D; rule 9). */
 export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions = {}, copies: ReadonlySet<string> = new Set()): string[] {
-  const fold = foldInstance(read, parseInstanceRecord(entry, read, opts).record);
+  return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies);
+}
+
+/** {@link checkInstance} for a record already parsed — a scene reference node's (`parseReferenceNode`, #2009). */
+export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set()): string[] {
+  const fold = foldInstance(read, rec);
   const live = liveTree(rootId);
   for (const [k, ph] of fold.placeholders) {
     if (ph.reason !== 'missing' || live.placeholders.has(k)) continue;
@@ -222,5 +283,30 @@ export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootI
     for (const a of [...live.anchors.keys()]) if (under(a, k)) live.anchors.delete(a);
     live.placeholders.add(k);
   }
-  return [...diverge(fold, live), ...unusedDiverge(fold, entry.guid!, live.placeholders)];
+  const removedRows = [...rec.list.rows].filter(([, r]) => r.removed).map(([k]) => k);
+  const projectsWhenRestored = (key: string): boolean => {
+    const rows = new Map(rec.list.rows);
+    rows.set(key as never, { ...rows.get(key as never)!, removed: false });
+    return foldInstance(read, { ...rec, list: { ...rec.list, rows } }).nodes.has(key as never);
+  };
+  // The member guids the instance's documents hold. A template-added key (`a+…`) names no member guid, so it counts as
+  // held: the marker that needs its absence stays off, and a loss there goes red.
+  const nodeGuids = new Set<string>();
+  const seenDocs = new Set<string>();
+  const walk = (g: string): void => {
+    if (!g || seenDocs.has(g)) return;
+    seenDocs.add(g);
+    const got = read(g);
+    if (!('doc' in got)) return;
+    for (const row of got.doc.entities ?? []) {
+      if (typeof row.localId === 'number') nodeGuids.add(row.nodeGuid ?? preV5NodeGuid(g, row.localId));
+      if (typeof row.prefab === 'string') walk(row.prefab);
+    }
+  };
+  walk(rec.source);
+  const memberInDocuments = (key: string): boolean => {
+    const last = key.slice(key.lastIndexOf('/') + 1);
+    return last.startsWith('a+') || nodeGuids.has(last);
+  };
+  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments)];
 }

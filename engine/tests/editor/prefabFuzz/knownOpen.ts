@@ -12,7 +12,7 @@
 
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
-import { type Failure } from './checks';
+import { type Failure, RULING_R } from './checks';
 
 export interface KnownOpen {
   issue: number;
@@ -53,6 +53,78 @@ export interface KnownOpen {
 const keptFrameStale = (f: StepFailure): boolean =>
   f.check === 'a rebuild is not a reload' && f.op.startsWith('outsideEdit') && /^\/[0-9a-f-]{36}: undefined vs \{/.test(f.detail);
 
+/** #1829's shape: across a save→reload, the marks of ONE component differ by a field the reload added (the save wrote a
+ *  partially stated added component whole). Only a mark list, never a value: `<guid>/marks/<n>: "T.a" vs "T.b"` within
+ *  one trait, or a mark the reload added at the end. */
+const partialAddedWidened = (f: StepFailure): boolean => {
+  if (f.check !== 'save→reload is not the identity') return false;
+  const m = /^\/([0-9a-f-]{36})\/marks\/\d+: (?:"(\w+)\.\w+"|undefined) vs "(\w+)\.\w+"$/.exec(f.detail);
+  // On the entry a file-direct write wrote, never just after one ran (review: a mark gained anywhere was claimed).
+  // Never a core trait: Transform, EntityAttributes and PrefabInstance are never a partially stated ADDED component.
+  return !!m && (m[2] === undefined || m[2] === m[3]) && !['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[3]!)
+    && (f.touched?.fileDirect ?? []).includes(m[1]!);
+};
+
+/** #2010's shape: an undo or redo of a composite (one agent call's entry) where some subs REFUSED beside subs that applied —
+ *  never one that threw for another reason. */
+const compositeHalfApplied = (f: StepFailure): boolean => {
+  // From the end walk (`undo threw`, the detail led by the entry's label) or an `undo`/`redo` op (`op threw`, the
+  // message then ` | ` and the stack) — the same mechanism either way (review: the op form went unclaimed).
+  if (!/^(undo|redo) threw$/.test(f.check) && f.check !== 'op threw') return false;
+  const m = /(\d+) of (\d+) sub-action\(s\) failed during (?:undo|redo): (.*?)(?: \| |$)/.exec(f.detail);
+  if (!m || Number(m[1]) >= Number(m[2])) return false;
+  // Each failed sub REFUSED under ruling R; a throw, or a refusal for any other reason (a guard's), is not #2010.
+  const subs = m[3]!.split(/; (?=")/);
+  return subs.every((s) => new RegExp(String.raw`^"[^"]*" refused \((?:"[^"]*"(?: \([^)]*\))? )?(?:${RULING_R})`).test(s));
+};
+
+/** #1820's paste assertion after a trash (seed 1012): the pasted frame is still expanded from an older document. */
+const pastedFrameStale = (f: StepFailure): boolean =>
+  f.check === 'op threw' && /^harness: pasted frame "[^"]*" is still expanded from an older \S+ when the paste returns \(#1820\)/.test(f.detail);
+
+/** #2013: today's load keeps a member's `removed` in its orphan store AND applies it — the fold removed that member too,
+ *  which the oracle marks `(applied)`. Every divergence line of the step must be one (`foldCheck` reports them all). The
+ *  `own` rows first waived here were NOT this: the fold keeps those in neither its anchors nor its unused (#2009 review). */
+const orphanBookedTwice = (f: StepFailure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
+  return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
+};
+
+/** #2015: a template move INTO a nested instance's member, made in prefab edit: today places the node under that member,
+ *  the fold at the frame above. Every divergence line is a parent the fold puts at an ANCESTOR of today's. */
+const templateMoveIntoNested = (f: Failure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => {
+    const m = /^parent \S+: fold \{"key":"([^"]+)"\} live \{"key":"([^"]+)"\}$/.exec(l);
+    // Under a NESTED instance's member: at least a frame and a member below where the fold puts it.
+    const depth = (k: string) => k.split('/').filter(Boolean).length;
+    return !!m && m[2]!.startsWith(m[1] === '/' ? '/' : `${m[1]}/`) && depth(m[2]!) - depth(m[1]!) >= 2;
+  });
+};
+
+/** #2016: a held reference copy's unused legacy part, keyed at '/' instead of the node it stands for. */
+const projectedAndLegacyGone = (f: Failure): boolean =>
+  f.check === 'P1 the live instance is not the fold of its record'
+  && f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^fold-only unused \/ legacy \(gone\)$/.test(l));
+
+/** #2017: a scene-added reference node stated once, in a template-added reference node's `added`, anchored twice by the
+ *  fold. Every line is an anchor list that is the live one with a guid repeated — nothing missing, nothing extra. */
+const anchorFoldedTwice = (f: Failure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => {
+    const m = /^anchors \S+: fold (\[[^\]]*\]) live (\[[^\]]*\])$/.exec(l);
+    if (!m) return false;
+    const fold = JSON.parse(m[1]!) as string[], live = JSON.parse(m[2]!) as string[];
+    return fold.length > live.length && new Set(live).size === live.length && [...new Set(fold)].sort().join() === [...live].sort().join();
+  });
+};
+
+/** #2018: an own link on a row whose member the fold does not project, kept by today and by neither side of the fold. */
+const ownLinkLost = (f: Failure): boolean =>
+  f.check === 'P1 the live instance is not the fold of its record'
+  && f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^kept-only unused \/\S* own \(unprojected\)$/.test(l));
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
     issue: 1951,
@@ -65,6 +137,105 @@ export const KNOWN_OPEN: KnownOpen[] = [
     ],
     reproduces: (f) => keptFrameStale(f),
     stops: (f, ops) => keptFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
+  },
+  {
+    issue: 1829,
+    what: "#1829's mechanism by a LEGAL route (#2009 verify seed 8): an agent's file-direct `/api/scene-mutate` (no renderer) states an added component PARTIALLY on an instance root (`overrides[1].Rotate3D = {speed: 2}`); the load marks `speed` only, the save writes the added component whole, so the reload marks `axis` too. The second save is byte-identical and no value changes. RECORDED, not fixed: hub ruling on #1829 (2026-09-29), \"closed under the Unity rule … nothing reads the difference … if an M2-shaped divergence ever gets a reader, option C (Unity's recorded-list model) is the recorded direction\" — which #2001 rule 4 (save writes the list, load → save verbatim) builds",
+    repro: [
+      {kind: 'createPrefab', u: [0.7522407586220652, 0.37439649226143956, 0.25634062057361007, 0.9831468125339597, 0.8870674234349281, 0.8410391425713897, 0.5883639119565487, 0.6700334628112614]},
+      {kind: 'fileMutate', u: [0.9580224296078086, 0.1352244857698679, 0.2825196594931185, 0.5995694634038955, 0.8785156579688191, 0.5761606062296778, 0.8552941682282835, 0.6788817942142487]},
+    ],
+    reproduces: (f) => partialAddedWidened(f),
+    stops: (f, ops) => partialAddedWidened(f) && ops.slice(0, f.step).some((o) => o.kind === 'fileMutate'),
+  },  {
+    issue: 2010,
+    what: "#2010 (hunt seed 1153, #2009): an agent call's ONE undo entry (a composite) HALF-applies when one sub's target is gone (ruling R) and another's is not — a CompositeStepError, the entry dropped from both stacks. Hub ruling 2026-10-02: a composite refuses WHOLE before any change (rule 8, ruling R, Unity's undo groups, Create Prefab's W5); not patched on the old model, an acceptance criterion of S7's undo step",
+    repro: [
+      {kind: 'duplicate', u: [0.06184223503805697, 0.016401618951931596, 0.4260118736419827, 0.9952845550142229, 0.754150097258389, 0.933946989942342, 0.10883641964755952, 0.8018948379904032]},
+      {kind: 'instantiate', u: [0.5674041979946196, 0.5850283564068377, 0.48810928617604077, 0.5204959260299802, 0.6030646823346615, 0.04302460653707385, 0.17528071580454707, 0.20929821371100843]},
+      {kind: 'agentSceneOps', u: [0.15362343448214233, 0.38407423673197627, 0.23320098500698805, 0.7974971465300769, 0.9292557146400213, 0.9054889436811209, 0.26010975521057844, 0.33315321896225214]},
+      {kind: 'editField', u: [0.5271977682132274, 0.5825724361930043, 0.2588861286640167, 0.05811204249039292, 0.2129378216341138, 0.6562503795139492, 0.47226678184233606, 0.3576792587991804]},
+      {kind: 'prefabEdit', u: [0.7204824090003967, 0.5535659797023982, 0.2216329409275204, 0.8557709041051567, 0.1865801983512938, 0.9647123455069959, 0.690936912316829, 0.6503027405124158], inner: [{kind: 'delete', u: [0.4812680569011718, 0.6051278768572956, 0.5707945781759918, 0.35522824386134744, 0.0693927661050111, 0.15888829249888659, 0.9739731524605304, 0.6058842276688665]}]},
+      {kind: 'undo', u: [0.9296851067338139, 0.5846737751271576, 0.049499761778861284, 0.42648099130019546, 0.8821541699580848, 0.15550759225152433, 0.961956514744088, 0.30397607292979956]},
+    ],
+    reproduces: (f) => compositeHalfApplied(f),
+    stops: (f, ops) => compositeHalfApplied(f) && ops.slice(0, f.step + 1).some((o) => o.kind === 'agentSceneOps' || o.kind === 'agentSetTraits'),
+  },
+  {
+    issue: 2013,
+    what: "#2013 (hunt seed 1062; #2009's P1 by the fold): today's load keeps a member's `removed` in its orphan store AND applies it, and the fold applies it too (the oracle marks it `(applied)`). Hub ruling 2026-10-02: a record is projected or unused, never both, so today is wrong; not patched on the old model, retired by #2001 S6 (save writes the record). Its `own` rows, first waived here, are #2018",
+    repro: [
+      {kind: 'delete', u: [0.5590389100834727, 0.7655044347047806, 0.44698118744418025, 0.02311297389678657, 0.09444080153480172, 0.98244315572083, 0.09199919365346432, 0.6827896372415125]},
+      {kind: 'apply', u: [0.6550896638073027, 0.3299250395502895, 0.3501399699598551, 0.08212947798892856, 0.8875960973091424, 0.30393532454036176, 0.4322215639986098, 0.8733348441310227], check: 'rebuild-reload'},
+      {kind: 'delete', u: [0.49076773901470006, 0.7339670513756573, 0.055244994116947055, 0.0027172567788511515, 0.8681969207245857, 0.6704316781833768, 0.3613628263119608, 0.6404079920612276]},
+      {kind: 'prefabEdit', u: [0.3152803545817733, 0.567811144515872, 0.8239632099866867, 0.25013977638445795, 0.11105125187896192, 0.500013978453353, 0.2667005807161331, 0.17943121818825603], inner: [{kind: 'delete', u: [0.5138724439311773, 0.41784890461713076, 0.45937095978297293, 0.8747622228693217, 0.01600198890082538, 0.9851582634728402, 0.42914512171410024, 0.8725892039947212]}]},
+    ],
+    reproduces: (f) => orphanBookedTwice(f),
+    // Tolerated, not a stop: frequent and benign (the save writes the row once), so the run goes on past it.
+    tolerates: (f) => orphanBookedTwice(f as StepFailure),
+  },
+  {
+    issue: 2018,
+    what: "#2018 (#2009 close-out review; hunt seed 1056): an own link on a row whose member the fold does not project is in neither the fold's anchors nor its unused; today's orphan store keeps it. Fold owner ai3; the fix deletes this",
+    repro: [
+      {kind: 'agentInstantiate', u: [0.4559346667956561, 0.37867973023094237, 0.5694238140713423, 0.25957475206814706, 0.43067003530450165, 0.023551187943667173, 0.005278054159134626, 0.010750872315838933]},
+      {kind: 'copy', u: [0.21567681711167097, 0.7286644533742219, 0.7490342773962766, 0.5499166115187109, 0.8973726592957973, 0.8362372894771397, 0.9806615179404616, 0.5986551374662668]},
+      {kind: 'paste', u: [0.06879417202435434, 0.8586573472712189, 0.23260780214332044, 0.5008264498319477, 0.8013004933018237, 0.19319971976801753, 0.38576094480231404, 0.4331498169340193]},
+      {kind: 'duplicate', u: [0.9156414228491485, 0.6522056800313294, 0.2831795741803944, 0.3938902891241014, 0.6584261360112578, 0.9838417551945895, 0.8780419887043536, 0.7850812294054776]},
+      {kind: 'prefabEdit', u: [0.7092356325592846, 0.24598290212452412, 0.15701974369585514, 0.3087505749426782, 0.08162508602254093, 0.46456338628195226, 0.05596627830527723, 0.7852319057565182], inner: [{kind: 'delete', u: [0.20540676708333194, 0.15140634472481906, 0.6272719907574356, 0.5795787451788783, 0.2754221009090543, 0.9344441038556397, 0.33999770134687424, 0.09485156228765845]}]},
+    ],
+    reproduces: (f) => ownLinkLost(f),
+    tolerates: (f) => ownLinkLost(f),
+  },
+  {
+    issue: 2015,
+    what: "#2015 (#2009's P1 in regression #1809's win seed 6858, a #2001 S5 entry criterion): a member moved in prefab edit under a NESTED instance's member — today places it there (self-consistent, and right per the hub's ruling: an added-child override on the nested instance), the fold at the frame above. Tolerated so P1 lands; the fold's fix deletes this",
+    repro: [
+      {kind: 'prefabEdit', u: [0.5173346495721489, 0.08749266993254423, 0.8221204644069076, 0.18406294146552682, 0.3249459487851709, 0.8549291610252112, 0.2693206842523068, 0.9086369727738202], inner: [{kind: 'reparent', u: [0.22139877150766551, 0.8194225707557052, 0.8731111134402454, 0.3676116168498993, 0.9742902971338481, 0.127988196676597, 0.6087110303342342, 0.1887473629321903]}]},
+      {kind: 'instantiate', u: [0.7440747111104429, 0.43991357320919633, 0.6826722382102162, 0.4947671240661293, 0.6600351938977838, 0.9901851266622543, 0.6497153099626303, 0.006117034703493118]},
+      {kind: 'delete', u: [0.6108392698224634, 0.46971312118694186, 0.05811715195886791, 0.6591711670625955, 0.9784175350796431, 0.0649864545557648, 0.2063837342429906, 0.6221727712545544]},
+      {kind: 'apply', u: [0.21948481863364577, 0.29272619541734457, 0.5293124683666974, 0.5085932151414454, 0.07048665941692889, 0.9514830820262432, 0.5172908876556903, 0.5575136966072023]},
+    ],
+    reproduces: (f) => templateMoveIntoNested(f),
+    tolerates: (f) => templateMoveIntoNested(f),
+  },
+  {
+    issue: 2016,
+    what: "#2016 (#2009's P1 in regression #1738's win seed 6136): a held copy of a reference node whose prefab was trashed (a converted row's `added` remainder) is keyed at '/' as an unused legacy part, instead of at the node it stands for — so the oracle's under-a-placeholder skip cannot see it. Hub ruling (a) 2026-10-02: the fold keys it at <frame>/a+<copy.key>; ai3's fix deletes this",
+    repro: [
+      {kind: 'instantiate', u: [0.4431566004641354, 0.7968979061115533, 0.40783188841305673, 0.5022549307905138, 0.19927031104452908, 0.6920147859491408, 0.2723008228931576, 0.9618998144287616]},
+      {kind: 'createPrefab', u: [0.0038380103651434183, 0.591657679527998, 0.6498477926943451, 0.16832039435394108, 0.2952046236023307, 0.20283732656389475, 0.14619030989706516, 0.46976823825389147]},
+      {kind: 'trashPrefab', u: [0.366121573606506, 0.12152830720879138, 0.5724751548841596, 0.37606001063250005, 0.03529732837341726, 0.28352958406321704, 0.45296140434220433, 0.5870168737601489]},
+      {kind: 'prefabEdit', u: [0.301515509840101, 0.43780972715467215, 0.667069936171174, 0.5753587565850466, 0.6484025486279279, 0.15705850371159613, 0.9615241875872016, 0.1484056394547224], inner: []},
+    ],
+    reproduces: (f) => projectedAndLegacyGone(f),
+    tolerates: (f) => projectedAndLegacyGone(f),
+  },
+  {
+    issue: 2017,
+    what: "#2017 (#2009's P1, hunt seed 1039, a #2001 S5 entry criterion): a scene-added reference node stated ONCE in a template-added reference node's `added` list is anchored TWICE by the fold; the live world has it once. Tolerated so P1 lands; the fold's fix deletes this",
+    repro: [
+      {kind: 'instantiate', u: [0.5609265118837357, 0.6023040043655783, 0.9762438023462892, 0.298269433202222, 0.8683141528163105, 0.9474625086877495, 0.828145133331418, 0.6475943445693702]},
+      {kind: 'createPrefab', u: [0.29290726501494646, 0.19988887920044363, 0.16759243491105735, 0.09675576607696712, 0.4572025721427053, 0.12822362151928246, 0.04358621081337333, 0.08530493942089379]},
+      {kind: 'instantiate', u: [0.8249817844480276, 0.9148745054844767, 0.3363472269847989, 0.08276237524114549, 0.6854521201457828, 0.144374803872779, 0.008927585324272513, 0.847050443990156]},
+      {kind: 'agentInstantiate', u: [0.1483824928291142, 0.6918918816372752, 0.38471077801659703, 0.9342870214022696, 0.22695961454883218, 0.011585129424929619, 0.5545891183428466, 0.6955016700085253]},
+      {kind: 'duplicate', u: [0.8299716536421329, 0.6594416976440698, 0.47682820400223136, 0.7401402303948998, 0.9696856064256281, 0.5790280047804117, 0.3553627871442586, 0.5044258621055633]},
+    ],
+    reproduces: (f) => anchorFoldedTwice(f),
+    tolerates: (f) => anchorFoldedTwice(f),
+  },
+  {
+    issue: 2001,
+    what: "#2001 § 3.2's paste row, S7 (hunt seed 1012, #2009; no agent op): copy a subtree holding a nested Q frame inside P, Apply a change to Q, trash P, paste — the pasted Q frame is still expanded from the PRE-Apply Q when the paste returns, with Q cached (#1820's assertion). Hub ruling 2026-10-02: RECORD, don't fix on the model being replaced; this repro is part of S7's record-based paste acceptance test",
+    repro: [
+      {kind: 'delete', u: [0.5590389100834727, 0.7655044347047806, 0.44698118744418025, 0.02311297389678657, 0.09444080153480172, 0.98244315572083, 0.09199919365346432, 0.6827896372415125]},
+      {kind: 'copy', u: [0.793059557909146, 0.07850893028080463, 0.8062161759007722, 0.8035517330281436, 0.2764330352656543, 0.8323238401208073, 0.26245217374525964, 0.47499521006830037]},
+      {kind: 'apply', u: [0.6550896638073027, 0.3299250395502895, 0.3501399699598551, 0.08212947798892856, 0.8875960973091424, 0.30393532454036176, 0.4322215639986098, 0.8733348441310227], check: 'rebuild-reload'},
+      {kind: 'trashPrefab', u: [0.5543728081975132, 0.558105546515435, 0.80344816041179, 0.12341438280418515, 0.40858249459415674, 0.5091396970674396, 0.03132167900912464, 0.12620670325122774]},
+      {kind: 'paste', u: [0.8836326005402952, 0.804022109368816, 0.46664451458491385, 0.7002741650212556, 0.33111054403707385, 0.6519596504513174, 0.19220631150528789, 0.19979474716819823]},
+    ],
+    reproduces: (f) => pastedFrameStale(f),
+    stops: (f, ops) => pastedFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
   },
 ];
 

@@ -74,6 +74,12 @@ const frame = () => {
   return { or, n, nested: authored().find((e) => e.name === 'R' && e.parentId === n.id) };
 };
 const byName = (name: string, parentId: number) => authored().filter((e) => e.name === name && e.parentId === parentId);
+/** Every entity named `name` anywhere under `rootId`. */
+const inSubtree = (name: string, rootId: number) => {
+  const all = authored();
+  const under = (id: number): boolean => { for (let e = all.find((x) => x.id === id); e?.parentId; e = all.find((x) => x.id === e!.parentId)) if (e.parentId === rootId) return true; return false; };
+  return all.filter((e) => e.name === name && under(e.id));
+};
 const duplicateGuids = () => {
   const n = new Map<string, number>();
   for (const e of authored()) if (e.guid) n.set(e.guid, (n.get(e.guid) ?? 0) + 1);
@@ -120,15 +126,18 @@ async function applyFromSecondO(f: Fixture): Promise<void> {
 
 /** Save, reload, and hold what must hold after it: one Extra and one nested P under N, no I7, the scene's delete kept;
  *  then a second save byte-identical to the first. */
-async function roundTripsAsOne(f: Fixture, deletedGuid: string): Promise<void> {
+async function roundTripsAsOne(f: Fixture, deletedGuid: string, anchorBack = false): Promise<void> {
   expect((await saveScene({ allowDialog: false })).saved).toBe(true);
   const first = be.read(f.scenePath)!;
   expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
   await settle();
   expect(duplicateGuids()).toEqual([]);
   const { n } = frame();
-  expect(byName('Extra', n.id).length, 'one Extra under N').toBe(1);
-  expect(byName('R', n.id).length, 'one nested P under N').toBe(1);
+  // At N's root while the anchor A is gone; once A comes back, under A — so then counted anywhere in N, and its parent
+  // asserted by the caller (review: counting anywhere for every case let a misplacement under the nested R pass).
+  const count = (name: string) => (anchorBack ? inSubtree(name, n.id) : byName(name, n.id)).length;
+  expect(count('Extra'), 'one Extra under N').toBe(1);
+  expect(count('R'), 'one nested P under N').toBe(1);
   expect(authored().some((e) => e.guid === deletedGuid), 'the scene\'s delete of QR holds').toBe(false);
   expect((await saveScene({ allowDialog: false })).saved).toBe(true);
   expect(be.read(f.scenePath)).toBe(first);
@@ -164,7 +173,13 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     be.write(f.prefabs.P.path, pBefore); // a checkout of P from before the delete
     await flushWatcher(be, before);
     await settle();
-    await roundTripsAsOne(f, qr);
+    await roundTripsAsOne(f, qr, true);
+    // The restore REACHED the editor: Extra is back under its anchor. Until the fuzz watcher keyed a mark by its bytes
+    // (#2009), P's own earlier prefab-edit save left a mark that took this outside write for the editor's, nothing
+    // reloaded, and the case ran with the anchor still gone.
+    const parentName = (name: string) => { const e = inSubtree(name, frame().n.id)[0]!; return authored().find((x) => x.id === e.parentId)?.name; };
+    expect(parentName('Extra')).toBe('A');
+    expect(parentName('R'), 'the nested P, anchored at A too').toBe('A');
   });
 
   it('a rebuild in place (another O instance\'s Apply refreshes this frame): still one copy', async () => {

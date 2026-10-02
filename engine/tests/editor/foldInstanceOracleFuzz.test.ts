@@ -7,7 +7,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, getCurrentWorld } from './prefabFuzz/harness';
-import { generate } from './prefabFuzz/ops';
+import { generate, VERIFY_SEEDS, VERIFY_LEN } from './prefabFuzz/ops';
 import { runOps } from './prefabFuzz/runner';
 import { loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { getTraitByName, setRunMode } from '@modoki/engine/runtime';
@@ -24,9 +24,11 @@ vi.stubGlobal('window', { __modokiElectron: { bridge } });
 vi.stubGlobal('localStorage', memoryStorage());
 boot(be);
 
-/** The fuzzer's verify seeds and length (`prefabFuzz.test.ts`). */
-const SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
-const LEN = 25;
+/** The fuzzer's verify seeds and length (`prefabFuzz.test.ts`), and two more (#2009's generator, 2026-10-02): 103 holds
+ *  an unused row under a rule-B placeholder on both sides (kept rows were compared there while the fold's were skipped),
+ *  and 235 is the only seed of 1-300 that reaches translation D once #2009's op kinds changed every seed's list. */
+const SEEDS = [...VERIFY_SEEDS, 103, 235];
+const LEN = VERIFY_LEN;
 /** The oracle needs the run's saved files, not its verdict: the fuzzer itself judges the run. */
 const OPTS = { expectedError: () => true, tolerate: () => true };
 
