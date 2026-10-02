@@ -26,12 +26,14 @@ import {
   getCurrentWorld, setCurrentWorld, getTraitByName, setRunMode, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { clearKeptMemberOrphans, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { clearKeptMemberOrphans, keptMemberOrphans, type SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { memberIdentities } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { memberToken } from '../../packages/modoki/src/runtime/core/templateRefs';
 import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { checkInstance, seen } from './foldOracle';
+import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
+import { deleteEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 registerAllTraits();
@@ -158,15 +160,113 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
     for (const d of docs) { prefabs.set(d.id, d); setPrefabCache(d.id, d as never); }
   };
   const ea = () => getTraitByName('EntityAttributes')!.trait;
-  const check = async (entries: SceneEntityEntry[], entry: SceneEntityEntry): Promise<string[]> => {
+  const check = async (entries: SceneEntityEntry[], entry: SceneEntityEntry, sceneVersion = 15): Promise<string[]> => {
     vi.stubGlobal('fetch', async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => '' }));
-    await load({ version: 15, entities: entries } as unknown as SceneData);
+    await load({ version: sceneVersion, entities: entries } as unknown as SceneData);
     vi.unstubAllGlobals();
     const root = [...getCurrentWorld().entities].find((e) => (e.get(ea()) as { guid?: string } | undefined)?.guid === ROOT)!;
     const held = new Set(entries.map((e) => e.guid).filter((g): g is string => !!g));
-    return checkInstance(entry, reader, root.id(), { sceneVersion: 15, held: (g) => held.has(g) });
+    return checkInstance(entry, reader, root.id(), { sceneVersion, held: (g) => held.has(g) });
   };
   const top = (extra: object = {}): SceneEntityEntry => ({ id: 2, name: 'Ship', prefab: 'P', guid: ROOT, traits: { PrefabInstance: { source: 'P', localId: 1 }, EntityAttributes: { name: 'Ship', guid: ROOT, parentId: 0 } }, ...extra }) as SceneEntityEntry;
+
+  /** #2035: a user node linked on a member that ONLY the instance's own removal cuts. No inner layer removes the member, it
+   *  is not gone and not in a missing frame. The fold keeps it `heldNode` (§ 10.4b, #2021, #2025: under the instance's own
+   *  removal a user node is held, never dropped). Today's load dropped the link with the cut, and the FIRST save lost the
+   *  user's node; since #2035 part 2 (hub ruling: fix it now, not at S6) `applyStoredMemberRows` keeps the row's links as
+   *  an orphan, so the oracle pairs them and the save writes them back. Ordinary editing reaches it: a template edit drops
+   *  the member, so the link is kept as an orphan, which a delete of the cut row does not take (it is not live), and the
+   *  save writes the cut beside it; then the template edit is undone (the route case, the close-out review's). */
+  describe('#2035: a user node on a member only the instance\'s own removal cuts is held, and every save writes it back', () => {
+    const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1)] };
+    const P = { id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'A', 1), row(5, 'R', 1, { prefab: 'Q' })] };
+    const R = `/${row(5, 'R', 0).nodeGuid}`, QA = `${R}/${row(2, 'QA', 0).nodeGuid}`;
+    const MINE = G(90);
+    const mine = (parentLocalId: number) => ({ parentLocalId, guid: MINE, name: 'Mine', traits: { EntityAttributes: { name: 'Mine' }, Transform: tf }, children: [] });
+    type Saved = { version: number; entities: SceneEntityEntry[] };
+    const save = async () => (await serializeScene()) as unknown as Saved;
+    const rowsOf = (s: Saved) => (s.entities.find((x) => x.guid === ROOT)?.members ?? {}) as Record<string, unknown>;
+    /** Load `s`'s entry through the oracle, then save: the oracle's lines and the saved scene. */
+    const loadSave = async (s: Saved) => {
+      const e = s.entities.find((x) => x.guid === ROOT)!;
+      return { lines: await check(s.entities, e, s.version), saved: await save() };
+    };
+    // [case, the link's row, the row the link is on, the scene version]. The cut is `removed: true` on R's row.
+    const shapes: Array<[string, Record<string, object>, string, number?]> = [
+      ['A: an own link on a member under the cut', { [QA]: { own: [mine(0)] } }, QA],
+      ['C: the same node in the legacy keyless added form', { [QA]: { added: [mine(2)] } }, QA],
+      ['C at v19, the newest form today reads (v20 is refused before any load)', { [QA]: { added: [mine(2)] } }, QA, 19],
+      ['D: an own link AT the removed row, whose prefab is present', { [R]: { own: [mine(0)] } }, R],
+    ];
+    const cut = (link: Record<string, object>) => ({ ...link, [R]: { ...link[R], removed: true } });
+    for (const [name, link, at, v] of shapes) {
+      it(name, async () => {
+        install(P, Q);
+        const first = await loadSave({ version: v ?? 15, entities: [top({ members: cut(link) })] });
+        expect(first.lines).toEqual([]);
+        // The save keeps the cut and writes the link back beside it; a reload and a second save keep both.
+        const rows = rowsOf(first.saved);
+        expect(rows[R]).toEqual(at === R ? { removed: true, own: [expect.objectContaining({ guid: MINE })] } : { removed: true });
+        expect(JSON.stringify(rows[at])).toContain(MINE);
+        const second = await loadSave(first.saved);
+        expect(second.lines).toEqual([]);
+        expect(rowsOf(second.saved)).toEqual(rows);
+      });
+
+      // Accept side, per shape: the form itself is read and written back, with no cut.
+      it(`${name} — with no cut, the node is shown, unreported, and the save writes it back`, async () => {
+        install(P, Q);
+        const { lines, saved } = await loadSave({ version: v ?? 15, entities: [top({ members: link })] });
+        expect(lines).toEqual([]);
+        expect(JSON.stringify(rowsOf(saved))).toContain(MINE);
+      });
+    }
+
+    it('the cut takes the row\'s other records and a keyed copy, as before: only the user\'s links are kept', async () => {
+      install(P, Q);
+      const keyed = { ...mine(2), guid: G(91), key: 'k1', name: 'K1' };
+      const { saved } = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { traits: { Transform: { x: 4 } }, added: [keyed, mine(2)] } }) })] });
+      expect(rowsOf(saved)[QA]).toEqual({ added: [expect.objectContaining({ guid: MINE })] });
+    });
+
+    // The close-out review's regression: a NODE row (`…/a+<key>`) is never in the load's live member keys, so "not live"
+    // there read as cut, and a user's child under a LIVE template-added node was kept as an orphan while it spawned: its
+    // delete came back on reload, and a reparent left a second copy on its guid. Only a member row can be cut this way.
+    it('a user child under a LIVE template-added node is not kept as well: its delete sticks across a save and reload', async () => {
+      const KID = G(92);
+      const k1 = { parentLocalId: 2, guid: '', key: 'k1', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] };
+      install({ ...P, entities: [...P.entities.slice(0, 2), row(5, 'R', 1, { prefab: 'Q', added: [k1] })] }, Q);
+      const kid = { parentLocalId: 0, guid: KID, name: 'Kid', traits: { EntityAttributes: { name: 'Kid' }, Transform: tf }, children: [] };
+      const first = await loadSave({ version: 15, entities: [top({ members: { [`${R}/a+k1`]: { own: [kid] } } })] });
+      expect(first.lines).toEqual([]);
+      expect(JSON.stringify(first.saved)).toContain(KID);
+      await loadSave(first.saved);
+      expect(keptMemberOrphans(ROOT) ?? {}).toEqual({});
+      const kidEntity = [...getCurrentWorld().entities].find((x) => (x.get(ea()) as { guid?: string } | undefined)?.guid === KID)!;
+      deleteEntitiesWithUndo([kidEntity.id()]);
+      const s1 = await save();
+      expect(JSON.stringify(s1)).not.toContain(KID);
+      expect(JSON.stringify((await loadSave(s1)).saved)).not.toContain(KID);
+    });
+
+    it('the route ordinary editing takes: a template edit orphans the link, the cut row is deleted, the edit is undone — the node is kept', async () => {
+      const Q0 = { ...Q, entities: Q.entities.filter((r) => r.localId !== 2) }; // Q's edit drops QA
+      install(P, Q0);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await loadSave({ version: 15, entities: [top({ members: { [QA]: { own: [mine(0)] } } })] });
+        deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]); // R's root takes Q's root name
+        const s1 = await save();
+        // Shape A, written by an editor save: the orphan the delete could not reach, beside the cut.
+        expect(rowsOf(s1)[R]).toEqual({ removed: true });
+        expect(JSON.stringify(rowsOf(s1)[QA])).toContain(MINE);
+        install(P, Q); // the template edit is undone
+        const back = await loadSave(s1);
+        expect(back.lines).toEqual([]);
+        expect(JSON.stringify(rowsOf(back.saved)[QA])).toContain(MINE);
+      } finally { warn.mockRestore(); }
+    });
+  });
 
   describe('#2022 (hub rulings 2026-10-02): the fold\'s residual move and cascade cases, against today\'s load', () => {
     const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1), row(3, 'QB', 2)] };

@@ -203,9 +203,8 @@ export function keptRowLeaves(key: string, r: Bag, skip: LeafSkip = () => false)
  *  - A kept row at or under a member the record REMOVES is not compared, except its `removed` leaf and its links: the save
  *    drops a gone member's kept unused part (#1914 R4's fix), and so does the record. A user-added node there is not
  *    skipped: the record keeps it `heldNode` (design § 10.4b), and where today orphans the row (its member gone, or
- *    untargeted because an inner layer removed it, or in a missing frame) it keeps the link and writes it back (#2032,
- *    hunt seed 178). Where the scene's removal alone cuts the member, today keeps the link in no store (#2035), and the
- *    fold's record prints `fold-only` whether or not the kept side is skipped.
+ *    untargeted because an inner layer removed it, in a missing frame, or cut by the instance's own removal alone, #2035)
+ *    it keeps the link and writes it back (#2032, hunt seed 178).
  *  - A kept-only line names its row, and a kept `removed` whose member the fold removed is marked `(applied)`: today
  *    books it twice (#2013). Without the key, "the fold applied it" and "the fold lost it" read the same (#2009 review). */
 export function unusedDiverge(fold: FoldedInstance, rootGuid: string, livePlaceholders: ReadonlySet<string> = new Set(), removedRows: readonly string[] = [], projectsWhenRestored: (key: string) => boolean = () => false, memberInDocuments: (key: string) => boolean = () => true, held?: Bag, ruledKept: readonly string[] = []): string[] {

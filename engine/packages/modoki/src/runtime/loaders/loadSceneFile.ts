@@ -1851,6 +1851,16 @@ export function settleEntryRows(
   for (const e of entries) if (e.templateNodeRows.length) keepTemplateNodeOrphans(world, e.root, e.templateNodeRows, read);
 }
 
+/** The user-added nodes stored row `row` links, as a row of their own: its `own`, and each element of a legacy `added`
+ *  without a template key (a keyed one states a node a template added, not one the user did). Undefined when it links
+ *  none (#2035). */
+function userLinksOf(row: SceneMemberRow): SceneMemberRow | undefined {
+  const own = row.own ?? [];
+  const added = (row.added ?? []).filter((n) => !(n as { key?: string } | undefined)?.key);
+  if (!own.length && !added.length) return undefined;
+  return { ...(own.length ? { own } : {}), ...(added.length ? { added } : {}) };
+}
+
 /** R2 for a TEMPLATE reference node (#1542): the node's rows the template it expands no longer backs are kept under its
  *  root's DERIVED guid, which is what a later save (`captureRowChannels`) and a Refresh (`settleKeptOrphans`) read it
  *  by. Runs after the derive, because until then the root has no guid to key by.
@@ -1944,7 +1954,8 @@ function applyStoredMemberRows(
   // world, and that is the load-bearing part: a member this instance REMOVED is absent from the world
   // but still IN the template, so a live-world test would report a loss on every load of every
   // instance that has ever deleted a member. Such a row is dropped silently, as R2 says — its member
-  // can only come back through undo, which restores the scene entry and its rows with it.
+  // can only come back through undo, which restores the scene entry and its rows with it — except the
+  // user-added nodes it links, which are kept (#2035, below).
   const root = findEntityById(rootEcsId, world) as EntityHandle | undefined;
   const rootGuid = durableGuid(root?.has(attrMeta.trait) ? (root.get(attrMeta.trait) as { guid?: string }).guid : '');
   if (!rootGuid) return;
@@ -1968,9 +1979,15 @@ function applyStoredMemberRows(
     // …and a row whose member a template layer REMOVED (#1914 R4, `isUntargetedRow`): its node is in the document, so
     // the test above calls it backed, but no member takes it. Kept the same way, without the warning: the template
     // still declares the node.
+    // …and the user-added nodes linked on a MEMBER row whose member the instance's OWN removal cuts (#2035; design § 10.4b:
+    // under the instance's own removal a user node is held, never dropped). A member row that is backed, untargeted by no
+    // lower layer and not live is that cut. Only a member row: `live` holds member keys alone, so a node row (`…/a+<key>`)
+    // is never in it, and its live node's children would be kept as well as spawned (close-out review). Only the links
+    // are kept: the cut takes the row's other records with it, as before (#1914 R4).
     const gone = !backed(key);
-    if (!gone && !(isRecord(row) && isUntargetedRow(row))) continue;
-    orphans[key] = row;
+    const cutLinks = !gone && isRecord(row) && !isUntargetedRow(row) && !live.has(key) && parseMemberRowKey(key).length ? userLinksOf(row) : undefined;
+    if (!gone && !(isRecord(row) && isUntargetedRow(row)) && !cutLinks) continue;
+    orphans[key] = cutLinks ?? row;
     if (gone) lost.push([key, row]);
   }
   if (!Object.keys(orphans).length) { dropKeptOrphanRows(rootGuid); return; }
