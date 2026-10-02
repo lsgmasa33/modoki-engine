@@ -10,7 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, displayNameParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 import { EPOCH_BASE, SINCE_CURSOR_BASE } from '../../../shared/sinceCursor.js';
-import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../../shared/waitForTiming.js';
+import { WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS, WAIT_FOR_EDIT_DEFAULT_MS, WAIT_FOR_EDIT_MAX_MS, WAIT_FOR_EDIT_MIN_MS, clampWaitForEditTimeout } from '../../../shared/waitForTiming.js';
 import { CONSOLE_LEVELS, CONSOLE_LOGS_PARAM_DOCS } from '../../../shared/consoleLevels.js';
 import {
   CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, LIGHT_KINDS, PRIMITIVE_MESHES, SPRITE_SHAPES, UI_PRESETS, vocabularyProse,
@@ -216,7 +216,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
       since: z.number().optional().describe(`${SINCE_CURSOR_BASE}.`),
       epoch: z.string().optional().describe(`${EPOCH_BASE}.`),
-      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default ${WAIT_FOR_EDIT_DEFAULT_MS}, clamped to [${WAIT_FOR_EDIT_MIN_MS}, ${WAIT_FOR_EDIT_MAX_MS}].`),
     },
     async ({ type, source, since, epoch, timeoutMs }) => {
       const q = new URLSearchParams();
@@ -229,7 +229,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       // Client-side transport timeout must clear the SERVER's own deadline (clamped to
       // 120s there) with headroom, or this fetch aborts before the backend answers and a
       // legitimate long park reads as "backend unreachable" instead of the real result.
-      const clampedServerTimeout = Math.max(50, Math.min(120_000, timeoutMs ?? 30_000));
+      const clampedServerTimeout = clampWaitForEditTimeout(timeoutMs); // the op's own clamp (#1962)
       const transportTimeoutMs = clampedServerTimeout + 15_000;
       return getJson(`/api/wait-for-edit${qs ? `?${qs}` : ''}`, transportTimeoutMs);
     },

@@ -418,6 +418,16 @@ describe('ota-embed-manifest.mjs', () => {
     expect(stderr).toMatch(/does not match/);
   });
 
+  it('#1965 item 6: a --dist inside a `..`-prefixed FOLDER of the project is inside, not an escape', () => {
+    const dotDist = path.join(projectDir, '..build', 'dist');
+    fs.mkdirSync(dotDist, { recursive: true });
+    fs.writeFileSync(path.join(dotDist, 'index.html'), '<html></html>');
+    const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',
+      ['--dist', dotDist, '--name', 'shell', '--engine-api', '1', '--project', projectDir]);
+    expect(stderr).not.toMatch(/is not inside --project/);
+    expect(status).toBe(0);
+  });
+
   it('#582: rejects a --dist outside --project', () => {
     const outsideDist = makeScratchDir('modoki-ota-embed-outside-dist-');
     try {

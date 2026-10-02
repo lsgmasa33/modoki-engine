@@ -41,6 +41,29 @@ describe('POST /api/toolchain/settings (#1985)', () => {
     expect(off.body).toMatchObject({ ok: true, settings: { allowSystemToolchain: false } });
     expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')).allowSystemToolchain).toBe(false);
   });
+
+  // #1962: the route read the field by truthiness, so `{}` wrote OFF and the STRING "false" wrote ON.
+  it('is a PARTIAL patch: an omitted field leaves the stored value alone', async () => {
+    fs.writeFileSync(settingsFile(), JSON.stringify({ allowSystemToolchain: true }));
+    const r = await post('/api/toolchain/settings', {});
+    expect(r.body).toMatchObject({ ok: true, settings: { allowSystemToolchain: true } });
+    expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')).allowSystemToolchain).toBe(true);
+  });
+
+  it('refuses a non-boolean (the string "false" used to turn it ON) and writes nothing', async () => {
+    fs.writeFileSync(settingsFile(), JSON.stringify({ allowSystemToolchain: false }));
+    const r = await post('/api/toolchain/settings', { allowSystemToolchain: 'false' });
+    expect(r.status).toBe(400);
+    expect(r.body).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    expect(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')).allowSystemToolchain).toBe(false);
+  });
+
+  it('a dev editor (no toolchain dir) is a 400, as /uninstall answers it — not a thrown 500', async () => {
+    delete process.env.MODOKI_TOOLCHAIN_DIR;
+    const r = await post('/api/toolchain/settings', { allowSystemToolchain: true });
+    expect(r.status).toBe(400);
+    expect(String(r.body.error)).toMatch(/no toolchain directory/);
+  });
 });
 
 describe('POST /api/toolchain/uninstall (#1985)', () => {

@@ -47,8 +47,13 @@ const ROUTER = 'engine/plugins/backend/editorBackendRouter.ts';
  *
  *  This nets routes that legitimately do not care (`/api/read-file` serving bytes). That is the
  *  intended trade: `EXEMPT` is the honest home for those, and a declaration a reader can check
- *  beats a trigger tuned until nothing inconvenient matches. */
-const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|readJsonFile|tryReadJsonFile|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync)\s*\(/;
+ *  beats a trigger tuned until nothing inconvenient matches.
+ *
+ *  ⚠️ **A write moved into a helper leaves this set unless the helper is named here** (#1965): folding
+ *  write-file's inline `writeFileSync` into `writeFileAtomic` dropped `/api/write-file` out of the
+ *  population, and its EXEMPT row went stale. `writeJsonAtomic` is NOT listed yet — naming it surfaces
+ *  four routes nothing has considered (#2050). */
+const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|readJsonFile|tryReadJsonFile|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync|writeFileAtomic)\s*\(/;
 
 /** Every registry name in the vocabulary, and the subset that holds an unsaved DOCUMENT. The split
  *  exists because `openAssetEditor` (#1362) is not a registry of parked documents — it is "a modal

@@ -1834,11 +1834,14 @@ default, so an eval that names no budget gets its own timeout message rather tha
 Only a caller that asks for more lifts the transport deadline with it. And the device ceiling stays
 strictly below the editor's on purpose — the device pays a real network hop the editor does not.
 
-Three files restate this rule with hand-kept constants, deliberately and with comments saying so:
-`bridgeHelpers.ts` (renderer, ships in the game), `editorBackendRouter.ts` (cannot import the
-renderer bundle), and the MCP's `context.ts`. A shared module would be better, but the only place all
-three could import from is `engine/tools/shared/`, which the shipped renderer has no business
-depending on — so the restatement is guarded by tests rather than removed.
+The rule lives ONCE, in `engine/tools/shared/evalTiming.ts` (`clampEvalTimeout` plus the budgets and the
+relay/client headroom), imported by the op (`bridgeHelpers.ts` re-exports it), the `/api/eval` relay and
+the MCP's `context.ts` (#1962). It used to be restated in all three. That was justified as keeping
+`tools/shared` out of the shipped renderer, but the renderer already depended on it (`simStepTiming`,
+`profilerActions`, `errorCodes`). The copies drifted: the relay took only a number, so `{timeoutMs:"20000"}`
+sized a 15s relay around a 20s eval. The modules the renderer imports from `tools/shared` (these, `simStepTiming`,
+`profilerActions`, `errorCodes`, `opParams`/`coerceArgs`) have no Node or outside dependency, and must keep it that
+way; some others there are Node-only (`backendUrl`, `identity`) and must not reach the renderer.
 
 ## Response budget (read this before adding a tool)
 

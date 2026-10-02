@@ -159,10 +159,13 @@ describe('since is a seq cursor, sinceMs the clock (#1559 C-6)', () => {
     expect(r.nextSeq).toBe(1);
   });
 
-  it('a negative limit is 0 — an empty page is not "truncated"', async () => {
-    const r = await read({ since: 4, limit: -3 });
+  it('limit:0 is an empty page, not "truncated"; a NEGATIVE limit is refused (#1962 — one rule for a count)', async () => {
+    const r = await read({ since: 4, limit: 0 });
     expect(r.returnedCount).toBe(0);
     expect(r.truncated).toBeUndefined();
+    const neg = await read({ since: 4, limit: -3 }) as unknown as { ok?: boolean; code?: string; error?: string };
+    expect(neg).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    expect(neg.error).toMatch(/limit must be a finite number >= 0/);
   });
 
   it('a level-filtered cursored poll pages the matches oldest-first and skips none', async () => {

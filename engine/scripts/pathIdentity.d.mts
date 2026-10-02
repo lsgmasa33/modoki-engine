@@ -27,6 +27,7 @@ export declare function pathCaseKey(s: string): string;
  *  before `path.relative`, which folds case on win32 but NOT on darwin. Includes equality —
  *  `electron/projects.ts`'s `isUnderRepo` answers STRICT containment and stays separate. */
 export declare function isUnderOrSame(parent: string, child: string): boolean;
+export declare function relEscapes(rel: string): boolean;
 
 /** The OTHER spelling of an absolute path (`fs.realpathSync.native`), or `null` when there is no
  *  distinct one — no path, unresolvable, non-absolute, or identical. A reap matches our pattern

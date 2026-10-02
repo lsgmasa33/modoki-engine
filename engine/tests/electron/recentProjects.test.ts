@@ -231,6 +231,8 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
     expect(isUnderRepo(cloneB, `${cloneA}/games/skin-test`)).toBe(false); // sibling clone
     expect(isUnderRepo(cloneB, cloneB)).toBe(false);                       // the root itself
     expect(isUnderRepo(cloneB, `${cloneB}-other/games/x`)).toBe(false);    // prefix, not under
+    expect(isUnderRepo(cloneB, `${cloneB}/..bak/games/x`)).toBe(true);     // a `..bak` FOLDER is inside (#1965 item 6)
+    expect(isUnderRepo(cloneB, `${cloneB}/../games/x`)).toBe(false);       // a `..` segment is not
   });
 
   it('MODOKI_PROJECT hard override always wins', () => {

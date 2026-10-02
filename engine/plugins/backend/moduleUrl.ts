@@ -35,6 +35,7 @@
  *  Pure: the host supplies the graph lookup and the filesystem probes. */
 
 import path from 'node:path';
+import { relEscapes } from './projectPaths';
 
 /** One client-environment module node, as far as this needs it. */
 export interface GraphModule {
@@ -120,7 +121,7 @@ export function fileForSpec(spec: string, host: ModuleUrlHost): { file: string }
 /** The URL Vite would write for `file` into an import — for a file the app has not loaded. */
 export function derivedUrl(file: string, viteRoot: string): string {
   const rel = path.relative(viteRoot, file);
-  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return '/' + toPosix(rel);
+  if (rel && !relEscapes(rel)) return '/' + toPosix(rel);
   const p = toPosix(file);
   return '/@fs' + (p.startsWith('/') ? p : '/' + p);
 }

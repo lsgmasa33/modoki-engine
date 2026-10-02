@@ -47,7 +47,7 @@ import { openInOS, revealInOS } from './osOpen';
 import { renderAvailability, renderJobs, renderScriptPath } from './recordRenderJob';
 import { fingerprintAssets } from '../takeAssets';
 import type { RenderOptions } from '../../packages/modoki/src/editor/recorder/renderOptions';
-import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
+import { relativiseUnderProject, planDroppedFileDest, relEscapes } from './projectPaths';
 import { osascriptChooser, type NativeChooser } from './nativeChooser';
 import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
@@ -293,7 +293,9 @@ import { validateSceneData, validatePrefabData, fieldValueWarning, jsonBankWarni
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, partialApplyVerdict, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { type ErrorCode } from '../../tools/shared/mcpResult';
-import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS } from '../../tools/shared/waitForTiming';
+import { DEVICE_REQUEST_HEADROOM_MS, WAIT_FOR_DEFAULT_MS, WAIT_FOR_MAX_MS, WAIT_FOR_MIN_MS, clampWaitForEditTimeout } from '../../tools/shared/waitForTiming';
+import { EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS, EVAL_RELAY_HEADROOM_MS, clampEvalTimeout } from '../../tools/shared/evalTiming';
+import { decodeOpQuery, decodeQueryFlag, flagRefusal } from '../../tools/shared/opParams';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { PROFILER_MUTATING_ACTIONS, PROFILER_READ_ACTIONS } from '../../tools/shared/profilerActions';
 import { decodeSceneOpsReply } from './sceneOpsReply';
@@ -471,6 +473,13 @@ export interface BackendRequest {
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', status, body });
+/** An op's §5 refusal envelope, answered on its code's status (`refusalStatus`) — or null when `result` is not one.
+ *  The ONE spelling of the rule `relayJson` applies, for the routes that read the reply themselves (#1965 item 2:
+ *  it was hand-rolled at ~10 routes, and `/api/creatable-assets` had drifted to answering a coded NO_RENDERER 409). */
+function refusalReply(result: unknown): BackendResult | null {
+  const refusal = opRefusal(result);
+  return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : null;
+}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -586,7 +595,7 @@ function resolveWritableFilePath(ctx: BackendContext, filePath: string): string 
   if (filePath.startsWith('/@fs/')) {
     const abs = fromFsUrl(filePath);
     const rel = path.relative(ctx.projectRoot, abs);
-    return (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) ? abs : null;
+    return (rel && !relEscapes(rel)) ? abs : null;
   }
   return ctx.resolveAssetPath(filePath);
 }
@@ -954,9 +963,24 @@ function writeJsonAtomic(absPath: string, bytes: Buffer): void {
   // decided whether "write an asset into a new folder" worked (QA-CTX-0008).
   const dir = path.dirname(absPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = absPath + '.tmp';
-  fs.writeFileSync(tmp, bytes);
-  fs.renameSync(tmp, absPath);
+  writeFileAtomic(absPath, bytes);
+}
+
+/** tmp + rename, the ONE copy (#1965 item 4 — there were three, and only adopt-file removed its `.tmp` when the
+ *  rename failed, so the other two left `<file>.tmp` beside the asset on a Windows EPERM for the scanner to find).
+ *  `beforeCommit` runs between the two, after the bytes are safely down: whatever must not happen unless the
+ *  write can land (write-file's orphan-sidecar sweep, #1992) goes there. Any failure removes the `.tmp` and
+ *  rethrows; the destination is untouched until the rename, which is the commit. */
+function writeFileAtomic(absPath: string, bytes: Buffer, beforeCommit?: () => void): void {
+  const tmp = `${absPath}.tmp`;
+  try {
+    fs.writeFileSync(tmp, bytes);
+    beforeCommit?.();
+    fs.renameSync(tmp, absPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    throw e;
+  }
 }
 
 // ── Source-file (script) browsing for the in-browser code editor ──────────────
@@ -1034,7 +1058,7 @@ function resolveSourcePath(ctx: BackendContext, p: string): { abs: string; writa
   const abs = p.startsWith('/@fs/') ? fromFsUrl(p) : path.resolve(ctx.projectRoot, p);
   const within = (root: string): boolean => {
     const rel = path.relative(root, abs);
-    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    return rel !== '' && !relEscapes(rel);
   };
   if (within(ctx.projectRoot)) return { abs, writable: true };
   const eng = engineSrcRoot(ctx);
@@ -1554,7 +1578,9 @@ async function unsavedGate(
  *  discard here would be a refusal naming an exit that does not exist. */
 async function heldAssetEditorRefusal(
   ctx: BackendContext,
-  absTarget: string,
+  /** Every path the operation would destroy. The registry probe is GLOBAL, so it runs ONCE for all of them
+   *  (#1965 item 10: delete-asset called this per target — N identical round trips of up to 1.5s each). */
+  absTargets: readonly string[],
   verb: string,
   /** Refuse when the probe could not answer. `/api/move-file` sets this because it has no OTHER
    *  gate, so a fall-through there is a straight fail-open. `/api/delete-asset` leaves it off: its
@@ -1581,15 +1607,13 @@ async function heldAssetEditorRefusal(
     };
   }
   if (probed.kind !== 'held') return null;
-  const targetUrl = (ctx.absToAssetUrl(absTarget) || '').toLowerCase();
-  // No canonical url for the target (the asset root itself) → treat it as containing everything,
+  // No canonical url for a target (the asset root itself) → treat it as containing everything,
   // the same fallback `/api/delete-asset` applies to its own candidates.
-  const blocking = targetUrl
-    ? probed.holds.filter((h) => {
-      const p = h.path.toLowerCase();
-      return p === targetUrl || p.startsWith(`${targetUrl}/`);
-    })
-    : probed.holds;
+  const targetUrls = absTargets.map((abs) => (ctx.absToAssetUrl(abs) || '').toLowerCase());
+  const blocking = probed.holds.filter((h) => {
+    const p = h.path.toLowerCase();
+    return targetUrls.some((t) => !t || p === t || p.startsWith(`${t}/`));
+  });
   if (!blocking.length) return null;
   return {
     status: 423,
@@ -1817,9 +1841,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/scene-state[?trait=&id=] (M→R) ── dump the LIVE ECS world by
   // relaying to the renderer. Proves an edit took effect without a screenshot.
   if (urlPath === '/api/scene-state' && method === 'GET') {
-    const params: { trait?: string; id?: number; guid?: string; name?: string; where?: string; full?: boolean; resources?: boolean; limit?: number; world?: boolean; bounds?: boolean; contacts?: boolean; precision?: number } = {};
+    // The typed params (`id`, `limit`, `precision` and the flags) decode by the op's own table (#1962):
+    // a malformed one reaches the op raw and is refused there, coded, like on every other transport.
+    // Significant digits for agent-facing floats default to 9; `precision=0` is exact float64.
+    const params: Record<string, unknown> = decodeOpQuery('scene-state', query);
     const trait = query.get('trait');
-    const id = query.get('id');
     const guid = query.get('guid');
     const name = query.get('name');
     const where = query.get('where');
@@ -1827,29 +1853,6 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (guid) params.guid = guid;
     if (name) params.name = name;
     if (where) params.where = where;
-    if (query.get('full') === '1' || query.get('full') === 'true') params.full = true;
-    if (query.get('resources') === '1' || query.get('resources') === 'true') params.resources = true;
-    if (query.get('world') === '1' || query.get('world') === 'true') params.world = true;
-    if (query.get('bounds') === '1' || query.get('bounds') === 'true') params.bounds = true;
-    if (query.get('contacts') === '1' || query.get('contacts') === 'true') params.contacts = true;
-    const limit = query.get('limit');
-    if (limit != null && limit !== '') {
-      const n = Number(limit);
-      if (Number.isNaN(n) || n < 0) return json({ error: `invalid limit (not a non-negative number): ${limit}` }, 400);
-      params.limit = Math.floor(n); // whole entities only — echoed value matches what's returned
-    }
-    // Significant digits for agent-facing floats (default 9). 0 = exact float64.
-    const precision = query.get('precision');
-    if (precision != null && precision !== '') {
-      const n = Number(precision);
-      if (Number.isNaN(n) || n < 0) return json({ error: `invalid precision (not a non-negative number): ${precision}` }, 400);
-      params.precision = Math.floor(n);
-    }
-    if (id != null && id !== '') {
-      const n = Number(id);
-      if (Number.isNaN(n)) return json({ error: `invalid id (not a number): ${id}` }, 400);
-      params.id = n;
-    }
     return relayJson(ctx, 'scene-state', params);
   }
 
@@ -1858,20 +1861,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // browser. Lets tooling read editor errors (failed scene/mesh loads, etc.)
   // without a devtools/MCP attach — the curl-able sibling of /api/scene-state.
   if (urlPath === '/api/console-logs' && method === 'GET') {
-    const params: { level?: string; limit?: number; since?: number; sinceMs?: number; epoch?: string } = {};
+    // `limit`/`since`/`sinceMs` decode by the op's table (#1962). A malformed one is forwarded RAW and the op
+    // refuses it: dropped here, `?since=abc` answered the default tail under a cursored framing.
+    const params: Record<string, unknown> = decodeOpQuery('console-logs', query);
     const level = query.get('level');
-    const limit = query.get('limit');
-    const since = query.get('since');
-    const sinceMs = query.get('sinceMs');
     if (level) params.level = level;
-    // NaN-guard, like the /api/journal and /api/editor-journal siblings. `?limit=abc` would
-    // otherwise pass NaN through to the op's tail: `NaN ?? 50` is NaN (nullish coalescing does
-    // not catch NaN), `length > NaN` is false, so the tail silently returns the WHOLE 500-entry
-    // ring — the exact flood the default exists to prevent. `?since=abc` is worse: every
-    // `ts > NaN` is false, so it returns zero logs and hides real errors.
-    if (limit != null && limit !== '' && !Number.isNaN(Number(limit))) params.limit = Number(limit);
-    if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
-    if (sinceMs != null && sinceMs !== '' && !Number.isNaN(Number(sinceMs))) params.sinceMs = Number(sinceMs);
     const epoch = query.get('epoch');
     if (epoch) params.epoch = epoch;
     return relayJson(ctx, 'console-logs', params);
@@ -1880,7 +1874,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/journal[?type=&level=&sinceCap=&epoch=] (M→R) ── the tick-stamped game-event trace
   // (emit/journalEvents) — verify game LOGIC (match/score/win) without screenshots.
   if (urlPath === '/api/journal' && method === 'GET') {
-    const params: { type?: string; level?: string; clear?: string; limit?: number; action?: string; sinceCap?: number | string; epoch?: string } = {};
+    // `limit`/`sinceCap` decode by the op's table (#1962), a malformed one forwarded raw for the op to refuse.
+    const params: Record<string, unknown> = decodeOpQuery('journal-events', query);
     const type = query.get('type');
     if (type) params.type = type;
     // ⚠️ `level` and `action` are forwarded RAW — never narrowed to the values this route knows
@@ -1897,12 +1892,6 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // here, a caller that meant "start clean" would get a full ring it believed empty.
     const clear = query.get('clear');
     if (clear != null) params.clear = clear;
-    const jLimit = query.get('limit');
-    if (jLimit != null && jLimit !== '' && !Number.isNaN(Number(jLimit))) params.limit = Number(jLimit);
-    // `sinceCap` goes through as a number when it is one and RAW otherwise, so `?sinceCap=abc` is
-    // refused by the op instead of silently becoming an uncursored read of the whole ring.
-    const jSinceCap = query.get('sinceCap');
-    if (jSinceCap != null && jSinceCap !== '') params.sinceCap = Number.isNaN(Number(jSinceCap)) ? jSinceCap : Number(jSinceCap);
     const jEpoch = query.get('epoch'); // the capture counter's life the cursor belongs to
     if (jEpoch) params.epoch = jEpoch;
     return relayJson(ctx, 'journal-events', params);
@@ -1947,21 +1936,16 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // NOTE this route ALLOWLISTS query params: one the tool sends but this does not parse is
     // silently dropped, and the caller believes it narrowed. Adding a param to the tool means
     // adding it HERE too.
-    const params: { layer?: string; ids?: number[]; guids?: string[]; name?: string; entities?: boolean; overlaps?: boolean; limit?: number; precision?: number } = {};
+    // The typed ones (`ids`, `entities`, `overlaps`, `limit`, `precision`) come from the op's table (#1962), so
+    // they cannot be dropped here; `?entities=0` used to turn the list ON (a truthy string), and a bad id was
+    // filtered out of `ids` without a word.
+    const params: Record<string, unknown> = decodeOpQuery('layout-bounds', query);
     const layer = query.get('layer');
-    const ids = query.get('ids');
     if (layer) params.layer = layer;
-    if (ids) params.ids = ids.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
     const guids = query.get('guids');
     if (guids) params.guids = guids.split(',').map((g) => g.trim()).filter(Boolean);
     const lbName = query.get('name');
     if (lbName) params.name = lbName;
-    if (query.get('entities')) params.entities = true;
-    if (query.get('overlaps')) params.overlaps = true;
-    const lbLimit = query.get('limit');
-    if (lbLimit != null && lbLimit !== '' && !Number.isNaN(Number(lbLimit))) params.limit = Number(lbLimit);
-    const lbPrec = query.get('precision');
-    if (lbPrec != null && lbPrec !== '' && !Number.isNaN(Number(lbPrec))) params.precision = Number(lbPrec);
     return relayJson(ctx, 'layout-bounds', params);
   }
 
@@ -1991,8 +1975,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // `{ok:false, code}` cannot pass, so without this check the envelope came back intact at
       // HTTP 200. Worth stating precisely, because the reshaping story would justify a check
       // BEFORE the guard and the real reason justifies one anywhere before the return.
-      const refusal = opRefusal(raw);
-      if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
+      const refusal = refusalReply(raw);
+      if (refusal) return refusal;
       // The bare-call summary and the filter-miss naming are shared with `device_handles`
       // (`tools/shared/handlesReply.ts`, #1216 C-14) — here, not at the op, because `inputRoutes.ts`
       // calls the op directly to aim tap_handle / drag_handle.
@@ -2006,8 +1990,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // `?video=1` opts INTO the downloaded-video cache index (#288 Phase 6). Opt-in because this is
     // a swept read tool and §6 is summary-first — a per-clip index would grow every caller's
     // payload to answer a question almost none of them asked.
-    const wantVideo = query.get('video') === '1' || query.get('video') === 'true';
-    return relayJson(ctx, 'diagnose', wantVideo ? { video: true } : {});
+    return relayJson(ctx, 'diagnose', decodeOpQuery('diagnose', query));
   }
 
   // ── Device connection (M) — the Modoki-owned lease to a physical device. ──
@@ -2571,18 +2554,16 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // in `result` (the MCP tool flags that as isError). Editor-only: this router is stripped
   // from shipped game builds.
   if (urlPath === '/api/eval' && method === 'POST') {
-    const b = (body ?? {}) as { code?: string; timeoutMs?: number };
+    const b = (body ?? {}) as { code?: string; timeoutMs?: unknown };
     if (typeof b.code !== 'string' || !b.code) return json({ error: 'code (string) required' }, 400);
     // Size the RELAY deadline from the op's own, exactly as /api/wait-for-edit does. Without this
     // the relay's 3000ms default was strictly SMALLER than the eval's 5000ms budget, so the eval's
     // timeout message was unreachable and a legitimately-slow eval reported as a dead renderer.
-    // The clamp is restated rather than imported — this file cannot import the renderer bundle —
-    // and must stay in step with `clampEvalTimeout(..., EVAL_ASYNC_TIMEOUT_MS,
-    // EDITOR_EVAL_MAX_TIMEOUT_MS)` in bridgeHelpers.ts (same pattern, same reason, as wait-for-edit).
-    const opTimeout = Number.isFinite(b.timeoutMs) && (b.timeoutMs as number) > 0
-      ? Math.max(50, Math.min(25_000, Math.floor(b.timeoutMs as number)))
-      : 5000;
-    const relayTimeoutMs = opTimeout + 10_000; // headroom over the op's own deadline
+    // The clamp is the op's OWN, imported (#1962): a restated copy took only a number, so
+    // `{timeoutMs:"20000"}` sized this relay at 15s while the op ran for 20s, and a 16s eval
+    // answered 504 while it was still running.
+    const opTimeout = clampEvalTimeout(b.timeoutMs, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS);
+    const relayTimeoutMs = opTimeout + EVAL_RELAY_HEADROOM_MS;
     // ⚠️ **#1013 names this route as its anchor "with the widest blast radius", and that is FALSE.**
     // The issue reasons that an eval body calls agent ops via `modoki.call(...)`, most of which
     // refuse by THROWING, so the refusal rejects the eval and lands in this catch. It does not:
@@ -2678,28 +2659,22 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     return relayJson(ctx, 'watch-start', body ?? {});
   }
   if (urlPath === '/api/watch/read' && method === 'GET') {
-    const readLimit = query.get('limit');
     const params = {
+      // `clear`, `samples` (raw series are ~40 chars/sample, so stats-only unless asked), `limit` and
+      // `precision` (default 9 significant digits; 0 = exact) decode by the op's table (#1962).
+      ...decodeOpQuery('watch-read', query),
       id: query.get('id') ?? '',
-      clear: query.get('clear') === '1' || query.get('clear') === 'true',
-      // Raw time-series are ~40 chars/sample and the caps allow 512 series × 5000 samples.
-      // Stats-only by default; opt in when you actually need the curve.
-      samples: query.get('samples') === '1' || query.get('samples') === 'true',
       // Read-side filters (Batch 3 D) — isolate a series in a broad watch.
       ...(query.get('name') ? { name: query.get('name')! } : {}),
       ...(query.get('guids') ? { guids: query.get('guids')!.split(',').map((g) => g.trim()).filter(Boolean) } : {}),
-      ...(readLimit != null && readLimit !== '' && !Number.isNaN(Number(readLimit)) ? { limit: Number(readLimit) } : {}),
-      // Significant digits for the stats/series floats (default 9); 0 = exact.
-      ...(query.get('precision') != null && query.get('precision') !== '' && !Number.isNaN(Number(query.get('precision')))
-        ? { precision: Number(query.get('precision')) } : {}),
     };
     try {
       const result = await ctx.requestBrowser('watch-read', params);
       // ⚠️ A CODED §5 refusal goes first and travels on its own status (#1013). The 404 below is
       // for the uncoded `{ok:false, error}` this op actually emits today — `opRefusal` requires a
       // `code` from the closed set, so the two do not overlap and the 404 keeps its meaning.
-      const wRefusal = opRefusal(result);
-      if (wRefusal) return json(result as Record<string, unknown>, refusalStatus(wRefusal.code));
+      const wRefusal = refusalReply(result);
+      if (wRefusal) return wRefusal;
       // A read of an unknown / auto-expired watch answers {ok:false,error} — return it at 404 so
       // the MCP GET path (getJson, which only fails on status>=400 and does NOT run isFailureBody)
       // surfaces it as a tool failure instead of a "successful" empty result an agent misreads as
@@ -2725,8 +2700,6 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // conventions §4 — "no mutating operation is reachable by GET", because a GET's ok is never
   // failure-checked — holds per action rather than on average.
   if (urlPath === '/api/profiler' && method === 'GET') {
-    const markers = query.get('markers');
-    const limit = query.get('limit');
     const action = query.get('action') ?? 'read';
     const MUTATING: readonly string[] = PROFILER_MUTATING_ACTIONS;
     if (!(PROFILER_READ_ACTIONS as readonly string[]).includes(action)) {
@@ -2738,15 +2711,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         ? json({ error: `profiler action "${action}" MUTATES profiler state, so it must be POSTed to /api/profiler — GET serves only ${PROFILER_READ_ACTIONS.join(' / ')}.` }, 405)
         : json({ error: `unknown profiler action "${action}". GET serves ${PROFILER_READ_ACTIONS.join(' / ')}; POST /api/profiler takes ${MUTATING.join(' / ')}.`, code: 'REFUSED_BY_OP', options: [...PROFILER_READ_ACTIONS, ...PROFILER_MUTATING_ACTIONS] }, 400);
     }
-    const params = {
-      action,
-      ...(markers != null && markers !== '' && !Number.isNaN(Number(markers)) ? { markers: Number(markers) } : {}),
-      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
-      // action:boot — the full-timeline escape hatch. Only `true` turns it on; anything else is
-      // the default, so a stray `?all=0` cannot flip it on by being truthy-as-a-string.
-      ...(query.get('all') === 'true' ? { all: true } : {}),
-    };
-    return relayJson(ctx, 'profiler', params);
+    // `markers`, `limit` and `all` (action:boot's full-timeline escape hatch) decode by the op's table (#1962).
+    return relayJson(ctx, 'profiler', { ...decodeOpQuery('profiler', query), action });
   }
   if (urlPath === '/api/profiler' && method === 'POST') {
     return relayJson(ctx, 'profiler', body ?? {});
@@ -2757,14 +2723,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     return relayJson(ctx, 'input-watch-start', body ?? {});
   }
   if (urlPath === '/api/input-watch/read' && method === 'GET') {
-    const limit = query.get('limit');
-    const precision = query.get('precision');
-    const params = {
-      unresolvedOnly: query.get('unresolvedOnly') === '1' || query.get('unresolvedOnly') === 'true',
-      ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
-      ...(precision != null && precision !== '' && !Number.isNaN(Number(precision)) ? { precision: Number(precision) } : {}),
-    };
-    return relayJson(ctx, 'input-watch-read', params);
+    return relayJson(ctx, 'input-watch-read', decodeOpQuery('input-watch-read', query)); // #1962
   }
   if (urlPath === '/api/input-watch/stop' && method === 'POST') {
     return relayJson(ctx, 'input-watch-stop', {});
@@ -2775,21 +2734,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
 
   // ── Hit REGIONS (#139, M→R) ── the shapes a game's hitTest uses, which are authored nowhere. ──
   if (urlPath === '/api/hit-regions' && method === 'GET') {
-    const num = (k: string): number | undefined => {
-      const v = query.get(k);
-      return v != null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : undefined;
-    };
     const ids = query.get('ids');
-    const atX = num('atX'), atY = num('atY');
     const params = {
+      // `limit`, `precision` and `at` (from `atX`+`atY`) decode by the op's table (#1962). Half a point
+      // is forwarded as half and refused by the op; it used to be dropped, turning a probe into none.
+      ...decodeOpQuery('hit-regions', query),
       action: query.get('action') || 'read',
       ...(query.get('provider') ? { provider: query.get('provider') } : {}),
       ...(query.get('kind') ? { kind: query.get('kind') } : {}),
       ...(ids ? { ids: ids.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
-      ...(num('limit') !== undefined ? { limit: num('limit') } : {}),
-      ...(num('precision') !== undefined ? { precision: num('precision') } : {}),
-      // Both or neither — a half-specified point would silently probe (x, 0).
-      ...(atX !== undefined && atY !== undefined ? { at: { x: atX, y: atY } } : {}),
     };
     return relayJson(ctx, 'hit-regions', params);
   }
@@ -2806,8 +2759,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // reads `dataUrl: undefined`, `writeDataUrlToTemp` throws, and the catch turns the op's
       // correct, coded "no 3D surface is mounted" into a 504 → NOT_AVAILABLE_HERE — "the route is
       // absent" — sending the agent to relaunch an editor that is answering perfectly well.
-      const refusal = opRefusal(raw);
-      if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
+      const refusal = refusalReply(raw);
+      if (refusal) return refusal;
       const result = raw as { width: number; height: number; quality?: number; surface?: string; dataUrl: string };
       // Echo the EFFECTIVE quality (1–100) the renderer actually used, so an out-of-unit value is
       // visibly converted rather than silently ignored (S3.13).
@@ -3799,11 +3752,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // non-discardable by TYPE: that is about the probe being unable to clear it programmatically,
       // not about a route being forbidden to proceed when told to.)
       if (rendererWrite !== true && discardUnsaved !== true) {
-        for (const target of resolved) {
-          if (target.sidecar) continue;
-          const refusal = await heldAssetEditorRefusal(ctx, target.abs, 'delete');
-          if (refusal) return json(refusal.body, refusal.status);
-        }
+        const targets = resolved.filter((t) => !t.sidecar).map((t) => t.abs);
+        const refusal = targets.length ? await heldAssetEditorRefusal(ctx, targets, 'delete') : null;
+        if (refusal) return json(refusal.body, refusal.status);
       }
       if (resolved.length > 0 && rendererWrite !== true && discardUnsaved !== true) {
         const probed = await unsavedGate(ctx, null, { registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene'] });
@@ -4086,6 +4037,10 @@ async function describeUnresolvedAgainstLiveWorld(
   // inconsistency docs/mcp-tool-conventions.md section 2 exists to prevent.
   // "What would the build drop?" belongs to /api/unused-assets, alone.
   if (urlPath === '/api/find-references' && method === 'GET') {
+    // The one flag spelling (#1962, `decodeQueryFlag`): `=== '1'` read `?reachableOnly=true` as OFF and
+    // answered the unfiltered list under a filtered framing. Refused before the graph walk, which is the cost.
+    const reachableOnly = decodeQueryFlag(query.get('reachableOnly'));
+    if (typeof reachableOnly === 'string') return json(flagRefusal('reachableOnly', reachableOnly), 400);
     try {
       // ── The unsaved-work DISCLOSURE (#889 C) ────────────────────────────────────────────────
       // ⚠️ Same enumeration as /api/unused-assets, same blindness, and a sharper irony: the
@@ -4125,7 +4080,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const result = findReferences(graph, node, {
         limit: clampInt(query.get('limit'), 50, 1, FIND_REFERENCES_MAX_LIMIT),
         maxDepth: clampInt(query.get('maxDepth'), 6, 1, FIND_REFERENCES_MAX_DEPTH),
-        reachableOnly: query.get('reachableOnly') === '1',
+        reachableOnly: reachableOnly === true,
       });
       const body: FindReferencesResponse = {
         ...result,
@@ -4374,7 +4329,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // sentence above could otherwise be read as promising more.
       const folderAbs = path.resolve(ctx.projectRoot, copyFolder);
       const folderRel = path.relative(ctx.projectRoot, folderAbs);
-      if (folderRel.startsWith('..') || path.isAbsolute(folderRel)) {
+      if (relEscapes(folderRel)) {
         return json({ error: 'copyFolder escapes the project' }, 403);
       }
       const leafName = name || (sourceAbs ? path.basename(sourceAbs) : 'dropped-file');
@@ -4394,23 +4349,15 @@ async function describeUnresolvedAgainstLiveWorld(
         // introduce a segment of its own, which is exactly the kind of edit that silently reopens
         // a hole in a caller three files away.
         const destRel = path.relative(ctx.projectRoot, destAbs);
-        if (destRel.startsWith('..') || path.isAbsolute(destRel)) {
+        if (relEscapes(destRel)) {
           return json({ error: 'destination escapes the project' }, 403);
         }
         fs.mkdirSync(path.dirname(destAbs), { recursive: true });
         removeOrphanSidecarsBefore(destAbs); // #1975: a new file never adopts a dead asset's sidecar (a no-op over an existing one)
-        const tmpPath = `${destAbs}.tmp`;
-        try {
-          fs.writeFileSync(tmpPath, bytes);
-          fs.renameSync(tmpPath, destAbs);
-          sidecarsAheadArrived(destAbs);
-          ctx.markEditorWrite(destAbs, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
-        } catch (writeErr) {
-          // Leave no half-written `.tmp` behind for the asset scanner to find: the write already
-          // failed, and a stray sibling of the file you dropped is a worse outcome than the error.
-          try { fs.unlinkSync(tmpPath); } catch { /* nothing to clean up */ }
-          throw writeErr;
-        }
+        // `writeFileAtomic` leaves no half-written `.tmp` behind for the asset scanner to find when it fails.
+        writeFileAtomic(destAbs, bytes);
+        sidecarsAheadArrived(destAbs);
+        ctx.markEditorWrite(destAbs, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
       }
       return json({ path: plan.path, copied: plan.write });
     } catch (e) {
@@ -5276,14 +5223,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // resolveGuidToPath lookup) right after a Save All. The write-guard mark below
       // covers every event of the tmp + rename burst (see its "write+rename"
       // handling), so this doesn't change hot-reload suppression behavior — same
-      // pattern as writeJsonAtomic in this file.
-      const tmpPath = `${absPath}.tmp`;
-      fs.writeFileSync(tmpPath, bytes);
+      // pattern as writeJsonAtomic in this file (`writeFileAtomic`, which also removes the `.tmp` on a failure).
       // #1975: a file created where none existed never adopts a dead asset's sidecar (a no-op when the file exists).
       // AFTER the tmp write (#1992 part 2), where ENOSPC/EACCES happen, so a failed write removes nothing; the rename
-      // below is the commit. A sidecar written ahead of this file by this backend is kept (#1992).
-      removeOrphanSidecarsBefore(absPath);
-      fs.renameSync(tmpPath, absPath);
+      // is the commit. A sidecar written ahead of this file by this backend is kept (#1992).
+      writeFileAtomic(absPath, bytes, () => removeOrphanSidecarsBefore(absPath));
       sidecarsAheadArrived(absPath);
       ctx.markEditorWrite(absPath, fingerprintBytes(bytes)); // after the write lands — `markWrittenFile`'s rule (#1911)
       if (ifNoneMatch === '*') noteSidecarAheadOfFile(absPath);
@@ -5473,7 +5417,7 @@ async function describeUnresolvedAgainstLiveWorld(
         return json({ error: 'Destination is inside the source' }, 400);
       }
       {
-        const refusal = await heldAssetEditorRefusal(ctx, absFrom, 'move', { refuseOnUnknown: true });
+        const refusal = await heldAssetEditorRefusal(ctx, [absFrom], 'move', { refuseOnUnknown: true });
         if (refusal) return json(refusal.body, refusal.status);
       }
       // ⚠️ The never-clobber check AGAIN (#1648 S2), now that the probe's `await` is behind us. Everything from here to
@@ -6082,8 +6026,8 @@ async function describeUnresolvedAgainstLiveWorld(
       const held = ctx.getHeldPointer?.();
       // ⚠️ Envelope check AFTER the merges are prepared but before they are applied (#1013):
       // spreading `obj` would hand back a 200 whose body is a refusal wearing `persistenceMode`.
-      const esRefusal = opRefusal(obj);
-      if (esRefusal) return json(obj as Record<string, unknown>, refusalStatus(esRefusal.code));
+      const esRefusal = refusalReply(obj);
+      if (esRefusal) return esRefusal;
       return json({
         ...obj,
         ...(ref ? { scenePathRef: ref } : {}),
@@ -6126,21 +6070,15 @@ async function describeUnresolvedAgainstLiveWorld(
   // Percept: the human-activity stream (!-prefixed). merged also returns the game journal
   // + a single-axis `timeline` windowed by `sinceCap` (a shared `cap` cursor).
   if (urlPath === '/api/editor-journal' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: string; limit?: number } = {};
+    // `since`, `sinceCap`, `limit` and `merged` decode by the op's table (#1962), a malformed one forwarded raw.
+    const params: Record<string, unknown> = decodeOpQuery('editor-journal', query);
     const type = query.get('type');
     const source = query.get('source');
-    const since = query.get('since');
-    const sinceCap = query.get('sinceCap');
-    const ejLimit = query.get('limit');
     if (type) params.type = type;
     // Forwarded RAW (#1072) — the op refuses an unknown source with its options. See /api/journal.
     if (source) params.source = source;
-    if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
     const epoch = query.get('epoch'); // #1214 B-3: the journal life the cursor belongs to
     if (epoch) params.epoch = epoch;
-    if (ejLimit != null && ejLimit !== '' && !Number.isNaN(Number(ejLimit))) params.limit = Number(ejLimit);
-    if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
-    if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
     // RETIRED (#1561), forwarded raw so the op refuses it — see /api/journal.
     const ejClear = query.get('clear');
     if (ejClear != null) params.clear = ejClear;
@@ -6170,27 +6108,21 @@ async function describeUnresolvedAgainstLiveWorld(
   // human edit instead of polling editor-journal in a loop. `source` defaults to 'human' in
   // the op (the whole point is "tell me what the HUMAN did").
   //
-  // The relay timeout below MUST exceed the op's own internal deadline (the op clamps
-  // `timeoutMs` to [50, 120_000] — WAIT_FOR_EDIT_MIN_MS/MAX_MS in agentEditorOps.ts; kept as
-  // a literal here rather than imported because plugins/ sits BELOW app/ in the build, so
-  // this file can't import from it), or this HTTP round trip would die first and report a
-  // legitimate 120s park as a dead backend instead of the op's own `timedOut:true`.
+  // The relay timeout below MUST exceed the op's own internal deadline, or this HTTP round trip would
+  // die first and report a legitimate 120s park as a dead backend instead of the op's own
+  // `timedOut:true`. The clamp is the op's own (`clampWaitForEditTimeout`, `tools/shared/waitForTiming.ts`
+  // — #1962: it used to be restated here as a literal).
   if (urlPath === '/api/wait-for-edit' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; epoch?: string; timeoutMs?: number } = {};
+    const params: Record<string, unknown> = decodeOpQuery('wait-for-edit', query); // `since`, `timeoutMs` (#1962)
     const type = query.get('type');
     const source = query.get('source');
-    const since = query.get('since');
-    const timeoutMsQ = query.get('timeoutMs');
     if (type) params.type = type;
     // Forwarded RAW (#1072). Dropping `?source=agnet` here made the op fall back to its 'human'
     // default and park waiting for the WRONG actor; the op refuses it instead. See /api/journal.
     if (source) params.source = source;
-    if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
     const epoch = query.get('epoch'); // #1214 B-3: the journal life the cursor belongs to
     if (epoch) params.epoch = epoch;
-    if (timeoutMsQ != null && timeoutMsQ !== '' && !Number.isNaN(Number(timeoutMsQ))) params.timeoutMs = Number(timeoutMsQ);
-    const clampedOpTimeout = Math.max(50, Math.min(120_000, params.timeoutMs ?? 30_000));
-    const relayTimeoutMs = clampedOpTimeout + 10_000; // headroom over the op's own deadline
+    const relayTimeoutMs = clampWaitForEditTimeout(params.timeoutMs) + 10_000; // headroom over the op's own deadline
     return relayJson(ctx, 'wait-for-edit', params, relayTimeoutMs);
   }
 
@@ -6232,8 +6164,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // A coded refusal travels on its code's status. Checked here rather than through `relayJson`
       // because this route's CATCH differs (the disk fallback below), and `modoki_read_asset_meta` is
       // a GET without `checkFailure` — a refusal relayed as a 200 would read as a success (#1012).
-      const refusal = opRefusal(raw);
-      return refusal ? json(raw as Record<string, unknown>, refusalStatus(refusal.code)) : json(raw);
+      return refusalReply(raw) ?? json(raw);
     } catch (e) {
       // Same split as `/api/asset-def` and the editor-action relay: the op answering (400) is not
       // a dead gateway. But unlike asset-def, a transport failure here is RECOVERABLE — the disk
@@ -6270,8 +6201,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // genuine miss, and those refusals must NOT arrive as a 200 the way a miss does — a miss is
       // `{ok:true, hit:null}`, which is a real answer. `postJson` would catch a 200 refusal, but
       // curl would not (#1212 B-17): a coded refusal gets its §5 status, as `relayJson` gives it.
-      const refusal = opRefusal(result);
-      return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
+      return refusalReply(result) ?? json(result);
     } catch (e) {
       return relayFailure(e);
     }
@@ -6292,6 +6222,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // validate_scene), so a 200 carrying {ok:false} would reach the agent as a successful read
       // of an empty registry. The op cannot fail today; this matches what the /api/player-prefs
       // GET sibling does, so the two do not diverge the moment one of them grows a refusal.
+      // A coded §5 refusal first, on its code's status (#1965 item 2: this route skipped it, so a coded
+      // NO_RENDERER answered 409, not 503); the 409 is for an UNCODED {ok:false}.
+      const refused = refusalReply(result);
+      if (refused) return refused;
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
       return json(result);
     }
@@ -6335,8 +6269,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // A CODED refusal gets its §5 status (#1212 B-17): the flat 409 gave every code one status —
       // the op's real refusal, NOT_AVAILABLE_HERE (an un-hydrated store), is a 400 now, as it is on
       // every relayJson route. An uncoded `ok:false` keeps the 409 it always had.
-      const refusal = opRefusal(result);
-      if (refusal) return json(result as Record<string, unknown>, refusalStatus(refusal.code));
+      const refusal = refusalReply(result);
+      if (refusal) return refusal;
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
       return json(result);
     } catch (e) {
@@ -6356,8 +6290,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // `postJson` would turn a 200 refusal into a failed tool call, but curl would read it as
       // success (#1212 B-17) — a coded refusal gets its §5 status, as `relayJson` gives it. An
       // uncoded `ok:false` stays a 200 for `isFailureBody`, as before.
-      const refusal = opRefusal(result);
-      return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
+      return refusalReply(result) ?? json(result);
     } catch (e) {
       return relayFailure(e);
     }
@@ -6508,7 +6441,14 @@ async function describeUnresolvedAgainstLiveWorld(
   // ota.enabled is on (only needs a bucket to read from).
   if (urlPath === '/api/ota/status' && method === 'GET') {
     const cfg = loadProjectConfig(ctx.projectRoot);
-    const bucket = query.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+    // An EMPTY `?bucket=` is absent (#1962), the rule every other query param here follows: `??` kept the
+    // '' and skipped a derivation that would have worked. A malformed EXPLICIT bucket is the caller's
+    // value and is named as such; it used to be told to "pass ?bucket= explicitly", which it just had.
+    const explicitBucket = query.get('bucket') || null;
+    const bucket = explicitBucket ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+    if (explicitBucket != null && !OTA_SAFE_BUCKET.test(explicitBucket)) {
+      return json({ ok: false, error: `bucket ${JSON.stringify(explicitBucket)} is not a usable gs:// bucket (expected gs://<name>[/<prefix>] in letters, digits and . _ - /).` }, 400);
+    }
     if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
       return json({ ok: false, error: `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.` }, 400);
     }
@@ -6577,9 +6517,22 @@ async function describeUnresolvedAgainstLiveWorld(
   // installed SDKs" toggle. Persists to settings.json in the toolchain dir, which
   // detect() reads live in BOTH main and the Vite plugin, so the change applies to
   // status immediately and to the next build without an editor restart.
+  //
+  // A PARTIAL patch, as `writeToolchainSettings` is (#1962): an omitted field is left alone, and a value
+  // that is not a boolean is refused. `!!` used to write `{}` as OFF and `"false"` (a string) as ON.
   if (urlPath === '/api/toolchain/settings' && method === 'POST') {
-    const { allowSystemToolchain } = (body ?? {}) as { allowSystemToolchain?: boolean };
-    const next = writeToolchainSettings({ allowSystemToolchain: !!allowSystemToolchain });
+    if (!process.env.MODOKI_TOOLCHAIN_DIR) {
+      // The same refusal `/uninstall` gives for the same condition; this one used to throw it as a 500.
+      return json({ error: 'no toolchain directory (dev editor) — nothing to persist settings to' }, 400);
+    }
+    const { allowSystemToolchain } = (body ?? {}) as { allowSystemToolchain?: unknown };
+    if (allowSystemToolchain !== undefined && typeof allowSystemToolchain !== 'boolean') {
+      return json({
+        ok: false, code: 'REFUSED_BY_OP' satisfies ErrorCode,
+        error: `allowSystemToolchain must be a boolean, got ${JSON.stringify(allowSystemToolchain)}. Nothing was written.`,
+      }, 400);
+    }
+    const next = writeToolchainSettings(allowSystemToolchain === undefined ? {} : { allowSystemToolchain });
     return json({ ok: true, settings: next });
   }
 

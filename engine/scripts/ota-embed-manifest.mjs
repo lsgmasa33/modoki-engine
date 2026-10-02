@@ -53,6 +53,7 @@ import { OTA_DEFAULT_BUNDLE_NAME } from './ota/publishGuards.mjs';
 import { createManifest, validateManifest } from './ota/schema.mjs';
 import { claimProjectOrExit } from './cliBuildClaim.mjs';
 import { readJsonFile } from './jsonFile.mjs'; // #1799: a BOM is read through
+import { relEscapes } from './pathIdentity.mjs';
 
 const EMBEDDED_BASE_VERSION = 'embedded'; // keep in sync with otaClient.ts's exported constant
 
@@ -125,7 +126,7 @@ async function main() {
   // dist with the shell project it's staged from. Those are different operations with
   // different invariants, not an inconsistency between the two scripts.
   const distRelToProject = path.relative(projectDir, distDir);
-  if (distRelToProject.startsWith('..') || path.isAbsolute(distRelToProject)) {
+  if (relEscapes(distRelToProject)) { // a `..foo` dist folder is inside (#1965 item 6)
     fail(`--dist (${distDir}) is not inside --project (${projectDir}) — an embedded manifest must describe the shipping app's OWN dist.`);
   }
 

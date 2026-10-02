@@ -156,9 +156,10 @@ describe('editor-journal merged=1: BOTH streams are tailed', () => {
     });
   });
 
-  it('a NaN limit falls back to the default rather than disabling the tail', async () => {
+  it('a NaN limit is REFUSED rather than disabling the tail (#1962), and an absent one is the default', async () => {
     for (let i = 0; i < 5; i++) editorEmit('!edit', { i });
-    const r = await runAgentOp('editor-journal', { merged: true, limit: NaN }) as Result;
+    expect(await runAgentOp('editor-journal', { merged: true, limit: NaN })).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    const r = await runAgentOp('editor-journal', { merged: true }) as Result;
     expect(r.editor).toHaveLength(5);      // under the default of 100
     expect(r.timeline).toHaveLength(5);
   });

@@ -108,6 +108,7 @@ import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult, setResultStamp } from './backend/writeResult';
 import { createPendingOutside } from '../tools/shared/pendingOutside';
+import { decodeQueryFlag } from '../tools/shared/opParams';
 import { openInOS } from './backend/osOpen';
 import { shipTranscoders } from './transcoders';
 
@@ -3661,8 +3662,8 @@ export function assetScannerPlugin(): Plugin {
         // work identically in a packaged Electron editor, not just this dev server. Only
         // the SSE publish pipeline below stays host-owned, same as /api/build.
 
-        // POST /api/ota/publish?version=v18[&mandatory=1|0][&bundleName=][&key=][&bucket=] (SSE stream)
-        // `mandatory` is tri-state: 1 sets it, 0 clears it, omitted inherits the existing
+        // POST /api/ota/publish?version=v18[&mandatory=1|true|0|false][&bundleName=][&key=][&bucket=] (SSE stream)
+        // `mandatory` is tri-state: 1/true sets it, 0/false clears it, omitted inherits the existing
         // release's value (sticky — see ota-publish.mjs's own header comment).
         // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
         // for: build FRESH from the current project.config.json (never accept a stale
@@ -3671,15 +3672,21 @@ export function assetScannerPlugin(): Plugin {
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'POST') {
           const url = new URL(req.url, 'http://localhost');
           const versionParam = url.searchParams.get('version');
-          // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:
-          // "1" sets it, "0" clears it, absent inherits the existing release's value —
-          // `mandatoryParam` is `undefined` in that last case, distinct from `false`.
-          const mandatoryRaw = url.searchParams.get('mandatory');
-          const mandatoryParam = mandatoryRaw === '1' ? true : mandatoryRaw === '0' ? false : undefined;
+          // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract: 1/true sets it, 0/false clears
+          // it, absent inherits the existing release's value — `mandatoryParam` is `undefined` then, distinct
+          // from `false`. The one flag spelling (#1962, `decodeQueryFlag`): `?mandatory=true` used to read as "inherit".
+          const mandatoryDecoded = decodeQueryFlag(url.searchParams.get('mandatory'));
+          if (typeof mandatoryDecoded === 'string') {
+            refuseBeforeStream(res, 'OTA publish refused', `mandatory must be 1/true (set), 0/false (clear) or omitted (inherit), got ${JSON.stringify(mandatoryDecoded)}.`);
+            return;
+          }
+          const mandatoryParam = mandatoryDecoded;
           const keyName = url.searchParams.get('key') || 'default';
           const cfg = loadProjectConfig(projectRoot);
           const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
-          const bucketParam = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+          // An EMPTY `?bucket=` is absent (#1962, as /api/ota/status): `??` kept the '' and skipped a derivation that would work.
+          const explicitBucket = url.searchParams.get('bucket') || null;
+          const bucketParam = explicitBucket ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
 
           const buildCwd = editorRoot || projectRoot;
           // THE publish-request check — the same `otaPublishPreflight` `ota-publish.mjs` runs (#827):
@@ -3711,7 +3718,9 @@ export function assetScannerPlugin(): Plugin {
               'bad-version': `version is required and must match ${OTA_SAFE_TOKEN}`,
               'bad-name': `bundleName must match ${OTA_SAFE_TOKEN}`,
               'bad-key-name': `key must match ${OTA_SAFE_TOKEN}`,
-              'bad-bucket': `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.`,
+              'bad-bucket': explicitBucket != null
+                ? `bucket ${JSON.stringify(explicitBucket)} is not a usable gs:// bucket (expected gs://<name>[/<prefix>] in letters, digits and . _ - /).`
+                : `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.`,
               'bad-project-bundle-name': "This project's ota.bundleName is empty — set it in Project Settings → OTA.",
               'bad-project-subgames': "This project's ota.subgames is not a list of project ids — fix it in Project Settings → OTA → Sub-games.",
               'bad-project-retain-versions': "This project's ota.retainVersions is not a positive whole number — set it in Project Settings → OTA → Versions kept.",

@@ -1694,10 +1694,13 @@ describe('router forwards the size-control params (never silently drops them)', 
     expect(seen[0]).toMatchObject({ op: 'watch-read', params: { id: 'w1', samples: true } });
   });
 
-  it('/api/watch/read defaults samples to false (stats-only)', async () => {
+  it('/api/watch/read sends no samples unless asked (the op reads absent as stats-only), and decodes ?samples=0 as OFF', async () => {
     const { ctx, seen } = spyCtx();
     await get('/api/watch/read?id=w1', ctx);
-    expect(seen[0]).toMatchObject({ params: { samples: false } });
+    expect((seen[0].params as { samples?: boolean }).samples).toBeUndefined();
+    const b = spyCtx();
+    await get('/api/watch/read?id=w1&samples=0', b.ctx);
+    expect(b.seen[0]).toMatchObject({ params: { samples: false } });
   });
 
   it('/api/layout-bounds forwards entities + overlaps', async () => {
@@ -1714,19 +1717,19 @@ describe('router forwards the size-control params (never silently drops them)', 
     expect(p.overlaps).toBeUndefined();
   });
 
-  it('/api/console-logs DROPS a non-numeric limit rather than passing NaN', async () => {
-    // NaN defeats the op's tail (`NaN ?? 50` is NaN; `length > NaN` is false), so `?limit=abc`
-    // would return the whole 500-entry ring — a full-buffer flood produced by a typo.
+  // #1962: a malformed number is forwarded RAW — never NaN, never dropped — and the op refuses it
+  // (`checkOpParams` in runAgentOp; the refusal itself is pinned in routeVocabularyForwarding.test.ts).
+  // Dropped, `?since=abc` answered the default tail under a cursored framing.
+  it('/api/console-logs forwards a non-numeric limit RAW for the op to refuse (not NaN, not dropped)', async () => {
     const { ctx, seen } = spyCtx();
     await get('/api/console-logs?limit=abc', ctx);
-    expect((seen[0].params as { limit?: number }).limit).toBeUndefined();
+    expect((seen[0].params as { limit?: unknown }).limit).toBe('abc');
   });
 
-  it('/api/console-logs DROPS a non-numeric since rather than passing NaN', async () => {
-    // `ts > NaN` is false for every entry → zero logs, silently hiding real errors.
+  it('/api/console-logs forwards a non-numeric since RAW for the op to refuse (not NaN, not dropped)', async () => {
     const { ctx, seen } = spyCtx();
     await get('/api/console-logs?since=abc', ctx);
-    expect((seen[0].params as { since?: number }).since).toBeUndefined();
+    expect((seen[0].params as { since?: unknown }).since).toBe('abc');
   });
 
   it('/api/console-logs still forwards a valid limit', async () => {
@@ -1735,13 +1738,13 @@ describe('router forwards the size-control params (never silently drops them)', 
     expect(seen[0]).toMatchObject({ op: 'console-logs', params: { limit: 5 } });
   });
 
-  it('/api/layout-bounds forwards a numeric limit and drops a bad one', async () => {
+  it('/api/layout-bounds forwards a numeric limit, and a bad one RAW for the op to refuse (#1962)', async () => {
     const { ctx, seen } = spyCtx();
     await get('/api/layout-bounds?layer=3d&limit=10', ctx);
     expect(seen[0]).toMatchObject({ params: { layer: '3d', limit: 10 } });
     const b = spyCtx();
     await get('/api/layout-bounds?layer=3d&limit=abc', b.ctx);
-    expect((b.seen[0].params as { limit?: number }).limit).toBeUndefined();
+    expect((b.seen[0].params as { limit?: unknown }).limit).toBe('abc');
   });
 
   it('/api/editor-journal forwards limit', async () => {

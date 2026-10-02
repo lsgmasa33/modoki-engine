@@ -35,6 +35,7 @@ import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
 import { handleEval, clampEvalTimeout, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS } from '../debug/bridgeHelpers';
+import { clampWaitForEditTimeout } from '../../tools/shared/waitForTiming';
 import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES,
@@ -1283,21 +1284,6 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
 
 let registered = false;
 
-/** `wait-for-edit` (#28) timeout bounds. Exported so the backend relay
- *  (`editorBackendRouter.ts`) and the MCP tool (`modoki-mcp/src/tools/editor.ts`) can give
- *  their OWN transport timeouts generous headroom over this op's internal deadline — a
- *  relay/HTTP timeout shorter than the op's own wait would kill a legitimate long park and
- *  report it as a dead backend rather than the normal `timedOut:true` answer. */
-export const WAIT_FOR_EDIT_DEFAULT_MS = 30_000;
-/** Upper bound on a single park. Long enough for a human to look away and make one edit;
- *  short enough that a wedged/disconnected renderer doesn't hold an HTTP request open
- *  indefinitely (this is a blocking long-poll, not an SSE stream — see the #28 brief for why
- *  SSE was passed over). A caller that wants to keep watching just calls again with the
- *  returned `nextSeq`. */
-export const WAIT_FOR_EDIT_MAX_MS = 120_000;
-/** Floor — guards against a 0/negative timeoutMs turning this into a busy-poll. */
-export const WAIT_FOR_EDIT_MIN_MS = 50;
-
 /** Total item count across a timeline's tracks (clips / markers / cues / spans), tolerant of both a
  *  raw partial doc and a normalized one — so timeline-set can compare pre/post normalization and detect
  *  silently-dropped malformed items. Exported for the F12 regression test. (F12) */
@@ -1810,8 +1796,7 @@ export function registerEditorAgentOps(): void {
         { options: [...EDITOR_JOURNAL_SOURCES] });
     }
     refuseUnknownJournalType('wait-for-edit', p.type, 'nothing was waited for');
-    const requested = typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) ? p.timeoutMs : WAIT_FOR_EDIT_DEFAULT_MS;
-    const timeoutMs = Math.max(WAIT_FOR_EDIT_MIN_MS, Math.min(WAIT_FOR_EDIT_MAX_MS, requested));
+    const timeoutMs = clampWaitForEditTimeout(p.timeoutMs);
     // #1214 B-3: a pre-reload cursor would park for the whole timeout while the human edits.
     const cursor = resolveEditorJournalCursor(p.since, p.epoch);
     return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: cursor.since }, timeoutMs)

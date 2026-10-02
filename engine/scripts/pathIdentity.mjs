@@ -315,14 +315,20 @@ export function isUnderOrSame(parent, child) {
   const C = pathCaseKey(canonicalWithMissingTail(child));
   if (P === C) return true; // `path.relative(P, P)` is '', which the escape test below would reject
   const rel = path.relative(P, C);
-  // ⚠️ **`rel.startsWith('..')` is WRONG and this function shipped it once.** It also rejects a
-  // child whose NAME begins with two dots — `path.relative('/proj', '/proj/..bak')` is `'..bak'`,
-  // which is inside the project and has a perfectly good relative form. Only the `..` SEGMENT
-  // means escaped. `projectPaths.ts`'s `relativiseUnderProject` already carried this spelling with the same comment, and
-  // `projectPaths.test.ts` has a case named for it; the SSOT was written with the version that
-  // test exists to forbid, and review caught it.
-  const escapes = rel === '..' || rel.startsWith(`..${path.sep}`);
-  return rel !== '' && !escapes && !path.isAbsolute(rel);
+  // ⚠️ **`rel.startsWith('..')` is WRONG and this function shipped it once** — see `relEscapes`.
+  return rel !== '' && !relEscapes(rel);
+}
+
+/** Does a `path.relative(root, x)` result leave `root`? The ONE lexical containment test (#1965 item 6).
+ *
+ *  Only a `..` SEGMENT escapes. `rel.startsWith('..')` also rejects a child whose NAME begins with two
+ *  dots: `path.relative('/proj', '/proj/..bak')` is `'..bak'`, which is inside. That spelling shipped at
+ *  five sites, and this function's own caller shipped it once even though a test existed to forbid it.
+ *  An absolute result (another drive on win32) escapes too. `''` is the root itself and does NOT escape:
+ *  whether the root counts is the caller's question. Lexical: it resolves no symlink. Use
+ *  `isUnderOrSame` when the paths must be compared canonically. */
+export function relEscapes(rel) {
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
 }
 
 /** The OTHER spelling of an absolute path, or `null` when there is no distinct one.

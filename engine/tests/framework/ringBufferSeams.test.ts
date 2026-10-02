@@ -340,12 +340,17 @@ describe('float precision: the op rounds, the producer stays exact', () => {
     expect(r.entities[0].traits.Transform.x).toBe(EXACT);
   });
 
-  it('a garbage precision falls back to the default rather than disabling rounding', async () => {
+  it('a garbage precision is REFUSED, never read as "no rounding" (#1962: one rule on every transport)', async () => {
     game!.spawn(Transform({ x: EXACT }), EntityAttributes({ name: 'Garbage', guid: 'g2-guid' }));
-    const r = await runAgentOp('scene-state', { trait: 'Transform', name: 'Garbage', precision: NaN }) as {
+    for (const precision of [NaN, 'abc', -1]) {
+      const r = await runAgentOp('scene-state', { trait: 'Transform', name: 'Garbage', precision });
+      expect(r).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+    }
+    // A decimal STRING is the number it spells (the route and the MCP side decode it the same way).
+    const ok = await runAgentOp('scene-state', { trait: 'Transform', name: 'Garbage', precision: '9' }) as {
       entities: Array<{ traits: { Transform: { x: number } } }>;
     };
-    expect(r.entities[0].traits.Transform.x).toBe(ROUNDED);
+    expect(ok.entities[0].traits.Transform.x).toBe(ROUNDED);
   });
 
   it('integer-valued fields (id, parentId, returnedCount, totalCount) are never touched', async () => {

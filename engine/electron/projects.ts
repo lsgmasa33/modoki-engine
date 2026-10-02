@@ -17,7 +17,7 @@ import { showOpenDialog } from './mainDialog';
 import path from 'node:path';
 import crypto from 'node:crypto';
 // The ONE 'same directory?' comparison (#869) — see engine/scripts/pathIdentity.mjs.
-import { samePath } from '../scripts/pathIdentity.mjs';
+import { relEscapes, samePath } from '../scripts/pathIdentity.mjs';
 import { isProjectFolder } from '../plugins/backend/openProjectRoute';
 import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read through
 
@@ -157,7 +157,7 @@ export function addRecentProject(root: string): void {
  *  the two-clone guard picks. */
 export function isUnderRepo(repoRoot: string, p: string): boolean {
   const rel = path.relative(repoRoot, p);
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel !== '' && !relEscapes(rel); // a `..foo` folder is inside (#1965 item 6)
 }
 
 /** Is `projectRoot` the editor's OWN checkout rather than a game to open? (#869)

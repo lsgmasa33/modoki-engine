@@ -20,7 +20,7 @@ import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { conversionToolchainDir, conversionCliDist } from '../../toolchain';
 
-const { spawned, healCalls, scaffoldCalls, installs } = vi.hoisted(() => ({ spawned: [] as string[], healCalls: { n: 0 }, scaffoldCalls: { n: 0 }, installs: [] as Array<{ id: string; toolchainDir: string }> }));
+const { spawned, spawnedArgv, healCalls, scaffoldCalls, installs } = vi.hoisted(() => ({ spawned: [] as string[], spawnedArgv: [] as string[][], healCalls: { n: 0 }, scaffoldCalls: { n: 0 }, installs: [] as Array<{ id: string; toolchainDir: string }> }));
 /** Every answer a route's slot gave `onPipelineStart` — the observable that a route's setup has
  *  finished and it has DECIDED whether to start (#1478). Pass-through: the real policy answers. */
 const pipelineStarts = vi.hoisted(() => [] as boolean[]);
@@ -45,6 +45,8 @@ const stubs = vi.hoisted(() => ({
   buildNumbersThrows: null as Error | null,
   /** An OTA preflight refusal to answer instead of the default pass (#1824). */
   otaRefusal: null as string | null,
+  /** What the route handed the preflight on its last call (#1962). */
+  otaPreflightArgs: null as Record<string, unknown> | null,
 }));
 
 vi.mock('../../plugins/healNativeProject', () => ({
@@ -96,7 +98,7 @@ vi.mock('../../scripts/ota/publishPreflight.mjs', async (importOriginal) => {
   return {
     ...real,
     readRawOtaBlock: () => ({ ok: true, ota: {} }),
-    otaPublishPreflight: () => (stubs.otaRefusal
+    otaPublishPreflight: (args: Record<string, unknown>) => (stubs.otaPreflightArgs = args, stubs.otaRefusal
       ? { ok: false, refusal: stubs.otaRefusal }
       : { ok: true, target: { kind: 'self' }, version: 'v1', bucket: 'gs://fixture-bucket/ota' }),
   };
@@ -115,8 +117,9 @@ vi.mock('../../plugins/buildStepShell', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../plugins/buildStepShell')>();
   return {
     ...real,
-    spawnBuildStep: (step: { label: string }) => {
+    spawnBuildStep: (step: { label: string; cmd?: string; args?: string[] }) => {
       spawned.push(step.label);
+      spawnedArgv.push([step.cmd ?? '', ...(step.args ?? [])]);
       const proc = new EventEmitter() as EventEmitter & { stdout: null; stderr: null; pid: undefined };
       proc.stdout = null; proc.stderr = null; proc.pid = undefined;
       setTimeout(() => proc.emit('close', 0), 0);
@@ -305,6 +308,52 @@ describe('#1824: a refusal before the stream opens is sent IN it', () => {
     expect(res.getHeader('Content-Type')).toBe('text/event-stream');
     expect(res.statuses()).toEqual(['FAILED:OTA publish refused\nota.enabled is false for this project — turn it on in Project Settings first.']);
     expect(spawned).toEqual([]);
+  });
+
+  // #1962: the one flag spelling. `?mandatory=true` read as "inherit" (only '1'/'0' were spellings).
+  it('/api/ota/publish: ?mandatory=yes is refused in the stream, before the preflight and the build', async () => {
+    spawned.length = 0;
+    stubs.otaPreflightArgs = null;
+    const { res } = drive('/api/ota/publish?version=v1&mandatory=yes');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses()).toEqual(['FAILED:OTA publish refused\nmandatory must be 1/true (set), 0/false (clear) or omitted (inherit), got "yes".']);
+    expect(stubs.otaPreflightArgs).toBeNull();
+    expect(spawned).toEqual([]);
+  });
+
+  // #1962, as /api/ota/status: an EMPTY ?bucket= is absent, so the bucket is derived from ota.baseUrl; and a
+  // bad EXPLICIT bucket is named as the caller's, not answered with "pass ?bucket= explicitly".
+  it.each([
+    ['true', '--mandatory'], ['1', '--mandatory'], ['false', '--no-mandatory'], ['0', '--no-mandatory'],
+  ])('/api/ota/publish: ?mandatory=%s reaches ota-publish.mjs as %s (`true` used to read as "inherit")', async (q, flag) => {
+    spawnedArgv.length = 0;
+    const { res } = drive(`/api/ota/publish?version=v1&mandatory=${q}`);
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 10000 });
+    const publish = spawnedArgv.find((argv) => argv.some((a) => a.endsWith('ota-publish.mjs')));
+    expect(publish, `steps: ${JSON.stringify(spawnedArgv)}`).toBeDefined();
+    expect(publish).toContain(flag);
+  });
+
+  it('/api/ota/publish: no ?bucket= and a baseUrl that names none is told to pass one (not "bucket null")', async () => {
+    stubs.otaRefusal = 'bad-bucket';
+    const { res } = drive('/api/ota/publish?version=v1');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses()[0]).toMatch(/Could not derive a gs:\/\/ bucket from ota\.baseUrl .*Pass \?bucket=gs:\/\/\.\.\. explicitly/);
+  });
+
+  it('/api/ota/publish: an empty ?bucket= derives from ota.baseUrl', async () => {
+    fs.writeFileSync(path.join(projectRoot, 'project.config.json'), JSON.stringify({ app: { appId: 'com.example.fixture', appName: 'Fixture' }, ota: { baseUrl: 'https://storage.googleapis.com/fixture-derived/ota/' } }));
+    stubs.otaRefusal = 'not-enabled'; // stop right after the preflight: only its input matters here
+    const { res } = drive('/api/ota/publish?version=v1&bucket=');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(stubs.otaPreflightArgs?.bucket).toBe('gs://fixture-derived/ota');
+  });
+
+  it('/api/ota/publish: a malformed explicit ?bucket= is refused naming that bucket', async () => {
+    stubs.otaRefusal = 'bad-bucket';
+    const { res } = drive('/api/ota/publish?version=v1&bucket=gs%3A%2F%2Fbad%20bucket');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses()).toEqual(['FAILED:OTA publish refused\nbucket "gs://bad bucket" is not a usable gs:// bucket (expected gs://<name>[/<prefix>] in letters, digits and . _ - /).']);
   });
 });
 

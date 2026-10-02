@@ -157,6 +157,7 @@ import { makeSchemaPusher } from './schemaPusher';
 // this is a deliberate exception to the app→tools/shared "types only" convention.
 import { SIM_STEP_MAX_TIMEOUT_MS, SIM_STEP_MAX_FRAMES, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
 import { PROFILER_ACTIONS, isProfilerAction } from '../../tools/shared/profilerActions';
+import { checkOpParams } from '../../tools/shared/opParams';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
@@ -908,9 +909,7 @@ registerAgentOp('console-logs', (params) => {
   if (p.since != null && p.sinceMs != null) {
     return { ok: false as const, code: 'AMBIGUOUS' as const, error: 'console-logs: pass since (a ring seq cursor, from nextSeq) OR sinceMs (an epoch-ms timestamp), not both — they select by different clocks.', options: ['since', 'sinceMs'] };
   }
-  if (p.since != null && (!Number.isInteger(p.since) || p.since < 0)) {
-    return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: since is a ring seq cursor (a non-negative integer — pass back a reply's nextSeq), got ${p.since}.` };
-  }
+  // `since` arrives a non-negative integer, `sinceMs` a finite number (`OP_PARAMS`, #1962) — only their MEANING is checked here.
   if (p.since != null && p.since >= CONSOLE_SEQ_CEILING) {
     return { ok: false as const, code: 'REFUSED_BY_OP' as const, error: `console-logs: since=${p.since} is a timestamp, but since is a ring SEQ cursor — pass back a reply's nextSeq. For "logged after this instant", use sinceMs=${p.since}.`, options: ['sinceMs'] };
   }
@@ -1031,12 +1030,7 @@ registerAgentOp('journal-events', (params) => {
       options: ['sinceCap', 'epoch'],
     };
   }
-  if (p.sinceCap !== undefined && (typeof p.sinceCap !== 'number' || !Number.isFinite(p.sinceCap) || p.sinceCap < 0)) {
-    return {
-      ok: false, code: 'REFUSED_BY_OP',
-      error: `sinceCap must be a non-negative number (a nextCap from an earlier read), got ${JSON.stringify(p.sinceCap)} — nothing was read.`,
-    };
-  }
+  // `sinceCap` and `limit` arrive checked (`OP_PARAMS`, #1962).
   // ⚠️ These two vocabulary refusals carry a §5 CODE and `options`, and that is load-bearing, not
   // decoration (#1072). This op answers a GET relay: `relayJson` sends a coded envelope as a 400, and
   // the MCP client fails any status ≥400 — but a plain read's 200 body is NOT checked for `ok:false`
@@ -1664,14 +1658,8 @@ registerAgentOp('profiler', (raw: unknown) => {
       options: [...PROFILER_ACTIONS],
     };
   }
-  // A count that is not a number used to reach `Math.max(1, NaN)` — which is NaN, so `slice(0, NaN)`
-  // returned nothing and the read looked empty. The GET route strips such values; a POST, an eval and
-  // a device relay did not.
-  for (const k of ['limit', 'markers'] as const) {
-    if (params[k] !== undefined && (typeof params[k] !== 'number' || !Number.isFinite(params[k]))) {
-      return { ok: false, code: 'REFUSED_BY_OP', error: `profiler: ${k} must be a finite number — got ${JSON.stringify(params[k])}. Nothing was read.` };
-    }
-  }
+  // `limit`/`markers` arrive checked (`OP_PARAMS`, #1962): a non-number used to reach `Math.max(1, NaN)`, so
+  // `slice(0, NaN)` returned nothing and the read looked empty.
   switch (action) {
     case 'capture-start':
       startCapture();
@@ -2993,6 +2981,11 @@ registerAgentOp('set-traits', (params) => applySetTraits(params));
 export async function runAgentOp(op: string, params: unknown = {}): Promise<unknown> {
   const handler = agentOps.get(op);
   if (!handler) throw new Error(`unknown agent op '${op}'`);
+  // The op's TYPED params, checked by the table its route decodes with (#1962, `tools/shared/opParams.ts`) —
+  // here, so every transport refuses a malformed value the same way. RETURNED, before the gate: nothing ran.
+  const checked = checkOpParams(op, params);
+  if (!checked.ok) return checked.refusal;
+  params = checked.params;
   // Asked here, the one entry point both editor transports and an eval's `modoki.call` share, so no path skips it.
   const gate = _opGate?.(op, params) ?? null;
   if (gate instanceof OpRefusal) throw gate;

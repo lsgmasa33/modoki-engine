@@ -29,7 +29,7 @@ implementation in `engine/tools/modoki-mcp/src/tools/editor.ts`, backend route
   `nextSeq` cursor; omit to wait for the *next* event from now, not to replay history), `epoch`
   (the `epoch` returned with that cursor — send it back with `since`),
   `timeoutMs` (default 30000, clamped server-side to `[50, 120000]` —
-  `WAIT_FOR_EDIT_MIN_MS`/`WAIT_FOR_EDIT_MAX_MS` in `agentEditorOps.ts`).
+  `clampWaitForEditTimeout` in `engine/tools/shared/waitForTiming.ts`, shared by the op, the relay and the tool).
 - If a matching event already happened after `since`, it returns **immediately** — you are never
   made to wait for something that already occurred.
 - Otherwise it blocks (a real held HTTP request, not client-side polling) until a matching event

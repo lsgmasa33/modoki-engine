@@ -17,6 +17,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
 import { notePendingHeader } from './pendingStamp.js';
 import { PENDING_OUTSIDE_HEADER } from '../../shared/pendingOutside.js';
+import { EDITOR_EVAL_MAX_TIMEOUT_MS, EVAL_ASYNC_TIMEOUT_MS, EVAL_CLIENT_HEADROOM_MS, clampEvalTimeout } from '../../shared/evalTiming.js';
 import { createSseParser, type SseFrame } from '../../../packages/modoki/src/editor/backend/sseFrames.js';
 import { buildLogLines, buildLogTail, writeBuildLog } from './buildLog.js';
 
@@ -447,8 +448,9 @@ export function createToolContext(config: { backend: string; token?: string }): 
       // fires first and reports the wrong cause: eval budget (renderer) < relay (backend, +10s)
       // < this client abort (+15s). The client's 30s default was already smaller than a 25s
       // eval + 10s relay, so it has to be sized here rather than left at the default.
-      const clientTimeout = Number.isFinite(timeoutMs) && (timeoutMs as number) > 0
-        ? Math.max(50, Math.min(25_000, Math.floor(timeoutMs as number))) + 15_000
+      // The op's own clamp, imported (#1962), so the three layers cannot disagree about the budget.
+      const clientTimeout = timeoutMs != null
+        ? clampEvalTimeout(timeoutMs, EVAL_ASYNC_TIMEOUT_MS, EDITOR_EVAL_MAX_TIMEOUT_MS) + EVAL_CLIENT_HEADROOM_MS
         : undefined;
       const { status, body } = await call('/api/eval', {
         method: 'POST',

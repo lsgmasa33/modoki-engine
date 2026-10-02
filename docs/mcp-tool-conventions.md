@@ -788,6 +788,33 @@ Rules:
     device relay flattens it to a string, and the editor relay can only call it `REFUSED_BY_OP`
     with the options stranded in the prose. The builders keep a throw as a programming-error
     backstop, using the SAME membership predicate — one check per table, not a second copy.
+- **A route never parses a TYPED param by its own rule. The op's table decodes it, and the op refuses
+  it** (#1962). A typed param is a number, a flag, a number list or a point. This is the numeric and
+  boolean twin of the vocabulary rule above. Each route parsed by its own rule, and each op checked by
+  another or not at all:
+  - a malformed number was DROPPED, so `?since=abc` answered the default tail under a cursored framing;
+  - flags had three spellings, and a truthy `?entities=0` turned the list ON;
+  - `/api/eval` restated the op's clamp and took a number only, so `{timeoutMs:"20000"}` sized a 15s
+    relay around a 20s eval.
+
+  `engine/tools/shared/opParams.ts` (`OP_PARAMS`) is now the op's schema for those params, and both
+  sides read it:
+  - **Route.** `decodeOpQuery` decodes with `coerceArgs`' lossless decoder, the rule the MCP side
+    already applies, and forwards what it cannot decode RAW.
+  - **Op.** `runAgentOp` runs `checkOpParams` before every handler, so all four transports refuse the
+    same value, coded, RETURNED rather than thrown, so the device relay keeps the code.
+  - **Flags.** A flag is `1`/`true` or `0`/`false`. Anything else is refused.
+  - **Counts.** A count (`limit`, `precision`, `markers`) is floored and must be >= 0. A `since`
+    cursor must be a non-negative integer.
+  - **Timing clamps.** The eval and wait-for-edit clamps live in `tools/shared` (`evalTiming.ts`,
+    `waitForTiming.ts`) and are imported by the op, the relay and the MCP client.
+  - **No op behind the route.** A backend-only route uses the same `decodeQueryFlag` and refuses the
+    raw rest itself (`find-references ?reachableOnly`).
+
+  **Adding a numeric or boolean param to a relayed op means adding it to `OP_PARAMS`.** Guarded by
+  `tests/plugins/opParams.test.ts`: the router may hold no `!Number.isNaN(Number(` drop and no
+  hand-spelled flag, and every table entry must be a registered op that some route decodes.
+
 - **A relayed route never HARD-CODES its catch status** (#1013). This is the receive-side half of
   the rule above, and the two are not the same fix: the emit side stops an op from *losing* its
   code, this side stops the route from *inventing* one. `ctx.requestBrowser` rejects identically

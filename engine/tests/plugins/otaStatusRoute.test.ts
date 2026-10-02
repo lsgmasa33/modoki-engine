@@ -94,11 +94,24 @@ describe('GET /api/ota/status (#1985)', () => {
     expect(argv()).toEqual(['storage', 'cat', 'gs://other-bucket/release.json']);
   });
 
-  it('a bucket that is not a safe gs:// URI is 400, and gcloud is never run', async () => {
+  it('a bucket that is not a safe gs:// URI is 400 NAMING the bucket it was given, and gcloud is never run', async () => {
     answer({ stdout: '{}' });
     const r = await status('gs://x;rm -rf ~');
     expect(r.status).toBe(400);
+    // #1962: it used to say "could not derive … Pass ?bucket= explicitly", to a caller who just had.
+    expect(String(r.body.error)).toContain('"gs://x;rm -rf ~" is not a usable gs:// bucket');
+    expect(String(r.body.error)).not.toMatch(/Pass \?bucket=/);
     expect(argv()).toBeNull();
+  });
+
+  it('an EMPTY ?bucket= is absent: the bucket is derived from ota.baseUrl (#1962 — `??` kept the empty string)', async () => {
+    answer({ stdout: JSON.stringify({ version: '1.0.0' }) });
+    const r = await handleBackendRequest({ projectRoot } as unknown as BackendContext, {
+      method: 'GET', urlPath: '/api/ota/status', query: new URLSearchParams('bucket='), body: undefined,
+    }) as { status?: number; body: Record<string, unknown> };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toMatchObject({ ok: true, bucket: BUCKET });
+    expect(argv()).toEqual(['storage', 'cat', `${BUCKET}/release.json`]);
   });
 
   it('with no ?bucket= and an ota.baseUrl that names none, 400 says to pass one; gcloud is never run', async () => {

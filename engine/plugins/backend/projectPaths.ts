@@ -13,7 +13,7 @@
  *  because the route itself cannot be unit-tested: it blocks on a modal `osascript` panel that
  *  only a human can dismiss (see `routeCoverage.test.ts`). */
 import path from 'node:path';
-import { canonicalPath } from '../../scripts/pathIdentity.mjs';
+import { canonicalPath, relEscapes } from '../../scripts/pathIdentity.mjs';
 
 /** Resolve symlinks in the CONTAINING directory only, keeping the leaf name as chosen.
  *  Resolving the leaf too would follow a symlink that lives inside the project out to its
@@ -56,13 +56,12 @@ export function relativiseUnderProject(projectRoot: string, chosenAbs: string): 
   // `rel === ''` means the project root itself was picked. There is no relative spelling of that
   // an asset field could use, so it stays absolute rather than becoming an empty value that reads
   // as "unset".
-  // `startsWith('..')` — the spelling this replaced — also rejects a directory whose NAME starts
-  // with two dots (`..art/icon.png` is inside the project and has a perfectly good relative form).
-  // Only the `..` segment itself means "escaped".
-  const escapes = rel === '..' || rel.startsWith(`..${path.sep}`);
-  const inside = rel !== '' && !escapes && !path.isAbsolute(rel);
+  const inside = rel !== '' && !relEscapes(rel);
   return inside ? rel.split(path.sep).join('/') : chosen;
 }
+
+/** The lexical containment test lives in `scripts/pathIdentity.mjs` (#1965 item 6); re-exported for the backend. */
+export { relEscapes };
 
 /** Where a file DROPPED on a Project Settings path field should land, and whether its bytes
  *  actually have to be written.
