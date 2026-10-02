@@ -1126,8 +1126,8 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   human's real project (CLAUDE.md #18). ⚠️ Passing an explicit `path` does not make it safe, two ways,
   both measured. (a) A save-as writes the CURRENT scene's own guid into the new file, so the probe and
   the real scene briefly share one guid; the dev asset scanner auto-heals a guid collision by keeping
-  the lexicographically-first path's id and REWRITING the other file
-  (`engine/plugins/vite-asset-scanner.ts`, `buildManifest(..., heal=true)`) — the first green run of
+  one file's id and REWRITING the other (`engine/plugins/vite-asset-scanner.ts`, `buildManifest(..., heal=true)`;
+  the keeper was the lexicographically-first path then, and is the prior owner since #1996) — the first green run of
   the save_all case re-minted the guid of the committed `tropical-island.scene.json` while reporting
   SMOKE OK. Keep the probe out of the manifest entirely: `detectType` classifies a plain `.json` as a
   scene only by the `.scene.json` suffix or the legacy `/scenes/` directory, and as a material only

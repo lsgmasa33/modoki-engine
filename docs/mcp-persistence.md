@@ -880,9 +880,10 @@ Duplicate does (`remintSceneEntityGuids`, with #1293's accepted `Persistent` cos
 already at that path, it is overwritten, and its old id stops resolving. That is deliberate: what
 referenced a scene replaced by Save As no longer resolves. It is not drift from the rule above.
 - **Why not keep an id.** The copy used to take the OPEN scene's id, so two files claimed one guid.
-  The dev scanner heals that by keeping the lexicographically-first path's id and rewriting the
+  The dev scanner then healed that by keeping the lexicographically-first path's id and rewriting the
   other file's (`buildManifest(…, heal=true)`), so it re-minted the COMMITTED original whenever the
-  copy sorted first. Measured on the MCP smoke: `mcp-smoke-save` rewrote `tropical-island`'s id. The
+  copy sorted first. (Since #1996 the heal keeps the prior owner and falls back to path order only with no
+  record: [editor.md](editor.md) § the copy census.) Measured on the MCP smoke: `mcp-smoke-save` rewrote `tropical-island`'s id. The
   smoke case now does exactly that save-as and asserts the original stays byte-identical.
 - **The editor reopens the copy.** The live world still holds the original's scene and entity guids.
   Left pointing at the copy, the next save would write them straight back into it, so the copy is
@@ -916,7 +917,7 @@ referenced a scene replaced by Save As no longer resolves. It is not drift from 
   and its Finder duplicate carrying one unused id both kept it (found in review, observed). A redo asks
   again, since the id it kept can have been taken while undone, and it writes nothing it could not get
   an answer for. ⚠️ Both decide BEFORE the bytes reach disk, against the route's own manifest. Left to the scanner, a colliding copy meets the heal
-  described above, which re-mints the ORIGINAL whenever the import sorts first. Before #1713 both imports
+  described above, which re-mints the ORIGINAL whenever the import sorts first and nothing records the prior owner. Before #1713 both imports
   copied byte for byte and left the collision to that heal. A binary, a `.layout.json`, a JSON file the
   scanner types as no asset, and unparseable JSON are written as they came.
 - **The reply names every file in the asset-root form (#1562).** The renderer builds the reply from

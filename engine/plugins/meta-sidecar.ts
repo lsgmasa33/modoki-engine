@@ -74,6 +74,48 @@ import { readJsonFile } from '../scripts/jsonFile.mjs'; // #1799: a BOM is read 
 import { CACHE_BLOCKS, type CacheBlock } from '../packages/modoki/src/runtime/loaders/sidecarSettings';
 export { CACHE_BLOCKS, type CacheBlock, sameImportSettings, BAKE_WRITABLE_KEYS } from '../packages/modoki/src/runtime/loaders/sidecarSettings';
 
+/** Re-mint, in place on `meta`, every GUID a binary sidecar DEFINES besides `id`, and return old → new.
+ *
+ *  Census of `BinaryAssetMeta` (assetManifest.ts, 2026-10-01): `sprites[].guid` is the only one. The whole-image
+ *  sprite is `deriveGuid('sprite:' + id)`, so it follows `id`, and nothing else in a sidecar holds a GUID.
+ *
+ *  ⚠️ A NEW field that defines a GUID is added HERE. This is the one list for both ways a sidecar gets copied: the
+ *  editor's Duplicate/Paste (`freshSidecarIdentity`, #1974) and a copy made outside the editor, which the scan's
+ *  collision heal re-mints (`writeAssetGuid`, #1987). The heal passes `only`, so it re-mints just the slice GUIDs that
+ *  actually collide; an editor copy re-mints every one. */
+export function remintSubAssetGuids(
+  meta: Record<string, unknown>, genGuid: () => string, only?: (guid: string) => boolean,
+): Map<string, string> {
+  const remap = new Map<string, string>();
+  if (Array.isArray(meta.sprites)) {
+    meta.sprites = meta.sprites.map((s: unknown) => {
+      if (!s || typeof s !== 'object') return s;
+      const old = (s as { guid?: unknown }).guid;
+      // `only` is the heal's: a slice the user added to the copy after copying it collides with nothing (#1996).
+      if (only && (typeof old !== 'string' || !only(old))) return s;
+      const fresh = genGuid();
+      if (typeof old === 'string') remap.set(old, fresh);
+      return { ...(s as Record<string, unknown>), guid: fresh };
+    });
+  }
+  return remap;
+}
+
+/** What a COPY of a binary keeps of its source's sidecar: everything but its identity. `id` becomes `id`, every
+ *  sub-asset GUID is re-minted (`remintSubAssetGuids`, filtered by `only`), and `generated` is dropped, because the
+ *  derived files belong to the original (a delete of the copy would trash them). Returns a new object and old → new.
+ *
+ *  The ONE rule for both kinds of copy: the editor's Duplicate/Paste (`freshSidecarIdentity`, #1974) and the scan's
+ *  heal of a copy made outside the editor once a prior owner proves which file is the copy (`writeAssetGuid`, #1996).
+ *  A field a copy must lose is dropped HERE. */
+export function copiedSidecarIdentity(
+  meta: Record<string, unknown>, id: string, genGuid: () => string, only?: (guid: string) => boolean,
+): { meta: Record<string, unknown>; reminted: Map<string, string> } {
+  const out: Record<string, unknown> = { ...meta, id };
+  delete out.generated;
+  return { meta: out, reminted: remintSubAssetGuids(out, genGuid, only) };
+}
+
 /** The FORMAT version of the `.meta.json` sidecar document — how the file is laid
  *  out (which top-level fields exist, how cache blocks are shaped), NOT a version
  *  of the asset it describes. `writeMetaSidecar` compares this against whatever

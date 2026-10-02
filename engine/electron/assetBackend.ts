@@ -3,13 +3,13 @@
  * Phase 2). Provides the same asset-root resolution + manifest cache + file
  * watcher the Vite plugin owns, so the *same* editorBackendRouter can run in
  * main with no Vite server. The pure machinery (findAssetRoots / scanAllAssets /
- * buildManifest / resolveAssetPath / absToAssetUrl / detectType) is reused from
+ * scanDevManifest / resolveAssetPath / absToAssetUrl / detectType) is reused from
  * the scanner; only the transport-specific glue (the shared asset-tree watcher +
  * broadcast callbacks) lives here.
  */
 
 import {
-  findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, createSceneChangeBatch,
+  findAssetRoots, defaultSaveRootDir, scanDevManifest, resolveAssetPath, absToAssetUrl, createSceneChangeBatch,
   type AssetRoot,
   type LiveReloadKind,
 } from '../plugins/vite-asset-scanner';
@@ -48,7 +48,7 @@ export function createAssetBackend(opts: {
 }): ElectronAssetBackend {
   const { projectRoot, onManifestUpdated, onSceneChanged } = opts;
   let assetRoots: AssetRoot[] = findAssetRoots(projectRoot);
-  let cachedManifest = buildManifest(scanAllAssets(assetRoots), true) as ElectronAssetManifest;
+  let cachedManifest = scanDevManifest(assetRoots) as ElectronAssetManifest;
 
   // ── Editor-own-write suppression — the SAME guard the Vite plugin's watcher uses ──
   // A route that changes a watched file marks it (`markEditorWrite`) so the watcher skips the hot-reload broadcast — an
@@ -61,7 +61,7 @@ export function createAssetBackend(opts: {
 
   const rebuildManifest = (): ElectronAssetManifest => {
     assetRoots = findAssetRoots(projectRoot);
-    cachedManifest = buildManifest(scanAllAssets(assetRoots), true) as ElectronAssetManifest;
+    cachedManifest = scanDevManifest(assetRoots) as ElectronAssetManifest;
     onManifestUpdated?.(cachedManifest);
     return cachedManifest;
   };

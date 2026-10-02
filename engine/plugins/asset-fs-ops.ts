@@ -12,7 +12,7 @@ import { assetJsonBytes } from './backend/editorBackendRouter';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
-import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
+import { writeMetaSidecar, copiedSidecarIdentity, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
 import { durableGuid, memberRowNodes, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
 import {
   derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, MAX_INSTANCE_DEPTH, type PrefabReader,
@@ -90,24 +90,11 @@ export function removeOrphanSidecars(absTarget: string): string[] {
 }
 
 /** A copied binary's sidecar: every GUID the sidecar DEFINES, re-minted. This is the COPY half of "a sidecar's identity
- *  belongs to exactly one live file" (#1974; the create half is `removeOrphanSidecars`).
- *
- *  Census of `BinaryAssetMeta` (assetManifest.ts, 2026-10-01):
- *  - `id` and `sprites[].guid` are the GUIDs it DEFINES.
- *  - The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`.
- *  - Nothing else in a sidecar holds a GUID.
- *
- *  ⚠️ A NEW field that defines a GUID must be added HERE, or every copy shares it with its source. The slices did
- *  (#1974): two textures then defined every slice GUID, slice refs drew whichever registered last, and the scan's
- *  collision heal could not see it, because a sub-asset has no file of its own to re-mint. `generated` is dropped:
- *  derived files belong to the original. */
+ *  belongs to exactly one live file" (#1974; the create half is `removeOrphanSidecars`). Which GUIDs those are is
+ *  `copiedSidecarIdentity`'s rule, shared with the scan's heal of a copy made outside the editor (#1996). Before #1974
+ *  the slices were kept: two textures then defined every slice GUID, and slice refs drew whichever registered last. */
 export function freshSidecarIdentity(meta: Record<string, unknown>, id: string, genGuid: () => string): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...meta, id };
-  delete out.generated;
-  if (Array.isArray(meta.sprites)) {
-    out.sprites = meta.sprites.map((s: unknown) => (s && typeof s === 'object' ? { ...(s as Record<string, unknown>), guid: genGuid() } : s));
-  }
-  return out;
+  return copiedSidecarIdentity(meta, id, genGuid).meta;
 }
 
 /** Build the platform-specific command + argv that moves one OR MANY files/folders

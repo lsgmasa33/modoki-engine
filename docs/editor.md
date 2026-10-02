@@ -4122,10 +4122,50 @@ owner:
 | **Copy** | Duplicate and Paste re-minted `meta.id` and kept `sprites[].guid`, so two textures defined every slice GUID, and slice refs drew whichever texture registered last | `freshSidecarIdentity` (`asset-fs-ops.ts`) re-mints every GUID a sidecar DEFINES (#1974) |
 | **Create** | a file deleted OUTSIDE the editor (Finder, git) left its sidecar, and an import or drop of a same-named file inherited the dead GUID and slices | `removeOrphanSidecars` runs before import-file, write-file, adopt-file, and the move and duplicate destinations (#1975) |
 
-- **The copy census** (`BinaryAssetMeta`, 2026-10-01): `id` and `sprites[].guid` are the GUIDs a sidecar
-  defines. The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`. ⚠️ A new field
-  that DEFINES a GUID must be added to `freshSidecarIdentity`, or every copy shares it. The scan's
-  collision heal cannot catch it: a sub-asset has no file of its own to re-mint.
+- **The copy census** (`remintSubAssetGuids`, `meta-sidecar.ts`): `id` and `sprites[].guid` are the GUIDs a
+  sidecar defines. The whole-image sprite is `deriveGuid('sprite:' + id)`, so it follows `id`. ⚠️ A new field
+  that DEFINES a GUID is added to that one helper, which serves both kinds of copy: the editor's Duplicate and
+  Paste (`freshSidecarIdentity`), and a copy made OUTSIDE the editor (Finder, Explorer, git), which the scan's
+  collision heal finds by its colliding `id` and re-mints with the slice GUIDs that still collide (#1996). Before
+  that the heal re-minted only `id`, so an outside copy of a sliced texture shared every slice GUID for good, and the
+  scan warned `GUID collision` on every pass. A slice added to the copy after copying collides with nothing and keeps
+  its GUID.
+- **Which file keeps a copied GUID: the PRIOR OWNER** (#1996, owner ruling 2026-10-02, as in Unity). The file that
+  held the GUID before the copy appeared keeps it, and the copy is re-minted by `copiedSidecarIdentity`, the same
+  rule as the editor's Duplicate (`generated` is dropped too). `scanDevManifest` (every host) keeps a record of GUID → path for each file-backed asset, and
+  `buildManifest` keeps the id on the recorded path.
+  - **Persisted, not just the in-memory manifest**, because outside copies are made while the editor is CLOSED, and
+    its first scan would have no previous manifest.
+  - **One record per asset-root DIRECTORY, not per host** (`guidOwnersFile`: `~/.modoki/guid-owners/<hash of the
+    canonical dir>.json`, keyed by root-relative path). The repo-root Vite server (`npm test`, `verify`) and the editor
+    on a project scan the same `games/<id>/assets` under different URL prefixes. A record per host let whichever
+    scanned first decide, so a test run re-minted the original (review of #1996, observed). It lives in no repo (a
+    standalone project does not gitignore `.cache/`) and never inside an app bundle. It names the root by its canonical
+    path, the one its file name hashes, so a symlinked spelling resolves to the same record.
+  - **Owners are kept per root, each with `since`** — when this machine first recorded the GUID in that root. A
+    cross-project duplicate left standing (#1584) is recorded in both roots, and the editor on one of those projects
+    can still heal it: it sees the engine built-in root and its own root as ONE project (`''`), where the repo-root
+    server saw two. The root that recorded the GUID FIRST keeps it (scoped review of #1996, observed: without `since`, an
+    engine font copied into a game re-minted the ENGINE's original). Only a unique earliest record decides that a file
+    is the copy; a tie (both first seen in one scan) falls through to the fallback order and keeps `generated`.
+  - **Every host and every test reads the REAL store.** A test that starts a host on a scratch project still scans the
+    real engine built-in root beside it, and its heal writes real sidecars, so a scratch store there re-minted by path
+    order (re-review of #1996, observed). Instead, `pruneGuidOwnerStore` (once per store per module instance: per
+    process for a host, per test file under vitest) deletes the records whose
+    root no longer exists: scratch projects, agent worktrees, publish stages. A root that is only temporarily missing
+    (an unmounted drive) loses its record and falls back to path order once.
+  - **The fallback order applies only without a decisive record**: the first scan of that directory on this machine
+    (a fresh clone, an agent worktree), a tie, or the recorded file is gone. It puts an engine built-in (`/modoki/…`)
+    first, since a project copy of one is always the copy, then the path that sorts first. `generated` is kept there,
+    because the file re-minted can be the original.
+  - **Why path order alone is wrong**: the copy usually sorts first. `"sheet copy.png"`, `"sheet - Copy.png"`,
+    `"sheet (1).png"` and `"textures copy/sheet.png"` all `localeCompare` before the original, so the ORIGINAL was
+    re-minted. Once slices were re-minted too, deleting the accidental copy broke every slice ref to the original for
+    good, which is why the slice re-mint (#1987 round 3) was reverted until this rule existed. Neither rule uses mtime,
+    which git clone and checkout reset.
+  - **Which copies collide at all**: a copy that carries its sidecar under the matching name — `cp` of the pair, a
+    copied folder, git. A same-folder Finder Duplicate of the pair names the sidecar `sheet.png.meta copy.json`, so the
+    copy gets a freshly minted id and nothing collides.
 - **No orphan sweep at rescan time, on purpose.** A move done in Finder renames the file and its sidecar
   as two separate events, and a rescan between them would delete a LIVE asset's identity. A create cannot
   tell an orphan from a sidecar whose file is on its way either, but it does not need to: it is about to

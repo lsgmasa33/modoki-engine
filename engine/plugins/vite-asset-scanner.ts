@@ -7,7 +7,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { createEditorWriteGuard, fingerprintFile } from './editorWriteGuard';
 import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatcher';
 import { normalizePath, type Plugin } from 'vite';
@@ -50,6 +50,8 @@ import {
   readMetaSidecar,
   assertSidecarWritable,
   quarantineCorruptSidecar,
+  remintSubAssetGuids,
+  copiedSidecarIdentity,
   salvageSidecarId,
   CORRUPT_SIDECAR_SUFFIX,
   SIDECAR_FORMAT_VERSION,
@@ -312,8 +314,18 @@ function writeJsonAtomic(absPath: string, json: unknown): void {
  *  (`<file>.meta.json` for binaries). Returns true on success. Used by collision
  *  auto-heal. Preserves the existing JSON shape, only replacing `id`. Atomic —
  *  a crash mid-write leaves the old file intact so we don't lose either the
- *  asset's id or its sidecar metadata. */
-export function writeAssetGuid(absPath: string, type: string, guid: string): boolean {
+ *  asset's id or its sidecar metadata.
+ *
+ *  `slices`, when passed, re-mints in the same sidecar write each sub-asset GUID (`remintSubAssetGuids`) that
+ *  `slices.only` accepts, and records old → new in `slices.reminted` (filled only on success). The collision heal
+ *  passes it, because a file that collides on its `id` is a COPY made outside the editor (Finder, Explorer, git), and a
+ *  copy shares its slice GUIDs too (#1996; #1974 closed only the editor's Duplicate). `slices.dropGenerated` applies
+ *  the editor Duplicate's whole rule (`copiedSidecarIdentity`: `generated` goes too); the heal sets it only when a prior
+ *  owner proves this file is the copy, because on the path-order fallback the file re-minted here can be the original. */
+export function writeAssetGuid(
+  absPath: string, type: string, guid: string,
+  slices?: { only: (guid: string) => boolean; reminted: Map<string, string>; dropGenerated?: boolean },
+): boolean {
   try {
     if (ID_BEARING_TYPES.has(type)) {
       // ⚠️ Same reasoning as the sidecar refusal below, applied to the DOCUMENT (#1468 D4): this
@@ -373,12 +385,18 @@ export function writeAssetGuid(absPath: string, type: string, guid: string): boo
       // Parses by construction now — anything that did not was just quarantined away.
       try { meta = readJsonFile(sidecar); } catch { /* recreate */ }
     }
-    meta.id = guid;
+    let reminted = new Map<string, string>();
+    if (slices?.dropGenerated) ({ meta, reminted } = copiedSidecarIdentity(meta, guid, randomUUID, slices.only));
+    else {
+      meta.id = guid;
+      if (slices) reminted = remintSubAssetGuids(meta, randomUUID, slices.only);
+    }
     // This writer does not route through `writeMetaSidecar`, so it must stamp
     // as well as refuse — refusing alone (above) yields an unstamped document,
     // which is the same downgrade-risk defect (#734) wearing a different face.
     meta.version = SIDECAR_FORMAT_VERSION;
     writeJsonAtomic(sidecar, meta);
+    for (const [from, to] of reminted) slices?.reminted.set(from, to);
     return true;
   } catch {
     return false;
@@ -1445,13 +1463,19 @@ export function manifestProjectOf(manifestPath: string): string {
 /** Build a serializable manifest from a scan. Detects GUID collisions (two
  *  files sharing an id — usually a raw `cp` that bypassed the editor's Duplicate
  *  flow). When `heal` is true (dev scans), the collision is resolved by keeping
- *  the id on the file whose path sorts FIRST (lexicographically) and regenerating
- *  a fresh id for the rest. The keeper is chosen by path — not mtime — so every
- *  machine heals identically (mtime is reset by git clone/checkout, which would
- *  otherwise make different machines rewrite different files and churn git).
- *  Otherwise it only warns. The internal `absPath` field is stripped from the
+ *  the id on ONE file and regenerating a fresh id (and fresh colliding slice GUIDs) for the rest.
+ *
+ *  The keeper is the PRIOR OWNER (#1996, owner ruling 2026-10-02, as in Unity): the path `priorOwners` records for
+ *  that GUID, i.e. the file that held it before the copy appeared. Only when there is no such record (or the recorded
+ *  file is gone) does it fall back to the path that sorts FIRST — and path order alone is the wrong answer for the
+ *  common case: `"sheet copy.png".localeCompare("sheet.png") === -1`, so a Finder or Explorer copy would keep the id
+ *  and the ORIGINAL would be re-minted, which breaks every ref to the original once the copy is deleted. Neither rule
+ *  uses mtime, which git clone/checkout resets, so different machines would heal different files and churn git.
+ *  `scanDevManifest` keeps the record (`guidOwnersFile`). Otherwise it only warns. The internal `absPath` field is stripped from the
  *  returned (serialized) entries. */
-export function buildManifest(assets: AssetEntry[], heal = false): { version: 2; assets: AssetEntry[]; folders: string[] } {
+export function buildManifest(
+  assets: AssetEntry[], heal = false, priorOwners?: ReadonlyMap<string, readonly GuidOwner[]>,
+): { version: 2; assets: AssetEntry[]; folders: string[] } {
   // Pull empty-folder marker entries (guid-less, editor-only) into a separate
   // `folders` list so the serialized `assets` array stays files-only (no guid/collision
   // bookkeeping applies to them). The editor's Assets panel seeds these into its tree.
@@ -1496,19 +1520,34 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
     if (g) g.push(it); else groups.set(it.entry.guid, [it]);
   }
 
+  // Healing a copied texture re-keys its slice entries (below). Its slices' groups are judged after it, because the
+  // scan emits a texture before its slices, so the texture's group is created first.
   for (const [guid, group] of groups) {
     // Collapse entries that point at the same file (e.g. an NFC/NFD path twin) —
-    // those aren't a real collision.
+    // those aren't a real collision. An entry re-keyed by an earlier heal is no longer in this group.
     const distinct: typeof group = [];
     const seenPaths = new Set<string>();
     for (const it of group) {
+      if (it.entry.guid !== guid) continue;
       if (!seenPaths.has(it.entry.path)) { seenPaths.add(it.entry.path); distinct.push(it); }
     }
     if (distinct.length <= 1) continue;
 
-    // Lexicographically-first path keeps the id; the rest get regenerated.
-    // Path-based ordering is stable across machines (unlike mtime).
-    distinct.sort((a, b) => a.entry.path.localeCompare(b.entry.path));
+    // The prior owner keeps the id: of the recorded paths in this group, the one recorded EARLIEST (a cross-project
+    // duplicate, #1584, is recorded in both roots, so the record must say which held it first). Without a decisive
+    // record, the fallback order: an engine built-in first (a project copy of one is always the copy; the editor host
+    // sees both as one project, `''`, so the #1584 guard below does not shield it), then the path that sorts first.
+    // The rest get regenerated.
+    const isBuiltin = (it: (typeof distinct)[number]) => (it.entry.path.startsWith('/modoki/') ? 0 : 1);
+    distinct.sort((a, b) => isBuiltin(a) - isBuiltin(b) || a.entry.path.localeCompare(b.entry.path));
+    const recorded = priorOwners?.get(guid) ?? [];
+    const sinceOf = (it: (typeof distinct)[number]) =>
+      recorded.find((o) => pathCaseKey(o.path) === pathCaseKey(it.entry.path))?.since;
+    let priorAt = -1;
+    distinct.forEach((it, i) => { const t = sinceOf(it); if (t !== undefined && (priorAt < 0 || t < sinceOf(distinct[priorAt])!)) priorAt = i; });
+    // Decisive only when no other file in the group was recorded as early: a tie says nothing about which is the copy.
+    const priorDecides = priorAt >= 0 && distinct.every((it, i) => i === priorAt || sinceOf(it) !== sinceOf(distinct[priorAt]));
+    if (priorAt > 0) distinct.unshift(...distinct.splice(priorAt, 1));
     const original = distinct[0];
     for (let i = 1; i < distinct.length; i++) {
       const copy = distinct[i];
@@ -1526,9 +1565,17 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
       }
       if (heal && copy.absPath && fs.existsSync(copy.absPath)) {
         const fresh = randomUUID();
-        if (writeAssetGuid(copy.absPath, copy.entry.type, fresh)) {
-          console.warn(`[asset-scanner] GUID collision healed: ${copy.entry.path}\n  was a copy of ${original.entry.path} (id ${guid})\n  new id ${fresh}`);
+        // Only a slice GUID something ELSE still defines is re-minted: one the user added to the copy is its own.
+        const collides = (g: string) => (groups.get(g) ?? []).some((it) => it.entry.guid === g && !isSpriteOf(it.entry, copy.entry.path, guid));
+        // With a prior owner the re-minted file is known to be the COPY, so the original's derived files are not its
+        // own: a delete of the copy would trash them (`deletionPathsFor`). On the path-order fallback it may be the
+        // original, so `generated` stays.
+        const slices = { only: collides, reminted: new Map<string, string>(), dropGenerated: priorDecides };
+        if (writeAssetGuid(copy.absPath, copy.entry.type, fresh, slices)) {
+          const n = slices.reminted.size;
+          console.warn(`[asset-scanner] GUID collision healed: ${copy.entry.path}\n  was a copy of ${original.entry.path} (id ${guid})\n  new id ${fresh}${n ? ` and ${n} new slice GUID(s)` : ''}`);
           copy.entry.guid = fresh;
+          rekeySpriteEntries(items, copy.entry.path, guid, fresh, slices.reminted);
           continue;
         }
       }
@@ -1537,6 +1584,159 @@ export function buildManifest(assets: AssetEntry[], heal = false): { version: 2;
   }
 
   return { version: ASSET_MANIFEST_VERSION, assets: items.map((it) => it.entry), folders };
+}
+
+/** A sprite entry the scan emitted from the sidecar of the texture at `texturePath`, whose id is `textureGuid`. The
+ *  path prefix alone is not enough: a texture literally named `x.png#y.png` has sprites under `x.png#` too (#1996). */
+function isSpriteOf(entry: AssetEntry, texturePath: string, textureGuid: string): boolean {
+  return entry.type === 'sprite' && entry.path.startsWith(texturePath + '#') && entry.sprite?.texture === textureGuid;
+}
+
+/** After the heal re-mints a texture, point the sprite entries THIS scan already emitted from its old sidecar at the
+ *  new GUIDs: the slices by `slices`, the whole-image sprite by re-deriving it, and every one's `sprite.texture`.
+ *  Without it the copy's slices name the original as their texture until the next scan. */
+function rekeySpriteEntries(
+  items: { entry: AssetEntry }[], texturePath: string, oldTextureGuid: string, textureGuid: string, slices: Map<string, string>,
+): void {
+  const prefix = texturePath + '#';
+  for (const { entry } of items) {
+    if (!isSpriteOf(entry, texturePath, oldTextureGuid) || !entry.sprite) continue;
+    entry.sprite = { ...entry.sprite, texture: textureGuid };
+    if (entry.path === prefix + 'default') {
+      entry.guid = deriveGuid('sprite:' + textureGuid);
+    } else if (entry.guid && slices.has(entry.guid)) {
+      entry.guid = slices.get(entry.guid)!;
+      entry.path = prefix + entry.guid;
+    }
+  }
+}
+
+/** Where the dev scan keeps the record of which file owns each GUID in ONE asset root (#1996): a machine-local file per
+ *  asset-root DIRECTORY, keyed by root-relative path.
+ *
+ *  ⚠️ Per root, not per host, and outside the project. The Vite server at the repo root (`npm test`, `verify`, a bare
+ *  `npm run dev`) and the editor opened on one project both scan `games/<id>/assets`, under different URL prefixes
+ *  (`/games/<id>/assets/…` and `/assets/…`). With a record per host, whichever scanned first after an outside copy
+ *  decided the owner — a test run re-minted the ORIGINAL and the editor then recorded the copy (review of #1996,
+ *  observed). Keyed by the directory, every host reads and writes the same record. Under the home directory, it is
+ *  in no repo (a standalone project does not gitignore `.cache/`) and never inside an app bundle. */
+export function guidOwnersFile(absDir: string, storeDir: string = defaultGuidOwnersStore()): string {
+  const key = createHash('sha256').update(pathCaseKey(canonicalPath(absDir))).digest('hex').slice(0, 24);
+  return path.join(storeDir, `${key}.json`);
+}
+
+function defaultGuidOwnersStore(): string {
+  return path.join(os.homedir(), '.modoki', 'guid-owners');
+}
+
+/** One recorded owner of a GUID: its manifest path, and when this machine first recorded the GUID in that root
+ *  (epoch ms). The time is what makes it a PRIOR owner when two roots both record one GUID. It is machine-local, as
+ *  the record is, so the reason mtime was rejected (git checkout resets it differently per machine) does not apply. */
+export interface GuidOwner { path: string; since: number }
+
+/** The record `guidOwnersFile` holds, as GUID → { root-relative path, since }; empty when there is none (first scan on
+ *  this machine, or unreadable: then the heal uses its fallback order, which is what it did before the record existed). */
+function readGuidOwners(file: string): Map<string, { rel: string; since: number }> {
+  const owners = new Map<string, { rel: string; since: number }>();
+  try {
+    const json = readJsonFile(file) as { owners?: unknown };
+    if (json && typeof json.owners === 'object' && json.owners) {
+      for (const [guid, o] of Object.entries(json.owners as Record<string, unknown>)) {
+        const { path: rel, since } = (o ?? {}) as { path?: unknown; since?: unknown };
+        if (typeof rel === 'string' && typeof since === 'number') owners.set(guid, { rel, since });
+      }
+    }
+  } catch { /* no record */ }
+  return owners;
+}
+
+/** Delete the records whose asset root no longer exists: an agent worktree, a publish stage under /tmp, a deleted
+ *  scratch project, an uninstalled app. Nothing else ever removes them, and every checkout that runs vitest writes one
+ *  per non-empty root. A root that is only temporarily missing (an unmounted drive) loses its record, and its next
+ *  scan falls back to path order once. */
+export function pruneGuidOwnerStore(storeDir: string = defaultGuidOwnersStore()): string[] {
+  const pruned: string[] = [];
+  let names: string[];
+  try { names = fs.readdirSync(storeDir).filter((n) => n.endsWith('.json')); } catch { return pruned; }
+  for (const name of names) {
+    const file = path.join(storeDir, name);
+    try {
+      const root = (readJsonFile(file) as { root?: unknown }).root;
+      if (typeof root === 'string' && !fs.existsSync(root)) { fs.rmSync(file, { force: true }); pruned.push(file); }
+    } catch { /* unreadable: leave it, readGuidOwners treats it as no record */ }
+  }
+  return pruned;
+}
+const prunedStores = new Set<string>();
+
+/** The dev scan every host runs (Vite plugin and Electron backend): scan, build with the collision heal, and keep the
+ *  prior-owner record the heal reads (#1996).
+ *
+ *  The editor already knows which file held a GUID: the manifest it built last time. Keeping that only in memory left
+ *  a gap exactly where outside copies happen — a copy made while the editor was CLOSED reached the first scan with no
+ *  previous manifest, so the heal fell back to path order and re-minted the original. Persisting the record closes it.
+ *  It lists file-backed assets only: a slice's owner follows its texture.
+ *
+ *  ⚠️ Every host and every test reads the REAL store: a test that starts a host on a scratch project still scans the
+ *  real engine built-in root beside it, and its heal writes real sidecars, so an empty store there re-minted by path
+ *  order (re-review of #1996, observed). Records for scratch roots are pruned instead, once per store per module
+ *  instance (per process for a host, per test file under vitest). `storeDir` is for unit tests that scan only scratch
+ *  roots, and `now` for tests that need two scans ordered in time. */
+export function scanDevManifest(
+  assetRoots: AssetRoot[], opts: { storeDir?: string; now?: number } = {},
+): { version: 2; assets: AssetEntry[]; folders: string[] } {
+  const store = opts.storeDir ?? defaultGuidOwnersStore();
+  if (!prunedStores.has(store)) { prunedStores.add(store); pruneGuidOwnerStore(store); }
+  // Longest prefix first, so a manifest path is attributed to the most specific root.
+  const roots = [...assetRoots].sort((a, b) => b.urlPrefix.length - a.urlPrefix.length).map((root) => {
+    const file = guidOwnersFile(root.absDir, store);
+    return { root, file, prior: readGuidOwners(file), owners: new Map<string, { rel: string; since: number }>() };
+  });
+  const rootOf = (manifestPath: string) => roots.find(({ root }) => manifestPath.startsWith(root.urlPrefix + '/'));
+  // GUID → every recorded owner, one per root that records it (a cross-project duplicate is recorded in both).
+  const prior = new Map<string, GuidOwner[]>();
+  for (const { root, prior: rec } of roots) {
+    for (const [guid, { rel, since }] of rec) {
+      const owner = { path: `${root.urlPrefix}/${rel}`, since };
+      const list = prior.get(guid);
+      if (list) list.push(owner); else prior.set(guid, [owner]);
+    }
+  }
+  const now = opts.now ?? Date.now();
+  const scanned = scanAllAssets(assetRoots);
+  const filePaths = new Set(scanned.filter((a) => a.absPath && a.type !== 'folder').map((a) => a.path));
+  const manifest = buildManifest(scanned, true, prior);
+
+  // Owners are kept PER ROOT, so a collision the heal leaves standing across roots (#1584) stays in both records.
+  for (const a of manifest.assets) {
+    if (!a.guid || !filePaths.has(a.path)) continue;
+    const r = rootOf(a.path);
+    if (!r) continue;
+    const rel = a.path.slice(r.root.urlPrefix.length + 1);
+    // Within one root, a collision the heal left standing (a refused write) keeps the owner it already had. `since`
+    // survives a move inside the root: it dates the GUID's arrival here, not its current path.
+    const had = r.prior.get(a.guid);
+    if (!r.owners.has(a.guid) || (had !== undefined && pathCaseKey(had.rel) === pathCaseKey(rel))) {
+      r.owners.set(a.guid, { rel, since: had?.since ?? now });
+    }
+  }
+  for (const { root, file, owners } of roots) {
+    const entries = [...owners].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)).map(([g, o]) => [g, { path: o.rel, since: o.since }]);
+    // The CANONICAL spelling, which the file name hashes too: the prune checks this path, and a symlink spelling would
+    // be pruned once the link is gone while the directory lives on.
+    const text = JSON.stringify({ root: canonicalPath(root.absDir), owners: Object.fromEntries(entries) }, null, 1) + '\n';
+    try {
+      if (fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') === text : entries.length === 0) continue;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // A unique temp name: two hosts (or a test run) can scan the same root at once.
+      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      fs.writeFileSync(tmp, text);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      console.warn(`[asset-scanner] could not record GUID owners for ${root.absDir} in ${file}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  return manifest;
 }
 
 /** Resolve the engine built-in assets dir (/modoki/assets) from the first
@@ -1899,8 +2099,7 @@ export function assetScannerPlugin(): Plugin {
    *  the fresh payload so guid → path lookups stay current after moves. */
   function rebuildManifest(): { version: 2; assets: AssetEntry[]; folders: string[] } {
     assetRoots = findAssetRoots(projectRoot);
-    const assets = scanAllAssets(assetRoots);
-    cachedManifest = buildManifest(assets, true); // dev: auto-heal id collisions
+    cachedManifest = scanDevManifest(assetRoots); // dev: auto-heal id collisions, prior owner keeps (#1996)
     if (viteServer) {
       try { viteServer.ws.send({ type: 'custom', event: 'asset-manifest-updated', data: cachedManifest }); }
       catch { /* ws not ready */ }
@@ -1998,7 +2197,7 @@ export function assetScannerPlugin(): Plugin {
       registerReimportHandler('video', videoReimportHandler);
       registerReimportHandler('font', fontReimportHandler);
       registerReimportHandler('environment', environmentReimportHandler);
-      cachedManifest = buildManifest(scanAllAssets(assetRoots), true); // dev: auto-heal id collisions
+      cachedManifest = scanDevManifest(assetRoots); // dev: auto-heal id collisions, prior owner keeps (#1996)
     },
 
     // Expose the resolved project config to the browser. Inlined at build time;

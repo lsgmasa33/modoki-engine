@@ -16,7 +16,7 @@ import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, manifestProjectOf, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, EDITOR_DELETE_FINGERPRINT, createBrowserRequestRegistry,
   settleRelayReply, countLiveBridgeClients,
-  handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
+  handleExitRequest, scanAllAssets, scanDevManifest, guidOwnersFile, pruneGuidOwnerStore, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps, distHasExtension, cdnBinaryCacheSteps, gcsCdnSteps, buildStepFailureTitle,
   otaPublishTarget, otaSubgameProjectDir, otaResolveSubgameDir, otaPublishSteps, otaSigningKeyRefusal,
@@ -24,6 +24,8 @@ import {
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
+import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
 import { accessPath, findNodes, functionsNamed, parseSource, referencesToPath, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -1392,6 +1394,367 @@ describe('buildManifest auto-heal', () => {
     expect(JSON.parse(fs.readFileSync(aPath, 'utf-8')).id).toBe(guid);
     expect(JSON.parse(fs.readFileSync(bPath, 'utf-8')).id).not.toBe(guid);
     warn.mockRestore();
+  });
+
+  it('a texture copied OUTSIDE the editor gets fresh slice GUIDs with its fresh id, and its sprites follow it in the same scan (#1987)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const texGuid = 'aaaaaaaa-1111-4111-8111-111111111111';
+      const s0 = 'bbbbbbbb-2222-4222-8222-222222222222';
+      const s1 = 'cccccccc-3333-4333-8333-333333333333';
+      const sidecar = JSON.stringify({
+        id: texGuid, version: 2,
+        spriteSheet: { width: 128, height: 64 },
+        sprites: [
+          { guid: s0, name: 'a', rect: { x: 0, y: 0, w: 64, h: 64 }, pivot: { x: 0.5, y: 0.5 } },
+          { guid: s1, name: 'b', rect: { x: 64, y: 0, w: 64, h: 64 }, pivot: { x: 0.5, y: 0.5 } },
+        ],
+      });
+      // What a Finder/Explorer copy leaves: the file and its sidecar, byte for byte.
+      for (const name of ['sheet.png', 'sheet copy.png']) {
+        fs.writeFileSync(path.join(tmpDir, name), 'pretend-png');
+        fs.writeFileSync(path.join(tmpDir, name + '.meta.json'), sidecar);
+      }
+      const roots: AssetRoot[] = [{ urlPrefix: '/games/g/assets', absDir: tmpDir }];
+      const sidecarOf = (name: string) => JSON.parse(fs.readFileSync(path.join(tmpDir, name + '.meta.json'), 'utf-8'));
+
+      const m = buildManifest(scanAllAssets(roots), true);
+
+      const [kept, healed] = sidecarOf('sheet.png').id === texGuid ? ['sheet.png', 'sheet copy.png'] : ['sheet copy.png', 'sheet.png'];
+      expect(sidecarOf(kept).sprites.map((s: { guid: string }) => s.guid)).toEqual([s0, s1]);
+      const healedMeta = sidecarOf(healed);
+      expect(healedMeta.id).not.toBe(texGuid);
+      const healedSlices: string[] = healedMeta.sprites.map((s: { guid: string }) => s.guid);
+      expect(healedSlices.some((g) => g === s0 || g === s1)).toBe(false);
+      expect(new Set(healedSlices).size).toBe(2);
+      // The manifest of THIS scan: no GUID twice, and every slice names the texture it came from.
+      const guids = m.assets.map((a) => a.guid).filter(Boolean);
+      expect(new Set(guids).size).toBe(guids.length);
+      const healedPath = '/games/g/assets/' + healed;
+      for (const a of m.assets.filter((x) => x.type === 'sprite')) {
+        expect(a.sprite?.texture).toBe(a.path.startsWith(healedPath + '#') ? healedMeta.id : texGuid);
+      }
+      expect(m.assets.filter((a) => a.path.startsWith(healedPath + '#')).map((a) => a.guid).sort()).toEqual([...healedSlices].sort());
+      expect(warn.mock.calls.some((c) => /GUID collision:/.test(String(c[0])))).toBe(false);
+
+      // And it stays healed: the next scan finds nothing to report.
+      warn.mockClear();
+      buildManifest(scanAllAssets(roots), true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('GUID collision'))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an unsliced 2D texture copied outside the editor: its whole-image sprite follows the fresh id in the same scan (#1987)", () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const texGuid = 'aaaaaaaa-1111-4111-8111-111111111111';
+      const sidecar = JSON.stringify({ id: texGuid, version: 2, type: '2d', textureCache: { hash: 'h', width: 64, height: 32 } });
+      for (const name of ['tile.png', 'tile copy.png']) {
+        fs.writeFileSync(path.join(tmpDir, name), 'pretend-png');
+        fs.writeFileSync(path.join(tmpDir, name + '.meta.json'), sidecar);
+      }
+      const roots: AssetRoot[] = [{ urlPrefix: '/games/g/assets', absDir: tmpDir }];
+
+      const m = buildManifest(scanAllAssets(roots), true);
+
+      const textures = m.assets.filter((a) => a.type === 'texture');
+      const sprites = m.assets.filter((a) => a.type === 'sprite');
+      expect(textures).toHaveLength(2);
+      expect(sprites).toHaveLength(2);
+      for (const t of textures) {
+        const own = sprites.find((sp) => sp.path === t.path + '#default')!;
+        expect(own.sprite?.texture).toBe(t.guid);
+        expect(own.guid).toBe(deriveGuid('sprite:' + t.guid));
+      }
+      expect(warn.mock.calls.some((c) => /GUID collision:/.test(String(c[0])))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  describe('the prior owner keeps a copied GUID (#1996)', () => {
+    const texGuid = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const s0 = 'bbbbbbbb-2222-4222-8222-222222222222';
+    const s1 = 'cccccccc-3333-4333-8333-333333333333';
+    const slice = (guid: string, x: number) => ({ guid, name: guid.slice(0, 4), rect: { x, y: 0, w: 64, h: 64 }, pivot: { x: 0.5, y: 0.5 } });
+    const sheetSidecar = (sprites = [slice(s0, 0), slice(s1, 64)], id = texGuid) =>
+      JSON.stringify({ id, version: 2, spriteSheet: { width: 192, height: 64 }, sprites });
+    let assetsDir: string;
+    let roots: AssetRoot[];
+    let warn: ReturnType<typeof vi.spyOn>;
+    const url = (name: string) => '/games/g/assets/' + name;
+    let store: string;
+    let clock = 0; // each scan strictly later than the last: two real scans can land in one millisecond
+    const scan = (r: AssetRoot[] = roots) => scanDevManifest(r, { storeDir: store, now: ++clock });
+    const put = (name: string, sidecar: string) => {
+      fs.mkdirSync(path.dirname(path.join(assetsDir, name)), { recursive: true });
+      fs.writeFileSync(path.join(assetsDir, name), 'pretend-png');
+      fs.writeFileSync(path.join(assetsDir, name + '.meta.json'), sidecar);
+    };
+    const sidecarOf = (name: string) => JSON.parse(fs.readFileSync(path.join(assetsDir, name + '.meta.json'), 'utf-8'));
+    const sliceGuids = (name: string): string[] => sidecarOf(name).sprites.map((sp: { guid: string }) => sp.guid);
+    const collisionWarnings = () => warn.mock.calls.filter((c: unknown[]) => /GUID collision:/.test(String(c[0])));
+    beforeEach(() => {
+      assetsDir = path.join(tmpDir, 'assets');
+      fs.mkdirSync(assetsDir);
+      roots = [{ urlPrefix: '/games/g/assets', absDir: assetsDir }];
+      store = path.join(tmpDir, 'guid-owners');
+      warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => { warn.mockRestore(); });
+
+    // What an outside copy that carries its sidecar leaves: `cp` of the pair, or Finder/Explorer copy-paste of a folder.
+    // (A same-folder Finder Duplicate of the pair names the sidecar `sheet.png.meta copy.json`, so nothing collides.)
+    it.each([
+      ['a renamed copy beside it', 'sheet.png', 'sheet copy.png'],
+      ['a copied folder', 'textures/sheet.png', 'textures copy/sheet.png'],
+    ])("%s, made while the editor was closed and sorting FIRST, is re-minted: the original keeps its id and slices, and deleting the copy leaves every slice ref resolving", (_label, orig, copy) => {
+      put(orig, sheetSidecar());
+      scan(); // the editor's last session: it records who owns each GUID
+      expect(JSON.parse(fs.readFileSync(guidOwnersFile(assetsDir, store), 'utf-8')).owners[texGuid].path).toBe(orig);
+
+      // Editor closed; the copy arrives byte for byte, and its path sorts first.
+      put(copy, sheetSidecar());
+      expect(copy.localeCompare(orig)).toBeLessThan(0);
+      const m = scan();
+
+      expect(sidecarOf(orig).id).toBe(texGuid);
+      expect(sliceGuids(orig)).toEqual([s0, s1]);
+      const copyMeta = sidecarOf(copy);
+      expect(copyMeta.id).not.toBe(texGuid);
+      const copySlices = sliceGuids(copy);
+      expect(copySlices.some((g) => g === s0 || g === s1)).toBe(false);
+      expect(new Set(copySlices).size).toBe(2);
+      // This scan's manifest: no GUID twice, every sprite names its own texture, every slice path ends in its own GUID.
+      const guids = m.assets.map((a) => a.guid).filter(Boolean);
+      expect(new Set(guids).size).toBe(guids.length);
+      for (const a of m.assets.filter((x) => x.type === 'sprite')) {
+        const ofCopy = a.path.startsWith(url(copy) + '#');
+        expect(a.sprite?.texture).toBe(ofCopy ? copyMeta.id : texGuid);
+        expect(a.path.endsWith('#' + a.guid)).toBe(true);
+      }
+      expect(m.assets.filter((a) => a.path.startsWith(url(copy) + '#')).map((a) => a.guid).sort())
+        .toEqual([...copySlices].sort());
+      expect(collisionWarnings()).toEqual([]);
+
+      // The user deletes the accidental copy: every ref to the original still resolves, to the original.
+      fs.rmSync(path.join(assetsDir, copy));
+      fs.rmSync(path.join(assetsDir, copy + '.meta.json'));
+      const after = scan();
+      const byGuid = new Map(after.assets.map((a) => [a.guid, a]));
+      expect(byGuid.get(texGuid)?.path).toBe(url(orig));
+      for (const g of [s0, s1]) { // a sliced sheet emits no whole-image sprite
+        expect(byGuid.get(g)?.sprite?.texture).toBe(texGuid);
+        expect(byGuid.get(g)?.path.startsWith(url(orig) + '#')).toBe(true);
+      }
+      expect(collisionWarnings()).toEqual([]);
+    });
+
+    it("the record belongs to the asset root, not the host: the repo-root server's record is the one the project editor reads", () => {
+      put('sheet.png', sheetSidecar());
+      scan(); // `npm test` / `verify` at the repo root: `/games/g/assets/…`
+      put('sheet copy.png', sheetSidecar());
+      scan([{ urlPrefix: '/assets', absDir: assetsDir }]); // the editor opened on the project: `/assets/…`
+      expect(sidecarOf('sheet.png').id).toBe(texGuid);
+      expect(sidecarOf('sheet copy.png').id).not.toBe(texGuid);
+    });
+
+    it('a root with no assets leaves no record behind (no litter in the store for every empty or scratch root)', () => {
+      const empty = path.join(tmpDir, 'empty');
+      fs.mkdirSync(empty);
+      put('sheet.png', sheetSidecar());
+      scan([...roots, { urlPrefix: '/games/e/assets', absDir: empty }]);
+      expect(fs.existsSync(guidOwnersFile(assetsDir, store))).toBe(true);
+      expect(fs.existsSync(guidOwnersFile(empty, store))).toBe(false);
+    });
+
+    it('a collision left standing across two projects stays in BOTH roots\' records, so each project\'s editor still finds its prior owner', () => {
+      const bDir = path.join(tmpDir, 'b-assets');
+      fs.mkdirSync(bDir);
+      fs.writeFileSync(path.join(bDir, 'sheet.png'), 'pretend-png');
+      fs.writeFileSync(path.join(bDir, 'sheet.png.meta.json'), sheetSidecar());
+      put('sheet.png', sheetSidecar());
+      const both: AssetRoot[] = [{ urlPrefix: '/games/a/assets', absDir: assetsDir }, { urlPrefix: '/games/b/assets', absDir: bDir }];
+      scan(both); // the repo-root server: a project copied whole (#1584), never healed across projects
+      const ownerIn = (dir: string) => JSON.parse(fs.readFileSync(guidOwnersFile(dir, store), 'utf-8')).owners[texGuid].path;
+      expect([ownerIn(assetsDir), ownerIn(bDir)]).toEqual(['sheet.png', 'sheet.png']);
+
+      fs.writeFileSync(path.join(bDir, 'sheet copy.png'), 'pretend-png');
+      fs.writeFileSync(path.join(bDir, 'sheet copy.png.meta.json'), sheetSidecar());
+      scan([{ urlPrefix: '/assets', absDir: bDir }]); // the editor on project b
+      expect(JSON.parse(fs.readFileSync(path.join(bDir, 'sheet.png.meta.json'), 'utf-8')).id).toBe(texGuid);
+      expect(JSON.parse(fs.readFileSync(path.join(bDir, 'sheet copy.png.meta.json'), 'utf-8')).id).not.toBe(texGuid);
+    });
+
+    it('a record whose asset root no longer exists is pruned (an agent worktree, a publish stage, a scratch project)', () => {
+      put('sheet.png', sheetSidecar());
+      const gone = path.join(tmpDir, 'gone');
+      fs.mkdirSync(gone);
+      fs.writeFileSync(path.join(gone, 'x.png'), 'pretend-png');
+      fs.writeFileSync(path.join(gone, 'x.png.meta.json'), sheetSidecar([], s1));
+      scan([...roots, { urlPrefix: '/games/x/assets', absDir: gone }]);
+      const goneRecord = guidOwnersFile(gone, store); // named while the dir exists: canonicalPath resolves only a live path
+      expect(fs.existsSync(goneRecord)).toBe(true);
+      fs.rmSync(gone, { recursive: true });
+      expect(pruneGuidOwnerStore(store)).toEqual([goneRecord]);
+      expect(fs.existsSync(goneRecord)).toBe(false);
+      expect(fs.existsSync(guidOwnersFile(assetsDir, store))).toBe(true);
+    });
+
+    it('one record per DIRECTORY: a symlinked spelling of the root names the same record', () => {
+      const link = path.join(tmpDir, 'linked-assets');
+      fs.symlinkSync(assetsDir, link, 'dir');
+      expect(guidOwnersFile(link, store)).toBe(guidOwnersFile(assetsDir, store));
+    });
+
+    it("an engine built-in copied into a game: the root that recorded the GUID FIRST keeps it, though both roots record it", () => {
+      const eng = path.join(tmpDir, 'eng');
+      fs.mkdirSync(eng);
+      fs.writeFileSync(path.join(eng, 'font.png'), 'pretend-png');
+      fs.writeFileSync(path.join(eng, 'font.png.meta.json'), sheetSidecar());
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }]);
+      put('font.png', sheetSidecar()); // the game's copy, in a root that sorts first in the editor host
+      // The repo-root server sees two projects and heals nothing (#1584); both roots now record the GUID.
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/games/a/assets', absDir: assetsDir }]);
+      // The editor on the game sees one project (`''`) and heals: the engine's original must keep the id.
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/assets', absDir: assetsDir }]);
+      expect(JSON.parse(fs.readFileSync(path.join(eng, 'font.png.meta.json'), 'utf-8')).id).toBe(texGuid);
+      expect(sidecarOf('font.png').id).not.toBe(texGuid);
+    });
+
+    it("the earlier record beats the fallback order: a game asset copied INTO the engine root is the copy", () => {
+      const eng = path.join(tmpDir, 'eng');
+      fs.mkdirSync(eng);
+      put('font.png', sheetSidecar());
+      scan([{ urlPrefix: '/games/a/assets', absDir: assetsDir }]);
+      fs.writeFileSync(path.join(eng, 'font.png'), 'pretend-png');
+      fs.writeFileSync(path.join(eng, 'font.png.meta.json'), sheetSidecar());
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/games/a/assets', absDir: assetsDir }]);
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/assets', absDir: assetsDir }]);
+      expect(sidecarOf('font.png').id).toBe(texGuid);
+      expect(JSON.parse(fs.readFileSync(path.join(eng, 'font.png.meta.json'), 'utf-8')).id).not.toBe(texGuid);
+    });
+
+    it('two roots first recorded in the same scan are a tie: the fallback order decides, and the re-minted file keeps `generated`', () => {
+      const eng = path.join(tmpDir, 'eng');
+      fs.mkdirSync(eng);
+      const model = JSON.stringify({ id: texGuid, version: 2, generated: { meshes: ['/x.mesh.json'] } });
+      fs.writeFileSync(path.join(eng, 'body.glb'), 'pretend-glb');
+      fs.writeFileSync(path.join(eng, 'body.glb.meta.json'), model);
+      put('body.glb', model);
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/games/a/assets', absDir: assetsDir }]);
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/assets', absDir: assetsDir }]);
+      expect(sidecarOf('body.glb').id).not.toBe(texGuid);
+      expect(sidecarOf('body.glb').generated).toEqual({ meshes: ['/x.mesh.json'] });
+    });
+
+    it('with no decisive record, an engine built-in outranks a project path in the fallback order', () => {
+      const eng = path.join(tmpDir, 'eng');
+      fs.mkdirSync(eng);
+      fs.writeFileSync(path.join(eng, 'font.png'), 'pretend-png');
+      fs.writeFileSync(path.join(eng, 'font.png.meta.json'), sheetSidecar());
+      put('font.png', sheetSidecar());
+      scan([{ urlPrefix: '/modoki/assets', absDir: eng }, { urlPrefix: '/assets', absDir: assetsDir }]);
+      expect(JSON.parse(fs.readFileSync(path.join(eng, 'font.png.meta.json'), 'utf-8')).id).toBe(texGuid);
+      expect(sidecarOf('font.png').id).not.toBe(texGuid);
+    });
+
+    it('a record written through a symlinked root names the real directory, so the prune keeps it once the link is gone', () => {
+      put('sheet.png', sheetSidecar());
+      const link = path.join(tmpDir, 'linked-assets');
+      fs.symlinkSync(assetsDir, link, 'dir');
+      scan([{ urlPrefix: '/games/g/assets', absDir: link }]);
+      fs.rmSync(link);
+      expect(pruneGuidOwnerStore(store)).toEqual([]);
+      put('sheet copy.png', sheetSidecar());
+      scan();
+      expect(sidecarOf('sheet.png').id).toBe(texGuid);
+    });
+
+    it('the dev scan itself prunes a dead root\'s record (not only a direct prune call)', () => {
+      fs.mkdirSync(store, { recursive: true });
+      const dead = path.join(store, 'dead.json');
+      fs.writeFileSync(dead, JSON.stringify({ root: path.join(tmpDir, 'no-such-root'), owners: {} }));
+      put('sheet.png', sheetSidecar());
+      scan();
+      expect(fs.existsSync(dead)).toBe(false);
+    });
+
+    it('a heal that is refused leaves the record on the prior owner, so the next scan still re-mints the copy', () => {
+      put('sheet.png', sheetSidecar());
+      scan();
+      // A sidecar from a newer engine is never rewritten, so the heal is refused and both files keep the GUID.
+      put('sheet copy.png', JSON.stringify({ ...JSON.parse(sheetSidecar()), version: 999 }));
+      scan();
+      expect(sidecarOf('sheet copy.png').id).toBe(texGuid);
+      expect(JSON.parse(fs.readFileSync(guidOwnersFile(assetsDir, store), 'utf-8')).owners[texGuid].path).toBe('sheet.png');
+      put('sheet copy.png', sheetSidecar());
+      scan();
+      expect(sidecarOf('sheet.png').id).toBe(texGuid);
+      expect(sidecarOf('sheet copy.png').id).not.toBe(texGuid);
+    });
+
+    it("a copy known to be the copy loses the original's `generated` list; on the path-order fallback it is kept", () => {
+      const model = JSON.stringify({ id: texGuid, version: 2, generated: { meshes: ['/assets/meshes/body.mesh.json'] } });
+      put('body.glb', model);
+      scan();
+      put('body copy.glb', model);
+      scan();
+      expect(sidecarOf('body.glb').generated).toEqual({ meshes: ['/assets/meshes/body.mesh.json'] });
+      expect(sidecarOf('body copy.glb').id).not.toBe(texGuid);
+      expect(sidecarOf('body copy.glb').generated).toBeUndefined();
+
+      fs.rmSync(store, { recursive: true });
+      const second = JSON.stringify({ id: s0, version: 2, generated: { meshes: ['/assets/meshes/second.mesh.json'] } });
+      put('second.glb', second);
+      put('second copy.glb', second);
+      scan();
+      expect(sidecarOf('second.glb').id).not.toBe(s0); // path order re-minted the original: it must keep its derived files
+      expect(sidecarOf('second.glb').generated).toEqual({ meshes: ['/assets/meshes/second.mesh.json'] });
+    });
+
+    it('with no record at all, the heal falls back to path order: the copy that sorts first keeps the id', () => {
+      put('sheet.png', sheetSidecar());
+      put('sheet copy.png', sheetSidecar());
+      scan();
+      expect(sidecarOf('sheet copy.png').id).toBe(texGuid);
+      expect(sidecarOf('sheet.png').id).not.toBe(texGuid);
+      expect(collisionWarnings()).toEqual([]);
+    });
+
+    it('re-mints only the slice GUIDs that collide: a slice added to the copy after copying keeps its GUID', () => {
+      put('sheet.png', sheetSidecar());
+      scan();
+      const own = 'dddddddd-4444-4444-8444-444444444444';
+      put('sheet copy.png', sheetSidecar([slice(s0, 0), slice(s1, 64), slice(own, 128)]));
+      scan();
+      const copySlices = sliceGuids('sheet copy.png');
+      expect(copySlices[2]).toBe(own);
+      expect(copySlices.slice(0, 2).some((g) => g === s0 || g === s1)).toBe(false);
+    });
+
+    it("re-keys only the copy's own sprites, not those of a texture literally named \"<copy>#<x>.png\"", () => {
+      const yGuid = 'eeeeeeee-5555-4555-8555-555555555555';
+      const sy = 'ffffffff-6666-4666-8666-666666666666';
+      put('sheet.png', sheetSidecar());
+      put('sheet copy.png#y.png', sheetSidecar([slice(sy, 0)], yGuid));
+      scan();
+      put('sheet copy.png', sheetSidecar());
+      const m = scan();
+      const ySprite = m.assets.find((a) => a.guid === sy);
+      expect(ySprite?.path).toBe(url('sheet copy.png#y.png') + '#' + sy);
+      expect(ySprite?.sprite?.texture).toBe(yGuid);
+    });
+
+    it.skipIf(pathCaseKey('A') !== 'a')('on a case-insensitive file system, a record that differs only in case still names the owner', () => {
+      put('sheet.png', sheetSidecar());
+      put('sheet copy.png', sheetSidecar());
+      buildManifest(scanAllAssets(roots), true, new Map([[texGuid, [{ path: url('SHEET.png'), since: 1 }]]]));
+      expect(sidecarOf('sheet.png').id).toBe(texGuid);
+      expect(sidecarOf('sheet copy.png').id).not.toBe(texGuid);
+    });
   });
 
   it('manifestProjectOf names the project of a monorepo path and nothing else', () => {
