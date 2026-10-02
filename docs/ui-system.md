@@ -951,6 +951,60 @@ event) — the lock the outer activation just acquired is still held, so the re-
 silently swallowed. No such caller exists in-tree today; this is a trap for game code to avoid,
 not a live defect.
 
+#### Press feedback — a held button grows (#2011)
+
+Every UI node with a `click` binding grows slightly while a finger (or mouse button) is held on it
+and settles back on release. **On by default** (owner, 2026-10-02), so a new button reacts with no
+setup.
+
+| Knob | Where | Default | Meaning |
+|---|---|---|---|
+| `pressScale` | `UISettings` (scene-wide) | `1.08` | the scale a held button grows to; `1` = off |
+| `pressDurationMs` | `UISettings` | `90` | ease time, both on press and on release |
+| `pressScale` | `UIAction` (per button) | absent | absent or `0` inherits the scene; `1` opts this node out; any other value overrides |
+
+- **It scales UP, not down** (the owner's call): a finger covers a button, so a shrink happens out
+  of sight, and growth reaches past the fingertip where it can be seen. A game that wants a shrink
+  sets `pressScale` below 1. Scale is the only effect; a tint/opacity/bounce variant is to be added
+  when a game needs one (owner, 2026-10-02).
+- **What grows is the press's OWN target** — the nearest element carrying `data-press-origin`
+  (the thing that will take the click), and only if it is a button. A press on a slider, a toggle
+  or a `swallowClicks` dialog body grows nothing; it does NOT walk past them to the dismiss scrim
+  behind (the review caught a volume drag growing the whole Settings dialog). A tap-zone press
+  that `pressOrigin.ts` hands to a neighbour (#977) grows the neighbour.
+- **A backdrop never grows**: a pressable covering half the UI root's area or more is a dismiss
+  scrim or a tap catcher, not a button, and scaling it would grow only its children — the dialog.
+  This is a RULE rather than a per-entity opt-out because every game has these (22 outside Court
+  when this landed). AREA, not "both axes near 100%": Court's `HintCatcher` sits in flow under the
+  top bar at 83% of the height (measured), and the first, both-axes-95% version missed it.
+- Only the primary pointer's primary button presses. A touch that becomes a scroll is cancelled and
+  settles back — a brief grow-and-return on a button inside a scroll view is the known cost.
+- Never in the editor's authoring preview (a click there selects).
+
+**Mechanism** (`runtime/ui/pressFeedback.ts`): `uiTreeStore` resolves each node's press against
+`UISettings` into `node.press` (a nested key, compared by value), and `UINode` stamps it as
+`data-press-scale`/`data-press-ms`. A document-level, capture-phase tracker installed by
+`UIRenderer` (beside `pressOrigin.ts`) writes the CSS **`scale` property** on the pressed element
+and clears it on `pointerup`/`pointercancel`. A CSS `transition` does the easing, so no tween runs
+in JS and no tween library is needed. The DOM is written directly (the `TouchControl` highlight's
+reasoning): a press never rebuilds the tree, and never touches `UIElement.scale`, so a save cannot
+persist it.
+
+⚠️ **The `scale` property does NOT compose innocently with an anchored element's `transform`.** It
+is applied outside `transform`, about `transform-origin` on the untransformed box, and the anchor
+pivot lives in `transform` (`translate(-px%, -py%)`) — so a bare `scale` grows a pivoted button
+about a point off its visible centre and it DRIFTS toward a corner (review: a centred pivot moved
+the centre (-8, -4) px on a 200x100 box at 1.08; the first version of this section claimed the
+opposite). The tracker adds a compensating `translate` property, computed by `pressTranslate` from
+the resolved transform matrix and origin, so the visible centre stays put for any pivot, rotation
+or `UIElement.scale` — measured 0.00 px drift in Chromium for all four. Both properties share one
+transition curve, so the centre holds mid-ease too.
+
+⚠️ **`UIAction.pressScale` is absent on every scene-loaded `UIAction`, and that is why absent and
+`0` mean "inherit".** koota hands an AoS trait's spawn params straight through without running its
+factory, so a factory default never reaches a loaded entity; the Inspector shows the missing value
+as 0.
+
 ### `UIToggle` — an on/off switch
 
 Add it beside `UIElement` and the entity renders as a switch: a track with a knob at one
@@ -4088,6 +4142,8 @@ under it. Observed in wordweave: with the "Too easy?" card up, the zoom button s
 hit stack. So every backdrop picks one of three, per the rules above: a click `UIAction` (tapping
 outside dismisses), `swallowClicks` (it doesn't — a decision dialog, or one with a worded dismiss),
 or `pointerThrough: true` (taps are MEANT to reach the layer below — sling's "Tap to play again").
+A backdrop that takes the click UIAction route needs nothing for press feedback: a pressable that
+covers half the screen never grows ([§ Press feedback](#press-feedback--a-held-button-grows-2011)).
 `engine/tests/assets/overlayBackdropTakesTap.test.ts` fails on any painted full-screen overlay in
 `games/`/`demos/` that picks none — "overlay" meaning it or an ancestor has `zIndex > 0`, starts
 hidden, or is shown by a `UIBinding.visibleBinding`.

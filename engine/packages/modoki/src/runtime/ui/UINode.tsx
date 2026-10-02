@@ -36,6 +36,7 @@ import { imageAlignPosition } from '../traits/UIElement';
 import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
+import { UI_PRESS_SCALE_ATTR, UI_PRESS_MS_ATTR } from './pressFeedback';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
@@ -1179,6 +1180,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // the code did — see #728's close-out.
   const swallowsClicks = node.swallowClicks === true && !node.pointerThrough;
   const takesClick = isInteractive || swallowsClicks;
+  // Press feedback (#2011) — a BUTTON only: a click binding, not a swallow (a panel that merely
+  // eats taps is not something the player presses). Runtime only, like the touch attrs above:
+  // in the editor preview a click selects, it does not press. `ui/pressFeedback.ts` reads these.
+  const pressAttrs: Record<string, string> = isInteractive && node.press && !onSelectEntity
+    ? { [UI_PRESS_SCALE_ATTR]: String(node.press.scale), [UI_PRESS_MS_ATTR]: String(node.press.ms) }
+    : {};
 
   // In editor mode, skip click handler on canvas2D containers — they're just mount points,
   // not something worth selecting. Let clicks pass through to children.
@@ -1839,7 +1846,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // resolves past the unstamped panel to the scrim, `pressBelongsTo` returns true (fail-open,
       // nothing recorded belongs to the panel), and the dialog dismisses. See pressOrigin.ts's
       // "⚠️ LIMIT" section — the gate only protects nodes carrying the marker.
-      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+      <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...pressAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
         {tapZoneLayer}
         {nineSliceLayer}
         {videoLayer}
@@ -1901,7 +1908,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
 
   return (
     // `takesClick`, not `isInteractive` — see the canvas2D return above for why (#728).
-    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+    <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...pressAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
       {tapZoneLayer}
       {nineSliceLayer}
       {videoLayer}

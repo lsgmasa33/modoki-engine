@@ -17,7 +17,8 @@ import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { markUIDirty, flagUIDirty, isUIDirty, clearUIDirty } from '../core/uiDirty';
 import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
-import { UISettings } from '../traits/UISettings';
+import { UISettings, UI_SETTINGS_DEFAULT_PRESS_SCALE, UI_SETTINGS_DEFAULT_PRESS_DURATION_MS } from '../traits/UISettings';
+import { resolvePress } from './pressFeedback';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
@@ -90,6 +91,11 @@ export interface UINodeData {
   // ── Separate traits (optional) ──
   binding?: { textBinding: string; inputBinding: string; visibleBinding?: string; visibleOp?: string; visibleValue?: string };
   action?: { bindings: UIActionBinding[] };
+  /** Press feedback (#2011), RESOLVED: the element's `UIAction.pressScale` against the scene's
+   *  `UISettings`. Absent when the element has no `UIAction` or its press is off — `UINode` also
+   *  requires a `click` binding before stamping it. Like `touch`, this carries the authored
+   *  value only, never whether the element is held right now (`ui/pressFeedback.ts`). */
+  press?: { scale: number; ms: number };
   // `AnchorMode`, not `string` — the projection sits between the trait (which is
   // already a union) and the layout modules (whose switches have no `default`), so
   // widening here would hand an unrecognised mode straight through to a silently
@@ -255,7 +261,7 @@ const _warnedLengthUnitMismatches = new Set<string>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'scroll', 'snapChild']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'press', 'scroll', 'snapChild']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -287,6 +293,7 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.textAnim as Record<string, unknown> | undefined, b.textAnim as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.toggle as Record<string, unknown> | undefined, b.toggle as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.touch as Record<string, unknown> | undefined, b.touch as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.press as Record<string, unknown> | undefined, b.press as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.scroll as Record<string, unknown> | undefined, b.scroll as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.snapChild as Record<string, unknown> | undefined, b.snapChild as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
@@ -398,6 +405,11 @@ function buildTree(world: World): UINodeData[] | null {
   _nodes.clear();
   _parentMap.clear();
   _sortMap.clear();
+  // Press feedback's scene default (#2011) — read once per build, fresh, for the same reason the
+  // root font is read fresh below: a cached copy goes stale across a world swap.
+  const uiSettings = world.queryFirst(UISettings)?.get(UISettings);
+  const scenePressScale = uiSettings?.pressScale ?? UI_SETTINGS_DEFAULT_PRESS_SCALE;
+  const scenePressMs = uiSettings?.pressDurationMs ?? UI_SETTINGS_DEFAULT_PRESS_DURATION_MS;
 
   // Active-highlight rules collected during the node pass, resolved after it so
   // we can read the (non-UI) target entity's live value without a nested query.
@@ -511,6 +523,8 @@ function buildTree(world: World): UINodeData[] | null {
       if (_actionMeta && entity.has(_actionMeta.trait)) {
         const a = entity.get(_actionMeta.trait) as any;
         node.action = { bindings: a.bindings || [] };
+        const press = resolvePress(a.pressScale, scenePressScale, scenePressMs);
+        if (press) node.press = press;
       }
       if (_touchMeta && entity.has(_touchMeta.trait)) {
         const tc = entity.get(_touchMeta.trait) as any;

@@ -903,6 +903,8 @@ export function registerAllTraits() {
       inputLockMaxMs: { type: 'number', min: 100, max: 60000, step: 100, tooltip: 'Safety valve, ms. If the lock has been held longer than this, it is force-released (with a console warning) on the next acquire attempt, so a hung async handler cannot brick the UI permanently. Must be ≥ Input Lock Min Ms — a smaller value here is clamped up to the floor.' },
       fontFamily: { type: 'string', tooltip: 'The DEFAULT typeface for every UI root in the scene — a FONT ASSET (drag one in, or use the Aa picker), stored as a GUID like every other asset reference. UI roots are SIBLINGS, not nested under one shared element, so a font authored only on a single UIElement never reaches the others; author it HERE once and it reaches every root by CSS inheritance. A per-element UIElement.fontFamily still overrides this for that element and its descendants.\nEmpty ⇒ falls back to systemFont, then to the browser default. When both are set the ASSET wins.', accept: ['.ttf', '.otf', '.woff', '.woff2'] },
       systemFont: { type: 'string', tooltip: 'A plain CSS family name (system-ui, Helvetica, or a stack) — for a typeface no asset can express. Used only when fontFamily above is empty or unresolvable. Same override rule: a per-element UIElement.systemFont still wins for that element.' },
+      pressScale: { type: 'number', min: 0.5, max: 2, step: 0.01, tooltip: 'Press feedback for every UI button in the scene: the scale a button grows to while a finger is held on it, settling back on release. Default 1.08; 1 = off; below 1 shrinks instead. A button\'s own UIAction.pressScale overrides this. A backdrop covering half the screen or more (a dismiss-on-tap scrim, a tap catcher) never scales.' },
+      pressDurationMs: { type: 'number', min: 0, max: 1000, step: 5, tooltip: 'How long, in ms, the press scale takes to grow on press and to settle back on release. 0 = instant.' },
     },
   });
 
@@ -1172,6 +1174,7 @@ export function registerAllTraits() {
       // target entity) or 'call' (dispatch a named system/engine action with
       // typed params). Edited via the Inspector's UIActionBindingsField.
       bindings: { type: 'bindings', tooltip: 'Event→response bindings: set a property or call an action on click/change/submit' },
+      pressScale: { type: 'number', min: 0, max: 2, step: 0.01, tooltip: 'Press feedback: the scale this element grows to while a finger is held on it. 0 (or empty) = use the scene default (UISettings.pressScale). 1 = off for this element. Only applies when the element has a Click binding. A backdrop covering half the screen or more (a dismiss-on-tap scrim) never scales — no need to turn it off.' },
     },
   });
 

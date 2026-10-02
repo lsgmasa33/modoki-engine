@@ -5,6 +5,10 @@ import { trait } from 'koota';
  *  silently drift from the authored default. */
 export const UI_SETTINGS_DEFAULT_INPUT_LOCK_MIN_MS = 300;
 export const UI_SETTINGS_DEFAULT_INPUT_LOCK_MAX_MS = 10000;
+/** Press feedback (#2011) is ON by default (owner, 2026-10-02): every button grows a little
+ *  while held. Re-exported so a scene with no `UISettings` entity gets the same value. */
+export const UI_SETTINGS_DEFAULT_PRESS_SCALE = 1.08;
+export const UI_SETTINGS_DEFAULT_PRESS_DURATION_MS = 90;
 
 /**
  * UI resource — the singleton knobs for the global input lock (`applyBindings`'
@@ -57,4 +61,19 @@ export const UISettings = trait({
    * descendant's own `font-family` wins over the inherited container value).
    */
   systemFont: '',
+  /**
+   * Press feedback (#2011): the scale a button grows to while a finger or mouse button is held
+   * on it, and returns from on release. Applies to every UI node with a `click` binding on its
+   * `UIAction`; a per-button `UIAction.pressScale` overrides it. `1` turns it off.
+   *
+   * Scale UP rather than down is the owner's call (2026-10-02): a finger covers a button, so a
+   * shrink happens out of sight, and growth reaches past the fingertip where it can be seen.
+   *
+   * On by default (owner, 2026-10-02): every new button reacts with no setup. A full-screen
+   * backdrop that carries a click binding (a dismiss-on-tap scrim) is never scaled — see
+   * `ui/pressFeedback.ts` § "A backdrop is never a button".
+   */
+  pressScale: UI_SETTINGS_DEFAULT_PRESS_SCALE,
+  /** How long, in ms, the press scale takes to grow on press and to settle back on release. */
+  pressDurationMs: UI_SETTINGS_DEFAULT_PRESS_DURATION_MS,
 });

@@ -14,6 +14,7 @@ import { useFocusStore, consumePendingActivation } from './focusManager';
 import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
 import { installPressOriginTracking } from './pressOrigin';
+import { installPressFeedback } from './pressFeedback';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
 import { VIEWPORT_LENGTH_UNITS, VIEWPORT_UNIT_AXIS, viewportUnitVar } from '../traits/uiLength';
 import { reservedEdgeVar } from './anchorCss';
@@ -91,6 +92,8 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // UINode's click handler can refuse a click the browser resolved to an ancestor a swipe merely
   // passed through. Same runtime-only gating as unblockRef, and disposed alongside it.
   const pressOriginRef = useRef<(() => void) | null>(null);
+  // #2011 — grows a held button (see pressFeedback.ts). Same runtime-only gating and lifetime.
+  const pressFeedbackRef = useRef<(() => void) | null>(null);
   // #1126 — the text-overflow scan (`uiOverflowScan.ts`). Same runtime-only gating again: SceneView's
   // authoring preview is a second mount of the SAME tree, and scanning both would measure every
   // element twice, once at the preview's simulated size, into one per-world findings store. Also
@@ -105,11 +108,14 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     unblockRef.current = null;
     pressOriginRef.current?.();
     pressOriginRef.current = null;
+    pressFeedbackRef.current?.();
+    pressFeedbackRef.current = null;
     overflowScanRef.current?.();
     overflowScanRef.current = null;
     if (!el) return;
     if (!onSelectEntity) unblockRef.current = registerPointerBlocker(el);
     if (!onSelectEntity) pressOriginRef.current = installPressOriginTracking(el.ownerDocument);
+    if (!onSelectEntity) pressFeedbackRef.current = installPressFeedback(el);
     if (!onSelectEntity && isUIOverflowCheckEnabled()) {
       overflowScanRef.current = installUIOverflowScan(el, () => useUITreeStore.getState().tree, (cb) => useUITreeStore.subscribe(cb));
     }

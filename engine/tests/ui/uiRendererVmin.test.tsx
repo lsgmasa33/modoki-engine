@@ -79,3 +79,37 @@ describe('UIRenderer viewport vars', () => {
     await waitFor(() => expect(vmin(container.firstElementChild)).toBe('4px'));
   });
 });
+
+// #2011 — the press-feedback tracker is installed by the RUNTIME mount only. Without this, deleting
+// the install line left every press-feedback test green while no button ever reacted (review).
+describe('UIRenderer installs press feedback', () => {
+  function pressStampedChild(root: Element): HTMLElement {
+    const btn = document.createElement('div');
+    btn.setAttribute('data-press-origin', '');
+    btn.setAttribute('data-press-scale', '1.1');
+    root.appendChild(btn);
+    const e = new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 });
+    Object.defineProperty(e, 'isPrimary', { value: true });
+    btn.dispatchEvent(e);
+    return btn;
+  }
+
+  it('a runtime mount grows a held button', async () => {
+    state.tree = [node()];
+    const { container, unmount } = render(<UIRenderer storeState={{}} />);
+    await waitFor(() => expect(container.firstElementChild).toBeTruthy());
+    const btn = pressStampedChild(container.firstElementChild!);
+    expect(btn.style.getPropertyValue('scale')).toBe('1.1');
+    unmount();
+    // Unmounting disposes the last install, which releases the held press.
+    expect(btn.style.getPropertyValue('scale')).toBe('');
+  });
+
+  it("the editor's authoring-preview mount does not install it", async () => {
+    state.tree = [node()];
+    const { container } = render(<UIRenderer storeState={{}} onSelectEntity={() => {}} />);
+    await waitFor(() => expect(container.firstElementChild).toBeTruthy());
+    const btn = pressStampedChild(container.firstElementChild!);
+    expect(btn.style.getPropertyValue('scale')).toBe('');
+  });
+});
