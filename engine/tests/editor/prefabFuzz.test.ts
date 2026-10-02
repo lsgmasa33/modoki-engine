@@ -947,6 +947,24 @@ describe('#1789 prefab fuzz', () => {
     expect(held).toBeGreaterThan(0);
   }, 120_000);
 
+  // #2034: rule 3 keeps the records under a deleted member, and the old capture drops them — except a row today keeps as
+  // an orphan, which it writes back. An Apply that removes the member from the template leaves its `removed` row one,
+  // under the deleted member above it; I25 compared it capture-only. Minimized from #2023's hunt seed 1268.
+  it('#2034: I25 compares a row the orphan store keeps under a deleted member (hunt seed 1268)', async () => {
+    const ops: Op[] = [
+      { kind: 'delete', u: [0.43066262220963836, 0.5671485434286296, 0.31415704009123147, 0.7053195766638964, 0.6566344688180834, 0.6918214168399572, 0.13091036188416183, 0.6012136829085648] },
+      { kind: 'apply', u: [0.49852385581471026, 0.7594188530929387, 0.6740478533320129, 0.8201011335477233, 0.4186440228950232, 0.3610785307828337, 0.17998847900889814, 0.7364051344338804], check: 'rebuild-reload' },
+      { kind: 'delete', u: [0.33927211235277355, 0.5592474001459777, 0.43799786223098636, 0.7623946040403098, 0.018773149931803346, 0.774509527022019, 0.3464857474900782, 0.2845225145574659] },
+    ];
+    const { res, kept } = await uncounted(async () => {
+      const before = s4Seen.removedKeptOrphan;
+      const r = await runOps(be, ops, STRICT);
+      return { res: r, kept: s4Seen.removedKeptOrphan - before };
+    });
+    expect(res.failure, `${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();
+    expect(kept).toBeGreaterThan(0);
+  }, 60_000);
+
   // The P1 waivers (#2013, #2015, #2016) TOLERATE, and `claimsOf` reads only `stops`, so their two sides are held here:
   // each tolerates its own shape, and a near miss — another line beside it, the other direction, another leaf — is
   // tolerated by nothing, or a fold regression of a neighbouring shape would pass verify.

@@ -9,7 +9,8 @@
  *
  *  A divergence is triaged against the RULES (#2014): a door gap is fixed in the door; an old-capture bug is translated
  *  out by `judge`, with its issue named, and counted (`s4Seen`), so a translation that stops being reached is visible:
- *  - rule 3 (hub refinement, § 10.4): deleting a member KEEPS the records on and under it; the old capture drops them;
+ *  - rule 3 (hub refinement, § 10.4): deleting a member KEEPS the records on and under it; the old capture drops them,
+ *    except a row today keeps as an orphan (`keptMemberOrphans`), which it writes back (#2034);
  *  - hub ruling G2: a removed BASE component keeps its field records; the old capture drops them;
  *  - #1942 (open): the old capture writes only the non-default fields of a component on a template-added plain node;
  *  - KNOWN_OPEN #1829: the old capture writes a component the base lacks WHOLE, and a rotation as its whole group,
@@ -39,19 +40,25 @@ import type { OpKind } from './ops';
 export const DOOR_OPS: ReadonlySet<OpKind> = new Set<OpKind>(['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'reparent', 'duplicate', 'paste', 'instantiate']);
 
 /** What the translations reached, for the non-vacuity pins (the harness counts the comparisons and skips itself). */
-export const s4Seen = { removedKept: 0, removedComponentKept: 0, known1942: 0, known1829: 0, known1931: 0 };
+export const s4Seen = { removedKept: 0, removedKeptOrphan: 0, removedComponentKept: 0, known1942: 0, known1829: 0, known1931: 0 };
 
 type Bag = Record<string, unknown>;
 
 /** The record's list with the rules' side applied where the old capture cannot write it (see the header). */
 function translated(rec: InstanceRecord): OverrideList {
   const underRemoved = removedDescendants(rec);
+  const orphans = keptMemberOrphans(rec.rootGuid);
   let folded: ReadonlyMap<string, unknown> | undefined;
   const rows = new Map<string, SceneTargetRecord>();
   for (const [k, r0] of rec.list.rows) {
     const { guid: _g, name: _n, ...r } = r0;
-    // Rule 3 (hub refinement, § 10.4): a deleted member keeps the records on and under it; the old capture drops them.
-    if (underRemoved(k)) { if (Object.keys(r).length) s4Seen.removedKept++; continue; }
+    // Rule 3 (hub refinement, § 10.4): a deleted member keeps the records on and under it; the old capture drops them —
+    // except a row today's orphan store keeps, which the capture writes back (#2034: an Apply that removed the member
+    // from the template leaves its `removed` row an orphan). That row is compared as any other.
+    if (underRemoved(k)) {
+      if (!orphans?.[k]) { if (Object.keys(r).length) s4Seen.removedKept++; continue; }
+      s4Seen.removedKeptOrphan++;
+    }
     if (r.removed === true) { if (Object.keys(r).length > 1) s4Seen.removedKept++; rows.set(k, { ...r0, removed: true, traits: undefined, traitRemovals: undefined } as SceneTargetRecord); continue; }
     const row: SceneTargetRecord = { ...r0 };
     // KNOWN_OPEN #1829 (recorded, not fixed): a component the base LACKS, stated partially (a file-direct agent write, a

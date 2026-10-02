@@ -5,6 +5,9 @@
 
 import { describe, it, expect } from 'vitest';
 import { placementDiverge } from './foldOracle';
+import { parseInstanceRecord } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
+import type { SceneEntityEntry } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { FoldedInstance, InstanceRecord, SceneTargetRecord, UnusedRecord, AddedNodeRef, DesiredNode, PrefabDoc, PrefabReader } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 const rec = (rows: Record<string, SceneTargetRecord>, heldOwn?: Record<string, string[]>, pendingLegacy?: Record<string, unknown>): InstanceRecord => ({
@@ -15,6 +18,7 @@ const rec = (rows: Record<string, SceneTargetRecord>, heldOwn?: Record<string, s
     ...(pendingLegacy ? { pendingLegacy } : {}),
   } as InstanceRecord['held'],
 });
+const show = (v: unknown) => JSON.stringify(v);
 const legacy = (key: string, path: string[], cause: UnusedRecord['cause']): UnusedRecord => ({ key, part: { kind: 'legacy', path }, cause });
 const fold = (o: { nodes?: string[]; placeholders?: string[]; anchors?: Record<string, string[]>; unused?: UnusedRecord[] }): FoldedInstance => ({
   nodes: new Map((o.nodes ?? ['/']).map((k) => [k, { key: k } as DesiredNode])),
@@ -194,36 +198,95 @@ describe('#2021 P1 oracle: every held legacy statement under a placeholder is re
 });
 
 describe('#2030 P1 oracle: #2025\'s held forms are placed by the rules (hub rulings Q3, Q4)', () => {
-  const node = (parentLocalId: number) => ({ guid: 'n', name: 'N', parentLocalId, traits: {} });
+  const node = (parentLocalId: number, guid = 'n') => ({ guid, name: guid.toUpperCase(), parentLocalId, traits: {} });
   const at = ['added', '0'];
+  /** The entry as stored: its root forms are what Q3 is judged from (#2030 review), whatever the record says. */
+  const owner = (rootLid: number | null, channels: Record<string, unknown>) => ({ traits: rootLid === null ? {} : { PrefabInstance: { localId: rootLid } }, ...channels });
 
   it('the entry-level legacy `added` under a missing root: AT it (`/`) when the entry states the root localId and the node names it', () => {
     const r = rec({}, undefined, { added: [node(1)] });
-    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] } }), r, { rootLid: 1 })).toEqual([]);
+    const o = owner(1, { added: [node(1)] });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] } }), r, { owner: o })).toEqual([]);
     // Held instead (the fold before #2025's Q3 fix): hidden, where every other form shows it.
-    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved')] }), r, { rootLid: 1 }))
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved')] }), r, { owner: o }))
       .toEqual(['own link n: stated ["anchor /"] placed ["unused / unresolved"]']);
   });
 
+  it('…judged from the STORED owner, not the record: a parse that links a node no ruling places at `/` is red', () => {
+    // The parse links what it places at `/` as the `/` row's `own`. One linking BOTH nodes agrees with itself; the stored
+    // owner says `m` names another localId, so it waits (#2030 review: the over-linking mutation passed the record).
+    const o = owner(1, { added: [node(1), node(2, 'm')] });
+    const overLinked = rec({ '/': { own: [{ guid: 'n' }, { guid: 'm' }] } });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n', 'm'] } }), overLinked, { owner: o }))
+      .toEqual(['own link m: stated ["unused / unresolved"] placed ["anchor /"]']);
+    // The record a correct parse makes: `n` linked, `m` held where it was stated.
+    const r = rec({ '/': { own: [{ guid: 'n' }] } }, undefined, { added: [node(2, 'm')] });
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: [legacy('/', at, 'unresolved')] }), r, { owner: o })).toEqual([]);
+    // A parse that links an owner's root node at another row: red, not a duplicate left unjudged (close-out review).
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: [own('/R', 'm', 'unresolved')] }), rec({ '/': { own: [{ guid: 'n' }] }, '/R': { own: [{ guid: 'm' }] } }), { owner: o }))
+      .toEqual(['own link m: stated at / by the owner, linked at /R by the parse', 'own link m: stated ["unused / unresolved"] placed ["unused /R unresolved"]']);
+    // A parse that drops a node the owner states: placed nowhere.
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] } }), rec({ '/': { own: [{ guid: 'n' }] } }), { owner: o }))
+      .toEqual(['own link m: stated ["unused / unresolved"] placed []']);
+  });
+
   it('…and waits, unresolved, when it is not provably AT the root: no localId stated, another localId, or a whole `/` list', () => {
-    for (const [what, r, rootLid] of [
-      ['no root localId stated (none is guessed, rule 5)', rec({}, undefined, { added: [node(1)] }), null],
-      ['anchored inside the missing frame', rec({}, undefined, { added: [node(2)] }), 1],
-      ['the held `/` row\'s whole list replaces it', rec({}, undefined, { added: [node(1)], members: { '/': { added: [] } } }), 1],
+    for (const [what, rootLid, channels] of [
+      ['no root localId stated (none is guessed, rule 5)', null, { added: [node(1)] }],
+      ['anchored inside the missing frame', 1, { added: [node(2)] }],
+      ['the held `/` row\'s whole list replaces it', 1, { added: [node(1)], members: { '/': { added: [] } } }],
     ] as const) {
+      const r = rec({}, undefined, structuredClone(channels));
+      const o = owner(rootLid, channels);
       const rowRec = what.includes('whole') ? [legacy('/', ['members', '/', 'added'], 'unresolved')] : [];
-      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved'), ...rowRec] }), r, { rootLid }), what).toEqual([]);
-      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: rowRec }), r, { rootLid }), what)
+      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', at, 'unresolved'), ...rowRec] }), r, { owner: o }), what).toEqual([]);
+      expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: rowRec }), r, { owner: o }), what)
         .toEqual(['own link n: stated ["unused / unresolved"] placed ["anchor /"]']);
     }
     // A REMAINDER `/` row states no whole list: the node is at the root.
-    const rem = rec({}, undefined, { added: [node(1)], members: { '/': { added: [], heldRemainder: true } } });
-    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: [legacy('/', ['members', '/', 'added'], 'unresolved')] }), rem, { rootLid: 1 })).toEqual([]);
+    const remainder = { added: [node(1)], members: { '/': { added: [], heldRemainder: true } } };
+    const rem = rec({}, undefined, remainder);
+    expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], anchors: { '/': ['n'] }, unused: [legacy('/', ['members', '/', 'added'], 'unresolved')] }), rem, { owner: owner(1, remainder) })).toEqual([]);
+  });
+
+  it('…through today\'s parse and fold: the node naming the root shows at `/`, the other waits', () => {
+    const entry = owner(1, { guid: 'root', prefab: 'P', added: [node(1), node(2, 'm')] }) as unknown as SceneEntityEntry;
+    const read: PrefabReader = () => ({ missing: true });
+    const { record } = parseInstanceRecord(entry, read, { sceneVersion: 19 });
+    const f = foldInstance(read, record);
+    expect(placementDiverge(f, record, { read, owner: entry })).toEqual([]);
+    expect([...f.anchors.get('/') ?? []].map((r) => r.guid)).toEqual(['n']);
+  });
+
+  it('a node stating an EMPTY guid names nothing: the parse holds it, and the oracle does not call it a user node', () => {
+    // Linked by its guid, `''` links nothing (the parser's rule at a missing root); a held record the fold reports, not a
+    // node to place — at `/` it would be stated there, and red.
+    const blank = { guid: '', name: 'B', parentLocalId: 1, traits: {} };
+    const entry = owner(1, { guid: 'root', prefab: 'P', added: [blank] }) as unknown as SceneEntityEntry;
+    const read: PrefabReader = () => ({ missing: true });
+    const { record } = parseInstanceRecord(entry, read, { sceneVersion: 19 });
+    const f = foldInstance(read, record);
+    expect(f.anchors.get('/') ?? []).toEqual([]);
+    expect(placementDiverge(f, record, { read, owner: entry })).toEqual([]);
+  });
+
+  it('…and a malformed root channel states no node: the file boundary keeps it verbatim, as the parse does', () => {
+    // One element no reader takes sends the whole list to `unparsed` (malformedChannels.ts), so nothing in it links.
+    const read: PrefabReader = () => ({ missing: true });
+    for (const channels of [
+      { added: [node(1), { guid: 'x', parentLocalId: 1 }] },
+      { added: [node(1)], members: { '/': { added: [{ guid: 'y', name: 'Y' }] } } },
+      { members: { '/': { own: [node(0, 'o'), { guid: 'z' }] } } },
+    ]) {
+      const entry = owner(1, { guid: 'root', prefab: 'P', ...channels }) as unknown as SceneEntityEntry;
+      const { record } = parseInstanceRecord(entry, read, { sceneVersion: 19 });
+      expect(placementDiverge(foldInstance(read, record), record, { read, owner: entry }), JSON.stringify(channels)).toEqual([]);
+    }
   });
 
   it('…while the root\'s document loads, the entry-level form stays unjudged', () => {
     const r = rec({}, undefined, { added: [node(1)] });
-    expect(placementDiverge(fold({ unused: [legacy('/', at, 'gone')] }), r, { rootLid: 1 })).toEqual([]);
+    expect(placementDiverge(fold({ unused: [legacy('/', at, 'gone')] }), r, { owner: owner(1, { added: [node(1)] }) })).toEqual([]);
   });
 
   // P's row 5 (node R) references M; whether M loads decides the slot's placeholder.
@@ -256,6 +319,14 @@ describe('#2030 P1 oracle: #2025\'s held forms are placed by the rules (hub ruli
     expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R/M', ['members', '/R/M'], 'unresolved')] }), inside)).toEqual([]);
     expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R/M', ['members', '/R/M', 'own'], 'unresolved')] }), inside)).toEqual([]);
     expect(placementDiverge(fold({ placeholders: ['/R'] }), inside)).toEqual(['own link n: stated ["unused /R/M unresolved"] placed []', 'under a placeholder, held ["members","/R/M"] not reported']);
+    // A held `added` is reported node by node: one record for the whole row (or its list) places none of them.
+    const two = rec({}, undefined, { members: { '/R/M': { added: [node(0), node(0, 'm')] } } });
+    const each = [legacy('/R/M', ['members', '/R/M', 'added', '0'], 'unresolved'), legacy('/R/M', ['members', '/R/M', 'added', '1'], 'unresolved')];
+    expect(placementDiverge(fold({ placeholders: ['/R'], unused: each }), two)).toEqual([]);
+    for (const whole of [['members', '/R/M'], ['members', '/R/M', 'added']]) {
+      expect(placementDiverge(fold({ placeholders: ['/R'], unused: [legacy('/R/M', whole, 'unresolved')] }), two), show(whole))
+        .toEqual(['own link n: stated ["unused /R/M unresolved"] placed []', 'own link m: stated ["unused /R/M unresolved"] placed []']);
+    }
     // AT a missing root (Q3, B4): it shows at `/`, and is not held.
     const atRoot = rec({}, undefined, { members: { '/': { own: [node(0)] } } });
     expect(placementDiverge(fold({ nodes: [], placeholders: ['/'], unused: [legacy('/', ['members', '/'], 'unresolved')] }), atRoot))

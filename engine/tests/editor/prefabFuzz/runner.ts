@@ -24,7 +24,7 @@ import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/iden
 import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { shadowSeams, listDiff, assertNotSelf, liveStoredRoots, type ShadowSeams } from './shadow';
-import { checkRecord, statedRootLid } from '../foldOracle';
+import { checkRecord, type StoredOwner } from '../foldOracle';
 import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, parseReferenceNode } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { getCachedPrefab } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
@@ -331,17 +331,17 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
   // ruling (a) for #1831 — a node at an unresolved placeholder owns its record and is live). Each is compared when it is
   // live. One under an own node the owner's fold does not ANCHOR and that is not live (a kept orphan row's, its member
   // gone) is not projected: counted, not compared, and whether the fold keeps it is the owner's unused comparison.
-  const queue: { parsed: ParsedInstance; counter: string; anchored: boolean; rootLid: number | null }[] = [];
+  const queue: { parsed: ParsedInstance; counter: string; anchored: boolean; owner: StoredOwner }[] = [];
   const out: Failure[] = [];
-  const parse = (what: string, counter: string, fn: () => ParsedInstance, rootLid: number | null, anchored = true) => {
-    try { queue.push({ parsed: fn(), counter, anchored, rootLid }); } catch (e) { out.push({ check: 'P1 by the fold threw', detail: `parse ${what}: ${String(e)}` }); }
+  const parse = (what: string, counter: string, fn: () => ParsedInstance, owner: StoredOwner, anchored = true) => {
+    try { queue.push({ parsed: fn(), counter, anchored, owner }); } catch (e) { out.push({ check: 'P1 by the fold threw', detail: `parse ${what}: ${String(e)}` }); }
   };
-  for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) parse(entry.guid, 'P1 by the fold', () => parseInstanceRecord(entry, read, opts), statedRootLid(entry));
+  for (const entry of scene.entities ?? []) if (entry.prefab && entry.guid) parse(entry.guid, 'P1 by the fold', () => parseInstanceRecord(entry, read, opts), entry);
   const refsUnder = (node: AddedEntity): AddedEntity[] => node.prefab ? [node] : (node.children ?? []).flatMap(refsUnder);
   // Every instance's failure, not the first: a KNOWN_OPEN entry tolerates one instance's, and must not hide another's —
   // and a throw in one instance's parse, fold or comparison is that instance's failure, not `serializeScene threw`.
   for (let i = 0; i < queue.length; i++) {
-    const { parsed: { record, ownContent }, counter, anchored: placed, rootLid } = queue[i]!;
+    const { parsed: { record, ownContent }, counter, anchored: placed, owner } = queue[i]!;
     try {
       const anchored = new Set([...foldInstance(read, record).anchors.values()].flat().map((r) => r.guid));
       for (const node of ownContent.values()) {
@@ -350,13 +350,13 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
           if (!ref.guid) continue;
           const counter = ref === node ? 'P1 by the fold: a scene-added reference node' : 'P1 by the fold: a reference node inside a plain added node';
           // Placed only inside a placed owner: a node anchored in a record that is itself not projected is not either.
-          parse(ref.guid, counter, () => parseReferenceNode(ref, read, opts), statedRootLid(ref), placed && anchored.has(node.guid));
+          parse(ref.guid, counter, () => parseReferenceNode(ref, read, opts), ref, placed && anchored.has(node.guid));
         }
       }
       const root = findEntityByGuid(record.rootGuid);
       if (!root && !placed) { ran('P1 by the fold: a reference node not projected (not compared)'); continue; }
       if (!root) { out.push({ check: 'P1 a stored instance has no live root', detail: record.rootGuid }); continue; }
-      const d = checkRecord(record, read, root.id(), copies, rootLid);
+      const d = checkRecord(record, read, root.id(), copies, owner);
       // Counted once a comparison RAN, under where the instance was found: a step with no stored instance compares
       // nothing, and an instance found but never compared (a missing root, a throw) must not read as checked.
       ran(counter);

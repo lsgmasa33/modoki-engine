@@ -17,6 +17,7 @@
 import type { SceneEntityEntry } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { PrefabReader } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { frameOf, componentOf } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { isUserNode } from '../foldOracle';
 
 export const FILE_FORMS = ['v16RowAtPlaceholder', 'v16RootAdded', 'v17RootOwn', 'legacyRootAdded', 'slotAtMissingNested'] as const;
 export type FileForm = (typeof FILE_FORMS)[number];
@@ -26,8 +27,6 @@ type Scene = { entities?: SceneEntityEntry[] } & Bag;
 export interface FormVariant { form: FileForm; entry: number; scene: Scene }
 
 const isBag = (v: unknown): v is Bag => !!v && typeof v === 'object' && !Array.isArray(v);
-/** A user's own node the rules link by guid: keyless, with a guid stated. */
-const isUserNode = (n: unknown): n is Bag & { guid: string } => isBag(n) && !(typeof n.key === 'string' && n.key) && typeof n.guid === 'string' && !!n.guid;
 
 /** The slot path (`'5'`, `'5.3'`) naming placeholder row `key` of the instance of `source`, frame by frame, or null when a
  *  step is not a document row (a template-added `a+` node) or a frame on the way does not load. */

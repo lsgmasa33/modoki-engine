@@ -60,6 +60,8 @@ const reached = Object.fromEntries(PLACED.map((k) => [k, 0])) as Record<(typeof 
 const forms = Object.fromEntries(FILE_FORMS.map((k) => [k, 0])) as Record<FileForm, number>;
 /** …and the held slot nodes among them `placementDiverge` judged rather than left unjudged (a slot's placeholder is a walk). */
 let slotJudged = 0;
+/** …and the user nodes of a stored entry's legacy `added` under a missing root, judged from the entry as stored (Q3). */
+let entryJudged = 0;
 
 describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scenes)', () => {
   for (const seed of SEEDS) {
@@ -121,6 +123,7 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
       // and judged as it is (the rulings place it the same in every form).
       const variants = fileForms(scene as never, read, (entry) => [...foldInstance(read, parseInstanceRecord(entry, read, opts).record).placeholders.keys()]);
       const slot0 = seen.heldSlotAdded;
+      const entry0 = seen.heldEntryAdded;
       for (const [n, v] of variants.entries()) {
         const path = scenePath!.replace(/\.json$/, `.form${n}.json`);
         be.write(path, JSON.stringify(v.scene));
@@ -130,6 +133,7 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
         forms[v.form]++;
       }
       slotJudged += seen.heldSlotAdded - slot0;
+      entryJudged += seen.heldEntryAdded - entry0;
       report[`seed ${seed}`] = lines;
       expect(lines).toEqual([]);
     }, 120_000);
@@ -150,6 +154,7 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     // #2030: every one of #2025's file forms was generated from a saved scene and judged.
     for (const k of FILE_FORMS) expect(forms[k], k).toBeGreaterThan(0);
     expect(slotJudged).toBeGreaterThan(0);
+    expect(entryJudged).toBeGreaterThan(0);
     // A guid stated twice is left unjudged (#1937), so a regression that states links twice would turn the check off.
     expect(seen.ownDuplicate).toBe(0);
   });

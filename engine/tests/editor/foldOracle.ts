@@ -15,6 +15,7 @@ import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolv
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, preV5NodeGuid, frameOf, componentOf, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { parseSteps } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { splitMalformedChannels } from '../../packages/modoki/src/runtime/loaders/malformedChannels';
 import { HELD_REMAINDER, type PrefabReader, type FoldedInstance, type UnusedRecord, type InstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
 
 type LiveNode = { key: string; parent: { key: string } | { guid: string } | null; traits: Record<string, Record<string, unknown> | true> };
@@ -306,15 +307,26 @@ function slotPlaceholder(source: string, path: string, read: PrefabReader | unde
   return null;
 }
 
+/** A user's own node, as every held form states one: keyless (a template node has a `key`), with a guid stated — the
+ *  rules link a node by its guid, so an empty one names nothing (#2030 review). Shared by the oracle and the fuzzer's
+ *  file forms (`prefabFuzz/fileForms.ts`), so the two cannot disagree on which nodes there are. */
+export const isUserNode = (n: unknown): n is Bag & { guid: string } =>
+  !!n && typeof n === 'object' && !Array.isArray(n) && !(typeof (n as Bag).key === 'string' && (n as Bag).key) && typeof (n as Bag).guid === 'string' && !!(n as Bag).guid;
+
+/** The stored owner {@link placementDiverge} reads a missing root's held forms from: a scene entry, or a scene-added
+ *  reference node. */
+export type StoredOwner = { traits?: unknown; added?: unknown; members?: unknown };
+
 /** What {@link placementDiverge} needs beyond the fold and the record to judge #2025's held forms (#2030). Absent, the
  *  form it would judge stays unjudged (counted), as before. */
 export interface PlacementContext {
   /** The instance's documents: a held `nestedStructure` slot names its frame by localIds, so where its node waits is a
    *  walk through them. */
   read?: PrefabReader;
-  /** The root localId the ENTRY states (`PrefabInstance.localId`), or `null` when it states none: the legacy `added`
-   *  channel names its anchor by localId, so whether a node there is AT a missing root depends on it. */
-  rootLid?: number | null;
+  /** The owner AS STORED. Under a missing root, where each user node of its root forms belongs (Q3) is read from it, not
+   *  from the parse: the parser takes the nodes it links out of what it holds and states them as the `/` row's `own`,
+   *  so judged from the record, a parser linking every node agrees with itself (#2030 review). */
+  owner?: StoredOwner;
 }
 
 /** #2021: where the fold puts what it cannot apply in place, against the RECORD (design § 10.4b, #2018's rulings).
@@ -327,8 +339,9 @@ export interface PlacementContext {
  *    AT a placeholder it shows "in every file form" (#2025, judged since #2030):
  *    - a held member row's `added` or `own`, at that row;
  *    - the entry-level legacy `added` under a MISSING ROOT: AT it (`/`) when the entry states the root's localId, the
- *      node names it, and the held `/` row states no whole `added` list (which replaces it once the document returns);
- *      otherwise it waits, `unresolved` (hub ruling Q3: no localId is guessed, rule 5);
+ *      node names it, and the `/` row states no whole `added` list (which replaces it once the document returns);
+ *      otherwise it waits, `unresolved` (hub ruling Q3: no localId is guessed, rule 5). Read from the owner AS STORED
+ *      (`ctx.owner`), with the `/` row's forms: the parse moves what it links, so it cannot judge its own linking;
  *    - a `nestedStructure` slot's `added` whose path stops at a MISSING nested document: it waits `unresolved`, keyed at
  *      that placeholder row (hub ruling Q4: AT and INSIDE cannot be told apart without the document), or `heldNode`
  *      there when a removal cut that row;
@@ -340,7 +353,7 @@ export interface PlacementContext {
  *  what is at or inside it is under the instance's own removal, so its links are `heldNode` and its other records are
  *  inert (hub, 2026-10-02, #2021: the cut dominates the placeholder; rule 3).
  *  Not judged: a guid stated more than once (a duplicate identifier: #1937 owns what it means; counted); a held node in
- *  the entry-level `added` while the root's document LOADS, or with no `ctx.rootLid`, and in a slot that resolves, names
+ *  the entry-level `added` while the root's document LOADS, or with no `ctx.owner`, and in a slot that resolves, names
  *  no reference row, or has no `ctx.read` (no ruling places those; counted) — each must still be placed exactly once; a
  *  nested-channel statement under a missing NESTED prefab; and which of a held statement's parts the fold reports — a
  *  statement needs one record besides its nodes, so one losing some of its fields passes. */
@@ -356,18 +369,36 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
   // The user-added nodes the record states: guid → each statement's anchor key and where the rules put it.
   const stated = new Map<string, { key: string; want: string }[]>();
   const state = (guid: string, key: string, want = allowedAt(key)) => stated.set(guid, [...(stated.get(guid) ?? []), { key, want }]);
-  for (const [key, r] of rec.list.rows) for (const o of r.own ?? []) state(o.guid, key);
+  // AT a missing root (Q3), each user node of the STORED owner's root forms: the legacy `added` shows at `/` when the
+  // owner states the root's localId, the node names it, and the `/` row states no whole `added` (which replaces those
+  // nodes once the document returns); otherwise it waits, `unresolved` (no localId is guessed, rule 5). A `/` row's
+  // `own`, and the keyless nodes of its whole `added`, show at `/`. Wherever the parse states these, they are judged here.
+  const fromOwner = new Set<string>();
+  if (atPh(ROOT_KEY) && ctx.owner) {
+    // As the file boundary reads it: a channel no reader takes (a malformed list) is kept verbatim, stating no node.
+    const o = splitMalformedChannels(ctx.owner).clean as Bag;
+    const rootLid = statedRootLid(o);
+    const row = o.members && typeof o.members === 'object' ? (o.members as Bag)[ROOT_KEY] as Bag | undefined : undefined;
+    const rowReplaces = !!row && typeof row === 'object' && Array.isArray(row.added) && row[HELD_REMAINDER] !== true;
+    const own = (list: unknown, want: (n: Bag) => string) => { for (const n of Array.isArray(list) ? list : []) if (isUserNode(n)) { state(n.guid, ROOT_KEY, want(n)); fromOwner.add(n.guid); } };
+    own(o.added, (n) => { seen.heldEntryAdded++; return rootLid !== null && n.parentLocalId === rootLid && !rowReplaces ? `anchor ${ROOT_KEY}` : `unused ${ROOT_KEY} unresolved`; });
+    if (row && typeof row === 'object') for (const list of ['own', 'added'] as const) own(row[list], () => `anchor ${ROOT_KEY}`);
+  }
+  for (const [key, r] of rec.list.rows) for (const o of r.own ?? []) {
+    if (!fromOwner.has(o.guid)) state(o.guid, key);
+    // The owner states it at the missing root: a link elsewhere is the parse moving it, not a second statement (which
+    // would leave the guid unjudged as a duplicate).
+    else if (key !== ROOT_KEY) out.push(`own link ${o.guid}: stated at ${ROOT_KEY} by the owner, linked at ${key} by the parse`);
+  }
   const linked = new Set(stated.keys());
   // `heldOwn` holds a node's CONTENT; with a link of the same guid it is that link's node, not a second one.
   for (const [key, nodes] of rec.held.heldOwn ?? []) for (const n of nodes) { const g = typeof n.guid === 'string' ? n.guid : ''; if (!linked.has(g)) state(g, key); }
   /** The scene-owned (keyless) nodes of a held list, by index. */
-  const nodesOf = (list: unknown): [string, string][] => (Array.isArray(list) ? list.flatMap((el, i): [string, string][] => {
-    const n = el as Bag | null;
-    return n && typeof n === 'object' && !(typeof n.key === 'string' && n.key) && typeof n.guid === 'string' ? [[String(i), n.guid]] : [];
-  }) : []);
-  /** A held node the rules place: the fold reports it at its legacy path, or within the held record that holds it. */
+  const nodesOf = (list: unknown): [string, string][] => (Array.isArray(list) ? list.flatMap((n, i): [string, string][] => (isUserNode(n) ? [[String(i), n.guid]] : [])) : []);
+  /** A held node the rules place: the fold reports it at its legacy path, or within the held record that holds it. One
+   *  the stored owner already states at a missing root is judged by that statement. */
   const nodePaths = new Map<string, string>();
-  const heldNode = (path: string[], guid: string, key: string, want?: string) => { state(guid, key, want); nodePaths.set(pathOf(path), guid); };
+  const heldNode = (path: string[], guid: string, key: string, want?: string) => { if (!(key === ROOT_KEY && fromOwner.has(guid))) state(guid, key, want); nodePaths.set(pathOf(path), guid); };
   // A node held in a form the rules do not place (counted): it is still placed exactly once, at its own path.
   const unjudged = new Map<string, string>();
   // A held member row's `added` (v16) and `own` (v17): the row names its anchor.
@@ -375,18 +406,13 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
     if (!row || typeof row !== 'object') continue;
     for (const list of ['added', 'own'] as const) for (const [i, g] of nodesOf((row as Bag)[list])) heldNode(['members', k, list, i], g, k);
   }
-  // The entry-level legacy `added` names its anchor by the localId of a document that, under a missing root, is gone.
-  const rootRow = (pending.members as Bag | undefined)?.[ROOT_KEY] as Bag | undefined;
-  const rootRowReplaces = !!rootRow && Array.isArray(rootRow.added) && rootRow[HELD_REMAINDER] !== true;
-  (Array.isArray(pending.added) ? pending.added : []).forEach((el, i) => {
-    const [g] = nodesOf([el]).map(([, guid]) => guid);
-    if (g === undefined) return;
-    const path = ['added', String(i)];
-    if (!atPh(ROOT_KEY) || ctx.rootLid === undefined) { unjudged.set(pathOf(path), g); return; }
-    seen.heldEntryAdded++;
-    const atRoot = ctx.rootLid !== null && (el as Bag).parentLocalId === ctx.rootLid && !rootRowReplaces;
-    heldNode(path, g, ROOT_KEY, atRoot ? `anchor ${ROOT_KEY}` : `unused ${ROOT_KEY} unresolved`);
-  });
+  // The entry-level legacy `added` names its anchor by the localId of a document that, under a missing root, is gone:
+  // judged from the stored owner (above), else unjudged.
+  for (const [i, g] of nodesOf(pending.added)) {
+    const path = ['added', i];
+    if (fromOwner.has(g)) heldNode(path, g, ROOT_KEY);
+    else unjudged.set(pathOf(path), g);
+  }
   // A `nestedStructure` slot's `added`, at the placeholder its path stops at.
   for (const [k, slot] of Object.entries((pending.nestedStructure ?? {}) as Bag)) {
     if (!slot || typeof slot !== 'object') continue;
@@ -407,9 +433,11 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
   for (const u of fold.unused) {
     if (u.part.kind === 'own') place(u.part.guid, `unused ${u.key} ${u.cause}`);
     else if (u.part.kind === 'legacy') {
-      // The record AT a node's path, or the held record holding it whole (a held row's `own` is one of its fields).
+      // The record AT a node's path; a held row's `own` node, also the record holding it whole: the fold splits a held
+      // `added` node by node, but a row's `own` is one of its fields. Only there, or one record for a whole list would
+      // place every node of it (#2030 review).
       const p = pathOf(u.part.path);
-      for (const [np, g] of nodePaths) if (np === p || np.startsWith(`${p}\u0000`)) place(g, `unused ${u.key} ${u.cause}`);
+      for (const [np, g] of nodePaths) if (np === p || (np.split('\u0000')[2] === 'own' && np.startsWith(`${p}\u0000`))) place(g, `unused ${u.key} ${u.cause}`);
     }
   }
   // An unjudged node is still ONE node: shown once, or held once at its own path — never neither, both or twice.
@@ -499,7 +527,7 @@ export function placementDiverge(fold: FoldedInstance, rec: InstanceRecord, ctx:
  *  - D: a nested reference row whose prefab is missing, with no copy: today spawns nothing there; the rule puts the
  *    placeholder at the row (design § 2.4 item 5, ruling D; rule 9). */
 export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions, copies: ReadonlySet<string> = new Set()): string[] {
-  return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies, statedRootLid(entry));
+  return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies, entry);
 }
 
 /** The root localId a stored owner (a scene entry, or a scene-added reference node) states, `null` when none. */
@@ -508,10 +536,10 @@ export function statedRootLid(owner: { traits?: unknown }): number | null {
   return typeof pi?.localId === 'number' ? pi.localId : null;
 }
 
-/** {@link checkInstance} for a record already parsed — a scene reference node's (`parseReferenceNode`, #2009). `rootLid`
- *  is the root localId the stored owner states (`null`: none), which judges its legacy `added` under a missing root;
- *  left out, that form stays unjudged (`placementDiverge`). */
-export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), rootLid?: number | null): string[] {
+/** {@link checkInstance} for a record already parsed — a scene reference node's (`parseReferenceNode`, #2009). `owner` is
+ *  the entry or node as stored, which judges its root forms under a missing root; left out, the legacy `added` there
+ *  stays unjudged (`placementDiverge`). */
+export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: number, copies: ReadonlySet<string> = new Set(), owner?: StoredOwner): string[] {
   const fold = foldInstance(read, rec);
   const live = liveTree(rootId);
   // What today shows, anchored anywhere, before any translation moves a subtree out.
@@ -570,5 +598,5 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
     const last = key.slice(key.lastIndexOf('/') + 1);
     return last.startsWith('a+') || nodeGuids.has(last);
   };
-  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept), ...placementDiverge(fold, rec, { read, rootLid })];
+  return [...diverge(fold, live), ...unusedDiverge(fold, rec.rootGuid, live.placeholders, removedRows, projectsWhenRestored, memberInDocuments, rec.held.pendingLegacy as Bag | undefined, ruledKept), ...placementDiverge(fold, rec, { read, owner })];
 }

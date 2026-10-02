@@ -767,14 +767,25 @@ mechanically:
       whatever states it: a list row's `own` link, its content in `held.heldOwn`, or a scene-owned node in a held
       legacy form. § 10.4b's AT-a-placeholder fix covers every file form (#2025), and the held forms are judged by its
       rulings (#2030):
-      - a held member row's `added` (v16) or `own` (v17), at that row. A node in a row held whole is placed by the
-        record that holds the row;
+      - a held member row's `added` (v16) or `own` (v17), at that row. The fold reports a held `added` node by node,
+        so each needs its own record. A row's `own` is one of the row's fields, so its node may also be placed by the
+        record that holds the row, or its `own` list, whole. An `added` node may not: one record for a whole list would
+        then place every node in it;
       - the entry-level legacy `added` under a MISSING ROOT. It is AT `/` only when the entry states the root's
-        localId, the node names it, and the held `/` row states no whole `added` list. Otherwise it waits, `unresolved`
-        (hub ruling Q3: no localId is guessed, rule 5);
+        localId, the node names it, and the `/` row states no whole `added` list. Otherwise it waits, `unresolved`
+        (hub ruling Q3: no localId is guessed, rule 5). This is judged from the owner AS STORED (the entry, or a
+        scene-added reference node), with the `/` row's `own` and the keyless nodes of its whole `added` (both AT
+        `/`). The parse cannot judge it: it moves each node it links into the `/` row's `own`, so a parser linking every
+        node agreed with itself and passed. The owner is read as the file boundary reads it (a malformed channel is kept
+        verbatim and states no node), and a node it states at `/` that the parse links at another row is red, not a
+        duplicate left unjudged;
       - a `nestedStructure` slot's `added` whose path stops at a MISSING nested document. It waits `unresolved`, keyed
         at that placeholder row, or is `heldNode` there when a removal cut the row (hub ruling Q4). The check walks the
-        documents to find the row (`slotPlaceholder`); it does not take the fold's key.
+        documents to find the row (`slotPlaceholder`); it does not take the fold's key. That walk repeats the fold's
+        own (`slotKey`), so it catches the two drifting apart, not a walk both get wrong.
+
+      A user node is keyless with a non-empty guid (`isUserNode`): the rules link a node by its guid, so `''` names
+      none. The oracle and the file forms share that one predicate.
     - The fold reports only placeholders no removal cut. A placeholder the instance's own removal cuts goes with its
       member: its links are `heldNode` and its other records are inert (hub ruling, 2026-10-02: the cut dominates the
       placeholder, rule 3).
@@ -796,7 +807,12 @@ mechanically:
     row (parent localId 1, as a writer of that form stated it). Every form is pinned as reached, on seeds 5, 103 and
     235; so is a slot node actually JUDGED. Reverting each of #2025's branches turns its form red: the v16 row at a
     placeholder (9761a16df) seed 5, the root linking (bcc95fcdc) seeds 103 and 235, the slot keying (bf5da623b) seed 5.
-    A `/` row's v17 `own` stays green under the second revert: #2018's older branch links it.
+    A `/` row's v17 `own` stays green under the second revert: #2018's older branch links it. The pure cases also hold
+    the review's mutations: a parser linking every node at a missing root, an oracle reading Q3 from the parse, a
+    whole-list record placing each node, and an empty guid taken as a node each turn one red. The fold collapsing a
+    held `added` into one record turns seeds 5 and 103 red. Not reached: at a missing root the save states the nodes in
+    the legacy `added`, so the generator's branch deriving the forms from a `/` row's `own` never runs on these seeds
+    (counted 2026-10-02: 2 legacy, 0 own).
   - **Rule D is reached on a copy-less form** (#2033). D is a nested reference row whose prefab is missing and the scene
     holds no copy of it: a file saved before v19 (`embeddedPrefabs` arrived then), or saved while the prefab still
     existed. The run's own save writes the copies, so each saved scene is judged once more with `embeddedPrefabs`
@@ -839,6 +855,12 @@ mechanically:
       but the old capture still links it from the kept row. I25 translates exactly that link (`keptDeletedLinks`: a
       kept `a+` row the fold still declares, its node not live, the record not linking it; counted as `known1931`), so the run reaches the save, which writes the link, and the reload, which brings the
       node back. It is #2001 S6's acceptance case. A fix to `templateFrameNodes` itself would end both entries first.
+  - #2034 had the same mistake in I25's rule-3 translation, which dropped every record row under a deleted member
+    because "the old capture drops them". It does not drop a row today keeps as an orphan: it writes that row back.
+    Delete a nested member and Apply it to the template: its `removed` row now names nothing in the template, so today
+    keeps it as an orphan. Then delete the member above it. Both sides keep that row, and I25 called it capture-only. Such a row is now compared like any other
+    (counted as `removedKeptOrphan`, pinned on #2023's hunt seed 1268, minimized to 3 ops). Dropping the branch turns
+    the pin red.
   - #2023's other seeds had no oracle gap: fold and parser defects (#2027, #2029), and one more #2013 double booking.
   - And five fold defects:
     - #2015: a document-level move of a template's own row into a nested instance's member was held and never projected.
