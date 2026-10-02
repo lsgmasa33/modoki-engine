@@ -266,6 +266,37 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       expect(Object.keys(held.members[`/${g(5, 'R')}/${g(2, 'QA')}`]!.added[0]!).sort()).toEqual(['children', 'guid', 'key', 'members', 'name', 'parentLocalId', 'prefab', 'traits']);
     });
 
+    it('#2025 item 2: a node a slot adds to a MISSING nested frame waits unresolved, keyed at its placeholder (today shows none)', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'M-missing' })]));
+      const mine = { parentLocalId: 1, guid: G(89), name: 'MineNS', traits: {}, children: [] };
+      const { f } = await fold(top({ nestedStructure: { '5': { added: [mine] } } }));
+      expect(f.unused).toEqual([{ key: `/${g(5, 'R')}`, part: { kind: 'legacy', path: ['nestedStructure', '5', 'added', '0'] }, cause: 'unresolved' }]);
+      expect([...f.anchors.values()].flat()).toEqual([]);
+    });
+
+    it('#2025 item 4: a user node held inside a missing frame under the instance\'s OWN removal is kept, heldNode — never neither', async () => {
+      install(P([row(5, 'R', 2, { prefab: 'M-missing' })]));
+      const mine = { parentLocalId: 1, guid: G(86), name: 'Mine', traits: {}, children: [] };
+      const e = top({ members: { [`/${g(2, 'A')}`]: { removed: true }, [`/${g(5, 'R')}/${G(87)}`]: { added: [mine] } } });
+      expect((await fold(e)).f.unused).toEqual([{ key: `/${g(5, 'R')}/${G(87)}`, part: { kind: 'legacy', path: ['members', `/${g(5, 'R')}/${G(87)}`, 'added', '0'] }, cause: 'heldNode' }]);
+    });
+
+    it('#2025 item 2 under the instance\'s OWN removal: the slot\'s node is kept heldNode, keyed at its placeholder as uncut', async () => {
+      install(P([row(5, 'R', 2, { prefab: 'M-missing' })]));
+      const mine = { parentLocalId: 1, guid: G(89), name: 'MineNS', traits: {}, children: [] };
+      const { f } = await fold(top({ members: { [`/${g(2, 'A')}`]: { removed: true } }, nestedStructure: { '5': { added: [mine] } } }));
+      expect(f.unused).toEqual([{ key: `/${g(5, 'R')}`, part: { kind: 'legacy', path: ['nestedStructure', '5', 'added', '0'] }, cause: 'heldNode' }]);
+    });
+
+    it('#2025 item 5: a held node\'s content whose link the list states is reported once, by the link', async () => {
+      install(P());
+      const { parsed } = await fold(top({ members: { [`/${g(2, 'A')}`]: { own: [{ parentLocalId: 0, guid: G(88), name: 'N', traits: {}, children: [] }] } } }));
+      expect(parsed.record.list.rows.get(`/${g(2, 'A')}` as never)?.own).toEqual([{ guid: G(88) }]);
+      const rec = { ...parsed.record, held: { ...parsed.record.held, heldOwn: new Map([[`/${g(2, 'A')}`, [{ guid: G(88), name: 'N', traits: {}, children: [] }]]]) } };
+      const { foldInstance } = await import('../../packages/modoki/src/runtime/prefab/foldInstance');
+      expect(foldInstance(reader, rec as never).unused.filter((u) => u.part.kind === 'own')).toEqual([]);
+    });
+
     it('#2024: a restore AT a placeholder row whose template removed it is applied — the placeholder shows — and not unused', async () => {
       const QZ = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QZ', 1, { prefab: 'Z-missing' })] };
       install(P([row(5, 'R', 1, { prefab: 'Q', members: { [`/${g(2, 'QZ')}`]: { removed: true } } })]), QZ);

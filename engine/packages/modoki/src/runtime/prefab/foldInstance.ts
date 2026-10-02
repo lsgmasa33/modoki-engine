@@ -583,6 +583,23 @@ function heldUnused(
     if (cut === 'inner') return 'gone';
     return [...st.placeholders.keys()].some((p) => k === p || k.startsWith(`${p}/`)) ? 'unresolved' : 'gone';
   };
+  /** The placeholder row a held slot's member path stops at, where a document is missing; null otherwise (a slot that
+   *  resolves, or names no reference row, keeps its records at the root). A slot's records are keyed there, not at the
+   *  instance root (#2025 item 2: the missing document's root localId is never guessed, rule 5, so a
+   *  node it adds waits `unresolved` — at the placeholder that waits, as today shows none; hub ruling Q4, measured). */
+  const slotKey = (path: string): RowKey | null => {
+    if (!doc) return null;
+    let f = frameOf('', doc, rec.source);
+    for (const step of parseSteps(path)) {
+      const row = typeof step === 'number' && Number.isInteger(step) ? f.byLid.get(step) : undefined;
+      if (!row?.prefab) return null;
+      const key = `${f.prefix}/${componentOf(f, step as number)}`;
+      const got = st.read(row.prefab);
+      if (!('doc' in got)) return key;
+      f = frameOf(key, got.doc, row.prefab);
+    }
+    return null;
+  };
   /** The frame prefix a held slot's member path names, or null when a step does not resolve. */
   const framePrefix = (path: string): string | null => {
     if (!doc) return null;
@@ -629,7 +646,15 @@ function heldUnused(
     else if (isRecord(value)) {
       for (const [k, v] of Object.entries(value)) {
         const c = !doc ? 'unresolved' : channel === 'nestedOverrides' || channel === 'nestedStructure' ? pathCause(k) : channel === 'members' ? rowCause(k) : cause;
-        if (c === null) continue;
+        if (c === null) {
+          // Inert under the instance's own removal (rule 3) — but a user's own node held there is still a node: kept and
+          // reported `heldNode`, as its v20 link is, never neither (#2025 item 4, hub ruling on #2021).
+          const added = isRecord(v) && (channel === 'members' || channel === 'nestedStructure') && Array.isArray(v.added) ? v.added : [];
+          added.forEach((el, i) => {
+            if (!(isRecord(el) && typeof el.key === 'string' && el.key)) out.push({ key: channel === 'members' ? k : slotKey(k) ?? ROOT_ROW_KEY, part: { kind: 'legacy', path: [channel, k, 'added', String(i)] }, cause: 'heldNode' });
+          });
+          continue;
+        }
         if (!isRecord(v) || (channel !== 'members' && channel !== 'nestedStructure')) {
           out.push({ key: ROOT_ROW_KEY, part: { kind: 'legacy', path: [channel, k] }, cause: of(v, c) });
           continue;
@@ -638,10 +663,13 @@ function heldUnused(
         // A row at a placeholder frame root (its prefab missing) anchors that frame's keyed nodes, as a node would.
         const prefix = channel === 'members' ? (n ? (n.frame.rootKey === ROOT_ROW_KEY ? '' : n.frame.rootKey) : st.placeholders.has(k) ? k : null) : framePrefix(k);
         // A held member row is keyed at its own row: it is that target's record (§ 2), kept verbatim.
-        container([channel, k], v, prefix, c, channel === 'members' ? k : ROOT_ROW_KEY);
+        container([channel, k], v, prefix, c, channel === 'members' ? k : slotKey(k) ?? ROOT_ROW_KEY);
       }
     } else out.push({ key: ROOT_ROW_KEY, part: { kind: 'legacy', path: [channel] }, cause: of(value, cause) });
   }
-  for (const [key, nodes] of rec.held.heldOwn ?? []) for (const n of nodes) out.push({ key, part: { kind: 'own', guid: typeof n.guid === 'string' ? n.guid : '' }, cause: 'heldNode' });
+  // A held node's content whose link the list states is reported by that link, once (#2025 item 5).
+  const linked = new Set<string>();
+  for (const r of rec.list.rows.values()) for (const o of (r as { own?: readonly { guid?: unknown }[] }).own ?? []) if (typeof o.guid === 'string') linked.add(o.guid);
+  for (const [key, nodes] of rec.held.heldOwn ?? []) for (const n of nodes) if (!(typeof n.guid === 'string' && linked.has(n.guid))) out.push({ key, part: { kind: 'own', guid: typeof n.guid === 'string' ? n.guid : '' }, cause: 'heldNode' });
   return out;
 }

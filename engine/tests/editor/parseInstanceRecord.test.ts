@@ -10,6 +10,7 @@ import type { AddedEntity, SceneEntityEntry } from '../../packages/modoki/src/ru
 import { serializeInstanceRecord } from '../../packages/modoki/src/runtime/prefab/serializeInstanceRecord';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import { HELD_REMAINDER } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
+import { roundTripEntry } from './instanceRecordRoundTrip';
 
 const G = (n: number): string => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000002006`;
 const N1 = G(1), N2 = G(2), N3 = G(3), NQ1 = G(11), NQ2 = G(12), NQ3 = G(13);
@@ -716,21 +717,54 @@ describe('close-out review round 4 (parser)', () => {
   });
 });
 
-describe('hub ruling (a), #1831 hunt seed 7078a: a scene-added reference node at an unresolved placeholder', () => {
-  it('whose own prefab resolves gets its own record; its link stays held; one anchored inside the missing frame waits', () => {
+describe('hub rulings (a) and Q3 (#1831 hunt seed 7078a, #2025 items 1 and 3): the user\'s nodes AT a missing instance root', () => {
+  const HR = (extra: object) => ({ id: 9, name: 'HR', prefab: 'H-trashed', guid: G(70), traits: { PrefabInstance: { source: 'H-trashed', localId: 1 } }, ...extra }) as never;
+  const anchoredAtRoot = (r: ReturnType<typeof parseInstanceRecord>) => (foldInstance(reader(), r.record).anchors.get('/') ?? []).map((o) => (o as { guid: string }).guid);
+  it('link at / and show, in every file form; a reference node there is a record of its own when its prefab resolves; one inside waits', () => {
     const QR = { parentLocalId: 1, guid: G(71), name: 'QR', prefab: 'Q', traits: {}, children: [] };
     const QIn = { parentLocalId: 2, guid: G(72), name: 'QIn', prefab: 'Q', traits: {}, children: [] };
     const QGone = { parentLocalId: 1, guid: G(73), name: 'QGone', prefab: 'Q-missing', traits: {}, children: [] };
-    const e = { id: 9, name: 'HR', prefab: 'H-trashed', guid: G(70), traits: { PrefabInstance: { source: 'H-trashed', localId: 1 } }, added: [QR, QIn, QGone] } as never;
-    const r = parseInstanceRecord(e, reader(), V15);
-    expect([...r.ownContent.keys()]).toEqual([G(71)]);
-    expect(r.record.held.pendingLegacy?.added).toEqual([QR, QIn, QGone]);
+    const Mine = { parentLocalId: 1, guid: G(74), name: 'Mine', traits: {}, children: [] };
+    // The legacy added channel, at the root localId: each links at / (its link is projected, #2018); QIn waits, held.
+    const r = parseInstanceRecord(HR({ added: [QR, QIn, QGone, Mine] }), reader(), V15);
+    expect(anchoredAtRoot(r)).toEqual([G(71), G(73), G(74)]);
+    expect(r.record.held.pendingLegacy?.added).toEqual([QIn]);
     const own = parseReferenceNode(r.ownContent.get(G(71)) as never, reader(), V15);
     expect(own.record.source).toBe('Q');
     expect(own.record.held.pendingLegacy).toBeUndefined();
-    // The v16 row form at the root: the same.
-    const row = parseInstanceRecord({ id: 9, name: 'HR', prefab: 'H-trashed', guid: G(70), traits: { PrefabInstance: { source: 'H-trashed', localId: 1 } }, members: { '/': { added: [QR] } } } as never, reader(), V15);
-    expect([...row.ownContent.keys()]).toEqual([G(71)]);
+    // The v16 held / row's whole added: linked, the list kept as the whole list it was (it replaced the missing frame's).
+    // A keyed copy of the missing document's node waits on it.
+    const Copy = { parentLocalId: 1, guid: G(75), key: 'k1', name: 'Copy', traits: {}, children: [] };
+    const row = parseInstanceRecord(HR({ members: { '/': { added: [QR, Mine, Copy], removedTraits: ['Light'] } } }), reader(), V15);
+    expect(anchoredAtRoot(row)).toEqual([G(71), G(74)]);
+    expect(row.record.held.pendingLegacy?.members).toEqual({ '/': { added: [Copy], removedTraits: ['Light'] } });
+    // The v17 own beside a held field (item 3): linked, not held inside the row.
+    const v17 = parseInstanceRecord(HR({ members: { '/': { own: [Mine], removedTraits: ['Light'] } } }), reader(), V15);
+    expect(anchoredAtRoot(v17)).toEqual([G(74)]);
+    expect(v17.record.held.pendingLegacy?.members).toEqual({ '/': { removedTraits: ['Light'] } });
+    // Close-out review. A held / row's own with no guid stays held (none derives without the document, rule 5).
+    const guidless = { parentLocalId: 0, name: 'N', traits: {}, children: [] };
+    const gl = parseInstanceRecord(HR({ members: { '/': { own: [guidless], removedTraits: ['Light'] } } }), reader(), V15);
+    expect(gl.record.held.pendingLegacy?.members).toEqual({ '/': { own: [guidless], removedTraits: ['Light'] } });
+    // The / row's whole list replaces the legacy nodes at the root once the document returns: those stay held (§ 10.3).
+    const L = { ...Mine, guid: G(76), name: 'L' };
+    const rw = parseInstanceRecord(HR({ added: [L], members: { '/': { added: [Mine], removedTraits: ['Light'] } } }), reader(), V15);
+    expect(anchoredAtRoot(rw)).toEqual([G(74)]);
+    expect(rw.record.held.pendingLegacy?.added).toEqual([L]);
+    // The legacy channel names its anchor by localId: with none stated, the root's is not guessed.
+    const nolid = parseInstanceRecord({ id: 9, name: 'HR', prefab: 'H-trashed', guid: G(70), traits: { PrefabInstance: { source: 'H-trashed' } }, added: [Mine] } as never, reader(), V15);
+    expect(anchoredAtRoot(nolid)).toEqual([]);
+    // All of it linked: nothing held, and nothing said to be.
+    const all = parseInstanceRecord(HR({ added: [Mine] }), reader(), V15);
+    expect(all.record.held.pendingLegacy).toBeUndefined();
+    expect(all.warnings.filter((w) => w.code === 'pendingLegacy')).toEqual([]);
+    // Load, save, load (as v20): the same record, each form.
+    for (const extra of [{ added: [Mine] }, { added: [L], members: { '/': { added: [Mine], removedTraits: ['Light'] } } }, { members: { '/': { own: [guidless], removedTraits: ['Light'] } } }, { added: [QR, QIn, QGone, Mine] }, { members: { '/': { added: [QR, Mine, Copy], removedTraits: ['Light'] } } }, { members: { '/': { own: [Mine], removedTraits: ['Light'] } } }]) {
+      const rt = roundTripEntry(HR(extra), reader(), V15);
+      expect(JSON.stringify([...rt.second.record.list.rows], null, 0)).toBe(JSON.stringify([...rt.first.record.list.rows], null, 0));
+      expect(rt.second.record.held).toEqual(rt.first.record.held);
+      expect(rt.bytes2).toBe(rt.bytes1);
+    }
   });
 });
 

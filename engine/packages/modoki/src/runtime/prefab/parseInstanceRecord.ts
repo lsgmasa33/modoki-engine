@@ -1064,6 +1064,38 @@ function unresolvedOwner<Own>(clean: OwnerChannels, out: ListBuilder<Own>, form:
   return Object.keys(pending).length ? pending as LegacyChannels : undefined;
 }
 
+/** Links at `/` the user's own nodes a missing root's held channels state AT it, and takes them out of what is held. A
+ *  node links only by a stated guid (none is guessed without the document, rule 5) and only once (one node, one link).
+ *  The legacy `added` channel names its anchor by localId, so it links only when the entry STATES the root's localId
+ *  (`rootLid`, null otherwise — the v20 writer states none, and a guessed 1 would move a node under a child, rule 5),
+ *  and not when the `/` row states a whole list, which replaces those nodes once the document returns (§ 10.3). */
+function atMissingRoot<Own>(pending: Record<string, unknown>, rootLid: number | null, out: ListBuilder<Own>, form: Form<Own>, ownContent: Map<string, SceneOwnedNode>): void {
+  const linkable = (n: unknown): n is AddedEntity => isRecord(n) && !(typeof n.key === 'string' && n.key) && typeof n.guid === 'string' && !!n.guid
+    && !(ownContent.has(n.guid) && ownContent.get(n.guid) !== (n as unknown));
+  const link = (nodes: AddedEntity[], from: 'legacy' | 'row'): void => { if (nodes.length) out.own(ROOT_ROW_KEY, nodes.map((n) => form.ownNode(n, ROOT_ROW_KEY)), from); };
+  const members = isRecord(pending.members) ? pending.members : undefined;
+  const row = members && isRecord(members[ROOT_ROW_KEY]) ? members[ROOT_ROW_KEY] as Record<string, unknown> : undefined;
+  const rowReplaces = !!row && Array.isArray(row.added) && !isRemainder(row as SceneMemberRow);
+  if (Array.isArray(pending.added) && rootLid !== null && !rowReplaces) {
+    const at = (pending.added as unknown[]).filter((n): n is AddedEntity => linkable(n) && n.parentLocalId === rootLid);
+    link(at, 'legacy');
+    pending.added = (pending.added as unknown[]).filter((n) => !at.includes(n as AddedEntity));
+    if (!(pending.added as unknown[]).length) delete pending.added;
+  }
+  if (!row) return;
+  if (Array.isArray(row.own)) {
+    const at = (row.own as unknown[]).filter(linkable);
+    link(at, 'row');
+    row.own = (row.own as unknown[]).filter((n) => !at.includes(n as AddedEntity));
+    if (!(row.own as unknown[]).length) delete row.own;
+  }
+  if (Array.isArray(row.added)) {
+    const at = (row.added as unknown[]).filter(linkable);
+    link(at, 'row');
+    row.added = (row.added as unknown[]).filter((n) => !at.includes(n as AddedEntity));
+  }
+}
+
 /** The scene root's default overrides (`Placement`), never list records on `"/"`. `guid` is the entry's, always. */
 const ROOT_DEFAULT_FIELDS = new Set(['parentId', 'sortOrder', 'editorFolder', 'sourceScene', 'name', 'guid']);
 
@@ -1120,18 +1152,15 @@ function parseSceneOwner(owner: SceneEntityEntry | AddedEntity, entry: boolean, 
     // EntityAttributes first, then the root override, read through the root localId the entry names.
     const rootLid = typeof pi?.localId === 'number' ? pi.localId : 1;
     const rootOv = attrs((clean.overrides as Record<string, unknown> | undefined)?.[rootLid]);
-    const pending = unresolvedOwner(clean, out, form, true, entry ? {} : { templateMoved: (clean as unknown as AddedEntity).templateMoved });
-    // A scene-added REFERENCE node anchored AT this placeholder whose own prefab resolves is a record of its own: its
-    // targets are nameable (format rule). Only its LINK — its element of the held list — stays held. One anchored inside
-    // the missing frame waits, wholly held (#2018; hub ruling (a) 2026-10-02, #1831 hunt seed 7078a).
-    const atRoot = [
-      ...(Array.isArray(clean.added) ? (clean.added as unknown[]).filter((n) => isRecord(n) && n.parentLocalId === rootLid) : []),
-      ...(isRecord(clean.members?.[ROOT_ROW_KEY]) && Array.isArray(clean.members![ROOT_ROW_KEY]!.added) ? clean.members![ROOT_ROW_KEY]!.added as unknown[] : []),
-    ];
-    for (const n of atRoot) {
-      if (!isRecord(n) || typeof n.prefab !== 'string' || !n.prefab || typeof n.guid !== 'string' || !n.guid) continue;
-      if ('doc' in read(n.prefab) && !ownContent.has(n.guid)) ownContent.set(n.guid, n as unknown as SceneOwnedNode);
-    }
+    let pending = unresolvedOwner(clean, out, form, true, entry ? {} : { templateMoved: (clean as unknown as AddedEntity).templateMoved });
+    // AT this placeholder — the instance root, always nameable — the user's own nodes link at `/` and show, in every file
+    // form: the legacy `added` at the root localId, a held `/` row's `own`, and the keyless nodes of its whole `added`
+    // (#2018; hub ruling Q3 on #2025, which also corrects (a): a reference node's LINK is projected too, so its record —
+    // its own whenever its prefab resolves, #1831 hunt seed 7078a — hangs from the placeholder). The rest stays held: a
+    // node anchored inside the missing frame waits, and a whole list keeps what it replaced, even emptied.
+    if (pending) atMissingRoot(pending as Record<string, unknown>, typeof pi?.localId === 'number' ? pi.localId : null, out, form, ownContent);
+    // Everything it held may have linked: then nothing is held, and nothing is said to be (close-out review).
+    if (pending && !Object.keys(pending).length) pending = undefined;
     const rowDefaults = takeRootDefaults(out, held, warnings);
     rootNamed(rowDefaults);
     const name = str(rowDefaults.name) ?? str(rootOv?.name) ?? ownName ?? (v20 ? undefined : str(ea?.name)) ?? 'Missing Prefab';
