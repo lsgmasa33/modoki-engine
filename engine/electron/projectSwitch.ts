@@ -31,6 +31,9 @@ export interface SwitchGate {
   close(reason: string, maxMs?: number | null): void;
   open(): void;
   isClosed(): boolean;
+  /** Closed with no timeout (`close(…, null)`): a re-root failed half way, and only a later open that re-roots
+   *  consistently, or a relaunch, lifts it. A later open that FAILS leaves it locked (#1990). */
+  isLocked(): boolean;
   /** The refusal for this request while closed, or null. Reads (GET/HEAD/OPTIONS) pass, and so does `/api/open-project`:
    *  a newer open must still be able to supersede this one (#1160). */
   refusal(method: string, urlPath: string): SwitchRefusal | null;
@@ -66,6 +69,7 @@ export function createSwitchGate(): SwitchGate {
     },
     open,
     isClosed: () => reason !== null,
+    isLocked: () => sticky,
     refusal(method, urlPath) {
       if (reason === null || PASSES.has(method.toUpperCase()) || PASS_PATHS.has(urlPath)) return null;
       return {
@@ -83,7 +87,10 @@ export function createSwitchGate(): SwitchGate {
 export type SwitchOutcome =
   | { kind: 'reRooted' }
   | { kind: 'superseded'; pairError?: unknown }
-  | { kind: 'failed'; error: unknown; pairError?: unknown; reRootFailed?: true };
+  /** `reRootFailed`: THIS open's re-root threw. `locked`: the gate is locked when the open returns, by this open's re-root
+   *  or by an EARLIER one's, so every write is refused until a relaunch; the caller must say so, not "saves go to the old
+   *  project" (#1990). */
+  | { kind: 'failed'; error: unknown; pairError?: unknown; reRootFailed?: true; locked?: true };
 
 /** The order of an open: prepare the new project, then (still current) close the gate and re-root.
  *  - `prepare` installs and starts the dev server. It resolves false when a newer open replaced this one while it
@@ -112,7 +119,7 @@ export async function prepareThenReRoot(steps: {
   try {
     prepared = await steps.prepare();
   } catch (error) {
-    return { kind: 'failed', error, ...(await pairBack()) };
+    return { kind: 'failed', error, ...(await pairBack()), ...(steps.gate.isLocked() ? { locked: true as const } : {}) };
   }
   if (!prepared || !steps.isCurrent()) return { kind: 'superseded', ...(await pairBack()) };
   steps.gate.close(steps.reason);
@@ -120,7 +127,7 @@ export async function prepareThenReRoot(steps: {
     await steps.reRoot();
   } catch (error) {
     steps.gate.close(`a project switch failed part way (${String(error instanceof Error ? error.message : error)}); relaunch the editor`, null);
-    return { kind: 'failed', error, reRootFailed: true };
+    return { kind: 'failed', error, reRootFailed: true, locked: true };
   }
   return { kind: 'reRooted' };
 }

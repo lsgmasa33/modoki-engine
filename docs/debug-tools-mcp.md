@@ -1684,10 +1684,10 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 
 | Tool | Endpoint | Effect | Needs | Aim | Smallest call |
 |---|---|---|---|---|---|
-| `modoki_add_native_target` | GET `/api/add-native-target` | file | project | — | `{"platform":"ios"}` |
-| `modoki_build` | GET `/api/build` | file | project | — | `{"platform":"web"}` |
+| `modoki_add_native_target` | POST `/api/add-native-target` | file | project | — | `{"platform":"ios"}` |
+| `modoki_build` | POST `/api/build` | file | project | — | `{"platform":"web"}` |
 | `modoki_ota_keygen` | POST `/api/ota/keygen` | file | project | — | *(no args)* |
-| `modoki_ota_publish` | GET `/api/ota/publish` | file | project | — | `{"version":"1.0.0"}` |
+| `modoki_ota_publish` | POST `/api/ota/publish` | file | project | — | `{"version":"1.0.0"}` |
 
 #### Meta — operates on the tool surface itself
 
@@ -2780,4 +2780,4 @@ Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit s
 - **`GET .../api/editor-state`** + **`POST .../api/editor-action {action, …}`** (allowlisted) + **`GET .../api/scenes`** + **`POST .../api/import-file {srcPath, destFolder}`** — the editor-parity surface (live UI state read; selection/play/undo/scene/prefab/entity actions; scene list; Finder-style import). `editor-state`/`editor-action` relay to the renderer, so they need a tab/editor open. See the modoki MCP section above for the tool wrappers.
 - **`GET .../api/build-modules`** — resolves `build.modules` (`'auto' | boolean` per module) for the OPEN project, reusing the same Node-side scene-scan `resolveModules` a real build uses (`engine/plugins/detect-modules.ts`). No renderer/tab needed — pure filesystem read. Lets an agent (or `get_editor_state`'s `rendererGate.render3d`) tell whether a project actually renders 3D, e.g. to explain a suppressed "no 3D viewport" watchdog warning on a 2D/UI-only project.
 
-**Gotcha:** the Vite plugin loads once at server startup. Editing the plugin **or any module it imports** (`sceneValidation`, `sceneMutate`, `assetRefRules`) requires a dev-server restart (`curl /api/exit` + `npm run dev`). Browser-side modules (`agentBridge`, `sceneSchema`) hot-update normally.
+**Gotcha:** the Vite plugin loads once at server startup. Editing the plugin **or any module it imports** (`sceneValidation`, `sceneMutate`, `assetRefRules`) requires a dev-server restart (`npm run dev:stop` + `npm run dev`). Browser-side modules (`agentBridge`, `sceneSchema`) hot-update normally.

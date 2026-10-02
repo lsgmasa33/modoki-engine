@@ -34,9 +34,8 @@ import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
  *  that. The list used to be the skip condition itself, and its "shrink-only" test compared the
  *  skipped TOOL names — so a route that moved into the router stayed skipped with that test green. */
 const NOT_ROUTER_OWNED: ReadonlyArray<{ item: string; reason: string }> = [
-  { item: '/api/build', reason: 'SSE build stream, served by vite-asset-scanner / the Electron host' },
-  { item: '/api/add-native-target', reason: 'SSE native-target scaffold stream, served outside the router' },
-  { item: '/api/ota/publish', reason: 'SSE OTA publish stream, served outside the router' },
+  // Empty since #1967: the three SSE build streams served outside the router (/api/build, /api/add-native-target,
+  // /api/ota/publish) are POSTs now, so this GET probe no longer reaches them.
 ];
 
 /** A plausible value per zod type, so every optional param is exercised rather than defaulted

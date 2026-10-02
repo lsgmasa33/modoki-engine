@@ -995,11 +995,13 @@ with its reason. The underlying smell, routes that change state on a GET, is tra
 
 Two host-specific concerns stay out of the shared router:
 
-- **`/api/build` + `/api/add-native-target` (SSE)** — the build/deploy pipeline (`vite
-  build` + gcloud/gradle, `cap add` scaffolding) lives in the Vite middleware, so the
-  Electron backend **proxies** those event streams straight to its main-owned Vite
-  server rather than duplicating the pipeline; the renderer's `EventSource` still targets
-  one base. With no `viteOrigin` they return 503.
+- **`/api/build` + `/api/add-native-target` + `/api/toolchain/install` + `/api/ota/publish`
+  (SSE, POST only since #1967)** — the build/deploy pipeline (`vite build` + gcloud/gradle,
+  `cap add` scaffolding) lives in the Vite middleware, so the Electron backend **proxies**
+  those event streams straight to its main-owned Vite server rather than duplicating the
+  pipeline; the renderer's `backendEventStream` (a fetch POST read as a stream) still
+  targets one base. Each forward carries the backend's project stamp, which Vite checks
+  (#1991). With no `viteOrigin` they return 503.
 - **Asset bytes + the watcher** — `engine/electron/assetBackend.ts` is a standalone
   asset backend giving the router the same asset-root resolution + manifest cache + file
   watcher the Vite plugin owns, so it runs in main **with no Vite server**. Its watcher is

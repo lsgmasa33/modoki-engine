@@ -9,8 +9,8 @@
  * *bytes* come from the Vite server (which main owns). `/api/build` is an SSE
  * stream owned by the Vite middleware (it runs `vite build` + gcloud/gradle), so
  * the backend PROXIES it to the Vite server rather than duplicating the pipeline —
- * the renderer's EventSource targets this backend (one base), and we pipe the
- * Vite server's event stream straight back.
+ * the renderer's POST stream (`backendEventStream`) targets this backend (one base),
+ * and we pipe the Vite server's event stream straight back.
  */
 
 import http from 'http';
@@ -20,6 +20,9 @@ import { reclaimStaleDeviceStateAtStartup } from '../plugins/backend/deviceConne
 import { serveProjectAsset, serveAppShell } from '../plugins/backend/staticAssets';
 import { writeBackendResult } from '../plugins/backend/writeResult';
 import { foreignRequestRefusal } from '../plugins/backend/requestOrigin';
+import { SSE_ROUTES } from '../plugins/backend/sseRoutes';
+import { PROJECT_ROOT_HEADER, projectStamp } from '../plugins/backend/projectStamp';
+import { ProjectSwitchedError, stoppedBySwitch } from './requestContext';
 import { checkToken, tokenMismatchError, TOKEN_HEADER, type TokenCheck } from './instanceToken';
 
 /** The one route exempt from the C6 token gate: identity is the DIAGNOSTIC — "which editor
@@ -64,10 +67,17 @@ export interface BackendServerOptions {
    *  captured by value — "Open Project" rebinds the running server, so the expected token
    *  changes under it. Omit ⇒ no gate (every request reads as `absent`). */
   getExpectedToken?: () => string | null;
+  /** Refuse a request before ANY route sees it — the build proxy, the host routes and the shared router alike — or
+   *  null to let it through. main passes the Open Project switch gate (#1976). It sits here, after the token gate and
+   *  ahead of the proxy, because a check inside `hostRoutes` runs after the proxy has already forwarded the build
+   *  family (#1991). */
+  fence?: (method: string, urlPath: string) => { status: number; body: unknown } | null;
 }
 
-export function startBackendServer(ctx: BackendContext, opts: BackendServerOptions = {}): Promise<BackendServerHandle> {
-  const { hostRoutes, appDistDir, port = 0, viteOrigin, getExpectedToken } = opts;
+/** `contextFor`: a context, or a factory called ONCE per request when it arrives, so a request keeps the project it
+ *  arrived in even if Open Project re-roots the backend while it runs (#1991, `requestContext.ts`). */
+export function startBackendServer(contextFor: BackendContext | (() => BackendContext), opts: BackendServerOptions = {}): Promise<BackendServerHandle> {
+  const { hostRoutes, appDistDir, port = 0, viteOrigin, getExpectedToken, fence } = opts;
   // Take back the machine-wide device state this clone left behind last run: any adb forward on its
   // own ports (#160), and any claim in `~/.modoki/device-claims.json` whose pid is gone (#225).
   // Called from the two backend HOSTS rather than at module scope, so importing the module in a test
@@ -77,6 +87,7 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
   reclaimStaleDeviceStateAtStartup();
   const server = http.createServer((req, res) => {
     const u = new URL(req.url || '/', 'http://127.0.0.1');
+    const ctx = typeof contextFor === 'function' ? contextFor() : contextFor;
     // CORS: the Vite dev renderer reaches this backend cross-origin (localhost vs
     // 127.0.0.1, or different port), so renderer→backend calls (save scene via
     // /api/write-file, /api/project-settings, /api/build) need ACAO. This backend
@@ -150,8 +161,16 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
       res.end(JSON.stringify({ error: tokenMismatchError(ctx.projectRoot, (server.address() as AddressInfo | null)?.port ?? null) }));
       return;
     }
+    // ── The fence (#1991): ahead of the build proxy and every route, so one check covers all three. ──
+    const fenced = fence?.(req.method || 'GET', u.pathname);
+    if (fenced) {
+      res.statusCode = fenced.status;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(fenced.body));
+      return;
+    }
     // ── SSE build-family endpoints — proxy to the Vite server that owns them.
-    //    The renderer's EventSource targets THIS backend (one base), but the
+    //    The renderer's stream targets THIS backend (one base), but the
     //    handlers (vite build + gcloud/gradle; cap add scaffolding) live in the
     //    Vite middleware; pipe their event stream straight back instead of
     //    duplicating it. /api/build = build+deploy; /api/add-native-target =
@@ -160,7 +179,9 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     //    /api/toolchain falls through to the direct router below); /api/ota/publish =
     //    the OTA publish pipeline (fresh build + gcloud) — same reasoning, JSON
     //    siblings /api/ota/status and /api/ota/keygen fall through to the router. ──
-    if (req.method === 'GET' && (u.pathname === '/api/build' || u.pathname === '/api/add-native-target' || u.pathname === '/api/toolchain/install' || u.pathname === '/api/ota/publish')) {
+    //    They are POSTs (#1967: each starts a job). Any method is forwarded as sent, so Vite's own 405 answers a GET —
+    //    one place decides the method, not two. ──
+    if (SSE_ROUTES.includes(u.pathname)) {
       if (!viteOrigin) {
         res.statusCode = 503;
         res.setHeader('Content-Type', 'application/json');
@@ -168,7 +189,9 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
         return;
       }
       const target = new URL((req.url || u.pathname), viteOrigin);
-      const proxyReq = http.get(target, (proxyRes) => {
+      // Stamped with the root THIS backend serves (#1991, projectStamp.ts): Vite refuses it if Open Project has already
+      // moved Vite to another project, so a Build or Publish OTA from the old window cannot run on the new one.
+      const proxyReq = http.request(target, { method: req.method, headers: { [PROJECT_ROOT_HEADER]: projectStamp(ctx.projectRoot) } }, (proxyRes) => {
         // Preserve the SSE headers (text/event-stream, no-cache); the CORS headers
         // set above survive (they aren't in proxyRes.headers).
         res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
@@ -184,11 +207,12 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
           res.end(JSON.stringify({ error: `build proxy to Vite failed: ${e.message}` }));
         } else { res.end(); }
       });
-      // Tear down the upstream request when the client goes away — whether the
-      // EventSource aborts (`req.close`) or the downstream socket closes for any
-      // other reason (`res.close`). (E3) Both are idempotent.
-      req.on('close', () => proxyReq.destroy());
+      // Tear down the upstream request when the client goes away (the stream's `close()` aborts its fetch) or the
+      // downstream socket closes for any other reason. (E3) ⚠️ `res`, not `req`: piping `req` consumes it, and a
+      // consumed request emits `close` as soon as its (empty) body has been read, which would kill every stream at
+      // its first byte. `res` closes only when the reply finishes or the client goes away.
       res.on('close', () => proxyReq.destroy());
+      req.pipe(proxyReq); // the params ride the query; this ends the upstream request (with any body sent)
       return;
     }
     // Buffer the body as binary chunks (not string concat — O(n²) + a UTF-8 decode
@@ -211,6 +235,15 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     });
     req.on('end', async () => {
       if (tooLarge) return;
+      // The fence again, now the body is in (#1991 review): a write whose head arrived before the switch began and whose
+      // body finished after it (a large upload) passed the check above, and would otherwise run past the gate.
+      const fencedLate = fence?.(req.method || 'GET', u.pathname);
+      if (fencedLate) {
+        res.statusCode = fencedLate.status;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(fencedLate.body));
+        return;
+      }
       const rawBody = Buffer.concat(chunks).toString('utf8');
       let body: unknown;
       try { body = rawBody.trim() ? JSON.parse(rawBody) : undefined; }
@@ -241,11 +274,22 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
           res.end(JSON.stringify({ error: `no backend route for ${req.method} ${u.pathname}` }));
           return;
         }
+        // A route a re-root stopped part way (#1991) that answered a FAILURE is the switch's 503: the router's catch-alls
+        // turn the throw into a generic 500, whose words read as a fault to retry. Only a failure: a route that caught
+        // the stop on purpose and finished (an import whose manifest rebuild was skipped, a reimport's per-asset
+        // `errors[]`) answered honestly about work that landed in the old project, and a 503 over it would hide that.
+        const stopped = stoppedBySwitch(ctx);
+        if (stopped && (result.status ?? 200) >= 500) throw stopped;
         writeBackendResult(res, result, req.headers['if-none-match']);
       } catch (e) {
-        res.statusCode = 500;
+        // A request whose project was switched away under it (#1991) is the switch gate's 503, not a server fault —
+        // also when a route caught the stop and then threw something else on the way out.
+        const stop = e instanceof ProjectSwitchedError ? e : stoppedBySwitch(ctx);
+        res.statusCode = stop ? 503 : 500;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+        res.end(JSON.stringify(stop
+          ? { ok: false, switching: true, reason: 'project-switching', error: stop.message }
+          : { error: e instanceof Error ? e.message : String(e) }));
       }
     });
   });

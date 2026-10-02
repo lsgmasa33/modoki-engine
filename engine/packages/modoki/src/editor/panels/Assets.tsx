@@ -111,7 +111,7 @@ function revealPathInFinder(assetPath: string): void {
  *  collision heal rather than serving the watcher's cached manifest. */
 async function fetchAssets(): Promise<{ assets: AssetEntry[]; folders: string[] }> {
   try {
-    const res = await backendFetch('/api/rescan-assets');
+    const res = await backendFetch('/api/rescan-assets', { method: 'POST' });
     if (res.ok) {
       const data = await res.json();
       return { assets: (data.assets || []) as AssetEntry[], folders: (data.folders || []) as string[] };

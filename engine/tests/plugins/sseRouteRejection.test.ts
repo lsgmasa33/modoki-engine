@@ -169,7 +169,7 @@ function setEnv(k: string, v: string | undefined) {
 }
 
 function drive(url: string, opts: { disconnectDuringSetup?: boolean } = {}): { res: FakeRes; next: ReturnType<typeof vi.fn> } {
-  const req = Object.assign(new EventEmitter(), { url, method: 'GET', headers: {} });
+  const req = Object.assign(new EventEmitter(), { url, method: 'POST', headers: {} }); // the build family is POST (#1967)
   const res = new FakeRes();
   if (opts.disconnectDuringSetup) {
     // The client leaves the moment the route registers its slot's close handler — i.e. inside the

@@ -1,6 +1,7 @@
 /** #1983: the editor's OTA key routes answer about the PROJECT's key, through the real router.
- *  `/api/ota/keys` copies a key an earlier editor left under the editor root (the packaged bundle, in
- *  production) into the project on its first read, leaving the original; `/api/ota/keygen` writes into
+ *  `/api/ota/keys` REPORTS a key an earlier editor left under the editor root (the packaged bundle, in
+ *  production) and copies nothing: a GET never changes state (#1967), so keygen and publish copy it in,
+ *  where it is about to be used; `/api/ota/keygen` writes into
  *  the project, and refuses to mint where it can copy. The editor root here is a scratch stand-in for
  *  the bundle; the keygen route runs the real script from this checkout. */
 
@@ -42,17 +43,13 @@ beforeEach(() => {
 afterEach(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
 
 describe('GET /api/ota/keys (#1983)', () => {
-  it('copies the bundle\'s key into the project on first read, and the original stays', async () => {
+  it('#1967: REPORTS the bundle\'s key as the one the project signs with, and writes nothing', async () => {
     const original = plant(bundle);
     bake(LEGACY.publicKey);
     const r = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
-    expect(r.body).toMatchObject({ ok: true, exists: true, publicKey: LEGACY.publicKey, copiedFrom: keyAt(bundle) });
-    expect(fs.readFileSync(keyAt(projectRoot)).equals(original)).toBe(true);
+    expect(r.body).toMatchObject({ ok: true, exists: true, publicKey: LEGACY.publicKey, legacyKeyAt: keyAt(bundle) });
+    expect(fs.existsSync(path.join(projectRoot, 'build'))).toBe(false); // no copy, no key folder, no .gitignore
     expect(fs.readFileSync(keyAt(bundle)).equals(original)).toBe(true);
-    // A second read finds the project's own copy and copies nothing.
-    const again = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
-    expect(again.body).toMatchObject({ ok: true, exists: true });
-    expect(again.body.copiedFrom).toBeUndefined();
   });
 
   it('the PACKAGED editor opening a game inside a clone finds the key the dev editor left at the clone\'s root', async () => {
@@ -63,8 +60,8 @@ describe('GET /api/ota/keys (#1983)', () => {
     const original = plant(clone);
     bake(LEGACY.publicKey);
     const r = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
-    expect(r.body).toMatchObject({ ok: true, exists: true, copiedFrom: keyAt(clone) });
-    expect(fs.readFileSync(keyAt(projectRoot)).equals(original)).toBe(true);
+    expect(r.body).toMatchObject({ ok: true, exists: true, legacyKeyAt: keyAt(clone) });
+    expect(fs.existsSync(keyAt(projectRoot))).toBe(false);
     expect(fs.readFileSync(keyAt(clone)).equals(original)).toBe(true);
   });
 
@@ -75,6 +72,7 @@ describe('GET /api/ota/keys (#1983)', () => {
     fs.writeFileSync(keyAt(projectRoot), JSON.stringify(own));
     const r = await call(ctxWith(bundle), 'GET', '/api/ota/keys', 'default');
     expect(r.body).toMatchObject({ exists: true, publicKey: own.publicKey });
+    expect(r.body.legacyKeyAt).toBeUndefined();
   });
 
   it('a project key whose privateKey is not its publicKey\'s pair is an error, never "matches Project Settings" (#1993)', async () => {

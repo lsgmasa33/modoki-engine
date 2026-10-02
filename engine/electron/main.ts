@@ -270,6 +270,8 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, mcpBackendDeferred, connectRefusal, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { createSwitchGate, prepareThenReRoot } from './projectSwitch';
+import { bindToArrival } from './requestContext';
+import { PROJECT_ROOT_HEADER, projectStamp } from '../plugins/backend/projectStamp';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
 import { composeDepsInstallError, projectDepsMissing } from './projectDeps';
 import { claimProjectForOpen, createOpenSequencer, type OpenTicket } from './openClaim';
@@ -1401,8 +1403,10 @@ const OPEN_MOUNT_SETTLE_MS = 600_000;
  *  root an open STARTED, so re-picking a project while a different one is queued would be dropped. */
 let requestedRoot = '';
 
-/** Refuses writes while the backend re-roots and the window reloads (#1976, `projectSwitch.ts`). Checked first by
- *  `hostRoutes`, so it covers the shared router too. */
+/** Refuses writes while the backend re-roots and the window reloads (#1976, `projectSwitch.ts`). It is the backend
+ *  server's `fence` (#1991), checked ahead of the build proxy, the host routes and the shared router alike. Two
+ *  neighbours finish the job: the proxy's project stamp (`projectStamp.ts`) covers the span in which Vite already
+ *  serves the new project, and the per-request context (`requestContext.ts`) covers a request already running. */
 const switchGate = createSwitchGate();
 
 /** Install the new project's deps and start its dev server, WITHOUT re-rooting the backend (`prepareThenReRoot` does
@@ -1505,7 +1509,11 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts)
     }
     console.error('[modoki-electron] open project failed:', detail);
     // A failed prepare left the backend on the project the window shows; a failed re-root left no consistent project.
-    mainWindow?.setTitle(outcome.reRootFailed ? `Modoki Editor ${APP_VERSION} — relaunch required` : titleFor(state.root));
+    // ⚠️ `locked`, not `reRootFailed`: a failed re-root EARLIER keeps the gate locked through this failure too, and
+    // only a successful open lifts it. Reading this open's own flag told the user "saves go there" over a gate that
+    // still refused every save (#1990).
+    const lockedBy = outcome.reRootFailed ? 'The switch failed part way' : 'An earlier project switch failed part way';
+    mainWindow?.setTitle(outcome.locked ? `Modoki Editor ${APP_VERSION} — relaunch required` : titleFor(state.root));
     if (!opts?.quiet) {
       await showMessageBox({
         type: 'error' as const,
@@ -1513,8 +1521,8 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts)
         message: outcome.reRootFailed
           ? 'The new project was prepared, but moving the editor onto it failed part way.'
           : 'Could not prepare the new project (dependency install or Vite server).',
-        detail: outcome.reRootFailed
-          ? `${detail}\n\nThe switch failed part way, so the editor refuses every write until it is relaunched:\n  scripts/launch-editor.sh "${newRoot}"`
+        detail: outcome.locked
+          ? `${detail}\n\n${lockedBy}, so the editor refuses every write until it is relaunched:\n  scripts/launch-editor.sh "${outcome.reRootFailed ? newRoot : state.root}"`
           : `${detail}\n\nThe editor is still on ${path.basename(state.root) || 'the previous project'}; its saves go there.`
             + (outcome.pairError
               ? ` Its dev server could not be restarted (${String(outcome.pairError instanceof Error ? outcome.pairError.message : outcome.pairError)}), so relaunch it:\n  scripts/launch-editor.sh "${state.root}"`
@@ -1523,7 +1531,7 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: OpenOpts)
       }, mainWindow);
     }
     // The agent's (quiet) open learns the lock from the reply, as the human does from the dialog.
-    return { kind: 'failed', detail: outcome.reRootFailed ? `${detail} — the switch failed part way, so the editor refuses every write until it is relaunched` : detail };
+    return { kind: 'failed', detail: outcome.locked ? `${detail} — ${lockedBy.toLowerCase()}, so the editor refuses every write until it is relaunched` : detail };
   }
   // (A newer open requested while this one prepared is caught by `prepareThenReRoot`'s `isCurrent`, BEFORE the
   // re-root (#1587 close-out review): that open restarts the dev server and reloads the window itself.)
@@ -1821,7 +1829,8 @@ app.whenReady().then(async () => {
     // and breaking the packaged smoke). Fire-and-forget: the disk write already succeeded; if the
     // child Vite is down the config self-heals on relaunch.
     invalidateProjectConfig: () => {
-      fetch(`${DEV_URL}/api/invalidate-project-config`, { method: 'POST' }).catch(() => { /* Vite unreachable — self-heals on relaunch */ });
+      // Stamped (#1991): Vite refuses it if it already serves another project, whose config this write did not touch.
+      fetch(`${DEV_URL}/api/invalidate-project-config`, { method: 'POST', headers: { [PROJECT_ROOT_HEADER]: projectStamp(state.root) } }).catch(() => { /* Vite unreachable — self-heals on relaunch */ });
     },
     // #1155: main has no module graph either, and the one that matters is the child Vite's — it
     // wrote the URLs the renderer imported. Forward to the same route there (status-preserving and
@@ -1876,9 +1885,7 @@ app.whenReady().then(async () => {
   // ── Renderer-bound host routes (capture/input) — only main can serve them
   //    (they touch the live window). Tried before the shared router. ──
   const hostRoutes: HostRoutes = async ({ method, urlPath, query, body, tokenCheck }) => {
-    // ── A project switch in flight (#1976): a write now could land in the other project. ──
-    const switching = switchGate.refusal(method, urlPath);
-    if (switching) return { kind: 'json', status: switching.status, body: switching.body };
+    // (A project switch in flight is refused before this runs: the server's `fence`, below at `bindOpts`.)
     // ── GET /api/identity — WHICH editor is this? Answered before the mainWindow guard
     //    (an identity check must work even while the window is starting or gone).
     //
@@ -2122,11 +2129,18 @@ app.whenReady().then(async () => {
   // No appDistDir: the editor shell is served by the Vite server (below), not a static
   // dist. main's HTTP server is /api + assets only. viteOrigin lets it proxy the
   // /api/build SSE to the Vite server (which owns the build pipeline).
-  const bindOpts = { hostRoutes, viteOrigin: DEV_URL, getExpectedToken: () => instanceToken };
+  // `fence`: the switch gate, ahead of every route and the build proxy (#1991). `contextFor`: each request is bound to
+  // the backend it arrived in, so one still running when a re-root replaces the backend stops instead of reaching
+  // the other project (`requestContext.ts`).
+  const bindOpts = { hostRoutes, viteOrigin: DEV_URL, getExpectedToken: () => instanceToken, fence: (method: string, urlPath: string) => switchGate.refusal(method, urlPath) };
+  const contextFor = () => {
+    const arrivedWith = state.backend;
+    return bindToArrival(ctx, () => state.backend === arrivedWith);
+  };
   let bindErr: unknown = null;
   for (const candidate of candidates) {
     try {
-      backendHandle = await startBackendServer(ctx, { ...bindOpts, port: candidate });
+      backendHandle = await startBackendServer(contextFor, { ...bindOpts, port: candidate });
       break;
     } catch (e) {
       bindErr = e;
@@ -2140,7 +2154,7 @@ app.whenReady().then(async () => {
     // failing to launch. This is the case that stales .mcp.json; healConnectedMcp() below
     // rewrites it and tells the user to restart Claude.
     try {
-      backendHandle = await startBackendServer(ctx, { ...bindOpts, port: 0 });
+      backendHandle = await startBackendServer(contextFor, { ...bindOpts, port: 0 });
       console.warn(`[modoki-electron] preferred ports (${candidates.join(', ')}) all taken — using ephemeral ${backendHandle.port}`);
     } catch (e) { bindErr = e; }
   }
@@ -2332,6 +2346,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('modoki:connect-claude', async (e) => {
     if (!fromMainFrame(e)) return { ok: false, error: 'untrusted frame' };
+    // It writes `.mcp.json` under the open project, with that project's token: the one IPC write the HTTP fence cannot
+    // see (#1991). Refused while a switch is in flight, and again if one landed during the CDP probe below.
+    const switching = switchGate.refusal('POST', 'ipc:connect-claude');
+    if (switching) return { ok: false, error: switching.body.error };
+    const arrivedWith = state.backend;
     try {
       const projectRoot = state.root;
       const backendUrl = `http://127.0.0.1:${resolvedBackendPort}`;
@@ -2341,6 +2360,8 @@ app.whenReady().then(async () => {
       // holds the port, Claude attaches to THAT renderer and every call silently succeeds
       // against the wrong project. Omitted ⇒ the agent simply has no CDP (an honest gap).
       const cdp = await cdpStatus();
+      // `root` and the gate too: a re-root that failed after `state.root` moved leaves the old backend in place (#1991 review).
+      if (state.backend !== arrivedWith || state.root !== projectRoot || switchGate.isClosed()) return { ok: false, error: `The editor switched project away from ${projectRoot} while connecting; nothing was written. Connect again.` };
       const chromeDevtools = cdp.ours && cdp.port != null ? buildChromeDevtoolsEntry(cdp.port) : undefined;
       // Write where claude READS (C9, §13): the nearest existing config inside the
       // project's own repo, else the project root. Writing into an in-repo game folder

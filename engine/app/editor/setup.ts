@@ -9,7 +9,7 @@
 import { createElement } from 'react';
 import type React from 'react';
 import {
-  createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
+  createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventStream, streamFailureText, fetchDeviceList,
   installEditorPrefabCacheWarm, alertInEditor, confirmUnsavedBeforeBuild,
   type ExtraMenuItem, type DeviceListReply,
 } from '@modoki/engine/editor';
@@ -196,15 +196,15 @@ function runStream(streamPath: string, totalSteps: number, logTag: string, start
   setBuildStatus({ active: true, message: startMessage, step: 0, totalSteps, failed: false });
   console.log(`[Build] ${startMessage} (${logTag})`);
 
-  const es = backendEventSource(streamPath);
+  const es = backendEventStream(streamPath);
 
   es.addEventListener('step', (e) => {
-    const { step, total } = JSON.parse((e as MessageEvent).data) as { step: number; total: number };
+    const { step, total } = JSON.parse(e.data) as { step: number; total: number };
     setBuildStatus({ step, totalSteps: total });
   });
 
   es.addEventListener('status', (e) => {
-    const status = JSON.parse((e as MessageEvent).data) as string;
+    const status = JSON.parse(e.data) as string;
     if (status === 'DONE') {
       // Set step to the FULL count so the modal's `done = step >= totalSteps`
       // becomes true → it shows "Build Complete!" + the OK dismiss button. The
@@ -231,14 +231,14 @@ function runStream(streamPath: string, totalSteps: number, logTag: string, start
 
   // Forward build output to console
   es.addEventListener('message', (e) => {
-    const line = JSON.parse((e as MessageEvent).data) as string;
+    const line = JSON.parse(e.data) as string;
     if (line) console.log(`[Build] ${line}`);
   });
 
-  es.onerror = () => {
-    setBuildStatus({ failed: true, message: 'Connection lost' });
-    console.error('[Build] Connection lost');
-    es.close();
+  // A refusal before the stream opened (a 503 mid project switch, a 405) carries the server's reason.
+  es.onerror = (failure) => {
+    setBuildStatus({ failed: true, message: streamFailureText(failure) });
+    console.error(`[Build] ${streamFailureText(failure)}`);
   };
 }
 

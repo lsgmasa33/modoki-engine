@@ -63,7 +63,7 @@ export async function createRegisteredAssetAskingToReplace(
  *  inline (`rebuildManifestInline`, #1963). A renderer cannot call that, so it asks for the rescan instead. A failure is reported,
  *  not thrown: the file IS written, and a 500 here would read as "nothing was created". */
 async function rebuildBackendManifest(): Promise<boolean> {
-  try { return (await backendFetch('/api/rescan-assets')).ok; } catch { return false; }
+  try { return (await backendFetch('/api/rescan-assets', { method: 'POST' })).ok; } catch { return false; }
 }
 
 /**

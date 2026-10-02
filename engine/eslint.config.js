@@ -321,7 +321,7 @@ export default tseslint.config(
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
       // ELECTRON_PLAN Phase 1 gate: every editor → backend call must go through
       // the single transport seam in editor/backend/editorBackend.ts (backendFetch /
-      // backendEventSource), so the transport is swappable in one place for the
+      // backendEventStream), so the transport is swappable in one place for the
       // packaged Electron host. Raw `fetch('/api/...')` / `new EventSource('/api/...')`
       // would bypass it. The client module itself is exempt — it builds URLs via
       // backendUrl(), not a `/api/...` string literal, so it never matches.
@@ -337,11 +337,11 @@ export default tseslint.config(
         },
         {
           selector: "NewExpression[callee.name='EventSource'] > Literal[value=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource('/api/...').",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource('/api/...').",
         },
         {
           selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
         },
         // ECS index gate: an entity that is spawned but not registered is invisible to the O(1)
         // entity index, so every lookup silently degrades to an O(n) scan — and engine code then
@@ -386,11 +386,11 @@ export default tseslint.config(
         },
         {
           selector: "NewExpression[callee.name='EventSource'] > Literal[value=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource('/api/...').",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource('/api/...').",
         },
         {
           selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
         },
       ],
     },
@@ -425,11 +425,11 @@ export default tseslint.config(
         },
         {
           selector: "NewExpression[callee.name='EventSource'] > Literal[value=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource('/api/...').",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource('/api/...').",
         },
         {
           selector: "NewExpression[callee.name='EventSource'] TemplateElement[value.raw=/^\\/api\\//]",
-          message: "Use backendEventSource() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
+          message: "Use backendEventStream() from editor/backend/editorBackend instead of new EventSource(`/api/...`).",
         },
         {
           selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='spawn']",

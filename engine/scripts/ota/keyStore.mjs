@@ -7,9 +7,10 @@
  *  in the packaged one, where an editor update replaces the bundle and the key with it. A lost key is
  *  irreversible: every installed binary has its public half baked in, so no other key can update it.
  *
- *  So the move is a COPY, never a move or a delete. The first read of a project that has no key
- *  (`adoptLegacyKey`, run by the publish preflight, the keygen script and `/api/ota/keys`) looks in the
- *  old places and copies a key it finds into the project, leaving the original where it was:
+ *  So the move is a COPY, never a move or a delete. The first USE of a project that has no key
+ *  (`adoptLegacyKey`, run by the publish preflight and the keygen script) looks in the old places and
+ *  copies a key it finds into the project, leaving the original where it was. `/api/ota/keys` only
+ *  REPORTS it (`findLegacyKey`): a GET never changes state (#1967). The places:
  *  - the editor's root (`editorRoot/build/ota-keys`): the packaged bundle, or the dev clone;
  *  - every ancestor of the project (`games/<id>` → the repo root), so a packaged editor opening a game
  *    inside a clone still finds the key the dev editor wrote there.
@@ -187,22 +188,16 @@ function healKeyDir(projectRoot, log) {
   }
 }
 
-/** Make sure the project has its key, copying one an earlier editor wrote (see the header). Never
- *  overwrites, never moves or deletes the original, and checks the copy is byte-identical before it
- *  counts. Returns `{ keyPath, copiedFrom }` (`copiedFrom` null when nothing was copied) plus
- *  `passedOver`: same-named keys found but not copied, with why. Throws when `configReadable` is false
- *  and a same-named earlier key exists (whether the project shipped with it is unknown), and when a
- *  copy was started and could not be completed safely (the partial copy is removed; the original is
- *  untouched). `configReadable` is REQUIRED: defaulting it would read "could not read the config" as
- *  "no public key", the one confusion that mints over a shipped key. */
-export function adoptLegacyKey({ projectRoot, editorRoot, name, expectedPublicKey, configReadable, log = (line) => console.log(line) }) {
-  if (typeof configReadable !== 'boolean') throw new TypeError('adoptLegacyKey: configReadable is required (true/false)');
+/** Which key the project signs with, WITHOUT writing anything: the project's own key when it has one, else the earlier
+ *  editor's key {@link adoptLegacyKey} would copy in (`source`), else none. Pure, so a GET can answer it (#1967: a GET
+ *  never changes state); the copy itself happens where a key is about to be USED, keygen and publish. Same refusal as
+ *  `adoptLegacyKey` when `configReadable` is false and a same-named earlier key exists. */
+export function findLegacyKey({ projectRoot, editorRoot, name, expectedPublicKey, configReadable }) {
+  if (typeof configReadable !== 'boolean') throw new TypeError('findLegacyKey: configReadable is required (true/false)');
   const keyPath = projectKeyPath(projectRoot, name);
   const passedOver = [];
-  healKeyDir(projectRoot, log);
-  if (fs.existsSync(keyPath)) return { keyPath, copiedFrom: null, passedOver };
+  if (fs.existsSync(keyPath)) return { keyPath, own: true, source: null, passedOver };
   const expected = typeof expectedPublicKey === 'string' && expectedPublicKey ? expectedPublicKey : null;
-  let source = null;
   for (const dir of legacyKeyDirs({ projectRoot, editorRoot })) {
     const candidate = path.join(dir, `${name}.json`);
     if (!fs.existsSync(candidate)) continue;
@@ -216,9 +211,26 @@ export function adoptLegacyKey({ projectRoot, editorRoot, name, expectedPublicKe
     }
     if (!expected) { passedOver.push({ from: candidate, reason: 'this project bakes no ota.publicKey yet, so no build of it trusts this key' }); continue; }
     if (pub !== expected) { passedOver.push({ from: candidate, reason: "its public key is not this project's ota.publicKey" }); continue; }
-    source = candidate;
-    break;
+    return { keyPath, own: false, source: candidate, passedOver };
   }
+  return { keyPath, own: false, source: null, passedOver };
+}
+
+/** Make sure the project has its key, copying one an earlier editor wrote (see the header). Never
+ *  overwrites, never moves or deletes the original, and checks the copy is byte-identical before it
+ *  counts. Returns `{ keyPath, copiedFrom }` (`copiedFrom` null when nothing was copied) plus
+ *  `passedOver`: same-named keys found but not copied, with why. Throws when `configReadable` is false
+ *  and a same-named earlier key exists (whether the project shipped with it is unknown), and when a
+ *  copy was started and could not be completed safely (the partial copy is removed; the original is
+ *  untouched). `configReadable` is REQUIRED: defaulting it would read "could not read the config" as
+ *  "no public key", the one confusion that mints over a shipped key. The choice of key is
+ *  {@link findLegacyKey}'s; this adds the writes. */
+export function adoptLegacyKey({ projectRoot, editorRoot, name, expectedPublicKey, configReadable, log = (line) => console.log(line) }) {
+  if (typeof configReadable !== 'boolean') throw new TypeError('adoptLegacyKey: configReadable is required (true/false)');
+  // An existing key folder is healed whether or not it holds this key (#1994); `findLegacyKey` itself writes nothing.
+  healKeyDir(projectRoot, log);
+  const { keyPath, own, source, passedOver } = findLegacyKey({ projectRoot, editorRoot, name, expectedPublicKey, configReadable });
+  if (own) return { keyPath, copiedFrom: null, passedOver };
   for (const p of passedOver) log(`[ota-keys] not copying ${p.from} into ${keyPath}: ${p.reason}`);
   if (!source) return { keyPath, copiedFrom: null, passedOver };
 

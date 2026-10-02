@@ -11,7 +11,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { backendFetch, postBackend, backendEventSource } from '../backend/editorBackend';
+import { backendFetch, postBackend, backendEventStream, streamFailureText, type BackendEventStream } from '../backend/editorBackend';
 import { ModalShell } from '../components/ModalShell';
 import { reportGestureRefusal } from '../backend/refusalChannel';
 
@@ -89,7 +89,7 @@ export default function BuildSupportDialog() {
   const [removing, setRemoving] = useState<string | null>(null); // tool id (or 'all') mid-remove
   const [confirmRemoveAll, setConfirmRemoveAll] = useState(false); // two-click confirm for the nuke
   const [log, setLog] = useState<string[]>([]);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<BackendEventStream | null>(null);
   // Tools we've already kicked an auto-install for this dialog session — so a failed
   // one isn't retried in a loop (the effect re-runs on every `data` refresh).
   const autoInstalledRef = useRef<Set<string>>(new Set());
@@ -124,14 +124,14 @@ export default function BuildSupportDialog() {
     if (installing) return; // one at a time (shared userData npm-tools dir)
     setInstalling(id);
     setLog([`Installing ${label(id)}…`]);
-    const es = backendEventSource(`/api/toolchain/install?id=${encodeURIComponent(id)}`);
+    const es = backendEventStream(`/api/toolchain/install?id=${encodeURIComponent(id)}`);
     esRef.current = es;
     es.onmessage = (ev) => {
       try { const line = JSON.parse(ev.data) as string; if (line) setLog((l) => [...l, line]); } catch { /* ignore */ }
     };
     es.addEventListener('status', (ev) => {
       let status = '';
-      try { status = JSON.parse((ev as MessageEvent).data) as string; } catch { /* ignore */ }
+      try { status = JSON.parse(ev.data) as string; } catch { /* ignore */ }
       if (status.startsWith('DONE')) {
         es.close(); esRef.current = null; setInstalling(null);
         refresh(); // re-detect: the row should flip to present
@@ -140,7 +140,7 @@ export default function BuildSupportDialog() {
         setLog((l) => [...l, `❌ ${status.slice('FAILED:'.length)}`]);
       }
     });
-    es.onerror = () => { es.close(); esRef.current = null; setInstalling(null); setLog((l) => [...l, '❌ Connection lost']); };
+    es.onerror = (failure) => { esRef.current = null; setInstalling(null); setLog((l) => [...l, `❌ ${streamFailureText(failure)}`]); };
   }, [installing, refresh]);
 
   // Auto-install the asset toolchain (Model Tools + Audio Tools) the way Node auto-

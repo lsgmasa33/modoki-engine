@@ -599,22 +599,22 @@ const DECLS: Record<string, Decl> = {
     minimalArgs: { srcPath: '/tmp/probe.png', destFolder: '/assets/textures' },
   },
   modoki_build: {
-    kind: 'build', method: 'GET', route: '/api/build',
+    kind: 'build', method: 'POST', route: '/api/build',
     mutating: true, persists: 'file', requires: ['project'],
     minimalArgs: { platform: 'web' },
-    notes: 'A MUTATING op behind GET, DELIBERATELY (Phase 6 decision): it is an SSE stream, and the browser/EventSource + curl ergonomics that make a live build log readable are GET-only. the F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). Also DENIED inside modoki_batch (a 30-min step cannot be bounded between steps).',
+    notes: 'POST since #1967 (it was a deliberate mutating GET for EventSource + curl ergonomics until then; a GET is assumed safe by every prefetcher and `<img src>`, and an EventSource reconnect re-ran the job). The params ride the query, the reply is an SSE stream. The F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). Also DENIED inside modoki_batch (a 30-min step cannot be bounded between steps).',
   },
   modoki_add_native_target: {
-    kind: 'build', method: 'GET', route: '/api/add-native-target',
+    kind: 'build', method: 'POST', route: '/api/add-native-target',
     mutating: true, persists: 'file', requires: ['project'],
     minimalArgs: { platform: 'ios' },
-    notes: 'A MUTATING op behind GET, DELIBERATELY (Phase 6 decision): it is an SSE stream, and the browser/EventSource + curl ergonomics that make a live build log readable are GET-only. the F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). 15-min SSE; also DENIED inside modoki_batch.',
+    notes: 'POST since #1967 (it was a deliberate mutating GET for EventSource + curl ergonomics until then; a GET is assumed safe by every prefetcher and `<img src>`, and an EventSource reconnect re-ran the job). The params ride the query, the reply is an SSE stream. The F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). 15-min SSE; also DENIED inside modoki_batch.',
   },
   modoki_ota_publish: {
-    kind: 'build', method: 'GET', route: '/api/ota/publish',
+    kind: 'build', method: 'POST', route: '/api/ota/publish',
     mutating: true, persists: 'file', requires: ['project'],
     minimalArgs: { version: '1.0.0' },
-    notes: 'A MUTATING op behind GET, DELIBERATELY (Phase 6 decision): it is an SSE stream, and the browser/EventSource + curl ergonomics that make a live build log readable are GET-only. the F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). It PUBLISHES, so it is the member of this set most worth watching: also DENIED inside modoki_batch.',
+    notes: 'POST since #1967 (it was a deliberate mutating GET for EventSource + curl ergonomics until then; a GET is assumed safe by every prefetcher and `<img src>`, and an EventSource reconnect re-ran the job). The params ride the query, the reply is an SSE stream. The F3 concern does NOT apply — these tools never touch `getJson`; `consumeBuildStream` reads the stream and fails on a non-2xx open, an `event:status FAILED`, a mid-run break, AND a close with no final DONE/FAILED (outcome unknown is a failure, not a success). It PUBLISHES, so it is the member of this set most worth watching: also DENIED inside modoki_batch.',
   },
   modoki_ota_status: { kind: 'read', method: 'GET', route: '/api/ota/status', requires: ['project'] },
   modoki_ota_keygen: {

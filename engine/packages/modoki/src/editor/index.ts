@@ -9,7 +9,7 @@
 // `writeAssetFileGuarded` + `expectedHash` + `fileChangedRefusal` are #1679's if-match seam, public for the same
 // reason: a game panel's undo that rewrites its own file must state what it expects there, and without the seam in
 // the barrel each game would grow its own guard shape (#1697, sling's Level/Wave editors).
-export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile, writeAssetFileGuarded } from './backend/editorBackend';
+export { backendFetch, backendPostJson, backendEventStream, streamFailureText, backendBase, backendUrl, jsonFileBody, writeAssetFile, writeAssetFileGuarded } from './backend/editorBackend';
 export { expectedHash, fileChangedRefusal, UndoRefusedError, reportUndoFailure } from './undo/undoFailure';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {

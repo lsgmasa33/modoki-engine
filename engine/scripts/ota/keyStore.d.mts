@@ -8,6 +8,14 @@ export function legacyKeyDirs(o: { projectRoot: string; editorRoot?: string | nu
 
 export function restrictToOwner(file: string): void;
 
+export function findLegacyKey(o: {
+  projectRoot: string;
+  editorRoot?: string | null;
+  name: string;
+  expectedPublicKey?: unknown;
+  configReadable: boolean;
+}): { keyPath: string; own: boolean; source: string | null; passedOver: { from: string; reason: string }[] };
+
 /** A key file read as a keypair, checked to BE one (its private half derives its public half, #1993). */
 export function readKeypair(file: string):
   | { ok: true; keypair: { publicKey: string; privateKey: string } }

@@ -367,7 +367,7 @@ import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
 import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
 import { checkOpenProjectRequest, openProjectReply, sameRootVerdict, inFlightReply, withExpectedToken, type ProjectSwitchHost } from './openProjectRoute';
 import { parseJsonText, readJsonFile } from '../../scripts/jsonFile.mjs'; // #1799: a BOM is read through
-import { adoptLegacyKey, readKeypair } from '../../scripts/ota/keyStore.mjs';
+import { findLegacyKey, readKeypair } from '../../scripts/ota/keyStore.mjs';
 import { readRawOtaBlock } from '../../scripts/ota/publishPreflight.mjs';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
@@ -1779,8 +1779,10 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     return { kind: 'json', body: ctx.getManifest(), headers: { 'Cache-Control': 'no-store' } };
   }
 
-  // ── GET/POST /api/rescan-assets (M) ── force a fresh scan + GUID heal.
+  // ── POST /api/rescan-assets (M) ── force a fresh scan + GUID heal. POST only (#1967): the heal writes sidecars, and
+  // a GET is assumed safe by everything from a link prefetcher to an `<img src>` (conventions §4).
   if (urlPath === '/api/rescan-assets') {
+    if (method !== 'POST') return json({ error: 'POST /api/rescan-assets: a rescan heals GUIDs and writes sidecars, so a GET does not run it.' }, 405);
     return json(ctx.rebuildManifest());
   }
 
@@ -6436,34 +6438,34 @@ async function describeUnresolvedAgainstLiveWorld(
     return json({ teams: discoverSigningTeams() });
   }
 
-  // ── GET /api/ota/keys?name=<name> (M) ── does the PROJECT's build/ota-keys/<name>.json exist
-  // (#1983), and if so what's its public key? No generation — lets the OTA Keys dialog show current
-  // state (and whether it matches project.config.json's ota.publicKey) WITHOUT a keygen call. Its
-  // writes: the first read's copy of a key an earlier editor left outside the project (keyStore.mjs:
-  // a copy, never a move), so the dialog answers about the key the project already signs with, and the
-  // key folder's own `.gitignore` when it lacks one.
+  // ── GET /api/ota/keys?name=<name> ── which key does the PROJECT sign with (#1983), and what's its public key? No
+  // generation — lets the OTA Keys dialog show current state (and whether it matches project.config.json's
+  // ota.publicKey) WITHOUT a keygen call. A pure read (#1967: a GET never changes state): a key an earlier editor left
+  // outside the project, which this route used to copy in, is REPORTED (`legacyKeyAt`), and copied by keygen or the
+  // next publish (`adoptLegacyKey`), where it is about to be used. It is the key the project signs with either way, so
+  // the dialog shows the same thing.
   if (urlPath === '/api/ota/keys' && method === 'GET') {
     const name = query.get('name') || 'default';
     if (!isOtaKeyName(name)) return json({ ok: false, error: `name must match ${OTA_SAFE_TOKEN} and not start with "-"` }, 400);
-    let keyPath: string;
-    let copiedFrom: string | null;
+    let found: ReturnType<typeof findLegacyKey>;
     try {
       const raw = readRawOtaBlock(ctx.projectRoot);
-      ({ keyPath, copiedFrom } = adoptLegacyKey({ projectRoot: ctx.projectRoot, editorRoot: ctx.editorRoot, name, expectedPublicKey: raw.ok ? (raw.ota as { publicKey?: unknown } | undefined)?.publicKey : undefined, configReadable: raw.ok || raw.reason === 'missing' }));
+      found = findLegacyKey({ projectRoot: ctx.projectRoot, editorRoot: ctx.editorRoot, name, expectedPublicKey: raw.ok ? (raw.ota as { publicKey?: unknown } | undefined)?.publicKey : undefined, configReadable: raw.ok || raw.reason === 'missing' });
     } catch (e) {
       return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500);
     }
-    if (!fs.existsSync(keyPath)) return json({ ok: true, name, exists: false, publicKey: null });
+    const keyFile = found.own ? found.keyPath : found.source;
+    if (!keyFile) return json({ ok: true, name, exists: false, publicKey: null });
     // Read as a PAIR (#1993): a file whose privateKey is not its publicKey's would otherwise be shown as
-    // "matches Project Settings", and its public half offered to Sync.
-    const read = readKeypair(keyPath);
+    // "matches Project Settings", and its public half offered to Sync. (A legacy `source` already passed this check.)
+    const read = readKeypair(keyFile);
     if (!read.ok) {
       const why = read.reason === 'unreadable' ? read.error
         : read.reason === 'no-public-half' ? 'it has no publicKey'
         : 'its privateKey is not the pair of its publicKey (a corrupt or foreign file — restore it from your backup)';
-      return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyPath)}: ${why}` }, 500);
+      return json({ ok: false, error: `could not read ${path.relative(ctx.projectRoot, keyFile)}: ${why}` }, 500);
     }
-    return json({ ok: true, name, exists: true, publicKey: read.keypair.publicKey, ...(copiedFrom ? { copiedFrom } : {}) });
+    return json({ ok: true, name, exists: true, publicKey: read.keypair.publicKey, ...(found.source ? { legacyKeyAt: found.source } : {}) });
   }
 
   // ── POST /api/ota/keygen?name=<name> (M, exec) ── generate the OTA signing keypair

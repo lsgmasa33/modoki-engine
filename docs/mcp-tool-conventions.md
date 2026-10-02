@@ -437,12 +437,24 @@ Therefore:
 
 > **No mutating operation is reachable by GET.**
 
-Because such an operation's failure is structurally unchecked. Six tools reach a mutating op by GET:
-`modoki_build`, `add_native_target`, `ota_publish`, and (found only by reading query params, not
-routes) `modoki_journal`, `editor_journal` — which mutated via `?action=start` and `?clear=1` (F3);
-`editor_journal` left the list when #1561 retired `clear` — and **`modoki_hit_regions`**, whose
-`action:'show'|'hide'` flips the overlay through a GET-only route. All of them now run their `ok:false` through the failure check at the call site, so a refusal
-cannot arrive as a success; the remaining violation is the METHOD, and the fix pattern below.
+Because such an operation's failure is structurally unchecked. Six tools reached a mutating op by GET.
+The build family, `modoki_build`, `add_native_target` and `ota_publish`, moved to POST in #1967. Their
+reply is still an SSE stream: the editor reads the POST's body with `backendEventStream`, the MCP with
+`consumeBuildStream`, and both use one parser (`sseFrames.ts`). Found only by reading query params,
+not routes: `modoki_journal` and `editor_journal`, which mutated via `?action=start` and `?clear=1`
+(F3). `editor_journal` left the list when #1561 retired `clear`. **`modoki_hit_regions`**'s
+`action:'show'|'hide'` flips the overlay through a GET-only route. The two left
+(`journal`, `hit_regions`) run their `ok:false` through the failure check at the call site, so a
+refusal cannot arrive as a success. They change renderer memory, not disk, so #1967 left them as
+they are. The remaining violation is the METHOD, and the fix pattern is below.
+
+**The HTTP side of the same rule (#1967): no route changes state on a GET**, whatever calls it. A
+GET is assumed safe by everything from a link prefetcher to an `<img src>`, and an `EventSource`
+reconnect re-sends it. So `/api/exit`, the four build-family streams and `/api/rescan-assets` (its
+GUID heal writes sidecars) answer anything but POST with a **405** (`refuseUnlessPost`,
+`plugins/backend/sseRoutes.ts`). `/api/ota/keys` GET only REPORTS a key an earlier editor left
+outside the project (`legacyKeyAt`); keygen and publish copy it in. The switch gate's "reads pass"
+rests on this rule (`editor.md`, Open Project).
 
 ⚠️ **The re-runnable query is only as trustworthy as the field it filters on — this sentence used
 to say otherwise, and the tool it was written about is what disproved it.** The query is

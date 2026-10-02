@@ -47,7 +47,7 @@ beforeEach(() => {
   writes = [];
   rescans = 0;
   onDisk = new Map();
-  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string; method?: string }) => {
     if (String(url).endsWith('/api/write-file')) {
       const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
       // Matched case-insensitively and answered with the stored spelling, as APFS and the real route do (#1273).
@@ -67,6 +67,8 @@ beforeEach(() => {
       return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as unknown as Response;
     }
     if (String(url).endsWith('/api/rescan-assets')) {
+      // POST only, as the real route (#1967).
+      if (init?.method !== 'POST') return { ok: false, status: 405, json: async () => ({ error: 'POST only' }) } as unknown as Response;
       rescans++;
       return { ok: true, json: async () => ({ assets: [] }) } as unknown as Response;
     }

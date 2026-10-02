@@ -17,6 +17,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
 import { notePendingHeader } from './pendingStamp.js';
 import { PENDING_OUTSIDE_HEADER } from '../../shared/pendingOutside.js';
+import { createSseParser, type SseFrame } from '../../../packages/modoki/src/editor/backend/sseFrames.js';
 import { buildLogLines, buildLogTail, writeBuildLog } from './buildLog.js';
 
 /** `why` for a 200 failure: a PARTIAL body's own `error` leads (#1910 close-out review). `failureDetail` prefers
@@ -704,7 +705,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     await ensureIdentity();
     let res: Response;
     try {
-      res = await fetch(BACKEND + path, { headers: { ...(token ? { 'X-Modoki-Token': token } : {}), Accept: 'text/event-stream' }, signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(BACKEND + path, { method: 'POST', headers: { ...(token ? { 'X-Modoki-Token': token } : {}), Accept: 'text/event-stream' }, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       return unreachable(e);
     }
@@ -722,8 +723,8 @@ export function createToolContext(config: { backend: string; token?: string }): 
     const decoder = new TextDecoder();
     // Every chunk, for the file: the answer carries only a tail (`logAnswer`).
     const log: string[] = [];
-    let buf = '';
-    let outcome: { ok: boolean; step?: string; error?: string } | null = null;
+    // Assigned inside `onFrame`, so declared with a cast: a plain `= null` narrows it to `null` for the reads below.
+    let outcome = null as { ok: boolean; step?: string; error?: string } | null;
     const pushLog = (chunk: string) => { log.push(chunk); };
     // `/api/build?platform=web` → `build-web`: which build a log file holds.
     const label = `${path.replace(/^\/api\//, '').split('?')[0]}-${new URLSearchParams(path.split('?')[1] ?? '').get('platform') ?? ''}`;
@@ -732,34 +733,26 @@ export function createToolContext(config: { backend: string; token?: string }): 
       return { tail: buildLogTail(lines), lines: lines.length, path: writeBuildLog(log, label) };
     };
     const fullLogOption = (file: string | null) => (file ? [`read the whole log (${file}) for what the tail cut`] : []);
+    const onFrame = ({ event, data }: SseFrame) => {
+      if (outcome) return;
+      let parsed: unknown = data;
+      try { parsed = JSON.parse(data); } catch { /* keep raw */ }
+      if (event === 'message') { if (parsed) pushLog(String(parsed)); }
+      else if (event === 'status') {
+        const status = String(parsed);
+        if (status === 'DONE') { outcome = { ok: true }; }
+        else if (status.startsWith('FAILED')) {
+          const details = status.slice('FAILED:'.length).trim();
+          outcome = { ok: false, step: details.split('\n')[0] || 'unknown step', error: details.split('\n').slice(1).join('\n') };
+        } else { pushLog(status); }
+      }
+    };
+    const parser = createSseParser(onFrame);
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        // SSE frames are separated by a blank line.
-        let sep: number;
-        while ((sep = buf.indexOf('\n\n')) >= 0) {
-          const frame = buf.slice(0, sep);
-          buf = buf.slice(sep + 2);
-          let event = 'message';
-          let data = '';
-          for (const raw of frame.split('\n')) {
-            if (raw.startsWith('event:')) event = raw.slice(6).trim();
-            else if (raw.startsWith('data:')) data += raw.slice(5).trim();
-          }
-          let parsed: unknown = data;
-          try { parsed = JSON.parse(data); } catch { /* keep raw */ }
-          if (event === 'message') { if (parsed) pushLog(String(parsed)); }
-          else if (event === 'status') {
-            const status = String(parsed);
-            if (status === 'DONE') { outcome = { ok: true }; }
-            else if (status.startsWith('FAILED')) {
-              const details = status.slice('FAILED:'.length).trim();
-              outcome = { ok: false, step: details.split('\n')[0] || 'unknown step', error: details.split('\n').slice(1).join('\n') };
-            } else { pushLog(status); }
-          }
-        }
+        if (done) { parser.push(decoder.decode()); parser.end(); break; }
+        parser.push(decoder.decode(value, { stream: true }));
         if (outcome) break;
       }
     } catch (e) {

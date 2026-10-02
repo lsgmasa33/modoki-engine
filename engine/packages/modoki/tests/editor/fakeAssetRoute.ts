@@ -107,7 +107,12 @@ export function makeFakeAssetRoute(): FakeAssetRoute {
         return reply(200, { ok: true, saved: true, sha256: sha256(copy), ...(sidecar ? { sidecar } : {}) });
       }
 
-      if (u.endsWith('/api/rescan-assets')) { route.onRescan(); return reply(200, route.rescanBody()); }
+      if (u.endsWith('/api/rescan-assets')) {
+        // POST only, as the real route (#1967): a caller that GETs it gets the 405, not a rescan.
+        if (init?.method !== 'POST') return reply(405, { error: 'POST /api/rescan-assets' });
+        route.onRescan();
+        return reply(200, route.rescanBody());
+      }
       if (u.includes('/api/')) return reply(200, { ok: true });
 
       const path = u.replace(/^https?:\/\/[^/]+/, '');

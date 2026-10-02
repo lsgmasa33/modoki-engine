@@ -936,7 +936,7 @@ times, and one release rule cannot serve both:
 - The **pipeline** owns its own release once started. Releasing it on `close` — which the first
   version did — frees the slot the instant the client disconnects, while the step loop is still
   awaiting a spawned child. The editor's own force-reload reaches that: editing a game `.ts`
-  reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
+  reloads the page, tearing down the build stream mid-build, and a retry then writes the same dist
   from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
 
 **Every stream ends with a status, even when the handler throws (#1259).** The dialog learns that a
@@ -3275,7 +3275,7 @@ no project set a `signingConfig`. Nothing shippable had ever come out of it — 
 `games/court` and `games/wordweave` needed to ship.
 
 **Build → iOS Release (App Store .ipa)** and **Build → Android Release (Play AAB)** are the entry
-points; over HTTP it is `GET /api/build?platform=ios|android&variant=release`, and over MCP it is
+points; over HTTP it is `POST /api/build?platform=ios|android&variant=release` (an SSE reply; POST since #1967), and over MCP it is
 `modoki_build {platform, variant:'release'}`. An **absent `variant` still means `debug`**, so every
 caller that predates this is unchanged.
 

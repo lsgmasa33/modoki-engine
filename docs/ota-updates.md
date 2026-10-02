@@ -669,7 +669,7 @@ wrapped by a safety-railed pipeline reachable two ways:
 - **MCP tools** — `modoki_ota_publish` / `modoki_ota_status` / `modoki_ota_keygen`
   (`engine/tools/modoki-mcp/src/tools/project.ts`), thin wrappers over the same backend routes.
 
-Both surfaces hit `GET /api/ota/publish` (SSE, `engine/plugins/vite-asset-scanner.ts`) which:
+Both surfaces hit `POST /api/ota/publish` (SSE, POST since #1967, `engine/plugins/vite-asset-scanner.ts`) which:
 (1) builds **fresh**, the currently-open project via `build-web.mjs` or a sub-game listed in its
 `ota.subgames` via `build-subgame.mjs` (#837) — never accepts a stale pre-built dist; (2) verifies/sets bucket CORS as a
 non-fatal preflight; (3) runs `ota-publish.mjs --project <projectRoot>`. The route deliberately
@@ -679,7 +679,7 @@ what happened when the route had a second, weaker one). It DOES run the publish-
 check itself — **`otaPublishPreflight` (`engine/scripts/ota/publishPreflight.mjs`, #827)**: enabled,
 the four tainted inputs, the bundle identity and publish target, and the signing key — as a fast
 refusal before the multi-minute build starts — sent IN the stream as a `FAILED:OTA publish refused` status, since
-a JSON 400 before the SSE headers is a body the dialog's `EventSource` cannot read (#1824). `ota-publish.mjs` runs the
+a JSON 400 before the SSE headers is a body the dialog cannot show as a step (#1824). `ota-publish.mjs` runs the
 SAME function, so the route's early answer can never refuse anything the script would allow, and a
 check added there refuses on both. Only the refusal WORDING is per side; each side keys its messages
 by `OTA_PUBLISH_REFUSALS`, and `publishPreflight.test.ts` holds both maps to the full list.

@@ -2,7 +2,7 @@
  * Single client seam for all editor → backend calls (ELECTRON_PLAN Phase 1).
  *
  * Every editor → backend request funnels through `backendFetch` /
- * `backendEventSource` here so the transport is swappable in exactly ONE place:
+ * `backendEventStream` here so the transport is swappable in exactly ONE place:
  *
  *   - Vite dev / browser: same-origin (base = ''). Vite middleware serves /api/*.
  *   - Packaged Electron: the editor host sets `window.__modokiBackendBase` to the
@@ -16,6 +16,8 @@
  */
 
 import { failureDetail } from './failureBody';
+import { createSseParser, type SseFrame } from './sseFrames';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** Base URL the editor backend is reachable at. Empty string = same-origin
  *  (Vite dev server / browser). The Electron host overrides it via a global the
@@ -47,9 +49,89 @@ export function backendPostJson(path: string, body: unknown, init?: RequestInit)
   });
 }
 
-/** SSE transport for streaming endpoints (currently /api/build). */
-export function backendEventSource(path: string): EventSource {
-  return new EventSource(backendUrl(path));
+/** One event off a {@link backendEventStream}: the frame's `data`, as `MessageEvent.data` would carry it. */
+export interface BackendStreamEvent { data: string }
+
+/** Why a {@link backendEventStream} ended badly: the server REFUSED the request, or the connection failed. */
+export interface BackendStreamFailure { refused: boolean; reason: string }
+
+/** The words a dialog shows for a {@link BackendStreamFailure}: a refusal is the server's reason, anything else is a lost
+ *  connection (with what the transport said). */
+export function streamFailureText(failure?: BackendStreamFailure): string {
+  if (!failure) return 'Connection lost';
+  return failure.refused ? `Refused: ${failure.reason}` : `Connection lost (${failure.reason})`;
+}
+
+/** The handle {@link backendEventStream} returns: the slice of `EventSource` the build-family dialogs use. */
+export interface BackendEventStream {
+  addEventListener(event: string, fn: (e: BackendStreamEvent) => void): void;
+  /** Frames with no `event:` field (the log lines). Same as `addEventListener('message', …)`. */
+  onmessage: ((e: BackendStreamEvent) => void) | null;
+  /** The stream could not open, or it ended or broke before the caller called `close()`. Fires at most once, and never
+   *  after `close()`. `failure` is absent when the stream simply ended; `refused` when the server answered the request
+   *  with an error status (`reason` is its own words, e.g. a 503 mid project switch); otherwise the connection failed. */
+  onerror: ((failure?: BackendStreamFailure) => void) | null;
+  /** Stop listening and abort the request; the server sees the client go away, as with `EventSource.close()`. */
+  close(): void;
+}
+
+/** The streaming transport for the build-family routes (/api/build, /api/add-native-target, /api/toolchain/install,
+ *  /api/ota/publish). They START a job, so they are POSTs (#1967: a GET never changes state), and `EventSource` can only
+ *  GET, so this reads the POST's `text/event-stream` body itself. Unlike `EventSource` it never reconnects: a
+ *  reconnect re-sends the request that starts the job, so a dropped connection would have re-run the build. */
+export function backendEventStream(path: string): BackendEventStream {
+  const listeners = new Map<string, Set<(e: BackendStreamEvent) => void>>();
+  const abort = new AbortController();
+  let closed = false;
+  const stream: BackendEventStream = {
+    addEventListener(event, fn) { listeners.set(event, (listeners.get(event) ?? new Set()).add(fn)); },
+    onmessage: null,
+    onerror: null,
+    close() { closed = true; abort.abort(); },
+  };
+  const fail = (failure?: BackendStreamFailure) => {
+    if (closed) return;
+    closed = true;
+    abort.abort();
+    stream.onerror?.(failure);
+  };
+  const deliver = ({ event, data }: SseFrame) => {
+    if (closed) return;
+    // Listeners are isolated (#1991 review): one that throws must not reach the read loop, whose catch would abort the
+    // request, and the server kills the job when its client goes. EventSource never let a listener touch the connection.
+    if (event === 'message' && stream.onmessage) notifyListeners([stream.onmessage], 'backendEventStream:onmessage', [{ data }]);
+    // A listener that throws (a malformed frame's JSON.parse) must not starve the others or break the read loop.
+    const fns = listeners.get(event);
+    if (fns && !closed) notifyListeners(fns, `backendEventStream:${event}`, [{ data }]);
+  };
+  void (async () => {
+    let res: Response;
+    try {
+      res = await backendFetch(path, { method: 'POST', headers: { Accept: 'text/event-stream' }, signal: abort.signal });
+    } catch (e) { fail({ refused: false, reason: e instanceof Error ? e.message : String(e) }); return; }
+    if (!res.ok || !res.body) {
+      const text = await res.text().catch(() => '');
+      let reason = text;
+      try { reason = failureDetail(JSON.parse(text)) ?? text; } catch { /* not JSON: the raw text */ }
+      fail(res.ok ? { refused: false, reason: 'the reply had no body' } : { refused: true, reason: reason || `HTTP ${res.status}` });
+      return;
+    }
+    const parser = createSseParser(deliver);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parser.push(decoder.decode(value, { stream: true }));
+        if (closed) return;
+      }
+      parser.push(decoder.decode());
+      parser.end();
+    } catch (e) { fail({ refused: false, reason: e instanceof Error ? e.message : String(e) }); return; }
+    fail(); // the server ended the stream without a final status the caller closed on
+  })();
+  return stream;
 }
 
 // ── The client-side JSON write seam (#835) ──────────────────────────────────────────

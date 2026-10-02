@@ -325,7 +325,7 @@ What pinning changed in committed sidecars, and what it did not: [textures.md](t
 - **`GET /api/toolchain`** (transport-agnostic backend router) → `toolchainStatus()`: every tool's
   detection + install/guide affordance, derived `adb`, and a `preflight` per target. Works in both the
   Vite-plugin process and the Electron main backend.
-- **`GET /api/toolchain/install?id=<tool>`** (host-owned SSE in `vite-asset-scanner.ts`, proxied by
+- **`POST /api/toolchain/install?id=<tool>`** (POST since #1967; host-owned SSE in `vite-asset-scanner.ts`, proxied by
   `backendServer.ts` like `/api/build`) → runs `install()`, streaming the log; provisions Node first so
   npm-based installs run on it.
 - **Build Support dialog** (`editor/panels/BuildSupportDialog.tsx`, opened from **Build → Build

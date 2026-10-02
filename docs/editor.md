@@ -3410,15 +3410,48 @@ other project. Now:
   over the old project's backend. It only restarts a server the open found running, never one that was
   not (a superseded launch had none, and its own fatal path reports that). If that restart fails, the
   dialog says to relaunch.
-- `prepareThenReRoot` closes `switchGate` and only then re-roots. `hostRoutes` checks the gate
-  first, so until the reload COMMITS (`did-navigate`) every request other than GET/HEAD/OPTIONS is
-  refused with 503 `{switching: true, reason: 'project-switching'}`, read-only POSTs (`scene-query`,
-  `eval`, `wait-for`) included. `/api/open-project` passes, so a newer open can still supersede. The gate
+- `prepareThenReRoot` closes `switchGate` and only then re-roots. The gate is the backend server's
+  `fence` (`backendServer.ts`, #1991), checked after the token gate and AHEAD of the build proxy, the
+  host routes and the shared router. It used to sit in `hostRoutes`, which runs after the proxy had
+  already forwarded Build / Add Native Target / Install / Publish OTA to Vite. Until the reload
+  COMMITS (`did-navigate`), every request other than GET/HEAD/OPTIONS is refused with 503
+  `{switching: true, reason: 'project-switching'}`, read-only POSTs (`scene-query`, `eval`,
+  `wait-for`) included. Letting reads through is sound only because no route changes state on a GET
+  (#1967, `mcp-tool-conventions.md` § 4). `/api/open-project` passes, so a newer open can still supersede. The gate
   opens by itself after 30 s, so a navigation that never commits cannot leave the editor read-only. A
   re-root that THROWS half way is the exception: the backend may be split between the projects, so the
   gate closes with no timeout, and a reload commit (the old window's Vite client reloading itself) does
   not lift it. Only a relaunch or another open, which re-roots consistently, does. That failure is
-  reported even if a newer open superseded it: as a dialog, or in an agent's `failed` reply.
+  reported even if a newer open superseded it: as a dialog, or in an agent's `failed` reply. A LATER
+  open that fails before re-rooting leaves the lock in place, so its outcome carries `locked` and keeps
+  "relaunch required" (#1990). Keying the title and dialog on that open's own `reRootFailed` used to
+  say "its saves go there" while every save still got the 503.
+- **Vite already serves the new project while the backend serves the old one**, all through the
+  prepare and, on a failure, until `pairBack`. So the gate alone could not stop a proxied Build or
+  Publish OTA from the old window running on the NEW project, and the shared router mounted in Vite
+  had no gate at all. The proxy STAMPS each forward with the root the backend serves
+  (`x-modoki-project-root`, URI-encoded because Node refuses a non-latin1 header;
+  `plugins/backend/projectStamp.ts`). Under Electron (`MODOKI_VITE_UNDER_ELECTRON`), Vite refuses a
+  state-changing request whose stamp is missing or names another root (`samePath`), with a 409 that
+  says to use the backend port. main's own config-invalidation POST is stamped too. The check runs in
+  the process that does the work, against the root it would use, so no check-then-forward race in
+  main can get around it. A standalone `npm run dev` has no marker and is its own only writer.
+- **A request already running when the re-root lands keeps its project** (`requestContext.ts`).
+  main's context reads `state.root`/`state.backend` live, so a recursive folder reimport that awaits
+  between files would resolve its next file against the NEW project's roots at the same URL. The
+  backend now calls a factory once per request: `projectRoot` is read at arrival, and every member
+  that reaches the project's files or asset backend throws `ProjectSwitchedError` once the backend
+  it arrived with is replaced. The stop is recorded on the context, so a route whose catch-all
+  turned it into a 500 is answered 503 `switching`. A route that caught it on purpose and FINISHED
+  keeps its own answer, about work that landed in the old project: an import whose manifest rebuild
+  was skipped, or a reimport's per-asset `errors[]`. The bookkeeping after a landed write
+  (`markEditorWrite`, `invalidateProjectConfig`) does nothing after a switch, so it cannot turn that
+  write into a "retry" error. The fence runs twice, at arrival and again once the body is in, so a
+  large upload whose body finishes after the gate closes is refused too. Draining in-flight requests before the
+  re-root was rejected: the agent's own `POST /api/open-project` and any `wait-for` long poll are in
+  flight for the whole open, so a drain would wait on the request driving the switch. The
+  `modoki:connect-claude` IPC, which writes `.mcp.json` under the project, asks the gate too, and
+  re-checks the project after its CDP probe.
 - Unity has no such window: Open Project closes the editor before the other project opens.
 
 **A superseded open does not reload.** If a newer open (a human's Open Recent, or another call)

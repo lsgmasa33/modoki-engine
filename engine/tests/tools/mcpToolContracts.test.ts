@@ -349,18 +349,18 @@ describe('tool contracts', () => {
    *
    *  PHASE 6 RESOLUTION (2026-07-30): the split is now deliberate, and the two halves are policed
    *  differently rather than merged.
-   *   - The BUILD FAMILY (`build`, `add_native_target`, `ota_publish`) stays GET because it is an SSE
-   *     stream — the live-log ergonomics (EventSource, `curl -N`) are GET-only. F3's concern does not
-   *     apply to them: they never touch `getJson`. `consumeBuildStream` fails on a non-2xx open, an
-   *     `event:status FAILED`, a mid-run break, and a close with NO final status (outcome unknown is
-   *     a failure, not a success).
+   *   - The BUILD FAMILY (`build`, `add_native_target`, `ota_publish`) stayed GET for the SSE live-log
+   *     ergonomics until #1967 moved them to POST (a GET is assumed safe by every prefetcher and
+   *     `<img src>`; `curl -N -X POST` streams just as well). They never touched `getJson`:
+   *     `consumeBuildStream` fails on a non-2xx open, an `event:status FAILED`, a mid-run break, and a
+   *     close with NO final status (outcome unknown is a failure, not a success).
    *   - `journal` keeps its mutating GET (the `curl` ergonomics are the point) but passes
    *     `checkFailure` at the call site, so a `200 {ok:false}` refusal IS a failed tool call.
    *     Asserted behaviourally below, not just declared. `editor_journal` left the list when #1561
    *     retired its `clear` — it is a pure read now.
    *  The list may only SHRINK. */
   const MUTATING_GETS = [
-    'modoki_build', 'modoki_add_native_target', 'modoki_ota_publish',
+    // The build family (build, add_native_target, ota_publish) left in #1967: they are POSTs now.
     // Found while writing this table, and NOT in the original route inventory — these mutate
     // through QUERY PARAMS on a GET (`?action=start`), so a scan of route methods alone missed it.
     'modoki_journal',

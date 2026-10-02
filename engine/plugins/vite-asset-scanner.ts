@@ -13,6 +13,8 @@ import { createAssetTreeWatcher, type AssetTreeWatcher } from './assetTreeWatche
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
 import { foreignRequestRefusal } from './backend/requestOrigin';
+import { SSE_ROUTES, refuseUnlessPost } from './backend/sseRoutes';
+import { PROJECT_ROOT_HEADER, stampRefusal } from './backend/projectStamp';
 import { RelayTimeoutError } from './backend/relayOutcome';
 import { computeKeptAssets, damagedPrefabBuildError, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
@@ -2351,11 +2353,28 @@ export function assetScannerPlugin(): Plugin {
           }
         }
 
-        // GET/POST /api/exit — shut this dev server down cleanly. Lets tooling
+        // The project-stamp check (#1991, projectStamp.ts): under the Electron editor a state-changing request must come
+        // from the editor's backend, stamped with the root it serves, and that root must be this server's. It closes the
+        // window in which Open Project has moved this server to the new project but the backend still serves the old
+        // one, and it fences the shared router mounted below, which has no switch gate of its own. Reads pass.
+        if (req.url?.startsWith('/api/')) {
+          const stamped = stampRefusal({ method: req.method, url: req.url, stamp: req.headers[PROJECT_ROOT_HEADER] }, projectRoot, process.env.MODOKI_VITE_UNDER_ELECTRON === '1');
+          if (stamped) {
+            console.warn(`[asset-scanner] refused ${req.method} ${req.url.split('?')[0]}: ${stamped.body.error}`);
+            res.statusCode = stamped.status;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify(stamped.body));
+            return;
+          }
+        }
+
+        // POST /api/exit — shut this dev server down cleanly. Lets tooling
         // (and Claude) stop a previously-spawned server with a curl instead of
         // hunting PIDs. Dev-only by construction (this middleware only runs under
-        // `vite` dev, never in a production build).
+        // `vite` dev, never in a production build). POST only (#1967): it was the
+        // route an `<img src>` stopped the dev server through (#1955).
         if (req.url === '/api/exit') {
+          if (refuseUnlessPost(req, res)) return;
           handleExitRequest(res); // writes the ack, then schedules process.exit(0) after flush
           return;
         }
@@ -2399,7 +2418,10 @@ export function assetScannerPlugin(): Plugin {
         // `/api/build-status` is NOT swallowed by a prefix match, and a query-less
         // `/api/build` still reaches its handler (which refuses) instead of falling
         // through to SPA HTML. Keep identical to the dedicated handlers below. (D5)
-        const sseRoutes = ['/api/build', '/api/add-native-target', '/api/toolchain/install', '/api/ota/publish'];
+        const sseRoutes = SSE_ROUTES;
+        // They START a job, so they are POSTs (#1967): any other method gets a 405 here, rather than falling past
+        // their POST-only handlers to Vite's SPA fallback and a 200 of HTML.
+        if (isApiRoute && isSseRoute(req.url!, sseRoutes) && refuseUnlessPost(req, res)) return;
         if ((isApiRoute && !isSseRoute(req.url!, sseRoutes)) || req.url === '/assets.manifest.json') {
           const u = new URL(req.url!, 'http://localhost');
           const ctx: BackendContext = {
@@ -2488,12 +2510,12 @@ export function assetScannerPlugin(): Plugin {
           return;
         }
 
-        // GET /api/add-native-target?platform=ios|android — scaffold a flat game
+        // POST /api/add-native-target?platform=ios|android — scaffold a flat game
         // project's native target in one action (SSE stream): ensure Capacitor
         // deps + capacitor.config.json, vendor engine plugins (copies), install,
         // build web, `npx cap add`, then heal native config + flag missing
         // Firebase. Turns the manual per-game checklist into one Build-menu click.
-        if ((req.url === '/api/add-native-target' || req.url?.startsWith('/api/add-native-target?')) && req.method === 'GET') {
+        if ((req.url === '/api/add-native-target' || req.url?.startsWith('/api/add-native-target?')) && req.method === 'POST') {
           const url = new URL(req.url, 'http://localhost');
           const platform = url.searchParams.get('platform') as NativePlatform | null;
           if (platform !== 'ios' && platform !== 'android') {
@@ -2604,13 +2626,13 @@ export function assetScannerPlugin(): Plugin {
           return;
         }
 
-        // GET /api/toolchain/install?id=<tool> — auto-install one INSTALLABLE build
+        // POST /api/toolchain/install?id=<tool> — auto-install one INSTALLABLE build
         // tool into the userData toolchain dir (SSE stream of npm/download output).
         // The status sibling GET /api/toolchain is the JSON router route; this stream
         // is host-owned like /api/build. Backs the Build-Support dialog's Install
         // buttons. Guided-only tools (Xcode) reject here — the dialog shows guide()
         // steps instead of an Install button for those.
-        if ((req.url === '/api/toolchain/install' || req.url?.startsWith('/api/toolchain/install?')) && req.method === 'GET') {
+        if ((req.url === '/api/toolchain/install' || req.url?.startsWith('/api/toolchain/install?')) && req.method === 'POST') {
           const url = new URL(req.url, 'http://localhost');
           const id = url.searchParams.get('id') as ToolId | null;
           res.setHeader('Content-Type', 'text/event-stream');
@@ -2676,9 +2698,9 @@ export function assetScannerPlugin(): Plugin {
           return;
         }
 
-        // GET /api/build?platform=ios|android|web|playable[&variant=debug|release] — build + deploy
+        // POST /api/build?platform=ios|android|web|playable[&variant=debug|release] — build + deploy
         // (SSE stream)
-        if ((req.url === '/api/build' || req.url?.startsWith('/api/build?')) && req.method === 'GET') {
+        if ((req.url === '/api/build' || req.url?.startsWith('/api/build?')) && req.method === 'POST') {
           const url = new URL(req.url, 'http://localhost');
           const platform = url.searchParams.get('platform');
           if (!isValidBuildPlatform(platform)) {
@@ -3636,14 +3658,14 @@ export function assetScannerPlugin(): Plugin {
         // work identically in a packaged Electron editor, not just this dev server. Only
         // the SSE publish pipeline below stays host-owned, same as /api/build.
 
-        // GET /api/ota/publish?version=v18[&mandatory=1|0][&bundleName=][&key=][&bucket=] (SSE stream)
+        // POST /api/ota/publish?version=v18[&mandatory=1|0][&bundleName=][&key=][&bucket=] (SSE stream)
         // `mandatory` is tri-state: 1 sets it, 0 clears it, omitted inherits the existing
         // release's value (sticky — see ota-publish.mjs's own header comment).
         // Wraps engine/scripts/ota-publish.mjs with the safety rails the plan doc calls
         // for: build FRESH from the current project.config.json (never accept a stale
         // pre-built dist/), verify/set bucket CORS. The version-collision decision
         // belongs to ota-publish.mjs alone, not this route (#577) — see Step 3 below.
-        if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
+        if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'POST') {
           const url = new URL(req.url, 'http://localhost');
           const versionParam = url.searchParams.get('version');
           // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:

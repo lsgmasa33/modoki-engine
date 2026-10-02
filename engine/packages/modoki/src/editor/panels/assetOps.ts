@@ -551,7 +551,7 @@ export function assetEditorHoldMessage(froms: readonly string[]): string | null 
  *  New prefab files must land under a *real* writable asset root — virtual tree
  *  nodes like "/" aren't writable. */
 export async function readWritableAssetRoot(): Promise<{ ok: true; root: string | null } | { ok: false; error: string }> {
-  const a = await callBackend('/api/rescan-assets');
+  const a = await callBackend('/api/rescan-assets', { method: 'POST' });
   if (!a.ok) return { ok: false, error: a.error };
   const assets = Array.isArray(a.body.assets) ? a.body.assets as { path: string }[] : [];
   return { ok: true, root: firstAssetRoot(assets.map((x) => x.path)) };

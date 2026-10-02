@@ -4,7 +4,7 @@
  * Electron backend's twin is electron/foreignOriginGate.test.ts). A refused request answers 403; one that passes reaches
  * the router, which 404s an unknown /api route as JSON. So 404 here means "the gate let it through".
  */
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, afterEach, vi, beforeAll, afterAll } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -59,7 +59,7 @@ afterAll(() => {
 });
 
 /** Drive one request through the middleware and wait for the response to end. */
-async function drive(url: string, origin?: string, method = 'POST', extra: Record<string, string> = {}): Promise<{ status: number; next: boolean }> {
+async function drive(url: string, origin?: string, method = 'POST', extra: Record<string, string> = {}): Promise<{ status: number; next: boolean; headers: Record<string, string>; body: string }> {
   const req = Object.assign(new EventEmitter(), {
     url, method, headers: { ...(origin ? { origin } : {}), ...extra }, socket: { localPort: VITE_PORT },
   });
@@ -69,7 +69,7 @@ async function drive(url: string, origin?: string, method = 'POST', extra: Recor
   middleware(req, res, () => { nextCalled = true; res.end(); });
   setImmediate(() => { req.emit('data', Buffer.from('{}')); req.emit('end'); });
   await done;
-  return { status: res.statusCode, next: nextCalled };
+  return { status: res.statusCode, next: nextCalled, headers: res.headers, body: res.body };
 }
 
 describe('the Vite middleware refuses a foreign Origin ahead of every /api route', () => {
@@ -97,6 +97,95 @@ describe('the Vite middleware refuses a foreign Origin ahead of every /api route
 
   it('ACCEPT: no Origin at all (curl, MCP) reaches the router', async () => {
     expect((await drive('/api/no-such-route')).status).toBe(404);
+  });
+});
+
+/** #1967: a GET never changes state. These routes STOP the server or START a job, and a GET is assumed safe by everything
+ *  from a link prefetcher to an `<img src>` — and an EventSource reconnect re-sends it. Here with NO Origin and no
+ *  Sec-Fetch-Site (curl's shape, and a LAN-bound page's, which carries neither), so the cross-site gate above passes it
+ *  and only the method rule stands between the request and the job. */
+describe('#1967: the routes that stop the server or start a job take POST only', () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.spyOn(console, 'error').mockImplementation(() => {}); });
+
+  it('GET /api/exit is 405 and the server is NOT stopped; the POST stops it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      const got = await drive('/api/exit', undefined, 'GET');
+      expect(got.status).toBe(405);
+      expect(got.headers.allow).toBe('POST');
+      vi.advanceTimersByTime(1_000);
+      expect(exit).not.toHaveBeenCalled();
+      expect((await drive('/api/exit', undefined, 'POST')).status).toBe(200);
+      vi.advanceTimersByTime(1_000);
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['/api/build?platform=web', '/api/add-native-target?platform=ios', '/api/toolchain/install?id=toktx', '/api/ota/publish?version=v1'])(
+    'GET %s is 405 before any job starts, not a fall-through to the SPA', async (url) => {
+      const got = await drive(url, undefined, 'GET');
+      expect(got.status).toBe(405);
+      expect(got.next).toBe(false);
+      expect(got.headers['content-type']).toBe('application/json');
+    },
+  );
+
+  it('ACCEPT: the POST reaches the route itself (its own in-stream refusal of a bad platform, not a 405)', async () => {
+    const got = await drive('/api/build?platform=nonsense', undefined, 'POST');
+    expect(got.status).not.toBe(405);
+    expect(got.headers['content-type']).toBe('text/event-stream');
+    expect(got.body).toContain('FAILED:Invalid build request');
+  });
+});
+
+/** #1991: under the Electron editor (`MODOKI_VITE_UNDER_ELECTRON`), this server takes a state-changing request only from
+ *  the editor's backend, stamped with the root it serves, and only when that root is this server's. That covers the
+ *  window in which Open Project has moved Vite to the new project while the backend still serves the old one, and the
+ *  shared router mounted here, which has no switch gate. Reads pass; a standalone `npm run dev` is left alone. */
+describe('#1991: under Electron, a write needs the backend\'s stamp for THIS server\'s project', () => {
+  const stamp = (root: string) => ({ 'x-modoki-project-root': encodeURIComponent(root) });
+  const underElectron = async <T>(fn: () => Promise<T>) => {
+    const before = process.env.MODOKI_VITE_UNDER_ELECTRON;
+    process.env.MODOKI_VITE_UNDER_ELECTRON = '1';
+    try { return await fn(); } finally { if (before === undefined) delete process.env.MODOKI_VITE_UNDER_ELECTRON; else process.env.MODOKI_VITE_UNDER_ELECTRON = before; }
+  };
+
+  it('a POST stamped for ANOTHER project (Vite already moved by the open) is 409, and the route never runs', async () => {
+    const got = await underElectron(() => drive('/api/build?platform=web', undefined, 'POST', stamp('/elsewhere/project-A')));
+    expect(got.status).toBe(409);
+    expect(got.body).toContain('switching project');
+  });
+
+  it('an UNSTAMPED write (an agent or curl on the Vite port) is 409 — the router mounted here is fenced too', async () => {
+    const got = await underElectron(() => drive('/api/write-file', undefined, 'POST'));
+    expect(got.status).toBe(409);
+    expect(got.body).toContain('backend');
+  });
+
+  it('an unstamped POST /api/exit is refused before it stops anything', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      expect((await underElectron(() => drive('/api/exit', undefined, 'POST'))).status).toBe(409);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(exit).not.toHaveBeenCalled();
+    } finally { exit.mockRestore(); }
+  });
+
+  it('ACCEPT: a write stamped with THIS server\'s root reaches the router', async () => {
+    expect((await underElectron(() => drive('/api/no-such-route', undefined, 'POST', stamp(projectRoot)))).status).toBe(404);
+  });
+
+  it('ACCEPT: the same root spelled differently (a trailing separator) is the same project — compared as paths, not strings', async () => {
+    expect((await underElectron(() => drive('/api/no-such-route', undefined, 'POST', stamp(`${projectRoot}/`)))).status).toBe(404);
+  });
+
+  it('ACCEPT: a read needs no stamp', async () => {
+    expect((await underElectron(() => drive('/api/no-such-route', undefined, 'GET'))).status).toBe(404);
+  });
+
+  it('ACCEPT: a standalone dev server (no marker) takes an unstamped write, as before', async () => {
+    expect((await drive('/api/no-such-route', undefined, 'POST')).status).toBe(404);
   });
 });
 

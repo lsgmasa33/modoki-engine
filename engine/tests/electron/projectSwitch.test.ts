@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { calledNames, callsTo, findNodes, namedFunctions, parseSource } from '@modoki/engine/testing/sourceAst';
 
 /** A stand-in for the backend: a save writes `<root>/<path>`, reading `root` when the request ARRIVES, behind the gate
@@ -108,6 +109,30 @@ describe('prepareThenReRoot (#1976)', () => {
     expect(host.written).toEqual([]);
     expect(gate.refusal('POST', '/api/write-file')?.body.error).toContain('relaunch');
   });
+
+  it('#1990: a LATER open that fails while an earlier re-root left the gate locked reports locked, not "saves go to the old project"', async () => {
+    const gate = createSwitchGate();
+    const host = makeHost(gate);
+    const b = await prepareThenReRoot({
+      gate, reason: 'opening B', isCurrent: () => true, prepare: async () => true, pairBack: async () => {},
+      reRoot: async () => { host.root = 'B'; throw new Error('backend failed to start'); },
+    });
+    expect(b).toMatchObject({ kind: 'failed', reRootFailed: true, locked: true });
+    const c = await prepareThenReRoot({
+      gate, reason: 'opening C', isCurrent: () => true, pairBack: async () => {}, reRoot: async () => {},
+      prepare: async () => { throw new Error('npm install failed'); },
+    });
+    expect(c.kind).toBe('failed');
+    expect(c).not.toHaveProperty('reRootFailed');
+    expect(c).toMatchObject({ locked: true });
+    expect(host.save('main.scene.json')).toBe(503); // what `locked` must describe
+    // …and an ordinary failure with no earlier lock is NOT reported locked (the accept side).
+    const fresh = await prepareThenReRoot({
+      gate: createSwitchGate(), reason: 'opening C', isCurrent: () => true, pairBack: async () => {}, reRoot: async () => {},
+      prepare: async () => { throw new Error('npm install failed'); },
+    });
+    expect(fresh).not.toHaveProperty('locked');
+  });
 });
 
 describe('createSwitchGate (#1976)', () => {
@@ -174,14 +199,49 @@ describe('main.ts wires the switch the way projectSwitch.ts requires (#1976)', (
     return calls[0];
   };
 
-  it('hostRoutes asks the gate FIRST, before any route', () => {
-    const decl = findNodes(sf, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'hostRoutes');
-    const fn = decl?.initializer;
-    if (!fn || !ts.isArrowFunction(fn) || !ts.isBlock(fn.body)) throw new Error('hostRoutes is no longer an arrow with a block');
-    const [first, second] = fn.body.statements;
-    expect(first.getText(sf)).toBe('const switching = switchGate.refusal(method, urlPath);');
-    expect(second && ts.isIfStatement(second) && second.expression.getText(sf)).toBe('switching');
-    expect(findNodes((second as ts.IfStatement).thenStatement, ts.isReturnStatement)).toHaveLength(1);
+  /** The initializer of a top-level-in-function `const <name> = …` in main.ts. */
+  const constInit = (name: string) => {
+    const decl = findNodes(sf, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === name);
+    if (!decl?.initializer) throw new Error(`main.ts no longer declares ${name}`);
+    return decl.initializer;
+  };
+
+  it('#1991: the gate is the backend server\'s FENCE, ahead of the build proxy, not a host route that runs after it', () => {
+    const opts = constInit('bindOpts');
+    if (!ts.isObjectLiteralExpression(opts)) throw new Error('bindOpts is no longer an object literal');
+    const fence = opts.properties.find((p) => p.name?.getText(sf) === 'fence');
+    expect(fence && calledNames(fence)).toContain('refusal');
+    expect(fence?.getText(sf)).toContain('switchGate.refusal(method, urlPath)');
+    // …and hostRoutes no longer carries a second copy that could drift from it.
+    expect(callsTo(constInit('hostRoutes'), 'refusal')).toEqual([]);
+  });
+
+  it('#1991: every backend server is started with the per-request context, bound to the backend each request arrived with', () => {
+    const starts = findNodes(sf, ts.isCallExpression).filter((c) => c.expression.getText(sf) === 'startBackendServer');
+    expect(starts.length).toBeGreaterThan(0);
+    for (const c of starts) expect(c.arguments[0].getText(sf)).toBe('contextFor');
+    const contextFor = constInit('contextFor');
+    const bind = callsTo(contextFor, 'bindToArrival');
+    expect(bind).toHaveLength(1);
+    expect(bind[0].arguments[1].getText(sf)).toBe('() => state.backend === arrivedWith');
+  });
+
+  it('#1991: Connect Claude Code (an IPC write under the open project) asks the gate, and re-checks the project after its await', () => {
+    const handler = findNodes(sf, ts.isCallExpression).find((c) => c.expression.getText(sf) === 'ipcMain.handle'
+      && c.arguments[0]?.getText(sf) === "'modoki:connect-claude'");
+    if (!handler) throw new Error('main.ts no longer handles modoki:connect-claude');
+    expectInOrder(handler.getText(sf), ['switchGate.refusal(', 'await cdpStatus()', 'state.backend !== arrivedWith', 'atomicWriteFileSync('], 'the connect-claude handler');
+  });
+
+  it('#1990: the failed branch\'s title, dialog and reply key "relaunch required" on outcome.locked, not this open\'s reRootFailed', () => {
+    const open = body('openProject');
+    const relaunchTitle = callsTo(open, 'setTitle').filter((c) => c.getText(sf).includes('relaunch required'));
+    expect(relaunchTitle).toHaveLength(1);
+    expect(relaunchTitle[0].arguments[0].getText(sf)).toMatch(/^outcome\.locked \?/);
+    // Every "refuses every write" message is chosen by `outcome.locked`; none by `reRootFailed`.
+    const conds = findNodes(open, ts.isConditionalExpression).filter((c) => /refuses every write/.test(c.whenTrue.getText(sf)));
+    expect(conds.length).toBeGreaterThanOrEqual(2);
+    for (const c of conds) expect(c.condition.getText(sf)).toBe('outcome.locked');
   });
 
   it('the gate opens on the reload\'s COMMIT, listened for before the reload is issued', () => {

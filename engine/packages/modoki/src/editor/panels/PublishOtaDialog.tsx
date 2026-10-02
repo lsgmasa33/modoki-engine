@@ -10,7 +10,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { backendFetch, backendEventSource } from '../backend/editorBackend';
+import { backendFetch, backendEventStream, streamFailureText, type BackendEventStream } from '../backend/editorBackend';
 import { otaBundleChoices, otaEngineApiNote, type OtaBundleChoice } from './publishOtaTargets';
 import { ModalShell } from '../components/ModalShell';
 import { confirmUnsavedBeforeBuild } from '../scene/unsavedGate';
@@ -63,7 +63,7 @@ export default function PublishOtaDialog() {
   const [failed, setFailed] = useState(false);
   const [statusLine, setStatusLine] = useState('');
   const [log, setLog] = useState<string[]>([]);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<BackendEventStream | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -129,11 +129,11 @@ export default function PublishOtaDialog() {
     if (mandatory === 'set') qs.set('mandatory', '1');
     else if (mandatory === 'clear') qs.set('mandatory', '0');
 
-    const es = backendEventSource(`/api/ota/publish?${qs}`);
+    const es = backendEventStream(`/api/ota/publish?${qs}`);
     esRef.current = es;
 
     es.addEventListener('status', (e) => {
-      const status = JSON.parse((e as MessageEvent).data) as string;
+      const status = JSON.parse(e.data) as string;
       if (status === 'DONE') {
         setDone(true);
         setPublishing(false);
@@ -149,14 +149,13 @@ export default function PublishOtaDialog() {
       }
     });
     es.addEventListener('message', (e) => {
-      const line = JSON.parse((e as MessageEvent).data) as string;
+      const line = JSON.parse(e.data) as string;
       if (line) setLog((prev) => (prev.length > 300 ? prev.slice(-300) : prev).concat(line));
     });
-    es.onerror = () => {
+    es.onerror = (failure) => {
       setFailed(true);
       setPublishing(false);
-      setStatusLine('Connection lost.');
-      es.close();
+      setStatusLine(`${streamFailureText(failure)}.`);
     };
   };
 
