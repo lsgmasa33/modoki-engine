@@ -86,7 +86,7 @@ import { generate, describe as describeOp, type Op, VERIFY_SEEDS, VERIFY_LEN } f
 import { projectFromStore, s5Seen } from './prefabFuzz/s5Seams';
 import { s4Seams, s4Seen, DOOR_OPS } from './prefabFuzz/s4Seams';
 import { installShadow } from './prefabFuzz/shadow';
-import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, type RunResult, type StepFailure } from './prefabFuzz/runner';
+import { foldCheck, runOps, shrink, consoleErrors, opOutcomes, taintCounts, skippedChecks, checksRun, handEditedPaths, carryTracker, diffFiles, rebaseForFileOp, trashedPrefabReferenced, newlySwallowed, firstUntoleratedDiff, type RunResult, type StepFailure } from './prefabFuzz/runner';
 import { KNOWN_OPEN, REGRESSIONS, type KnownOpen, type Reach } from './prefabFuzz/knownOpen';
 import { seen } from './foldOracle';
 import { writeFileSync } from 'node:fs';
@@ -1069,6 +1069,21 @@ describe('#1789 prefab fuzz', () => {
     ]) expect(who(P1(lines)), lines.join(' ; ')).toEqual([]);
     // Another check with a waiver's detail is not the waiver's.
     expect(who({ check: 'save→reload is not the identity', detail: `${g} kept-only unused own` })).toEqual([]);
+  });
+
+  // #2061: the end-of-run respawn check names ONE diff, so a KNOWN_OPEN entry tolerating it sets that diff aside and the
+  // comparison runs again. Mutations: return null once a diff is tolerated (the whole check tolerated) — the first
+  // expectation goes red; set aside an entity one side lacks — the last one does.
+  it('a tolerated no-op-rebuild diff hides no diff behind it (#2061)', () => {
+    const before = { a: { traits: { EntityAttributes: { name: 'C' } } }, b: { traits: { Transform: { x: 1 } } } };
+    const after = { a: { traits: { EntityAttributes: { name: 'QR' } } }, b: { traits: { Transform: { x: 2 } } } };
+    const byName = (f: { detail: string }) => f.detail.includes('/EntityAttributes/name: ');
+    expect(firstUntoleratedDiff(before, after, 'c', byName)?.detail).toMatch(/^\/b\/traits\/Transform\/x: /);
+    expect(firstUntoleratedDiff(before, { ...after, b: before.b }, 'c', byName)).toBeNull();
+    expect(firstUntoleratedDiff(before, after, 'c')?.detail).toMatch(/^\/a\/traits\/EntityAttributes\/name: /);
+    expect(after.a.traits.EntityAttributes.name, 'the caller\'s tree is not mutated').toBe('QR');
+    expect(before.a.traits.EntityAttributes.name, 'nor is the side it reads from').toBe('C');
+    expect(firstUntoleratedDiff(before, { b: before.b }, 'c', () => true)?.detail).toMatch(/^\/a: /);
   });
 
   it('KNOWN_OPEN claims no failure of a mechanism it does not name (#1777\'s shape, and regressions planted in review)', () => {

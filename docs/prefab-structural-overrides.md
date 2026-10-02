@@ -1197,6 +1197,22 @@ all, and every untouched sibling was pinned: a later template change to it never
 - **Fallback to the v16 whole list** for a member whose list cannot be stated node by node: a chain node
   there with no key (a file from before keys), a key used twice in the frame, or a reference node the
   rows above cannot state. That member's list is pinned exactly as in v16, and nothing else is.
+- **A missing nested row's placeholder keys its row (#2059).** A row whose prefab is missing shows a placeholder
+  with no `PrefabInstance` (#2001 S5, ruling D), and a node the user hung AT it is captured at the row's localId
+  (#2018). `keyFor` in `moveChannelsOntoRows` asked only for members with a live `PrefabInstance`, so that node's
+  statement had no row, and the WHOLE frame fell back to the legacy `nestedStructure` slot. Every other row record
+  of the frame left its row (I23), and the slot restated the chain's lists, so a later template change stopped
+  reaching the instance (observed: O moved its added node Extra to x 9, and the instance kept 6). A placeholder now
+  stands for its row in the frame of the member it hangs under (`instanceRowKeysIn`'s rule), matched by the row's
+  `nodeGuid`, in a NESTED frame only, where `stateFrame` states the node in the row's `own`. The top frame keeps the
+  per-node legacy `added` channel for such a node: its loop writes a row's whole-list `added`, which on load replaced
+  every node the chain anchors at the nested root once the prefab came back (a template node there was deleted, and the
+  next save stated the deletion; close-out review). A placeholder whose row hangs under ANOTHER nested row's root is
+  attributed to that inner frame, as `instanceRowKeysIn` attributes it, so that layout still falls back to the slot
+  (traced by the close-out review, not driven).
+  The route the fuzz found (#2058, hunt seeds 7315/7393): a
+  nested prefab trashed, its frame kept live (#1862), then a prefab edit's leave, whose rebuild turns the kept frame
+  into the placeholder. Tests: `placeholderRowFrameSave.test.ts`, and both seeds as prefabFuzz REGRESSIONS.
 - **Where the loader places a chain node is where the diff looks for it.** A node whose anchor row the
   inner document no longer has is re-anchored to the frame root, as `applyStructureCore` does; a node
   whose anchor is not LIVE (the scene deleted that member, or any member above it — `removed` lists only

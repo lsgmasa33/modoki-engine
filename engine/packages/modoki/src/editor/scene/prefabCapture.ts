@@ -25,7 +25,7 @@ import { frameRespell } from '../../runtime/loaders/frameRespell';
 import { writtenTraitKeys } from './traitDefault';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceStructureData, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
-import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf, UnresolvedPrefabRef } from '../../runtime/core/unresolvedPrefabRef';
 import { keptUnusedRows, keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
 import { type OverrideMap, foldStructureLayers, frameKeyIndex } from '../../runtime/loaders/prefabOverrides';
 import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
@@ -1301,6 +1301,22 @@ export function moveChannelsOntoRows(
     if (!m) byFrame.set(d.rootInstanceId, (m = new Map()));
     m.set(d.localId, entity.id());
   });
+  // A missing nested row's placeholder (#2001 S5, ruling D) has no PrefabInstance, so the query above cannot see it. It
+  // stands for its row in the frame of the member it hangs under (`instanceRowKeysIn`'s rule), and a node the user hung AT
+  // it is captured at the row's localId (#2018). Without this a frame holding one could not key that node's statement, and
+  // fell back to the whole legacy slot, taking every other row record of the frame with it (#2059). By frame root, then
+  // localId: the row's nodeGuid.
+  const placeholderRows = new Map<number, Map<number, string>>();
+  const eaMeta = getTraitByName('EntityAttributes');
+  getCurrentWorld().query(UnresolvedPrefabRef).updateEach((_, entity) => {
+    const ph = rowPlaceholderOf(entity);
+    const parent = ph && eaMeta && entity.has(eaMeta.trait) ? (entity.get(eaMeta.trait) as { parentId?: number }).parentId : undefined;
+    const frame = parent ? (readTraitData(parent, piMeta) as { rootInstanceId?: number } | null)?.rootInstanceId : undefined;
+    if (!ph || !frame) return;
+    let m = placeholderRows.get(frame);
+    if (!m) placeholderRows.set(frame, (m = new Map()));
+    m.set(ph.localId, ph.nodeGuid);
+  });
 
   /** The row key for member `lid` of the frame rooted at `frameRoot` (document `doc`, frame key
    *  `frameKey` — '' for the top frame), or '' when no row may carry it. `live` asks for a member that
@@ -1314,8 +1330,12 @@ export function moveChannelsOntoRows(
     }
     const ecs = byFrame.get(frameRoot)?.get(lid);
     if (ecs) return rowed.get(ecs) ?? '';
-    if (live) return '';
     const g = rowAt(doc, lid)?.nodeGuid;
+    // A live member asked for and not found: only its row's placeholder stands for it, and only in a NESTED frame, whose
+    // statements go on rows as `own` (`stateFrame`). In the top frame a node at the placeholder stays in the per-node legacy
+    // `added` channel: the top-frame loop writes a row's `added`, the whole list, which replaced every node the chain
+    // anchors at the nested root once its prefab came back (#2059 close-out review: a template node there was deleted).
+    if (live && !(frameRoot !== rootId && g && placeholderRows.get(frameRoot)?.get(lid) === g)) return '';
     return g && isGuid(g) && (frameRoot === rootId || frameKey) ? `${frameKey}/${g}` : '';
   };
 

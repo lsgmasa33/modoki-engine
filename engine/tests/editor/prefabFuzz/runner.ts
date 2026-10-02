@@ -180,7 +180,7 @@ const parkedPaths = (): Set<string> => new Set(getDirtyAssetPaths().filter((p) =
  *
  *  The comparison reloads the scene, so afterwards the post-op scene (saved first) is loaded back and the run goes on
  *  from it, with the undo stack reset as a save→reload leaves it. */
-async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Promise<Failure | null> {
+async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string, tolerate?: (f: Failure) => boolean): Promise<Failure | null> {
   // Every skip is COUNTED by its reason (close-out review): a check whose guards quietly return reads as coverage it is not.
   // A placeholder carrying a record (an entry's, a node's); a missing ROW's carries none, and is compared as any node.
   const skip = editing() ? 'prefab edit open' : recordPlaceholderGuids().size ? 'a placeholder live' : null;
@@ -214,10 +214,11 @@ async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Pr
   const reloadedSide = without(reloaded);
   const a = ruledMissing(without(live), reloadedSide, gone) as Record<string, unknown>;
   const b = alignEqualOrientations(a, reloadedSide);
-  const d = firstDiff(a, b);
   ran(`rebuild≡reload after ${kind}`);
   st.note = `rebuild≡reload checked${except ? ' (the Apply\'s own instance left out)' : ''}`;
-  return d ? { check: 'a rebuild is not a reload', detail: d, moved: nodeMoved(d, a, b) } : null;
+  // A tolerated leaf diff is set aside and the next one judged (#2059 close-out review); one that cannot be set aside
+  // comes back, and the caller tolerates it whole as before. Unexercised today: no KNOWN_OPEN entry tolerates this check.
+  return firstUntoleratedDiff(a, b, 'a rebuild is not a reload', tolerate);
 }
 
 /** #1880 T4, the RESPAWN form of "fold(chain + capture(live)) ≡ live": every stored instance root, rebuilt from its own
@@ -228,7 +229,7 @@ async function rebuildIsReload(st: RunState, sBefore: unknown, kind: string): Pr
  *  form is held by the round trip (`checkRoundTrip`); the template form by the round trips after Create Prefab and a
  *  prefab-edit save. Run once, at the END of the run: a rebuild renumbers ids, and the ops pick their targets in id
  *  order, so running it between ops would change every seed's path. */
-async function respawnIdentity(): Promise<Failure | null> {
+async function respawnIdentity(tolerate?: (f: Failure) => boolean): Promise<Failure | null> {
   if (editing()) return null;
   const before = worldTree();
   const roots = authored().filter((e) => {
@@ -252,8 +253,40 @@ async function respawnIdentity(): Promise<Failure | null> {
   const after = worldTree();
   dump('t4-before', before); dump('t4-after', after);
   ran(`respawn identity (${roots.length ? 'instances' : 'none'})`);
-  const d = firstDiff(before, alignEqualOrientations(before, after));
-  return d ? { check: 'a no-op rebuild is not the identity', detail: d, moved: nodeMoved(d, before, after) } : null;
+  return firstUntoleratedDiff(before, alignEqualOrientations(before, after), 'a no-op rebuild is not the identity', tolerate);
+}
+
+/** The first diff of `before` vs `after` that `tolerate` does not claim, as a failure of `check`, or null. Each diff a
+ *  KNOWN_OPEN entry tolerates is set aside and the comparison runs again (#2061): `firstDiff` names ONE diff, so tolerating
+ *  it whole would hide every diff behind it. Only a leaf on a plain-object path can be set aside, by taking its value from
+ *  `before`; a diff inside a list, or an entity one side lacks, is never tolerated here. `after` is not mutated. */
+export function firstUntoleratedDiff(before: unknown, after: unknown, check: string, tolerate?: (f: Failure) => boolean): Failure | null {
+  const aligned = structuredClone(after) as Record<string, unknown>;
+  for (let n = 0; n < 64; n++) {
+    const d = firstDiff(before, aligned);
+    if (!d) return null;
+    const failure: Failure = { check, detail: d, moved: nodeMoved(d, before, after) };
+    if (!tolerate?.(failure) || !setAsideLeaf(before, aligned, d)) return failure;
+    ran(`tolerated (KNOWN_OPEN): ${check}`);
+  }
+  return { check, detail: 'more than 64 tolerated diffs' };
+}
+
+/** Set `after`'s leaf at diff `d`'s path (`/a/b/c: x vs y`) to `before`'s, when every step of it is a plain object on both
+ *  sides and the leaf itself is not one. False, changing nothing, otherwise. */
+function setAsideLeaf(before: unknown, after: Record<string, unknown>, d: string): boolean {
+  const steps = d.slice(0, d.indexOf(': ')).split('/').slice(1);
+  if (!steps.length) return false;
+  const plain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  let b: unknown = before, a: unknown = after;
+  for (const k of steps.slice(0, -1)) {
+    if (!plain(b) || !plain(a)) return false;
+    b = b[k]; a = a[k];
+  }
+  const leaf = steps[steps.length - 1]!;
+  if (!plain(b) || !plain(a) || plain(b[leaf]) || plain(a[leaf]) || b[leaf] === undefined || a[leaf] === undefined) return false;
+  a[leaf] = structuredClone(b[leaf]);
+  return true;
 }
 
 /** #2009: the new model's checks (`shadow.ts`), each only once the build has installed its seam, and each run counted.
@@ -608,7 +641,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     if (sBefore !== undefined && outcome !== 'done') ran(`rebuild≡reload after ${op.kind}: not run (the op was ${outcome})`);
     if (sBefore !== undefined && outcome === 'done') {
       let t2Failure: Failure | null;
-      try { t2Failure = await rebuildIsReload(st, sBefore, op.kind); } catch (e) { return fail(i, label, { check: 'rebuild≡reload threw', detail: String(e) }); }
+      try { t2Failure = await rebuildIsReload(st, sBefore, op.kind, opts.tolerate); } catch (e) { return fail(i, label, { check: 'rebuild≡reload threw', detail: String(e) }); }
       // Said in the step's own trace line, which was written before the check ran (close-out review).
       // Read back through the declared type, as `roundTrip` below: the reset above narrows `st.note` to undefined.
       const t2Note = (st as RunState).note;
@@ -735,7 +768,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     try { endFailures.push(...checkScene(await serializeScene())); } catch (e) { endFailures.push({ check: 'serializeScene threw', detail: String(e) }); }
   }
   if (endFailures.length) return fail(walkStep, 'undo/redo to the ends', endFailures[0]);
-  const respawn = await respawnIdentity();
+  const respawn = await respawnIdentity(opts.tolerate);
   if (respawn) return fail(walkStep + 1, 'a no-op rebuild of every stored instance', respawn);
   const respawnErrors = consoleErrors.splice(0).filter((m, k, list) => !opts.expectedError(m, list[k - 1]));
   if (respawnErrors.length) return fail(walkStep + 1, 'a no-op rebuild of every stored instance', { check: 'console.error', detail: respawnErrors[0].slice(0, 300) });

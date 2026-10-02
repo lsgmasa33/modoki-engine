@@ -13,6 +13,13 @@
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
 import { type Failure } from './checks';
+import { placeholderGuids } from './harness';
+import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
+import { rowPlaceholderOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
+import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
+import { getAllAssets } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
+import { keptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { getAllEntities } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
 
 export interface KnownOpen {
   issue: number;
@@ -104,6 +111,26 @@ const linkBookedTwice = (f: StepFailure): boolean => {
     } catch { return false; } // a list `show` cut short
   };
   return lines.every((l) => KEPT.test(l) || restated(l));
+};
+
+/** #2061: the end walk's redo of an instantiate respawns a FRESH instance after its nested prefab was trashed, so a missing
+ *  nested row's placeholder takes the template row's name, while the no-op rebuild's capture names it from the kept orphan
+ *  row the earlier reload stored under the same root guid (`"C" vs "QR"`). Only a name on a live ROW placeholder, and only
+ *  that pair: the live side (`before`) is the name a template row with the placeholder's nodeGuid states, and the rebuilt
+ *  side is the name a kept orphan row carrying the placeholder's guid states. A rebuild that names it anything else is
+ *  not this. */
+const redoFreshRowName = (f: Failure): boolean => {
+  if (f.check !== 'a no-op rebuild is not the identity') return false;
+  const m = /^\/([0-9a-f-]{36})\/traits\/EntityAttributes\/name: (".*") vs (".*")$/.exec(f.detail);
+  const handle = m ? findEntityByGuid(m[1]!) : undefined;
+  const row = handle ? rowPlaceholderOf(handle as never) : undefined;
+  if (!m || !row || !placeholderGuids().has(m[1]!)) return false;
+  const [live, rebuilt] = [JSON.parse(m[2]!) as string, JSON.parse(m[3]!) as string];
+  const templateNamed = getAllAssets().some((a) => a.type === 'prefab'
+    && !!getCachedPrefabSync(a.guid)?.entities?.some((e) => (e as { nodeGuid?: string }).nodeGuid === row.nodeGuid && e.name === live));
+  const keptNamed = getAllEntities().some((e) => !!e.guid
+    && Object.values(keptMemberOrphans(e.guid) ?? {}).some((r) => r.guid === m[1] && r.name === rebuilt));
+  return templateNamed && keptNamed;
 };
 
 export const KNOWN_OPEN: KnownOpen[] = [
@@ -201,6 +228,18 @@ export const KNOWN_OPEN: KnownOpen[] = [
     // No `stops`: a stop matching a gained entity would claim every such hunt finding, so a hunt that reaches this
     // reports it.
     reproduces: (f) => f.check === 'save→reload is not the identity' && /^\/1000000b-0000-4000-8000-[0-9a-f]+: undefined vs .*\(an entity was gained\)/.test(f.detail),
+  },
+  {
+    issue: 2061,
+    what: "#2061 (the first three ops of #2058's hunt seed 7393, reached once #2059's fix cleared the P1 that stopped them): instantiate P, trash Q. The end walk's redo of the instantiate respawns P fresh, so QR's row placeholder takes P's row name \"C\"; the no-op rebuild names it \"QR\" from the kept orphan row the walk's earlier reload stored under that root guid. Pre-existing; S7 (#2046) moves undo respawns onto records",
+    repro: [
+      {kind: 'agentInstantiate', u: [0.6674717084970325, 0.4996268576942384, 0.3815350905060768, 0.034017449244856834, 0.06155300512909889, 0.9358029635623097, 0.3157953575719148, 0.6284085356164724]},
+      {kind: 'reparent', u: [0.482875149929896, 0.8734884578734636, 0.38113589212298393, 0.2252884756308049, 0.3568096316885203, 0.5456582698971033, 0.2601598205510527, 0.007961861556395888]},
+      {kind: 'trashPrefab', u: [0.8713770764879882, 0.9898986634798348, 0.030512092169374228, 0.8338360395282507, 0.4410598403774202, 0.3584468113258481, 0.37893556780181825, 0.659620591904968]},
+    ],
+    reproduces: (f) => redoFreshRowName(f),
+    // Tolerated, not a stop: it fires in the end-of-run respawn check, which REGRESSIONS reach too (#2058's 7393 for #2059).
+    tolerates: (f) => redoFreshRowName(f),
   },
 ];
 
@@ -1681,6 +1720,40 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       {kind: 'copy', u: [0.047603919403627515, 0.1860050461255014, 0.7616051095537841, 0.7350369652267545, 0.3258965630084276, 0.8664930600207299, 0.6159129564184695, 0.4834953863173723]},
       {kind: 'paste', u: [0.8183805355802178, 0.9486813894473016, 0.01189982588402927, 0.0742787797935307, 0.4845500800292939, 0.13237358047626913, 0.23614742350764573, 0.8943054398987442]},
       {kind: 'duplicate', u: [0.6945080934092402, 0.6400255267508328, 0.6276550388429314, 0.33482245658524334, 0.3410636903718114, 0.628475341014564, 0.4927038447931409, 0.34074873523786664]},
+    ],
+  },
+  {
+    issue: 2059,
+    what: "#2059 (#2058 hunt seed 7393): Q trashed (its frame kept live, #1862), a component removed from A inside O1's frame N, a prefab edit entered and left. The leave's rebuild made QR a Missing Prefab ROW placeholder, which has no PrefabInstance, so the save could not key the user node hung at it and wrote N's whole frame as a nestedStructure slot: A's traitRemovals left its row (I23), and the slot pinned O's row N. The placeholder now keys its row",
+    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    repro: [
+      {kind: 'agentInstantiate', u: [0.6674717084970325, 0.4996268576942384, 0.3815350905060768, 0.034017449244856834, 0.06155300512909889, 0.9358029635623097, 0.3157953575719148, 0.6284085356164724]},
+      {kind: 'reparent', u: [0.482875149929896, 0.8734884578734636, 0.38113589212298393, 0.2252884756308049, 0.3568096316885203, 0.5456582698971033, 0.2601598205510527, 0.007961861556395888]},
+      {kind: 'trashPrefab', u: [0.8713770764879882, 0.9898986634798348, 0.030512092169374228, 0.8338360395282507, 0.4410598403774202, 0.3584468113258481, 0.37893556780181825, 0.659620591904968]},
+      {kind: 'removeComponent', u: [0.749022817471996, 0.5743397730402648, 0.22010771231725812, 0.1258765764068812, 0.9673434284050018, 0.40104631381109357, 0.3404397426638752, 0.26114655402489007]},
+      {kind: 'prefabEdit', u: [0.30439053755253553, 0.9824485050048679, 0.621363015146926, 0.8514903427567333, 0.38750377646647394, 0.09630950773134828, 0.36354211741127074, 0.5106841078959405], inner: []},
+    ],
+  },
+  {
+    issue: 2059,
+    what: "#2059 (#2058 hunt seed 7315): the same mechanism through a component ADDED to a template-added node (a+k-extra) beside the row placeholder, then a prefab edit entered and left",
+    reaches: { op: 14, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      {kind: 'createPrefab', u: [0.6531596290878952, 0.1349203244317323, 0.9291874435730278, 0.5688708273228258, 0.23637120961211622, 0.817773116286844, 0.7321690185926855, 0.6318876841105521]},
+      {kind: 'addChild', u: [0.8554722955450416, 0.7890805348288268, 0.2961395571473986, 0.7911491480190307, 0.11397592630237341, 0.15691655781120062, 0.49159336066804826, 0.6833016187883914]},
+      {kind: 'apply', u: [0.8441214438062161, 0.5399220990948379, 0.8976710052229464, 0.9270965834148228, 0.863135983236134, 0.8721229082439095, 0.19310055975802243, 0.5559854737948626]},
+      {kind: 'editField', u: [0.33063534018583596, 0.3950750110670924, 0.2106431231368333, 0.3715954616200179, 0.5933064436540008, 0.5296889969613403, 0.7900368489790708, 0.5875003878027201]},
+      {kind: 'revert', u: [0.6651820589322597, 0.6015062211081386, 0.8186922634486109, 0.6694165780209005, 0.48392732767388225, 0.7171400128863752, 0.8115258535835892, 0.3329265248030424]},
+      {kind: 'reparent', u: [0.06576389423571527, 0.754194404464215, 0.5448171815369278, 0.8684334100689739, 0.8823837430682033, 0.28025771025568247, 0.9901871709153056, 0.4634666333440691]},
+      {kind: 'editField', u: [0.8742571787443012, 0.6173578447196633, 0.8197523006238043, 0.7145520600024611, 0.17029295186512172, 0.09598661167547107, 0.7398973836097866, 0.07068576826713979]},
+      {kind: 'addChild', u: [0.9052511816844344, 0.6357001240830868, 0.19991253479383886, 0.3199590283911675, 0.05070341378450394, 0.12579660094343126, 0.2504061853978783, 0.4448295186739415]},
+      {kind: 'apply', u: [0.14022293500602245, 0.8456499318126589, 0.7407670705579221, 0.6003984180279076, 0.9187250935938209, 0.5699330021161586, 0.810465264134109, 0.7147453099023551], check: 'rebuild-reload'},
+      {kind: 'undo', u: [0.9438059504609555, 0.5615827508736402, 0.5696721132844687, 0.15374653064645827, 0.04043620894663036, 0.1892189907375723, 0.10106790321879089, 0.7415685916785151]},
+      {kind: 'duplicate', u: [0.05449988227337599, 0.8062572302296758, 0.8937495148275048, 0.04962858650833368, 0.6027097054757178, 0.73399737640284, 0.9729458193760365, 0.8287006218452007]},
+      {kind: 'trashPrefab', u: [0.8866672082804143, 0.9434305636677891, 0.3680167200509459, 0.8531635932158679, 0.007195445243269205, 0.4332162393257022, 0.04187265411019325, 0.15332136279903352]},
+      {kind: 'undo', u: [0.17663414310663939, 0.01229062769562006, 0.5800135440658778, 0.717533276649192, 0.5507293122354895, 0.4764806858729571, 0.7154232081957161, 0.24112055450677872]},
+      {kind: 'addComponent', u: [0.4504307541064918, 0.3548886945936829, 0.3065341168548912, 0.7175041695591062, 0.7666598793584853, 0.32540461677126586, 0.4841995006427169, 0.6778079124633223]},
+      {kind: 'prefabEdit', u: [0.2107876797672361, 0.3341078688390553, 0.9170295137446374, 0.4216249173041433, 0.6825626569334418, 0.24313193350099027, 0.27615417796187103, 0.772553448099643], inner: []},
     ],
   },
 ];
