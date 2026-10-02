@@ -5,6 +5,7 @@ import { Assets, ImageSource, Texture } from 'pixi.js';
 import { fireDirtyListeners } from '../core/renderDirty';
 import { AssetNetworkError, checkAssetResponse } from '../core/assetLoadErrors';
 import { rethrowFetchFailure } from '../core/loadFailureMemo';
+import { trackBootContent } from '../core/bootContentGate';
 
 /** Load a texture through PixiJS Assets, forcing the image parser for `blob:` URLs.
  *
@@ -24,6 +25,18 @@ import { rethrowFetchFailure } from '../core/loadFailureMemo';
  *  skinned-part path calls this once per rendered frame until the texture is live. Without this,
  *  a 2 s load at 60 fps landed ~120 wakes in one burst; with it, exactly one per load. */
 const wakePending = new Set<string>();
+
+/** #1928 — while the game boots, the splash waits for every 2D texture the boot is loading. A
+ *  Canvas2D surface's first frame is not "the board has drawn": `Scene2D.makeSprite` starts every
+ *  sprite whose texture is not resident on `Texture.EMPTY` and binds it when the load lands, and a
+ *  game's runtime-spawned sprites (Slime Shooter's pieces) are never prewarmed. Every 2D texture
+ *  load funnels through this file, so this is the one place to hold for them. A no-op outside a
+ *  boot (`trackBootContent` returns null). Settles on failure too — a 404 must not hold the splash. */
+function holdBootFor<T>(kind: string, url: string, load: Promise<T>): Promise<T> {
+  const done = trackBootContent(`${kind}:${url.slice(url.lastIndexOf('/') + 1)}`);
+  if (done) load.then(done, done);
+  return load;
+}
 
 export function loadPixiTexture(url: string): Promise<Texture> {
   evictSourcelessEntry(url);
@@ -48,7 +61,9 @@ export function loadPixiTexture(url: string): Promise<Texture> {
   // itself — Scene2D's material-sprite path backs off and schedules its own wake (#1374) — and a
   // reject wake here would retry a 404 at frame rate. A consumer that reveals something on failure
   // wakes for itself.
-  if (!miss || wakePending.has(url)) return load;
+  if (!miss) return load;
+  holdBootFor('texture2d', url, load);
+  if (wakePending.has(url)) return load;
   wakePending.add(url);
   return load.then(
     (tex) => { wakePending.delete(url); fireDirtyListeners(); return tex; },
@@ -86,8 +101,12 @@ export function loadPixiTexture(url: string): Promise<Texture> {
  *  playable build needs no special case here. The no-`createImageBitmap` fallback is SAFE rather
  *  than a quiet reintroduction: without it Pixi decodes into an `HTMLImageElement`, and the unpack
  *  flag IS honoured for those. */
-export async function loadMtsdfAtlasTexture(url: string): Promise<Texture> {
+export function loadMtsdfAtlasTexture(url: string): Promise<Texture> {
   if (typeof createImageBitmap !== 'function') return loadPixiTexture(url);
+  return holdBootFor('font-atlas', url, fetchMtsdfAtlasTexture(url));
+}
+
+async function fetchMtsdfAtlasTexture(url: string): Promise<Texture> {
   // Every outcome typed for `fontTexturePixi`'s failure memo (#1397): no response and a dropped
   // body are network errors, a non-ok status or the SPA fallback a `MissingAssetError`.
   const response = checkAssetResponse(await fetch(url).catch(rethrowFetchFailure(url)), url);

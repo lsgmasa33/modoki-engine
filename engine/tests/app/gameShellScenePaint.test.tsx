@@ -21,6 +21,10 @@ const spies = vi.hoisted(() => {
    *  "painted". Null until GameShell actually calls it — which is itself the assertion for the
    *  no-3D case. */
   let release: ((outcome: string) => void) | null = null;
+  let releaseBoot: ((r: { outcome: string; pending: string[] }) => void) | null = null;
+  // Forward refs for the two closures below that need fields of the object they live in.
+  const spies_holdContent = { on: false };
+  let spies_disarm: () => () => void = () => () => {};
   const waitForScenePaint = vi.fn((_opts?: unknown) => new Promise<string>((r) => { release = r; }));
   const order: string[] = [];
   const releaseTimeHold = vi.fn(() => { order.push('release'); });
@@ -35,8 +39,20 @@ const spies = vi.hoisted(() => {
     releaseTimeHold,
     holdTimeForLoading: vi.fn(() => { order.push('hold'); return releaseTimeHold; }),
     isWaiting: () => release !== null,
+    /** #1928 — the 2D/UI boot-content gate. `holdContent` makes the next wait park until
+     *  `releaseContent`; otherwise it reports nothing pending, as a project with no 2D/UI surface
+     *  would. */
+    holdContent: spies_holdContent,
+    releaseContent: (outcome = 'ready') => { releaseBoot?.({ outcome, pending: outcome === 'ready' ? [] : ['canvas2d:7'] }); releaseBoot = null; },
+    waitForBootContent: vi.fn((_opts?: unknown) => spies_holdContent.on
+      ? new Promise<{ outcome: string; pending: string[] }>((r) => { releaseBoot = r; })
+      : Promise.resolve({ outcome: 'idle', pending: [] as string[] })),
+    disarmBootContent: vi.fn(),
+    armBootContent: vi.fn(() => spies_disarm()),
+    bindDisarm(fn: () => () => void) { spies_disarm = fn; },
   };
 });
+spies.bindDisarm(() => spies.disarmBootContent);
 
 /** Set per test before rendering — GameShell reads it through the mocked `loadConfig`. */
 const config = vi.hoisted(() => ({ disable3D: false as boolean, scenePath: '/scene.json' as string | undefined }));
@@ -65,6 +81,11 @@ vi.mock('@modoki/engine/runtime', () => ({
   // it, and spreading `importActual` instead would pull the real barrel and defeat the point of an
   // explicit list — which is what caught this import in the first place.
   SCENE_PAINT_MAX_WAIT_MS: 5000,
+  armBootContent: spies.armBootContent,
+  waitForBootContent: spies.waitForBootContent,
+  BOOT_CONTENT_MAX_WAIT_MS: 5000,
+  bootSpan: (_name: string, fn: () => unknown) => fn(),
+  bootSpanAsync: (_name: string, fn: () => Promise<unknown>) => fn(),
 }));
 
 vi.mock('@modoki/engine/runtime/debug', () => ({ DebugMenu: () => null }));
@@ -129,6 +150,8 @@ afterEach(() => {
   config.disable3D = false;
   config.scenePath = '/scene.json';
   spies.releaseScenePaint(); // never leave a deferred parked for the next test
+  spies.releaseContent();
+  spies.holdContent.on = false;
   spies.order.length = 0;
 });
 
@@ -222,5 +245,81 @@ describe('GameShell first-paint gating (#334)', () => {
     render(React.createElement(GameShell, { gameId: 'hold-ota' }));
     await waitFor(() => expect(spies.releaseTimeHold).toHaveBeenCalled(), { timeout: 5000 });
     expect(spies.order).toEqual(['hold', 'release']);
+  });
+  // #1928 — a project with NO 3D surface used to reveal two frames after the swap, before its Pixi
+  // board had begun init or its backdrop had decoded (iPad mini 5: splash down at 798 ms, board's
+  // first frame at 1326 ms). The 2D/UI gate is what holds it now.
+  it('a NO-3D project keeps the overlay up until its 2D/UI content has arrived (#1928)', async () => {
+    config.disable3D = true;
+    spies.holdContent.on = true;
+    makeGame('flat-content');
+    render(React.createElement(GameShell, { gameId: 'flat-content' }));
+    await waitFor(() => expect(spies.waitForBootContent).toHaveBeenCalled(), { timeout: 5000 });
+    for (let i = 0; i < 10; i++) await new Promise<void>(r => requestAnimationFrame(() => r()));
+    expect(screen.queryByTestId('loading-overlay')).not.toBeNull();
+    expect(spies.disarmBootContent).not.toHaveBeenCalled();
+
+    spies.releaseContent('ready');
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
+    expect(spies.waitForScenePaint).not.toHaveBeenCalled();
+    expect(spies.disarmBootContent).toHaveBeenCalled();
+  });
+
+  it('a 3D project waits for BOTH — the scene paint, then its 2D/UI content', async () => {
+    spies.holdContent.on = true;
+    makeGame('both-content');
+    render(React.createElement(GameShell, { gameId: 'both-content' }));
+    await waitFor(() => expect(spies.waitForScenePaint).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.waitForBootContent).not.toHaveBeenCalled();
+    spies.releaseScenePaint('painted');
+    await waitFor(() => expect(spies.waitForBootContent).toHaveBeenCalled(), { timeout: 5000 });
+    expect(screen.queryByTestId('loading-overlay')).not.toBeNull();
+    spies.releaseContent('ready');
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
+  });
+
+  it('content that arrived DURING the wait gets two more frames before the reveal — a landed texture is resident, not yet drawn', async () => {
+    config.disable3D = true;
+    spies.holdContent.on = true;
+    makeGame('content-frames');
+    render(React.createElement(GameShell, { gameId: 'content-frames' }));
+    await waitFor(() => expect(spies.waitForBootContent).toHaveBeenCalled(), { timeout: 5000 });
+    const realRaf = window.requestAnimationFrame;
+    let frames = 0;
+    window.requestAnimationFrame = ((cb: FrameRequestCallback) => { frames++; return realRaf(cb); }) as typeof window.requestAnimationFrame;
+    try {
+      spies.releaseContent('ready');
+      await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
+      expect(frames).toBeGreaterThanOrEqual(2);
+    } finally {
+      window.requestAnimationFrame = realRaf;
+    }
+  });
+
+  it('reveals anyway when the content wait times out — a surface that never arrives cannot stick the splash', async () => {
+    config.disable3D = true;
+    spies.holdContent.on = true;
+    makeGame('content-timeout');
+    render(React.createElement(GameShell, { gameId: 'content-timeout' }));
+    await waitFor(() => expect(spies.waitForBootContent).toHaveBeenCalled(), { timeout: 5000 });
+    spies.releaseContent('timeout');
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
+  });
+
+  it('arms the content window BEFORE the scene loads, and closes it when GameShell unmounts mid-boot', async () => {
+    spies.holdContent.on = true;
+    spies.loadScene.mockImplementationOnce(async () => {
+      // The UI tree mounts its surfaces as the scene swaps in — they can only register if the
+      // window is already open by then.
+      expect(spies.armBootContent).toHaveBeenCalledTimes(1);
+      spies.order.push('loadScene');
+    });
+    makeGame('content-cancel');
+    const { unmount } = render(React.createElement(GameShell, { gameId: 'content-cancel' }));
+    await waitFor(() => expect(spies.waitForScenePaint).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.loadScene).toHaveBeenCalled();
+    expect(spies.disarmBootContent).not.toHaveBeenCalled();
+    unmount();
+    expect(spies.disarmBootContent).toHaveBeenCalled();
   });
 });

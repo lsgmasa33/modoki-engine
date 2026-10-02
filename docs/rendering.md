@@ -4031,7 +4031,7 @@ for presentation).
 | property | how |
 |---|---|
 | costs a fast project nothing | resolves `'idle'` synchronously when the paint already landed — the ordinary case, since the caller has a scene load and an `onSceneReady` to get through first |
-| a no-3D project never hangs | `GameShell` gates the await on the same `disable3D \|\| !Scene3D` condition that decides whether `Scene3D` renders, and on a boot scene actually being loaded |
+| a no-3D project never hangs | `GameShell` gates the await on the same `disable3D \|\| !Scene3D` condition that decides whether `Scene3D` renders, and on a boot scene actually being loaded. Its 2D and UI surfaces wait on `bootContentGate` instead (#1928, next section) |
 | cannot stick forever | `SCENE_PAINT_MAX_WAIT_MS` (5 s) mirrors `LIVE_COMPILE_MAX_HOLD_MS`; a renderer that never comes up calls `abandonScenePaint()` instead of making the caller sit out the ceiling |
 | no leak on a game change | the boot effect's `AbortController` is passed as `signal`, so cleanup drops the waiter and its timer |
 
@@ -4040,6 +4040,92 @@ which needs one. Both calls are synchronous (swap listener, submit point), so a 
 be attributed to the swap that most recently armed; there is no promise that can land late. A waiter
 parked across a second swap therefore waits for the NEWER scene, which is the one that will be under
 the overlay.
+
+### …and so do the 2D and UI surfaces (#1928)
+
+⚠️ **The row above that says "a no-3D project never hangs" was true, and it was also the bug.** With
+no 3D surface, nothing armed the signal, so the reveal waited only for the two rAFs. Those two
+frames land before a Pixi board has even begun `Application.init`, and before a backdrop image has
+decoded. The boot splash and overlay then came down over the bare `body` (`#0f0f23`) and, on iOS
+in dark mode, over the WKWebView's black `systemBackground`, and the art popped in afterwards.
+`games/slime-shooter` hit this the day it dropped its unused 3D layer (`disable3D`).
+
+Measured on an iPad mini 5, cold launch, ms from boot:
+- **Reveal and content:** splash down at 798; the board's slot init ran 882 → 956; its first frame
+  drew at 1326; the backdrop's decode ran 736 → 859.
+- **First launch after install:** a further 372 ms gap plus a 774 ms frame, all after the reveal.
+
+`core/bootContentGate.ts` is the 2D/UI twin of the paint signal. It is a pending **set**, not
+one bit, because how many surfaces a boot puts on screen is only known once the UI tree renders.
+- **`armBootContent()`.** `GameShell` opens a window before the scene load. It closes it on reveal,
+  on failure, when a mandatory OTA stops the boot, and in the effect cleanup, beside the time hold.
+- **`trackBootContent(label)`.** While the window is open, each surface registers and gets a `done`
+  callback. The callback is `null` when nothing is armed, so the editor never registers anything.
+  There are four producers (`ui/bootContentProbes.tsx` holds the two React ones):
+  - **`Canvas2DMount`:** `done` on the slot's next successful render
+    (`canvas2DPool.whenNextRendered`). A pending waiter forces that render: `renderAll` draws the
+    slot whatever the dirty set says, and `hasRedrawOwed` keeps the loop awake for it, but only for
+    a sized canvas.
+    ⚠️ **Not by writing `redrawOwed`.** The close-out review found that flag outliving an
+    unsubscribe on a canvas that never got a size. `renderAll` skips that canvas, so nothing ever
+    cleared the flag, and every later 2D frame redrew every canvas for the rest of the session.
+  - **`loadPixiTexture` / `loadMtsdfAtlasTexture` (`pixiTextureLoad.ts`):** a token per texture
+    *miss* while it loads, released on success or failure.
+    ⚠️ **A slot's first render is not "the board has drawn".** `Scene2D.makeSprite` starts every
+    sprite whose texture is not resident on `Texture.EMPTY` and binds it when the load lands. A
+    game's runtime-spawned sprites, such as Slime Shooter's pieces, are never prewarmed. Every 2D
+    texture load funnels through this one file, so the hold sits there. A landed texture is
+    resident, not yet drawn, so when the wait resolves `'ready'` (something arrived while it
+    waited), `GameShell` waits two more bounded frames before the reveal.
+  - **`BootContentHold`:** the `<Suspense>` fallback in front of `Canvas2DMount`. ⚠️ **Without it
+    the board is never waited for.** `UINode` lazy-loads `Canvas2DMount` so a 3D-only build can drop
+    it, so on a device the board mounted, and registered, only after the wait had found the set
+    empty. That was observed on the iPad: the first version waited for the backdrop and reveals at
+    1039 ms, with no `canvas2d` item in the boot spans. The fallback holds a token while the chunk
+    loads, and hands over to the mount's own token in the same React commit.
+  - **`BootImageProbe`:** mounted by `UINode` beside a visible image, it decodes the same URL the
+    element paints, and calls `done` when the decode settles.
+- **The handoff is not "everything arrived".** The fallback's token is released a moment before the
+  mount's is registered, in one synchronous effect flush. So the set counts as empty only if it is
+  still empty at a microtask boundary (`settleIfEmpty`).
+- **The wait.** `GameShell` awaits `waitForBootContent()` after the two rAFs, and for a 3D project
+  after the scene paint. The two frames are what give React the commit in which those surfaces mount
+  and register. Content that registers during the wait is waited for too.
+
+| property | how |
+|---|---|
+| a surface that can never draw does not hold the boot | every failure path settles its token: a failed `Application.init`, a box still 0×0 after the size retry's 120 frames, an unmount, a failed decode or texture load, a slot torn down first (`teardownSlot` fires its render waiters) |
+| ⚠️ a 0×0 Canvas2D still costs its boot | the size retry gives up after 120 frames, about 2 s at 60 fps and more under boot's main-thread stalls, and the splash waits that long. Accepted: such a canvas is already broken (#213, F10) |
+| cannot stick forever | `BOOT_CONTENT_MAX_WAIT_MS` (5 s); on timeout `GameShell` warns with the labels still pending and reveals anyway |
+| a stale boot cannot corrupt the next | closing the window clears the set, so an old `done` deletes nothing; a stale `disarm` cannot close a newer window |
+| readable on a device | `profiler {action:'boot'}` carries a `boot-content` span per item, plus `boot-content-wait` and `boot-reveal` |
+
+**Verified on the iPad mini 5** (work-ai2 `8eb804eec`, ms from boot):
+
+| | first cold launch after install | warm relaunch |
+|---|---|---|
+| backdrop decode done | 905 | 753 |
+| board's first render (after its chunk load) | 1370 | 1218 |
+| 2D textures (31) done | **2038** | **1702** |
+| `boot-reveal` | **2077** | **1740** |
+
+⚠️ **Every one of the 31 textures landed AFTER the board's first render, on both launches.** So the
+first version, which waited only for the canvas, revealed a board with no reef art or pieces on it,
+and they popped in over the next ~0.7 s. The texture hold is what makes the reveal complete. It is
+also most of the wait.
+
+⚠️ **It makes nothing faster.** The board's bring-up, the texture loads and the first launch's
+774 ms frame still take as long. They now happen under the splash instead of over a dark page, so
+time-to-content is unchanged. The splash itself stays up longer: on the iPad the reveal moved from
+~0.8 to 2.1 s on a cold launch and to 1.7 s warm, all of it time the art was previously popping in
+on screen. The owner accepted "~0.5 s" (2026-10-02), before the texture hold showed the full gap,
+so that ruling covers only part of this number.
+
+⚠️ **Not done: the native WebView `backgroundColor`.** It would only cover the WKWebView's frames
+before its first paint, after the early native-splash hide, and that gap was never observed. The
+colour also must not be a hand-authored hex, because the boot splash derives its own from the art
+(`splashEdgeColour`). If a black flash survives this fix on a device, the fix is to feed the native
+colour from that same source at sync.
 
 ⚠️ **`LoadingOverlay`'s 120 ms anti-flash mount delay was left alone**, and the reasoning is worth
 recording because it looks like part of this bug. That delay opens a window where `visible` is true

@@ -28,6 +28,7 @@ import { applyAnchorStyle, applyRotationStyle } from './anchorCss';
 // of them can disagree about which axes an anchor sizes (#744 reuses it — see `trackStyle`).
 import { isSizeInert } from './anchorLayout';
 import { NineSliceImage } from './NineSliceImage';
+import { BootImageProbe, BootContentHold } from './bootContentProbes';
 import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
@@ -807,6 +808,8 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // 9-slice sprites render as a decorative overlay layer (see below); a plain image
   // renders as a CSS background. Built here, injected as the first child of the return.
   let nineSliceLayer: React.ReactNode = null;
+  // #1928 — while the game boots, the splash waits for this image to decode (see BootImageProbe).
+  let bootImageProbe: React.ReactNode = null;
   if (node.imageSrc) {
     // DOM images (CSS background / NineSliceImage <img>) MUST resolve to a browser-
     // decodable URL — the browser can't decode the KTX2 GPU variant. resolveDomImageUrl
@@ -814,6 +817,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // production DOM, so a mis-typed 3d texture (no WebP sibling) warns rather than 404 silently.
     const imgUrl = resolveDomImageUrl(node.imageSrc, true);
     if (imgUrl) {
+      bootImageProbe = <BootImageProbe url={imgUrl} />;
       // 9-slice: a UI sprite with authored border insets renders as 9 overlapping
       // divs (NineSliceImage) — seamless at any zoom, unlike CSS `border-image` whose
       // regions tile and leave subpixel seams under the editor's scaled preview.
@@ -1290,6 +1294,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     style.cursor = undefined;
     text = '';
     nineSliceLayer = null;   // 9-slice background is a UI visual — strip it too
+    bootImageProbe = null;   // …and so nothing is drawn for the boot to wait on
   }
 
   // Video: mount the clip into this node's own box. Built here — ahead of the input and
@@ -1837,7 +1842,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // `pointerEvents: 'auto'` unless told otherwise, and a DOM ancestor set to `none` does not
       // stop a descendant set to `auto` from receiving pointer events — so the outer `style`
       // above (which already reflects `node.pointerThrough`) can't reach through to it on its own.
-      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={null}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
+      : (!onSelectEntity && Canvas2DMount ? <Suspense fallback={<BootContentHold label={`canvas2d:${node.entityId}`} />}><Canvas2DMount entityId={node.entityId} applyWebSizeMode pointerThrough={node.pointerThrough} /></Suspense> : null);
     return (
       // `takesClick`, not `isInteractive` (#728) — a `swallowClicks` node must ALSO get the
       // press-origin marker below. If it didn't, the TAP case would still look fixed
@@ -1849,6 +1854,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...pressAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
         {tapZoneLayer}
         {nineSliceLayer}
+        {bootImageProbe}
         {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
@@ -1911,6 +1917,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...pressAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
       {tapZoneLayer}
       {nineSliceLayer}
+      {bootImageProbe}
       {videoLayer}
       {textContent}
       {node.children.map(child => (

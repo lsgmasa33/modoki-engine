@@ -8,6 +8,7 @@ import { markScene2DDirty } from './Scene2D';
 import { retrySizeUntilMeasured, computeBackingSize } from './canvas2DSizing';
 import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { onForceResize } from './resizeBus';
+import { trackBootContent } from '../core/bootContentGate';
 
 interface Canvas2DMountProps {
   entityId: number;
@@ -55,6 +56,12 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
     if (!slot) return; // pool at capacity
 
     let cancelled = false;
+
+    // #1928 — while a boot is armed, the splash stays up until this surface has DRAWN: its first
+    // successful render after mount. Released on every path that means "it never will" too (init
+    // failed, a 0×0 box, unmounted) — a token nobody settles holds the boot to the gate's ceiling.
+    const bootDone = trackBootContent(`canvas2d:${entityId}`);
+    const unwatchBoot = bootDone ? pool.whenNextRendered(slot, bootDone) : null;
 
     function measure() {
       const rect = el!.getBoundingClientRect();
@@ -136,10 +143,14 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
         applySize,
         scheduleFrame: (cb) => requestAnimationFrame(cb),
         cancelFrame: (h) => cancelAnimationFrame(h),
-        warn: (frames) => console.warn(
-          `[Canvas2DMount] entity ${entityId}: canvas still 0×0 after ${frames} frames — ` +
-          `a display:none/detached ancestor? It won't render until it has a non-zero box.`,
-        ),
+        warn: (frames) => {
+          unwatchBoot?.();
+          bootDone?.(); // nothing to show — the boot must not wait on it
+          console.warn(
+            `[Canvas2DMount] entity ${entityId}: canvas still 0×0 after ${frames} frames — ` +
+            `a display:none/detached ancestor? It won't render until it has a non-zero box.`,
+          );
+        },
       });
       // Ongoing changes (rotation, layout reflow) are handled by the observer.
       ro = new ResizeObserver(updateSize);
@@ -159,6 +170,7 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
       slot.ready.then(() => {
         if (!cancelled) mount();
       }).catch((err) => {
+        bootDone?.();
         console.error(
           `[Canvas2DMount] entity ${entityId}: Application.init() failed — this canvas will stay ` +
           `blank:`, err,
@@ -175,6 +187,8 @@ export function Canvas2DMount({ entityId, pool = defaultPool, markDirty = markSc
         el.removeChild(slot.canvas);
       }
       updateSizeRef.current = null;
+      unwatchBoot?.();
+      bootDone?.();
       pool.unmount(entityId); // drop the mount claim → slot reclaimed if sim isn't holding it
     };
   }, [entityId, pool, markDirty, applyWebSizeMode]);

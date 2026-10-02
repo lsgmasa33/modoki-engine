@@ -27,6 +27,7 @@ vi.mock('pixi.js', () => ({
 // Import AFTER the mock is registered.
 const { loadPixiTexture, loadMtsdfAtlasTexture } = await import('../../src/runtime/rendering/pixiTextureLoad');
 const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+const { armBootContent, pendingBootContent, resetBootContentGate } = await import('../../src/runtime/core/bootContentGate');
 
 // #1368 G1: the shim is the one Pixi texture store, so the refill wake lives here. A SUCCESSFUL
 // MISS only — a hit must never wake (Scene2D calls through here from its draw path), and neither
@@ -272,5 +273,67 @@ describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045
     vi.stubGlobal('createImageBitmap', undefined);
     await loadMtsdfAtlasTexture(url);
     expect(load).toHaveBeenCalledWith(url);
+  });
+});
+
+// #1928 close-out: a Canvas2D surface's first frame is not "the board has drawn" — a sprite whose
+// texture is not resident starts on Texture.EMPTY and binds when the load lands. Every 2D texture
+// load passes through this file, so while the game boots each one holds the splash.
+describe('boot-content hold (#1928)', () => {
+  const flush = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+  beforeEach(() => { load.mockClear(); cacheMap.clear(); resetBootContentGate(); vi.unstubAllGlobals(); });
+
+  it('a miss holds the boot until its load lands', async () => {
+    armBootContent();
+    let resolve!: (t: unknown) => void;
+    load.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+    const p = loadPixiTexture('/assets/textures/piece.webp');
+    await flush();
+    expect(pendingBootContent()).toEqual(['texture2d:piece.webp']);
+    resolve({ id: 'x' });
+    await p;
+    await flush();
+    expect(pendingBootContent()).toEqual([]);
+    resetBootContentGate();
+  });
+
+  it('a FAILED load releases too — a 404 must not hold the splash for the ceiling', async () => {
+    armBootContent();
+    load.mockImplementationOnce(() => Promise.reject(new Error('404')));
+    await loadPixiTexture('/assets/missing.webp').catch(() => {});
+    await flush();
+    expect(pendingBootContent()).toEqual([]);
+    resetBootContentGate();
+  });
+
+  it('a cache hit holds nothing; outside a boot nothing registers', async () => {
+    armBootContent();
+    cacheMap.set('/assets/hit.webp', { source: {} });
+    // Asked SYNCHRONOUSLY: a hit's promise settles a microtask later, so a token it took would
+    // already be gone after an await — and the check could not tell a hold from none.
+    const hit = loadPixiTexture('/assets/hit.webp');
+    expect(pendingBootContent()).toEqual([]);
+    await hit;
+    resetBootContentGate();
+    let resolve!: (t: unknown) => void;
+    load.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+    const p = loadPixiTexture('/assets/later.webp');
+    expect(pendingBootContent()).toEqual([]);
+    resolve({});
+    await p;
+  });
+
+  it('an MTSDF atlas (its own fetch path) holds the boot until it is built', async () => {
+    armBootContent();
+    let respond!: (r: unknown) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { respond = r; })));
+    vi.stubGlobal('createImageBitmap', vi.fn(() => Promise.resolve({})));
+    const p = loadMtsdfAtlasTexture('/assets/fonts/baloo.png');
+    expect(pendingBootContent()).toEqual(['font-atlas:baloo.png']);
+    respond({ ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob) });
+    await p;
+    await flush();
+    expect(pendingBootContent()).toEqual([]);
+    resetBootContentGate();
   });
 });

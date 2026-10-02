@@ -62,6 +62,7 @@ import {
   DEFAULT_TOGGLE_TRACK_WIDTH, DEFAULT_TOGGLE_TRACK_HEIGHT, toggleKnobFloor, droppedTextStyleFields,
 } from '../../src/runtime/ui/UINode';
 import { NineSliceImage } from '../../src/runtime/ui/NineSliceImage';
+import { armBootContent, pendingBootContent, resetBootContentGate } from '../../src/runtime/core/bootContentGate';
 import { UI_PAINT_ATTR } from '../../src/runtime/ui/uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, installPressOriginTracking, pressBelongsTo } from '../../src/runtime/ui/pressOrigin';
 import { isPaintOpaque } from '../../src/editor/panels/uiPreviewPick';
@@ -2554,5 +2555,30 @@ describe('a child replaced on a recycled index remounts (#868)', () => {
     } finally {
       world.destroy();
     }
+  });
+});
+
+// #1928 — while the game boots, the splash waits for every image the UI tree actually DRAWS. The
+// probe is what registers it, so it must be mounted for exactly those images: a hidden node or a
+// stripped visual that registered would hold the splash for an image nobody will see.
+describe('UINode boot image probe (#1928)', () => {
+  afterEach(() => resetBootContentGate());
+
+  it('a visible image node holds the boot for its DOM url', () => {
+    armBootContent();
+    renderNode(makeNode({ imageSrc: 'tex-a' }));
+    expect(pendingBootContent()).toEqual(['ui-image:variant:tex-a']);
+  });
+
+  it('a hidden image node does not', () => {
+    armBootContent();
+    renderNode(makeNode({ imageSrc: 'tex-a', isVisible: false }));
+    expect(pendingBootContent()).toEqual([]);
+  });
+
+  it('an image stripped by uiVisualsHidden does not', () => {
+    armBootContent();
+    renderNode(makeNode({ imageSrc: 'tex-a' }), { uiVisualsHidden: true });
+    expect(pendingBootContent()).toEqual([]);
   });
 });

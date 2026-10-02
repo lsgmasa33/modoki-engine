@@ -667,6 +667,12 @@ export {
   waitForScenePaint, isScenePaintPending, SCENE_PAINT_MAX_WAIT_MS, resetScenePaintSignal,
   armScenePaint, markScenePainted, abandonScenePaint, type ScenePaintOutcome,
 } from './rendering/scenePaintSignal';
+// …and its 2D/UI twin (#1928): every Canvas2D surface and visible UI image the boot put on screen
+// has arrived. Same reason to be a leaf.
+export {
+  armBootContent, trackBootContent, waitForBootContent, pendingBootContent, resetBootContentGate,
+  BOOT_CONTENT_MAX_WAIT_MS, type BootContentOutcome, type BootContentResult,
+} from './core/bootContentGate';
 export type { RenderSettings, ThreeRenderSettings, PixiRenderSettings, WebRenderSettings } from './rendering/renderSettings';
 export { getWorldTransform3D, getWorldMatrix3D, getParentWorldMatrix3D, worldToLocal3D, hasParent } from './core/ecs/worldTransform';
 export type { WorldTransform3D } from './core/ecs/worldTransform';

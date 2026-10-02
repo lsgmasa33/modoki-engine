@@ -63,6 +63,12 @@ vi.mock('@modoki/engine/runtime', () => ({
   // imported name fails at BINDING, so this file collects zero tests rather than failing a case.
   // Mirrors `runtime/rendering/scenePaintSignal.ts`; nothing here asserts on the value.
   SCENE_PAINT_MAX_WAIT_MS: 5000,
+  // #1928 — the 2D/UI boot-content gate. Stubbed to "nothing pending"; gameShellScenePaint pins it.
+  armBootContent: () => () => {},
+  waitForBootContent: async () => ({ outcome: 'idle', pending: [] }),
+  BOOT_CONTENT_MAX_WAIT_MS: 5000,
+  bootSpan: (_name: string, fn: () => unknown) => fn(),
+  bootSpanAsync: (_name: string, fn: () => Promise<unknown>) => fn(),
 }));
 
 vi.mock('@modoki/engine/runtime/debug', () => ({

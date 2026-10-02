@@ -6,7 +6,7 @@ import { useBackgroundFlush } from './useBackgroundFlush';
 import { useAppActivityTimeline } from './useAppActivityTimeline';
 import { useResumeReload } from './useResumeReload';
 import { useDeadAudioReload } from './useDeadAudioReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, armBootContent, waitForBootContent, BOOT_CONTENT_MAX_WAIT_MS, bootSpan, bootSpanAsync, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -271,6 +271,10 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     // overlay drops, so the first frame seen is t = 0. Released on every exit: success, failure,
     // a mandatory OTA stopping the boot, and this effect's cleanup (a game change mid-boot). See `core/loadingTimeHold.ts`.
     const releaseLoadingTimeHold = holdTimeForLoading();
+    // #1928 — open the boot-content window: every Canvas2D surface and visible UI image this boot
+    // puts on screen registers, and the reveal below waits for them. Closed on every exit, beside
+    // the time hold. See `runtime/core/bootContentGate.ts`.
+    const disarmBootContent = armBootContent();
 
     let cancelled = false;
     /** Cancel token for the awaits that park on something OTHER than a promise this body owns —
@@ -559,7 +563,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         const otaShouldProceed = await checkAppOtaUpdate();
         if (cancelled) return;
         // This boot ends here for the session, and nothing below will release the hold.
-        if (!otaShouldProceed) { releaseLoadingTimeHold(); return; }
+        if (!otaShouldProceed) { releaseLoadingTimeHold(); disarmBootContent(); return; }
 
         // OTA Phase 4 — a sub-game's config.scenePath is a root-relative build-output
         // literal baked against ITS OWN origin (config.assetBaseUrl, set by
@@ -628,6 +632,28 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         }
         if (cancelled) return;
 
+        // …and THEN the 2D and UI surfaces (#1928). The scene-paint wait above covers only a 3D
+        // surface, so on a project without one (`disable3D`) the two frames were the whole gate —
+        // and they land before a Pixi board has even begun `Application.init`, or a backdrop image
+        // has decoded. Measured on an iPad mini 5 cold-launching slime-shooter: splash down at
+        // 798 ms, board's first frame at 1326 ms, a black-then-pop-in launch in between. Waited
+        // AFTER the two frames on purpose: they give React the commit in which the UI tree mounts
+        // those surfaces, which is when they register. Bounded by the gate's own ceiling, so a
+        // surface that never arrives delays the reveal and never prevents it.
+        const content = await bootSpanAsync('boot-content-wait', () => waitForBootContent({ signal: abortBoot.signal }));
+        if (content.outcome === 'timeout') {
+          console.warn(`[GameShell] boot content did not arrive within ${BOOT_CONTENT_MAX_WAIT_MS} ms — revealing the game anyway; still pending: ${content.pending.join(', ')}`);
+        } else if (content.outcome === 'ready' && bootFramesConfirmed) {
+          // ⚠️ `bootFramesConfirmed`: with a dead frame loop (#682) two more frames cannot draw
+          // anything, and waiting for them would only add a second full ceiling to the reveal.
+          // Something arrived DURING the wait — a texture landing is "resident", not "drawn": the
+          // sprite binds it and Scene2D redraws on the next frame. Two more frames put that redraw
+          // under the splash too (bounded, like every frame wait here).
+          await waitTwoFramesBounded(TWO_FRAME_WAIT_TIMEOUT_MS);
+        }
+        disarmBootContent();
+        if (cancelled) return;
+
         // OTA boot-watchdog confirm (docs/ota-updates.md):
         // THIS is the app's own "fully booted" signal (rendered a real frame of the
         // ACTUAL game, not just index.html loading) — the exact proof-of-boot the native
@@ -670,7 +696,8 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // are the same artwork, so the handoff is one continuous image rather than a cut to dark
         // navy. A no-op wherever no boot splash was injected (dev, editor, playable, or a project
         // that has authored no splash).
-        dismissBootSplash();
+        // A span, so `profiler {action:'boot'}` places the reveal against what it waited on.
+        bootSpan('boot-reveal', dismissBootSplash);
 
         activeGameIdRef.current = gameId;
         initializedRef.current = true;
@@ -679,6 +706,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         releaseLoadingTimeHold();
       } catch (e) {
         releaseLoadingTimeHold();
+        disarmBootContent();
         if (!cancelled) {
           console.error('[GameShell] Failed to load game:', e);
           // Take the splash down so the error is SEEN: it outranks every boot surface by z-index,
@@ -690,7 +718,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
       }
     })();
 
-    return () => { cancelled = true; abortBoot.abort(); releaseLoadingTimeHold(); };
+    return () => { cancelled = true; abortBoot.abort(); releaseLoadingTimeHold(); disarmBootContent(); };
     // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
     // effect writes `configReady` and `initialized`; listing either here makes it re-run
     // itself and double-drive every registration in the body.

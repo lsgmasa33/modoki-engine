@@ -655,3 +655,113 @@ describe('pendingInits — what the gameplay recorder waits on (#1479)', () => {
     expect(pool.defaultPool.pendingInits()).toBe(0);
   });
 });
+
+// #1928 — the boot reveal waits on "this surface has DRAWN". `whenNextRendered` is that signal, so
+// each way it could lie is pinned: firing on a render that threw (a blank surface), never firing
+// because nothing dirtied the slot, or stranding its waiter when the slot is torn down.
+describe('canvas2DPool.whenNextRendered (#1928)', () => {
+  it('fires on the next SUCCESSFUL render, once', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    s.canvas.width = 320; s.canvas.height = 480;
+    await s.ready;
+    const cb = vi.fn();
+    pool.defaultPool.whenNextRendered(s, cb);
+    expect(cb).not.toHaveBeenCalled();
+    pool.renderAll();
+    expect(cb).toHaveBeenCalledTimes(1);
+    pool.renderAll();
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT fire on a render that threw — an aborted render left the surface blank', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    s.canvas.width = 320; s.canvas.height = 480;
+    await s.ready;
+    const render = s.app.renderer.render as ReturnType<typeof vi.fn>;
+    render.mockImplementationOnce(() => { throw new TypeError('batcher null'); });
+    const cb = vi.fn();
+    pool.defaultPool.whenNextRendered(s, cb);
+    pool.renderAll();
+    expect(cb).not.toHaveBeenCalled();
+    pool.renderAll();                       // the retry draws
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('forces that render even when the slot is not in the dirty set — a waiter must not depend on something else changing', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    s.canvas.width = 320; s.canvas.height = 480;
+    await s.ready;
+    const cb = vi.fn();
+    pool.defaultPool.whenNextRendered(s, cb);
+    pool.renderAll(new Set());              // nothing dirty
+    expect(s.app.renderer.render).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('the unsubscribe drops the waiter', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    s.canvas.width = 320; s.canvas.height = 480;
+    await s.ready;
+    const cb = vi.fn();
+    const off = pool.defaultPool.whenNextRendered(s, cb);
+    off();
+    pool.renderAll();
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('fires when the slot is torn down before it ever drew — a waiter is never stranded', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    await s.ready;                          // never sized, so renderAll would skip it
+    const cb = vi.fn();
+    pool.defaultPool.whenNextRendered(s, cb);
+    pool.release(1);
+    pool.destroyPool();
+    expect(s.destroyed).toBe(true);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('an UNSIZED slot\'s waiter keeps nothing awake, and an unsubscribe leaves no obligation behind (close-out)', async () => {
+    // A canvas that registered at boot and never got a size used to leave `redrawOwed` set for the
+    // session — every later 2D frame then redrew every canvas.
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    await s.ready;                          // initialized, never sized
+    const off = pool.defaultPool.whenNextRendered(s, vi.fn());
+    expect(pool.defaultPool.hasRedrawOwed()).toBe(false);
+    s.canvas.width = 320; s.canvas.height = 480;
+    expect(pool.defaultPool.hasRedrawOwed()).toBe(true);   // sized: the waiter's frame is owed
+    off();
+    expect(pool.defaultPool.hasRedrawOwed()).toBe(false);  // and gone with the waiter
+    pool.renderAll(new Set());
+    expect(s.app.renderer.render).not.toHaveBeenCalled();
+  });
+
+  it('a waiter that re-subscribes from its own callback gets the NEXT render forced too', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    s.canvas.width = 320; s.canvas.height = 480;
+    await s.ready;
+    const second = vi.fn();
+    pool.defaultPool.whenNextRendered(s, () => { pool.defaultPool.whenNextRendered(s, second); });
+    pool.renderAll(new Set());
+    expect(second).not.toHaveBeenCalled();
+    pool.renderAll(new Set());              // still nothing dirty
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it('on an already-destroyed slot, fires at once', async () => {
+    const pool = await getModule();
+    const s = pool.allocate(1)!;
+    await s.ready;
+    pool.release(1);
+    pool.destroyPool();
+    const cb = vi.fn();
+    pool.defaultPool.whenNextRendered(s, cb);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+});

@@ -31,6 +31,7 @@
  *  must stay global too, or one viewport's release would unload a texture another still shows. */
 
 import { Application, Container } from 'pixi.js';
+import { notifyListeners } from '../core/notifyListeners';
 import { getWebGPUSupported } from './gpuDetect';
 import { getRenderSettings, getEffectivePixiSettings } from './renderSettings';
 import { registerPointerPassthrough } from '../core/pointerBlockers';
@@ -83,6 +84,10 @@ export interface Canvas2DSlot {
    *  happens later, when `slot.ready` resolves. Treat THIS, never `canvas.parentElement`, as the
    *  answer to "is anyone still using this slot?" (#213). */
   mounted: boolean;
+  /** Callbacks waiting for this slot's next SUCCESSFUL `renderer.render` (#1928) — see
+   *  `whenNextRendered`. Fired and cleared by `renderAll`'s success path, and by `teardownSlot`
+   *  (a slot that will never render again must not leave its waiters parked). */
+  renderWaiters?: Set<() => void>;
   /** Consecutive frames this slot's renderer threw — distinguishes a one-frame
    *  teardown blip (swallowed silently) from a genuinely stuck renderer. */
   renderFailFrames?: number;
@@ -817,6 +822,23 @@ export class Canvas2DPool {
       releasePixiGlobalsIfIdle();
     }
     slot.recovery?.dispose();
+    fireRenderWaiters(slot);
+  }
+
+  /** Call `cb` once, on this slot's next successful render — the moment a frame of its CURRENT
+   *  content reached its canvas (#1928's boot gate: "the board has drawn"). Also called if the
+   *  slot is torn down first, so a waiter can never be stranded. Returns an unsubscribe.
+   *  A pending waiter FORCES that render — `renderAll` draws the slot whatever the dirty set says,
+   *  and `hasRedrawOwed` keeps the frame loop awake for it — because a waiter is asking about the
+   *  frame and must not depend on something else happening to change.
+   *  ⚠️ The obligation is the waiter's PRESENCE, not a `redrawOwed` write (#1928 close-out): that flag
+   *  survived an unsubscribe on a canvas that never got a size (renderAll skips ≤1 px), which kept
+   *  every later 2D frame redrawing every canvas for the rest of the session. And it applies only to
+   *  a SIZED canvas, which is the only kind that can render. */
+  whenNextRendered(slot: Canvas2DSlot, cb: () => void): () => void {
+    if (slot.destroyed) { cb(); return () => {}; }
+    (slot.renderWaiters ??= new Set()).add(cb);
+    return () => { slot.renderWaiters?.delete(cb); };
   }
 
   /** Reclaim a slot to the free pool once it has NO claims (neither sim-bound nor
@@ -917,8 +939,9 @@ export class Canvas2DPool {
     return v;
   }
 
-  /** Does any live slot owe a redraw after a thrown render (`redrawOwed`)? NOT read-and-clear —
-   *  the flag is cleared by the successful render itself.
+  /** Does any live slot owe a redraw — after a thrown render (`redrawOwed`), or to a pending
+   *  `whenNextRendered` waiter on a SIZED canvas (#1928)? NOT read-and-clear — the flag is cleared
+   *  by the successful render itself, and a waiter by being fired or unsubscribed.
    *
    *  ⚠️ Scene2D must read this ABOVE its idle whole-frame skip, exactly like `consumeRebuildFlag`
    *  above. The skip returns before `renderAll` is reached at all, so a slot that owes a redraw
@@ -927,6 +950,8 @@ export class Canvas2DPool {
   hasRedrawOwed(): boolean {
     for (const slot of this.slots) {
       if (slot.redrawOwed && slot.entityId !== null && slot.initialized) return true;
+      if (slot.renderWaiters?.size && slot.entityId !== null && slot.initialized
+        && slot.canvas.width > 1 && slot.canvas.height > 1) return true;
     }
     return false;
   }
@@ -986,7 +1011,7 @@ export class Canvas2DPool {
       if (slot.canvas.width <= 1 || slot.canvas.height <= 1) continue;
       // `redrawOwed` OVERRIDES the dirty set: a slot whose last render threw has a cleared,
       // undefined surface and must be retried, or it stays blank forever (#455).
-      if (dirtyIds && !dirtyIds.has(slot.entityId) && !slot.redrawOwed) continue;
+      if (dirtyIds && !dirtyIds.has(slot.entityId) && !slot.redrawOwed && !slot.renderWaiters?.size) continue;
       // A slot's Application can be mid-teardown during a world swap (a scene reload —
       // e.g. Apply-to-Prefab undo's loadScene — or a Canvas2DMount unmount), or lose its
       // WebGL context when its <canvas> leaves the DOM. The renderer object still exists
@@ -998,6 +1023,7 @@ export class Canvas2DPool {
       if (!renderer) continue;
       try {
         renderer.render(slot.app.stage);
+        if (slot.renderWaiters?.size) fireRenderWaiters(slot);
         slot.renderFailFrames = 0;
         slot.stuckRecoveryRequested = false;   // episode over — a later one gets its own request
         slot.redrawOwed = false;
@@ -1189,6 +1215,15 @@ export class Canvas2DPool {
 // reader chasing a SceneView/GameView slot collision could take it as a missing phase and go
 // looking for the cause there; two sessions independently flagged it (#1000, #1002).
 // `getSlotsForMemoryReport`'s doc comment below has stated it in the present tense throughout.
+/** Fire and clear a slot's `renderWaiters`. The set is swapped out first, so a callback that
+ *  subscribes again lands on the NEXT render rather than this one. */
+function fireRenderWaiters(slot: Canvas2DSlot): void {
+  const waiting = slot.renderWaiters;
+  if (!waiting?.size) return;
+  slot.renderWaiters = undefined;
+  notifyListeners(waiting, 'canvas2DPool:whenNextRendered', []);
+}
+
 export const defaultPool = new Canvas2DPool();
 
 export function initPool(): Promise<void> {
