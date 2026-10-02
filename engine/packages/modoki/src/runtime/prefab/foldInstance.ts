@@ -510,7 +510,10 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
         if (!st.schema.component(part.trait)) { unused.push({ key, part, cause: 'unregistered' }); continue; }
         const below = n.below ?? { traits: new Set(Object.keys(n.traits)), removed: new Set<string>() };
         const on = r.traitRemovals![part.trait];
-        const takes = on ? below.traits.has(part.trait) && !below.removed.has(part.trait) : below.removed.has(part.trait);
+        // A removal restating one an inner layer already made is APPLIED, a no-op for now: it keeps "stays removed" if the
+        // template later restores the component (F1 by analogy), and its target exists, so it is not `gone` (hub ruling on
+        // #2023's 418(b), 2026-10-02; #2027).
+        const takes = on ? below.traits.has(part.trait) : below.removed.has(part.trait);
         if (!takes && !inert) unused.push({ key, part, cause: 'gone' });
       } else if (part.kind === 'parent' && key === ROOT_ROW_KEY) {
         // The root's own `parent`: names nothing every reader takes (#2022 item 3, "never neither").

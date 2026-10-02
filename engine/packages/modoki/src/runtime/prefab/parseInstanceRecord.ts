@@ -38,6 +38,7 @@ import { INSTANCE_MODEL_SCENE_VERSION } from '../core/version';
 import { deriveGuid, deriveMemberGuidAvoiding, memberPathSteps, nodeRowComponent, nodeRowKey, parseSteps } from '../core/assetRefRules';
 import { restoreMalformed, splitMalformedChannels } from '../loaders/malformedChannels';
 import { memberPathRecords } from '../loaders/memberPaths';
+import { placedAnchor } from '../loaders/memberTranslation';
 import { isMemberToken, memberToken, parseMemberToken } from '../core/templateRefs';
 import {
   foldRowStep, foldStructureLayers, frameKeyIndex, overRowsOf,
@@ -290,16 +291,28 @@ class ListBuilder<Own> {
     (this.rec(key) as AnyRecord)[field] = value;
   }
 
-  /** Replay `other`'s records into this builder as statements of `from`. */
-  absorb(other: ListBuilder<Own>, from: Source): void {
+  /** Replay `other`'s records into this builder as statements of `from`. `under`: as a LOWER layer than this builder's
+   *  ROW-sourced parts, which keep their value — a reference copy under the owner's own rows into its frame, which today
+   *  applies after the copy, its OVER rows (close-out review F2). Its legacy parts do not win: a slot's copy of the same
+   *  node is replaced by the row's copy, as today's fold replaces it (re-review N1). */
+  absorb(other: ListBuilder<Own>, from: Source, under = false): void {
     for (const [key, r] of other.rows) {
+      const mine = this.rows.get(key);
+      const byRow = (part: string, present: boolean): boolean => under && present && !this.legacyParts.has(`${key}\u0000${part}`);
+      // Identity pins are not layered: the copy's pin overwrites, as before #2027. Nothing observes which one wins (the
+      // oracle ignores guids), so no layering is claimed for them.
       if (r.guid !== undefined) this.pin(key, 'guid', r.guid);
       if (r.name !== undefined) this.pin(key, 'name', r.name);
-      for (const [t, data] of Object.entries(r.traits ?? {})) this.traitData(key, t, data, from);
-      for (const [t, on] of Object.entries(r.traitRemovals ?? {})) this.traitRemoval(key, t, on, from);
-      if (r.removed !== undefined) this.removed(key, r.removed, from);
+      for (const [t, data] of Object.entries(r.traits ?? {})) {
+        const bag = mine?.traits?.[t];
+        if (isRecord(data) && Object.keys(data).length) {
+          for (const [f, v] of Object.entries(data)) if (!byRow(`traits.${t}.${f}`, isRecord(bag) && f in bag)) this.field(key, t, f, v, from);
+        } else if (!byRow(`traits.${t}`, bag !== undefined)) this.traitData(key, t, data, from);
+      }
+      for (const [t, on] of Object.entries(r.traitRemovals ?? {})) if (!byRow(`traitRemovals.${t}`, mine?.traitRemovals?.[t] !== undefined)) this.traitRemoval(key, t, on, from);
+      if (r.removed !== undefined && !byRow('removed', mine?.removed !== undefined)) this.removed(key, r.removed, from);
       if (r.own) this.own(key, r.own, from);
-      if (r.parent !== undefined) this.parent(key, r.parent, from);
+      if (r.parent !== undefined && !byRow('parent', mine?.parent !== undefined)) this.parent(key, r.parent, from);
     }
   }
 }
@@ -355,6 +368,24 @@ interface Ctx<Own> {
   entryRows?: boolean;
   /** A scene file written before the instance model (v20): where a stray row form is read as today reads it (#2020). */
   preV20?: boolean;
+  /** Converting a scene reference COPY (`referenceCopy`): its structure is ONE statement (#2027). */
+  copy?: CopySession;
+}
+
+/** A scene reference copy's structure, stated whole: the nodes of its own frame pair as ONE list, as today's fold pairs
+ *  them (`pairWithBase`). */
+interface CopySession {
+  /** The copy's own frame. */
+  frame: string;
+  /** Its nodes as today's fold of the copy lists them (the top-level `added` a member row's `added` replaces, then each
+   *  row's `added` and `own`), each the copy's own statement, with the localId it anchors at. */
+  list: AddedEntity[];
+  anchor: Map<AddedEntity, number>;
+  /** The member rows whose `added` / `own` that list already holds. */
+  rows: Set<string>;
+  /** Every template key the copy states a node with, in any of its lists: such a node in `d` is the copy's, not one a
+   *  document supplies (re-review N3). */
+  keys: Set<string>;
 }
 
 /** The channels an owner states: legacy ones about its own top frame and the frames below it, and its rows. */
@@ -509,7 +540,9 @@ function slotLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDelta, '
     const mine = new Set(stated[lid] ?? []);
     for (const t of names) if (!mine.has(t)) ctx.out.traitRemoval(key, t, false, 'legacy');
   }
-  pinAdded(ctx, chain, s.added ?? [], undefined, at('added'));
+  // A reference copy's own frame: its rows' nodes are part of the one list (#2027).
+  if (ctx.copy && f.prefix === ctx.copy.frame) pinAdded(ctx, chain, ctx.copy.list, undefined, at('added'), false, ctx.copy.anchor);
+  else pinAdded(ctx, chain, s.added ?? [], undefined, at('added'));
 }
 
 /** Does this held container stand for a whole list's REMAINDER (`HELD_REMAINDER`)? */
@@ -541,8 +574,8 @@ function remainderLists<Own>(ctx: Ctx<Own>, f: Frame, s: Pick<NestedStructureDel
  *  `anchorLid` (every anchor when undefined: a slot). A node pairs with the chain node it replaced as today's fold pairs
  *  them (`pairWithBase`: same key, among the replaced nodes, same prefab-ness); a paired node becomes that node's ROW,
  *  every field it states recorded; each replaced chain node nothing pairs with is removed; every other node is an own
- *  node. */
-function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[], anchorLid: number | undefined, at: Path, additive = false): void {
+ *  node. A node in `anchors` (a reference copy's row node, #2027) hangs at that localId when it pairs with nothing. */
+function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[], anchorLid: number | undefined, at: Path, additive = false, anchors?: ReadonlyMap<AddedEntity, number>): void {
   const f = chain.frame;
   const lower = chain.lists.added ?? [];
   const replaced = lower.filter((n) => anchorLid === undefined || n.parentLocalId === anchorLid);
@@ -569,7 +602,7 @@ function pinAdded<Own>(ctx: Ctx<Own>, chain: Chain, list: readonly AddedEntity[]
     for (const child of node.children ?? []) visit(child, rowKey, kids);
     for (const c of kids) if (!paired.has(c)) removeNode(c);
   };
-  for (const node of list) visit(node, keyOfLid(f, anchorLid ?? node.parentLocalId) ?? (f.prefix || ROOT_ROW_KEY), replaced);
+  for (const node of list) visit(node, keyOfLid(f, anchors?.get(node) ?? anchorLid ?? node.parentLocalId) ?? (f.prefix || ROOT_ROW_KEY), replaced);
   // A held REMAINDER is not the whole list: the chain nodes it does not name were converted already (`HELD_REMAINDER`).
   if (!additive) for (const n of replaced) if (!paired.has(n)) removeNode(n);
 }
@@ -600,11 +633,19 @@ function referenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, node: Adde
     : node;
   // Its warnings stand only if it converts: held whole, nothing it says about its content happened (close-out review).
   const warnings: ParseWarning[] = [];
-  const scratch: Ctx<Own> = { ...ctx, warnings, out: new ListBuilder<Own>(warnings), pending: new Pending(), ownContent: new Map(), ownerRows: false, entryRows: false };
+  // Its structure is ONE statement, over the chain minus the chain node's own structure (#2027): today folds the copy's
+  // lists alone over the document, the chain node giving values only (`baseLayersOf`). D is that fold.
+  const dLayers: Layer[] = [{ slots: converted.nestedStructure, rows: converted.members, values: converted.overrides, valuePaths: converted.nestedOverrides }];
+  const dFold = foldStructureLayers(sub.frame.doc as never, dLayers, 0, { added: converted.added, removed: converted.removed, removedTraits: converted.removedTraits });
+  const d: Chain = { frame: sub.frame, lists: dFold.channels as Lists, state: { layers: dLayers, forwardRoots: dFold.forwardRoots as Chain['state']['forwardRoots'] } };
+  const scratch: Ctx<Own> = { ...ctx, warnings, out: new ListBuilder<Own>(warnings), pending: new Pending(), ownContent: new Map(), ownerRows: false, entryRows: false, copy: copySession(sub.frame, converted) };
   convertOwner(scratch, sub.frame, converted, { whole: true, pins: true, at: (...p) => p });
-  if (!scratch.pending.empty) { hold(); return; }
+  const base = frameKeyIndex(chain.lists.added as (AddedEntity & { key?: string })[] | undefined).get(key);
+  if (!restoreChainStructure(scratch, sub, d, [sub.frame.docGuid], reachOf(base)) || !scratch.pending.empty) { hold(); return; }
   ctx.warnings.push(...warnings);
-  ctx.out.absorb(scratch.out, 'legacy');
+  // UNDER what the owner already stated into the copy's frame: today applies the owner's rows there after the copy (its
+  // OVER rows), whatever the key order its rows are read in (close-out review F2).
+  ctx.out.absorb(scratch.out, 'legacy', true);
   if (tokens.length) {
     // A well-formed copy of the same node stating only the tokens, so any reader takes it as a copy and holds it again.
     const { parentLocalId, guid, key: k, prefab, name } = node;
@@ -613,6 +654,117 @@ function referenceCopy<Own>(ctx: Ctx<Own>, chain: Chain, key: string, node: Adde
     ctx.warnings.push({ code: 'pendingLegacy', key, message: `a copy of template node ${key} states member parents as tokens no reader resolves; the copy converts and they are kept` });
   }
   for (const [g, n] of scratch.ownContent) if (!ctx.ownContent.has(g)) ctx.ownContent.set(g, n);
+}
+
+/** The copy's own-frame nodes as ONE list (#2027, seeds 551/566/418(a)), as today's fold of the copy lists them
+ *  (`foldMemberRowChannels`), each the copy's own statement: the top-level `added` nodes no member row's whole `added`
+ *  replaced, then every plain member row's `added` and `own`, at the row's member. Which nodes a row replaced is decided
+ *  by today's own test on their anchors, not read off the fold's output, which clones a node a row reaches (close-out
+ *  review F1). A nested reference row's lists belong to its own frame. */
+function copySession(f: Frame, copy: AddedEntity): CopySession {
+  const top = copy.added ?? [];
+  const topKeys = frameKeyIndex(top as (AddedEntity & { key?: string })[]);
+  const replaced = new Set<AddedEntity>();
+  const s: CopySession = { frame: f.prefix, list: [], anchor: new Map(), rows: new Set(), keys: new Set() };
+  const keysOf = (list: unknown): void => {
+    for (const n of Array.isArray(list) ? list : []) {
+      if (!isRecord(n)) continue;
+      if (typeof n.key === 'string' && n.key) s.keys.add(n.key);
+      keysOf(n.children);
+    }
+  };
+  keysOf(copy.added);
+  for (const row of Object.values(isRecord(copy.members) ? copy.members : {})) if (isRecord(row)) { keysOf(row.added); keysOf(row.own); }
+  for (const slot of Object.values(isRecord(copy.nestedStructure) ? copy.nestedStructure : {})) if (isRecord(slot)) keysOf(slot.added);
+  for (const [rawKey, row] of Object.entries(isRecord(copy.members) ? copy.members : {})) {
+    const comp = /^\/[^/]+$/.test(rawKey) ? rawKey.slice(1) : null;
+    const member = comp && !nodeRowKey(comp) ? rowOfComponent(f, comp) : undefined;
+    if (!isRecord(row) || !member || typeof member.localId !== 'number' || member.prefab || member.localId === f.rootLid) continue;
+    const lid = member.localId;
+    s.rows.add(rawKey);
+    if (Array.isArray(row.added)) {
+      const named = new Set(row.added.map((n) => (isRecord(n) && typeof n.key === 'string' ? n.key : '')).filter(Boolean));
+      for (const n of top) {
+        const k = typeof (n as { key?: unknown }).key === 'string' ? (n as { key: string }).key : '';
+        if (n.parentLocalId === lid || (!!k && named.has(k) && topKeys.get(k) === n && placedAnchor(f.doc as never, n.parentLocalId) === lid)) replaced.add(n);
+      }
+    }
+    for (const n of [...(Array.isArray(row.added) ? row.added : []), ...(Array.isArray(row.own) ? row.own : [])] as AddedEntity[]) {
+      s.list.push(n);
+      s.anchor.set(n, lid);
+    }
+  }
+  s.list.unshift(...top.filter((n) => !replaced.has(n)));
+  return s;
+}
+
+/** Where the copied chain node's own statements reach, keyed from its frame: a member-row key (its rows and the rows the
+ *  layers above state into it) or a `nestedStructure` localId path. */
+interface Reach { key: (rel: string) => boolean; path: (lids: string) => boolean }
+
+function reachOf(node: AddedEntity | null | undefined): Reach {
+  // Structure only: the chain node's VALUES apply under the copy as well (`baseLayersOf`), so a row stating only values
+  // cannot make the restore wrong, and is no reason to hold the copy (re-review N2).
+  const structural = (r: unknown): boolean => isRecord(r) && (['removed', 'removedTraits', 'traitRemovals', 'added', 'own'] as const).some((f) => r[f] !== undefined);
+  const keys: string[] = Object.entries(node?.members ?? {}).filter(([, r]) => structural(r)).map(([k]) => k);
+  for (const o of node ? overRowsOf<AddedEntity>(node) : []) {
+    keys.push(...Object.entries(o.rows ?? {}).filter(([, r]) => structural(r)).map(([k]) => k));
+    if (structural(o.rootRow)) keys.push('/');
+  }
+  const paths = Object.keys(node?.nestedStructure ?? {});
+  return {
+    key: (rel) => keys.some((k) => k === rel || k.startsWith(`${rel}/`)),
+    path: (lids) => paths.some((p) => p === lids || p.startsWith(`${lids}.`)),
+  };
+}
+
+/** Under a scene copy, the chain node's own STRUCTURE does not apply (today: `baseLayersOf`, values only; #2027, seed
+ *  1231): at every frame of the copy, a removal, a component removal or a node on which the chain and the copy's fold `d`
+ *  disagree, and which no statement of the copy already decides, is stated back to what `d` shows. The copy's own
+ *  statements are recorded as written; this pass adds only what the copy left unsaid, and nothing both folds agree on.
+ *  `docs`: the documents containing frame `c`, its own last (a cycle is a document containing itself, § 10.4b — not a
+ *  document repeated on the hang path). `rel` / `lids`: the frame's key and localId path from the copy's frame. False when
+ *  a frame the chain node's statements reach cannot be read: the copy is then held whole (all or nothing; review F5). */
+function restoreChainStructure<Own>(ctx: Ctx<Own>, c: Chain, d: Chain, docs: readonly string[], reach: Reach, rel = '', lids: string | null = ''): boolean {
+  const f = c.frame;
+  const rec = (k: RowKey): AnyRecord | undefined => ctx.out.rows.get(k);
+  const dRemoved = new Set(d.lists.removed ?? []);
+  for (const lid of c.lists.removed ?? []) {
+    const k = dRemoved.has(lid) ? null : keyOfLid(f, lid);
+    if (k !== null && rec(k)?.removed === undefined) ctx.out.removed(k, false, 'legacy');
+  }
+  for (const [lid, names] of Object.entries(c.lists.removedTraits ?? {})) {
+    const k = keyOfLid(f, Number(lid));
+    if (k === null) continue;
+    const shown = new Set(d.lists.removedTraits?.[Number(lid)] ?? []);
+    for (const t of names) if (!shown.has(t) && rec(k)?.traitRemovals?.[t] === undefined) ctx.out.traitRemoval(k, t, false, 'legacy');
+  }
+  const cKeys = frameKeyIndex(c.lists.added as (AddedEntity & { key?: string })[] | undefined);
+  const dKeys = frameKeyIndex(d.lists.added as (AddedEntity & { key?: string })[] | undefined);
+  const nodeKey = (key: string): RowKey => `${f.prefix}/${nodeRowComponent(key)}`;
+  // A node only the chain has goes; a node a DOCUMENT supplies (template form, no guid) that the chain removed comes back.
+  for (const [key, n] of cKeys) if (n && !dKeys.has(key) && rec(nodeKey(key))?.removed === undefined) ctx.out.removed(nodeKey(key), true, 'legacy');
+  for (const [key, n] of dKeys) if (n && !n.guid && !cKeys.has(key) && !ctx.copy?.keys.has(key) && rec(nodeKey(key))?.removed === undefined) ctx.out.removed(nodeKey(key), false, 'legacy');
+  // Down: every nested row of the document, and every reference node a document supplies to both folds. One the copy
+  // restates is a scene statement in `d`, guid and all: a copy of its own (`referenceCopy`). A supplied node is nested in
+  // the document that wrote it, one that contains this frame, so its cycle test leaves this frame's own document out.
+  const down: { comp: string; docs: readonly string[]; lids: string | null }[] = [];
+  for (const [lid, row] of f.byLid) {
+    if (row.prefab && lid !== f.rootLid && !docs.includes(row.prefab)) down.push({ comp: componentOf(f, lid)!, docs, lids: lids === null ? null : lids ? `${lids}.${lid}` : String(lid) });
+  }
+  const writers = docs.slice(0, -1);
+  for (const [key, n] of dKeys) {
+    if (n?.prefab && !n.guid && cKeys.get(key)?.prefab === n.prefab && !writers.includes(n.prefab)) down.push({ comp: nodeRowComponent(key), docs: writers, lids: null });
+  }
+  for (const step of down) {
+    const cs = chainStep(c, step.comp, ctx.read);
+    const ds = chainStep(d, step.comp, ctx.read);
+    const at = `${rel}/${step.comp}`;
+    if ('frame' in cs && 'frame' in ds) {
+      if (!restoreChainStructure(ctx, cs, ds, [...step.docs, cs.frame.docGuid], reach, at, step.lids)) return false;
+    } else if (('unresolved' in cs || 'unresolved' in ds) && (reach.key(at) || (step.lids !== null && reach.path(step.lids)))) return false;
+  }
+  return true;
 }
 
 /** One chain step per localId of a `.`-joined path. */
@@ -782,8 +934,17 @@ function convertRows<Own>(ctx: Ctx<Own>, prefix: string, rows: Record<string, Sc
     }
     if (isRecord(row.traitRemovals)) for (const [t, on] of Object.entries(row.traitRemovals)) if (typeof on === 'boolean') ctx.out.traitRemoval(key, t, on, 'row');
     if (typeof row.removed === 'boolean') ctx.out.removed(key, row.removed, 'row');
-    if (Array.isArray(row.added) && !unnamed) wholeAdded(ctx, key, row.added, ['members', rawKey, 'added'], isRemainder(row));
-    if (Array.isArray(row.own)) ctx.out.own(key, row.own.map((n) => ctx.form.ownNode(n, key)), 'row');
+    // A reference copy's row in its own frame: its nodes are in the copy's one list, paired there (#2027).
+    const inCopyList = !!ctx.copy?.rows.has(rawKey);
+    if (Array.isArray(row.added) && !unnamed && !inCopyList) wholeAdded(ctx, key, row.added, ['members', rawKey, 'added'], isRemainder(row));
+    if (Array.isArray(row.own) && !inCopyList) {
+      // A copy restates the chain node it replaced, keyed, in whichever list (`pairWithBase` pairs `own` as `added`).
+      const target = ctx.copy ? rowTarget(ctx, key) : null;
+      if (target && target.lid !== null) {
+        ctx.out.stating = true;
+        try { pinAdded(ctx, target.chain, row.own, target.lid, ['members', rawKey, 'own'], true); } finally { ctx.out.stating = false; }
+      } else ctx.out.own(key, row.own.map((n) => ctx.form.ownNode(n, key)), 'row');
+    }
     if (typeof row.parent === 'string') {
       // A scene row states its parent by GUID. A member token written there is a legacy form no gesture writes (#1869):
       // today's drain resolves it from frame root 0, naming nothing, and the member stays. Held verbatim and unused, not

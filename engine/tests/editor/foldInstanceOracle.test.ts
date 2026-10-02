@@ -393,8 +393,17 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const QL = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0, { traits: { EntityAttributes: { name: 'Q', parentId: 0 }, Transform: tf, Light: {} } }), row(2, 'QA', 1)] };
       install(P([row(5, 'R', 1, { prefab: 'Q', removedTraits: { 1: ['Light'] } })]), QL);
       const restore = top({ removedTraits: { 5: ['Light'] }, members: { [`/${g(5, 'R')}`]: { removedTraits: [] } } });
-      // Light stays removed, as today. The kept legacy removal restates the chain's, so it is reported unused (gone).
-      expect(await check([restore], restore)).toEqual([`fold-only unused /${g(5, 'R')} -Light (gone)`]);
+      // Light stays removed, as today. The kept legacy removal restates the chain's: an APPLIED record, not unused (hub
+      // ruling on #2023's 418(b), #2027 — F1 by analogy; its target exists, so Remove Unused must not take it).
+      expect(await check([restore], restore)).toEqual([]);
+      expect((await fold(restore)).f.unused).toEqual([]);
+      // The same at an entry-level row (418(b) is not copy-specific): a whole list restating the chain's removal.
+      const entryRow = top({ members: { [`/${g(5, 'R')}`]: { removedTraits: ['Light'] } } });
+      expect(await check([entryRow], entryRow)).toEqual([]);
+      const { parsed, f } = await fold(entryRow);
+      expect(parsed.record.list.rows.get(`/${g(5, 'R')}` as never)?.traitRemovals).toEqual({ Light: true });
+      expect(f.unused).toEqual([]);
+      expect(f.nodes.get(`/${g(5, 'R')}` as never)?.traits.Light).toBeUndefined();
     });
 
     it('5 (review): an alias row\'s token replaces no other row\'s move', async () => {
@@ -434,6 +443,179 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const base = { [`/${g(3, 'A')}`]: { removed: true }, [`/${g(5, 'D')}`]: { guid: G(83) }, [`/${g(4, 'B')}`]: { guid: G(84), parent: G(83) } };
       expect(await check(...same({ members: { ...base, [`/${g(2, 'M')}`]: { parent: G(84) } } }))).toEqual([]);
       expect(await check(...same({ members: { ...base, [`/${g(6, 'N')}`]: { parent: G(84) } } }))).toEqual([]);
+    });
+  });
+
+  describe('#2027: a scene reference COPY\'s structure is ONE whole statement, over the chain without the base node\'s structure', () => {
+    // Q3 ← S in Q2 ← k1 (a template-added reference node P's row R adds at QA) ← the scene's copy of k1.
+    const lit = (name: string, parentId: number) => ({ traits: { EntityAttributes: { name, parentId }, Transform: tf, Light: {} } });
+    const Q3 = { id: 'Q3', version: 5, rootLocalId: 1, entities: [row(1, 'Q3', 0), row(2, 'Q3XX', 1, lit('Q3XX', 1))] };
+    const Q2 = { id: 'Q2', version: 5, rootLocalId: 1, entities: [row(1, 'Q2', 0), row(2, 'Q2A', 1), row(3, 'Q2B', 2, lit('Q2B', 2)), row(4, 'S', 1, { prefab: 'Q3' })] };
+    const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1), row(3, 'QB', 2)] };
+    const g = (lid: number, name: string) => row(lid, name, 0).nodeGuid;
+    const k1 = { parentLocalId: 2, guid: '', key: 'k1', prefab: 'Q2', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] };
+    const k2 = { parentLocalId: 0, guid: '', key: 'k2', name: 'K2', traits: { EntityAttributes: { name: 'K2' }, Transform: tf }, children: [] };
+    /** P adds k1 (its template statement: `base`); the scene entry replaces it at QA with its copy (`copy`). */
+    const scene = (base: object, copy: object, docs: Array<{ id: string } & Record<string, unknown>> = [Q2, Q3]): SceneEntityEntry => {
+      install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(5, 'R', 1, { prefab: 'Q', added: [{ ...k1, ...base }] })] }, Q, ...docs);
+      return top({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [{ ...k1, guid: G(95), ...copy }] } } });
+    };
+    const fold = async (e: SceneEntityEntry) => {
+      const { parseInstanceRecord } = await import('../../packages/modoki/src/runtime/prefab/parseInstanceRecord');
+      const { foldInstance } = await import('../../packages/modoki/src/runtime/prefab/foldInstance');
+      const parsed = parseInstanceRecord(e, reader, { sceneVersion: 15 });
+      return { parsed, f: foldInstance(reader, parsed.record) };
+    };
+    const K1 = `/${g(5, 'R')}/a+k1`;
+
+    it('A (seed 566): a KEYED node in a copy row\'s own pairs with the chain node it restates — one node, at its a+key row', async () => {
+      // Beside it, a keyless node of the user's: linked once, at the row's member.
+      const mine = { parentLocalId: 0, guid: G(98), name: 'Mine', traits: { EntityAttributes: { name: 'Mine', guid: G(98) }, Transform: tf }, children: [] };
+      const e = scene({ members: { [`/${g(2, 'Q2A')}`]: { added: [k2] } } }, { members: { [`/${g(2, 'Q2A')}`]: { own: [{ ...k2, guid: G(96) }, mine] } } });
+      expect(await check([e], e)).toEqual([]);
+      const { parsed, f } = await fold(e);
+      expect(f.anchors.get(`${K1}/${g(2, 'Q2A')}` as never)?.map((r) => r.guid)).toEqual([G(98)]);
+      expect(parsed.record.list.rows.get(`${K1}/a+k2` as never)?.guid).toBe(G(96));
+      // The same one frame down: a deeper row's keyed own pairs with the chain node at its member.
+      const deep = `/${g(4, 'S')}/${g(2, 'Q3XX')}`;
+      const down = scene({ members: { [deep]: { added: [k2] } } }, { members: { [deep]: { own: [{ ...k2, guid: G(96) }] } } });
+      expect(await check([down], down)).toEqual([]);
+      expect((await fold(down)).f.anchors.get(`${K1}${deep}` as never)).toBeUndefined();
+      // A copy that does not restate it: today spawns nothing there (the copy's structure is whole), and the fold agrees.
+      const none = scene({ members: { [`/${g(2, 'Q2A')}`]: { added: [k2] } } }, { members: {} });
+      expect(await check([none], none)).toEqual([]);
+      expect((await fold(none)).f.nodes.has(`${K1}/a+k2` as never)).toBe(false);
+    });
+
+    it('A′ (seed 418): a copy row\'s added restates a node of the base\'s top-level list — paired, not pinned AND removed', async () => {
+      const e = scene({ added: [{ ...k2, parentLocalId: 2 }] }, { members: { [`/${g(2, 'Q2A')}`]: { added: [{ ...k2, guid: G(97) }] } } });
+      expect(await check([e], e)).toEqual([]);
+      const { parsed, f } = await fold(e);
+      expect(f.nodes.has(`${K1}/a+k2` as never)).toBe(true);
+      expect(parsed.record.list.rows.get(`${K1}/a+k2` as never)?.removed).toBeUndefined();
+      // The one list is today's: a row's whole added replaces the copy's top-level nodes at its member.
+      const node = (n: number, at: number) => ({ parentLocalId: at, guid: G(n), name: `N${n}`, traits: { EntityAttributes: { name: `N${n}`, guid: G(n) }, Transform: tf }, children: [] });
+      const replaced = scene({}, { added: [node(110, 2)], members: { [`/${g(2, 'Q2A')}`]: { added: [node(111, 0)] } } });
+      expect(await check([replaced], replaced)).toEqual([]);
+      expect((await fold(replaced)).f.anchors.get(`${K1}/${g(2, 'Q2A')}` as never)?.map((r) => r.guid)).toEqual([G(111)]);
+    });
+
+    describe('close-out review (F1–F5)', () => {
+      const deep = `/${g(4, 'S')}/${g(2, 'Q3XX')}`;
+      const Q4 = { id: 'Q4', version: 5, rootLocalId: 1, entities: [row(1, 'Q4', 0), row(2, 'Q4Y', 1, lit('Q4Y', 1))] };
+      const kx = { parentLocalId: 2, guid: '', key: 'kx', prefab: 'Q4', name: 'KX', traits: { EntityAttributes: { name: 'KX' }, Transform: tf }, children: [] };
+      const withS = (added: object[], docs: Array<{ id: string } & Record<string, unknown>> = [Q3, Q4]) => [{ ...Q2, entities: [...Q2.entities.slice(0, 3), row(4, 'S', 1, { prefab: 'Q3', added })] }, ...docs];
+      /** The owner's own row into the copy's frame, read BEFORE the row holding the copy (writers sort member keys). */
+      const first = (e: SceneEntityEntry, rows: Record<string, object>): SceneEntityEntry => ({ ...e, members: { ...rows, ...e.members } }) as SceneEntityEntry;
+
+      it('F1: a copy\'s own top-level node a node row reaches is still in the one list (the fold clones it)', async () => {
+        const kz = { ...kx, key: 'kz' };
+        const r9 = scene({ added: [kz] }, { added: [{ ...kz, guid: G(120) }], members: { [`/a+kz/${g(2, 'Q4Y')}`]: { traits: { Transform: { x: 3 } } } } }, [Q2, Q3, Q4]);
+        expect(await check([r9], r9)).toEqual([]);
+        expect((await fold(r9)).f.nodes.has(`${K1}/a+kz` as never)).toBe(true);
+        const k2a = { ...k2, parentLocalId: 2 };
+        const r8 = scene({ added: [k2a] }, { added: [{ ...k2a, guid: G(121) }], members: { '/a+k2': { traits: { Transform: { x: 3 } } } } });
+        expect(await check([r8], r8)).toEqual([]);
+      });
+
+      it('F2: the owner\'s own rows into the copy\'s frame win over the copy, in either key order', async () => {
+        const r2 = first(scene({ members: { [deep]: { removed: true } } }, { members: {} }), { [`${K1}${deep}`]: { removed: true } });
+        expect(await check([r2], r2)).toEqual([]);
+        expect((await fold(r2)).parsed.record.list.rows.get(`${K1}${deep}` as never)?.removed).toBe(true);
+        const r1 = first(scene({ members: { [deep]: { traitRemovals: { Light: true } } } }, { members: {} }), { [`${K1}${deep}`]: { traitRemovals: { Light: true } } });
+        expect(await check([r1], r1)).toEqual([]);
+        // The copy's own frame too (its top-level lists' restores; this predates #2027).
+        const q2b = `/${g(3, 'Q2B')}`;
+        const r4 = first(scene({ members: { [q2b]: { traitRemovals: { Light: true } } } }, { members: {} }), { [`${K1}${q2b}`]: { traitRemovals: { Light: true } } });
+        expect(await check([r4], r4)).toEqual([]);
+      });
+
+      it('F3: a node a DOCUMENT supplies, which the base removes and the copy says nothing about, shows, as today', async () => {
+        for (const n of [{ ...k2, key: 'kp', parentLocalId: 2 }, kx]) {
+          const e = scene({ members: { [`/${g(4, 'S')}/a+${n.key}`]: { removed: true } } }, { members: {} }, withS([n]));
+          expect(await check([e], e)).toEqual([]);
+          expect((await fold(e)).f.nodes.has(`${K1}/${g(4, 'S')}/a+${n.key}` as never)).toBe(true);
+        }
+      });
+
+      it('F4: a document repeated on the hang path (not containing itself) is walked: the base\'s removal there does not apply', async () => {
+        const Q4t = { ...Q4, entities: [...Q4.entities, row(3, 'T', 1, { prefab: 'Q3' })] };
+        const at = `/${g(4, 'S')}/a+kx/${g(3, 'T')}/${g(2, 'Q3XX')}`;
+        const e = scene({ members: { [at]: { traitRemovals: { Light: true } } } }, { members: {} }, withS([kx], [Q3, Q4t]));
+        expect(await check([e], e)).toEqual([]);
+        expect((await fold(e)).f.nodes.get(`${K1}${at}` as never)?.traits.Light).toBeDefined();
+      });
+
+      it('re-review N1: an earlier SLOT copy of the same node does not beat the row\'s copy, which replaces it (today: x=7)', async () => {
+        const q2b = `/${g(3, 'Q2B')}`;
+        const e0 = scene({}, { overrides: { 3: { Transform: { x: 7 } } } });
+        const e = { ...e0, nestedStructure: { '5': { added: [{ ...k1, guid: G(130), overrides: { 3: { Transform: { x: 5 } } } }] } } } as SceneEntityEntry;
+        expect(await check([e], e)).toEqual([]);
+        expect(((await fold(e)).f.nodes.get(`${K1}${q2b}` as never)?.traits.Transform as { x?: number })?.x).toBe(7);
+      });
+
+      it('re-review N3: a guid-less keyed node the COPY states is not "restored" as if a document supplied it', async () => {
+        const kq = { parentLocalId: 2, guid: '', key: 'kq', name: 'KQ', traits: { EntityAttributes: { name: 'KQ' }, Transform: tf }, children: [] };
+        const { parsed } = await fold(scene({}, { added: [kq] }));
+        expect(parsed.record.list.rows.get(`${K1}/a+kq` as never)?.removed).toBeUndefined();
+      });
+
+      it('F5: a frame the base reaches that cannot be read holds the copy whole (all or nothing); one it does not reach does not', async () => {
+        const e = scene({ members: { [deep]: { traitRemovals: { Light: true } } } }, { members: {} }, [Q2]);
+        expect((await fold(e)).parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [{ ...k1, guid: G(95), members: {} }], heldRemainder: true } } });
+        const quiet = scene({}, { members: {} }, [Q2]);
+        expect((await fold(quiet)).parsed.record.held.pendingLegacy).toBeUndefined();
+        // A row the base states there with VALUES only is no reason: values apply under the copy anyway (re-review N2).
+        const values = scene({ members: { [deep]: { traits: { Transform: { x: 42 } } } } }, { overrides: { 3: { Transform: { x: 7 } } } }, [Q2]);
+        expect((await fold(values)).parsed.record.held.pendingLegacy).toBeUndefined();
+      });
+    });
+
+    describe('seed 1231: the base node\'s STRUCTURE records do not survive under the copy (today: `baseLayersOf`, values only)', () => {
+      const deep = `/${g(4, 'S')}/${g(2, 'Q3XX')}`;
+      it('the copy restates the base\'s removal: no Light, and the restated removal is applied (418(b)), not unused', async () => {
+        const e = scene({ members: { [deep]: { traitRemovals: { Light: true } } } }, { members: { [deep]: { traitRemovals: { Light: true } } } });
+        expect(await check([e], e)).toEqual([]);
+        const { f } = await fold(e);
+        expect(f.nodes.get(`${K1}${deep}` as never)?.traits.Light).toBeUndefined();
+        expect(f.unused).toEqual([]);
+      });
+      it('the copy omits the base\'s removal: Light shows, as today', async () => {
+        for (const at of [deep, `/${g(3, 'Q2B')}`]) {
+          const e = scene({ members: { [at]: { traitRemovals: { Light: true } } } }, { members: {} });
+          expect(await check([e], e)).toEqual([]);
+          expect((await fold(e)).f.nodes.get(`${K1}${at}` as never)?.traits.Light).toBeDefined();
+        }
+      });
+      it('the base removes a member the copy says nothing about: it shows, as today', async () => {
+        const e = scene({ members: { [deep]: { removed: true } } }, { members: {} });
+        expect(await check([e], e)).toEqual([]);
+        expect((await fold(e)).f.nodes.has(`${K1}${deep}` as never)).toBe(true);
+      });
+      it('the base adds a node at a deeper member the copy says nothing about: it is not there, as today', async () => {
+        const e = scene({ members: { [deep]: { added: [k2] } } }, { members: {} });
+        expect(await check([e], e)).toEqual([]);
+        expect((await fold(e)).f.nodes.has(`${K1}/${g(4, 'S')}/a+k2` as never)).toBe(false);
+      });
+      it('through a reference node a DOCUMENT supplies to both (not the copy): the base\'s removal there does not apply either', async () => {
+        const Q4 = { id: 'Q4', version: 5, rootLocalId: 1, entities: [row(1, 'Q4', 0), row(2, 'Q4Y', 1, lit('Q4Y', 1))] };
+        const kx = { parentLocalId: 2, guid: '', key: 'kx', prefab: 'Q4', name: 'KX', traits: { EntityAttributes: { name: 'KX' }, Transform: tf }, children: [] };
+        const Q2x = { ...Q2, entities: [...Q2.entities.slice(0, 3), row(4, 'S', 1, { prefab: 'Q3', added: [kx] })] };
+        const at = `/${g(4, 'S')}/a+kx/${g(2, 'Q4Y')}`;
+        const e = scene({ members: { [at]: { traitRemovals: { Light: true } } } }, { members: {} }, [Q2x, Q3, Q4]);
+        expect(await check([e], e)).toEqual([]);
+        expect((await fold(e)).f.nodes.get(`${K1}${at}` as never)?.traits.Light).toBeDefined();
+      });
+      it('a document that contains itself further down ends the walk (no stack overflow)', async () => {
+        const Q3c = { ...Q3, entities: [...Q3.entities, row(3, 'Z', 1, { prefab: 'Q2' })] };
+        const { parsed } = await fold(scene({ members: { [deep]: { removed: true } } }, { members: {} }, [Q2, Q3c]));
+        expect(parsed.record.list.rows.get(`${K1}${deep}` as never)?.removed).toBe(false);
+      });
+      it('the base sets a field the copy says nothing about: a value layer, so it still holds (today: x=42)', async () => {
+        const e = scene({ members: { [deep]: { traits: { Transform: { x: 42 } } } } }, { members: {} });
+        expect(await check([e], e)).toEqual([]);
+        expect(((await fold(e)).f.nodes.get(`${K1}${deep}` as never)?.traits.Transform as { x?: number })?.x).toBe(42);
+      });
     });
   });
 
