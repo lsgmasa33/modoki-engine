@@ -126,6 +126,7 @@ describe.skipIf(!hasInternalGames())('#2007 oracle: the fold is what today spawn
           const root = [...getCurrentWorld().entities].find((e) => (e.get(ea) as { guid?: string } | undefined)?.guid === entry.guid);
           if (!root) { lines.push(`${entry.name}: no live root`); continue; }
           for (const d of checkInstance(entry, reader, root.id(), {
+            sceneVersion: (typeof (file as { version?: unknown }).version === 'number' ? (file as { version: number }).version : 0),
             parentGuid: (r) => (typeof r === 'number' ? idToGuid.get(r) ?? '' : typeof r === 'string' ? r : ''),
             sceneHadCopies: !!file.embeddedPrefabs, held: (g) => held.has(g),
           })) lines.push(`${entry.name}: ${d}`);
@@ -163,9 +164,247 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
     vi.unstubAllGlobals();
     const root = [...getCurrentWorld().entities].find((e) => (e.get(ea()) as { guid?: string } | undefined)?.guid === ROOT)!;
     const held = new Set(entries.map((e) => e.guid).filter((g): g is string => !!g));
-    return checkInstance(entry, reader, root.id(), { held: (g) => held.has(g) });
+    return checkInstance(entry, reader, root.id(), { sceneVersion: 15, held: (g) => held.has(g) });
   };
   const top = (extra: object = {}): SceneEntityEntry => ({ id: 2, name: 'Ship', prefab: 'P', guid: ROOT, traits: { PrefabInstance: { source: 'P', localId: 1 }, EntityAttributes: { name: 'Ship', guid: ROOT, parentId: 0 } }, ...extra }) as SceneEntityEntry;
+
+  describe('#2022 (hub rulings 2026-10-02): the fold\'s residual move and cascade cases, against today\'s load', () => {
+    const Q = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1), row(3, 'QB', 2)] };
+    const P = (extra: object[] = [], moved?: object) => ({ id: 'P', version: 5, rootLocalId: 1, ...(moved ? { moved } : {}), entities: [row(1, 'Ship', 0), row(2, 'A', 1), row(3, 'B', 2), row(4, 'C', 1), ...extra] });
+    const g = (lid: number, name: string) => row(lid, name, 0).nodeGuid;
+    const same = (extra: object): [SceneEntityEntry[], SceneEntityEntry] => [[top(extra)], top(extra)];
+    const fold = async (e: SceneEntityEntry, opts: { sceneVersion: number } = { sceneVersion: 15 }) => {
+      const { parseInstanceRecord } = await import('../../packages/modoki/src/runtime/prefab/parseInstanceRecord');
+      const { foldInstance } = await import('../../packages/modoki/src/runtime/prefab/foldInstance');
+      const parsed = parseInstanceRecord(e, reader, opts);
+      return { parsed, f: foldInstance(reader, parsed.record) };
+    };
+
+    it('1, a ruled visible FIX: a move into a row today deletes later is refused, and the member stays (today loses it)', async () => {
+      install(P([row(5, 'E', 1)]));
+      const e = top({ members: { [`/${g(2, 'A')}`]: { removed: true, guid: G(82) }, [`/${g(4, 'C')}`]: { guid: G(81) }, [`/${g(3, 'B')}`]: { parent: G(81) }, [`/${g(5, 'E')}`]: { parent: G(82) } } });
+      expect(await check([e], e)).toEqual([`fold-only node /${g(5, 'E')}`]);
+    });
+
+    it('2: a plain row under a removed missing-prefab row goes with it, in either form (no dangling parent)', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'M-missing' }), row(6, 'X', 5)]));
+      // Today books the row\'s removal twice, kept AND applied (#2013, ruled today-wrong): the oracle marks it applied.
+      expect(await check(...same({ members: { [`/${g(5, 'R')}`]: { removed: true } } }))).toEqual([`kept-only unused /${g(5, 'R')} removed (applied)`]);
+      expect(await check(...same({ removed: [5] }))).toEqual([]);
+    });
+
+    it('3: the instance root\'s own parent record moves nothing and is reported unused, gone', async () => {
+      install(P());
+      expect(await check(...same({ members: { '/': { parent: SCENE } } }))).toEqual([]);
+      // The legacy form: today drops it (lost on save); the rules report it ("never neither").
+      expect(await check(...same({ moved: { 1: SCENE } }))).toEqual(['fold-only unused / parent (gone)']);
+    });
+
+    it('4: under the instance\'s own removal, a template-keyed node\'s ignored parent is inert — kept, not unused', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'Q', added: [{ parentLocalId: 2, guid: '', key: 'k1', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] }] })]), Q);
+      const e = top({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { removed: true }, [`/${g(5, 'R')}/a+k1`]: { parent: SCENE } } });
+      expect(await check([e], e)).toEqual([]);
+      expect((await fold(e)).f.unused).toEqual([]);
+    });
+
+    it('4 (rule 3, G2): under the instance\'s own removal, a removal that would not take and an unknown field are inert too', async () => {
+      install(P());
+      const e = top({ members: { [`/${g(3, 'B')}`]: { removed: true, traitRemovals: { Light: true }, traits: { Transform: { bogus: 1 } } } } });
+      expect(await check([e], e)).toEqual([]);
+      expect((await fold(e)).f.unused).toEqual([]);
+    });
+
+    it('5, matching today: a member token written in a scene row names nothing — the member stays, the token is kept, unused, and warned', async () => {
+      install(P());
+      const e = top({ members: { [`/${g(3, 'B')}`]: { parent: '@member:4' } } });
+      // Today keeps the row and ignores it; the rules report the record (unused, gone).
+      expect(await check([e], e)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      const { parsed, f } = await fold(e);
+      expect(f.nodes.get(`/${g(3, 'B')}` as never)?.parent).toEqual({ key: `/${g(2, 'A')}` });
+      expect(parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(3, 'B')}`]: { parent: '@member:4' } } });
+      expect(parsed.warnings.some((w) => w.code === 'pendingLegacy' && w.key === `/${g(3, 'B')}`)).toBe(true);
+    });
+
+    it('5 (review): the held token is still the member\'s ONE move — it replaces a lower one, and a legacy move of the same row', async () => {
+      install(P([], { '2.3': '@member:4' }));
+      const e = top({ members: { [`/${g(3, 'B')}`]: { parent: '@member:99' } } });
+      expect(await check([e], e)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      install(P());
+      const e2 = top({ moved: { 3: G(81) }, members: { [`/${g(4, 'C')}`]: { guid: G(81) }, [`/${g(3, 'B')}`]: { parent: '@member:99' } } });
+      expect(await check([e2], e2)).toEqual([`fold-only unused /${g(3, 'B')} parent (gone)`]);
+      expect((await fold(e2)).parsed.record.list.rows.get(`/${g(3, 'B')}` as never)?.parent).toBeUndefined();
+    });
+
+    it('5 (review): a held token under the instance\'s own removal is inert, as every record there', async () => {
+      install(P());
+      expect((await fold(top({ members: { [`/${g(3, 'B')}`]: { removed: true, parent: '@member:4' } } }))).f.unused).toEqual([]);
+      expect((await fold(top({ members: { [`/${g(2, 'A')}`]: { removed: true }, [`/${g(3, 'B')}`]: { parent: '@member:4' } } }))).f.unused).toEqual([]);
+    });
+
+    it('5 (review; hub Q1): a reference copy whose member row carries a token CONVERTS before v20 — only the token is held', async () => {
+      const Q2 = { id: 'Q2', version: 5, rootLocalId: 1, entities: [row(1, 'Q2', 0), row(2, 'Q2A', 1), row(3, 'Q2B', 2)] };
+      const k1 = { parentLocalId: 2, guid: '', key: 'k1', prefab: 'Q2', name: 'K1', traits: { EntityAttributes: { name: 'K1' }, Transform: tf }, children: [] };
+      install(P([row(5, 'R', 1, { prefab: 'Q', added: [k1] })]), Q, Q2);
+      const copy = { ...k1, members: { [`/${g(3, 'Q2B')}`]: { parent: '@member:2', traits: { Transform: { x: 7 } } } } };
+      const e = top({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [copy] } } });
+      // Today applies the copy's x=7 and ignores the token: so does the fold. The token is kept as an unnameable remainder,
+      // reported as a held copy whose node shows is — waiting, never removable (close-out review round 2).
+      expect(await check([e], e)).toEqual([`fold-only unused /${g(5, 'R')}/${g(2, 'QA')} own (unresolved)`]);
+      const { parsed, f } = await fold(e);
+      expect(parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [{ ...copy, traits: {}, children: [], members: { [`/${g(3, 'Q2B')}`]: { parent: '@member:2' } } }], heldRemainder: true } } });
+      expect(f.unused.length).toBe(1);
+      // From v20 no writer states a copy: held whole.
+      expect((await fold(e, { sceneVersion: 20 })).parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [copy], heldRemainder: true } } });
+      // Written back, the converted overrides and the held token read back as they were.
+      const { roundTripEntry } = await import('./instanceRecordRoundTrip');
+      const rt = roundTripEntry(e, reader, { sceneVersion: 15 });
+      expect(rt.second.record.held.pendingLegacy).toEqual(rt.first.record.held.pendingLegacy);
+      expect(rt.second.record.list).toEqual(rt.first.record.list);
+      // The held element states the copy's identity and the tokens, nothing else: its other channels converted.
+      const withChannels = { ...copy, overrides: { 2: { Transform: { x: 5 } } } };
+      const held = (await fold(top({ members: { [`/${g(5, 'R')}/${g(2, 'QA')}`]: { added: [withChannels] } } }))).parsed.record.held.pendingLegacy as { members: Record<string, { added: object[] }> };
+      expect(Object.keys(held.members[`/${g(5, 'R')}/${g(2, 'QA')}`]!.added[0]!).sort()).toEqual(['children', 'guid', 'key', 'members', 'name', 'parentLocalId', 'prefab', 'traits']);
+    });
+
+    it('#2024: a restore AT a placeholder row whose template removed it is applied — the placeholder shows — and not unused', async () => {
+      const QZ = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QZ', 1, { prefab: 'Z-missing' })] };
+      install(P([row(5, 'R', 1, { prefab: 'Q', members: { [`/${g(2, 'QZ')}`]: { removed: true } } })]), QZ);
+      const e = top({ members: { [`/${g(5, 'R')}/${g(2, 'QZ')}`]: { removed: false } } });
+      expect(await check([e], e)).toEqual([]);
+      const { f } = await fold(e);
+      expect(f.placeholders.has(`/${g(5, 'R')}/${g(2, 'QZ')}` as never)).toBe(true);
+      expect(f.unused).toEqual([]);
+      expect((await fold(top())).f.placeholders.has(`/${g(5, 'R')}/${g(2, 'QZ')}` as never)).toBe(false);
+      // Only the removal: a field there targets the missing document's root, and waits on it.
+      const withField = top({ members: { [`/${g(5, 'R')}/${g(2, 'QZ')}`]: { removed: false, traits: { Transform: { x: 3 } } } } });
+      expect((await fold(withField)).f.unused.map((u) => `${u.part.kind} ${u.cause}`)).toEqual(['field unresolved']);
+    });
+
+    it('#2025: a user node in a v16 row\'s added AT a Missing Prefab placeholder is anchored there, as in every file form', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'M-missing' })]));
+      const mine = { parentLocalId: 0, guid: G(84), name: 'Mine', traits: { EntityAttributes: { name: 'Mine', guid: G(84) }, Transform: tf }, children: [] };
+      const e = top({ members: { [`/${g(5, 'R')}`]: { added: [mine] } } });
+      expect(await check([e], e)).toEqual([]);
+      const { f, parsed } = await fold(e);
+      expect(f.anchors.get(`/${g(5, 'R')}` as never)).toEqual([{ guid: G(84) }]);
+      // The list it was stays held, the user's node taken out: it still replaces the missing document's nodes there.
+      expect(parsed.record.held.pendingLegacy).toEqual({ members: { [`/${g(5, 'R')}`]: { added: [] } } });
+      // One node, one link: stated already by the legacy channel, the row's copy of it stays held.
+      const twice = top({ added: [{ ...mine, parentLocalId: 1 }], members: { [`/${g(5, 'R')}`]: { added: [mine] } } });
+      expect(await check([twice], twice)).toEqual([]);
+      expect((await fold(twice)).f.anchors.get(`/${g(5, 'R')}` as never)).toBeUndefined();
+    });
+
+    it('2 (review): a failed move lifted through a cut placeholder reaches the nearest row that stays', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'M-missing' }), row(6, 'X', 5), row(7, 'M', 6)]));
+      const e = top({ members: { [`/${g(5, 'R')}`]: { removed: true }, [`/${g(6, 'X')}`]: { guid: G(83) }, [`/${g(7, 'M')}`]: { parent: G(83) } } });
+      expect((await fold(e)).f.nodes.get(`/${g(7, 'M')}` as never)?.parent).toEqual({ key: '/' });
+    });
+
+    it('4 (review): the instance\'s own removal of an ancestor covers a row an inner layer removed — its records inert', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'Q', members: { [`/${g(3, 'QB')}`]: { removed: true } } })]), Q);
+      const e = top({ members: { [`/${g(5, 'R')}`]: { removed: true }, [`/${g(5, 'R')}/${g(3, 'QB')}`]: { traits: { Transform: { x: 1 } } } } });
+      expect(await check([e], e)).toEqual([]);
+      expect((await fold(e)).f.unused).toEqual([]);
+      // The same with a missing-prefab row in the inner layer\'s place: the placeholder\'s records are inert too.
+      const Q3 = { id: 'Q3', version: 5, rootLocalId: 1, entities: [row(1, 'Q3', 0), row(2, 'S', 1, { prefab: 'M-missing' })] };
+      install(P([row(5, 'R', 1, { prefab: 'Q3', members: { [`/${g(2, 'S')}`]: { removed: true } } })]), Q3);
+      const e3 = top({ members: { [`/${g(5, 'R')}`]: { removed: true }, [`/${g(5, 'R')}/${g(2, 'S')}`]: { traits: { Transform: { x: 1 } } } } });
+      expect((await fold(e3)).f.unused).toEqual([]);
+    });
+
+    it('#2020: a whole removedTraits row on a plain template-added node is a stray form — held, not applied, at every version', async () => {
+      const lightTf = { EntityAttributes: { name: 'K2' }, Transform: tf, Light: {} };
+      install(P([row(5, 'R', 1, { prefab: 'Q', added: [{ parentLocalId: 2, guid: '', key: 'k2', name: 'K2', traits: lightTf, children: [] }] })]), Q);
+      const e = top({ members: { [`/${g(5, 'R')}/a+k2`]: { removedTraits: ['Light'] } } });
+      // Today keeps Light (and its next save drops the row); the fold keeps Light and reports the held row.
+      expect(await check([e], e)).toEqual([`fold-only unused /${g(5, 'R')}/a+k2 -Light (gone)`]);
+      const { parsed, f } = await fold(e);
+      expect(parsed.warnings.some((w) => w.code === 'pendingLegacy' && w.key === `/${g(5, 'R')}/a+k2`)).toBe(true);
+      expect(f.nodes.get(`/${g(5, 'R')}/a+k2` as never)?.traits.Light).toBeDefined();
+      // No writer states it, the v20 one included: written back, it reads back held — load, save, load shows the same.
+      expect((await fold(e, { sceneVersion: 20 })).f.nodes.get(`/${g(5, 'R')}/a+k2` as never)?.traits.Light).toBeDefined();
+      const { roundTripEntry } = await import('./instanceRecordRoundTrip');
+      const rt = roundTripEntry(e, reader, { sceneVersion: 15 });
+      expect(rt.second.record.held.pendingLegacy).toEqual(rt.first.record.held.pendingLegacy);
+    });
+
+    it('#2020: on a template-added REFERENCE node\'s root row, today applies it — and so does the fold', async () => {
+      const Q2 = { id: 'Q2', version: 5, rootLocalId: 1, entities: [row(1, 'Q2', 0, { traits: { EntityAttributes: { name: 'Q2', parentId: 0 }, Transform: tf, Light: {} } }), row(2, 'Q2A', 1)] };
+      install(P([row(5, 'R', 1, { prefab: 'Q', added: [{ parentLocalId: 2, guid: '', key: 'k2', prefab: 'Q2', name: 'K2', traits: { EntityAttributes: { name: 'K2' }, Transform: tf }, children: [] }] })]), Q, Q2);
+      const e = top({ members: { [`/${g(5, 'R')}/a+k2`]: { removedTraits: ['Light'] } } });
+      expect(await check([e], e)).toEqual([]);
+    });
+
+    it('#2019: before v20, a row\'s whole lists at a NESTED ROOT sit beside the legacy part (today shows both); a plain anchor replaces', async () => {
+      const QL = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0, { traits: { EntityAttributes: { name: 'Q', parentId: 0 }, Transform: tf, Light: {} } }), row(2, 'QA', 1)] };
+      install(P([row(5, 'R', 1, { prefab: 'Q' })]), QL);
+      const node = (n: number, name: string, at: number) => ({ parentLocalId: at, guid: G(n), name, traits: { EntityAttributes: { name, guid: G(n) }, Transform: tf }, children: [] });
+      const nested = top({ added: [node(61, 'LA', 5)], removedTraits: { 5: ['Light'] }, members: { [`/${g(5, 'R')}`]: { added: [node(62, 'RB', 5)], removedTraits: [] } } });
+      expect(await check([nested], nested)).toEqual([]);
+      const { f } = await fold(nested);
+      expect(f.nodes.get(`/${g(5, 'R')}` as never)?.traits.Light).toBeUndefined();
+      expect((f.anchors.get(`/${g(5, 'R')}` as never) ?? []).map((r) => r.guid).sort()).toEqual([G(61), G(62)].sort());
+      // From v20 the row wins (§ 10.3): a legacy channel beside it is a stray writer's.
+      expect((await fold(nested, { sceneVersion: 20 })).f.anchors.get(`/${g(5, 'R')}` as never)?.map((r) => r.guid)).toEqual([G(62)]);
+      const plain = top({ added: [node(63, 'LC', 2)], members: { [`/${g(2, 'A')}`]: { added: [node(64, 'RD', 2)] } } });
+      expect(await check([plain], plain)).toEqual([]);
+    });
+
+    it('#2019 review: a nested frame\'s OWN slot at its root is replaced by the row, as today; and the row\'s restore keeps a beside removal', async () => {
+      const Q2 = { id: 'Q2', version: 5, rootLocalId: 1, entities: [row(1, 'Q2', 0, { traits: { EntityAttributes: { name: 'Q2', parentId: 0 }, Transform: tf, Light: {} } }), row(2, 'Q2A', 1)] };
+      const QS = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1), row(3, 'S', 1, { prefab: 'Q2' })] };
+      install(P([row(5, 'R', 1, { prefab: 'Q' })]), QS, Q2);
+      const node = (n: number, name: string, at: number) => ({ parentLocalId: at, guid: G(n), name, traits: { EntityAttributes: { name, guid: G(n) }, Transform: tf }, children: [] });
+      const own = top({ nestedStructure: { '5.3': { added: [node(71, 'LA', 1)], removed: [], removedTraits: { 1: ['Light'] } } }, members: { [`/${g(5, 'R')}/${g(3, 'S')}`]: { added: [node(72, 'RB', 1)], removedTraits: [] } } });
+      expect(await check([own], own)).toEqual([]);
+      // The chain removed Light at R; the entry\'s legacy channel removes it again, and the row restores nothing it names.
+      const QL = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0, { traits: { EntityAttributes: { name: 'Q', parentId: 0 }, Transform: tf, Light: {} } }), row(2, 'QA', 1)] };
+      install(P([row(5, 'R', 1, { prefab: 'Q', removedTraits: { 1: ['Light'] } })]), QL);
+      const restore = top({ removedTraits: { 5: ['Light'] }, members: { [`/${g(5, 'R')}`]: { removedTraits: [] } } });
+      // Light stays removed, as today. The kept legacy removal restates the chain's, so it is reported unused (gone).
+      expect(await check([restore], restore)).toEqual([`fold-only unused /${g(5, 'R')} -Light (gone)`]);
+    });
+
+    it('5 (review): an alias row\'s token replaces no other row\'s move', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'Q' })]), Q);
+      const e = top({ members: { [`/${g(4, 'C')}`]: { guid: G(81) }, [`/${g(5, 'R')}`]: { parent: G(81) }, [`/${g(5, 'R')}/${g(1, 'Q')}`]: { parent: '@member:99' } } });
+      expect((await fold(e)).f.nodes.get(`/${g(5, 'R')}` as never)?.parent).toEqual({ key: `/${g(4, 'C')}` });
+    });
+
+    it('5 (review): a scene REFERENCE node\'s converted templateMoved survives a save — its row tokens are moves', async () => {
+      const { parseReferenceNode } = await import('../../packages/modoki/src/runtime/prefab/parseInstanceRecord');
+      const { foldInstance } = await import('../../packages/modoki/src/runtime/prefab/foldInstance');
+      const { serializeInstanceRecord } = await import('../../packages/modoki/src/runtime/prefab/serializeInstanceRecord');
+      const Q3 = { id: 'Q', version: 5, rootLocalId: 1, entities: [row(1, 'Q', 0), row(2, 'QA', 1), row(3, 'QB', 2), row(4, 'QC', 1)] };
+      install(Q3);
+      const node = { parentLocalId: 0, guid: G(90), name: 'QR', prefab: 'Q', traits: {}, children: [], templateMoved: { '2.3': '@member:4' } } as never;
+      const first = parseReferenceNode(node, reader, { sceneVersion: 15 });
+      const at = (p: typeof first) => foldInstance(reader, p.record).nodes.get(`/${g(3, 'QB')}` as never)?.parent;
+      expect(at(first)).toEqual({ key: `/${g(4, 'QC')}` });
+      const written = serializeInstanceRecord(first.record, { identity: new Map(), sceneOwned: (gd) => first.ownContent.get(gd) });
+      expect(at(parseReferenceNode({ ...written.entry, guid: G(90), name: 'QR', parentLocalId: 0, children: [] } as never, reader, { sceneVersion: 20 }))).toEqual({ key: `/${g(4, 'QC')}` });
+    });
+
+    it('6: a ^ token in a template move matches today, in each layer it can be written in', async () => {
+      install(P([row(5, 'R', 1, { prefab: 'Q' })], { '5.3': '@member:^4' }), Q);
+      expect(await check([top()], top())).toEqual([]);
+      install(P([row(5, 'R', 1, { prefab: 'Q', members: { [`/${g(3, 'QB')}`]: { parent: '@member:^4' } } })]), Q);
+      expect(await check([top()], top())).toEqual([]);
+      const Q2 = { id: 'Q2', version: 5, rootLocalId: 1, entities: [row(1, 'Q2', 0), row(2, 'Q2A', 1), row(3, 'S', 1, { prefab: 'Q' })] };
+      install(P([row(5, 'R', 1, { prefab: 'Q2', members: { [`/${g(3, 'S')}/${g(3, 'QB')}`]: { parent: '@member:^2' } } })]), Q2, Q);
+      expect(await check([top()], top())).toEqual([]);
+      install(P([row(5, 'R', 1, { prefab: 'Q2' })]), { ...Q2, entities: [row(1, 'Q2', 0), row(2, 'Q2A', 1), row(3, 'S', 1, { prefab: 'Q', members: { [`/${g(3, 'QB')}`]: { parent: '@member:^2' } } })] }, Q);
+      expect(await check([top()], top())).toEqual([]);
+    });
+
+    it('7 (not reproduced): a lift never frees a later cycle — it keeps the member inside every surviving ancestor', async () => {
+      install({ id: 'P', version: 5, rootLocalId: 1, entities: [row(1, 'Ship', 0), row(2, 'M', 1), row(3, 'A', 2), row(4, 'B', 3), row(5, 'D', 4), row(6, 'N', 1)] });
+      const base = { [`/${g(3, 'A')}`]: { removed: true }, [`/${g(5, 'D')}`]: { guid: G(83) }, [`/${g(4, 'B')}`]: { guid: G(84), parent: G(83) } };
+      expect(await check(...same({ members: { ...base, [`/${g(2, 'M')}`]: { parent: G(84) } } }))).toEqual([]);
+      expect(await check(...same({ members: { ...base, [`/${g(6, 'N')}`]: { parent: G(84) } } }))).toEqual([]);
+    });
+  });
 
   it('a template-added reference node is nested in the document that WROTE it, not the frame it hangs in (fuzz seed 6)', async () => {
     const node = (prefab: string) => ({ parentLocalId: 1, guid: '', key: 'ks', prefab, name: 'K', traits: { EntityAttributes: { name: 'K' }, Transform: tf }, children: [] });

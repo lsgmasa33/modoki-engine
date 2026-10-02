@@ -50,10 +50,12 @@ describe.skipIf(!hasInternalGames())('#2008 P2: serialize and parse are inverse 
 
     for (const scene of project.scenes) {
       it(scene.rel, () => {
-        const entries = ((readJson(scene.abs).entities ?? []) as SceneEntityEntry[]);
+        const file = readJson(scene.abs);
+        const entries = ((file.entities ?? []) as SceneEntityEntry[]);
         const idToGuid = new Map(entries.map((e) => [e.id, e.guid] as const));
         const held = new Set(entries.map((e) => e.guid).filter((g): g is string => !!g));
         const opts = {
+          sceneVersion: (typeof (file as { version?: unknown }).version === 'number' ? (file as { version: number }).version : 0),
           parentGuid: (r: unknown) => (typeof r === 'number' ? idToGuid.get(r) ?? '' : typeof r === 'string' ? r : ''),
           held: (g: string) => held.has(g),
         };

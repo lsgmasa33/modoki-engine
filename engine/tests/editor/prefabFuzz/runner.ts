@@ -310,7 +310,7 @@ export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[
   };
   const held = new Set((scene.entities ?? []).map((e) => e.guid).filter((g): g is string => !!g));
   const copies = new Set(Object.keys((scene.embeddedPrefabs ?? {}) as object));
-  const opts = { sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
+  const opts = { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g: string) => held.has(g) };
   // Every stored instance: the top-level entries, then each reference node the scene added (its own record, § 2.5),
   // found in its owner's scene-owned content — which a top-level entry's fold leaves as an anchor and never compares —
   // or in the `children` of a plain node the scene added there (#2009 review: a list root's children were never walked).

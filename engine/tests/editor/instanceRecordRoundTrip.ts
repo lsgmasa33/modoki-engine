@@ -3,6 +3,7 @@
  *  (`instanceRecordRoundTripFixtures.test.ts`). */
 
 import { parseInstanceRecord, parseTemplateList, parseTemplateLists, type ParseOptions } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import {
   serializeInstanceRecord, serializeTemplateDocHeld, serializeTemplateOwner,
 } from '../../packages/modoki/src/runtime/prefab/serializeInstanceRecord';
@@ -61,13 +62,14 @@ export function toV10Docs(docs: ReadonlyMap<string, PrefabDoc>, read: PrefabRead
 
 /** parse → serialize → parse → serialize, for one scene entry. The identity map is empty: the parsed pins are already
  *  in the list, and a pin the projection would add is the one thing a first save adds (design § 2.7). */
-export function roundTripEntry(entry: SceneEntityEntry, read: PrefabReader, opts: ParseOptions = {}): {
+export function roundTripEntry(entry: SceneEntityEntry, read: PrefabReader, opts: ParseOptions): {
   first: ParsedInstance; second: ParsedInstance; bytes1: string; bytes2: string;
 } {
   const write = (p: ParsedInstance) => serializeInstanceRecord(p.record, { identity: new Map(), sceneOwned: (g) => p.ownContent.get(g) });
   const first = parseInstanceRecord(entry, read, opts);
   const s1 = write(first);
-  const second = parseInstanceRecord({ id: entry.id, ...s1.entry } as SceneEntityEntry, read, opts);
+  // What the writer wrote is a v20 entry: read back as one, or a version-gated reading goes unmeasured (#2007 close-out).
+  const second = parseInstanceRecord({ id: entry.id, ...s1.entry } as SceneEntityEntry, read, { ...opts, sceneVersion: INSTANCE_MODEL_SCENE_VERSION });
   const s2 = write(second);
   return { first, second, bytes1: JSON.stringify(s1.entry), bytes2: JSON.stringify(s2.entry) };
 }

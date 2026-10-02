@@ -294,7 +294,8 @@ function foldFrame(
 
     const rootRec = layer.rows.get(ROOT_ROW_KEY);
     // A frame root's `removed` is the enclosing frame's to apply (it deletes this whole instance).
-    if (rootRec) apply(absKey(prefix, ROOT_ROW_KEY), { ...rootRec, removed: undefined });
+    // The instance root's `parent` is no move: its place is the placement, which every reader keeps (#2022 item 3).
+    if (rootRec) apply(absKey(prefix, ROOT_ROW_KEY), { ...rootRec, removed: undefined, ...(prefix ? {} : { parent: undefined }) });
     const nodeRows: [RowKey, AnyRecord][] = [];
     for (const [rel, rec] of layer.rows) {
       if (rel === ROOT_ROW_KEY || rel.indexOf('/', 1) > 0) continue;
@@ -331,28 +332,47 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
   const scene: Layer = { rows: rec.list.rows as ReadonlyMap<RowKey, AnyRecord>, scene: true, depth: 0, home: [] };
   if ('doc' in top) foldFrame(st, frameOf('', top.doc, rec.source), [scene], [], { parent: null, orphan: { guid: rec.placement.parent } });
   else st.placeholders.set(ROOT_ROW_KEY, { ...top, parent: null });
+  // A scene row's member-token parent, held (#2022 items 5-6): today's drain still takes it as the member's one move,
+  // and it names nothing — the member stays, over every lower move.
+  const heldRows = (rec.held.pendingLegacy as { members?: Record<string, unknown> } | undefined)?.members ?? {};
+  for (const [k, row] of Object.entries(heldRows)) {
+    const n = isRecord(row) && typeof row.parent === 'string' ? st.nodes.get(k) : undefined;
+    if (n) { n.movedTo = undefined; n.sceneMoved = false; n.stay = true; }
+  }
 
   // The removal cascade, through the final parent links.
   const removed = new Map<RowKey, 'inner' | 'scene'>();
   const cut = (key: RowKey, seen = new Set<RowKey>()): 'inner' | 'scene' | undefined => {
     if (removed.has(key)) return removed.get(key);
     const n = st.nodes.get(key);
-    if (!n || seen.has(key)) return undefined;
+    if (seen.has(key)) return undefined;
+    // A placeholder is a row like any other: its own removal, or its parent's, takes what hangs under it (#2022 item 2:
+    // a plain row under a removed missing-prefab row kept a parent that names nothing).
+    const ph = n ? undefined : st.placeholders.get(key);
+    if (ph) {
+      seen.add(key);
+      const self = st.placeholderRemovedBy.get(key);
+      const up = ph.parent && 'key' in ph.parent ? cut(ph.parent.key, seen) : undefined;
+      return up === 'scene' ? up : (self && self !== 'none' ? self : undefined) ?? up;
+    }
+    if (!n) return undefined;
     seen.add(key);
     const self = n.removedBy !== 'none' ? n.removedBy : undefined;
     const up = !n.sceneMoved && n.parent && 'key' in n.parent ? cut(n.parent.key, seen) : undefined;
-    const r = self ?? up;
+    // The instance's own removal anywhere on the way up covers what an inner one removed too (rule 3; #2022 review).
+    const r = up === 'scene' ? up : self ?? up;
     if (r) removed.set(key, r);
     return r;
   };
   for (const key of st.nodes.keys()) cut(key);
   // A placeholder hangs where its row would: under a removed member it goes with it (#2007 review, item 3).
   const cutPlaceholders = new Map<RowKey, 'inner' | 'scene'>();
-  for (const [key, ph] of st.placeholders) {
-    const self = st.placeholderRemovedBy.get(key);
-    const r = (self !== 'none' ? self : undefined) ?? (ph.parent && 'key' in ph.parent ? cut(ph.parent.key) : undefined);
-    if (r) { cutPlaceholders.set(key, r); st.placeholders.delete(key); }
+  const cutParent = new Map<RowKey, Parent>();
+  for (const [key, ph] of [...st.placeholders]) {
+    const r = cut(key);
+    if (r) { cutPlaceholders.set(key, r); cutParent.set(key, ph.parent); }
   }
+  for (const key of cutPlaceholders.keys()) st.placeholders.delete(key);
   const underCut = (key: RowKey): 'inner' | 'scene' | undefined => {
     for (const [p, r] of cutPlaceholders) if (key === p || key.startsWith(`${p}/`)) return r;
     return undefined;
@@ -386,8 +406,9 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
   // is the realize's to judge, not the fold's.
   const alive = (to: Parent): boolean => !to || !('key' in to) || (st.nodes.has(to.key) && !removed.has(to.key));
   const fail = (k: RowKey): void => {
+    // Up through every removed row, a cut placeholder included (#2022 review: the lift stopped on one).
     let p = st.nodes.get(k)?.parent;
-    for (let i = 0; p && 'key' in p && removed.has(p.key) && i < 100_000; i++) p = st.nodes.get(p.key)?.parent;
+    for (let i = 0; p && 'key' in p && (removed.has(p.key) || cutParent.has(p.key)) && i < 100_000; i++) p = st.nodes.get(p.key)?.parent ?? cutParent.get(p.key);
     // `null` is the instance root's place (the placement): kept, never read as "the root" (final review: a failed root
     // move made the root its own parent).
     parentOf.set(k, p === undefined ? { key: ROOT_ROW_KEY } : p);
@@ -469,26 +490,38 @@ export function foldInstance(read: PrefabReader, rec: InstanceRecord, opts: Fold
     const cutBy = underCut(key);
     if (cutBy === 'scene') continue;
     if (cutBy === 'inner') { whole('gone'); continue; }
-    if (!n || st.ambiguous.has(key)) { whole(underPlaceholder(key) ? 'unresolved' : 'gone'); continue; }
+    if (!n || st.ambiguous.has(key)) {
+      // A removal AT a placeholder row targets the reference ROW, in a document that loaded: it decides whether the
+      // placeholder shows, so it is applied, never unused — as `removed: true` there is (cut, inert; #2024, hub ruling).
+      const atPlaceholder = !n && st.placeholders.has(key);
+      for (const part of parts) if (!(atPlaceholder && part.kind === 'removed')) unused.push({ key, part, cause: underPlaceholder(key) ? 'unresolved' : 'gone' });
+      continue;
+    }
     // A member a layer UNDER the instance's own list removed, and the list does not restore: its target is gone (#1914 R4).
     if (removed.get(key) === 'inner') { whole('gone'); continue; }
+    // Under the instance's OWN removal a record is inert, kept and not removable (rule 3, G2; #2022 item 4): only a
+    // cause Remove Unused never takes is still reported.
+    const inert = removed.get(key) === 'scene';
     for (const part of parts) {
       if (part.kind === 'field' || part.kind === 'trait') {
         if (!st.schema.component(part.trait)) { unused.push({ key, part, cause: 'unregistered' }); continue; }
-        if (part.kind === 'field' && !st.schema.field(part.trait, part.field)) unused.push({ key, part, cause: 'unknownField' });
+        if (part.kind === 'field' && !inert && !st.schema.field(part.trait, part.field)) unused.push({ key, part, cause: 'unknownField' });
       } else if (part.kind === 'traitRemoval') {
         if (!st.schema.component(part.trait)) { unused.push({ key, part, cause: 'unregistered' }); continue; }
         const below = n.below ?? { traits: new Set(Object.keys(n.traits)), removed: new Set<string>() };
         const on = r.traitRemovals![part.trait];
         const takes = on ? below.traits.has(part.trait) && !below.removed.has(part.trait) : below.removed.has(part.trait);
-        if (!takes) unused.push({ key, part, cause: 'gone' });
-      } else if (part.kind === 'parent' && n.templateKey) {
+        if (!takes && !inert) unused.push({ key, part, cause: 'gone' });
+      } else if (part.kind === 'parent' && key === ROOT_ROW_KEY) {
+        // The root's own `parent`: names nothing every reader takes (#2022 item 3, "never neither").
+        unused.push({ key, part, cause: 'gone' });
+      } else if (part.kind === 'parent' && n.templateKey && !inert) {
         // A legacy move of a template-keyed node (#1883 ruling C): every reader ignores it, so it is unused.
         unused.push({ key, part, cause: 'gone' });
       }
     }
   }
-  for (const u of heldUnused(st, rec, 'doc' in top ? top.doc : null, underCut)) unused.push(u);
+  for (const u of heldUnused(st, rec, 'doc' in top ? top.doc : null, underCut, (k) => removed.get(k))) unused.push(u);
 
   // A stable order (by key, then part, then cause), not the rows' insertion order: a legacy record and its v20 spelling
   // hold the same rows in a different order, and the two folds must agree (#2008 P2).
@@ -514,6 +547,8 @@ function heldUnused(
   st: State, rec: InstanceRecord, doc: PrefabDoc | null,
   /** The removal cascade's verdict on a placeholder frame it took (rule 3: the instance's own removal keeps records). */
   underCut: (key: RowKey) => 'inner' | 'scene' | undefined,
+  /** The cascade's verdict on a node: under the instance's own removal a held row is inert too (#2022 review). */
+  removedBy: (key: RowKey) => 'inner' | 'scene' | undefined = () => undefined,
 ): UnusedRecord[] {
   const out: UnusedRecord[] = [];
   const pending = rec.held.pendingLegacy as Record<string, unknown> | undefined;
@@ -544,7 +579,7 @@ function heldUnused(
    *  the instance's own removal it is kept unreported (rule 3); otherwise its target is gone. */
   const rowCause = (k: RowKey): UnusedCause | null => {
     const cut = underCut(k);
-    if (cut === 'scene') return null;
+    if (cut === 'scene' || removedBy(k) === 'scene') return null;
     if (cut === 'inner') return 'gone';
     return [...st.placeholders.keys()].some((p) => k === p || k.startsWith(`${p}/`)) ? 'unresolved' : 'gone';
   };

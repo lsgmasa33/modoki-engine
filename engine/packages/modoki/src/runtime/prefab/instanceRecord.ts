@@ -34,7 +34,8 @@ export const ROOT_ROW_KEY: RowKey = '/';
 
 // ── Records ─────────────────────────────────────────────────────────────────────────────────────────
 
-/** Trait data on a record: field → value, or `true` for a tag trait. */
+/** Trait data on a record: field → value. A tag trait (no fields) is `true` OR `{}`: the parser keeps whichever the file
+ *  wrote, and every consumer treats the two alike (the writer emits `{}`, work-ai S4). */
 export type RecordTraits = Record<string /*trait*/, Record<string /*field*/, unknown> | true>;
 
 /**
@@ -208,7 +209,9 @@ export interface ParseWarning {
  * What `parseInstanceRecord` returns for one stored owner (a scene entry or a scene reference node).
  * The record holds links only; `ownContent` carries each linked scene-owned node's content (by guid) so
  * the first projection can spawn it. After that, the content lives on the live entity, like any plain
- * scene entity's.
+ * scene entity's. One exception, unlinked: a scene-added REFERENCE node anchored at an unresolved placeholder whose
+ * own prefab resolves (hub ruling (a), #1831) — its link stays in the held list, so no anchor names it, yet it is a
+ * record of its own; a consumer parses every `ownContent` reference node, not only the anchored ones.
  */
 export interface ParsedInstance {
   record: InstanceRecord;

@@ -44,11 +44,12 @@ describe('#2008 P2: serialize and parse are inverse over the fuzzer\'s saved sce
       const readV10: PrefabReader = (g) => (v10.has(g) ? { doc: v10.get(g)! } : { missing: true });
       const scenePath = [...files.keys()].find((p) => p.endsWith('.scene.json') || /\/scenes\/[^/]+\.json$/.test(p));
       expect(scenePath, `seed ${seed}: the run saved no scene`).toBeTruthy();
-      const entries = ((JSON.parse(files.get(scenePath!)!) as { entities?: SceneEntityEntry[] }).entities ?? []);
+      const file = JSON.parse(files.get(scenePath!)!) as { entities?: SceneEntityEntry[]; version?: number };
+      const entries = file.entities ?? [];
       const held = new Set(entries.map((e) => e.guid).filter((g): g is string => !!g));
       for (const entry of entries) {
         if (!entry.prefab) continue;
-        const { first, second, bytes1, bytes2 } = roundTripEntry(entry, read, { held: (g) => held.has(g) });
+        const { first, second, bytes1, bytes2 } = roundTripEntry(entry, read, { sceneVersion: file.version ?? 0, held: (g) => held.has(g) });
         expect(asData(second.record), `${entry.name}: parse(serialize(rec)) ≡ rec`).toEqual(asData(first.record));
         expect(ownAsLinked(second.ownContent), `${entry.name}: own content`).toEqual(ownAsLinked(first.ownContent));
         expect(bytes2, `${entry.name}: a second save writes the same bytes`).toBe(bytes1);

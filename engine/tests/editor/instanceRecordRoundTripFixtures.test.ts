@@ -94,7 +94,7 @@ describe('#2008 P2 over fixtures: scene form', () => {
   for (const f of SCENE) {
     it(f.name, () => {
       const read = reader(...f.docs);
-      const { first, second, bytes1, bytes2 } = roundTripEntry(f.entry, read);
+      const { first, second, bytes1, bytes2 } = roundTripEntry(f.entry, read, { sceneVersion: 15 });
       expect(f.reaches(first), 'the fixture reaches its class').toBeTruthy();
       expect(asData(second.record), 'parse(serialize(rec)) ≡ rec').toEqual(asData(first.record));
       expect(ownAsLinked(second.ownContent), 'own content').toEqual(ownAsLinked(first.ownContent));

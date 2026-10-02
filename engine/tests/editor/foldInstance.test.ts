@@ -39,7 +39,7 @@ const entry = (extra: Partial<SceneEntityEntry> = {}): SceneEntityEntry => ({
   id: 7, name: 'Ship', prefab: 'P', guid: ROOT, traits: { PrefabInstance: { source: 'P', localId: 1 } }, ...extra,
 });
 const fold = (e: SceneEntityEntry, m = docs) => {
-  const rec: InstanceRecord = parseInstanceRecord(e, reader(m)).record;
+  const rec: InstanceRecord = parseInstanceRecord(e, reader(m), { sceneVersion: 15 }).record;
   return foldInstance(reader(m), rec, { schema });
 };
 const causes = (f: ReturnType<typeof fold>) => f.unused.map((u) => `${u.key} ${u.part.kind}${'trait' in u.part ? `:${u.part.trait}` : ''}${'field' in u.part ? `.${u.part.field}` : ''} ${u.cause}`);
@@ -505,5 +505,25 @@ describe('foldInstance — a cycle is a document containing itself, not a frame 
     const f = fold(entry({ prefab: 'PS', traits: { PrefabInstance: { source: 'PS', localId: 1 } } }), new Map([['PS', PS], ['Q', Q], ['S', S]]));
     expect([...f.placeholders.keys()]).toEqual([]);
     expect(f.nodes.has(`/${G(712)}/a+ks/${G(702)}`)).toBe(true);
+  });
+});
+
+describe('foldInstance — G2 (hub rule): a field and a removal of the same component are both kept; the field is inert while the removal stands', () => {
+  it('the instance states both: the component is removed, the field is neither applied nor unused', () => {
+    const f = fold(entry({ members: { [`/${N2}`]: { traits: { Light: { intensity: 5 } }, traitRemovals: { Light: true } } } as never }));
+    expect(f.nodes.get(`/${N2}`)?.traits.Light).toBeUndefined();
+    expect(f.unused).toEqual([]);
+  });
+
+  it('a prefab removes it and the instance edits a field: inert; the instance restoring the component applies the field again', () => {
+    const PR: PrefabDoc = { id: 'PR', rootLocalId: 1, entities: [
+      { localId: 1, nodeGuid: G(801), traits: { EntityAttributes: { name: 'Root' } } },
+      { localId: 2, nodeGuid: G(802), prefab: 'Q', traits: { EntityAttributes: { name: 'R', parentId: 1 } }, members: { [`/${NQ2}`]: { traitRemovals: { Light: true } } } } as never,
+    ] };
+    const run = (row: object) => fold(entry({ prefab: 'PR', traits: { PrefabInstance: { source: 'PR', localId: 1 } }, members: { [`/${G(802)}/${NQ2}`]: row } as never }), new Map([['PR', PR], ['Q', Q]]));
+    const removed = run({ traits: { Light: { intensity: 5 } } });
+    expect(removed.nodes.get(`/${G(802)}/${NQ2}`)?.traits.Light).toBeUndefined();
+    expect(removed.unused).toEqual([]);
+    expect(run({ traits: { Light: { intensity: 5 } }, traitRemovals: { Light: false } }).nodes.get(`/${G(802)}/${NQ2}`)?.traits.Light).toEqual({ intensity: 5 });
   });
 });

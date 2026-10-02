@@ -293,7 +293,7 @@ const under = (key: string, k: string) => k === '/' || key === k || key.startsWi
  *    Prefab placeholder (owner ruling B, design § 5.4; rule 9: no copy);
  *  - D: a nested reference row whose prefab is missing, with no copy: today spawns nothing there; the rule puts the
  *    placeholder at the row (design § 2.4 item 5, ruling D; rule 9). */
-export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions = {}, copies: ReadonlySet<string> = new Set()): string[] {
+export function checkInstance(entry: SceneEntityEntry, read: PrefabReader, rootId: number, opts: ParseOptions, copies: ReadonlySet<string> = new Set()): string[] {
   return checkRecord(parseInstanceRecord(entry, read, opts).record, read, rootId, copies);
 }
 
@@ -334,7 +334,9 @@ export function checkRecord(rec: InstanceRecord, read: PrefabReader, rootId: num
   const projectsWhenRestored = (key: string): boolean => {
     const rows = new Map(rec.list.rows);
     rows.set(key as never, { ...rows.get(key as never)!, removed: false });
-    return foldInstance(read, { ...rec, list: { ...rec.list, rows } }).nodes.has(key as never);
+    // A placeholder is a projected row too: the removal of a missing-prefab row is applied when it takes the placeholder.
+    const restored = foldInstance(read, { ...rec, list: { ...rec.list, rows } });
+    return restored.nodes.has(key as never) || restored.placeholders.has(key as never);
   };
   // The member guids the instance's documents hold. A template-added key (`a+…`) names no member guid, so it counts as
   // held: the marker that needs its absence stays off, and a loss there goes red.

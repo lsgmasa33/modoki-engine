@@ -65,7 +65,7 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
         if (!entry.prefab || !entry.guid) continue;
         const root = [...getCurrentWorld().entities].find((e) => (e.get(ea) as { guid?: string } | undefined)?.guid === entry.guid);
         if (!root) { lines.push(`${entry.name}: no live root`); continue; }
-        for (const d of checkInstance(entry, read, root.id(), { sceneHadCopies: !!scene.embeddedPrefabs, held: (g) => held.has(g) }, copies)) lines.push(`${entry.name}: ${d}`);
+        for (const d of checkInstance(entry, read, root.id(), { sceneVersion: (typeof (scene as { version?: unknown }).version === 'number' ? (scene as { version: number }).version : 0), sceneHadCopies: !!scene.embeddedPrefabs, held: (g) => held.has(g) }, copies)) lines.push(`${entry.name}: ${d}`);
       }
       report[`seed ${seed}`] = lines;
       expect(lines).toEqual([]);
