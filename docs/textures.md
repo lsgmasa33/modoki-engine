@@ -573,12 +573,38 @@ agree today are indistinguishable to a runtime assertion.
   converter never downscales a page and shifts every frame rect.
 - **Cache gate** — `plugins/atlas-cache.ts` `atlasHashKey()` is a stable 16-hex
   key over every member's source **bytes** + slice rect/pivot + the pack options +
-  `ATLAS_ENCODER_VERSION` (`'atlas-1'`), members sorted by GUID so reordering
-  doesn't churn. The handler skips the whole pack when the atlas hash is unchanged
-  **and** every page variant is still cached (`cacheHit` over the `'2d'` variant
-  set). The written `atlasCache` block records `hash`, per-page `{hash, variants,
-  w, h}`, the page `texture` settings, and a `frames` map (member GUID → `{page,
-  rect, pivot}`) the runtime resolver indexes.
+  the **page settings the encoder receives** + `ATLAS_ENCODER_VERSION`, members
+  sorted by GUID so reordering doesn't churn. The handler skips the whole pack when
+  the atlas hash is unchanged **and** every page variant is still cached
+  (`cacheHit` over the `'2d'` variant set). The written `atlasCache` block records
+  `hash`, per-page `{hash, variants, w, h}`, the page `texture` settings, and a
+  `frames` map (member GUID → `{page, rect, pivot}`) the runtime resolver indexes.
+  - ⚠️ **The key hashes what `pageSettings(src)` RETURNS, not the authored
+    `src.texture`** (#2065). The two differ by the pageSize `maxSize` floor and the
+    playable WebP override. The old key took three authored fields. So a playable
+    build after a normal pack found the KTX2 pack "up to date", because its WebP
+    sibling satisfied `cacheHit`. It shipped `~uastc.ktx2` pages with a ktx2
+    manifest block into an artifact that has no KTX2 transcoder. Reproduced on
+    skin-test: 2.22 MB with the KTX2 page, 2.04 MB without it. The settings are keyed with
+    the texture cache's own `textureSettingsKey`, the same string each page's
+    variant hash uses, so there is no second field list to drift. The pack options
+    are taken **by exclusion**: every normalized source field except
+    `members`/`texture`/`id`/`version`. A new option is therefore keyed without an edit here.
+    Guard: `tests/plugins/atlasPageSettingsKey.test.ts`, which uses a mapped type that
+    makes every `TextureImportSettings` field carry a perturbation.
+  - **A playable build does not write the sidecar.** The sidecar is committed
+    source, and the WebP pages are a build profile. Persisting them dirtied the tree
+    and flipped the sidecar back on the next normal build. `packAtlasAsset` returns
+    the block, and the production build puts THAT block in the manifest. That matches
+    how it uses each texture's build-time conversion. Revert-run: with the sidecar's
+    block in the manifest instead, the build's dist verifier refuses it
+    (`~page0~uastc.ktx2 — atlas page: missing`). That verifier is the wiring's standing guard:
+    the only state a dropped `packedAtlases` line can break is a `ktx2-*` atlas in a playable,
+    and that is exactly what it refuses. No unit test can see the call site go. The committed
+    hashes themselves are pinned by `tests/assets/atlasSidecarHashReproduces.test.ts`.
+    Cost: a playable build re-composites
+    every atlas whose playable settings differ, but the page encode is a cache hit
+    after the first run.
 
 ### Trim (`"trim": true`)
 

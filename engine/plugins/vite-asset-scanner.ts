@@ -41,7 +41,7 @@ import { registerReimportHandler, type ReimportContext } from './reimport-regist
 import { ASSET_MANIFEST_VERSION } from '../packages/modoki/src/runtime/loaders/assetManifestVersion';
 import { textureReimportHandler } from './reimport-texture';
 import { modelReimportHandler, resolvePostprocessorForId, validatePostprocessorRegistry, isRiggedMeta } from './reimport-model';
-import { atlasReimportHandler } from './reimport-atlas';
+import { atlasReimportHandler, packAtlasAsset } from './reimport-atlas';
 import { audioReimportHandler } from './reimport-audio';
 import { fontReimportHandler } from './reimport-font';
 import { environmentReimportHandler } from './reimport-environment';
@@ -4592,9 +4592,10 @@ export function assetScannerPlugin(): Plugin {
         catch (e) { console.warn(`[asset-shaker] SSR server close warning: ${e instanceof Error ? e.message : e}`); }
       }
 
-      // Pack each kept atlas and copy its page variants into dist/. Runs BEFORE the
-      // manifest scan below so the freshly-written sidecar `atlasCache` is read into the
-      // atlas's manifest entry (scanDir picks it up). The fully-packed member source
+      // Pack each kept atlas and copy its page variants into dist/. The block the pack
+      // RETURNS becomes the manifest entry's `atlas` (below, via `packedAtlases`) — not the
+      // sidecar scanDir reads, which a playable build deliberately leaves at the normal
+      // profile's KTX2 pages (#2065). The fully-packed member source
       // textures are already absent from `result.kept` (the tree-shaker redirected their
       // refs to the atlas), so they aren't copied — the pages replace them.
       const atlasReCtx: ReimportContext = {
@@ -4603,14 +4604,14 @@ export function assetScannerPlugin(): Plugin {
         listAssets: () => scanAllAssets(assetRoots),
       };
       let atlasPageCount = 0;
+      const packedAtlases = new Map<string, AtlasCacheBlock>(); // NFC virtualPath → the block whose pages were copied
       for (const virtualPath of result.kept) {
         if (!virtualPath.endsWith('.atlas.json')) continue;
         const srcAbs = resolveAssetPath(virtualPath, assetRoots);
         if (!srcAbs || !fs.existsSync(srcAbs)) continue;
         try {
-          await atlasReimportHandler(virtualPath, srcAbs, atlasReCtx);
-          const cache = (readMetaSidecar(srcAbs) as { atlasCache?: AtlasCacheBlock }).atlasCache;
-          if (!cache) continue;
+          const cache = await packAtlasAsset(virtualPath, srcAbs, atlasReCtx);
+          packedAtlases.set(virtualPath.normalize('NFC'), cache);
           for (let p = 0; p < cache.pages.length; p++) {
             for (const v of cache.pages[p].variants) {
               const cacheFile = cachePathFor(getCacheDir(projectRoot), atlasPageUrlPath(virtualPath, p), cache.pages[p].hash, v as TextureVariant);
@@ -4653,6 +4654,8 @@ export function assetScannerPlugin(): Plugin {
         if (h) entry.hash = h;
         const m = convertedModels.get(entry.path.normalize('NFC'));
         if (m) { entry.model = m.settings; entry.modelCache = m.cache; entry.hash = m.cache.hash; }
+        const at = packedAtlases.get(entry.path.normalize('NFC'));
+        if (at) { entry.atlas = at; entry.hash = at.hash; }
         // Audio: bake the converted variant's ext + loadType + build-time hash so the
         // runtime resolves `<src>~audio.<ext>?v=<hash>` (source dropped from dist).
         const a = convertedAudio.get(entry.path.normalize('NFC'));

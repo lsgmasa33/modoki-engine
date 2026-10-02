@@ -5,12 +5,11 @@
 
 import esbuild from 'esbuild';
 import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
 // The MCP bundle's options live in a DECLARATION-ONLY module so the test that verifies the
 // shipped artifact can import them instead of restating them (#945 B1) — this file runs
 // esbuild at top level, so it cannot be imported for them.
 import { mcpDir, mcpOpts } from './mcpBuildOpts.mjs';
+import { ensureInstalledMatchesLockfile } from './installedMatchesLockfile.mjs';
 // Same split, same reason, for the MAIN bundle (#1035): the guard that proves no bare
 // `@modoki/*` require reaches main.cjs must build with the REAL options, and cannot import
 // them from here without running this build as a side effect.
@@ -39,14 +38,15 @@ const opts = electronOpts();
 // no @modelcontextprotocol/sdk to inline → "Could not resolve …/sdk/server/mcp.js".
 // Self-heal at this single choke point (every packaging path — dist:mac/win/dir,
 // smoke:packaged — runs build-electron), so the deps are guaranteed present exactly
-// where esbuild resolves them (mcpDir/node_modules). Idempotent: skipped when already
-// installed (local dev, warm CI cache). execSync (shell) so `npm` resolves to npm.cmd
-// on Windows without the .cmd spawn EINVAL that execFile hits.
-const mcpSdkMarker = path.join(mcpDir, 'node_modules', '@modelcontextprotocol', 'sdk', 'package.json');
-if (!existsSync(mcpSdkMarker)) {
-  console.log('[build-electron] modoki-mcp deps missing → npm install in engine/tools/modoki-mcp');
-  execSync('npm install --no-audit --no-fund', { cwd: mcpDir, stdio: 'inherit' });
-}
+// where esbuild resolves them (mcpDir/node_modules). Skipped only when the installed tree
+// matches the tool's package-lock.json, package by package. It used to skip whenever the
+// sdk's package.json merely EXISTED, so an sdk/zod bump bundled the old deps into the shipped
+// server (#2066). execSync (shell) so `npm` resolves to npm.cmd on Windows without the .cmd
+// spawn EINVAL that execFile hits.
+ensureInstalledMatchesLockfile(mcpDir, 'engine/tools/modoki-mcp', {
+  install: () => execSync('npm install --no-audit --no-fund', { cwd: mcpDir, stdio: 'inherit' }),
+  log: (m) => console.log(`[build-electron] ${m}`),
+});
 
 if (watch) {
   const ctx = await esbuild.context(opts);

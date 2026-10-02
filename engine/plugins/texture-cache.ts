@@ -27,7 +27,10 @@ export function getCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-textures');
 }
 
-function stableSettings(s: TextureImportSettings): string {
+/** The encoder-settings part of a texture content key. Exported because an atlas page is
+ *  encoded through this same converter, so the atlas pack gate keys its page settings with
+ *  this exact string rather than a second hand-kept field list (#2065). */
+export function textureSettingsKey(s: TextureImportSettings): string {
   const base = [s.format, s.maxSize, s.mipmaps, s.wrapS, s.wrapT, s.colorspace].join('|');
   // Append flip flags ONLY when set, so existing textures (no flips) hash exactly
   // as before and don't force a mass re-conversion when this field was introduced.
@@ -49,7 +52,7 @@ function stableSettings(s: TextureImportSettings): string {
 export function hashKey(srcBytes: Buffer, settings: TextureImportSettings): string {
   return createHash('sha256')
     .update(srcBytes).update('\0')
-    .update(stableSettings(settings)).update('\0')
+    .update(textureSettingsKey(settings)).update('\0')
     .update(ENCODER_VERSION)
     .digest('hex').slice(0, 16);
 }

@@ -12,6 +12,8 @@
 
 import { createHash } from 'crypto';
 import type { AtlasSource } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
+import type { TextureImportSettings } from '../packages/modoki/src/runtime/loaders/textureSettings';
+import { textureSettingsKey } from './texture-cache';
 
 /** Bump when the packer/compositor pipeline changes so stale atlas caches invalidate. */
 // atlas-2: the pinned toktx (#1327) — evicts atlases an unpinned build converted under the same key.
@@ -34,18 +36,31 @@ export interface AtlasHashMember {
   pivot: { x: number; y: number };
 }
 
-function stableOpts(src: AtlasSource): string {
-  return [src.pageSize, src.padding, src.extrude, src.maxPages ?? '', src.texture?.format ?? 'webp',
-    src.texture?.maxSize ?? '', src.texture?.mipmaps ?? '',
-    // Appended only when set, so every untrimmed atlas keeps the key it already had (no re-pack).
-    ...(src.trim ? ['trim'] : [])].join('|');
+/** The pack-layout options: every field of the normalized source EXCEPT the ones hashed
+ *  some other way — `members` (per member below), `texture` (keyed as the settings the encoder
+ *  actually receives), and `id`/`version` (identity, not output). Taken by exclusion rather than
+ *  listed, so a pack option added to `readAtlasSource` is keyed without anyone remembering to add
+ *  it here (#2065: the list this replaced held three of the ten encoder inputs). */
+function packOpts(src: AtlasSource): string {
+  const { members: _m, texture: _t, id: _i, version: _v, ...pack } = src;
+  return JSON.stringify(Object.keys(pack).sort().map((k) => [k, (pack as Record<string, unknown>)[k]]));
 }
 
-/** Stable 16-hex content key for (members' bytes + rects + pack options + version).
- *  Members are sorted by GUID so member-list reordering doesn't change the hash. */
-export function atlasHashKey(members: AtlasHashMember[], src: AtlasSource): string {
+/** Stable 16-hex content key for (members' bytes + rects + pack options + page encoder
+ *  settings + version). Members are sorted by GUID so member-list reordering doesn't change
+ *  the hash.
+ *
+ *  `pageSettings` is what `reimport-atlas.ts`'s `pageSettings(src)` RETURNS, not the authored
+ *  `src.texture` — the encoder is fed the resolved settings plus two build-time rewrites the
+ *  authored block never shows (the pageSize-derived `maxSize` floor and the playable WebP
+ *  override). Keying the authored block let a playable build reuse a normal build's KTX2 pages
+ *  (#2065). It is keyed with the texture cache's own `textureSettingsKey`, the same string each
+ *  page's variant hash uses, so the two keys cannot disagree about which settings matter. */
+export function atlasHashKey(members: AtlasHashMember[], src: AtlasSource, pageSettings: TextureImportSettings): string {
   const h = createHash('sha256');
-  h.update(ATLAS_ENCODER_VERSION).update('\0').update(stableOpts(src)).update('\0');
+  h.update(ATLAS_ENCODER_VERSION).update('\0')
+    .update(packOpts(src)).update('\0')
+    .update(textureSettingsKey(pageSettings)).update('\0');
   for (const m of [...members].sort((a, b) => (a.guid < b.guid ? -1 : a.guid > b.guid ? 1 : 0))) {
     h.update(m.guid).update('\0')
       .update(`${m.rect.x},${m.rect.y},${m.rect.w},${m.rect.h};${m.pivot.x},${m.pivot.y}`).update('\0')

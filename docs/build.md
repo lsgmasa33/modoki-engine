@@ -1658,6 +1658,22 @@ bundles with `packages: 'external'`, so main.cjs does not move either.
   `tests/electron/packagedDepsSignature.test.ts` (the hash's behaviour) and
   `viteCacheBustSignature.test.ts` (that `buildSig` reads it and the build defines it).
 
+**The rest of #2064's class: up-to-date checks keyed narrower than their inputs (#2065, #2066).**
+#2064's sibling sweep found eight more caches whose "still valid" check missed an input. Each was
+rated by the user path it reaches. A check that reaches a **shipped artifact or an ordinary build**
+was fixed; the others are left alone, with the reasons below.
+
+| Check | Reaches | Disposition |
+|---|---|---|
+| Atlas pack gate (`atlasHashKey`) | **Playable** after a normal pack shipped KTX2 pages (reproduced on skin-test) | **Fixed, #2065**. It keys the page settings the encoder receives: [textures.md § Sprite atlas packing](textures.md#sprite-atlas-packing) |
+| `build-electron.mjs`'s modoki-mcp deps skip | **The shipped MCP bundle** of any local packaging run (`verify:packaged`, `dist:*`) after an sdk/zod bump | **Fixed, #2066**. `installedMatchesLockfile.mjs` compares every lockfile pin with the installed version, and the build refuses to bundle if npm's "up to date" leaves it stale (#685's state). Live: zod 3.25.75 installed against a 3.25.76 pin re-installs, and a hand-edited install exits 1 |
+| Model LOD local `hash` (`meta-sidecar.ts` merges it, `staticAssets.ts` serves `lodCachePath(hash)`) | The **editor** after a pull that changes a GLB or its `model` settings: old LODs and Inspector stats | Left alone. A build re-converts from source (`vite-asset-scanner.ts`), so nothing ships stale, and reimporting the model heals the editor. The hash is local by design (#127) |
+| Project-deps "installed" check (`electron/main.ts`, `projectDeps.ts`) | The packaged editor opening a project whose `package.json` moved | Left alone. Existence-only is deliberate (#215) and needs an owner call. In the repo, RULE 1's `npm install` re-runs `bootstrap-game-deps`, which never skips on existence |
+| Vendored-plugin marker (a tarball re-packed in place keeps its name) | A native build from a stale extraction | Already guarded. `healNativeProject` step 5 (`verifyInstalledMatchesTarballResult`) byte-compares every installed plugin with its tarball and refuses the build |
+| OTA new-binary key (`CFBundleVersion`/`versionCode` only) | Two **dev** native builds at the same commit count, with an OTA bundle applied on the device; only `games/ota-test` (a fixture) uses OTA | Left alone. A store build always has a higher commit count. Capacitor's own `isNewBinary` shares the key, so a fix would mean overriding what Capacitor serves on both platforms, or a per-build build number. That changes store numbering, which is an owner call. Workaround: uninstall the fixture app |
+| Android SDK provisioning (`marker: 'platform-tools'`) | A pull that bumps `ANDROID_SDK_PACKAGES` or the cmdline-tools pin | Left alone. Provisioning accepts the SDK licences, so Gradle can install a missing platform or build-tools at build time. That is AGP's documented behaviour, **not observed here** |
+| sharp in no texture/atlas/HDR key; the harfbuzz wasm in no font key | Per-machine cache drift after a library bump | Left alone, for the same reason as #1327's binary-blind CLI keys. The key feeds committed sidecar hashes (667 committed sidecars carry a `textureCache` block, counted 2026-10-03 with `git grep -lz`), so a version term would rewrite all of them on every bump. The caches are per-machine, so the effect is drift, not breakage |
+
 Measured 2026-08-03 (v0.3.6, macOS): **30/30 cold boots clean** via
 `engine/scripts/repro-cold-boot.sh` — no crash, no boundary fire, no console errors. At the observed
 Windows rate that outcome has p≈0.4%, so the rate really is **materially lower on macOS**, which is

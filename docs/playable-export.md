@@ -380,7 +380,10 @@ removes nothing" below for the two that were not, and why they are gone rather t
   the SFX use) — the source `.meta.json` is untouched, so the real game still streams.
 - **KTX2 needs a transcoder the profile skips.** The WebP-only profile drops the Basis/pixi-ktx
   transcoders, so rigged/skeletal GLBs and sprite-atlas pages MUST also take the playable WebP override
-  or they bake KTX2 (`KHR_texture_basisu`) with no transcoder → black textures offline.
+  or they bake KTX2 (`KHR_texture_basisu`) with no transcoder → black textures offline. For an
+  atlas, the override must also move the pack gate's KEY. Until #2065 it did not, so a playable built
+  after a normal pack reused the KTX2 pages:
+  [textures.md § Sprite atlas packing](textures.md#sprite-atlas-packing).
 - **PixiJS 2D textures need a FORCED parser for `blob:` URLs.** Pixi v8 picks its texture loadParser by
   EXTENSION (`loadTextures.test` → `checkExtension` → `path.extname`, which strips BOTH `?query` and
   `#hash` — a URL hint can't smuggle it in), and an inlined asset is an extension-less `blob:` URL → "we

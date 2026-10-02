@@ -123,7 +123,18 @@ function resolveMembers(src: AtlasSource, assets: ReimportAsset[]): ResolvedMemb
   return out;
 }
 
-export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
+/** Pack an atlas (or confirm its cached pack still holds) and return the cache block that
+ *  describes the pages on disk. The reimport handler below discards the return; the production
+ *  build uses it as the manifest's `atlas` block, the way it uses each texture's build-time
+ *  conversion rather than the possibly-stale sidecar.
+ *
+ *  ⚠️ **A playable build does not write the sidecar** (#2065). Its pages are a build-profile
+ *  override (`pageSettings` → WebP), and the sidecar is committed source: persisting them would
+ *  dirty the tree on every playable build and flip the sidecar back to KTX2 on the next normal
+ *  one. The texture pipeline never writes a sidecar for its playable override either. Cost: a
+ *  playable build re-composites each atlas, since the gate compares against the committed
+ *  normal-profile hash — the page ENCODE is still a texture-cache hit after the first time. */
+export async function packAtlasAsset(sourceUrlPath: string, absPath: string, ctx: Parameters<ReimportHandler>[2]): Promise<AtlasCacheBlock> {
   const src = readAtlasSource(absPath);
   const assets = ctx.listAssets?.() ?? [];
   const members = resolveMembers(src, assets);
@@ -140,7 +151,7 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     return b;
   };
   const hashMembers: AtlasHashMember[] = members.map((m) => ({ guid: m.guid, textureBytes: bytesFor(m.textureAbs), rect: m.rect, pivot: m.pivot }));
-  const atlasHash = atlasHashKey(hashMembers, src);
+  const atlasHash = atlasHashKey(hashMembers, src, settings);
 
   const prevMeta = readMetaSidecar(absPath);
   const prev = prevMeta.atlasCache as AtlasCacheBlock | undefined;
@@ -148,7 +159,7 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     // Atlas pages are 2d (browser-previewable in the editor), so they emit a WebP sibling
     // for a ktx2 page — check the same '2d' variant set the emitter below produces.
     !!block && block.pages.every((_, i) => cacheHit(cacheDir, atlasPageUrlPath(sourceUrlPath, i), block.pages[i].hash, settings.format, '2d'));
-  if (prev && prev.hash === atlasHash && allPagesCached(prev)) return; // up to date
+  if (prev && prev.hash === atlasHash && allPagesCached(prev)) return prev; // up to date
 
   const sharp = ((await nativeDynamicImport('sharp')) as typeof import('sharp')).default;
   // Trim (`src.trim`): each member's visible pixels, in its own frame. A fully transparent member keeps a 1 px
@@ -230,8 +241,14 @@ export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
   }
 
   const block: AtlasCacheBlock = { hash: atlasHash, pages, texture: settings, frames };
+  if (isPlayableBuild()) return block;
   const meta = { ...prevMeta };
   if (typeof meta.id !== 'string' && src.id) meta.id = src.id;
   meta.atlasCache = block;
   writeMetaSidecar(absPath, meta);
+  return block;
+}
+
+export const atlasReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
+  await packAtlasAsset(sourceUrlPath, absPath, ctx);
 };

@@ -132,7 +132,7 @@ describe('committed .meta.json sidecars never carry a host-local cache value (#1
  *
  * `modelCache.hash` is machine-dependent by construction, so it is peeled out of the committed
  * sidecar entirely. `textureCache.hash` is NOT: `hashKey` is
- * `sha256(source bytes ‖ stableSettings ‖ ENCODER_VERSION)` — no paths, no timestamps, no tool
+ * `sha256(source bytes ‖ textureSettingsKey ‖ ENCODER_VERSION)` — no paths, no timestamps, no tool
  * version. It is therefore a genuine cross-machine claim, and committing it is correct. Its
  * presence is also load-bearing rather than merely informational: `vite-asset-scanner.ts` uses it
  * to decide a conversion EXISTS at all, and without it the manifest bakes no texture settings and
@@ -201,7 +201,7 @@ describe('committed textureCache.hash reproduces from committed inputs (#161)', 
  * guard) plus `textureCache`, `fontCache`, `audioCache`, `environmentCache` and `atlasCache`.
  * Committed, tracked, and carrying a hash the texture-only guard could not see:
  *
- *     textureCache 211  ·  fontCache 4  ·  audioCache 3  ·  environmentCache 3  ·  atlasCache 1
+ *     textureCache 211  ·  fontCache 4  ·  audioCache 3  ·  environmentCache 3  ·  atlasCache 3
  *
  * All of these hashes are the same pure shape as the texture one
  * (`sha256(source bytes ‖ stableSettings ‖ <KIND>_ENCODER_VERSION)`), so they can be checked
@@ -209,11 +209,10 @@ describe('committed textureCache.hash reproduces from committed inputs (#161)', 
  * reimport, and the record silently describes an artifact the pipeline stopped producing. Nothing
  * about the defect is texture-specific; textures are only where it was noticed.
  *
- * NOT covered, deliberately: `atlasCache`. `atlasHashKey` is keyed on the member sprites' GUIDs,
- * rects and TEXTURE BYTES resolved through the project-wide asset index, not on the sidecar's own
- * source file — reproducing it here would mean running the asset scanner, a different and much
- * slower kind of test. One committed atlas exists; it is named here as a known gap rather than
- * silently skipped, because a guard whose exclusions are invisible reads as total coverage.
+ * NOT covered HERE: `atlasCache`. `atlasHashKey` is keyed on the member sprites' GUIDs, rects and
+ * TEXTURE BYTES resolved through the project-wide asset index, not on the sidecar's own source file,
+ * so it cannot be recomputed from one file. Its row lives in `atlasSidecarHashReproduces.test.ts`,
+ * which drives the real pack gate against each project's asset index instead (#2065).
  */
 describe('the other committed cache-block hashes reproduce too (#161 sweep)', () => {
   const KINDS = [
