@@ -317,7 +317,7 @@ function preflight(input: BatchInput, getTool: typeof defaultGetTool): Preflight
     //
     // zod's default behaviour silently DROPS keys the shape doesn't declare, and for a tool whose
     // params are all optional that turns a typo into a different operation. MEASURED on batch use
-    // case 8: `modoki_set_selection {name:'Capsule'}` — `name` is not a parameter — parsed to `{}`,
+    // case 8: `modoki_set_selection` called with `{name:'Capsule'}` — `name` is not a parameter — parsed to `{}`,
     // which that tool documents as "no refs at all = clear", so it CLEARED the selection and
     // reported `ok`. A misspelling that succeeds at doing something else is the worst outcome for a
     // batch, because there is no intermediate response to notice it in. (The

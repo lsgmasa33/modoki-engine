@@ -240,10 +240,10 @@ In a system: `emit('match', { color, count: tiles.length })`.
 
 **Live (integration + feel):**
 ```
-modoki_dispatch('swap', {from, to})   // or modoki_tap for the real hit-test path
-modoki_step(60)                        // pause + step the live world deterministically
-modoki_events({ type: 'win' })         // read the journal over the IPC bridge
-modoki_capture_viewport()              // does it LOOK right — the human's call
+modoki_dispatch_action {name:'swap', params:{from, to}}   // or modoki_tap for the real hit-test path
+modoki_play_control {action:'step'}                        // step the paused live world deterministically
+modoki_journal {type:'win'}                                // read the journal over the IPC bridge
+modoki_capture_viewport                                    // does it LOOK right — the human's call
 ```
 
 ## Risks & open questions

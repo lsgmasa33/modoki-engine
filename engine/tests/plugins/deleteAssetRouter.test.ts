@@ -373,3 +373,98 @@ describe('/api/delete-asset trashes a file\'s sidecars with it (#1648 S4)', () =
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('/api/delete-asset re-checks its operands at the commit point (#1978)', () => {
+  /** A scratch project whose renderer runs `during` inside the LAST awaited probe — the global unsaved-work gate, the
+   *  one asking `dirtyAsset` — so a check placed before that await (or before the held-editor probe) cannot pass. */
+  const setup = (files: string[], during: (dir: string) => void) => {
+    const dir = makeScratchDir('modoki-delete-router-commit-');
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f), '{}');
+    }
+    trashed.length = 0;
+    const ctx = makeCtx((p) => path.join(dir, p), () => ({}));
+    (ctx as { requestBrowser: unknown }).requestBrowser = async (op: string, params: unknown) => {
+      const registries = (params as { registries?: string[] }).registries ?? [];
+      if (op === 'resolve-unsaved' && registries.includes('dirtyAsset')) during(dir);
+      return op === 'resolve-unsaved' ? { ok: true, holds: [], discarded: [], covers: registries } : { ok: true, notes: [] };
+    };
+    return { dir, ctx };
+  };
+  type Changed = { status?: number; body: { ok?: boolean; conflict?: boolean; reason?: string; changed?: string[]; trashed?: number } };
+
+  it('a file renamed away during the probe is NOT reported trashed, and its new name survives', async () => {
+    const { dir, ctx } = setup(['x.png', 'x.png.meta.json'], (d) => {
+      fs.renameSync(path.join(d, 'x.png'), path.join(d, 'y.png'));
+      fs.renameSync(path.join(d, 'x.png.meta.json'), path.join(d, 'y.png.meta.json'));
+    });
+    const r = (await del({ path: '/x.png' }, ctx)) as Changed;
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ ok: false, conflict: true, reason: 'changed' });
+    expect(r.body.changed).toEqual(['/x.png', '/x.png.meta.json']);
+    expect(trashed).toEqual([]);
+    expect(fs.existsSync(path.join(dir, 'y.png'))).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a NEW file landing on the path during the probe is not trashed unprobed', async () => {
+    const { dir, ctx } = setup(['fx/a.particle.json'], (d) => {
+      const p = path.join(d, 'fx/a.particle.json');
+      fs.rmSync(p);
+      fs.writeFileSync(p, '{"new":true}');   // same path, another entry — what an atomic save leaves too
+    });
+    const r = (await del({ path: '/fx/a.particle.json' }, ctx)) as Changed;
+    expect(r.status).toBe(409);
+    expect(r.body.changed).toEqual(['/fx/a.particle.json']);
+    expect(trashed).toEqual([]);
+    expect(fs.readFileSync(path.join(dir, 'fx/a.particle.json'), 'utf8')).toBe('{"new":true}');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a sidecar that APPEARS during the probe is a change too — the sidecar list was decided without it', async () => {
+    const { dir, ctx } = setup(['a.png'], (d) => fs.writeFileSync(path.join(d, 'a.png.meta.json'), '{}'));
+    const r = (await del({ path: '/a.png' }, ctx)) as Changed;
+    expect(r.status).toBe(409);
+    expect(r.body.changed).toEqual(['/a.png.meta.json']);
+    expect(trashed).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('ACCEPT SIDE: nothing changes during the probe → the file and its sidecar are trashed', async () => {
+    const { dir, ctx } = setup(['a.png', 'a.png.meta.json'], () => {});
+    const r = (await del({ path: '/a.png' }, ctx)) as Changed;
+    expect(r.status).toBeUndefined();
+    expect(r.body).toMatchObject({ ok: true, trashed: 2 });
+    expect(trashed.flat().map((abs) => path.basename(abs)).sort()).toEqual(['a.png', 'a.png.meta.json']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a file moved INTO a folder operand during the probe is not trashed with it unprobed', async () => {
+    const { dir, ctx } = setup(['fx/a.particle.json', 'b.particle.json'], (d) => {
+      fs.renameSync(path.join(d, 'b.particle.json'), path.join(d, 'fx/b.particle.json'));
+    });
+    const r = (await del({ path: '/fx' }, ctx)) as Changed;
+    expect(r.status).toBe(409);
+    expect(r.body.changed).toEqual(['/fx']);
+    expect(trashed).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('ACCEPT SIDE: Finder\'s .DS_Store or a converter\'s ~ variant landing in the folder is not a change', async () => {
+    const { dir, ctx } = setup(['fx/a.png'], (d) => {
+      fs.writeFileSync(path.join(d, 'fx/.DS_Store'), '');
+      fs.writeFileSync(path.join(d, 'fx/a.png~atlas.png'), '');
+    });
+    const r = (await del({ path: '/fx' }, ctx)) as Changed;
+    expect(r.body).toMatchObject({ ok: true, trashed: 1 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('ACCEPT SIDE: a folder nothing touches during the probe is trashed', async () => {
+    const { dir, ctx } = setup(['fx/a.particle.json'], () => {});
+    const r = (await del({ path: '/fx' }, ctx)) as Changed;
+    expect(r.body).toMatchObject({ ok: true, trashed: 1 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

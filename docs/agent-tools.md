@@ -70,7 +70,7 @@ keeps the strict-schema refusal working for game tools too.
 
 ⚠️ **An unrecognised param type refuses the WHOLE tool**, loudly, rather than degrading that one
 param to `z.any()`. A silently-untyped param is how a typo becomes a different operation — the
-reason the entire surface went strict after `modoki_set_selection {name:'Capsule'}` parsed to `{}`
+reason the entire surface went strict after `modoki_set_selection` called with `{name:'Capsule'}` parsed to `{}`
 and cleared the human's selection while reporting success.
 
 ### `mutates` is required and has no default

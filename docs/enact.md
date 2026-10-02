@@ -374,7 +374,7 @@ the boundary that matters is the panel it belongs to.
   The editor puts the Game panel's canvases beside the SceneView's (measured on `games/3d-test`,
   1600×968: Game 3D at x 0–366, SceneView at x 370–736), an entity's rect may straddle its own
   canvas's edge with its centre outside, and the DOM check accepted *any* `<canvas>` as "the click
-  reached the surface". Measured: `modoki_tap {entity: Plane029, surface:'game-3d'}` at (402,186)
+  reached the surface". Measured: `modoki_tap {entity:{name:'Plane029', surface:'game-3d'}}` at (402,186)
   answered `ok:true, occluded:false` and the editor journal recorded `!focus {panel:"scene"}` — the
   click drove the Scene panel. The canvas must now belong to the surface that was named, decided
   from the two host markers that exist (`[data-game-view-area]`, `[data-scene-viewport]`) and

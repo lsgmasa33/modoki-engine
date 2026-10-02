@@ -1404,6 +1404,24 @@ export function agentStepGate(op: string, params?: unknown): OpRefusal | (() => 
   return beginForwardEdit();
 }
 
+/** The agent's way out of each PARKED registry `discard-asset-edits` does not own, as replies cite it (#2039).
+ *
+ *  ⚠️ Two replies used to send the agent to a "discard by registry" call on `modoki_persistence` — which takes no
+ *  parameters at all. `resolve-unsaved` (below) can discard by registry, but it is a renderer op only the BACKEND
+ *  calls, never on the MCP surface. The import-settings park's one agent exit is a sidecar write, and a parked baseScene
+ *  ref has none but a save. One table, so the two replies cannot drift again; `mcpCitedCalls.test.ts` checks each
+ *  cited call against the registered schemas. */
+const PARKED_EXITS = {
+  // ⚠️ Not "pass what modoki_get_asset_meta returns": while a park exists that read answers with the PARKED document,
+  // and writing it back SAVES the edit this exit is for discarding (measured on catvader.png, #2039 live check). No MCP
+  // read returns the pre-edit document while parked, so the reply names the two files that hold it.
+  pendingMeta: 'modoki_write_asset_meta {path, meta, discardUnsaved:true} writes `meta`, then drops the import-settings '
+    + 'park for that path. The pre-edit settings are only on DISK — <asset>.meta.json deep-merged with the gitignored '
+    + '<asset>.meta.local.json; modoki_get_asset_meta answers with the parked edit, so posting it back SAVES that edit, '
+    + 'and posting the .meta.json alone deletes the .meta.local.json',
+  pendingBaseScene: 'a parked baseScene ref has no discard op: modoki_save_all writes it',
+} as const;
+
 export function registerEditorAgentOps(): void {
   // Every op registered here is the AGENT acting (human actions come through the UI,
   // not these ops). Shadow registerAgentOp so any editor-activity events an op emits
@@ -2699,10 +2717,9 @@ export function registerEditorAgentOps(): void {
       : ' Run modoki_save_all to write all of it.')
       + (liveHalf ? ' `discardUnsaved:true` deliberately discards the LIVE-WORLD edits (not those of a loaded base the target shares).' : '')
       + (parkedHalf
-        ? ' ⚠️ `discardUnsaved:true` does NOT drop the parked entries — use'
-          + ' modoki_discard_asset_edits (parked asset documents),'
-          + ' modoki_write_asset_meta {discardUnsaved:true} (the import-settings park for the path it writes),'
-          + ' or modoki_persistence {op:"resolve-unsaved"} (discard by registry).'
+        ? ' ⚠️ `discardUnsaved:true` does NOT drop the parked entries:'
+          + ' modoki_discard_asset_edits drops parked asset documents;'
+          + ` ${PARKED_EXITS.pendingMeta}; ${PARKED_EXITS.pendingBaseScene}.`
         : '');
     throw new OpRefusal(
       'REQUIRES_SAVE',
@@ -3188,9 +3205,7 @@ export function registerEditorAgentOps(): void {
         + (leftBehind.length
           ? ` NOT covered by this call — this op owns the dirty-ASSET registry only, and these `
             + `parked edits are STILL pending: ${leftBehind.join('; ')}. modoki_save_all writes `
-            + 'them; modoki_write_asset_meta {discardUnsaved:true} drops the import-settings park '
-            + 'for the path it writes, and modoki_persistence {op:"resolve-unsaved"} can discard '
-            + 'these registries by name.'
+            + `them; ${PARKED_EXITS.pendingMeta}; ${PARKED_EXITS.pendingBaseScene}.`
           : ''),
     };
     const partial = reimportFailedPartial(reply.discarded, reply.reimportFailed);
@@ -3643,7 +3658,7 @@ export function registerEditorAgentOps(): void {
             `instance — ${[...unknown].slice(0, 5).join(', ')}${unknown.size > 5 ? ', …' : ''}. NOTHING was ` +
             `${verb === 'apply' ? 'applied' : 'reverted'} (a partial ${verb} would look like a success). Valid ` +
             `keys (${actOn.length} total) include: ${sample}${actOn.length > 5 ? ', …' : ''}. ` +
-            "Call prefabAction:'overrides' for the exact set.",
+            "Call modoki_prefab {action:'overrides'} for the exact set.",
             { options: actOn },
           );
         }
@@ -3689,7 +3704,7 @@ export function registerEditorAgentOps(): void {
             `prefab apply: ${excluded.length} requested key(s) cannot be written into a prefab ` +
             `template — ${excluded.join(', ')}. These are scene-only or runtime-only fields ` +
             "(EntityAttributes.editorFolder, runtime read-backs); apply would silently skip them. " +
-            "They ARE revertable — prefabAction:'revert' resets them on this instance. Drop them " +
+            "They ARE revertable — modoki_prefab {action:'revert'} resets them on this instance. Drop them " +
             'from `keys` to apply the rest.',
           );
         }
@@ -3705,7 +3720,7 @@ export function registerEditorAgentOps(): void {
           if (checked.bad.length) {
             throw new OpRefusal('NOT_FOUND',
               `prefab apply: ${checked.bad.length} key(s) cannot be applied where asked — ${checked.bad.slice(0, 5).join('; ')}${checked.bad.length > 5 ? '; …' : ''}. ` +
-              "NOTHING was applied. prefabAction:'overrides' lists each key's `targets`.",
+              "NOTHING was applied. modoki_prefab {action:'overrides'} lists each key's `targets`.",
               { options: [...new Set([...opts.values()].flatMap((t) => t.options.map((x) => x.target)))] });
           }
           perKey = checked.perKey;
@@ -3737,7 +3752,7 @@ export function registerEditorAgentOps(): void {
                 : rest.length
                   ? `Drop them from \`keys\`${strayTargets.length ? ' and from `targets`' : ''} to apply the rest; `
                   : 'Nothing else was named, so there is nothing left to apply; ')
-              + "prefabAction:'revert' resets them on this instance.",
+              + "modoki_prefab {action:'revert'} resets them on this instance.",
               rest.length && !conflicting.length && !strayTargets.length ? { options: [`keys:${JSON.stringify(rest)}`] } : {});
           }
         }
@@ -3864,7 +3879,7 @@ export function registerEditorAgentOps(): void {
       if (!isEditingPrefab()) {
         throw new Error(
           "prefab edit-save: the editor is NOT in prefab-edit mode, so there is no prefab to write. " +
-          "Open one first (prefabAction:'edit-open' with the .prefab.json path).",
+          "Open one first: modoki_prefab {action:'edit-open', path:<the .prefab.json>}.",
         );
       }
       const editing = useEditorStore.getState().editingPrefab!;

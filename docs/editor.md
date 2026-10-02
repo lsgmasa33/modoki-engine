@@ -4091,12 +4091,22 @@ Three rules from B3's review (#1648), each the backstop the route lacked:
   is that `absToAssetUrl` cannot name the path, which for a path `resolveAssetPath` accepted means
   exactly "a root". So a test fixture whose `absToAssetUrl` stub returns `null` makes EVERY delete a
   root delete.
-- **A never-clobber check is asked again after every `await`.** move-file and duplicate-asset checked
-  that the destination was free, awaited a renderer probe, then wrote. A file landing during the probe
-  was overwritten, and two concurrent moves to one name both answered ok. Each now re-checks
-  synchronously, right before the fs call. This is the same check-then-act rule `ifMatch` already
-  documents for write-file. Move keeps its inode compare (a case-only rename is not a collision);
-  duplicate keeps a plain `existsSync` (a copy onto itself must be refused).
+- **What a route decided about a path is asked again at the COMMIT POINT** — synchronously, after its
+  last `await`, right before the fs call (family `unguarded-asset-write`). The renderer probes these
+  routes await take long enough for the disk to move. move-file and duplicate-asset checked that the
+  destination was free, awaited, then wrote: a file landing during the probe was overwritten, and two
+  concurrent moves to one name both answered ok (#1954). Each now re-checks the destination there, and
+  judges the retype there too (#1960). Move keeps its inode compare (a case-only rename is not a
+  collision); duplicate keeps a plain `existsSync` (a copy onto itself must be refused).
+  delete-asset decided which operands and sidecars exist before its probes and never asked again: a
+  file renamed away during them answered `trashed` (darwin's trash reads "no longer there" as "went")
+  and the renderer unbound a file that lived on (#1978). It now snapshots each operand and every
+  sidecar it could have — existence, which entry (inode), and a folder's files, minus `.DS_Store` and
+  `~` variants — and answers `409 {reason:'changed'}`, trashing nothing, if any differ. write-meta has
+  the same check for its asset: a rename during its park probe minted an orphan sidecar carrying the
+  live asset's GUID. This is the check-then-act rule `ifMatch` already documents for write-file.
+  ⚠️ **A test of this rule must change the disk INSIDE the last awaited probe** (the stub renderer's
+  reply), or a check placed before the await passes it too.
 - **A delete takes the named file's sidecars with it.** A binary's GUID lives in its `.meta.json`.
   An agent that trashed the file alone left the sidecar, and the next file at that path inherited
   the dead GUID, so every ref to the deleted asset silently showed the new one. Unity deletes the

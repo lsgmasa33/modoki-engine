@@ -970,9 +970,21 @@ folder (issue #54). The first version of this check used only the suffixes, and 
 (`scannerUrlOf`): the disk's spelling of every folder that already exists, because on APFS/NTFS a new
 `/assets/Scenes/x.json` lands in the on-disk `scenes/` and is typed by it (second close-out review).
 A path no kind claims — a plain `.json` outside those folders, or a `.meta.json` sidecar — is NOT
-refused: an unknown kind is not a wrong one. Deliberately outside the rule: `/api/write-file` (byte-
-opaque by design; its only kind-aware guard is the prefab format gate), and `duplicate-asset`,
-`move-file` and `adopt-file`, which never overwrite an existing file. Guarded by
+refused: an unknown kind is not a wrong one. **Except where the route REPLACES an existing file whole**
+(`wrongKindRefusal`'s `replace`, used by `/api/scene-save-as`, #1980): that route accepts an in-project
+`/@fs/` path, which reaches files outside every asset root, and "unknown is not wrong" let a scene
+overwrite `game.ts` (observed). There an existing file must already be a scene.
+
+**A move or copy never retypes an asset through the destination's name** (#1960). Nothing is written,
+so `wrongKindRefusal` does not apply; `retypeRefusal` compares the kind the scan gives the source's
+name with the kind it would give the destination's, file by file for a folder (the legacy folder rules
+type by the folder a file sits in), and refuses `409 {wrongKind:true, retyped:[…]}` only when both are
+KNOWN and differ — `m.mat.json` → `m.prefab.json` used to keep its GUID and become a prefab. ⚠️ **The
+rule must stay symmetric.** Refusing a kind LOST while allowing one GAINED made a one-way door: a data
+`.json` dragged into a legacy `scenes/` folder could not be dragged back out (close-out review,
+reproduced). Both directions are undone by moving back, so both are allowed. Deliberately outside the
+rule: `/api/write-file` (byte-opaque by design; its only kind-aware guard is the prefab format gate) and
+`adopt-file`. Guarded by
 `tests/plugins/wrongKindRefusal.test.ts`, `tests/plugins/sceneSaveAsRoute.test.ts` and
 `tests/editor/otherAssetKindAt.test.ts`.
 

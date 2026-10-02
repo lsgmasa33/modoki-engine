@@ -20,7 +20,7 @@
  *
  *  This module used to be inlined in `ApplyPrefabDialog.tsx` (the human "Apply to
  *  Prefab" / "Revert Overrides" panel) — `buildTree()` + the four string templates.
- *  It moved out so a SECOND caller (the `modoki_prefab {prefabAction:'overrides'}`
+ *  It moved out so a SECOND caller (the `modoki_prefab {action:'overrides'}`
  *  agent op, which has no dialog to build a tree in) can enumerate the exact same
  *  keys the dialog checkboxes carry, rather than reimplementing the walk and
  *  drifting from it the next time one of the two changes. One builder

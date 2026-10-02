@@ -103,7 +103,7 @@ export function defineTool<S extends ZodRawShape>(
   //
   // zod strips unknown keys by default, and the SDK builds a plain `z.object(shape)` from a raw
   // shape (`zod-compat.js` objectFromShape). For a tool whose params are all optional that turns
-  // a TYPO INTO A DIFFERENT OPERATION: `modoki_set_selection {name:'Capsule'}` — there is no
+  // a TYPO INTO A DIFFERENT OPERATION: `modoki_set_selection` called with `{name:'Capsule'}` — there is no
   // `name` param — parsed to `{}`, which that tool documents as "no refs = clear", so it CLEARED
   // the human's selection and reported ok. That was measured. The fix shipped for
   // `modoki_batch`'s pre-flight only, leaving every DIRECT call — where most calls happen —

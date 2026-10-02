@@ -104,7 +104,7 @@ export { existingAssetPath } from './scene/createAssetDocument';
 export { describeEffect, type KeyEffect, type EditEffect, type ApplyConflict } from './scene/prefabApplyEffects';
 export { commitPrefabWrite, commitPrefabWrites, prefabConflictReason, prefabTextIsDocument, type PrefabCommitResult, type PrefabCommitsResult, type PrefabWrite, type PrefabExpectation } from './scene/prefabCommit';
 // Shared override-key enumeration for the Apply-to-Prefab / Revert-Overrides surfaces —
-// the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {prefabAction:'overrides'}`
+// the dialog (ApplyPrefabDialog.tsx) and the `modoki_prefab {action:'overrides'}`
 // agent op both build their checkbox/discovery list from this ONE walk, so they cannot
 // silently drift from each other (see prefabOverrideKeys.ts's header comment).
 export {

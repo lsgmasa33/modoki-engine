@@ -913,3 +913,29 @@ describe('/api/reimport — only newer-format sidecars in the way is a refusal, 
     expect(res.body.code).toBeUndefined();
   });
 });
+
+describe('/api/write-meta re-checks its asset at the commit point (#1978 close-out review)', () => {
+  /** The park gate's probe is the route's one await; `during` runs inside it. */
+  const ctxDuring = (during: () => void) => makeCtx((op, params) => {
+    if (op === 'resolve-unsaved') during();
+    return rendererWithParks([])(op, params);
+  });
+
+  it('an asset renamed away (sidecar and all) during the probe gets no orphan sidecar minted at the old path', async () => {
+    seed();
+    const res = await post('/api/write-meta', { path: ASSET, meta: { id: 'rock-guid', version: 1 } }, ctxDuring(() => {
+      fs.renameSync(assetAbs(), path.join(projectRoot, 'b.png'));
+      fs.renameSync(metaAbs(), path.join(projectRoot, 'b.png.meta.json'));
+    }));
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ ok: false, conflict: true, reason: 'changed', changed: [ASSET] });
+    expect(fs.existsSync(metaAbs())).toBe(false);   // no `rock.png.meta.json` next to nothing, carrying b.png's GUID
+  });
+
+  it('ACCEPT SIDE: nothing changes during the probe → the sidecar is written', async () => {
+    seed();
+    const res = await post('/api/write-meta', { path: ASSET, meta: { id: 'rock-guid', version: 1, texture: { maxSize: 512 } } }, ctxDuring(() => {}));
+    expect(res.body.ok).toBe(true);
+    expect((readMeta().texture as { maxSize: number }).maxSize).toBe(512);
+  });
+});

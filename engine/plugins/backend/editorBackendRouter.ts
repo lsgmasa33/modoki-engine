@@ -59,7 +59,7 @@ import { getReimportHandler, getReimportTypes, type ReimportContext, type Reimpo
 import { findGamesEntry } from '../findGamesEntry';
 import { classifyPrefabWrite, classifyPrefabMarkWrite } from '../prefabWriteGuard';
 import { classifyPrefabIdentityWrite, admittedPrefab } from './prefabIdentityGuard';
-import { classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
+import { classifyBinaryExt, classifyJsonAssetPath, classifyJsonAssetSuffix } from '../assetTypes';
 
 /** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
  *  A file that does not parse is the most important thing a validator can report, and it used to
@@ -631,9 +631,22 @@ function assetKindAt(ctx: BackendContext, absPath: string): { kind: string | nul
  *  A kind nothing can name (a plain `.json` outside the legacy `/scenes/`/`/materials/` folders) is
  *  NOT refused: an unknown kind is not a wrong one, and refusing it would break a write this never
  *  had grounds to judge. */
-function wrongKindRefusal(ctx: BackendContext, absPath: string, expected: string): BackendResult | null {
+function wrongKindRefusal(
+  ctx: BackendContext, absPath: string, expected: string,
+  /** `replace` (scene-save-as, #1980): an EXISTING file must already BE `expected`, so one no kind names is refused too.
+   *  A route that replaces the whole file with a new document cannot vouch for what it destroys — `game.ts` reached
+   *  through an in-project `/@fs/` path has no asset kind, and "unknown is not wrong" let a scene overwrite it. */
+  opts: { replace?: boolean } = {},
+): BackendResult | null {
   const { kind, exists, url } = assetKindAt(ctx, absPath);
-  if (kind === null || kind === expected) return null;
+  if (kind === expected) return null;
+  if (kind === null && !(opts.replace && exists)) return null;
+  if (kind === null) {
+    return json({
+      error: `${url ?? absPath} is not a ${expected} — no asset kind names that file, and this route would replace it whole. Nothing was written.`,
+      wrongKind: true, existingType: null,
+    }, 409);
+  }
   const shown = url ?? absPath;
   return exists
     ? json({ error: `${shown} is not a ${expected} (it is typed '${kind}'). Nothing was written.`, wrongKind: true, existingType: kind }, 409)
@@ -664,10 +677,96 @@ function assetRootOperandRefusal(ctx: BackendContext, absPath: string, input: st
  *  name both passed it and the second rename destroyed the first file. */
 function destinationTaken(absFrom: string, absTo: string): boolean {
   if (!fs.existsSync(absTo) || absTo === absFrom) return false;
+  return !sameEntry(absFrom, absTo); // a failed stat answers "not the same entry" → a real collision
+}
+
+// ── The commit point (family/unguarded-asset-write: #1954, #1960, #1978, #1980) ──────────────────────────────────────
+// A route that moves, copies, trashes or replaces a caller-named path judges what is AT that path SYNCHRONOUSLY, after
+// its last `await` and right before the fs call — never only from an answer taken before a renderer probe. Each check
+// below returns the route's refusal or null, and nothing may `await` between it and the fs call it guards: that span is
+// what makes check-then-act atomic against every other request this process serves (the `ifMatchRefusal` rule).
+
+/** What the NEXT scan types the file at asset url `url` as, by its NAME: the JSON rule (suffix + legacy folders) for a
+ *  `.json`, the shared binary table otherwise. The scanner's `detectType` composes the same two, and this router may not
+ *  import the scanner (it is host-agnostic). Null: no asset kind — a plain data `.json`, a sidecar, an `.obj` source. */
+function kindByName(url: string): string | null {
+  return url.endsWith('.json') ? classifyJsonAssetPath(url) : classifyBinaryExt(url);
+}
+
+/** True when `a` and `b` are one directory entry — a case-only rename on a case-insensitive disk. */
+function sameEntry(a: string, b: string): boolean {
   try {
-    const a = fs.statSync(absFrom), b = fs.statSync(absTo);
-    return !(a.ino === b.ino && a.dev === b.dev);
-  } catch { return true; /* stat failed → treat as a real collision */ }
+    const x = fs.statSync(a), y = fs.statSync(b);
+    return x.ino === y.ino && x.dev === y.dev;
+  } catch { return false; }
+}
+
+/** A move or copy that would change what an asset IS through its destination's name (#1960) — `m.mat.json` moved to
+ *  `m.prefab.json` kept its GUID and became a prefab in the manifest. #1472's `wrongKindRefusal` judges a WRITE of a
+ *  known kind; here nothing is written, so the source's own kind is the expectation, and only a change from one KNOWN kind
+ *  to ANOTHER is refused. ⚠️ The rule must be SYMMETRIC, or a move becomes a one-way door: refusing a kind LOST while
+ *  allowing one GAINED let a data `.json` dropped into a legacy `scenes/` folder in, and then refused to let it back out
+ *  (close-out review, reproduced). Losing a kind is the reverse of gaining one, both are undone by moving back, and a
+ *  write of the same bytes at either name would be accepted. A folder is judged per file: its children keep their names, but the legacy
+ *  `/scenes/` and `/materials/` folder rules type a plain `.json` by the folder it sits in. Commit-point check.
+ *
+ *  A case-only rename needs no special landing: every suffix and legacy folder name is lower-case, so a case variant can
+ *  only move a kind between KNOWN and NONE, which this allows. (`scannerUrlOf` answers such a destination with the old
+ *  spelling, i.e. the same kind.) */
+function retypeRefusal(ctx: BackendContext, absFrom: string, absTo: string, isDir: boolean, verb: 'move' | 'duplicate'): BackendResult | null {
+  const landing = scannerUrlOf(ctx, absTo);
+  const fromUrl = ctx.absToAssetUrl(absFrom, { onDisk: true });
+  if (!landing || !fromUrl) return null; // an asset root, which #1953 refuses before this
+  const pairs: Array<[string, string]> = isDir
+    ? filesUnder(absFrom).map((rel) => [`${fromUrl}/${rel}`, `${landing}/${rel}`]) // `filesUnder` joins with / on every OS
+    : [[fromUrl, landing]];
+  const retyped = pairs
+    .map(([from, to]) => ({ from, to, type: kindByName(from), newType: kindByName(to) }))
+    .filter((p) => p.type !== null && p.newType !== null && p.type !== p.newType);
+  if (!retyped.length) return null;
+  const shown = retyped.slice(0, 5).map((p) => `${p.from} ('${p.type}') → ${p.to} ('${p.newType}')`);
+  return json({
+    error: `Refusing to ${verb}: the destination's name would RETYPE ${retyped.length === 1 ? 'it' : `${retyped.length} assets`} — `
+      + `${shown.join('; ')}${retyped.length > 5 ? '; …' : ''}. `
+      + (verb === 'move'
+        ? 'It keeps its GUID, so every ref to it would resolve to an asset of the other kind.'
+        : 'The copy would be loaded as the other kind while its bytes are the first.')
+      + ' Nothing was changed.',
+    wrongKind: true,
+    retyped,
+    options: ["keep the kind: a destination name whose suffix (e.g. .mat.json) or legacy folder (scenes/, materials/) types it the same as the source's"],
+  }, 409);
+}
+
+/** What each path held when a route decided on it — existence, which directory entry, and for a folder which files sit
+ *  under it — so the commit point can ask again (#1978). The entry matters, not just existence: a file replaced at the
+ *  same path (an atomic save, a rename landing on it) is not the file the route probed. And a folder's contents matter:
+ *  a file moved INTO it during the probe was never probed, and the trash would take it with the folder. */
+type PathSnapshot = Map<string, { ino: number; dev: number; files?: string } | null>;
+function snapshotPaths(abs: Iterable<string>): PathSnapshot {
+  const snap: PathSnapshot = new Map();
+  for (const p of abs) {
+    try {
+      const st = fs.statSync(p);
+      snap.set(p, { ino: st.ino, dev: st.dev, ...(st.isDirectory() ? { files: snapshotFilesOf(p) } : {}) });
+    } catch { snap.set(p, null); }
+  }
+  return snap;
+}
+/** A folder's files as the snapshot compares them. Without dotfiles and derived `~` variants (`x.png~atlas.png`): Finder
+ *  writes `.DS_Store` and a converter writes a variant on their own schedule, and a delete refused for either is a
+ *  spurious 409 (close-out review). Neither carries an edit a probe could have been asked about. */
+function snapshotFilesOf(dir: string): string {
+  return filesUnder(dir).filter((rel) => !rel.split('/').some((seg) => seg.startsWith('.') || seg.includes('~'))).sort().join('\0');
+}
+/** The snapshot's paths that are no longer what they were — gone, appeared, another entry, or a folder whose files
+ *  changed. Commit-point check. */
+function changedSince(snap: PathSnapshot): string[] {
+  const now = snapshotPaths(snap.keys());
+  return [...snap].filter(([p, was]) => {
+    const is = now.get(p) ?? null;
+    return was === null || is === null ? was !== is : was.ino !== is.ino || was.dev !== is.dev || was.files !== is.files;
+  }).map(([p]) => p);
 }
 
 function rebuildManifestInline(ctx: BackendContext): boolean {
@@ -3514,6 +3613,15 @@ async function describeUnresolvedAgainstLiveWorld(
       // Single-path back-compat: a lone non-existent target is still a 404 — unless the caller stated what it
       // expects there, and then a gone file is a failed precondition (409 below), as on `/api/write-file`.
       if (resolved.length === 0 && !Array.isArray(paths) && expectations.map.size === 0) return json({ error: 'File not found' }, 404);
+      // Everything decided above — which operands exist, which sidecars go with them — is asked again at the commit
+      // point (#1978), because the gates below `await` the renderer and the disk can move meanwhile. Each operand and
+      // every sidecar it COULD have, present or not: a sidecar that appears is a change too.
+      const inputOf = new Map<string, string>();
+      for (const [input, abs] of absOf) {
+        inputOf.set(abs, input);
+        if (!SIDECAR_SUFFIXES.some((x) => abs.endsWith(x))) for (const x of SIDECAR_SUFFIXES) inputOf.set(abs + x, input + x);
+      }
+      const decidedOn = snapshotPaths(inputOf.keys());
       // Which of them are FOLDERS — asked before the trash, while they still exist. Same reason
       // as /api/move-file: only the route can tell, and a folder needs `prefix` or the repair
       // reaches the folder and none of its contents.
@@ -3607,6 +3715,20 @@ async function describeUnresolvedAgainstLiveWorld(
       // before it changed anything. ⚠️ Checked HERE, after every gate that awaits and right before the trash,
       // and nothing may `await` between the two: that synchronous span is what makes check-then-trash atomic
       // (same rule, same reason, as `ifMatchRefusal` on `/api/write-file`).
+      // ⚠️ The commit point (#1978): the operands must still be the entries the gates above judged. A file renamed away
+      // during the probe used to answer `trashed` (darwin's trash reads "no longer there" as "went") and unbind a path
+      // whose file lives on under its new name; a file that LANDED there meanwhile was trashed unprobed. Synchronous
+      // from here to the trash, like the precondition below. With no gate run (`rendererWrite`, `discardUnsaved`) nothing
+      // awaited since the snapshot, so it cannot differ and the editor's own deletes are unaffected.
+      const moved = changedSince(decidedOn);
+      if (moved.length > 0) {
+        const shown = moved.map((abs) => inputOf.get(abs) ?? abs);
+        return json({
+          ok: false, conflict: true, reason: 'changed', changed: shown,
+          error: `Nothing was trashed: ${shown.join(', ')} changed on disk while the delete waited for the editor (gone, `
+            + 'appeared, replaced by another file, or a folder whose files changed). Read the paths again before deciding to delete them.',
+        }, 409);
+      }
       const conflicts = deletePreconditionConflicts(expectations.map, absOf);
       if (conflicts.length > 0) {
         return json({
@@ -4208,6 +4330,11 @@ async function describeUnresolvedAgainstLiveWorld(
           ],
         }, 404);
       }
+      // The asset judged above is asked about again at the commit point (#1978's shape, found by its close-out review):
+      // the park gate below awaits the renderer, and a rename of the asset meanwhile (which takes its sidecar along)
+      // left this write to mint a sidecar next to nothing — an orphan carrying the live asset's GUID, the trap #1975
+      // closed for imports.
+      const decidedOn = snapshotPaths([resolved]);
       // ── The park gate (#872) ──────────────────────────────────────────────────────────────
       // This route REPLACES the sidecar wholesale, and since #845 a human's Inspector
       // import-settings change is PARKED in the renderer rather than written. Both directions used
@@ -4255,6 +4382,13 @@ async function describeUnresolvedAgainstLiveWorld(
       // in `ifMatchRefusal` is synchronous and Node is single-threaded, so the guard holds only
       // while the call site keeps that window closed. `writeMetaSidecar` is synchronous; keep it
       // that way, and see `ifMatchRefusal`'s own docblock.
+      if (rendererWrite !== true && changedSince(decidedOn).length > 0) {
+        return json({
+          ok: false, conflict: true, reason: 'changed', changed: [assetPath],
+          error: `Nothing was written: ${assetPath} changed on disk while the write waited for the editor (gone, or replaced by `
+            + 'another file), so a sidecar written now could describe nothing. Find the asset again (modoki_list_assets) and repeat.',
+        }, 409);
+      }
       const refusal = ifMatchRefusal(sidecarPath(resolved), ifMatch);
       if (refusal) return json(refusal, 409);
       writeMetaSidecar(resolved, meta as Parameters<typeof writeMetaSidecar>[1]);
@@ -5011,7 +5145,14 @@ async function describeUnresolvedAgainstLiveWorld(
     try {
       const { path: filePath, content, openPath, loadedPaths } = (body ?? {}) as { path: string; content: string; openPath?: string; loadedPaths?: unknown };
       const absPath = typeof filePath === 'string' ? resolveWritableFilePath(ctx, filePath) : null;
-      if (!absPath) return outsideAssetRoots('Path outside allowed directories');
+      // Not `outsideAssetRoots` (#1980): this route DOES take an in-project /@fs/ path (a flat project's scenes load
+      // through one), which that advice calls unaccepted — `/api/write-file`'s refusal, for the same resolver.
+      if (!absPath) {
+        return json({
+          error: `${JSON.stringify(filePath)} is outside this project${String(filePath).startsWith('/@fs/') ? ' (a /@fs/ path must be inside the project)' : "'s asset roots"}, so nothing was written`,
+          options: ['pass an asset-root URL of THIS project (e.g. /assets/scenes/main.scene.json) — modoki_list_scenes lists valid values'],
+        }, 403);
+      }
       // The open scene's OWN file under another spelling — `%20`, `./`, a `/@fs/` form, a case
       // variant — which the client's string compare cannot see. Writing a copy here would give the
       // ORIGINAL a fresh id and reminted entity guids, the very damage this route exists to prevent.
@@ -5039,7 +5180,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // Never cross kinds (#1264): the client only sends a `.scene.json` name or a file the manifest
       // already types `scene`, so this is the backstop for a manifest that disagrees — or that does
       // not list the file at all, which the manifest-only check this replaced let through (#1472).
-      const kindRefusal = wrongKindRefusal(ctx, absPath, 'scene');
+      // `replace` (#1980): an existing file no kind names is refused too — an in-project /@fs/ path reaches `game.ts`.
+      const kindRefusal = wrongKindRefusal(ctx, absPath, 'scene', { replace: true });
       if (kindRefusal) return kindRefusal;
       // A non-object is refused `unreadable` before the spread below makes it an object with no version (`too-old`).
       if (!scene || typeof scene !== 'object' || Array.isArray(scene)) assertSceneFormatReadable(scene);
@@ -5101,6 +5243,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // copy a file onto itself.
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
+      {
+        let isDir = false;
+        try { isDir = fs.statSync(absFrom).isDirectory(); } catch { /* raced away → judged as a file */ }
+        const retype = retypeRefusal(ctx, absFrom, absTo, isDir, 'duplicate');
+        if (retype) return retype;
+      }
       // The prefab reader lets a copied scene's refs to prefab MEMBERS follow the reminted root (#1324).
       removeOrphanSidecars(absTo); // #1975: the copy must not adopt a dead asset's sidecar at its new path
       const newGuid = duplicateAssetFile(absFrom, absTo, undefined, makePrefabResolver(ctx));
@@ -5172,6 +5320,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // fingerprinting below and the `prefix` on the repair (#867).
       let isDir = false;
       try { isDir = fs.statSync(absFrom).isDirectory(); } catch { /* raced away → treat as a file */ }
+      // Still synchronous from the never-clobber re-check above: the commit point (#1960).
+      const retype = retypeRefusal(ctx, absFrom, absTo, isDir, 'move');
+      if (retype) return retype;
 
       // The destination is about to APPEAR, and the watcher cannot tell a rename from an
       // external overwrite — so fingerprint it as the editor's own write, exactly as

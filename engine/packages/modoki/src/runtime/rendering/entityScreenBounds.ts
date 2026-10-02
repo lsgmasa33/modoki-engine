@@ -7,7 +7,7 @@
  *  is the point: the two providers answer the same question about different cameras, and the
  *  ONE thing that keeps going wrong is one of them measuring fewer entity kinds than the
  *  surface renders. Scene3D measured only `ecsObjects`, so a skinned character in the GAME view
- *  had no bounds at all and `modoki_tap{entity, surface:'game-3d'}` refused it.
+ *  had no bounds at all and `modoki_tap {entity:{name, surface:'game-3d'}}` refused it.
  *
  *  THE INVARIANT THIS MODULE EXISTS TO HOLD (QA-CTX-0006 / QA-SVIEW-0004):
  *  **what is measured must equal what a click can select.** `pickEntityAtViewportPoint` — the

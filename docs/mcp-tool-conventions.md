@@ -56,7 +56,7 @@ so the refusal states which param has the field and quotes that param's own desc
 Why: zod strips unknown keys by default, and the MCP SDK builds a plain `z.object` (no `.strict()`)
 — verified in `@modelcontextprotocol/sdk`'s `objectFromShape` (`.../zod-compat.js`). For a tool
 whose params are all optional, that turns a typo into **a different operation**:
-`modoki_set_selection {name:'Capsule'}` (no such param) parses to `{}`, which that tool documents as
+`modoki_set_selection` called with `{name:'Capsule'}` (no such param) parses to `{}`, which that tool documents as
 "no refs = clear", so it **clears the human's selection and reports success**. That was measured,
 fixed for `modoki_batch`'s pre-flight — and left in place for every direct call, which is where
 most calls happen (V2).
@@ -1346,7 +1346,7 @@ These needed owner sign-off because each changes the advertised surface. All are
 
 1. **§1 strict everywhere — LANDED.** An unknown key is now an error naming the real params, at the
    single registration point (`registerAll.ts`), so it covers direct calls and every `modoki_batch`
-   step. It was the fix for a measured destructive bug: `modoki_set_selection {name:'Capsule'}` — no
+   step. It was the fix for a measured destructive bug: `modoki_set_selection` called with `{name:'Capsule'}` — no
    such param — parsed to `{}`, which that tool documents as "no refs = clear", so it CLEARED the
    human's selection and reported ok.
 2. **§5 error envelope — LANDED.** Every failure is `{error:{code,tool,what,why,got?,expected?,
