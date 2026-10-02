@@ -116,7 +116,7 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
 async function readAssetJsonOrAbort(path: string, current: number): Promise<Record<string, unknown> | null> {
   let json: unknown;
   try {
-    const res = await fetch(path, { cache: 'no-store' });
+    const res = await fetch(assetUrl(path), { cache: 'no-store' });
     json = await parseAssetJson(res, path);
   } catch (e) {
     const outcome = classifyExistingAssetFetchFailure(e);

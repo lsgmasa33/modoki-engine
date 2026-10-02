@@ -37,6 +37,7 @@ import { useMissingLocalStats } from '../useMissingLocalStats';
 import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -146,7 +147,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
   useEffect(() => {
     let live = true;
     setProbedRigged(false);
-    if (!isSourceModel) glbHasSkins(path).then((s) => { if (live) setProbedRigged(s); });
+    if (!isSourceModel) glbHasSkins(assetUrl(path)).then((s) => { if (live) setProbedRigged(s); });
     return () => { live = false; };
   }, [path, isSourceModel]);
 

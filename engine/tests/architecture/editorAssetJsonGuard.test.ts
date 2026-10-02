@@ -43,11 +43,13 @@ function editorSources() {
   return repoFiles({ under: editorDir, match: /\.tsx?$/, floor: 150 });
 }
 
-/** Matches `fetch(asset.path)`, `fetch(path)`, `fetch(x.y.path)` — with or without a trailing
- *  options arg — but NOT `backendFetch(...)` (case-sensitive, and `\bfetch\(` alone would still
- *  match the tail of that name) and NOT `fetch(assetUrl(asset.path))` (the argument there is a call
- *  expression, not a bare `<expr>.path` — deliberately narrower, per the brief). */
-const FETCH_PATH_CALL = /(?<![\w$])fetch\(\s*(?:[\w$]+(?:\.[\w$]+)*\.path|path)\s*[,)]/g;
+/** Matches `fetch(asset.path)`, `fetch(path)`, `fetch(x.y.path)` and the same wrapped in `assetUrl(…)` — with or
+ *  without a trailing options arg — but NOT `backendFetch(...)` (case-sensitive, and `\bfetch\(` alone would still
+ *  match the tail of that name). The `assetUrl(…)` arm was excluded once ("deliberately narrower"); since #1979 a
+ *  PATH may only be fetched through `assetUrl` (it percent-encodes), so that wrapped shape is now the ONLY correct
+ *  one — every bare site moved to it, and without the arm this rule would be green over zero inputs. */
+const PATH_EXPR = String.raw`(?:[\w$]+(?:\.[\w$]+)*\.path|path)`;
+const FETCH_PATH_CALL = new RegExp(String.raw`(?<![\w$])fetch\(\s*(?:assetUrl\(\s*${PATH_EXPR}\s*\)|${PATH_EXPR})\s*[,)]`, 'g');
 
 /** How far past a matched `fetch(...path)` call to look for the `.json(`/`parseAssetJson` that
  *  decides its fate — generously past a `.then((r) => …)` chain or an `await`+next-statement pair,
@@ -163,5 +165,57 @@ describe('editor asset-document loads are parsed through parseAssetJson, not res
       + 'from this guard. Pardon the CALL, with a count, via '
       + '@modoki/engine/testing/exemptionLedger.\n\nOffending call sites:\n' + offenders.join('\n'),
     ).toEqual([]);
+  });
+});
+
+/** #1979: an asset PATH reaches the network only through `assetUrl`, which percent-encodes the `%`, `?` and `#` a
+ *  URL cannot carry literally (docs/engine-concepts.md, "Asset path vs asset URL"). The close-out review found a dozen
+ *  editor sites handing a raw path to `fetch` / a loader / `src` / a CSS `url()`. Each one could open a different file
+ *  than the one a later write hit: `my%20fx.particle.json` was read as `my fx.particle.json` and saved over the
+ *  literal file.
+ *
+ *  ⚠️ SCOPE, stated so the green means what it says: the rule sees a value spelled as a PATH — an identifier ending in
+ *  `path`/`Path` (`path`, `texPath`, `scenePath`, `assetPath`…) or a `.path` member, bare or inside
+ *  `cacheBustReimport(…)` — as the first argument of `fetch(`, a loader's `.load(`/`.loadAsync(`, `cssUrl(`, or a
+ *  `src=`. It does NOT see a path held in a variable named otherwise (`p`, `url`, `file`), or one built by a helper call
+ *  (`videoPreviewUrl(path, …)`). Naming a path `…Path` is therefore what puts it under this rule. Scanned in
+ *  `editor/**` and the app shell (`engine/app/**`). */
+describe('an editor fetch / load / src of an asset PATH goes through assetUrl (#1979)', () => {
+  const PATHISH = String.raw`(?:[\w$]+(?:\.[\w$]+)*\.path|[\w$]*[pP]ath)\b`;
+  const ARG = String.raw`\s*(?:cacheBustReimport\(\s*)?${PATHISH}\s*[,)]`;
+  const BARE_PATH_USE = new RegExp(
+    String.raw`(?<![\w$])fetch\(${ARG}` // fetch(path) / fetch(x.path) / fetch(cacheBustReimport(path, e))
+    + String.raw`|\.load(?:Async)?\(${ARG}` // loader.load(path, …) / loadAsync(texPath)
+    + String.raw`|(?<![\w$])cssUrl\(${ARG}` // cssUrl(texPath)
+    + String.raw`|\bsrc\s*=\s*\{?\s*${PATHISH}\s*[;}\n]`, // img.src = path / <img src={path}>
+    'g');
+  const appDir = path.resolve(__dirname, '../../app');
+
+  it('the matcher catches each shape and lets the assetUrl-wrapped one through', () => {
+    const hits = (src: string) => (src.match(BARE_PATH_USE) ?? []).length;
+    expect(hits('const r = await fetch(path, init);')).toBe(1);
+    expect(hits('fetch(asset.path).then(f);')).toBe(1);
+    expect(hits('fetch(cacheBustReimport(path, epoch), { signal })')).toBe(1);
+    expect(hits('loader.load(path, onLoad);')).toBe(1);
+    expect(hits('await gltf.loadAsync(glbPath);')).toBe(1);
+    expect(hits('backgroundImage: cssUrl(texPath),')).toBe(1);
+    expect(hits('img.src = scenePath;')).toBe(1);
+    expect(hits('<img src={path} alt="" />')).toBe(1);
+    expect(hits('await fetch(assetUrl(path), init); img.src = assetUrl(path); <img src={assetUrl(path)} />')).toBe(0);
+    expect(hits('loader.load(assetUrl(path)); cssUrl(assetUrl(texPath)); fetch(cacheBustReimport(assetUrl(path), e))')).toBe(0);
+    expect(hits('backendFetch(path); loadPath(path); fetch(url)')).toBe(0);
+  });
+
+  it('has no bare fetch / load / src / cssUrl of a path in editor/** or the app shell', () => {
+    const offenders: string[] = [];
+    const appSources = repoFiles({ under: appDir, match: /\.tsx?$/, floor: 50 });
+    for (const { abs } of [...editorSources(), ...appSources]) {
+      const rel = path.relative(path.resolve(editorDir, '../../../..'), abs).replace(/\\/g, '/');
+      const code = stripComments(fs.readFileSync(abs, 'utf8'));
+      BARE_PATH_USE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = BARE_PATH_USE.exec(code))) offenders.push(`${rel}:${code.slice(0, m.index).split('\n').length}`);
+    }
+    expect(offenders, 'route the path through assetUrl(...) — a raw path is not a URL').toEqual([]);
   });
 });

@@ -31,6 +31,7 @@ import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 const DELIVERY_LABELS: Record<VideoDelivery, string> = {
   bundled: 'Bundled — ships in the build',
@@ -184,7 +185,7 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
         key={`${path}:${cache?.hash ?? 'src'}`}
         controls
         preload="metadata"
-        src={videoPreviewUrl(path, converted)}
+        src={assetUrl(videoPreviewUrl(path, converted))}
         style={{ width: '100%', maxHeight: 160, background: '#111', border: '1px solid #333', borderRadius: 3, marginBottom: 6, display: 'block' }}
       />
 

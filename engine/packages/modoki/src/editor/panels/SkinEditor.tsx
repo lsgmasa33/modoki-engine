@@ -45,6 +45,7 @@ import { BufferedNumberInput, BufferedFieldScope, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
 import { captureSkinOpBasis, isSkinOpBasisCurrent, skinOpStaleMessage, type SkinOpBasis } from './skinOpBasis';
+import { cssUrl } from '../../runtime/core/assetUrlPath';
 
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
@@ -1225,12 +1226,12 @@ function RigSpriteThumb({ guid }: { guid: string }) {
   const sp = guid ? getAssetEntry(guid)?.sprite : undefined;
   const box: React.CSSProperties = { width: 40, height: 40, border: '1px solid #333', background: '#0e0e16', flexShrink: 0 };
   if (sp && sp.rect.w > 0 && sp.rect.h > 0) {
-    const url = sp.texture ? assetUrl(resolveGuidToPath(sp.texture) ?? '') : undefined;
-    return <div style={spriteThumbStyle(url, sp.rect, sp.sheetW, sp.sheetH, { w: 40, h: 40 })} />;
+    const texPath = sp.texture ? resolveGuidToPath(sp.texture) : undefined;
+    return <div style={spriteThumbStyle(texPath, sp.rect, sp.sheetW, sp.sheetH, { w: 40, h: 40 })} />;
   }
   const path = guid ? resolveGuidToPath(guid) : undefined;
   if (path) {
-    return <div style={{ ...box, backgroundImage: `url("${assetUrl(path)}")`, backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center', imageRendering: 'pixelated' }} />;
+    return <div style={{ ...box, backgroundImage: cssUrl(assetUrl(path)), backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center', imageRendering: 'pixelated' }} />;
   }
   return <div style={box} />;
 }

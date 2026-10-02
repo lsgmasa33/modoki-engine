@@ -85,10 +85,11 @@ function makeCtx(renderer: RendererStub, manifest: Manifest = { version: 2, asse
   return {
     projectRoot,
     editorRoot: projectRoot,
-    // Percent-decodes, like the real `resolveAssetPath`. It did not, and nothing noticed until
-    // `/api/write-meta` started checking the asset EXISTS (#1215 A-2): F7's `/rock%2Epng` resolved
-    // to a file literally named `rock%2Epng`, a resolver no route is ever given.
-    resolveAssetPath: (p: string) => path.join(projectRoot, decodeURIComponent(p).replace(/^\//, '')),
+    // Does NOT percent-decode, like the real `resolveAssetPath` since #1979: an asset path is an
+    // identity, so `/rock%2Epng` names a file literally called `rock%2Epng`. (This stub decoded
+    // while production did too; a stub more permissive than production explores a region no route
+    // reaches — docs/windows.md, the "path SHAPE handed to a route" entry.)
+    resolveAssetPath: (p: string) => path.join(projectRoot, p.replace(/^\//, '')),
     absToAssetUrl: (p: string) => p,
     firstRootDir: () => null,
     getManifest: () => manifest,
@@ -569,9 +570,9 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
   });
 
   it('F7 — the gate is keyed on the CANONICAL asset URL, not the raw request string', async () => {
-    // `resolveAssetPath` prepends a missing slash and percent-decodes, so these reach a real file —
-    // while the park is filed under the canonical URL. Gating on the raw string missed it and the
-    // write destroyed the very park it had just checked for.
+    // `resolveAssetPath` prepends a missing slash, so this reaches a real file — while the park is
+    // filed under the canonical URL. Gating on the raw string missed it and the write destroyed the
+    // very park it had just checked for.
     seed();
 
     const noSlash = await post('/api/write-meta', { path: 'rock.png', meta: { id: 'rock-guid' } },
@@ -579,10 +580,12 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
     expect(noSlash.status, 'a leading-slash-less path must still find the park').toBe(409);
     expect(readMeta().texture).toEqual({ maxSize: 2048 });
 
+    // A `%` spelling is NOT another spelling of this asset (#1979): it names a different, absent
+    // file, so it must neither write the sidecar nor be gated by this asset's park.
     asked = [];
-    const encoded = await post('/api/write-meta', { path: '/rock%2Epng', meta: { id: 'rock-guid' } },
+    const percent = await post('/api/write-meta', { path: '/rock%2Epng', meta: { id: 'rock-guid' } },
       makeCtx(rendererWithParks([ASSET])));
-    expect(encoded.status, 'a percent-encoded path must still find the park').toBe(409);
+    expect(percent.status, 'a literal-% name is a different, missing asset').toBe(404);
     expect(readMeta().texture).toEqual({ maxSize: 2048 });
   });
 

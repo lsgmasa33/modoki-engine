@@ -74,6 +74,7 @@ import {
   getCurrentFolder, setCurrentFolder,
 } from './assetFolderState';
 import { ModalShell } from '../components/ModalShell';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 
 /** The Assets panel's "Instantiate" (the shared flow, `prefabPlace.ts`). */
@@ -121,7 +122,7 @@ async function fetchAssets(): Promise<{ assets: AssetEntry[]; folders: string[] 
   const config = getGameConfig();
   const manifestPath = config.assetManifest || '/assets.manifest.json';
   try {
-    const res = await fetch(manifestPath);
+    const res = await fetch(assetUrl(manifestPath));
     if (!res.ok) return { assets: [], folders: [] };
     const data = await res.json();
     return { assets: (data.assets || []) as AssetEntry[], folders: (data.folders || []) as string[] };

@@ -7,6 +7,7 @@ import { assetUrl, withCacheBust } from './assetUrl';
 import { getAllAssets, getAssetEntry, resolveRef, onFontInvalidated, type FontManifestBlock } from './assetManifest';
 import { isGuid } from '../core/assetRefRules';
 import { createTeardownToken } from '../core/liveness';
+import { cssUrl } from '../core/assetUrlPath';
 
 export { parseFontFilename, type FontInfo };
 
@@ -66,9 +67,9 @@ async function doLoadFont(path: string): Promise<string> {
   // now applies here too and the dev reload is a real refetch (see `assetUrl.ts`).
   // QUOTE the CSS url() — an unquoted url() breaks on a SPACE (or other CSS-special
   // char) in the filename (e.g. "Geologica-Bold Dynamic.ttf"), failing face.load().
-  // Escape any embedded double-quote/backslash so the quoted url() stays well-formed.
-  const src = withCacheBust(assetUrl(path), getAssetEntry(path)?.hash).replace(/(["\\])/g, '\\$1');
-  const face = new FontFace(info.family, `url("${src}")`, {
+  // `cssUrl` quotes it and escapes any embedded double-quote/backslash.
+  const src = withCacheBust(assetUrl(path), getAssetEntry(path)?.hash);
+  const face = new FontFace(info.family, cssUrl(src), {
     weight: info.weight,
     style: info.style,
   });

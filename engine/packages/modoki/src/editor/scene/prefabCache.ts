@@ -169,8 +169,10 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
  *  itself: a stale read — one a write or a trash overtook — re-registered its guid at the path the trash had just emptied,
  *  so a trashed prefab resolved again until the next manifest broadcast. */
 function registerRead(source: string, prefab: PrefabFile): void {
-  const url = isGuid(source) ? resolveRef(source) : assetUrl(source);
-  if (prefab.id && url) registerAsset(prefab.id, url, 'prefab');
+  // The manifest keys a PATH, never a URL: `assetUrl` percent-encodes a `%`/`?`/`#` (#1979), so registering its output
+  // re-keyed `50%.prefab.json` as `50%25.prefab.json`.
+  const assetPath = isGuid(source) ? resolveRef(source) : source;
+  if (prefab.id && assetPath) registerAsset(prefab.id, assetPath, 'prefab');
 }
 
 const refusedReads = new Map<string, string>();
@@ -189,12 +191,12 @@ export async function fetchPrefabSource(source: string, init: RequestInit = ASSE
   // Normally a GUID (resolve via manifest). A freshly-instantiated instance can
   // still carry a path before its owning scene is saved + normalized; resolveRef
   // rejects internal asset paths loudly, so fetch a path ref directly instead.
-  const url = isGuid(source) ? resolveRef(source) : assetUrl(source);
-  if (!url) return null;
-  const parked = parkedPrefabRead(isGuid(source) ? url : source);
+  const assetPath = isGuid(source) ? resolveRef(source) : source;
+  if (!assetPath) return null;
+  const parked = parkedPrefabRead(assetPath);
   if (parked) return parked;
   try {
-    const res = await fetch(url, init);
+    const res = await fetch(assetUrl(assetPath), init);
     if (!res.ok) return null;
     const prefab: unknown = await res.json();
     // Not a prefab document (#1813) is a prefab that did not load — the loader's rule (`isPrefabDocument`).

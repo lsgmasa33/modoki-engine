@@ -43,8 +43,11 @@ import { PREFAB_EDIT_SCENE_PREFIX } from '../core/ecs/sceneLoaded';
  *  next save writes the stale world over the external change.
  *
  *  The `/assets/` segment is found case-insensitively too (a `/@fs/` path spells the folder as it is on disk), and a
- *  percent-encoded spelling (`2D%20Animation`) is decoded: the server resolves both, while the watcher reports the
- *  literal on-disk name.
+ *  percent-encoded spelling (`2D%20Animation`) is decoded, because this takes URLs as well as paths: a Vite module
+ *  URL (`?url`, an HMR `?t=`) is encoded, while the watcher reports the literal on-disk name.
+ *  ⚠️ That makes the key lossy for a name holding a literal escape (#1979): `my%20level` and `my level` share a key,
+ *  with the same disk-wins price as the case fold below — a change to one reloads the other. Accepted: both files must
+ *  exist, and a key that missed the encoded spelling would skip a reload silently instead. Nothing fetches a key.
  *
  *  A synthetic prefab-edit key (`PREFAB_EDIT_SCENE_PREFIX` + guid, or + the prefab's PATH when it has no guid) is
  *  returned whole: cut at an `/assets/` inside it, it would lose the prefix that `adopt` reads to drop the edit

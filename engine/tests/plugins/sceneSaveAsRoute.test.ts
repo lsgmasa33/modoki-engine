@@ -21,8 +21,8 @@ function makeCtx(): BackendContext {
   return {
     projectRoot,
     editorRoot: projectRoot,
-    // The REAL resolver: it decodes `%20` and resolves `./`, which is what makes a second spelling of
-    // one file possible at all.
+    // The REAL resolver: it resolves `./`, which is what makes a second spelling of one file possible
+    // at all. (It no longer decodes `%20` — #1979 — so that is a DIFFERENT file, not a spelling.)
     resolveAssetPath: (p: string) => resolveAssetPath(p, [{ urlPrefix: '', absDir: projectRoot }]),
     absToAssetUrl: (p: string) => '/' + path.relative(projectRoot, p).split(path.sep).join('/'),
     firstRootDir: () => null,
@@ -121,12 +121,22 @@ describe('/api/scene-save-as', () => {
     fs.mkdirSync(path.join(projectRoot, 'scenes'), { recursive: true });
     const before = JSON.stringify(openScene());
     fs.writeFileSync(path.join(projectRoot, 'scenes/New Scene.scene.json'), before);
-    for (const spelling of ['/scenes/New%20Scene.scene.json', '/scenes/./New Scene.scene.json']) {
+    for (const spelling of ['/scenes/./New Scene.scene.json', 'scenes/New Scene.scene.json']) {
       // `loadedPaths` holds the open scene too, as the client always sends it: sameFile must win.
       const res = await post({ path: spelling, content: before, openPath: '/scenes/New Scene.scene.json', loadedPaths: ['/scenes/New Scene.scene.json'] });
       expect(res.status, spelling).toBe(409);
       expect((res.body as { sameFile?: boolean }).sameFile, spelling).toBe(true);
     }
+    expect(fs.readFileSync(path.join(projectRoot, 'scenes/New Scene.scene.json'), 'utf-8')).toBe(before);
+  });
+
+  it('a %20 spelling is a DIFFERENT file, not the open scene: it is saved beside it (#1979)', async () => {
+    fs.mkdirSync(path.join(projectRoot, 'scenes'), { recursive: true });
+    const before = JSON.stringify(openScene());
+    fs.writeFileSync(path.join(projectRoot, 'scenes/New Scene.scene.json'), before);
+    const res = await post({ path: '/scenes/New%20Scene.scene.json', content: before, openPath: '/scenes/New Scene.scene.json', loadedPaths: ['/scenes/New Scene.scene.json'] });
+    expect(res.body.ok).toBe(true);
+    expect(fs.existsSync(path.join(projectRoot, 'scenes/New%20Scene.scene.json'))).toBe(true);
     expect(fs.readFileSync(path.join(projectRoot, 'scenes/New Scene.scene.json'), 'utf-8')).toBe(before);
   });
 

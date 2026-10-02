@@ -16,8 +16,10 @@ const mockLoadScene = vi.fn().mockResolvedValue(undefined);
  *  the others poll their own assertion. Each used to sleep 10ms and bet on it (#1478). */
 const mockSetFontStatus = vi.fn();
 
-vi.mock('@modoki/engine/runtime', () => ({
+vi.mock('@modoki/engine/runtime', async () => ({
   getGameConfig: () => mockGetGameConfig(),
+  // The REAL decode: what `loadInitialScene` must hand `loadScene` is exactly what it computes (#1979).
+  bootScenePath: (await import('../../packages/modoki/src/runtime/core/config')).bootScenePath,
   loadAllFonts: (...args: any[]) => mockLoadAllFonts(...args),
   loadManifestJson: vi.fn(),
   // init.ts reads useGameStore.getState().setFontStatus (the store moved into the
@@ -111,6 +113,18 @@ describe('loadInitialScene', () => {
     await loadInitialScene();
 
     expect(mockLoadScene).toHaveBeenCalledWith('/scenes/test.json');
+  });
+
+  it('hands loadScene a PATH: a `?url` scenePath is percent-encoded, and is decoded once (#1979)', async () => {
+    // What Vite writes for `import u from './assets/scenes/level 1.scene.json?url'`. Passed through raw, loadScene's
+    // assetUrl encoded the `%` again and the boot scene 404'd.
+    mockGetGameConfig.mockReturnValue({ scenePath: '/assets/scenes/level%201.scene.json' });
+    vi.resetModules();
+    const { loadInitialScene } = await import('../../app/ecs/init');
+
+    await loadInitialScene();
+
+    expect(mockLoadScene).toHaveBeenCalledWith('/assets/scenes/level 1.scene.json');
   });
 
   it('skips loading when no scenePath is set', async () => {

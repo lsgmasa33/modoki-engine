@@ -213,3 +213,38 @@ describe('serveProjectAsset — .gltf-named source serves its baked LOD variants
     expect(res!.headers?.ETag).toBe(`"${hash}"`);
   });
 });
+
+/** #1979: the request pathname is the asset path ENCODED, and `serveProjectAsset` is the ONE place
+ *  it is decoded — once. `ctx().resolveAssetPath` above does not decode, exactly like production
+ *  since #1979, so every assertion here is about this function's own decode. */
+describe('serveProjectAsset — decodes the request path exactly once (#1979)', () => {
+  const put = (rel: string, bytes: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), bytes);
+  };
+  const servedPath = (res: unknown) => (res as { path?: string } | null)?.path;
+
+  it('serves a file whose name holds a literal % (the URL carries it as %25)', async () => {
+    put('assets/100%.png', 'P');
+    expect(servedPath(await serveProjectAsset(ctx(), '/assets/100%25.png'))).toBe(path.join(root, 'assets/100%.png'));
+  });
+
+  it('tells `my%20tex.png` from `my tex.png` — each URL serves its OWN file', async () => {
+    put('assets/my tex.png', 'SPACE');
+    put('assets/my%20tex.png', 'PERCENT');
+    expect(servedPath(await serveProjectAsset(ctx(), '/assets/my%20tex.png'))).toBe(path.join(root, 'assets/my tex.png'));
+    expect(servedPath(await serveProjectAsset(ctx(), '/assets/my%2520tex.png'))).toBe(path.join(root, 'assets/my%20tex.png'));
+  });
+
+  it('a malformed escape is not an asset: it falls through (null), never throws a 500', async () => {
+    put('assets/100%.png', 'P');
+    await expect(serveProjectAsset(ctx(), '/assets/100%.png')).resolves.toBeNull();
+  });
+
+  it('a VARIANT URL of a %-named source decodes once too (it used to decode twice and throw)', async () => {
+    put('assets/models/50%.glb', 'GLB-SOURCE-BYTES');
+    put('assets/models/50%.glb.meta.json', JSON.stringify({ modelCache: { hash: 'deadbeefdeadbeef' } }));
+    const res = await serveProjectAsset(ctx(), '/assets/models/50%25.glb.processed.glb');
+    expect(servedPath(res), 'degrades to the %-named source GLB').toBe(path.join(root, 'assets/models/50%.glb'));
+  });
+});

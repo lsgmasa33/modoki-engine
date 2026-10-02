@@ -7,6 +7,7 @@ import { whenMeshTemplate, meshStatsFromTemplate } from '../../../runtime/loader
 import { InfoRow, Section } from './widgets';
 import { MeshPreview } from '../MeshPreview';
 import { useModelInvalidationEpoch, useAssetInvalidationEpoch, cacheBustReimport } from '../useAssetInvalidationEpoch';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 export function MeshAssetView({ path }: { path: string }) {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
@@ -21,7 +22,7 @@ export function MeshAssetView({ path }: { path: string }) {
 
   useEffect(() => {
     const ac = new AbortController();
-    fetch(cacheBustReimport(path, epoch), { signal: ac.signal })
+    fetch(cacheBustReimport(assetUrl(path), epoch), { signal: ac.signal })
       .then(r => r.ok ? r.json() : null)
       .then(setData)
       .catch(e => { if (e.name !== 'AbortError') setData(null); });

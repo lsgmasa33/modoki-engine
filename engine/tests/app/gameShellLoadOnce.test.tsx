@@ -21,7 +21,7 @@ import React from 'react';
 const spies = vi.hoisted(() => ({
   attributionInit: vi.fn(),
   playerPrefsInit: vi.fn(async () => ({ discardedPending: [] })),
-  loadScene: vi.fn(async () => {}),
+  loadScene: vi.fn(async (_path: string, _opts?: unknown) => {}),
   clearAppServices: vi.fn(),
   resolveTierForNo3DProject: vi.fn(async () => {}),
   resolveTierBeforeSceneLoad: vi.fn(async () => {}),
@@ -30,13 +30,16 @@ const spies = vi.hoisted(() => ({
 }));
 
 // ── `@modoki/engine/runtime` barrel — every named export App.tsx imports from it. ──
-vi.mock('@modoki/engine/runtime', () => ({
+vi.mock('@modoki/engine/runtime', async () => ({
+  // The REAL decode (#1979): App.tsx reads config.scenePath through it, and a stub would be more permissive.
+  bootScenePath: (await import('../../packages/modoki/src/runtime/core/config')).bootScenePath,
   useGameLoop: () => {},
   setGameConfig: vi.fn(),
   sceneManager: { loadScene: spies.loadScene },
   ensureManifestLoaded: vi.fn(async () => {}),
-  resolveSceneByName: vi.fn(() => undefined),
-  assetUrl: (p: string) => p,
+  resolveSceneByName: vi.fn((_name: string): string | undefined => undefined),
+  // ENCODES like the real one (#1979), so a second assetUrl pass over a scene path is visible as `%2525`.
+  assetUrl: (p: string) => p.replace(/%/g, '%25'),
   appServices: () => ({
     attribution: { init: spies.attributionInit },
     ads: { init: vi.fn(), cleanup: vi.fn() },
@@ -153,7 +156,7 @@ import type { GameDefinition } from '@modoki/engine/runtime';
  *  `virtual:modoki-games` (empty under vitest, per `tests/framework/gameRegistry.test.ts`)
  *  plus dynamically-registered games — so registering here is the real resolution path,
  *  not a stand-in for it. */
-function makeGame(id: string) {
+function makeGame(id: string, scenePath = '/scene.json') {
   const registerSystems = vi.fn(async () => {});
   const registerAppServices = vi.fn(async () => {});
   const def: GameDefinition = {
@@ -163,7 +166,7 @@ function makeGame(id: string) {
     registerAppServices,
     loadConfig: async () => ({
       assetManifest: '/assets.manifest.json',
-      scenePath: '/scene.json',
+      scenePath,
       disable3D: true,
     } as never),
   };
@@ -176,6 +179,33 @@ afterEach(() => {
   cleanup();
   __resetGameRegistryForTest();
   vi.clearAllMocks();
+});
+
+/** #1979: `loadScene` takes a scene PATH and runs it through `assetUrl` itself. `config.scenePath` is a Vite `?url`
+ *  value (percent-ENCODED), and a `?scene=` override resolves to a manifest path — so App must decode the first once and
+ *  must not wrap the second. Each mistake double-encodes, which 404s the boot scene. */
+describe('GameShell hands loadScene a scene PATH (#1979)', () => {
+  it('decodes the `?url` config.scenePath once', async () => {
+    makeGame('url-game', '/assets/scenes/level%201.scene.json');
+    render(React.createElement(GameShell, { gameId: 'url-game' }));
+    await waitFor(() => expect(spies.loadScene).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.loadScene.mock.calls[0][0]).toBe('/assets/scenes/level 1.scene.json');
+  });
+
+  it('passes a ?scene= override as the manifest path, not through assetUrl a second time', async () => {
+    const runtime = await import('@modoki/engine/runtime');
+    vi.mocked(runtime.resolveSceneByName).mockReturnValueOnce('/assets/scenes/50%.scene.json');
+    const before = window.location.href;
+    window.history.replaceState({}, '', '/?scene=50pct');
+    try {
+      makeGame('override-game');
+      render(React.createElement(GameShell, { gameId: 'override-game' }));
+      await waitFor(() => expect(spies.loadScene).toHaveBeenCalled(), { timeout: 5000 });
+      expect(spies.loadScene.mock.calls[0][0]).toBe('/assets/scenes/50%.scene.json');
+    } finally {
+      window.history.replaceState({}, '', before);
+    }
+  });
 });
 
 describe('GameShell load-once contract (#267)', () => {

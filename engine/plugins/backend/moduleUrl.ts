@@ -77,6 +77,11 @@ export interface ModuleUrlResolution {
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
+/** A spec is a URL by contract (an import specifier, or one copied from the browser), so it is
+ *  decoded — but a raw path holding a literal `%` is a malformed escape, and that keeps its
+ *  spelling rather than throwing a 500 (#1979). */
+const decodeSpec = (p: string) => { try { return decodeURIComponent(p); } catch { return p; } };
+
 /** Drop an origin, a query and a hash, leaving the path the spec names. */
 function pathPart(spec: string): string {
   let s = spec.trim();
@@ -94,7 +99,7 @@ export function fileForSpec(spec: string, host: ModuleUrlHost): { file: string }
   if (!p) return { error: 'path is empty' };
   let abs: string;
   if (p.startsWith('/@fs/')) {
-    abs = decodeURIComponent(p.slice('/@fs'.length));
+    abs = decodeSpec(p.slice('/@fs'.length));
     // `/@fs/C:/x` on Windows: the leading slash belongs to the URL, not the path.
     if (/^\/[A-Za-z]:\//.test(abs)) abs = abs.slice(1);
   } else if (/^[A-Za-z]:[\\/]/.test(p)) {
@@ -102,10 +107,10 @@ export function fileForSpec(spec: string, host: ModuleUrlHost): { file: string }
   } else if (p.startsWith('/')) {
     // An absolute path and a Vite-root URL share a leading slash. The file on disk decides:
     // `/Users/…/x.ts` exists as written, `/packages/…` does not (it is under the Vite root).
-    const decoded = decodeURIComponent(p);
+    const decoded = decodeSpec(p);
     abs = host.exists(decoded) ? decoded : path.join(host.viteRoot, decoded);
   } else {
-    abs = path.join(host.repoRoot, decodeURIComponent(p));
+    abs = path.join(host.repoRoot, decodeSpec(p));
   }
   abs = path.normalize(abs);
   if (!host.exists(abs)) return { error: `no such file: ${abs}` };

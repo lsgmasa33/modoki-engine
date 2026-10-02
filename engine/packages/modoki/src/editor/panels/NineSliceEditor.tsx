@@ -23,6 +23,7 @@ import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } fr
 import { dragNineSliceGuide } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 import { ModalShell } from '../components/ModalShell';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -94,7 +95,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     const img = new Image();
     img.onload = () => { imgRef.current = img; setImgDims({ w: img.naturalWidth, h: img.naturalHeight }); setZoom(1); };
     img.onerror = () => console.error('[NineSliceEditor] failed to load image', path);
-    img.src = path;
+    img.src = assetUrl(path);
     return () => { img.onload = null; img.onerror = null; };
   }, [path]);
 

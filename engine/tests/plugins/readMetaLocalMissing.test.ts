@@ -23,7 +23,7 @@ function makeCtx(): BackendContext {
   return {
     projectRoot,
     editorRoot: projectRoot,
-    resolveAssetPath: (p: string) => path.join(projectRoot, decodeURIComponent(p).replace(/^\//, '')),
+    resolveAssetPath: (p: string) => path.join(projectRoot, p.replace(/^\//, '')), // no decode, like production (#1979)
     absToAssetUrl: (p: string) => p,
     firstRootDir: () => null,
     getManifest: () => manifest,

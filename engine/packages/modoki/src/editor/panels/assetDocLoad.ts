@@ -52,6 +52,7 @@
 
 import { assetIsAbsent, parseAssetJson, ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
 import { beginFreshFileRead } from '../scene/freshFileRead';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 /** What to do when an asset document's fetch/parse threw.
  *
@@ -103,7 +104,7 @@ export function classifyAssetDocFetchFailure(e: unknown): AssetDocFetchFailure {
  *  stale. A failed read applies nothing, so its change stays held. */
 export async function readAssetDocFresh(path: string, init: { signal?: AbortSignal } = {}): Promise<unknown> {
   const read = beginFreshFileRead(path);
-  const json = await parseAssetJson(await fetch(path, { ...init, ...ASSET_FETCH_INIT }), path);
+  const json = await parseAssetJson(await fetch(assetUrl(path), { ...init, ...ASSET_FETCH_INIT }), path);
   read.landed();
   return json;
 }

@@ -42,6 +42,7 @@ import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo,
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
 import { driveEntriesFromScroll } from './entriesSystem';
+import { cssUrl } from '../core/assetUrlPath';
 
 /** The CSS-animated text span, isolated in React.memo. The game UI re-renders every
  *  frame (fps is in its store selector); re-creating the span each frame RESTARTS its
@@ -838,7 +839,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         );
       } else {
         // Plain image (raw texture, or an atlas-packed sprite with no source dims).
-        style.backgroundImage = `url(${imgUrl})`;
+        style.backgroundImage = cssUrl(imgUrl);
         style.backgroundSize = node.imageMode === 'fill' ? '100% 100%' : node.imageMode === 'none' ? 'auto' : node.imageMode;
         style.backgroundPosition = imageAlignPosition(node.imageAlign);
         style.backgroundRepeat = 'no-repeat';

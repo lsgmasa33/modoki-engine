@@ -24,6 +24,7 @@ import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -119,7 +120,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
     <>
       {/* Source preview — native transport gives play/stop/scrub for free. */}
       <Waveform path={path} />
-      <audio controls src={path} style={{ width: '100%', height: 32, marginBottom: 6 }} />
+      <audio controls src={assetUrl(path)} style={{ width: '100%', height: 32, marginBottom: 6 }} />
 
       <div style={sectionStyle}>Load Type</div>
       <div style={rowStyle}>
@@ -206,7 +207,7 @@ function Waveform({ path }: { path: string }) {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(path);
+        const res = await fetch(assetUrl(path));
         if (!res.ok) return;
         const buf = await ctx.decodeAudioData(await res.arrayBuffer());
         if (cancelled) return;

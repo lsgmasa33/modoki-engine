@@ -89,7 +89,7 @@ import { resolveModelSettings, lodUrlSuffix, type ModelImportSettings, type Mode
 import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/runtime/loaders/spriteSheet';
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
-import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
+import { handleBackendRequest, assetJsonBytes, normalizeAssetUrl, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
 import { healNativeProject } from './healNativeProject';
 import { injectedBuildNumbers, writeBuildNumberArgFiles } from './healNativeConfig';
@@ -1820,10 +1820,13 @@ export function scanAllAssets(roots: AssetRoot[]): AssetEntry[] {
   return assets;
 }
 
-/** Resolve an asset path (URL) to an absolute file path.
- *  Returns null if the path is outside allowed roots. */
+/** Resolve an asset path to an absolute file path.
+ *  Returns null if the path is outside allowed roots.
+ *
+ *  ⚠️ An asset PATH, not a URL: spelled as the file is named on disk, never percent-decoded here
+ *  (#1979 — see `normalizeAssetUrl`). A request pathname is decoded once, by `serveProjectAsset`. */
 export function resolveAssetPath(assetPath: string, roots: AssetRoot[]): string | null {
-  const cleaned = decodeURIComponent(assetPath.startsWith('/') ? assetPath : '/' + assetPath);
+  const cleaned = normalizeAssetUrl(assetPath);
 
   for (const root of roots) {
     if (cleaned.startsWith(root.urlPrefix + '/')) {

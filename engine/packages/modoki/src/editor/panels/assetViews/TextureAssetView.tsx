@@ -22,6 +22,7 @@ import { useMissingLocalStats } from '../useMissingLocalStats';
 import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -324,7 +325,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
   return (
     <>
       {/* Source preview */}
-      <img src={path} alt={name} style={{ width: '100%', maxHeight: 140, objectFit: 'contain', background: '#1a1a1a', border: '1px solid #333', marginBottom: 6 }} />
+      <img src={assetUrl(path)} alt={name} style={{ width: '100%', maxHeight: 140, objectFit: 'contain', background: '#1a1a1a', border: '1px solid #333', marginBottom: 6 }} />
 
       <TextureSettingsControls type={type} settings={settings} onChangeType={changeType} onChange={update} advancedOpen={false} />
 

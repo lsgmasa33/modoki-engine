@@ -57,7 +57,9 @@ spies.bindDisarm(() => spies.disarmBootContent);
 /** Set per test before rendering — GameShell reads it through the mocked `loadConfig`. */
 const config = vi.hoisted(() => ({ disable3D: false as boolean, scenePath: '/scene.json' as string | undefined }));
 
-vi.mock('@modoki/engine/runtime', () => ({
+vi.mock('@modoki/engine/runtime', async () => ({
+  // The REAL decode (#1979): App.tsx reads config.scenePath through it, and a stub would be more permissive.
+  bootScenePath: (await import('../../packages/modoki/src/runtime/core/config')).bootScenePath,
   useGameLoop: () => {},
   setGameConfig: vi.fn(),
   sceneManager: { loadScene: spies.loadScene },

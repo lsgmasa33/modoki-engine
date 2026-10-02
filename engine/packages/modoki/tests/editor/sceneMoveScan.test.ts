@@ -12,6 +12,9 @@ import { setCurrentWorld, registerEntity, indexEntityGuid } from '../../src/runt
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { setRunMode } from '../../src/runtime/core/playState';
 
+/** A real-shaped response: the scan parses through `parseAssetJson`, which reads `text()` (#1979 close-out). */
+const jsonResponse = (body: unknown) => ({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
+
 const mockAssets: { guid: string; path: string; type: string }[] = [];
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   getAllAssets: () => mockAssets,
@@ -19,7 +22,8 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({
   assetUrl: (path: string) => path,
 }));
-vi.mock('../../src/runtime/loaders/assetFetch', () => ({
+vi.mock('../../src/runtime/loaders/assetFetch', async (orig) => ({
+  ...(await orig<typeof import('../../src/runtime/loaders/assetFetch')>()), // the real parseAssetJson (#1979 close-out)
   ASSET_FETCH_INIT: {},
 }));
 
@@ -90,12 +94,12 @@ describe('preflightSceneMove', () => {
     );
     (global.fetch as any).mockImplementation((path: string) => {
       if (path === '/assets/scenes/Sibling.json') {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ baseScene: 'base-1', entities: [{ traits: { EntityAttributes: { guid: 'shared-guid' } } }] }) });
+        return Promise.resolve(jsonResponse({ baseScene: 'base-1', entities: [{ traits: { EntityAttributes: { guid: 'shared-guid' } } }] }));
       }
       if (path === '/assets/scenes/OtherBase.json') {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ baseScene: 'not-base-1', entities: [{ traits: { EntityAttributes: { guid: 'shared-guid' } } }] }) });
+        return Promise.resolve(jsonResponse({ baseScene: 'not-base-1', entities: [{ traits: { EntityAttributes: { guid: 'shared-guid' } } }] }));
       }
-      return Promise.resolve({ ok: false });
+      return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('') });
     });
 
     const pre = await preflightSceneMove(root.id(), 'base-1'); // promote into base-1

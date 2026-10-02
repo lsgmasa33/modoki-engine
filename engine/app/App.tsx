@@ -6,7 +6,7 @@ import { useBackgroundFlush } from './useBackgroundFlush';
 import { useAppActivityTimeline } from './useAppActivityTimeline';
 import { useResumeReload } from './useResumeReload';
 import { useDeadAudioReload } from './useDeadAudioReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, armBootContent, waitForBootContent, BOOT_CONTENT_MAX_WAIT_MS, bootSpan, bootSpanAsync, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, bootScenePath as scenePathOfConfig, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, armBootContent, waitForBootContent, BOOT_CONTENT_MAX_WAIT_MS, bootSpan, bootSpanAsync, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -543,11 +543,11 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Resolved against the already-loaded manifest by GUID or filename; if it
         // doesn't match a shipped scene we fall back to the game's boot scene.
         const requestedScene = new URLSearchParams(window.location.search).get('scene');
-        // resolveSceneByName returns the base-relative manifest path; assetUrl adds
-        // the deploy sub-path prefix so the fetch resolves under /<id>/ (idempotent,
-        // matching how config.scenePath's `?url` import is already base-prefixed).
+        // resolveSceneByName returns the base-relative manifest PATH; `loadScene` runs it through
+        // assetUrl, which adds the deploy sub-path prefix so the fetch resolves under /<id>/. Not
+        // wrapped here too: assetUrl encodes a `%` (#1979), so a second pass broke a %-named scene.
         const resolved = requestedScene ? resolveSceneByName(requestedScene) : undefined;
-        const overridePath = resolved ? assetUrl(resolved) : undefined;
+        const overridePath = resolved || undefined;
         if (requestedScene && !overridePath) {
           console.warn(`[GameShell] ?scene="${requestedScene}" did not match a shipped scene; using default.`);
         }
@@ -570,9 +570,11 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // subgameLoader.ts), not the shell's — prefix it here or the fetch 404s
         // against the shell's webroot instead of the staged bundle. Unset (baked
         // shell game) is a no-op. See config.ts's assetBaseUrl doc.
+        // The sub-game branch keeps the `?url` value ENCODED: prefixed with an origin it is a full URL,
+        // which assetUrl passes through untouched. Otherwise it is read as a PATH (#1979).
         const defaultScenePath = config.assetBaseUrl && config.scenePath?.startsWith('/')
           ? config.assetBaseUrl + config.scenePath
-          : config.scenePath;
+          : scenePathOfConfig(config);
         const bootScenePath = overridePath ?? defaultScenePath;
         if (bootScenePath) {
           await sceneManager.loadScene(bootScenePath, { gameId });

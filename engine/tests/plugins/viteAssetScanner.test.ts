@@ -1166,9 +1166,14 @@ describe('resolveAssetPath', () => {
     expect(result).toBe(path.resolve('/project/packages/modoki/src/runtime/assets', 'a/c.png'));
   });
 
-  it('handles URL-encoded paths', () => {
-    const result = resolveAssetPath('/modoki/assets/my%20texture.png', roots);
-    expect(result).toBe(path.resolve('/project/packages/modoki/src/runtime/assets', 'my texture.png'));
+  it('takes an asset PATH, not a URL: a % is part of the name, never an escape (#1979)', () => {
+    const base = '/project/packages/modoki/src/runtime/assets';
+    // It used to decodeURIComponent first: this one resolved to a DIFFERENT file, `my texture.png`…
+    expect(resolveAssetPath('/modoki/assets/my%20texture.png', roots)).toBe(path.resolve(base, 'my%20texture.png'));
+    // …and this one threw URIError, a 500 on every route and a failed production build.
+    expect(resolveAssetPath('/modoki/assets/100%.png', roots)).toBe(path.resolve(base, '100%.png'));
+    // An encoded `..` is a literal directory name now, so it stays inside the root.
+    expect(resolveAssetPath('/modoki/assets/%2e%2e/x.png', roots)).toBe(path.resolve(base, '%2e%2e/x.png'));
   });
 
   it('adds leading slash if missing', () => {

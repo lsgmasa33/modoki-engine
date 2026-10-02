@@ -1,7 +1,14 @@
-/** Prefix a root-absolute asset path with Vite's BASE_URL so runtime fetches
- *  resolve when the app is hosted under a sub-path (e.g. "/demo/"). No-op when
- *  BASE_URL is "/" (dev + native Capacitor builds). Pass-through for relative,
- *  http, data, and blob URLs; idempotent for already-prefixed paths. */
+import { encodeAssetUrlPath } from '../core/assetUrlPath';
+
+/** Turn a root-absolute asset PATH into the URL that fetches it: percent-encode the characters a
+ *  URL path cannot carry literally, then prefix Vite's BASE_URL so runtime fetches resolve when the
+ *  app is hosted under a sub-path (e.g. "/demo/"). The prefix is a no-op when BASE_URL is "/" (dev +
+ *  native Capacitor builds). Pass-through for relative, http, data, and blob URLs.
+ *
+ *  ⚠️ **This is the one path → URL crossing** (#1979, `assetUrlPath.ts`). Without the encode a file
+ *  named `50%.png` made a malformed URL, and one named `my%20tex.png` fetched `my tex.png` — the
+ *  server decodes a request once, so the URL must have been encoded once. Takes a PATH: never feed
+ *  it its own output, or a `%` is encoded twice. */
 export function assetUrl(path: string): string {
   if (!path) return path;
   // Playable single-file build: the self-extract bootstrap inlines every reachable
@@ -14,6 +21,7 @@ export function assetUrl(path: string): string {
     const inlined = (globalThis as { __PLAYABLE_ASSETS__?: Record<string, string> }).__PLAYABLE_ASSETS__?.[path];
     if (inlined) return inlined;
   }
+  if (path.charCodeAt(0) === 47 /* '/' */) path = encodeAssetUrlPath(path);
   const base = import.meta.env?.BASE_URL || '/';
   // Vite does NOT guarantee BASE_URL ends with "/" — it only normalizes a leading
   // slash (resolveBaseUrl in vite's config resolution), so a build invoked with

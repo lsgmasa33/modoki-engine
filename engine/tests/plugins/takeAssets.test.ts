@@ -192,7 +192,14 @@ describe('sceneUrlToAsset', () => {
   const rels = ['scenes/main.scene.json', 'other/scenes/main.scene.json'];
   it('matches either URL layout — flat /assets/, or /games/<id>/assets/ on a multi-project server', () => {
     expect(sceneUrlToAsset('/assets/scenes/main.scene.json', rels)).toBe('scenes/main.scene.json');
-    expect(sceneUrlToAsset('/games/court/assets/scenes/main.scene.json?x=1', rels)).toBe('scenes/main.scene.json');
+    expect(sceneUrlToAsset('/games/court/assets/scenes/main.scene.json', rels)).toBe('scenes/main.scene.json');
+  });
+  it('takes the scene PATH as spelled on disk: a % or a # is part of the name (#1979)', () => {
+    const named = ['scenes/my%20level.scene.json', 'scenes/my level.scene.json', 'scenes/50%.scene.json', 'scenes/a#b.scene.json'];
+    expect(sceneUrlToAsset('/assets/scenes/my%20level.scene.json', named)).toBe('scenes/my%20level.scene.json');
+    expect(sceneUrlToAsset('/assets/scenes/my level.scene.json', named)).toBe('scenes/my level.scene.json');
+    expect(sceneUrlToAsset('/assets/scenes/50%.scene.json', named)).toBe('scenes/50%.scene.json');
+    expect(sceneUrlToAsset('/assets/scenes/a#b.scene.json', named)).toBe('scenes/a#b.scene.json');
   });
   it('prefers the longest match, and does not match a file name that merely ends the same', () => {
     expect(sceneUrlToAsset('/assets/other/scenes/main.scene.json', rels)).toBe('other/scenes/main.scene.json');

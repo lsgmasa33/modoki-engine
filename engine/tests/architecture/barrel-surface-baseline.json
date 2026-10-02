@@ -258,6 +258,7 @@
   "beginProfilerSample",
   "beginSample",
   "boneWeightField",
+  "bootScenePath",
   "bootSpan",
   "bootSpanAsync",
   "bootSpansOverlapping",

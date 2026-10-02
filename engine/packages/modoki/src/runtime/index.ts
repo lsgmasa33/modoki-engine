@@ -85,7 +85,7 @@ export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entry
 export { onAssetInvalidated, emitAssetInvalidated } from './core/assetInvalidation';
 export type { InvalidatedAssetKind, AssetInvalidationListener } from './core/assetInvalidation';
 export {
-  type GameConfig, setGameConfig, getGameConfig,
+  type GameConfig, setGameConfig, getGameConfig, bootScenePath,
 } from './core/config';
 export type { GameDefinition, EditorPanelDef } from './core/gameDefinition';
 export {

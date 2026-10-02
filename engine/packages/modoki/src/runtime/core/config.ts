@@ -5,6 +5,7 @@
 // would pull the whole `three` base into this widely-imported config module (and thus
 // into a 2D-only build). Erased at compile time.
 import type * as THREE from 'three';
+import { decodeAssetUrlPath } from './assetUrlPath';
 
 export interface GameConfig {
   /** Human-readable game name */
@@ -17,8 +18,9 @@ export interface GameConfig {
    *  Called only if no scenePath is set or the scene file doesn't exist. */
   initWorld: () => void;
 
-  /** Path to the default scene file (e.g., "/scenes/scene.json").
-   *  If set, the editor loads this scene on startup instead of calling initWorld(). */
+  /** URL of the default scene file — what a `?url` import gives (`import u from './assets/scenes/main.scene.json?url'`),
+   *  so it is percent-ENCODED. If set, the editor loads this scene on startup instead of calling initWorld().
+   *  ⚠️ Read it as a scene PATH through `bootScenePath(config)`, never raw (#1979). */
   scenePath?: string;
 
   /** Disable the Three.js 3D renderer for this game (frees GPU memory). */
@@ -50,6 +52,16 @@ export interface GameConfig {
 // ── Active game config (set at startup) ─────────────────
 
 let activeConfig: GameConfig | null = null;
+
+/** `config.scenePath` as an asset PATH — decoded once, here (#1979, `assetUrlPath.ts`). Vite writes a `?url` import
+ *  through `encodeURI`, so a boot scene named `level 1.scene.json` arrives as `level%201.scene.json`, and a project under
+ *  `My Games/` as `/@fs/…/My%20Games/…`. `loadScene` takes a path and `assetUrl` encodes it again on the way out, so
+ *  passing the URL straight through double-encoded it: a 404 in production and an unmatched `/@fs/` root in the editor.
+ *  A malformed escape is kept as written — no `?url` value has one. */
+export function bootScenePath(config: Pick<GameConfig, 'scenePath'>): string | undefined {
+  const url = config.scenePath;
+  return url ? decodeAssetUrlPath(url) ?? url : url;
+}
 
 export function setGameConfig(config: GameConfig) {
   activeConfig = config;

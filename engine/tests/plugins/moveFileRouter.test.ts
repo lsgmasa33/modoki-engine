@@ -237,6 +237,15 @@ describe('/api/delete-asset carries the repair too (#867 sibling)', () => {
   const del = (body: Record<string, unknown>) =>
     handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/delete-asset', query: new URLSearchParams(), body });
 
+  it('a % in a name is LITERAL: it deletes that file, never the decoded spelling\'s (#1979)', async () => {
+    fs.writeFileSync(path.join(tmp, 'my tex.json'), '{}');
+    fs.writeFileSync(path.join(tmp, 'my%20tex.json'), '{}');
+    await del({ paths: ['/my%20tex.json'] });
+    expect(fs.existsSync(path.join(tmp, 'my%20tex.json')), 'the named file is gone').toBe(false);
+    expect(fs.existsSync(path.join(tmp, 'my tex.json')), 'the space-named file survives').toBe(true);
+    expect((rec.asked[0].params as { moves: { from: string }[] }).moves[0].from).toBe('/my%20tex.json');
+  });
+
   it('tells the renderer the asset is GONE, so a bound panel unbinds', async () => {
     fs.writeFileSync(path.join(tmp, 'spark.particle.json'), '{}');
     await del({ paths: ['/spark.particle.json'] });
@@ -269,8 +278,8 @@ describe('/api/delete-asset carries the repair too (#867 sibling)', () => {
 
 /** Review finding (#867): the route fed RAW client strings into a path-EXACT comparison.
  *
- *  `resolveAssetPath` is deliberately tolerant — it prepends a missing leading slash,
- *  `decodeURIComponent`s, and resolves `.`/`..` — while the renderer's `applyMove` is
+ *  `resolveAssetPath` is deliberately tolerant — it prepends a missing leading slash and resolves
+ *  `.`/`..` (it no longer percent-decodes: #1979) — while the renderer's `applyMove` is
  *  `path !== move.from → undefined`. So a tolerated-but-non-canonical path moved the file and then
  *  repaired nothing, reported as `{ok:true, repaired:[]}`, which is indistinguishable from
  *  "nothing was bound". `modoki_move_asset` takes a bare `z.string()`, so the agent surface — the
@@ -284,11 +293,25 @@ describe('/api/move-file canonicalizes before repairing (#867 review)', () => {
     });
   });
 
-  it('a PERCENT-ENCODED path repairs the decoded one', async () => {
+  it('a % in a name is LITERAL: it moves that file, and the decoded spelling\'s file is untouched (#1979)', async () => {
+    // Both exist. The route used to decode `%20`, so this moved `my fx/a.json` — the WRONG asset,
+    // sidecar and GUID with it — and repaired refs to it, while `my%20fx/a.json` stayed put.
     fs.mkdirSync(path.join(tmp, 'my fx'));
-    fs.writeFileSync(path.join(tmp, 'my fx', 'a.json'), '{}');
+    fs.writeFileSync(path.join(tmp, 'my fx', 'a.json'), '{"which":"space"}');
+    fs.mkdirSync(path.join(tmp, 'my%20fx'));
+    fs.writeFileSync(path.join(tmp, 'my%20fx', 'a.json'), '{"which":"percent"}');
     await move('/my%20fx/a.json', '/b.json');
-    expect(rec.asked[0].params).toEqual({ moves: [{ from: '/my fx/a.json', to: '/b.json' }] });
+    expect(rec.asked[0].params).toEqual({ moves: [{ from: '/my%20fx/a.json', to: '/b.json' }] });
+    expect(fs.readFileSync(path.join(tmp, 'b.json'), 'utf-8')).toBe('{"which":"percent"}');
+    expect(fs.readFileSync(path.join(tmp, 'my fx', 'a.json'), 'utf-8')).toBe('{"which":"space"}');
+  });
+
+  it('a name with a bare % (no valid escape) moves instead of 500ing (#1979)', async () => {
+    fs.writeFileSync(path.join(tmp, '50%.json'), '{}');
+    const res = await move('/50%.json', '/b.json');
+    expect(res?.body?.ok, JSON.stringify(res)).toBe(true);
+    expect(fs.existsSync(path.join(tmp, '50%.json'))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, 'b.json'))).toBe(true);
   });
 
   it('a path with a .. segment repairs the resolved one', async () => {

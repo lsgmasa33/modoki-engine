@@ -14,6 +14,7 @@
 
 import React from 'react';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
+import { cssUrl } from '../core/assetUrlPath';
 
 export interface NineSliceImageProps {
   url: string;
@@ -46,7 +47,7 @@ function cell(url: string, W: number, H: number, sx: number, sy: number, sw: num
   const inner: React.CSSProperties = {
     position: 'absolute',
     inset: `-${OV}px`,
-    backgroundImage: `url(${url})`,
+    backgroundImage: cssUrl(url),
     backgroundRepeat: 'no-repeat',
     backgroundSize: `${(W / sw) * 100}% ${(H / sh) * 100}%`,
     backgroundPosition: `${posPct(sx, W, sw)} ${posPct(sy, H, sh)}`,

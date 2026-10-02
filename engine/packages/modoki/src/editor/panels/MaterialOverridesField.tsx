@@ -21,6 +21,7 @@ import { BufferedTextInput, BufferedNumberInput, inputStyle } from './fields';
 import { FieldLabel, DropdownField } from './assetViews/widgets';
 import { FieldValueWidget, useWorldDirtyTick } from './inspectorFields';
 import { AssetRefField } from './AssetRefField';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 /** Standard material properties a `prop` override can drive. `map*` targets drive one axis of
  *  the base texture's offset (UV scroll) / repeat (tiling). */
@@ -74,9 +75,10 @@ function useShaderUniforms(guid: string): { uniforms: string[]; textures: string
     let cancelled = false;
     setOut({ uniforms: [], textures: [], is2D: false });
     if (!guid) return;
+    // A PATH, fetched through `assetUrl` — the one path → URL encode (#1979).
     const path = isGuid(guid) ? (resolveGuidToPath(guid) ?? resolveRef(guid)) : guid;
     if (!path) return;
-    fetch(path)
+    fetch(assetUrl(path))
       .then((r) => parseAssetJson(r, path))
       .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
       .then(async (json) => {

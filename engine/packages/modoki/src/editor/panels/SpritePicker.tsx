@@ -33,6 +33,8 @@ import { groupSpritesByTexture, sortGroupsByName } from './spritePickerGroups';
 import { spritelessTextures, filterSpriteless } from './spritelessTextures';
 import { makeTexture2D, textureRefCount } from './makeTexture2D';
 import { useEditorStore } from '../store/editorStore';
+import { cssUrl } from '../../runtime/core/assetUrlPath';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 const SPRITELESS_CAP = 30;
 
@@ -43,21 +45,23 @@ const BOX_H = 38;
  *  Exported so list editors (e.g. SpriteAnimatorSection's frame rows) can render
  *  the same cropped thumbnail. `box` defaults to the picker's BOX_W×BOX_H. */
 export function spriteThumbStyle(
-  srcUrl: string | undefined,
+  texPath: string | undefined,
   rect: { x: number; y: number; w: number; h: number },
   sheetW?: number, sheetH?: number,
   box: { w: number; h: number } = { w: BOX_W, h: BOX_H },
 ): React.CSSProperties {
   const BOX_W = box.w, BOX_H = box.h;
+  // A PATH, made a URL here (#1979): every caller held a manifest path, and four of five passed it raw.
+  const srcUrl = texPath ? assetUrl(texPath) : undefined;
   const base: React.CSSProperties = { width: BOX_W, height: BOX_H, flexShrink: 0, background: '#0e0e16', border: '1px solid #333', backgroundRepeat: 'no-repeat', backgroundPosition: 'center', imageRendering: 'pixelated' };
   if (!srcUrl || !sheetW || !sheetH || rect.w <= 0 || rect.h <= 0) {
-    return { ...base, backgroundImage: srcUrl ? `url("${srcUrl}")` : undefined, backgroundSize: 'contain' };
+    return { ...base, backgroundImage: srcUrl ? cssUrl(srcUrl) : undefined, backgroundSize: 'contain' };
   }
   const scale = Math.min(BOX_W / rect.w, BOX_H / rect.h);
   const dispW = rect.w * scale, dispH = rect.h * scale;
   return {
     ...base,
-    backgroundImage: `url("${srcUrl}")`,
+    backgroundImage: cssUrl(srcUrl),
     backgroundSize: `${sheetW * scale}px ${sheetH * scale}px`,
     backgroundPosition: `${(BOX_W - dispW) / 2 - rect.x * scale}px ${(BOX_H - dispH) / 2 - rect.y * scale}px`,
   };

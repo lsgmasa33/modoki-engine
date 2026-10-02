@@ -35,7 +35,9 @@ const spies = vi.hoisted(() => ({
 }));
 
 // ── `@modoki/engine/runtime` barrel — every named export App.tsx imports from it. ──
-vi.mock('@modoki/engine/runtime', () => ({
+vi.mock('@modoki/engine/runtime', async () => ({
+  // The REAL decode (#1979): App.tsx reads config.scenePath through it, and a stub would be more permissive.
+  bootScenePath: (await import('../../packages/modoki/src/runtime/core/config')).bootScenePath,
   useGameLoop: () => {},
   setGameConfig: vi.fn(),
   sceneManager: { loadScene: spies.loadScene },

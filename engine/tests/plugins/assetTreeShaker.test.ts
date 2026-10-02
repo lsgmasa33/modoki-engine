@@ -118,18 +118,12 @@ describe('asset-tree-shaker virtualToAbs (path-traversal guard)', () => {
    *  copies passed their own suites. Assert the two agree on the same inputs, so hardening
    *  or weakening either one alone fails here. Delete this only by deduplicating them.
    *
-   *  SCOPE: plain (already-decoded) paths only — the twins legitimately differ on
-   *  percent-encoding and that is NOT drift to "fix". resolveAssetPath serves HTTP
-   *  requests, so it decodeURIComponent()s first; virtualToAbs consumes authored refs out
-   *  of scene JSON, which are not URL-encoded. Measured consequence, recorded so nobody
-   *  "aligns" them by accident:
-   *    '/assets/%2e%2e/evil.png'  → scanner null (decodes to '..', rejects)
-   *                               → shaker  <root>/%2e%2e/evil.png (literal dir name)
-   *  The shaker's answer stays INSIDE the root, so this is not an escape — but note the
-   *  mirror case: a ref containing '%20' would have the shaker look for a literal
-   *  'nor%20mal.png' while the scanner resolves 'nor mal.png'. Asset names with spaces do
-   *  exist here (e.g. '2D Animation.json'), so if encoded refs ever reach the shaker, that
-   *  asymmetry — not the traversal guard — is the thing to look at. */
+   *  Percent signs included (#1979): the twins USED to differ there — resolveAssetPath
+   *  decodeURIComponent()ed first, virtualToAbs did not — and that was the defect, not a
+   *  legitimate difference: an asset path is an identity spelled as the file is named, so
+   *  the scanner looked for 'nor mal.png' where the shaker (correctly) looked for the
+   *  literal 'nor%20mal.png', and threw on '100%.png'. The only URL → path decode is now
+   *  serveProjectAsset's, so both agree on every case below. */
   it('agrees with resolveAssetPath on every containment case (twin-drift guard)', () => {
     const cases = [
       '/assets/models/a.glb',          // plain in-root
@@ -138,6 +132,9 @@ describe('asset-tree-shaker virtualToAbs (path-traversal guard)', () => {
       '/assets/../assets-evil/secret', // prefix-sharing sibling
       '/assets/sub/../../assets-extra/x',
       '/assets/',                      // degenerate
+      '/assets/%2e%2e/evil.png',       // an encoded '..' is a literal dir name, in-root (#1979)
+      '/assets/nor%20mal.png',         // a literal %20, not a space
+      '/assets/100%.png',              // a bare % (threw URIError in the scanner)
       '/unrelated/x.png',              // no matching root
     ];
     for (const c of cases) {

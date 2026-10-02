@@ -25,6 +25,7 @@ import { useMissingLocalStats } from '../useMissingLocalStats';
 import { MISSING_STATS_HINT } from './measuredStats';
 import { reimportAsset, reimportProblem } from './reimportAsset';
 import { reportGestureRefusal } from '../../backend/refusalChannel';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -134,7 +135,7 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
     const loader = new HDRLoader();
     loader.setDataType(THREE.FloatType);
     loader.load(
-      path,
+      assetUrl(path), // a PATH, made a URL (#1979)
       (tex) => {
         if (cancelled) return;
         const img = tex.image as { data: Float32Array | Uint16Array; width: number; height: number };

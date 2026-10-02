@@ -52,6 +52,7 @@ import { isGuid, resolveGuidToPath } from '../../../runtime/loaders/assetManifes
 import { resolveSceneChain, type FetchSceneMeta } from '../../../runtime/scene/sceneChain';
 import { parseAssetJson, isMissingAsset } from '../../../runtime/loaders/assetFetch';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 /** Editor-side `FetchSceneMeta`: fetch the scene FILE for a path, or resolve a
  *  guid to a path via the asset manifest first. Mirrors SceneManager.loadScene's
@@ -60,7 +61,7 @@ const fetchSceneMetaForEditor: FetchSceneMeta = async (locator) => {
   const path = isGuid(locator) ? resolveGuidToPath(locator) : locator;
   if (!path) return null;
   try {
-    const res = await fetch(path);
+    const res = await fetch(assetUrl(path));
     const data = await parseAssetJson(res, path) as { id?: string; baseScene?: string };
     const guid = data.id && isGuid(data.id) ? data.id : `path:${path}`;
     return { guid, path, baseScene: data.baseScene };
@@ -114,7 +115,7 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
     const ac = new AbortController();
     setLoaded(false);
     setWarning(null);
-    fetch(path, { signal: ac.signal })
+    fetch(assetUrl(path), { signal: ac.signal })
       .then((r) => parseAssetJson(r, path))
       .catch((e) => { if (isMissingAsset(e)) return null; throw e; })
       .then((json) => {
@@ -176,7 +177,7 @@ export function SceneAssetView({ path, name }: { path: string; name: string }) {
       path, old, next, write, fileDirect: lastRoute.current === 'parked',
       current: () => baseSceneHeldBy(path, {
         currentScenePath: getCurrentScenePath, liveBaseScene: getCurrentBaseScene,
-        readScene: (p) => fetch(p, { cache: 'no-store' }).then((r) => parseAssetJson(r, p)),
+        readScene: (scenePath) => fetch(assetUrl(scenePath), { cache: 'no-store' }).then((r) => parseAssetJson(r, scenePath)),
       }),
     }));
   }, [write, path]);

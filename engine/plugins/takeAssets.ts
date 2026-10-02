@@ -149,13 +149,16 @@ export function assetClosure(
   return seen;
 }
 
-/** A scene URL the page loaded (`/assets/scenes/main.scene.json`, or under `/games/<id>/assets/`
+/** A scene path the page loaded (`/assets/scenes/main.scene.json`, or under `/games/<id>/assets/`
  *  on a multi-project server) → its path in the fingerprint. Matched by suffix, so it holds for
- *  either URL layout; null for a scene outside the project's assets (the engine's own). */
-export function sceneUrlToAsset(url: string, rels: Iterable<string>): string | null {
-  const raw = url.split(/[?#]/)[0];
-  let clean = raw;
-  try { clean = decodeURIComponent(raw); } catch { /* a bare `%`: match it as written */ }
+ *  either layout; null for a scene outside the project's assets (the engine's own).
+ *
+ *  ⚠️ An asset PATH, not a URL (#1979): every input is `SceneManager`'s own path — the journal's
+ *  `@scene-loaded`/`@scene-swapped` payloads and the page's `state.scene` — spelled as the file is
+ *  named. So it is neither decoded nor cut at `?`/`#`: doing either made a `my%20level` or an
+ *  `a#b` scene match nothing, and the take went unchecked. */
+export function sceneUrlToAsset(scenePath: string, rels: Iterable<string>): string | null {
+  const clean = scenePath;
   let best: string | null = null;
   for (const rel of rels) {
     if (clean === rel || clean.endsWith(`/${rel}`)) {

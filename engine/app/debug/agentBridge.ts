@@ -184,6 +184,7 @@ import {
   // on the first attempt. See videoCacheSlot.ts.
   getActiveVideoCache,
 } from '@modoki/engine/runtime';
+import { assetUrl } from '../../packages/modoki/src/runtime/loaders/assetUrl';
 
 /** Minimal transport the bridge needs — implemented over the Electron preload
  *  IPC channel (window.__modokiElectron.bridge) under Electron. */
@@ -3674,7 +3675,7 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictMsgs: readonly Scen
     let preloaded: SceneData | undefined;
     if (!changedBaseGuid) {
       try {
-        const res = await fetch(current, { cache: 'no-store' });
+        const res = await fetch(assetUrl(current), { cache: 'no-store' });
         if (res.ok) {
           preloaded = await res.json();
           // Best-effort resolver over the runtime's already-loaded prefab cache (#35) — no

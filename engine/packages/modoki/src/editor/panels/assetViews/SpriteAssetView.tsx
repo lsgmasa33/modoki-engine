@@ -5,23 +5,26 @@
 
 import { getAssetEntry, getGuidForPath, resolveGuidToPath } from '../../../runtime/loaders/assetManifest';
 import { InfoRow } from './widgets';
+import { cssUrl } from '../../../runtime/core/assetUrlPath';
+import { assetUrl } from '../../../runtime/loaders/assetUrl';
 
 const BOX = 132;
 
 /** Crop one source-px frame out of the source image into a BOX×BOX tile (contain). */
-function thumbStyle(srcUrl: string | undefined, rect: { x: number; y: number; w: number; h: number }, sheetW?: number, sheetH?: number): React.CSSProperties {
+function thumbStyle(texPath: string | undefined, rect: { x: number; y: number; w: number; h: number }, sheetW?: number, sheetH?: number): React.CSSProperties {
+  const srcUrl = texPath ? assetUrl(texPath) : undefined; // a PATH, made a URL here (#1979)
   const base: React.CSSProperties = {
     width: BOX, height: BOX, background: '#0e0e16', border: '1px solid #333',
     backgroundRepeat: 'no-repeat', backgroundPosition: 'center', imageRendering: 'pixelated',
   };
   if (!srcUrl || !sheetW || !sheetH || rect.w <= 0 || rect.h <= 0) {
-    return { ...base, backgroundImage: srcUrl ? `url("${srcUrl}")` : undefined, backgroundSize: 'contain' };
+    return { ...base, backgroundImage: srcUrl ? cssUrl(srcUrl) : undefined, backgroundSize: 'contain' };
   }
   const scale = Math.min(BOX / rect.w, BOX / rect.h);
   const dispW = rect.w * scale, dispH = rect.h * scale;
   return {
     ...base,
-    backgroundImage: `url("${srcUrl}")`,
+    backgroundImage: cssUrl(srcUrl),
     backgroundSize: `${sheetW * scale}px ${sheetH * scale}px`,
     backgroundPosition: `${(BOX - dispW) / 2 - rect.x * scale}px ${(BOX - dispH) / 2 - rect.y * scale}px`,
   };

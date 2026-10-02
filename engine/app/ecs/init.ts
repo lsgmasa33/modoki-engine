@@ -1,6 +1,6 @@
 /** Initialize the ECS world — register traits/loaders, load scene from file. */
 
-import { getGameConfig, loadAllFonts, loadManifestJson, ensureManifestLoaded, sceneManager } from '@modoki/engine/runtime';
+import { getGameConfig, bootScenePath, loadAllFonts, loadManifestJson, ensureManifestLoaded, sceneManager } from '@modoki/engine/runtime';
 import { registerAll } from './register';
 import { useGameStore } from '@modoki/engine/runtime';
 
@@ -21,11 +21,12 @@ export function initWorldSync() {
  *  is the active world (and its assets + shaders are ready). */
 export async function loadInitialScene(): Promise<void> {
   const config = getGameConfig();
-  if (!config.scenePath) return;
+  const scenePath = bootScenePath(config);
+  if (!scenePath) return;
   try {
     await ensureManifestLoaded(config.assetManifest || '/assets.manifest.json');
-    await sceneManager.loadScene(config.scenePath);
-    console.log(`[Runtime] Loaded scene from ${config.scenePath}`);
+    await sceneManager.loadScene(scenePath);
+    console.log(`[Runtime] Loaded scene from ${scenePath}`);
   } catch (e) {
     console.warn(`[Runtime] Failed to load scene: ${e}`);
     throw e;

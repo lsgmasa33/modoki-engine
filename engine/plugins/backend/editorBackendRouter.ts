@@ -1375,8 +1375,15 @@ async function applyMovesInRenderer(
  *  move. This is the value that trades those two off; it is not a measurement. */
 const RENDERER_REPAIR_TIMEOUT_MS = 1500;
 
-/** An asset-root URL as the RENDERER keys it — the one normalisation `resolveAssetPath` applies
+/** An asset path as the RENDERER keys it — the one normalisation `resolveAssetPath` applies
  *  before it resolves (`vite-asset-scanner.ts`, which imports this rather than repeating it).
+ *
+ *  ⚠️ **It does NOT percent-decode, and must not** (#1979). An asset path is an identity spelled as
+ *  the file is named on disk — a JSON body carries it raw and `URLSearchParams` has already decoded
+ *  a query value — so a decode here was a SECOND one: `100%.png` threw `URIError` (a 500 on every
+ *  route), and a file literally named `my%20tex.png` resolved to `my tex.png`, so a delete or a
+ *  move acted on the wrong file. The only URL → path decode is `serveProjectAsset`'s
+ *  (`runtime/core/assetUrlPath.ts`).
  *
  *  ⚠️ **A gate keyed on the RAW request string is not keyed on the same thing the registry is**
  *  (#872 review). `{path: "assets/textures/rock.png"}` and `"/assets/my%20tex.png"` both resolve to
@@ -1384,7 +1391,7 @@ const RENDERER_REPAIR_TIMEOUT_MS = 1500;
  *  never filed under, misses, and reports `clear`. The park is then destroyed by the very call that
  *  checked for it. Normalise once, gate and resolve on the same value. */
 export function normalizeAssetUrl(assetPath: string): string {
-  return decodeURIComponent(assetPath.startsWith('/') ? assetPath : `/${assetPath}`);
+  return assetPath.startsWith('/') ? assetPath : `/${assetPath}`;
 }
 
 /** The four kinds of unsaved state a renderer can hold that a Node route would otherwise miss.
@@ -5538,10 +5545,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // invalidated. The panel repairs itself synchronously when IT is the mover; this covers
       // every other caller, and `modoki_move_asset` (a separate PROCESS) has no other route to it.
       // ⚠️ CANONICAL urls, never the raw request body. `resolveAssetPath` is deliberately
-      // tolerant — it prepends a missing leading slash, `decodeURIComponent`s, and resolves `.`
+      // tolerant — it prepends a missing leading slash (no percent-decode since #1979) and resolves `.`
       // and `..` — while the renderer's `applyMove` compares paths EXACTLY. So an agent calling
-      // `modoki_move_asset {from: "assets/fx/spark.particle.json"}` (no leading slash, or a
-      // percent-encoded space) moved the file and then asked the renderer to repair a path that
+      // `modoki_move_asset {from: "assets/fx/spark.particle.json"}` (no leading slash)
+      // moved the file and then asked the renderer to repair a path that
       // matches no binding, no parked write and no selection: a silent no-op reported as
       // `{ok:true, repaired:[]}`, indistinguishable from "nothing was bound", arriving from the
       // exact out-of-process caller this repair exists for. `assetEditorBindings.ts`'s header

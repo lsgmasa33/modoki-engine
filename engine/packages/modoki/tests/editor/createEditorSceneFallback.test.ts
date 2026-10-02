@@ -156,6 +156,15 @@ describe('canonicalBootScenePath (gap #2 — boot the working-copy scene, not a 
     expect(doFetch).toHaveBeenCalledWith(BUNDLE, { cache: 'no-store' });
   });
 
+  it('fetches the candidate PATH through assetUrl — a literal % in the name is encoded, once (#1979)', async () => {
+    // Since #1979 the candidate is `bootScenePath`'s DECODED path, so a raw fetch of `my%20lvl` asked the server for
+    // `my lvl` — another file, whose GUID would then be canonicalised and booted.
+    registerAsset(SCENE_GUID, CANON, 'scene');
+    const doFetch = vi.fn(async () => jsonResponse({ id: SCENE_GUID }));
+    await canonicalBootScenePath('/assets/my%20lvl-DC3lOki3.json', doFetch as never);
+    expect(doFetch).toHaveBeenCalledWith('/assets/my%2520lvl-DC3lOki3.json', { cache: 'no-store' });
+  });
+
   it('returns a candidate ALREADY registered in the manifest without fetching', async () => {
     registerAsset(SCENE_GUID, CANON, 'scene');
     const doFetch = vi.fn();

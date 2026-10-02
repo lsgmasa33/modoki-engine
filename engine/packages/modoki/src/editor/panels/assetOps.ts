@@ -49,6 +49,7 @@ import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { flushPendingMetaFor } from '../scene/pendingMeta';
 import { existingAssetPath } from '../scene/createAssetDocument';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -454,7 +455,7 @@ export async function readPriorDocument(path: string): Promise<string | null | u
   const parked = parkedPrefabRead(path);
   if (parked) return jsonFileBody(parked);
   try {
-    const res = await fetch(path, { cache: 'no-store' });
+    const res = await fetch(assetUrl(path), { cache: 'no-store' });
     if (res.status === 404) return undefined;
     if (!res.ok) return null;
     const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(await res.arrayBuffer());

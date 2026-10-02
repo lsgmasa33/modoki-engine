@@ -17,7 +17,7 @@
 
 import { getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
-import { ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { getAllAssets } from '../../runtime/loaders/assetManifest';
 import { getCurrentScenePath } from './serialize';
 
@@ -74,9 +74,9 @@ export async function preflightSceneMove(entityId: number, targetScene: string):
   for (const asset of sceneAssets) {
     let data: { baseScene?: string; entities?: unknown[] } | null;
     try {
-      const res = await fetch(assetUrl(asset.path), ASSET_FETCH_INIT);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
+      // parseAssetJson throws on a non-ok status and on the dev server's HTML fallthrough, so both land in scanFailed
+      // (#460's rule — this site sat outside its matcher until #1979 put every path fetch through assetUrl).
+      data = await parseAssetJson(await fetch(assetUrl(asset.path), ASSET_FETCH_INIT), asset.path) as typeof data;
     } catch {
       result.scanFailed.push(asset.path);
       continue;

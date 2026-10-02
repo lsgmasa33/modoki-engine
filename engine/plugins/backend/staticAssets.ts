@@ -28,6 +28,7 @@ import { getEnvCacheDir, envCachePathFor } from '../env-cache';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from '../font-cache';
 import { getModelCacheDir, lodCachePath } from '../model-cache';
 import { atlasPageUrlPath } from '../atlas-cache';
+import { decodeAssetUrlPath } from '../../packages/modoki/src/runtime/core/assetUrlPath';
 import { transcoderForUrl, transcoderSourceDir } from '../transcoders';
 import { getReimportHandler, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import type { TextureVariant } from '../../packages/modoki/src/runtime/loaders/textureSettings';
@@ -169,9 +170,15 @@ export async function serveProjectAsset(
   ctx: Pick<BackendContext, 'projectRoot' | 'resolveAssetPath' | 'editorRoot'> & AutoConvertCaps,
   urlPath: string,
 ): Promise<BackendResult | null> {
+  // The request pathname is the asset path ENCODED — decode it here, once, and nowhere else: every
+  // branch below and `resolveAssetPath` take the decoded identity (#1979, `assetUrlPath.ts`). A
+  // malformed escape is no asset URL this engine builds, so it falls through rather than 500ing.
+  const assetPath = decodeAssetUrlPath(urlPath);
+  if (assetPath === null) return null;
+
   // 1. A real file under any discovered assets/ directory (streamed — GLB/HDR can
   //    be tens of MB). Project assets are user-editable, so no long cache.
-  const absPath = ctx.resolveAssetPath(urlPath);
+  const absPath = ctx.resolveAssetPath(assetPath);
   if (absPath && fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
     const ext = path.extname(absPath).toLowerCase();
     return file(MIME_TYPES[ext] || 'application/octet-stream', absPath);
@@ -184,12 +191,12 @@ export async function serveProjectAsset(
   //    so without the fallback this 404s, the KTX2 worker blob ends up being the SPA index.html
   //    ("Unexpected identifier 'html'"), and every KTX2 texture silently fails to transcode. The
   //    lookup is `transcoderSourceDir`, the same one the build's copy and its `?v=` version use (#1586).
-  const transcoder = transcoderForUrl(urlPath);
+  const transcoder = transcoderForUrl(assetPath);
   if (transcoder) {
     const dir = transcoderSourceDir(transcoder, [ctx.projectRoot, ctx.editorRoot].filter((r): r is string => !!r));
-    const abs = dir && path.join(dir, path.basename(urlPath));
+    const abs = dir && path.join(dir, path.basename(assetPath));
     if (!abs || !fs.existsSync(abs)) return null;
-    return file(urlPath.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', abs, { ...IMMUTABLE });
+    return file(assetPath.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', abs, { ...IMMUTABLE });
   }
 
   // 3. A converted model-LOD GLB from the local cache. URL form:
@@ -200,11 +207,9 @@ export async function serveProjectAsset(
   //    GLB-binary export named `foo.gltf` by Tripo/3D AI Studio). Match both, else
   //    the variant URL falls through to the app-shell and GLTFLoader chokes on the
   //    returned index.html ("Unexpected token '<' … is not valid JSON").
-  const mm = urlPath.match(/^(.+\.(?:glb|gltf))\.(processed|lod(\d+))\.glb$/);
+  const mm = assetPath.match(/^(.+\.(?:glb|gltf))\.(processed|lod(\d+))\.glb$/);
   if (mm) {
-    // Decode percent-encoding so a non-ASCII-named GLB's LOD resolves to the same
-    // cache path the texture branch (below) already decodes for (P2-7).
-    const sourceUrl = decodeURIComponent(mm[1]);
+    const sourceUrl = mm[1];
     const level = mm[2] === 'processed' ? 0 : parseInt(mm[3], 10);
     const absSource = ctx.resolveAssetPath(sourceUrl);
     if (absSource) {
@@ -257,9 +262,9 @@ export async function serveProjectAsset(
   //     would otherwise greedily match `<atlasUrl>~page<N>` as a (nonexistent) source.
   //     The atlas's `.meta.json` sidecar carries each page's content hash; page bytes
   //     live in the shared texture cache keyed on the synthetic page url path.
-  const am = urlPath.match(/^(.+\.atlas\.json)~page(\d+)~(uastc|etc1s|astc|webp|png)\.(?:ktx2|webp|png)$/);
+  const am = assetPath.match(/^(.+\.atlas\.json)~page(\d+)~(uastc|etc1s|astc|webp|png)\.(?:ktx2|webp|png)$/);
   if (am) {
-    const atlasUrl = decodeURIComponent(am[1]);
+    const atlasUrl = am[1];
     const pageIndex = parseInt(am[2], 10);
     const variant = am[3] as TextureVariant;
     const ctFor = (v: TextureVariant) => v === 'webp' ? 'image/webp' : v === 'png' ? 'image/png' : 'application/octet-stream';
@@ -289,9 +294,9 @@ export async function serveProjectAsset(
   // 3c. A converted audio variant from the local cache. URL form:
   //     <sourceUrl>~audio.<ext> — the source's meta carries the cache hash. Must
   //     run BEFORE the texture-variant branch (its `.+` would swallow the suffix).
-  const aud = urlPath.match(/^(.+)~audio\.(mp3|m4a|opus|wav|flac)$/);
+  const aud = assetPath.match(/^(.+)~audio\.(mp3|m4a|opus|wav|flac)$/);
   if (aud) {
-    const sourceUrl = decodeURIComponent(aud[1]);
+    const sourceUrl = aud[1];
     const ext = aud[2];
     const ctFor: Record<string, string> = {
       mp3: 'audio/mpeg', m4a: 'audio/mp4', opus: 'audio/ogg', wav: 'audio/wav', flac: 'audio/flac',
@@ -325,9 +330,9 @@ export async function serveProjectAsset(
   //     `.+` would swallow the suffix. Without this route the runtime resolves a
   //     `~video.mp4` URL that 404s, and the element reports the genuinely unhelpful
   //     DEMUXER_ERROR_COULD_NOT_OPEN (it demuxed the 404 body).
-  const vid = urlPath.match(/^(.+)~video\.mp4$/);
+  const vid = assetPath.match(/^(.+)~video\.mp4$/);
   if (vid) {
-    const sourceUrl = decodeURIComponent(vid[1]);
+    const sourceUrl = vid[1];
     const absSource = ctx.resolveAssetPath(sourceUrl);
     if (absSource) {
       const hash = (readMetaSidecar(absSource).videoCache as { hash?: string } | undefined)?.hash;
@@ -355,9 +360,9 @@ export async function serveProjectAsset(
   //     the source font's meta carries the cache hash. Must run BEFORE the generic
   //     texture-variant branch below — that regex's `.+` would otherwise greedily
   //     match `<font>.ttf~atlas` as a (nonexistent) `png`-variant source.
-  const fm = urlPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json|instance\.ttf)$/i);
+  const fm = assetPath.match(/^(.+\.(?:ttf|otf|woff|woff2))~(atlas\.png|metrics\.json|instance\.ttf)$/i);
   if (fm) {
-    const sourceUrl = decodeURIComponent(fm[1]);
+    const sourceUrl = fm[1];
     const which = fm[2].toLowerCase();
     const ctFor = which === 'atlas.png' ? 'image/png'
       : which === 'metrics.json' ? 'application/json'
@@ -395,9 +400,9 @@ export async function serveProjectAsset(
   //     <sourceUrl>~env.hdr — the source's meta carries the cache hash. Must run
   //     BEFORE the texture-variant branch (whose `.+` would swallow the suffix; and
   //     `.hdr` isn't in that branch's ext list anyway, but keep the ordering explicit).
-  const env = urlPath.match(/^(.+\.hdr)~env\.hdr$/);
+  const env = assetPath.match(/^(.+\.hdr)~env\.hdr$/);
   if (env) {
-    const sourceUrl = decodeURIComponent(env[1]);
+    const sourceUrl = env[1];
     const absSource = ctx.resolveAssetPath(sourceUrl);
     if (absSource) {
       const hash = (readMetaSidecar(absSource).environmentCache as { hash?: string } | undefined)?.hash;
@@ -430,12 +435,9 @@ export async function serveProjectAsset(
 
   // 4. A converted texture variant from the local cache. URL form:
   //    <sourceUrl>~<variant>.<ext> — the source's meta carries the cache hash.
-  const vm = urlPath.match(/^(.+)~(uastc|etc1s|astc|webp|png)\.(?:ktx2|webp|png)$/);
+  const vm = assetPath.match(/^(.+)~(uastc|etc1s|astc|webp|png)\.(?:ktx2|webp|png)$/);
   if (vm) {
-    // Decode percent-encoding: cachePathFor stitches sourceUrl onto the cache
-    // dir as a filesystem path laid out by decoded path (UTF-8 bytes), so a
-    // non-ASCII filename misses the lookup if passed encoded.
-    const sourceUrl = decodeURIComponent(vm[1]);
+    const sourceUrl = vm[1];
     const variant = vm[2] as TextureVariant;
     const absSource = ctx.resolveAssetPath(sourceUrl);
     const ctFor = (v: TextureVariant) => v === 'webp' ? 'image/webp' : v === 'png' ? 'image/png' : 'application/octet-stream';

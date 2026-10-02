@@ -22,6 +22,7 @@
 import * as THREE from 'three';
 import { backendFetch, readBackendAnswer } from '../backend/editorBackend';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
+import { encodeAssetUrlPath } from '../../runtime/core/assetUrlPath';
 import { getModelPostprocessor } from '../../runtime/loaders/modelPostprocessorRegistry';
 
 /** Source model extensions that must be converted to GLB before import.
@@ -174,7 +175,7 @@ async function loadOBJ(url: string, resourcePath: string, baseName: string): Pro
       // MTLLoader yields a silently-empty material set that masks the real .mtl
       // further down the candidate list. Require a non-HTML body that actually
       // declares a material.
-      const res = await fetch(resourcePath + mtlName);
+      const res = await fetch(resourcePath + encodeAssetUrlPath(mtlName));
       if (!res.ok) continue;
       if ((res.headers.get('content-type') ?? '').includes('text/html')) continue;
       const text = await res.text();

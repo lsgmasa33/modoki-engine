@@ -19,7 +19,7 @@ import type { EditorPanelDef } from '../runtime/core/gameDefinition';
 import type { TraitMeta } from '../runtime/core/ecs/traitRegistry';
 import { registerModelPostprocessor, type ModelPostprocessor } from '../runtime/loaders/modelPostprocessorRegistry';
 import { registerTrait } from '../runtime/core/ecs/traitRegistry';
-import { setGameConfig } from '../runtime/core/config';
+import { setGameConfig, bootScenePath } from '../runtime/core/config';
 import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
@@ -40,6 +40,7 @@ import { rendererReady } from '../runtime/loaders/textureResolver';
 import { rendererInitFailedPromise, getRendererProgress, hasViewportBegunInit } from '../runtime/core/activeRenderer';
 import { useEditorStore } from './store/editorStore';
 import { assetSetSignature } from './assetSetSignature';
+import { assetUrl } from '../runtime/loaders/assetUrl';
 
 /** Last asset-set signature the Assets panel was refreshed on (see assetSetSignature
  *  for why we dedupe rather than refresh on every broadcast). */
@@ -177,7 +178,8 @@ export async function canonicalBootScenePath(
     if (getGuidForPath(openProjectPath)) return openProjectPath;
   }
   try {
-    const res = await doFetch(scenePath, { cache: 'no-store' });
+    // `scenePath` is a PATH since #1979 (`bootScenePath` decodes the `?url` value), so it is fetched through assetUrl.
+    const res = await doFetch(assetUrl(scenePath), { cache: 'no-store' });
     if (!res.ok) return scenePath;
     const data = (await res.json()) as { id?: unknown };
     const id = typeof data?.id === 'string' ? data.id : null;
@@ -781,7 +783,7 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // The override slots in FRONT of the normal candidates — never replaces them — so a
     // bad/missing override degrades to the remembered scene (or config default) rather
     // than a blank world. That ordering lives in resolveSceneCandidates, not here.
-    const candidates = resolveSceneCandidates(lastScene, options.config.scenePath, resolvedOverride);
+    const candidates = resolveSceneCandidates(lastScene, bootScenePath(options.config), resolvedOverride);
 
     // Boot the working-copy scene, not a hashed bundle copy, so saves +
     // external-edit hot-reload round-trip in a built/cloud editor (gap #2); pass

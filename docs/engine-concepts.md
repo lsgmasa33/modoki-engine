@@ -361,6 +361,38 @@ still fires, so data-only verification looks fine. After copying, let the import
 timeline cue), and verify with `modoki_diagnose` (`refs.issues: []`), a real `modoki_render_scene`
 and the console — not `get_scene_state` alone.
 
+### Asset path vs asset URL (#1979)
+
+What a GUID resolves to is an **asset path**: `/assets/textures/50%.png`, spelled exactly as the
+file is named on disk. It is an identity. The manifest keys on it, a JSON body or an MCP argument
+carries it, a query value equals it once `URLSearchParams` has parsed it, `resolveAssetPath`
+resolves it, and the production build copies it under that name. **It is never percent-encoded,
+so nothing that holds one may decode it.**
+
+An **asset URL** is that path on the wire. Only three places cross between the two, and all of
+them use `runtime/core/assetUrlPath.ts`:
+
+| Direction | Where | What it does |
+|---|---|---|
+| path → URL | `assetUrl()` (runtime) | `encodeAssetUrlPath` encodes only `%`, `?` and `#`. A space or non-ASCII is left for the browser, so an ordinary name's URL is unchanged. |
+| URL → path | `serveProjectAsset` (dev/editor server) | `decodeAssetUrlPath` decodes the request pathname **once**. A malformed escape falls through instead of becoming a 500. |
+| URL → path | `bootScenePath(config)` (`core/config.ts`) | `config.scenePath` is a Vite `?url` import, and Vite `encodeURI`s it. It is decoded once here, so `assetUrl` does not encode it a second time. Read it through this helper, never raw. |
+
+So a fetch of a path goes through `assetUrl`, never `fetch(path)` or `src={path}`. The reverse
+holds too: `assetUrl`'s OUTPUT is never an identity. `prefabCache` once registered it as a
+manifest path, and `App.tsx` once ran it twice. A CSS
+`background-image` goes through `cssUrl()`, which quotes and escapes the value. An unquoted
+`url(…)` is dropped silently when the name has a space or a parenthesis.
+
+⚠️ **The resolver used to decode every input, and that was the whole defect.** `100%.png` threw
+`URIError`, which meant a 500 on every route and a failed production build. A file literally named
+`my%20tex.png` resolved to `my tex.png`, so a move or a delete acted on the WRONG asset, taking its
+sidecar and GUID with it. The production build resolved its raw names through the same decoder, so
+`a%41.png` was looked for as `aA.png` and silently left out of `dist`.
+
+Known limit: Vite's own `/@fs/` server decodes with `decodeURI`, which leaves `%23`/`%3F` encoded.
+So a `#` or `?` in a path **outside** every asset root still 404s there. A `%` works.
+
 ### World
 A **world** holds all entities and their traits. modoki uses **two-world
 isolation** for scene swaps: the next scene is built in a staging world, then

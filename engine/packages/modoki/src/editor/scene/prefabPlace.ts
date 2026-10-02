@@ -21,6 +21,7 @@ import { capturePrefabRead, StalePrefabRead } from './prefabRead';
 import { PrefabEditRefusalError } from './prefabEditRefusal';
 import { UndoRefusedError } from '../undo/undoFailure';
 import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
+import { assetUrl } from '../../runtime/loaders/assetUrl';
 
 /** Where the placed prefab lives NOW, for a redo: by the document's own guid, as Unity's instance names its prefab
  *  asset by GUID, and at the path it was placed from only when the manifest has no entry. A Rename in Assets is not
@@ -47,7 +48,7 @@ async function readPrefabFile(path: string): Promise<PrefabFile | null> {
   const parked = parkedPrefabRead(path);
   if (parked) return parked;
   try {
-    const raw = await parseAssetJson(await fetch(path), path) as PrefabFile;
+    const raw = await parseAssetJson(await fetch(assetUrl(path)), path) as PrefabFile;
     // Read as every seat reads it (`fetchPrefabSource`; #1937 C-A): admitted — a keyless template node spawns with the key
     // the caches hold, so the frame's record is the cached document and a scene override on that key applies — and a
     // document declaring an identifier twice is not placed. Then the zIndex migration every editor read runs: the

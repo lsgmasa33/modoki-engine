@@ -52,6 +52,21 @@ describe('getPrefabSource ref handling', () => {
 
     expect(prefab?.name).toBe('ByGuid');
     expect(manifest.resolveRef).toHaveBeenCalledWith(guid);
-    expect((global.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(`RESOLVED:${guid}`);
+    // `resolveRef` answers the manifest PATH, so the fetch still goes through assetUrl (#1979) — it used to fetch
+    // the path raw, which skipped both BASE_URL and the percent-encode.
+    expect((global.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(`ASSETURL:RESOLVED:${guid}`);
+  });
+
+  it('registers the read under the PATH, never under assetUrl\'s URL (#1979)', async () => {
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const { getPrefabSource } = await import('../../src/editor/scene/prefabCache');
+    const path = '/games/x/assets/50%.prefab.json';
+    const id = '99999999-2222-4333-8444-555555555555';
+    global.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ id, name: 'Pct', entities: [], rootLocalId: 1 }) })) as unknown as typeof fetch;
+
+    await getPrefabSource(path);
+
+    // `assetUrl` percent-encodes; registering its output re-keyed `50%.prefab.json` as `50%25.prefab.json`.
+    expect(manifest.registerAsset).toHaveBeenCalledWith(id, path, 'prefab');
   });
 });
