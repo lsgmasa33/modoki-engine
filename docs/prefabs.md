@@ -71,11 +71,15 @@ The table after the list says how far each rule is built.
 **Format rule (owner, 2026-10-02):** older override forms are converted on load and never written
 again. These are the localId channels, path-keyed `nestedOverrides`/`nestedStructure`, `moved` and
 legacy pins. There is one in-memory form and one writer.
-Two exceptions are written back verbatim, because no conversion is possible (hub refinement,
-2026-10-02, from #2001's study): a value no reader can parse (the S3 / F-CB1(a) rule), and the legacy
-channels of an instance whose prefab is missing, since a localId means something only next to its
-document (rule 9 keeps that list untouched). Both are converted on the first save after they become
-readable.
+A legacy record is converted when its target can be NAMED. One that cannot be named is held verbatim,
+written back, and converted on the first save after it becomes nameable (hub refinement, 2026-10-02,
+#2001 and #2006). A record cannot be named when its value is unparseable (the S3 / F-CB1(a) rule), when
+its instance's prefab (or the nested prefab its path runs through) is missing or damaged (rule 9), or
+when its localId names no row of a present document. That last kind's target is gone (rule 7): it
+counts as unused, and Remove Unused may clear it, since I4 never reuses a localId. The one visible
+exception: a node added under such a localId is re-anchored at the instance root, as today, so a
+converted scene shows exactly what it showed before. That applies to the legacy localId case only; a
+gone nodeGuid anchor keeps B′.
 
 | Rule | Built today? |
 |---|---|

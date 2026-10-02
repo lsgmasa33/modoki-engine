@@ -756,6 +756,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/audioBufferCache.ts:29' },
   { item: 'loaders/fontAtlasLoader.ts::owners',
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/fontAtlasLoader.ts:30' },
+  { item: 'prefab/instanceRecord.ts::PrefabDocRow.removedTraits',
+    reason: 'not-entity: a legacy template-form channel of a prefab reference row, keyed by the NESTED prefab document\'s serialized localId (its own id space), read only to convert it on parse (#2006); never a runtime entity id; prefab/instanceRecord.ts:213' },
   { item: 'loaders/loadSceneFile.ts::NestedStructureDelta.removedTraits',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the NESTED prefab file\'s own id space — the instance this delta addresses), not a runtime entity id; loaders/loadSceneFile.ts:42' },
   { item: 'loaders/loadSceneFile.ts::AddedEntity.overrides',
