@@ -504,4 +504,18 @@ export const UIElement = trait({
   rangeMin: 0,
   rangeMax: 100,
   rangeStep: 1,
+  /**
+   * The slider knob's diameter in CSS px. **0 = the browser's own slider**, whose knob the WebView
+   * sizes (about 16 px) and which no other field here can change. Above 0 the engine DRAWS the
+   * slider instead — a round knob this size (`rangeThumbColor`) on a pill track (`textColor`) — because a native
+   * knob is too small to grab on a phone (#2106). The element's own `height` is the touch target, so
+   * keep it at least this tall.
+   */
+  rangeThumbSize: 0,
+  /** The drawn slider's track height in CSS px. 0 = a quarter of `rangeThumbSize`. Read only when
+   *  `rangeThumbSize` is above 0 — the native slider's track is the browser's. */
+  rangeTrackHeight: 0,
+  /** The drawn slider's knob colour. The track is `textColor`, so a knob in another colour stands
+   *  out against its own track. Read only when `rangeThumbSize` is above 0. */
+  rangeThumbColor: 0xffffff as number,
 });

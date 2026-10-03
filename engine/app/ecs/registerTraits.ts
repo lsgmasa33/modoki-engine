@@ -1149,6 +1149,9 @@ export function registerAllTraits() {
       rangeMin: { type: 'number', step: 1, tooltip: 'Slider minimum value (elementType=range)', ...S('Input') },
       rangeMax: { type: 'number', step: 1, tooltip: 'Slider maximum value (elementType=range)', ...S('Input') },
       rangeStep: { type: 'number', step: 0.1, tooltip: 'Slider step increment (elementType=range)', ...S('Input') },
+      rangeThumbSize: { type: 'number', min: 0, step: 1, tooltip: 'Slider knob diameter in CSS px (elementType=range). 0 = the browser\'s own slider, whose small knob cannot be resized. Above 0 the engine draws the slider: a round knob this size (rangeThumbColor) on a pill track (textColor). Keep the element\'s height at least this tall — the height is the touch target.', ...S('Input') },
+      rangeThumbColor: { type: 'color', tooltip: 'Drawn slider knob colour. The track is textColor. Ignored while rangeThumbSize is 0 (the native slider).', ...S('Input') },
+      rangeTrackHeight: { type: 'number', min: 0, step: 1, tooltip: 'Drawn slider track height in CSS px. 0 = a quarter of rangeThumbSize. Ignored while rangeThumbSize is 0 (the native slider).', ...S('Input') },
     },
   });
 

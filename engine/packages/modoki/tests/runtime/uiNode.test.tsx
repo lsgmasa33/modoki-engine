@@ -104,7 +104,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
     imageSrc: '', imageMode: 'cover', imageAlign: 'center', imageEpoch: 0, hasVideo: false, elementType: 'div', placeholder: '',
-    rangeMin: 0, rangeMax: 100, rangeStep: 1,
+    rangeMin: 0, rangeMax: 100, rangeStep: 1, rangeThumbSize: 0, rangeTrackHeight: 0, rangeThumbColor: 0xffffff,
     children: [],
     ...over,
   };

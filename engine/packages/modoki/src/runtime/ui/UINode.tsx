@@ -30,6 +30,7 @@ import { isSizeInert } from './anchorLayout';
 import { NineSliceImage } from './NineSliceImage';
 import { BootImageProbe, BootContentHold } from './bootContentProbes';
 import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTextAnimation';
+import { UI_RANGE_CLASS, ensureUIRangeStyles, uiRangeVars } from './uiRangeStyle';
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
@@ -1574,10 +1575,23 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     // Same reason as the input above: this would silently undo `pointerThrough`.
     if (!node.pointerThrough) style.pointerEvents = 'auto';
     style.accentColor = hexToColor(node.textColor);
+    // The DRAWN slider (`rangeThumbSize > 0`, #2106): the knob and track are pseudo-elements an inline
+    // style cannot reach, so the look is a class plus per-element custom properties.
+    // Only a DRAWN slider reads its knob colour — a plain one (no `rangeThumbSize`) never did, and a node built
+    // without the #2106 fields (a test's hand-made node) must not crash converting a colour it will not use.
+    const rangeVars = node.rangeThumbSize > 0
+      ? uiRangeVars(node, sliderValue, hexToColor(node.textColor), hexToColor(node.rangeThumbColor))
+      : null;
+    const rangeClass = rangeVars ? UI_RANGE_CLASS : undefined;
+    if (rangeVars) {
+      ensureUIRangeStyles();
+      Object.assign(style, rangeVars);
+    }
     if (onSelectEntity) {
       return (
         <input
           type="range"
+          className={rangeClass}
           style={{ ...style, cursor: 'pointer' }}
           min={node.rangeMin}
           max={node.rangeMax}
@@ -1595,6 +1609,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     return (
       <input
         type="range"
+        className={rangeClass}
         style={style}
         min={node.rangeMin}
         max={node.rangeMax}

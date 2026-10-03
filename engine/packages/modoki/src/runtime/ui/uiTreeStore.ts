@@ -88,6 +88,7 @@ export interface UINodeData {
   elementType: string; placeholder: string;
   // ── Range (slider) ──
   rangeMin: number; rangeMax: number; rangeStep: number;
+  rangeThumbSize: number; rangeTrackHeight: number; rangeThumbColor: number;
   // ── Separate traits (optional) ──
   binding?: { textBinding: string; inputBinding: string; visibleBinding?: string; visibleOp?: string; visibleValue?: string };
   action?: { bindings: UIActionBinding[] };
@@ -496,6 +497,8 @@ function buildTree(world: World): UINodeData[] | null {
         imageEpoch: ui.imageSrc ? spriteEpoch(ui.imageSrc) : 0,
         elementType: ui.elementType || 'div', placeholder: ui.placeholder || '',
         rangeMin: ui.rangeMin ?? 0, rangeMax: ui.rangeMax ?? 100, rangeStep: ui.rangeStep ?? 1,
+        rangeThumbSize: ui.rangeThumbSize ?? 0, rangeTrackHeight: ui.rangeTrackHeight ?? 0,
+        rangeThumbColor: ui.rangeThumbColor ?? 0xffffff,
         // A PLAIN SCALAR, always written, never an optional nested block: `_scalarKeys`
         // is derived once from whichever node happens to be built first, so an
         // only-sometimes-present key can be missed entirely — and a node whose video

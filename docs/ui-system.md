@@ -467,7 +467,13 @@ Field groups (representative fields, verified against `UIElement.ts`):
   `background-position` (`imageAlignPosition`, `traits/UIElement.ts`); an unknown value is `center`.
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
-  `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`).
+  `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`). The slider is the browser's own
+  control unless `rangeThumbSize` is above 0: a native knob is about 16 px whatever the element's box
+  and cannot be resized, which is too small to grab on a phone (#2106). With a thumb size the engine
+  DRAWS it — a round knob that size on a pill track (`rangeTrackHeight`, default a quarter of the
+  knob), filled up to the knob; the track is `textColor`, the knob `rangeThumbColor` (white by default) — through one injected stylesheet and per-element
+  custom properties (`runtime/ui/uiRangeStyle.ts`), since a knob is a pseudo-element no inline style
+  reaches. The element's `height` stays the touch target.
 
 ⚠️ **`text` and most text STYLING do nothing on four of these shapes, and DEV now says so (#745).**
 Two holes, same class as everything else on this page — the Inspector shows every field and
