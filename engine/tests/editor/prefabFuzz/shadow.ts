@@ -98,6 +98,12 @@ export function listDiff(recorded: OverrideList, captured: OverrideList): string
   return firstDiff(canonList(recorded), canonList(captured));
 }
 
+/** P5's comparison (design § 3.5, the rule-3 audit): the first difference between a record's list before a record-neutral
+ *  op and after it, modulo identity pins (a reload re-pins nothing, but the pins are not the list's records), or null. */
+export function p5Diff(before: OverrideList, after: OverrideList): string | null {
+  return firstDiff(canonList(before), canonList(after));
+}
+
 /** Throws when the captured list shares the store's list or a row object of it: the capture then read the store. */
 export function assertNotSelf(stored: OverrideList, captured: OverrideList): void {
   if (stored === captured || stored.rows === captured.rows) throw new Error('harness: I25 compared the record with itself (the capture returned the store\'s list)');

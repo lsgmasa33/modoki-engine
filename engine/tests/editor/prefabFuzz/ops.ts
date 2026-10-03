@@ -91,7 +91,16 @@ const WEIGHTS: Record<OpKind, number> = {
   apply: 9, revert: 5, prefabEdit: 4, undo: 9, redo: 4, saveReload: 8,
   trashPrefab: 1, renamePrefab: 2, outsideEdit: 2,
   agentSetTraits: 6, agentInstantiate: 3, agentSceneOps: 4, fileMutate: 2, playStop: 3, timelinePreview: 3,
+  // A HUNT may reweight ops to aim at one (#2046 S7: "the per-op fuzz weights" each step is proved by):
+  // `MODOKI_PREFAB_FUZZ_WEIGHTS='revert=40,undo=15'`. Verify runs never set it, so their seeds keep their meaning.
+  ...huntWeights(),
 };
+
+function huntWeights(): Partial<Record<OpKind, number>> {
+  const spec = typeof process !== 'undefined' ? process.env.MODOKI_PREFAB_FUZZ_WEIGHTS : undefined;
+  if (!spec) return {};
+  return Object.fromEntries(spec.split(',').map((p) => p.split('=')).map(([k, v]) => [k!.trim(), Number(v)]).filter(([, v]) => Number.isFinite(v)));
+}
 
 /** What prefab edit may do inside its edit world: the entity ops, instantiate (nesting), undo/redo. */
 const INNER: OpKind[] = ['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'duplicate', 'reparent', 'instantiate', 'undo', 'redo', 'agentSetTraits', 'agentInstantiate'];
@@ -254,8 +263,9 @@ async function editRefusable(gesture: () => Outcome | Promise<Outcome>, st: RunS
   } catch (e) {
     // Only in a prefab-edit WORLD, the refusal's own ground truth (not `editing()`, which also needs the session flag):
     // outside one the refusal must never fire, and a gesture it refused there is a finding. The one reason that holds
-    // in the scene too is a new child under a Missing Prefab placeholder (#1831 M2).
-    if (!(e instanceof PrefabEditRefusalError) || (!isPrefabEditWorld() && e.reason !== 'under-missing-prefab')) throw e;
+    // in the scene too is a new child under a Missing Prefab placeholder (#1831 M2), and a delete of a Missing Prefab
+    // row's node (#2028 close-out: the panels toast it; hunt seed 7395 read it as an op that threw).
+    if (!(e instanceof PrefabEditRefusalError) || (!isPrefabEditWorld() && e.reason !== 'under-missing-prefab' && e.reason !== 'missing-prefab-row')) throw e;
     st.note = e.message;
     return 'refused';
   }
@@ -509,7 +519,7 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       }
       const pre = liveGuids();
       const clip = st.clip;
-      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect); requirePastedFramesCurrent(pre); return 'done'; }, st);
+      const r = await editRefusable(() => { pasteEntityCopy(clip.snapshot, parent, noSelect, clip.records); requirePastedFramesCurrent(pre); return 'done'; }, st);
       for (const g of liveGuids()) if (!pre.has(g)) st.touched.paste.add(g);
       return r;
     }

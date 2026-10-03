@@ -30,7 +30,7 @@ import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/id
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { captureInstanceEntry } from '../scene/instanceEntry';
 import { savedFrameDoc } from '../scene/prefabRebuild';
-import { outermostStoredRoot } from './instanceKeys';
+import { guidOfEntity, outermostStoredRoot, projectionRootOf, storedRootsUnder } from './instanceKeys';
 
 type Bag = Record<string, unknown>;
 
@@ -92,11 +92,26 @@ export function capturedRecordsOf(topRootId: number): InstanceRecord[] | null {
 /** Re-seed the records of the instance tree that holds stored root `rootId` (its outermost owner's tree) from the old
  *  capture. Returns whether it could. */
 export function reseedFromCapture(rootId: number, world: World = getCurrentWorld()): boolean {
-  const top = outermostStoredRoot(rootId) || rootId;
+  // The outermost PROJECTABLE root (`projectionRootOf`): a Missing Prefab placeholder's capture is its kept record, which
+  // does not state a reference node the scene added that still shows under it (#2018), so that node is its own top.
+  const top = projectionRootOf(rootId) || outermostStoredRoot(rootId) || rootId;
   const recs = capturedRecordsOf(top);
   if (!recs) return false;
   for (const r of recs) setInstanceRecord(world, r);
   return true;
+}
+
+/** Every record of the instance tree at outermost root `top` fresh: the tree re-seeded from its capture when ANY of them is
+ *  missing or stale, not only the top's (#2046 S7 close-out review F2). A step taking a tree's records before it writes
+ *  must not take a stale nested one (a scene-added reference node's: a reparent of a member it supplies marks only its own
+ *  record; a reload's bank leaves one whose fold changed) as absent — its own write then re-seeds the whole tree, and its
+ *  undo dropped that record and rebuilt the node from the post-step capture. False when the tree cannot be had. */
+export function treeForWrite(top: number, world: World = getCurrentWorld()): boolean {
+  const topGuid = guidOfEntity(top);
+  if (!topGuid) return false;
+  if ([top, ...storedRootsUnder(top)].every((id) => freshInstanceRecord(world, guidOfEntity(id)))) return true;
+  if (!reseedFromCapture(top, world)) return false;
+  return !!freshInstanceRecord(world, topGuid);
 }
 
 /** The fresh record for stored root `rootId` (guid `rootGuid`), re-seeding it first when it is missing or stale. Null

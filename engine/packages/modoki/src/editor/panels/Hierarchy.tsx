@@ -1101,7 +1101,7 @@ export default function Hierarchy() {
       void requestReparent(sourceId, parentId).then((moved) => { if (moved) setEntityClipboard(null); });
       return;
     }
-    withPrefabEditRefusalToast(() => pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity));
+    withPrefabEditRefusalToast(() => pasteEntityCopy(entityClipboard.snapshot, parentId, selectEntity, entityClipboard.records));
   }, [entityClipboard, selectEntity, requestReparent]);
 
   // ── Focus (frame in SceneView orbit camera — see SceneView F-key) ──

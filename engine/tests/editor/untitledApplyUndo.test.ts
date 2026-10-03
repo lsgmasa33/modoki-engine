@@ -19,7 +19,13 @@
  *  resolve instead of throwing on a skipped restore — the half-swapped and in-flight cases go red.
  *
  *  #1868: the undo writes no file, so the window these cases land a switch in is the undo's in-memory restore
- *  (`parkPrefabChanges`, entered before the world check), not its file install. */
+ *  (`parkPrefabChanges`, entered before the world check), not its file install.
+ *
+ *  #2046 S7.3: the undo no longer reloads the world. It restores the applying instance's RECORDS in place and reprojects
+ *  every instance from its own (`restoreRecords`); the snapshot reload is the fallback when the store cannot state the
+ *  world. So "the world restore ran" is counted as `restores` (the record restore), and the reload's key (`sm.path`) is
+ *  never touched; the world checks, the waits and the drop of a step that spanned a swap are the same. Mutation: drop
+ *  `restoreRecords`' world check — the in-flight and swapped-world cases go red. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
@@ -106,6 +112,14 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOri
     ...real,
     refreshBaseInstances: (...a: unknown[]) => { refreshes.n++; return (real.refreshBaseInstances as (...x: unknown[]) => unknown)(...a); },
   };
+});
+/** The undo's restore from records (#2046 S7.3: the applying tree's records seated and reprojected, in place, no world
+ *  reload) — counted, as the rederive is above, so a skipped restore can be seen to skip it. */
+/** Record restores (`restoreSide`): the applying tree's, and each other tree the Apply's fan-out reached — here B's. */
+const restores = vi.hoisted(() => ({ n: 0 }));
+vi.mock('../../packages/modoki/src/editor/instance/instanceHistory', async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  return { ...real, restoreSide: (...a: unknown[]) => { restores.n++; return (real.restoreSide as (...x: unknown[]) => unknown)(...a); } };
 });
 // The undo's restore, entered before it asks whether its world is still live — the window (`sm.window`).
 vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOriginal) => {
@@ -263,6 +277,7 @@ beforeEach(() => {
   sm.next = null;
   sm.loading = false;
   refreshes.n = 0;
+  restores.n = 0;
   setCurrentScenePath(null);
   const prev = getCurrentWorld();
   setCurrentWorld(createWorld());
@@ -287,11 +302,11 @@ describe('undoing an Apply made in an untitled scene rebuilds that world (#1575)
     expect(xOf(inInst('A', 'Box'))).toBe(5);
     expect(xOf(inInst('B', 'Box'))).toBe(0);
     expect(await saved()).toEqual(before);
-    // Still untitled: reloaded under '', no scene path, nothing saved.
-    expect(sm.path).toBe('');
+    // Still untitled: restored in place from the records (#2046 S7.3) — no world reloaded, no scene path, nothing saved.
+    expect(sm.path).toBeNull();
     expect(getCurrentScenePath()).toBeNull();
     expect(sm.saves).toBe(0);
-    expect(refreshes.n).toBe(1); // the rederive ran after the restore
+    expect(restores.n).toBe(2); // the records were restored: A's tree, and B's, which the fan-out reached (hub ruling 2026-10-03)
   });
 
   it('a value, redone: both instances show it again, with no override', async () => {
@@ -334,7 +349,8 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     await quietly(() => undo());
     expect(xOf(inInst('B', 'Box'))).toBe(0);
     expect(await saved()).toEqual(before);
-    expect(sm.path).toBe(SAVED);
+    // Restored in place (#2046 S7.3): no world reloaded, under either path, and the scene keeps its new one.
+    expect(sm.path).toBeNull();
     expect(getCurrentScenePath()).toBe(SAVED);
     // A field Apply saves no scene, so neither does its undo (#1695): the restore is dirty, as any undo leaves it.
     expect(sm.saves).toBe(0);
@@ -372,7 +388,7 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     expect(sm.duringWrite).toBeNull(); // precondition: the undo really awaited
     expect(getCurrentWorld() === other).toBe(true);
     expect(canRedo()).toBe(false);
-    expect(refreshes.n).toBe(0); // …and the rederive did not rebuild the incoming world's instances
+    expect(refreshes.n + restores.n).toBe(0); // …and nothing rebuilt the incoming world's instances
     await quietly(() => redo());
     expect(getCurrentWorld() === other).toBe(true);
     expect(sm.path).toBe(Y);
@@ -395,7 +411,7 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     expect(sm.duringWrite).toBeNull(); // precondition: the undo really awaited
     expect(getCurrentWorld() === other).toBe(true);
     expect(sm.saves).toBe(0);
-    expect(refreshes.n).toBe(0);
+    expect(refreshes.n + restores.n).toBe(0);
     expect(boxNow()).toMatchObject({ x: 0 }); // the prefab still came back (in memory)
     // Applied half — the file, not the world — so it is dropped, not left on the redo stack as though undone.
     expect(canRedo()).toBe(false);
@@ -413,7 +429,7 @@ describe('undoing an untitled scene\'s Apply after the world changed under it (#
     expect(sm.duringWrite).toBeNull(); // precondition
     expect(sm.path).toBeNull(); // nothing loaded over it
     expect(xOf(inInst('B', 'Box'))).toBe(5); // the world was left for the load to replace
-    expect(refreshes.n).toBe(0);
+    expect(refreshes.n + restores.n).toBe(0);
     expect(canRedo()).toBe(false); // dropped, not marked undone
   });
 });
@@ -456,7 +472,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
     const { did, result } = await undoDuring(() => loadScene('/scenes/B.json'));
     expect(did).toBe(true);
     expect(result).toBe('loaded');
-    expect(refreshes.n).toBe(1); // the rederive ran — over A's world, before the swap
+    expect(restores.n).toBe(2); // the records were restored — over A's world, before the swap
     expect(sm.saves).toBe(0); // a field Apply saved no scene, so its undo saves none either (#1695)
     expect(boxNow()).toMatchObject({ x: 0 });
     expect(getCurrentScenePath()).toBe('/scenes/B.json');
@@ -483,7 +499,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
 
     const { did } = await undoDuring(() => newScene());
     expect(did).toBe(true);
-    expect(refreshes.n).toBe(1);
+    expect(restores.n).toBe(2);
     expect(all().some((e) => e.guid === ROOT.A)).toBe(false); // the new scene landed after it
   });
 
@@ -507,7 +523,7 @@ describe('a world switch during an Apply undo waits for it (#1579)', () => {
     try {
       const { did } = await undoDuring(() => openPrefabForEditing({ path: '/assets/prefabs/mid.prefab.json', name: 'Mid' }));
       expect(did).toBe(true);
-      expect(refreshes.n).toBe(1);
+      expect(restores.n).toBe(2);
       expect(isEditingPrefab()).toBe(true);
       expect(boxNow()).toMatchObject({ x: 0 }); // the editor cache still holds the restored document
       expect(xOf(all().find((e) => e.name === 'Box')!.id)).toBe(0); // and the edit world was built from it

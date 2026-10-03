@@ -13,6 +13,7 @@ import { getCachedPrefab } from '../loaders/meshTemplateCache';
 import type { ParsedInstance, PrefabDoc, PrefabReader, SceneOwnedNode } from './instanceRecord';
 import { parseInstanceRecord, parseReferenceNode, type ParseOptions } from './parseInstanceRecord';
 import { markStale, setInstanceRecord, storedInstance } from './instanceStore';
+import { adoptBankedRecords, type RecordBank } from './recordBank';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { instanceRowKeysIn } from '../core/ecs/memberRows';
@@ -164,13 +165,16 @@ function buildParentLinks(world: World, data: { entities?: SceneEntityEntry[] },
 
 /** {@link fillInstanceStore} for the load path, one owner at a time: an owner the parser throws on is reported and left
  *  unstored, never fails the load (the store is a shadow until S5). The report names the entry, for a parser defect. */
-export function fillInstanceStoreReporting(world: World, data: { entities?: SceneEntityEntry[]; embeddedPrefabs?: unknown; version?: unknown }): void {
+export function fillInstanceStoreReporting(world: World, data: { entities?: SceneEntityEntry[]; embeddedPrefabs?: unknown; version?: unknown }, bank?: RecordBank): void {
   let opts: ParseOptions;
   try { opts = sceneParseOptions(data); } catch (err) { console.error(`[instanceStore] could not read the scene's instance options (#2001 S4): ${(err as Error)?.message ?? err}`); return; }
   for (const entry of Array.isArray(data.entities) ? data.entities : []) {
     try {
       if (!isInstanceEntry(entry)) continue;
-      for (const p of recordsOf(parseInstanceRecord(entry, cachedPrefabReader, opts), cachedPrefabReader, opts)) setInstanceRecord(world, p.record);
+      const parts = recordsOf(parseInstanceRecord(entry, cachedPrefabReader, opts), cachedPrefabReader, opts);
+      for (const p of parts) setInstanceRecord(world, p.record);
+      // #2046 S7.6: a world the editor reloads from its own text takes back the exact lists it held (`recordBank.ts`).
+      if (bank) adoptBankedRecords(world, bank, entry, parts.map((p) => p.record.rootGuid), cachedPrefabReader);
     } catch (err) {
       console.error(`[instanceStore] could not parse the instance record of "${entry.name ?? entry.guid}" (#2001 S4): ${(err as Error)?.message ?? err}`);
     }

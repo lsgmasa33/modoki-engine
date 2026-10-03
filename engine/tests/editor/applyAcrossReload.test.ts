@@ -74,13 +74,27 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', async (importOri
     },
   },
 }));
+/** When set, the next in-memory restore (an Apply undo's park, #1868) waits for `gate` after calling `reached` — the undo
+ *  held in flight before it changed anything (#2046 S7.3: it restores records in place, and reloads no world). */
+const park = vi.hoisted(() => ({ hold: null as null | { gate: Promise<void>; reached: () => void } }));
+vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabCommit')>();
+  return {
+    ...real,
+    parkPrefabChanges: async (...a: Parameters<typeof real.parkPrefabChanges>) => {
+      const h = park.hold;
+      if (h) { park.hold = null; h.reached(); await h.gate; }
+      return real.parkPrefabChanges(...a);
+    },
+  };
+});
 vi.mock('../../packages/modoki/src/editor/scene/serialize', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   saveScene: async () => ({ saved: true, reason: 'ok' }),
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, readTraitData, loadSceneFile, instantiatePrefabIntoWorld,
   destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
@@ -94,7 +108,7 @@ import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/seri
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { applyToPrefabWithUndo } from '../../packages/modoki/src/editor/undo/applyPrefabUndo';
-import { swapHistory, undo, canRedo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { swapHistory, undo, canRedo, canUndo, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
@@ -390,8 +404,9 @@ describe('#1750 close-out: an instance rebuilt in place under a waiting Apply (a
 
 describe('#1750 close-out re-review: an unrelated Apply during an Apply undo does not drop the undo', () => {
   // A global "frames rebuilt" invalidation made this undo restore the file only, throw, and vanish from both stacks. Since
-  // #1868 the undo writes no file, so the window it held is its world restore — and an Apply asked there waits for that
-  // adoption, then refuses because the world it planned in was replaced, rather than landing under the undo.
+  // #1868 the undo writes no file; since #2046 S7.3 it reloads no world either, so the window it holds is its in-memory
+  // restore — and an Apply asked there plans in the same world, lands, and leaves the undo to land whole after it.
+  // Mutation: have the record restore resolve `false` (a world it thinks it left) — the undo throws and is dropped.
   it('the undo lands whole: the prefab back, the instance back, redo available', async () => {
     const P2 = 'aaaaaaaa-0000-4000-8000-000000021750';
     const p2Doc = () => ({ id: P2, version: 6, name: 'P2', rootLocalId: 1, entities: [row(1, G(31), 'S', 0), row(2, G(32), 'T', 1)] });
@@ -409,17 +424,24 @@ describe('#1750 close-out re-review: an unrelated Apply during an Apply undo doe
     const gate = new Promise<void>((r) => { release = r; });
     let reached!: () => void;
     const atWrite = new Promise<void>((r) => { reached = r; });
-    smLoad.hold = { gate, reached };
+    park.hold = { gate, reached };
     const undoing = quietly(() => undo());
-    await atWrite; // the undo's world restore is in flight
+    await atWrite; // the undo's restore is in flight
     const rootC = rootIdOf(ROOT_C);
     const keyC = collectInstanceOverrideKeys(rootC, getCachedPrefabSync(P2) as PrefabFile).fields.find((k) => k.endsWith('.Transform.x'))!;
     const applyC = quietly(() => applyToPrefabWithUndo(rootC, new Set([keyC])));
     release();
-    await undoing;
-    // The unrelated Apply waited for the restore's adoption, then found the world it planned in replaced — H1's refusal.
-    expect(await applyC).toMatchObject({ applied: false, refused: 'the scene reloaded — open Apply again.' });
+    expect(await undoing, 'the undo applied').toBe(true);
+    // The unrelated Apply planned in the world the undo restores in place: nothing replaced it, so it landed.
+    expect((await applyC).applied).toBe(true);
     expect(((getCachedPrefabSync(P) as PrefabFile).entities.find((e) => e.name === 'A')!.traits.Transform as { x: number }).x, 'the prefab went back').toBe(0);
-    expect(canRedo(), 'the undo entry survived as a redo').toBe(true);
+    expect(((getCachedPrefabSync(P2) as PrefabFile).entities.find((e) => e.name === 'T')!.traits.Transform as { x: number }).x, 'C applied').toBe(7);
+    // The instance back too: its own x again, over the template's restored 0.
+    const pi = getTraitByName('PrefabInstance')!;
+    const memberA = getAllEntities().find((e) => e.name === 'A' && (readTraitData(e.id, pi) as { rootInstanceId?: number } | null)?.rootInstanceId === rootIdOf(ROOT_A))!;
+    expect((readTraitData(memberA.id, getTraitByName('Transform')!) as { x: number }).x, 'the instance went back').toBe(5);
+    // C is the newest entry; as any new edit after an undo, it took the redo stack.
+    expect(canUndo()).toBe(true);
+    expect(canRedo()).toBe(false);
   });
 });

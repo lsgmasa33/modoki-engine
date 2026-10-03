@@ -74,6 +74,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
   findEntityById: (id: number) => index.get(id),
+  // By the guid EntityAttributes holds: the refresh names the entries it rebuilt by guid (#2046 S7.3).
+  findEntityByGuid: (g: string) => [...index.values()].find((e: any) => e.has(EntityAttributes) && e.get(EntityAttributes).guid === g),
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },

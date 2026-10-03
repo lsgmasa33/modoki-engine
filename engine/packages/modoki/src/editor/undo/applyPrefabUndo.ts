@@ -37,13 +37,18 @@ import {
 } from '../scene/prefabRebuild';
 import { applyToPrefabSelective, type ApplyResult } from '../scene/prefabApply';
 import type { ApplyTargets } from '../scene/prefabApplyTargets';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
+import { projectionRootOf } from '../instance/instanceKeys';
 import { useEditorStore } from '../store/editorStore';
 import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { ensureGuid } from './entityRef';
-import { captureEntityIdentity } from '../../runtime/core/ecs/entityUtils';
+import { captureEntityIdentity, getAllEntities, readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { PREFAB_EDIT_SCENE_PREFIX } from '../scene/prefabEditWorld';
 import { currentSceneKey } from '../scene/authoredSnapshot';
+import { restoreSide, takeEveryTree, takeTreeRecords, storeStatesTheWorld, reseedEveryTree, type TreeRecords } from '../instance/instanceHistory';
+import { markStale } from '../../runtime/prefab/instanceStore';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -203,6 +208,88 @@ export async function rederiveBaseInstances(
 
 const worldLeft = () => new Error('the scene changed while it ran, so only the prefab was restored — the instances were not');
 
+/** Restore one side of an Apply onto records (#2046 S7.3, rule 8; #1868 D1 = Park kept): every prefab it wrote goes back IN
+ *  MEMORY, the applying tree's records are seated as they stood on that side and the tree reprojected from them, and the
+ *  commit's rebase reprojects every other tree from its own record onto the restored documents (their lists did not
+ *  change). No world reload. Resolves `false` when the world it belongs to is no longer live, having restored the prefab
+ *  documents only; throws when the tree could not be reprojected (its root is gone, or a document it reads cannot be). */
+async function restoreRecords(
+  source: string, prefab: PrefabFile, expected: PrefabFile,
+  others: readonly { source: string; doc: PrefabFile; expected: PrefabFile }[],
+  records: TreeRecords, selGuid: string,
+  /** Every other tree the Apply's fan-out reached, as it stood on this side (rule 8: the step stands for their lists too). */
+  fanned: readonly TreeRecords[] = [],
+): Promise<boolean> {
+  const key = currentSceneKey();
+  const world = getCurrentWorld();
+  let restored: boolean | null = null;
+  await parkPrefabChanges([
+    { source, doc: prefab, from: expected },
+    ...others.map((o) => ({ source: o.source, doc: o.doc, from: o.expected })),
+  ], {
+    maintainsRecords: true,
+    // The rebase is run below, only in the world this step belongs to: a load in flight replaces the world it would rebuild.
+    rebase: false,
+    rebuild: async () => {
+      // The same world checks as the snapshot restore (`restoreSnapshot`): a world replaced meanwhile gets the prefab only.
+      if (currentSceneKey() !== key || getCurrentWorld() !== world || isSceneLoadSwapping() || sceneManager.getNext() !== null) {
+        console.warn(`[ApplyPrefab] ${key ?? 'the untitled scene'} is no longer the live world; restored the prefab only`);
+        return;
+      }
+      restored = restoreSide(records.side, records.at) !== null;
+      if (!restored) return;
+      // Every other tree the fan-out reached, from ITS records on this side: a load since (a snapshot-path undo of another
+      // Apply, a reload) re-parsed its pins from a file the Apply wrote, a member's pin the restored template no longer
+      // has, which R2 keeps and the save wrote back (hunt seed 7529's Inspector form). A tree that cannot be rebuilt is
+      // left to the rebase, from its capture.
+      for (const t of fanned) if (!restoreSide(t.side, t.at)) markStale(world, 'apply', [t.at]);
+      // Every tree left onto the restored documents, each from its own record (`rebuildStaleFrames`).
+      await rebaseStaleInstances();
+    },
+  });
+  if (restored === null) return false;
+  if (!restored) {
+    markStale(world, 'apply');
+    throw new Error('the applied instance could not be rebuilt from its records (its root is gone, or a prefab it reads cannot be read), so only the prefab was restored');
+  }
+  const id = selGuid ? entityIdForGuid(selGuid) : 0;
+  useEditorStore.getState().selectEntity(id || null);
+  return true;
+}
+
+/** Is the tree at `guid` live and projectable — its root its own projection root? A load since the Apply can have left
+ *  it a Missing Prefab placeholder (its prefab trashed, hunt seed 8026), which only the snapshot's reload restores. */
+function projectable(guid: string): boolean {
+  const id = findEntityByGuid(guid)?.id();
+  return !!id && projectionRootOf(id) === id;
+}
+
+/** `before` with a `null` for each root only `after` holds, so restoring it drops a record the Apply made. */
+function bothSides(before: TreeRecords, after: TreeRecords): TreeRecords {
+  return { ...before, side: { ...before.side, records: new Map([...[...after.side.records.keys()].map((g) => [g, null] as const), ...before.side.records]) } };
+}
+
+/** The trees of {@link takeEveryTree}'s `every` (taken before an Apply) other than the applying one at `applying`, in scene
+ *  `scene`, that hold an instance of one of `written` now — each with its side after the Apply. A tree that cannot be
+ *  stated after it is left to the rebase. */
+function fannedTrees(every: ReadonlyMap<string, TreeRecords>, applying: string, written: ReadonlySet<string>, scene: string,
+  sceneOf: (guid: string) => string): { before: TreeRecords; after: TreeRecords }[] {
+  const pi = getTraitByName('PrefabInstance');
+  if (!pi) return [];
+  const links = getAllEntities().map((e) => [e.id, e.parentId] as const);
+  const out: { before: TreeRecords; after: TreeRecords }[] = [];
+  for (const [at, before] of every) {
+    if (at === applying || sceneOf(at) !== scene) continue;
+    const top = entityIdForGuid(at);
+    if (!top) continue;
+    const holds = collectSubtreeIds(links, [top]).some((id) => written.has((readTraitData(id, pi) as { source?: string } | null)?.source ?? ''));
+    if (!holds) continue;
+    const after = takeTreeRecords(top, before.side.records.keys());
+    if (after) out.push({ before: bothSides(before, after), after });
+  }
+  return out;
+}
+
 function makeApplyPrefabAction(opts: {
   source: string;
   prefabBefore: PrefabFile;
@@ -217,17 +304,12 @@ function makeApplyPrefabAction(opts: {
   others: readonly { source: string; before: PrefabFile; after: PrefabFile }[];
   /** Every prefab file the Apply wrote, innermost first (`ApplyResult.writes`) — the order the base re-derive runs in. */
   writes: readonly { source: string; before: PrefabFile; after: PrefabFile }[];
+  /** The applying tree's records on each side (#2046 S7.3): when both were taken, the undo and redo restore them and
+   *  reload no world; otherwise they reload the scene snapshot. */
+  records?: { before: TreeRecords; after: TreeRecords; fanned?: { before: TreeRecords; after: TreeRecords }[] } | null;
 }): UndoAction {
   const label = 'Apply to Prefab';
-  return {
-    label,
-    affectedScenes: opts.affectedScenes,
-    // The world restore reaches only the primary; every carried base instance of the prefab is
-    // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
-    // Not when the restore found its world gone: the rederive rebuilds every base instance of the prefab in whatever
-    // world is live, which is then a scene this Apply never touched (#1575 close-out re-review). And the step THROWS
-    // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
-    // (#310), rather than pushing it to the other stack as if the world had followed.
+  const snapshot = {
     undo: async () => {
       const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
       if (!await restoreSnapshot(opts.source, opts.prefabBefore, opts.prefabAfter, opts.sceneBefore, opts.selGuid, others)) throw worldLeft();
@@ -238,6 +320,43 @@ function makeApplyPrefabAction(opts: {
       if (!await restoreSnapshot(opts.source, opts.prefabAfter, opts.prefabBefore, opts.sceneAfter, opts.selGuid, others)) throw worldLeft();
       await rederiveBaseInstances(opts.writes.map((w) => ({ source: w.source, from: w.before, to: w.after })), opts.baseAfter, 'Redo');
     },
+  };
+  const recs = opts.records;
+  if (recs) {
+    // The snapshot when the store cannot state the world any more (a step since left a record stale): only the applying
+    // tree's list changed, so every OTHER tree is reprojected from its own — which a stale one has not got. Stale before
+    // and after that path, as every step that does not maintain the records (`undoStep`).
+    const viaSnapshot = async (run: () => Promise<void>) => {
+      markStale(getCurrentWorld(), 'apply');
+      try { await run(); } finally { markStale(getCurrentWorld(), 'apply'); }
+    };
+    return {
+      label,
+      affectedScenes: opts.affectedScenes,
+      maintainsRecords: true,
+      undo: async () => {
+        if (!storeStatesTheWorld() || !projectable(recs.before.at)) return viaSnapshot(snapshot.undo);
+        const others = opts.others.map((o) => ({ source: o.source, doc: o.before, expected: o.after }));
+        if (!await restoreRecords(opts.source, opts.prefabBefore, opts.prefabAfter, others, recs.before, opts.selGuid, recs.fanned?.map((f) => f.before))) throw worldLeft();
+      },
+      redo: async () => {
+        if (!storeStatesTheWorld() || !projectable(recs.after.at)) return viaSnapshot(snapshot.redo);
+        const others = opts.others.map((o) => ({ source: o.source, doc: o.after, expected: o.before }));
+        if (!await restoreRecords(opts.source, opts.prefabAfter, opts.prefabBefore, others, recs.after, opts.selGuid, recs.fanned?.map((f) => f.after))) throw worldLeft();
+      },
+    };
+  }
+  return {
+    label,
+    affectedScenes: opts.affectedScenes,
+    // The world restore reaches only the primary; every carried base instance of the prefab is
+    // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
+    // Not when the restore found its world gone: the rederive rebuilds every base instance of the prefab in whatever
+    // world is live, which is then a scene this Apply never touched (#1575 close-out re-review). And the step THROWS
+    // then, because it applied only half — the file, not the world. `runStep` drops a throwing step with a loud report
+    // (#310), rather than pushing it to the other stack as if the world had followed.
+    undo: snapshot.undo,
+    redo: snapshot.redo,
   };
 }
 
@@ -318,6 +437,13 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   // `sceneBefore`'s serialize (it fetches a cold prefab) or the preloads, renumbered the world (#1750 H1, both windows).
   if (!adopted()) return { ...NOT_APPLIED, refused: 'the scene reloaded — open Apply again.' };
   if (!sameInstance()) return { ...NOT_APPLIED, refused: 'the instance was rebuilt meanwhile — open Apply again.' };
+  // The applying tree's records before (#2046 S7.3), taken after the last await: the plan reads the tree as it is here.
+  reseedEveryTree();
+  const recordsBefore = takeTreeRecords(rootInstanceId);
+  // …and every other tree's, for the ones the fan-out reaches (decided once the Apply says what it wrote, below).
+  const everyBefore = takeEveryTree();
+  const sceneOf = (guid: string): string => (readTraitData(entityIdForGuid(guid), getTraitByName('EntityAttributes')!) as { sourceScene?: string } | null)?.sourceScene ?? '';
+  const applyingScene = recordsBefore ? sceneOf(recordsBefore.at) : '';
   const result = await applyToPrefabSelective(rootInstanceId, selectedKeys, targets, opts);
   if (!result.applied || !result.source || !result.prefabBefore || !result.prefabAfter) {
     return result; // no-op apply — nothing to undo
@@ -332,6 +458,17 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
   // instance's own value into the enclosing row, and a re-derive from the row it restores cannot bring that value back.
   const liveAfter = baseBefore && rootGuid ? entityIdForGuid(rootGuid) : 0;
   const baseAfter = liveAfter && ctx ? captureSide(liveAfter, rootGuid, ctx.source) : null;
+  // …and after: the Apply rebuilt the applying tree from its capture (its U15 subtraction) and left its records stale, so
+  // they are re-seeded from that capture here — fresh, the after side. Each side names the roots only the other holds.
+  const topAfter = recordsBefore ? entityIdForGuid(recordsBefore.at) : 0;
+  const recordsAfter = recordsBefore && topAfter ? takeTreeRecords(topAfter, recordsBefore.side.records.keys()) : null;
+  const records = recordsBefore && recordsAfter ? {
+    before: bothSides(recordsBefore, recordsAfter),
+    after: recordsAfter,
+    // Every OTHER tree of the applying scene holding an instance of a document the Apply wrote: the set its fan-out reached,
+    // fixed here (#2046 S7.3, hub ruling 2026-10-03). An instance added later, or one in another scene, is not in it.
+    fanned: fannedTrees(everyBefore, recordsBefore.at, new Set(writes.map((w) => w.source)), applyingScene, sceneOf),
+  } : null;
   pushAction(makeApplyPrefabAction({
     source: result.source,
     prefabBefore: result.prefabBefore,
@@ -345,6 +482,7 @@ async function applyHeld(rootInstanceId: number, selectedKeys: Set<string>, targ
     // Every file but the one `result.source` names (writes are innermost first, and a U14 Apply's frame file is not).
     others: writes.filter((w) => w.source !== result.source),
     writes,
+    records,
   }));
   return result;
 }

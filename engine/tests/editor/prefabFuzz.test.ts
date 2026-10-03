@@ -18,6 +18,7 @@
  *  - `MODOKI_PREFAB_FUZZ=<n>` (optional `MODOKI_PREFAB_FUZZ_SEED=<first>`, `MODOKI_PREFAB_FUZZ_LEN=<ops>`): n seeds, for
  *    long hunts. Every distinct failure is shrunk and printed with its seed and a paste-ready replay.
  *  - `MODOKI_PREFAB_FUZZ_REPLAY='<json op list>'`: run exactly that list.
+ *  - `MODOKI_PREFAB_FUZZ_RUN_TAG=<hex>`: with a replay, the run tag to use (a REGRESSIONS entry's `runTag`, #1946).
  *
  *  REAL, not stood in for: the backend router over a scratch directory (`prefabFuzz/backend.ts`), SceneManager's load,
  *  both prefab caches, the manifest, the undo stack, the adoption owner, prefab edit's world swaps, and the watcher's
@@ -284,7 +285,9 @@ describe('#1789 prefab fuzz', () => {
   if (replay) {
     it('replays the given op list', async () => {
       const ops = JSON.parse(replay) as Op[];
-      const r = await runOps(be, ops, OPTS);
+      // `MODOKI_PREFAB_FUZZ_RUN_TAG=<hex>`: the run tag to replay under (an entry's `runTag`; re-pinning one, #1946).
+      const tag = process.env.MODOKI_PREFAB_FUZZ_RUN_TAG;
+      const r = await runOps(be, ops, tag ? { ...OPTS, runTag: parseInt(tag, 16) } : OPTS);
       realError(r.trace.join('\n'));
       // Which open issue already claims this failure, as the hunt would say it (triage; the verdict is unchanged).
       const known = r.failure ? knownStop(r.failure, ops) : undefined;
@@ -391,7 +394,7 @@ describe('#1789 prefab fuzz', () => {
   for (const r of REGRESSIONS) {
     it(`regression #${r.issue}: ${r.what}`, async () => {
       const before = new Map(skippedChecks);
-      const res = await runOps(be, r.repro, OPTS);
+      const res = await runOps(be, r.repro, r.runTag === undefined ? OPTS : { ...OPTS, runTag: r.runTag });
       expect(res.failure, res.failure ? `${res.failure.check}: ${res.failure.detail}` : '').toBeUndefined();
       const skips = [...skippedChecks].filter(([k, n]) => n > (before.get(k) ?? 0)).map(([k]) => k).sort();
       const outcomeOf = (i: number) => res.trace.map((l) => /^(\d+): .*? → (\w+)/.exec(l)).find((m) => m && Number(m[1]) === i)?.[2];
@@ -936,15 +939,17 @@ describe('#1789 prefab fuzz', () => {
     const ops: Op[] = [
       { kind: 'duplicate', u: [0.7219006572850049, 0.5483197642024606, 0.30764133017510176, 0.5250595326069742, 0.09884512959979475, 0.40332550974562764, 0.8549339685123414, 0.12889821105636656] },
       { kind: 'instantiate', u: [0.46533699450083077, 0.3489740223158151, 0.42113381205126643, 0.3490595759358257, 0.5367825583089143, 0.6584286321885884, 0.4939265919383615, 0.9836620986461639] },
-      { kind: 'fileMutate', u: [0.28141955262981355, 0.0669010104611516, 0.11636064387857914, 0.5872549663763493, 0.6053570182994008, 0.006638948572799563, 0.7421369452495128, 0.9577205339446664] },
-      { kind: 'delete', u: [0.34164101001806557, 0.21144867152906954, 0.29246249445714056, 0.6761395719368011, 0.1756759958807379, 0.4217527159489691, 0.6035060549620539, 0.608379076467827] },
-      { kind: 'reparent', u: [0.3341537709347904, 0.3475193327758461, 0.5419025190640241, 0.9471577857621014, 0.6461046554613858, 0.49814249901100993, 0.31486722477711737, 0.9499714151024818] },
+      { kind: 'fileMutate', u: [0.08333333333333333, 0.0669010104611516, 0.11636064387857914, 0.5872549663763493, 0.6053570182994008, 0.006638948572799563, 0.7421369452495128, 0.9577205339446664] },
+      { kind: 'delete', u: [0.86, 0.21144867152906954, 0.29246249445714056, 0.6761395719368011, 0.1756759958807379, 0.4217527159489691, 0.6035060549620539, 0.608379076467827] },
+      { kind: 'reparent', u: [0.0625, 0.3475193327758461, 0.35416666666666663, 0.9471577857621014, 0.6461046554613858, 0.49814249901100993, 0.31486722477711737, 0.9499714151024818] },
       { kind: 'prefabEdit', u: [0.4120011862833053, 0.9537779504898936, 0.4036154255736619, 0.43466546991840005, 0.38601681031286716, 0.2412711256183684, 0.09834549622610211, 0.639129497576505], inner: [{ kind: 'addChild', u: [0.9393244939856231, 0.4576516943052411, 0.23018345166929066, 0.40157105633988976, 0.16762143652886152, 0.2843701737001538, 0.8595813701394945, 0.24596478277817369] }, { kind: 'instantiate', u: [0.22026996384374797, 0.12059283978305757, 0.2941668222192675, 0.4091447307728231, 0.13556098844856024, 0.8536935087759048, 0.814816486556083, 0.3400204873178154] }, { kind: 'redo', u: [0.24725748295895755, 0.28348000324331224, 0.7228020506445318, 0.9703174650203437, 0.8350812348071486, 0.5344295417889953, 0.8794529172591865, 0.5522513668984175] }, { kind: 'editField', u: [0.6509293727576733, 0.7839175323024392, 0.7955678380094469, 0.42464192933402956, 0.6151037919335067, 0.8330991917755455, 0.19254334270954132, 0.9538525966927409] }] },
-      { kind: 'apply', u: [0.31004549586214125, 0.3223990136757493, 0.25569736980833113, 0.6923409083392471, 0.5388481102418154, 0.8259633409325033, 0.9307957089040428, 0.3583616646938026] },
+      { kind: 'apply', u: [0.8500000000000001, 0.3223990136757493, 0.25569736980833113, 0.6923409083392471, 0.5388481102418154, 0.8259633409325033, 0.9307957089040428, 0.3583616646938026] },
     ];
     const { res, held } = await uncounted(async () => {
       const before = seen.ownHeld;
-      const r = await runOps(be, ops, STRICT);
+      // #1947 re-pinned: the draws above remapped to the targets they picked before a placed instance went last, under the
+      // run tag they were recorded with (`RunOpts.runTag`).
+      const r = await runOps(be, ops, { ...STRICT, runTag: 0x081500c20000 });
       return { res: r, held: seen.ownHeld - before };
     });
     expect(res.failure, `${res.failure?.check}: ${res.failure?.detail}`).toBeUndefined();

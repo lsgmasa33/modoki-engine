@@ -38,12 +38,12 @@ import { createWorld, type Entity, type World } from 'koota';
 import { storedInstances } from '../../../packages/modoki/src/runtime/prefab/instanceStore';
 import type { InstanceRecord, ParsedInstance, SceneOwnedNode } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { capturedEntryOf, editorPrefabReader } from '../../../packages/modoki/src/editor/instance/instanceSync';
-import { allStoredRoots, guidOfEntity, instanceKeyMap, outermostStoredRoot, storedRootsUnder } from '../../../packages/modoki/src/editor/instance/instanceKeys';
+import { allStoredRoots, guidOfEntity, outermostStoredRoot, storedRootsUnder } from '../../../packages/modoki/src/editor/instance/instanceKeys';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { withFrameRecords } from '../../../packages/modoki/src/editor/scene/prefabRebuild';
 import type { ExpansionReader } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import type { InstanceEntry } from '../../../packages/modoki/src/editor/scene/instanceEntry';
-import { serializeInstanceRecord, type MemberIdentity } from '../../../packages/modoki/src/runtime/prefab/serializeInstanceRecord';
+import { serializeInstanceRecord } from '../../../packages/modoki/src/runtime/prefab/serializeInstanceRecord';
 import { parseInstanceRecord } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { recordsOf } from '../../../packages/modoki/src/runtime/prefab/instanceLoad';
 import { INSTANCE_MODEL_SCENE_VERSION, SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
@@ -52,6 +52,7 @@ import { s4Seams } from './s4Seams';
 import { findEntityById } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { clearOverrideMarks, getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { instantiatePrefabIntoWorld, settleEntryRows, entryRowsOf } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
+import { identityOf } from '../../../packages/modoki/src/editor/instance/instanceReproject';
 import { keptStateOf, restoreKeptState } from '../../../packages/modoki/src/runtime/core/ecs/keptOrphanRows';
 import { damagedPrefabReason, forgetDamagedPrefab } from '../../../packages/modoki/src/runtime/core/damagedPrefabs';
 import { rowPlaceholderOf, unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
@@ -62,16 +63,6 @@ import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templat
 export const s5Seen = { projected: 0, nestedWithOwner: 0, rootPlacementMarks: 0 };
 const PLACEMENT_MARKS = ['name', 'sortOrder', 'editorFolder', 'sourceScene'].map((f) => `EntityAttributes.${f}`);
 
-
-/** The present members of record-owning root `rootId`, by key: the identity the writer pins (§ 2.7). */
-function identityOf(rootId: number): MemberIdentity {
-  const out = new Map<string, { guid: string }>();
-  for (const [id, key] of instanceKeyMap(rootId)) {
-    const guid = key === '/' ? '' : guidOfEntity(id);
-    if (guid) out.set(key, { guid });
-  }
-  return out;
-}
 
 /** `rec` written as a v20 entry. `parsed`: the capture's parse of the same instance, for its scene-owned content;
  *  `byGuid`: every capture parse of the tree, for a reference node inside that content. */

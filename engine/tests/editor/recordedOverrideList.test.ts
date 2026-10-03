@@ -27,10 +27,16 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { setActionCallback, pushAction, clearHistory, writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo } from '@modoki/engine/editor';
-import { pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { pasteTraitValuesWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, addTraitToEntitiesWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { undo, redo, _setUndoClock } from '../../packages/modoki/src/editor/undo/undoManager';
 import { inFieldGesture } from '../../packages/modoki/src/editor/undo/fieldGesture';
 import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
+import { makeLiveFieldEditAction } from '../../packages/modoki/src/editor/undo/overrideMarkWrites';
+import { buildTransformUndoAction } from '../../packages/modoki/src/editor/scene/gizmoUndo';
+import { instanceTargetOf } from '../../packages/modoki/src/editor/instance/instanceKeys';
+import * as instanceEdits from '../../packages/modoki/src/editor/instance/instanceEdits';
+import { freshInstanceRecord, storedInstance } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { writeUIHandleValues, commitUIHandleDrag } from '../../packages/modoki/src/editor/scene/uiHandleCommit';
@@ -342,5 +348,93 @@ describe('F7: every instance records its root sortOrder, Unity\'s rootOrder (#19
     expect(field(rootId(), 'EntityAttributes', 'sortOrder')).toBe(7); // precondition: the root shows the template's order
     await reloadUnder(await saved(), (d) => { (d.entities[0]!.traits.EntityAttributes as Record<string, unknown>).sortOrder = 2; });
     expect(field(rootId(), 'EntityAttributes', 'sortOrder')).toBe(7);
+  });
+});
+
+// #1941 (#2046 S7.2, rule 8): a REDO puts back the rows and marks its forward step left, recomputing nothing (Unity's redo
+// restores the state it recorded). Each case moves the base onto the forward's value between the undo and the redo, the
+// one change that tells a restored record from a re-derived one, then moves the template again: a restored record holds.
+// From the reference build of #1941 (10594bfbe); site 4 (duplicate and paste) lands with S7 step 4.
+describe('a redo puts back what its forward step left, after the base moved (#1941)', () => {
+  const recordedOn = (id: number, key: string) => !!getOverrideMarkSet(findEntity(id)!)?.has(key);
+  const bTf = (d: ReturnType<typeof baseDoc>) => tfOf(d, 2);
+
+  // Mutation: `writeTraitFieldsPerEntityWithUndo`'s redo re-records by diff (`writeMany`) — red.
+  it('Paste Component Values: the pasted x stays the instance\'s own', async () => {
+    pasteTraitValuesWithUndo([member('B')], meta('Transform'), { x: 4 });
+    expect(recordedOn(member('B'), 'Transform.x')).toBe(true);
+    await undo();
+    await reloadUnder(await saved(), (d) => { bTf(d).x = 4; });
+    await redo();
+    expect([field(member('B'), 'Transform', 'x'), recordedOn(member('B'), 'Transform.x')]).toEqual([4, true]);
+    await reloadUnder(await saved(), (d) => { bTf(d).x = 8; });
+    expect(field(member('B'), 'Transform', 'x')).toBe(4);
+  });
+
+  // Mutation: Add Component's redo goes through the door again (`addComponent` + `recordOverridesByDiff`) — red.
+  it('Add Component: the added component stays the instance\'s own once the template gives it the same values', async () => {
+    expect(addTraitToEntitiesWithUndo([member('B')], meta('Rotate3D'), { axis: 'z', speed: 5 })).toBeNull();
+    await undo();
+    await reloadUnder(await saved(), (d) => { (d.entities[2]!.traits as Record<string, unknown>).Rotate3D = { axis: 'z', speed: 5 }; });
+    await redo();
+    expect(recordedOn(member('B'), 'Rotate3D.speed')).toBe(true);
+    await reloadUnder(await saved(), (d) => { (d.entities[2]!.traits as Record<string, unknown>).Rotate3D = { axis: 'x', speed: 7 }; });
+    expect([field(member('B'), 'Rotate3D', 'axis'), field(member('B'), 'Rotate3D', 'speed')]).toEqual(['z', 5]);
+  });
+
+  // The collider points' commit (`makeLiveFieldEditAction`), driven on a field the fixture has. Mutation: its redo
+  // re-records (`markOverrideIfInstance` in place of putting back the after-side's marks and rows) — red.
+  it('a live-set field edit (the collider points\' commit): the edited value stays the instance\'s own', async () => {
+    const action = makeLiveFieldEditAction(member('B'), 'Transform', 'x', (id, v: number) => writeTraitField(id, meta('Transform'), 'x', v), 0, 4, 'Edit x');
+    expect(recordedOn(member('B'), 'Transform.x')).toBe(true);
+    action.undo();
+    await reloadUnder(await saved(), (d) => { bTf(d).x = 4; });
+    action.redo();
+    expect(recordedOn(member('B'), 'Transform.x')).toBe(true);
+    await reloadUnder(await saved(), (d) => { bTf(d).x = 8; });
+    expect(field(member('B'), 'Transform', 'x')).toBe(4);
+  });
+});
+
+// #2046 S7.2 (rule 8): the two drag commits that write live and record at their end put back each side's EXACT rows, and
+// their undo and redo leave the records fresh (`maintainsRecords`).
+describe('a drag commit\'s undo and redo restore the exact rows (#2046 S7.2)', () => {
+  const stored = () => storedInstance(getCurrentWorld(), ROOT1);
+  /** The row now, read WITHOUT a re-seed: a stale record reads as none. */
+  const rowOf = (id: number) => { const t = instanceTargetOf(id); if (t?.kind !== 'member') throw new Error(`${id} is no instance member`); const key = t.key; return structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT1)?.list.rows.get(key)); };
+  /** The row before the gesture, through the door (which re-seeds a record the load left stale, as the writer does). */
+  const rowFirst = (id: number) => structuredClone(instanceEdits.rowsOf([id])![0]!.row);
+
+  // Mutation: drop `maintainsRecords` from `commitUIHandleDrag`'s entry — the undo leaves the records stale.
+  it('a UI handle drag', async () => {
+    const u = member('U');
+    const was = rowFirst(u);
+    const before = { ...(readTraitData(u, meta('UIElement')) as Record<string, unknown>) };
+    writeUIHandleValues(u, 'UIElement', { height: 70 });
+    commitUIHandleDrag(u, 'UIElement', before, { ...(readTraitData(u, meta('UIElement')) as Record<string, unknown>) }, 'drag');
+    const left = rowOf(u);
+    expect(left).not.toEqual(was);
+    await undo();
+    expect([stale(), rowOf(member('U'))]).toEqual([undefined, was]);
+    await redo();
+    expect([stale(), rowOf(member('U'))]).toEqual([undefined, left]);
+    function stale() { return stored()?.stale; }
+  });
+
+  // Mutation: drop `maintainsRecords` from `buildTransformUndoAction` — the undo leaves the records stale.
+  it('a gizmo drag', async () => {
+    const b = member('B');
+    const was = rowFirst(b);
+    writeTraitField(b, meta('Transform'), 'x', 5); // the drag's live frames
+    pushAction(buildTransformUndoAction({
+      label: 'drag', trait: meta('Transform').trait, resolve: () => member('B'), findEntity: (id) => findEntity(id) as never,
+      before: { x: 0 }, after: { x: 5 }, markFields: ['x'],
+    }));
+    const left = rowOf(b);
+    expect(left?.traits?.Transform).toEqual({ x: 5 });
+    await undo();
+    expect([stored()?.stale, rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([undefined, was, 0]);
+    await redo();
+    expect([stored()?.stale, rowOf(member('B')), field(member('B'), 'Transform', 'x')]).toEqual([undefined, left, 5]);
   });
 });

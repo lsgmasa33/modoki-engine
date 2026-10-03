@@ -38,7 +38,7 @@ import { isGuid } from '../../runtime/core/assetRefRules';
 import { markUIDirty } from '../../runtime/core/uiDirty';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { staleAround } from '../../runtime/prefab/instanceStore';
+import { markStale } from '../../runtime/prefab/instanceStore';
 
 export interface PrefabReimportReport {
   /** Each path whose file document both caches now hold, its instances rebased onto it. */
@@ -74,6 +74,9 @@ async function reimportPrefabsInPlaceUnmarked(paths: readonly string[], opts: { 
     // A world replaced during the reads loaded its frames from these files itself: nothing here is left to rebase.
     if (opts.rebase === false || !sources.size || getCurrentWorld() !== world) return report;
     const names = new Map(getAllEntities().map((e) => [e.id, e]));
+    // A placeholder's re-expansion rebuilds its frame from the capture, or loads its entry anew: the records are left
+    // behind (#2001 S4). The rebase before it reprojected every fresh tree from its record (#2046 S7.3).
+    if (placeholdersOf(sources).length) markStale(getCurrentWorld(), 'outsideEdit');
     await reexpandPlaceholders(sources);
     for (const { entity: e, source } of placeholdersOf(sources)) {
       report.placeholders.push({ entity: e.name || String(e.id), ...(e.guid ? { guid: e.guid } : {}), source });
@@ -226,7 +229,11 @@ async function reimportOutsidePrefabChangesUnmarked(paths: readonly string[], op
   return { report, needsReload: leftover > 0 && !worldHasUnsavedEdits() };
 }
 
-// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
-// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
-export const reimportOutsidePrefabChanges = staleAround('outsideEdit', reimportOutsidePrefabChangesUnmarked);
-export const reimportPrefabsInPlace = staleAround('outsideEdit', reimportPrefabsInPlaceUnmarked);
+/** `fn`, marking the instance store stale only when it throws part-way: an outside change maintains the list otherwise —
+ *  its landing changes no record, its rebase reprojects each fresh tree from its record and marks what it rebuilt from
+ *  the capture, and a placeholder re-expansion marks itself (#2046 S7.3). */
+const staleOnThrow = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+  try { return await fn(...args); } catch (err) { markStale(getCurrentWorld(), 'outsideEdit'); throw err; }
+};
+export const reimportOutsidePrefabChanges = staleOnThrow(reimportOutsidePrefabChangesUnmarked);
+export const reimportPrefabsInPlace = staleOnThrow(reimportPrefabsInPlaceUnmarked);

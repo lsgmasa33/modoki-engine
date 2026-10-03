@@ -14,7 +14,9 @@
  *  computed key or a helper that takes the field name as a variable. It matches a literal `'sortOrder'` argument to
  *  a call named `writeTraitField`. False positives at landing: 3, all undo writes that then put a mark snapshot back
  *  (`restoreMarks` in reparentEntity and moveEntityToScene, `putMarkState(…, 'EntityAttributes', …)` in
- *  restorableSortOrderWrite); they are exempted by that call, not by name. */
+ *  restorableSortOrderWrite); they are exempted by that call, not by name. One more since #2046 S7 (#1947): the door's
+ *  `place` writes a new instance root's order live and seats it in the record's placement (`setInstanceRecord`), which is
+ *  that field's one home (§ 10.4) — no mark is the right state there, exempted by that call too. */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -37,10 +39,15 @@ function restoresMarks(call: ts.CallExpression): boolean {
   return callsTo(fn, 'restoreMarks', 'putMarkState').some((c) => enclosingFunction(c) === fn
     && (calleeName(c) === 'restoreMarks' || stringValueOf(c.arguments[1]) === 'EntityAttributes'));
 }
+/** Whether `call`'s own function seats an instance record (`setInstanceRecord`): the order lives in its placement. */
+function seatsRecord(call: ts.CallExpression): boolean {
+  const fn = enclosingFunction(call);
+  return !ts.isSourceFile(fn) && callsTo(fn, 'setInstanceRecord').some((c) => enclosingFunction(c) === fn);
+}
 function rawSortOrderWrites(code: string, label: string): string[] {
   return callsTo(parseSource(code, label), 'writeTraitField')
     .filter((call) => stringValueOf(call.arguments[2]) === 'sortOrder')
-    .filter((call) => !restoresMarks(call))
+    .filter((call) => !restoresMarks(call) && !seatsRecord(call))
     .map((call) => `${label}:${lineOf(call)}`);
 }
 
@@ -66,7 +73,9 @@ describe('editor sortOrder writes go through the marking writer (#1709)', () => 
       const undo = () => { writeTraitField(id, attrMeta, 'sortOrder', 1); restoreMarks(id, marks); };
       function edit() { writeTraitField(id, attrMeta, 'sortOrder', 2); const u = () => restoreMarks(id, marks); }
       const back = (id) => { writeTraitField(id, attrMeta, 'sortOrder', 3); putMarkState(id, 'EntityAttributes', s); };
-      const wrong = (id) => { writeTraitField(id, attrMeta, 'sortOrder', 4); putMarkState(id, 'Transform', s); };`;
-    expect(rawSortOrderWrites(src, 'x.ts')).toEqual(['x.ts:2', 'x.ts:5', 'x.ts:7', 'x.ts:9']);
+      const wrong = (id) => { writeTraitField(id, attrMeta, 'sortOrder', 4); putMarkState(id, 'Transform', s); };
+      function place(id) { writeTraitField(id, attrMeta, 'sortOrder', 6); setInstanceRecord(world, rec); }
+      function placeLater(id) { writeTraitField(id, attrMeta, 'sortOrder', 7); const later = () => setInstanceRecord(world, rec); }`;
+    expect(rawSortOrderWrites(src, 'x.ts')).toEqual(['x.ts:2', 'x.ts:5', 'x.ts:7', 'x.ts:9', 'x.ts:11']);
   });
 });

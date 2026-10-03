@@ -2009,9 +2009,12 @@ describe('#1781: a template reference node whose statement adds a component is n
     });
   }
 
-  it('#1914 R1: undoing a removal of a component T no longer adds restores it RECORDED, as a reload shows it', async () => {
-    // The removal's snapshot holds T's value unrecorded; once T drops the component the save writes it whole as an added
-    // component, which a reload records. Mutation: `restoreMarks` passes `recordAdded` false — the undo leaves it unmarked.
+  it('#1914 R1, as rule 8 restates it: undoing a removal of a component T no longer adds leaves it off, as a reload of the restored list shows it', async () => {
+    // The undo restores the exact list (#2046 S7.2; rule 8): the removal record comes off and nothing else is stated, so
+    // the fold, through a T that no longer adds the component, has none, and the live member shows none. Unity's undo
+    // restores its modifications list the same way. (Before S7 the undo re-derived the component from the snapshot and
+    // recorded it whole, `takeUnmarkedFromBase(recordAdded)`, D-8b.) Live and reload agree, which is R1's invariant.
+    // Mutation: drop the presence sync in `putRows` — the undo re-adds it live, and the reload drops it.
     install(sDoc(), qDoc(), pDoc(), withT({ overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }));
     await load(scene(O, [ROOT1]));
     removeTraitFromEntitiesWithUndo([named('M')[0]!.id], meta('UIFocusable'));
@@ -2019,13 +2022,10 @@ describe('#1781: a template reference node whose statement adds a component is n
     await rebaseStaleInstances();
     expect(focus('M')).toBeNull(); // precondition: T no longer adds it, and the scene removed it
     await undo();
-    const markOf = () => getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === named('M')[0]!.id)!);
-    expect(focus('M')?.focusOrder).toBe(3);
-    expect(markOf()?.has('UIFocusable.focusOrder')).toBe(true);
+    expect(focus('M')).toBeNull();
     const { scene: s } = await saved();
     await load(s);
-    expect(focus('M')?.focusOrder).toBe(3);
-    expect(markOf()?.has('UIFocusable.focusOrder')).toBe(true);
+    expect(focus('M')).toBeNull();
   });
 
   // #1804, the WRITER twin: a prefab-edit save of O measured T's frames against the bare documents too, so a no-edit save

@@ -22,13 +22,20 @@
 import type { World } from 'koota';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import type { Entity } from 'koota';
+import { findEntity, readTraitDataFull, writeTraitField } from '../../runtime/core/ecs/entityUtils';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { remapGuidValues } from '../../runtime/core/assetRefRules';
 import { soaSchema } from '../../runtime/core/ecs/traitSchema';
 import { ROTATION_MARKS } from '../../runtime/loaders/overrideMarks';
 import { foldInstance } from '../../runtime/prefab/foldInstance';
+import { rowAt } from '../../runtime/core/prefabRowAt';
 import { dropInstanceRecord, freshInstanceRecord, markStale, setInstanceRecord } from '../../runtime/prefab/instanceStore';
-import { ROOT_ROW_KEY, type InstanceRecord, type RowKey, type SceneTargetRecord } from '../../runtime/prefab/instanceRecord';
+import { ROOT_ROW_KEY, type InstanceRecord, type Placement, type RowKey, type SceneTargetRecord } from '../../runtime/prefab/instanceRecord';
+import { preV5NodeGuid } from '../../runtime/prefab/parseInstanceRecord';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
+import { nestedFrameMoves } from '../scene/prefabChain';
 import { valuesEqual } from '../scene/prefab';
 import { collectComparableTraits } from '../scene/prefabInstanceOverrides';
 import { guidOfEntity, instanceKeyMap, instanceTargetOf, outermostStoredRoot, storedRootsAbove, storedRootsUnder, type InstanceTarget } from './instanceKeys';
@@ -166,6 +173,90 @@ function putFieldRecordImpl(state: FieldRecordState): void {
   (rowOf(rec, state.key).traits ??= {})[state.trait] = clone(state.bag) as Bag;
 }
 
+// ── Undo of a list edit (#2046 S7 step 2) ─────────────────────────────────────────────────────────────────────────────
+
+/** One entity's row as a step found it (rule 8): the whole row its key names in its record, and the record's placement
+ *  when the entity is the record's root (its name, order and folder live there, § 10.4). */
+export interface RowSnap { rootGuid: string; key: RowKey; row: SceneTargetRecord | undefined; placement?: Placement }
+
+/** The row of each of `entityIds` now, aligned with them (a stale record is re-seeded first); null for an entity that
+ *  is no instance member (a plain or scene-owned node, a Missing Prefab placeholder). */
+function rowsOfImpl(entityIds: readonly number[]): (RowSnap | null)[] {
+  return entityIds.map((id) => {
+    const t = instanceTargetOf(id);
+    if (!t || t.kind !== 'member') return null;
+    const rec = recordForWrite(t.rootId, t.rootGuid);
+    if (!rec) return null;
+    return {
+      rootGuid: t.rootGuid, key: t.key, row: clone(rec.list.rows.get(t.key)),
+      ...(t.key === ROOT_ROW_KEY ? { placement: clone(rec.placement) } : {}),
+    };
+  });
+}
+
+/** {@link rowsOfImpl}, or null when an entity's record is not fresh ALREADY: for a step whose live write ran before it read
+ *  its rows (a drag commit — the drag wrote live as it went). A re-seed there captures the dragged values, so the before
+ *  side would state the value the undo takes back (#2046 S7 close-out review F1); such a step does not maintain the
+ *  records (`putFieldRows` with no rows marks them stale). */
+function priorRowsOfImpl(entityIds: readonly number[]): (RowSnap | null)[] | null {
+  const world = getCurrentWorld();
+  for (const id of entityIds) {
+    const t = instanceTargetOf(id);
+    if (t?.kind === 'member' && !freshInstanceRecord(world, t.rootGuid)) return null;
+  }
+  return rowsOfImpl(entityIds);
+}
+
+/**
+ * Put back each row EXACTLY as a step found it ({@link rowsOf}; rule 8 — nothing re-derived, D-8a/D-8b), then bring
+ * `trait` on the live entity to what the list says, the fold of the record through the CURRENT template's every layer:
+ * - `fields`: a field the row does not record shows the fold's value (owner ruling on #1800: Unity shows the current
+ *   asset's value for a field the instance does not override); a recorded field keeps the value the step's write put.
+ * - `'all'` (a step that put a whole component on or took it off): the component is live exactly when the fold has it,
+ *   and every field it has follows the rule above. Undoing a removal of a component the template no longer gives the
+ *   member leaves it off, as a reload of the restored list shows it and as Unity's undo does (this replaced #1914 R1's
+ *   "comes back recorded", which was D-8b's re-derivation, `takeUnmarkedFromBase(recordAdded)`).
+ * Call it AFTER the step's live writes. Returns false when a row could not be put (its record cannot be had) or has no
+ * fold to show (its prefab cannot be read): the caller's step did not maintain the records.
+ */
+function putRowsImpl(entityIds: readonly number[], snaps: readonly (RowSnap | null)[], trait: string, fields: readonly string[] | 'all'): boolean {
+  const meta = getTraitByName(trait);
+  let all = true;
+  entityIds.forEach((id, i) => {
+    const snap = snaps[i];
+    if (!snap) return;
+    const rootId = guidRoot(snap.rootGuid);
+    const rec = rootId ? recordForWrite(rootId, snap.rootGuid) : null;
+    if (!rec) { all = false; return; }
+    if (snap.row) rec.list.rows.set(snap.key, clone(snap.row)); else rec.list.rows.delete(snap.key);
+    if (snap.placement) rec.placement = clone(snap.placement);
+    const e = findEntity(id);
+    if (!meta || !e || (fields !== 'all' && (meta.category === 'tag' || !e.has(meta.trait)))) return;
+    // A record whose prefab cannot be read has no fold to show: the caller takes the base the marks name instead.
+    if (!('doc' in editorPrefabReader(rec.source))) { all = false; return; }
+    const node = foldInstance(editorPrefabReader, rec).nodes.get(snap.key);
+    if (!node) return; // the list puts the member nowhere (removed): a structural step's own projection
+    const folded = node.traits[trait];
+    if (fields === 'all') {
+      if (folded === undefined) { if (e.has(meta.trait)) e.remove(meta.trait); return; }
+      if (!e.has(meta.trait)) e.add(meta.trait(meta.category === 'tag' ? undefined : clone(folded === true ? {} : folded) as Bag));
+      if (meta.category === 'tag') return;
+    }
+    if (folded === undefined || folded === true) return;
+    const stated = snap.row?.traits?.[trait];
+    const placed = snap.key === ROOT_ROW_KEY && trait === 'EntityAttributes';
+    for (const f of fields === 'all' ? Object.keys(collectComparableTraits(id, [meta])[meta.name] ?? {}) : fields) {
+      if (stated === true || (stated && (stated as Bag)[f] !== undefined)) continue;
+      if (placed && ROOT_PLACEMENT_FIELDS.has(f)) continue; // the placement states it, and the write put it live
+      if (trait === 'EntityAttributes' && NODE_IDENTITY_FIELDS.has(f)) continue;
+      const v = f in folded ? (folded as Bag)[f] : schemaDefault(meta, f);
+      const live = readTraitDataFull(id, meta)?.[f];
+      if (!valuesEqual(live, v)) writeTraitField(id, meta, f, clone(v));
+    }
+  });
+  return all;
+}
+
 // ── Components ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -284,19 +375,43 @@ function placementParent(rootId: number): string {
  * of another instance, that node's `own` links it (§ 2.5; review § Census: "a prefab drop on a member appends to the
  * anchor's own").
  */
-function placeImpl(rootId: number, world: World = getCurrentWorld()): void {
+function placeImpl(rootId: number, opts: { sortOrder?: number } = {}, world: World = getCurrentWorld()): void {
   const ea = getTraitByName('EntityAttributes'), pi = getTraitByName('PrefabInstance');
   const e = findEntity(rootId);
   if (!ea || !pi || !e || !e.has(pi.trait)) return;
   const attrs = e.get(ea.trait) as { guid?: string; name?: string; sortOrder?: number; editorFolder?: string; parentId?: number };
   const source = (e.get(pi.trait) as { source?: string }).source ?? '';
   if (!attrs.guid || !source) return;
+  // #1947: last among its siblings, as Unity appends a placed instance — not its template root's own order, which ties
+  // with every sibling at it (usually 0) and sorted by its fresh guid. A redo puts back the order it recorded (`opts`,
+  // #1941's rule), not a new end. Written live without a mark: the placement below states it (§ 10.4: one home each).
+  const sortOrder = opts.sortOrder ?? endOrderUnder(attrs.parentId ?? 0, rootId);
+  if (attrs.sortOrder !== sortOrder) writeTraitField(rootId, ea, 'sortOrder', sortOrder);
+  // Its members' identity pinned as they are (§ 3.2: "identity pins = the current guids"), as the first save writes them:
+  // a pin is kept verbatim once the template drops its member (rule 5), and an unpinned record lost it (hunt seed 8268).
+  const rows = new Map<RowKey, SceneTargetRecord>();
+  for (const [id, key] of memberRowsToWrite(rootId)) {
+    const m = findEntity(id)?.get(ea.trait) as { guid?: string; name?: string } | undefined;
+    if (m?.guid) rows.set(key as RowKey, { guid: m.guid, ...(m.name !== undefined ? { name: m.name } : {}) });
+  }
   setInstanceRecord(world, {
     rootGuid: attrs.guid, source,
-    placement: { parent: placementParent(rootId), sortOrder: attrs.sortOrder ?? 0, name: attrs.name ?? '', ...(attrs.editorFolder ? { editorFolder: attrs.editorFolder } : {}) },
-    list: { rows: new Map() }, held: {},
+    placement: { parent: placementParent(rootId), sortOrder, name: attrs.name ?? '', ...(attrs.editorFolder ? { editorFolder: attrs.editorFolder } : {}) },
+    list: { rows }, held: {},
   });
   addChild(rootId);
+}
+
+/** One past the highest order among the children of `parentId` other than `selfId`; 0 for none. */
+function endOrderUnder(parentId: number, selfId: number): number {
+  const ea = getTraitByName('EntityAttributes')!;
+  let max = -1;
+  for (const e of getCurrentWorld().query(ea.trait)) {
+    if (e.id() === selfId) continue;
+    const a = e.get(ea.trait) as { parentId?: number; sortOrder?: number };
+    if ((a.parentId ?? 0) === parentId && typeof a.sortOrder === 'number' && a.sortOrder > max) max = a.sortOrder;
+  }
+  return max + 1;
 }
 
 /** `addChild`: entity `childId` (a new plain node, a copy, or a stored root) now hangs at its live parent. When that
@@ -340,7 +455,7 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
   const top = entityIds.filter((id) => { for (let p = parentOf(id), n = 0; p && n < 1024; p = parentOf(p), n++) if (set.has(p)) return false; return true; });
   // What each top's commit does, read now (before the delete): data, applied in one pass below.
   type Item =
-    | { kind: 'member'; rec: InstanceRecord; key: RowKey; underKeys: Set<RowKey>; nested: string[] }
+    | { kind: 'member'; rec: InstanceRecord; key: RowKey; underKeys: Set<RowKey>; gone: Set<string>; nested: string[] }
     | { kind: 'unlink'; at: ReturnType<typeof linkAt>; rec: InstanceRecord | null; guid: string; nested: string[] };
   const items: Item[] = [];
   for (const id of top) {
@@ -351,7 +466,7 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
       if (!rec) continue;
       // Member keys are FLAT within a frame (§ 2.1): the member's descendants are found in the live tree, before the
       // delete, as every keyed node of its instance under it; a frame they open keys its rows under their own key.
-      items.push({ kind: 'member', rec, key: t.key, underKeys: keyedSubtree(t.rootId, id), nested });
+      items.push({ kind: 'member', rec, key: t.key, underKeys: keyedSubtree(t.rootId, id), gone: liveGuidsUnder(id), nested });
       continue;
     }
     // An instance's own root, a scene-owned node, or a plain entity: unlink from the instance it hangs in, if any.
@@ -361,14 +476,39 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
   return () => {
     for (const item of items) {
       if (item.kind === 'member') {
-        const { rec, key, underKeys } = item;
+        const { rec, key, underKeys, gone } = item;
         const under = (k: RowKey) => underKeys.has(k) || [...underKeys].some((u) => k.startsWith(`${u}/`));
         rowOf(rec, key).removed = true;
-        for (const k of [...rec.list.rows.keys()]) if (under(k) && rec.list.rows.get(k)!.own) { delete rec.list.rows.get(k)!.own; tidy(rec, k); }
+        // Only the links of the nodes that go WITH it: a link the record holds for a node that is not live (its anchor
+        // dropped from the template, kept as an R2 orphan) names nothing this delete removed (I23; hunt seed 178).
+        for (const k of [...rec.list.rows.keys()]) {
+          const row = rec.list.rows.get(k)!;
+          if (!under(k) || !row.own) continue;
+          const kept = row.own.filter((o) => !gone.has(o.guid));
+          if (kept.length) row.own = kept;
+          else delete row.own;
+          tidy(rec, k);
+        }
       } else if (item.at && item.rec && item.guid) unlink(item.rec, item.at.key, item.guid);
       for (const g of item.nested) dropInstanceRecord(world, g);
     }
   };
+}
+
+/** The guid of every live entity in the subtree at `entityId`, itself included: what a delete of it takes. */
+function liveGuidsUnder(entityId: number): Set<string> {
+  const ea = getTraitByName('EntityAttributes')!;
+  const all = getCurrentWorld().entities as Iterable<Entity>;
+  const parent = new Map<number, number>();
+  const guid = new Map<number, string>();
+  for (const e of all) {
+    const a = e.get(ea.trait) as { parentId?: number; guid?: string } | undefined;
+    parent.set(e.id(), a?.parentId ?? 0);
+    if (a?.guid) guid.set(e.id(), a.guid);
+  }
+  const out = new Set<string>();
+  for (const [id, g] of guid) for (let a = id, n = 0; a && n < 1024; a = parent.get(a) ?? 0, n++) if (a === entityId) { out.add(g); break; }
+  return out;
 }
 
 /** The keys of every keyed node of the instance at `rootId` (`instanceKeyMap`) inside the live subtree at `entityId`,
@@ -476,6 +616,233 @@ function afterCopyImpl(copyId: number, world: World = getCurrentWorld()): void {
   addChild(copyId, world);
 }
 
+// ── Copy, on records (#2046 S7.4, D-8c; § 3.2's duplicate/paste row) ─────────────────────────────────────────────────
+
+/** Is `held` empty: nothing the parse could not interpret, no kept node? */
+function heldIsEmpty(held: object | undefined): boolean {
+  return Object.values(held ?? {}).every((v) => v == null || (v instanceof Map ? v.size === 0 : typeof v === 'object' && !Object.keys(v as object).length));
+}
+
+/**
+ * The records a copy of the subtree at `entityId` carries, read BEFORE the copy: every record-owning stored root at or
+ * under it, fresh, by root guid. Null when a copy could not restate one exactly, and the copy keeps `afterCopy`'s stale
+ * path: a MEMBER copied (#1756's link rules decide what it becomes), a root with no record, held data (a kept orphan, a
+ * value the parse could not interpret), or a record not every part of which the fold uses (an R2 orphan names a guid the
+ * source keeps).
+ */
+function copyRecordsOfImpl(entityId: number, world: World = getCurrentWorld()): Map<string, InstanceRecord> | null {
+  const t = instanceTargetOf(entityId);
+  if (t?.kind === 'member' && t.key !== ROOT_ROW_KEY) return null;
+  const out = new Map<string, InstanceRecord>();
+  for (const r of storedRootsUnder(entityId)) {
+    const g = guidOfEntity(r);
+    const rec = g ? recordForWrite(r, g, world) : null;
+    if (!rec || !heldIsEmpty(rec.held) || foldInstance(editorPrefabReader, rec).unused.length) return null;
+    out.set(g, clone(rec));
+  }
+  return out;
+}
+
+/**
+ * Seat `records` ({@link copyRecordsOf}'s) for the copy just spawned at `copyId`, then link it where it hangs (`addChild`):
+ * each record under its copy's root guid (`remap`: a source guid → the copy's, the copy plan's), its `own` links and its
+ * identity pins remapped the same way, and its placement the live copy's. False, with the enclosing records marked stale as `afterCopy` marks them, when a
+ * copied root is not live.
+ */
+function seatCopyImpl(records: ReadonlyMap<string, InstanceRecord>, remap: ReadonlyMap<string, string>, copyId: number, world: World = getCurrentWorld()): boolean {
+  const ea = getTraitByName('EntityAttributes')!;
+  const seated: InstanceRecord[] = [];
+  for (const [g, src] of records) {
+    const to = remap.get(g);
+    const id = to ? findEntityByGuid(to, world)?.id() : undefined;
+    const attrs = id ? findEntity(id)?.get(ea.trait) as { name?: string; sortOrder?: number; editorFolder?: string; sourceScene?: string } | undefined : undefined;
+    // A link, or a pin, naming a node the copy does not hold would be a second claimant of the source's node.
+    const unmapped = [...src.list.rows.values()].some((row) => row.own?.some((o) => !remap.has(o.guid)) || (row.guid !== undefined && !remap.has(row.guid)));
+    if (!to || !id || !attrs || unmapped) {
+      markStale(world, 'duplicateInstance', storedRootsAbove(copyId).map(guidOfEntity));
+      return false;
+    }
+    const rec = clone(src);
+    rec.rootGuid = to;
+    // The live copy's placement: its parent, its fresh order, the scene it was pasted into (`adoptParentScene`).
+    rec.placement = {
+      ...rec.placement, parent: placementParent(id), sortOrder: attrs.sortOrder ?? 0, name: attrs.name ?? rec.placement.name,
+      ...(attrs.editorFolder ? { editorFolder: attrs.editorFolder } : {}), ...(attrs.sourceScene ? { sourceScene: attrs.sourceScene } : {}),
+    };
+    if (!attrs.editorFolder) delete rec.placement.editorFolder;
+    if (!attrs.sourceScene) delete rec.placement.sourceScene;
+    for (const [k, row] of [...rec.list.rows]) {
+      // The pin follows the copy (rule 5: a pin is identity, kept verbatim even once the template drops its member).
+      if (row.guid !== undefined) row.guid = remap.get(row.guid)!;
+      // A value naming a node the copy holds follows the copy, as the copy's live values do (`copySnapshot`, #1338); a
+      // stated node guid (identity, a legacy field record) is the copy plan's to give, which derives it (hunt seed 8148).
+      if (row.traits) {
+        row.traits = remapGuidValues(row.traits, remap) as typeof row.traits;
+        const ea = row.traits.EntityAttributes;
+        if (ea && ea !== true) for (const f of NODE_IDENTITY_FIELDS) delete (ea as Bag)[f];
+      }
+      if (row.parent !== undefined) row.parent = remap.get(row.parent) ?? row.parent;
+      if (row.own) row.own = row.own.map((o) => ({ ...o, guid: remap.get(o.guid) ?? o.guid }));
+      tidy(rec, k);
+    }
+    seated.push(rec);
+  }
+  // Every instance the copy holds is one of the seated: a node the copy plan made a root of its own has no record here.
+  const seatedGuids = new Set(seated.map((r) => r.rootGuid));
+  if (storedRootsUnder(copyId).some((r) => !seatedGuids.has(guidOfEntity(r)))) {
+    markStale(world, 'duplicateInstance', storedRootsAbove(copyId).map(guidOfEntity));
+    return false;
+  }
+  for (const rec of seated) setInstanceRecord(world, rec);
+  addChild(copyId, world);
+  return true;
+}
+
+// ── Revert ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** What a Revert needs of the frame it reverts in: the document its keys' localIds are read against. */
+export interface RevertFrame {
+  /** The frame root the keys are stated against (an instance root, or an owned nested frame's root). */
+  frameRoot: number;
+  /** That frame's document, and its guid. */
+  doc: { entities: ReadonlyArray<{ localId: number; nodeGuid?: string; traits?: Record<string, unknown> }>; rootLocalId?: number };
+  source: string;
+}
+
+/** A Revert's record edits, decided: the records they touched, by root guid, and the live root of the tree to
+ *  reproject. Null when no key named a record. */
+export interface RevertEdit {
+  /** Every record the Revert changed or dropped, by root guid. */
+  touched: string[];
+  /** The outermost live root of the instance tree. */
+  top: number;
+  /** What the Revert takes out, for the caller to report: the keys that named no record. */
+  unmatched: string[];
+}
+
+/**
+ * `revert`: take the selected keys' records OFF the list (§ 3.2's Revert row; Unity: Revert is one of the three acts
+ * that take a record off, rule 3). Each key names one record of the frame's owning record:
+ * - `<lid>.<T>.<f>`: the field record (rotation is one record, #1880 F5); on the instance root, `name`, `sortOrder` and
+ *   `editorFolder` are its placement (§ 10.4), which goes back to the prefab root's;
+ * - `+trait.<lid>.<T>`: the added component (or the restore of a layer's removal), whole;
+ * - `-trait.<lid>.<T>`: the component removal; the field records kept beside it apply again (G2);
+ * - `-removed.<lid>`: the member removal; the records on and under it apply again (rule 3: "reverting the deletion
+ *   brings it back as it was", § 10.4);
+ * - `~moved.<lid>` / `~moved.<chain>:<lid>`: the legacy move (`parent`);
+ * - `+added.<guid>`: the link of a node the scene added — the node itself is scene content and goes with it (a plain
+ *   delete, § 3.2), with the records of any instance inside it.
+ * The value a reverted record leaves is the FOLD's without it (§ 3.6): the enclosing rows' (#1492), and a returned
+ * member as every layer states it (#1730). A key that names no record of this list reverts nothing: it is the
+ * enclosing prefab's own statement, or not this instance's.
+ *
+ * Mutates the store only; the caller reprojects (`reprojectFromStore`). Keys are in localId form against `frame.doc`.
+ */
+export function revert(frame: RevertFrame, keys: ReadonlySet<string>, world: World = getCurrentWorld()): RevertEdit | null {
+  const ft = instanceTargetOf(frame.frameRoot);
+  if (!ft || ft.kind !== 'member') return null;
+  const top = storedRootsAbove(frame.frameRoot).filter((id) => !unresolvedRefOf(findEntity(id) as never)).at(-1) ?? ft.rootId;
+  // The whole tree's records fresh first (a re-seed states every record of it), then the frame's own.
+  if (!recordForWrite(top, guidOfEntity(top), world)) return null;
+  const rec = recordForWrite(ft.rootId, ft.rootGuid, world);
+  if (!rec) return null;
+  const rootLid = frame.doc.rootLocalId ?? 1;
+  const prefix = ft.key === ROOT_ROW_KEY ? '' : ft.key;
+  const keys2 = instanceKeyMap(ft.rootId);
+  const liveByLid = new Map<number, number>([[rootLid, frame.frameRoot]]);
+  for (const [id, row] of memberRowsIn(ft.rootId)) if (row.frameRoot === frame.frameRoot && row.rowLocalId) liveByLid.set(row.rowLocalId, id);
+  /** The row key of member `lid` of the frame: its live key, else the key its row's identity gives (§ 2.1). The frame
+   *  root's own lid is the frame's key. */
+  const keyOfLid = (lid: number): RowKey | null => {
+    const live = liveByLid.get(lid);
+    const liveKey = live !== undefined ? keys2.get(live) : undefined;
+    if (liveKey !== undefined) return liveKey;
+    // Not live, or a member of a pre-v5 document, which no live key names: its row's identity, as the parser derives it
+    // (§ 10.4b, `preV5NodeGuid`).
+    const row = rowAt(frame.doc.entities, lid);
+    if (!row) return null;
+    return `${prefix}/${row.nodeGuid || preV5NodeGuid(frame.source, lid)}`;
+  };
+  const touched = new Set<string>([ft.rootGuid]);
+  const unmatched: string[] = [];
+  const nested = keys.size && [...keys].some((k) => k.startsWith('~moved.') && k.includes(':')) ? nestedFrameMoves(frame.frameRoot) : [];
+  const ea = getTraitByName('EntityAttributes')!;
+  const parentOfId = (id: number) => ((findEntity(id)?.get(ea.trait) as { parentId?: number } | undefined)?.parentId ?? 0);
+  const templateRoot = rowAt(frame.doc.entities, rootLid)?.traits?.EntityAttributes as Bag | undefined;
+
+  const dropField = (r: InstanceRecord, key: RowKey, trait: string, field: string): boolean => {
+    const row = r.list.rows.get(key);
+    const bag = row?.traits?.[trait];
+    if (bag === undefined) return false;
+    if (bag === true) { delete row!.traits![trait]; tidy(r, key); return true; }
+    const fields = isRotation(trait, field) ? (ROTATION_MARKS as readonly string[]).map((m) => m.split('.')[1]!) : [field];
+    if (!fields.some((f) => (bag as Bag)[f] !== undefined)) return false;
+    // A component the base lacks is stated whole (an added one, § 2.5): its reverted field takes the schema default the
+    // fold fills in, and the last one taken takes the component with it, as the old Revert's reduced capture did.
+    for (const f of fields) delete (bag as Bag)[f];
+    tidy(r, key);
+    return true;
+  };
+
+  for (const k of keys) {
+    let hit = false;
+    if (k.startsWith('+added.')) {
+      const guid = k.slice('+added.'.length);
+      const id = findEntityByGuid(guid)?.id() ?? 0;
+      const at = id ? linkAt(parentOfId(id)) : null;
+      const owner = at ? recordForWrite(at.rootId, at.rootGuid, world) : null;
+      if (at && owner && owner.list.rows.get(at.key)?.own?.some((o) => o.guid === guid)) {
+        unlink(owner, at.key, guid);
+        touched.add(at.rootGuid);
+        for (const r of storedRootsUnder(id)) { const g = guidOfEntity(r); touched.add(g); dropInstanceRecord(world, g); }
+        hit = true;
+      }
+    } else if (k.startsWith('-removed.')) {
+      const key = keyOfLid(Number(k.slice('-removed.'.length)));
+      const row = key ? rec.list.rows.get(key) : undefined;
+      if (row?.removed === true) { delete row.removed; tidy(rec, key!); hit = true; }
+    } else if (k.startsWith('-trait.') || k.startsWith('+trait.')) {
+      const [kind, lidStr, trait] = k.split('.');
+      const key = keyOfLid(Number(lidStr));
+      const row = key ? rec.list.rows.get(key) : undefined;
+      if (row && trait) {
+        if (kind === '-trait' && row.traitRemovals?.[trait] === true) { delete row.traitRemovals[trait]; hit = true; }
+        if (kind === '+trait') {
+          if (row.traits?.[trait] !== undefined) { delete row.traits[trait]; hit = true; }
+          if (row.traitRemovals?.[trait] === false) { delete row.traitRemovals[trait]; hit = true; }
+        }
+        tidy(rec, key!);
+      }
+    } else if (k.startsWith('~moved.')) {
+      const rest = k.slice('~moved.'.length);
+      let target: { r: InstanceRecord; key: RowKey } | null = null;
+      if (rest.includes(':')) {
+        const m = nested.find((n) => n.key === k);
+        const t = m ? instanceTargetOf(m.memberEcs) : null;
+        const r = t?.kind === 'member' ? recordForWrite(t.rootId, t.rootGuid, world) : null;
+        if (t?.kind === 'member' && r) { target = { r, key: t.key }; touched.add(t.rootGuid); }
+      } else {
+        const key = keyOfLid(Number(rest));
+        if (key) target = { r: rec, key };
+      }
+      const row = target?.r.list.rows.get(target.key);
+      if (row?.parent !== undefined) { delete row.parent; tidy(target!.r, target!.key); hit = true; }
+    } else {
+      const [lidStr, trait, field] = k.split('.');
+      const lid = Number(lidStr);
+      const key = trait && field !== undefined ? keyOfLid(lid) : null;
+      if (key === ROOT_ROW_KEY && trait === 'EntityAttributes' && ROOT_PLACEMENT_FIELDS.has(field!)) {
+        // The root's default overrides (§ 10.4): its placement goes back to the prefab root's.
+        if (field === 'name' && typeof templateRoot?.name === 'string' && rec.placement.name !== templateRoot.name) { rec.placement.name = templateRoot.name; hit = true; }
+        if (field === 'sortOrder' && typeof templateRoot?.sortOrder === 'number' && rec.placement.sortOrder !== templateRoot.sortOrder) { rec.placement.sortOrder = templateRoot.sortOrder; hit = true; }
+        if (field === 'editorFolder' && rec.placement.editorFolder !== undefined) { delete rec.placement.editorFolder; hit = true; }
+      } else if (key) hit = dropField(rec, key, trait!, field!);
+    }
+    if (!hit) unmatched.push(k);
+  }
+  return { touched: [...touched], top, unmatched };
+}
+
 // ── The shield ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The door is a SHADOW at S4: it must never fail, or change, the gesture it records — the old path still saves. A
@@ -506,5 +873,10 @@ export const beginDelete = shielded('beginDelete', beginDeleteImpl, NOOP);
 export const beginReparent = shielded('beginReparent', beginReparentImpl, NOOP);
 export const prepare = shielded('prepare', prepareImpl, undefined);
 export const afterCopy = shielded('afterCopy', afterCopyImpl, undefined);
+export const copyRecordsOf = shielded('copyRecordsOf', copyRecordsOfImpl, null);
+export const seatCopy = shielded('seatCopy', seatCopyImpl, false);
 export const fieldRecordOf = shielded('fieldRecordOf', fieldRecordOfImpl, null);
 export const putFieldRecord = shielded('putFieldRecord', putFieldRecordImpl, undefined);
+export const rowsOf = shielded('rowsOf', rowsOfImpl, null);
+export const priorRowsOf = shielded('priorRowsOf', priorRowsOfImpl, null);
+export const putRows = shielded('putRows', putRowsImpl, false);

@@ -32,7 +32,7 @@ import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
-import { staleAround } from '../../runtime/prefab/instanceStore';
+import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
 
 /** Authored-world snapshot captured at the first pose of a session — primary, bases, and the scene
  *  key it belongs to (so a scene swap mid-preview can't revert the wrong scene). Captured and
@@ -477,6 +477,7 @@ onWorldSwap(() => {
 registerPosedWorldSource('a preview session is open', () => _snap !== null);
 registerPosedWorldSource('a preview restore is still landing', () => _restoresInFlight > 0);
 
-// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
-// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
-export const endTimelinePreviewSessionReporting = staleAround('stop', endTimelinePreviewSessionReportingUnmarked);
+// #2001 S4 (#2014): an exit that keeps the posed world leaves values no record states, so it marks the store stale once it
+// finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`). One that restored the authored
+// world does not (#2046 S7.6): the reload took back its exact records, or parsed fresh ones from the snapshot.
+export const endTimelinePreviewSessionReporting = staleAroundUnless('stop', endTimelinePreviewSessionReportingUnmarked, (out) => out.reverted);

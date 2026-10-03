@@ -4,7 +4,7 @@
 
 import { absenceIsRemoval } from '../../runtime/loaders/overrideFate';
 import { rowAt } from '../../runtime/core/prefabRowAt';
-import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { getOverrideMarkSet, restoreOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { placedAnchor, translateLocalIds, translateCarried } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -272,7 +272,15 @@ function finishTemplateReferenceNode(
   // The node's key before anything reads it: `keepsTemplateRows` and the climb out of the node (`templateFrameClimber`)
   // both ask it, and a Refresh respawns the node from a scene-form capture that carries none. The caller stamps it
   // anyway (`addedNodeIdentity`); after the capture was too late (#1541/#1542 close-out review).
-  if (!readOnly) addedNodeIdentity(ecsId, true);
+  if (!readOnly) {
+    // A scene-added reference node records its sibling order implicitly (F7), and the key stamped next makes it a
+    // template's copy, whose order is recorded like any field: so the order it records is stored as a mark first, or the
+    // row this writes leaves it out and the node goes back to its template root's order (#1947 placed one after a sibling).
+    const node = findEntity(ecsId);
+    const marked = node ? getOverrideMarkSet(node as never) : undefined;
+    if (node && marked?.has('EntityAttributes.sortOrder')) restoreOverrideMarks(node as never, ['EntityAttributes.sortOrder']);
+    addedNodeIdentity(ecsId, true);
+  }
   const ref = captureInstanceReference(ecsId, source, childPrefab, { template: true, readOnly });
   const rc = captureRowChannels(ecsId, source, childPrefab, ref, true, readOnly);
   const tokens = templateTokenizer(ecsId, filterAuthoringVisible(getAllEntities()), new Map(), new Map(), true);

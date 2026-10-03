@@ -46,17 +46,8 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabCommit', async (importOrig
 // The restore's path write goes through the adoption owner (#1698), which writes through `serialize.ts`'s own setter —
 // not the mocked export above — and that persists the path.
 vi.stubGlobal('localStorage', { setItem: () => {}, getItem: () => null, removeItem: () => {} });
-vi.mock('../../packages/modoki/src/editor/scene/prefabRebuild', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabRebuild')>();
-  return {
-    ...real,
-    // The restore rebases carried stale roots (#1483). In production the world restore re-expands the primary
-    // from the restored prefab, so the rebase finds nothing there; here `loadScene` is a no-op that leaves the
-    // primary built from the prefab being undone, and a real rebase would rebuild it — masking the
-    // `refreshBaseInstances` filter this file pins. No root here is carried, so the stub loses nothing.
-    rebaseStaleInstances: async () => 0,
-  };
-});
+// #2046 S7.3: the undo restores from records in place and its rebase reprojects every other instance from its own — the
+// real rebase, so the stub the snapshot reload's cases used (a no-op `loadScene` left the primary for it) is gone.
 vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/prefabApply')>();
   return {
@@ -73,8 +64,11 @@ vi.mock('../../packages/modoki/src/editor/scene/prefabApply', async (importOrigi
       install(kitAfter);
       const pi = getTraitByName('PrefabInstance')!;
       const roots = getAllEntities().filter((e) => (readTraitData(e.id, pi)?.rootInstanceId as number) === e.id && readTraitData(e.id, pi)?.source === KIT).map((e) => e.id);
+      // The instance applied FROM is named, as the real Apply names it (`appliedFrom`): it is rebuilt from its capture,
+      // every other one is reprojected from its record (#2046 S7.3).
       for (const id of roots) {
-        refreshInstances(KIT, [id], kitDoc as never, kitAfter as never);
+        const from = rootGuidOf(id) === ROOT ? [{ rootId: id, rootGuid: ROOT, fields: new Set<string>() }] : undefined;
+        refreshInstances(KIT, [id], kitDoc as never, kitAfter as never, new Map(), from);
       }
       return { applied: true, source: KIT, prefabBefore: kitDoc, prefabAfter: kitAfter, promotedAdditions: 0 };
     },
@@ -196,19 +190,18 @@ describe('Apply to Prefab on a base\'s instance (#1431)', () => {
     expect(isSceneDirty(BASE)).toBe(true);
   });
 
-  // Mutation: drop the `sourceScene` filter in `refreshBaseInstances` — the undo then re-derives the
-  // primary instances too, against a prefab the real restore did not build them from.
-  it('a PRIMARY instance dirties no base, and the undo leaves primary instances to the world restore', async () => {
+  // #2046 S7.3: the undo restores a primary instance from its records in place, as it does a base's — no world reload.
+  it('a PRIMARY instance dirties no base, and the undo restores it in place', async () => {
     await applyToPrefabWithUndo(rootId(), new Set(['+added.x']));
     expect(isSceneDirty(BASE)).toBe(false);
     await undo();
-    // The primary comes back from `sceneBefore` — mocked away here, so both stay as the apply left them.
-    expect(mine()).toHaveLength(0);
-    expect(promoted()).toHaveLength(2);
+    expect(mine()).toHaveLength(1);
+    expect(promoted()).toHaveLength(0);
+    expect(isSceneDirty(BASE)).toBe(false);
   });
 
-  // Mutation: drop `restoreBaseInstance` from the undo (or the redo) closure — the applied instance
-  // keeps its post-apply shape (no Mine) after undo, and the dirty base would be saved without it.
+  // Mutation (#2046 S7.3): drop `restoreRecords`' `restoreSide` — the applied instance keeps its post-apply shape (no
+  // Mine) after undo, and the dirty base would be saved without it (this case, the primary's and the minted-guid one).
   it('undo brings the promoted node back into the base instance, still base-owned; redo takes it away', async () => {
     stampAll(BASE);
     await applyToPrefabWithUndo(rootId(), new Set(['+added.x']));
@@ -225,10 +218,9 @@ describe('Apply to Prefab on a base\'s instance (#1431)', () => {
     expect(sourceOf(rootId())).toBe(BASE);
   });
 
-  // Mutation: drop `refreshBaseInstances` from the undo (or the redo) closure — the OTHER base
-  // instance keeps the member of the prefab being undone, which the dirty base's save would write
-  // as a structural diff against the restored prefab.
-  //   And: pass `{}` as the refresh's overrides — the other instance's OWN marked override is lost.
+  // Mutation (#2046 S7.3): drop `restoreRecords`' rebase — the OTHER base instance keeps the member of the prefab being
+  // undone, which the dirty base's save would write as a structural diff against the restored prefab (this case and the
+  // primary's). Its own override is kept by its record, which the reprojection reads.
   it('undo/redo re-derive the OTHER base instances of the prefab too, keeping their own overrides', async () => {
     stampAll(BASE);
     const slot2 = () => slotOf(ROOT2);

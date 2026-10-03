@@ -43,6 +43,7 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { captureAdoptionGate } from '../scene/adoptionGate';
 import { captureEntityIdentity, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { markStale } from '../../runtime/prefab/instanceStore';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
 import { firstAssetRoot } from './assetRoots';
@@ -835,6 +836,8 @@ async function createPrefab(
       // the settles, the marks) can still throw, and the keys are the file's by then — not a create that landed nothing.
       ({ guidRemap, undoKept, priorLinks, keys } = tagCreatedPrefab(id, landed.path, prefab, { unkeyed: unkeyed.ids(), onLinked: unkeyed.keep }));
     },
+    // The tag marks the records of the tree it links (#2046 S7.5); every other tree keeps its own.
+    maintainsRecords: true,
   });
   // Said to the human, as the agent's create says it (#1776): a failed write was a bare null, which both panels only
   // logged, so a Create Prefab that wrote nothing looked like one that did nothing.
@@ -885,13 +888,20 @@ async function createPrefab(
    *  so moving this line is a test failure, not a silent change. Only on a path that actually undoes —
    *  a refused file write leaves the tree
    *  tagged, and must leave the stamp with it. */
-  const unstamp = () => { undoKept(); undoKept = () => {}; unstampMemberGuids(guidRemap); };
+  const unstamp = () => {
+    undoKept(); undoKept = () => {};
+    // A record keyed or pinned by a guid the rename moves is the tree's: stale, so the next write re-seeds it (S7.5).
+    markStale(getCurrentWorld(), 'createPrefab', [...guidRemap.keys(), ...guidRemap.values()]);
+    unstampMemberGuids(guidRemap);
+  };
   const treeChangedRefusal = (why: string) => new UndoRefusedError(
     `"${prefab.name ?? savePath}" no longer describes the tree it was made from: ${why}. Nothing was written or linked.`,
     `The tree changed since it was saved as ${savePath.split('/').pop()} — nothing was redone`,
   );
   const action: UndoAction = {
     label,
+    // Each direction's tag, untag and relink mark the records of the tree they act on, and only those (#2046 S7.5).
+    maintainsRecords: true,
     // Both directions are ALL-OR-NOTHING: a file write is gated, and the
     // cache + the live tree's instance tagging only follow if it landed (#308). A CREATE's undo writes no file at all
     // (#1795: it unlinks and leaves the prefab), and its redo writes one only where the file was deleted since.
@@ -947,6 +957,7 @@ async function createPrefab(
       // (#1868 hub call e). Refused, before anything changes, when the editor holds another document than this Replace
       // left (a prefab-edit save since, an outside change) — the #1679 precondition, asked of memory.
       await parkPrefabChanges([{ source: guid, doc: restored(), from: prefab }], {
+        maintainsRecords: true, // the untag and relink mark the tree they act on (#2046 S7.5)
         rebuild: () => {
           unstamp();
           // By the document's own guid (#1807): the manifest can still map it to a renamed path an undo just moved back.
@@ -1047,10 +1058,10 @@ async function createPrefab(
         tagged = true;
       };
       if (replaced) {
-        await parkPrefabChanges([{ source: guid, doc: prefab, from: restored() }], { rebuild });
+        await parkPrefabChanges([{ source: guid, doc: prefab, from: restored() }], { rebuild, maintainsRecords: true });
         return;
       }
-      const committed = await commitPrefabWrite(savePath, prefab, { expected: null, bytes: content, rebuild });
+      const committed = await commitPrefabWrite(savePath, prefab, { expected: null, bytes: content, rebuild, maintainsRecords: true });
       if (committed.conflict) throw fileChangedRefusal([savePath]);
       if (!committed.ok) {
         reportUndoFailure({

@@ -27,6 +27,7 @@ import { getTraitByName } from '../core/ecs/traitRegistry';
 import { isStoredRoot } from '../core/assetRefRules';
 import { templateKeyOf } from '../core/templateIdentity';
 import { unresolvedRefOf } from '../core/unresolvedPrefabRef';
+import { onGuidRemap } from '../core/ecs/guidRemap';
 import type { InstanceRecord } from './instanceRecord';
 
 /** One stored instance. `stale` names the op that left the record unmaintained, until a re-seed clears it. */
@@ -108,15 +109,41 @@ function liveStoredRootGuids(world: World): string[] {
   return out;
 }
 
-/** `fn`, marking every record of the current world stale (`by`) once it has finished — returned, thrown or settled. For
- *  the ops S7 moves onto records (see the header): wrapped at their export, so no return path can skip the mark. The
- *  world read is the one current at the END, since an op can swap it (an Apply undo, a reload). */
+/** `fn`, marking every record of the current world stale (`by`) before it starts and once it has finished — returned,
+ *  thrown or settled. For the ops S7 moves onto records (see the header): wrapped at their export, so no return path can
+ *  skip the mark. Before, because a rebase inside the op reads the store (#2046 S7.3) and must not reproject from a
+ *  record the op is leaving behind; after, in the world current at the END, since an op can swap it (an Apply undo, a
+ *  reload). */
 export function staleAround<A extends unknown[], R>(by: string, fn: (...args: A) => R): (...args: A) => R {
+  return staleAroundUnless(by, fn, () => false);
+}
+
+/** {@link staleAround}, except that a finished op whose result `kept(out)` says the world it ends in holds the records it
+ *  must is not marked after: a reload of a world the editor held, whose load took back the exact lists (#2046 S7.6,
+ *  `recordBank.ts`) or parsed fresh ones from the text it loaded. A throw still marks. */
+export function staleAroundUnless<A extends unknown[], R>(by: string, fn: (...args: A) => R, kept: (out: Awaited<R>) => boolean): (...args: A) => R {
   return (...args: A): R => {
     let out: R;
-    try { out = fn(...args); } catch (err) { markStale(getCurrentWorld(), by); throw err; }
-    if (out instanceof Promise) return out.finally(() => markStale(getCurrentWorld(), by)) as R;
     markStale(getCurrentWorld(), by);
+    try { out = fn(...args); } catch (err) { markStale(getCurrentWorld(), by); throw err; }
+    if (out instanceof Promise) {
+      return out.then((v: Awaited<R>) => { if (!kept(v)) markStale(getCurrentWorld(), by); return v; },
+        (err: unknown) => { markStale(getCurrentWorld(), by); throw err; }) as R;
+    }
+    if (!kept(out as Awaited<R>)) markStale(getCurrentWorld(), by);
     return out;
   };
 }
+
+// A rename (`applyGuidRemap`) re-points every live ref to a renamed entity, and no record value: a record naming one — a
+// field value referring to the node, a pin, a link, its own root guid — no longer states what it did, so it goes stale
+// (#2046 S7 close-out review). Create Prefab's renames reach refs in OTHER trees, whose records S7.5 no longer marks.
+onGuidRemap('instanceStore', (remap, world) => {
+  const named: string[] = [];
+  for (const [g, s] of storeOf(world)) {
+    if (s.stale) continue;
+    const text = JSON.stringify(s.record, (_k, v: unknown) => v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v);
+    for (const from of remap.keys()) if (text.includes(from)) { named.push(g); break; }
+  }
+  if (named.length) markStale(world, 'guidRemap', named);
+});

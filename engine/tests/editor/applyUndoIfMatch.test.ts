@@ -96,7 +96,7 @@ vi.mock('../../packages/modoki/src/editor/scene/serialize', async (importOrigina
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, readTraitData, loadSceneFile, instantiatePrefabIntoWorld,
   destroyEntity, Transform, type SceneData,
 } from '@modoki/engine/runtime';
 import { setActionCallback, pushAction } from '@modoki/engine/editor';
@@ -331,7 +331,9 @@ describe('an Apply undo never touches the file route (#1868)', () => {
 
     expect(fs.posts).toHaveLength(writes);
     expect(boxInCache().x).toBe(0);
-    expect(sm.loads).toBe(loads + 1); // the world was rebuilt from the pre-Apply snapshot
+    // The instance is back from its records, in place (#2046 S7.3): its own x over the restored template's, no reload.
+    expect((readTraitData(box(), getTraitByName('Transform')!) as { x: number }).x).toBe(5);
+    expect(sm.loads).toBe(loads);
     expect(canRedo()).toBe(true);
     expect(toast).not.toHaveBeenCalled();
   });

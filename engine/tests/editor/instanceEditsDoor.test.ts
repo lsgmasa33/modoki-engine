@@ -21,10 +21,10 @@ import {
 } from '@modoki/engine/runtime';
 import { clearKeptMemberOrphans } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import {
-  setActionCallback, pushAction, clearHistory, undo, writeTraitFieldWithUndo, reparentEntity, duplicateEntity,
+  setActionCallback, pushAction, clearHistory, undo, redo, writeTraitFieldWithUndo, reparentEntity, duplicateEntity,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, createEntityWithUndo, deleteEntitiesWithUndo,
 } from '@modoki/engine/editor';
-import { pasteEntityCopy, snapshotEntity } from '../../packages/modoki/src/editor/undo/entityActions';
+import { clipEntity, pasteEntityCopy, snapshotEntity } from '../../packages/modoki/src/editor/undo/entityActions';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
 import { writeTraitField } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
@@ -288,7 +288,7 @@ describe('children (§ 2.5)', () => {
     createEntityWithUndo('Create', kid, [{ name: 'EntityAttributes', data: { name: 'Grand', parentId: kid } }, { name: 'Transform' }], () => {});
     expect(ownOf(key(2))).toEqual([guidOf(kid)]);
   });
-  // Mutation: drop `instanceEdits.afterCopy` in `duplicateEntity` / `pasteEntityCopy`.
+  // Mutation: drop `addChild` in `seatCopy` (the record path, #2046 S7.4) — and in `afterCopy`, the stale path.
   it('a duplicate of a scene-owned node is linked beside it', () => {
     const kid = createEntityWithUndo('Create', byName('A'), [{ name: 'EntityAttributes', data: { name: 'Kid', parentId: byName('A') } }, { name: 'Transform' }], () => {})!;
     const copy = duplicateEntity(kid, () => {})!;
@@ -477,8 +477,8 @@ describe('who owns a record', () => {
   });
 });
 
-// The door is a shadow at S4: a throw inside it (a parser or fold defect) must not fail the gesture. Mutation: export
-// `setFieldsImpl` unshielded — the write throws out of `writeTraitFieldWithUndo`.
+// A throw inside the door (a parser or fold defect) must not fail the gesture. Mutation: export `rowsOfImpl` unshielded —
+// the write throws out of `writeTraitFieldWithUndo` (since #2046 S7.2 the first door call a field write makes is `rowsOf`).
 describe('the shield: the door never fails a gesture', () => {
   it('a door that throws reports, marks the record stale, and the write and its undo still land', async () => {
     setInstanceRecord(getCurrentWorld(), { ...rec(), list: null as never });
@@ -486,23 +486,65 @@ describe('the shield: the door never fails a gesture', () => {
     try {
       expect(() => writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7)).not.toThrow();
       expect((readTraitData(byName('A'), meta('Transform')) as { x: number }).x).toBe(7);
-      expect(errors.mock.calls.some((c) => String(c[0]).includes('[instanceEdits] setFields threw'))).toBe(true);
-      expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('doorError');
+      expect(errors.mock.calls.some((c) => /^\[instanceEdits\] \w+ threw; the records are marked stale/.test(String(c[0])))).toBe(true);
       await undo();
       expect((readTraitData(byName('A'), meta('Transform')) as { x: number }).x).toBe(0);
     } finally { errors.mockRestore(); }
   });
 });
 
-describe('stale marks: the ops S7 has not moved yet', () => {
+describe('stale marks: an undo step that does not maintain the records', () => {
   // Mutation: drop `markStale` in `undoStep`.
-  it('an undo leaves every record stale, and the next door write re-seeds it from the capture first', async () => {
+  it('leaves every record stale, and the next door write re-seeds it from the capture first', async () => {
     writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7);
+    // An op S7 has not moved: its undo writes live state the records do not follow.
+    const a = byName('A');
+    pushAction({ label: 'raw', undo: () => writeTraitField(a, meta('Transform'), 'x', 0), redo: () => {} });
     await undo();
     expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('undo');
     writeTraitFieldWithUndo(byName('B'), meta('Transform'), 'x', 1);
-    expect(row(key(2))?.traits).toBeUndefined(); // the undone edit is gone: the re-seed read the live tree
+    // The re-seed read the live tree (the raw undo's x = 0, still marked), not the stored record's x = 7.
+    expect(row(key(2))?.traits).toEqual({ Transform: { x: 0 } });
     expect(row(key(3))?.traits?.Transform).toEqual({ x: 1 });
+  });
+});
+
+describe('a coalesced chain maintains the records only when both halves do', () => {
+  // Mutation: drop the flag merge in `pushAction`'s coalesce branch — the merged entry keeps the first half's flag, its
+  // redo (the second half's) leaves the records as they were, and the undo after it reads them as fresh.
+  it('a maintaining field write merged with a raw one leaves the records stale on undo', async () => {
+    const a = byName('A');
+    writeTraitFieldWithUndo(a, meta('Transform'), 'x', 7);
+    pushAction({ label: 'raw', undo: () => {}, redo: () => {}, coalesceKey: `field:${a}:Transform.x` });
+    await undo();
+    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBe('undo');
+  });
+});
+
+// #2046 S7.2 (rule 8): a field step's undo and redo put back the EXACT rows it found and left, and the records stay fresh.
+describe('undo of a field edit restores the exact list', () => {
+  // Mutation: drop `maintainsRecords` from `writeTraitFieldWithUndo`'s entry — the undo marks the records stale.
+  it('the undo leaves the record fresh with the row it found, the redo with the row it left', async () => {
+    writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7);
+    const left = structuredClone(row(key(2)));
+    await undo();
+    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
+    expect(row(key(2))).toBeUndefined();
+    await redo();
+    expect(storedInstance(getCurrentWorld(), ROOT1)?.stale).toBeUndefined();
+    expect(row(key(2))).toEqual(left);
+  });
+  // Mutation: `putRows` without its fold patch — the undo shows the value the field had before the edit (0), not the
+  // template's value now (#1800: Unity shows the current asset's value for a field the instance does not override).
+  it('a field the restored row does not record shows the fold\'s value now, not the value it had before', async () => {
+    writeTraitFieldWithUndo(byName('A'), meta('Transform'), 'x', 7);
+    // The template's x moves to 3 behind the step (as an Apply on another instance would).
+    const doc = pDoc();
+    (doc.entities.find((e) => e.localId === 2)!.traits.Transform as { x: number }).x = 3;
+    prefabs.set(P, doc); setPrefabCache(P, doc as never);
+    await undo();
+    expect(row(key(2))).toBeUndefined();
+    expect((readTraitData(byName('A'), meta('Transform')) as { x: number }).x).toBe(3);
   });
 });
 
@@ -522,3 +564,77 @@ describe('the save-time drift check (§ 10.2, review R3(b))', () => {
 });
 
 void readTraitData;
+
+// #2046 S7.4 (D-8c; § 3.2's duplicate/paste row): a copy of a whole instance carries the source's records — its list,
+// verbatim, under the copy's guid, placed where the copy is — and its redo (or a paste of a clipboard that outlived a
+// template change) rebuilds the copy from them onto the template's CURRENT document. Before, the copy's records were
+// marked stale and re-seeded from a capture, and a respawn was rebased from it.
+describe('a duplicate or paste of an instance carries its records (#2046 S7.4)', () => {
+  const kids = (id: number) => getAllEntities().filter((e) => e.parentId === id);
+  /** Member `name` under instance root `root` (the copy and the source both hold one). */
+  const memberOf = (root: number, name: string): number => {
+    const walk = (id: number): number | undefined => {
+      for (const k of kids(id)) { if (k.name === name) return k.id; const d = walk(k.id); if (d) return d; }
+      return undefined;
+    };
+    return walk(root)!;
+  };
+  const tfOf = (id: number) => readTraitData(id, meta('Transform')) as { x: number; y: number };
+  const recOf = (guid: string) => freshInstanceRecord(getCurrentWorld(), guid);
+  /** The template's B, retuned: a change the undo stack does not hold (a saved prefab edit, an outside edit). */
+  const retuneB = (y: number) => {
+    const d = pDoc();
+    (d.entities[2]!.traits.Transform as { y: number }).y = y;
+    prefabs.set(d.id, d); setPrefabCache(d.id, d as never);
+  };
+  const editSource = () => {
+    writeTraitFieldWithUndo(byName('B'), meta('Transform'), 'x', 4);
+    removeTraitFromEntitiesWithUndo([byName('A')], meta('Rotate3D'));
+    expect(row(key(2))?.traitRemovals, 'premise: the source records a removal').toBeTruthy();
+  };
+
+  // Mutation: `copyRecordsOf` returning null (the stale path) — the copy has no fresh record.
+  it('the copy holds the source\'s list, fresh, under its own guid and placement; undo drops it, redo seats it again', async () => {
+    editSource();
+    const copy = duplicateEntity(rootId(), () => {})!;
+    const cg = guidOf(copy)!;
+    expect(strip(recOf(cg)! as never)).toEqual(strip(rec() as never));
+    expect(recOf(cg)!.placement).toMatchObject({ parent: '', sortOrder: (readTraitData(copy, meta('EntityAttributes')) as { sortOrder: number }).sortOrder });
+    const cap = capturedRecordsOf(copy)!.find((r) => r.rootGuid === cg)!;
+    expect(strip(recOf(cg)! as never)).toEqual(strip(cap as never));
+
+    await undo();
+    expect(getAllEntities().some((e) => e.guid === cg)).toBe(false);
+    expect(storedInstance(getCurrentWorld(), cg), 'the undo drops the copy\'s record').toBeUndefined();
+    await redo();
+    expect(strip(recOf(cg)! as never)).toEqual(strip(rec() as never));
+  });
+
+  // Mutation: `spawnOnRecords` returning right after the seat (no reprojection) — the copy keeps the old template's y.
+  it('a redo after a template change rebuilds the copy onto the current document, under its own overrides', async () => {
+    editSource();
+    const copy = duplicateEntity(rootId(), () => {})!;
+    const cg = guidOf(copy)!;
+    const before = structuredClone(recOf(cg));
+    expect(before, 'premise: the copy is on records').toBeTruthy();
+    await undo();
+    retuneB(7);
+    await redo();
+    const live = getAllEntities().find((e) => e.guid === cg)!.id;
+    expect(tfOf(memberOf(live, 'B'))).toMatchObject({ x: 4, y: 7 });
+    expect(recOf(cg)).toEqual(before);
+  });
+
+  it('a paste of a clipboard that outlived a template change shows the current document under the copied overrides', async () => {
+    editSource();
+    const clip = clipEntity(rootId(), 'copy')!;
+    expect(clip.records?.size, 'premise: the clipboard carries the record').toBe(1);
+    retuneB(7);
+    const pasted = pasteEntityCopy(clip.snapshot, 0, () => {}, clip.records);
+    const pg = guidOf(pasted)!;
+    expect(tfOf(memberOf(pasted, 'B'))).toMatchObject({ x: 4, y: 7 });
+    expect(strip(recOf(pg)! as never)).toEqual(strip(rec() as never));
+    await undo();
+    expect(storedInstance(getCurrentWorld(), pg)).toBeUndefined();
+  });
+});

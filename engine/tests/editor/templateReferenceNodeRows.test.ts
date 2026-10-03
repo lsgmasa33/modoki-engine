@@ -31,7 +31,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, loadSceneFile, instantiatePrefabIntoWorld,
   destroyEntity, spawnEntity, Transform, EntityAttributes, type SceneData,
 } from '@modoki/engine/runtime';
-import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, setActionCallback, pushAction } from '@modoki/engine/editor';
+import { serializeScene, deleteEntitiesWithUndo, writeTraitFieldWithUndo, createEntityWithUndo, setActionCallback, pushAction } from '@modoki/engine/editor';
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, setPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { ownInstanceStructure } from '../../packages/modoki/src/editor/scene/prefabChain';
@@ -810,7 +810,10 @@ describe('#1541/#1542 close-out review', () => {
     const xr = await instantiatePrefabAsync(xDoc as never, inMid('N1')[0]!.id);
     setPrefabSource(xr, { id: X });
     writeTraitFieldWithUndo(all().find((e) => e.name === 'XKid')!.id, getTraitByName('Transform')!, 'x', 9);
-    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'XNode', parentId: all().find((e) => e.name === 'XKid')!.id, guid: 'eeeeeeee-0000-4000-8000-0000000000d1' }));
+    // Added as a user adds it (through the door, #2046 S7.3): the rebase reprojects the tree from its record, which a
+    // raw spawn never told.
+    const xKid = all().find((e) => e.name === 'XKid')!.id;
+    createEntityWithUndo('Create XNode', xKid, [{ name: 'Transform' }, { name: 'EntityAttributes', data: { name: 'XNode', parentId: xKid, guid: 'eeeeeeee-0000-4000-8000-0000000000d1' } }], () => {});
     install(midDoc());
     await quietly(() => rebaseStaleInstances());
     const members = JSON.stringify(refNodeOf(serializePrefab(root, OUTER2)!).members ?? {});

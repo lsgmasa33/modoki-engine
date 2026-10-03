@@ -97,7 +97,7 @@ export async function placePrefabFromPath(path: string, opts: {
       label: `Instantiate "${prefab.name}"`,
       initialId: rootId,
       // A refusal here throws out of the redo, which drops the step with its own notice (`prefabInstantiateUndo.ts`).
-      respawn: async (rootGuid) => {
+      respawn: async (rootGuid, sortOrder) => {
         const at = placedPrefabPath(prefab.id, path);
         const again = capturePrefabRead(at);
         const p = await readPrefabFile(at);
@@ -106,7 +106,7 @@ export async function placePrefabFromPath(path: string, opts: {
         if (other) throw other;
         // Required after the read, right before the spawn: a parent that is gone, or is a placeholder now, refuses the
         // redo (owner ruling R) rather than landing the instance at the scene root or under another entity.
-        const id = await instantiatePrefabInstance(p, at, parentRef ? () => parentRef.require() : 0, again, rootGuid);
+        const id = await instantiatePrefabInstance(p, at, parentRef ? () => parentRef.require() : 0, again, rootGuid, sortOrder);
         opts.onPlaced?.(id);
         return id;
       },

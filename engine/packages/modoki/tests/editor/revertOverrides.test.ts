@@ -96,7 +96,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 
 beforeEach(async () => {
   testWorld = createWorld();
@@ -179,29 +179,29 @@ describe('revertOverridesSelective', () => {
     expect(memberData(result!.newRootId, 1, 'Spin')).toBeUndefined();
   });
 
-  // What this proves is the Revert's RESULT: the full and the reduced payloads each rebuild their own state. It does not
-  // drive the undo entry (`revertOverridesWithUndo`), which this file's world mock cannot resolve a ref in — that wiring
-  // is `engine/tests/editor/revertUndoCurrentPrefab.test.ts`'s (swapping the entry's undo and redo turns it red, and left
-  // this case green: #1877). Mutation for this case: `revertOverridesSelective` returns `fullSide` as the reduced side
-  // (`prefabRevert.ts`).
-  it('the Revert\'s result carries both states: a rebuild from the full payload restores the edit, from the reduced one reverts it', async () => {
+  // What this proves is the Revert's RESULT: the records before and after (#2001 S7, rule 8) each rebuild their own state.
+  // It does not drive the undo entry (`revertOverridesWithUndo`), whose wiring is
+  // `engine/tests/editor/revertUndoCurrentPrefab.test.ts`'s (swapping the entry's undo and redo turns it red, #1877).
+  // Mutation for this case: `revertOverridesSelective` returns the after side as its `before` (`prefabRevert.ts`).
+  it('the Revert\'s result carries both states: restoring the before records puts the edit back, the after ones revert it', async () => {
     const { m, root } = await setup();
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
+    const { restoreSide } = await import('../../src/editor/instance/instanceHistory');
 
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
     writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
 
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
     expect(result).not.toBeNull();
-    const { fullSide, reducedSide } = result!;
+    const { before, after, topGuid } = result!;
     expect(memberData(result!.newRootId, 2, 'EngineFlame')!.idleScale).toBe(0.1); // reverted
 
-    // The full (pre-revert) side: idleScale back to 0.5.
-    let cur = m.rebuildFrameFromSide(result!.newRootId, fullSide)!;
+    // The before side: idleScale back to 0.5.
+    let cur = restoreSide(before, topGuid)!.root;
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.5);
 
-    // The reduced side: idleScale reverted again.
-    cur = m.rebuildFrameFromSide(cur, reducedSide)!;
+    // The after side: idleScale reverted again.
+    cur = restoreSide(after, topGuid)!.root;
     expect(memberData(cur, 2, 'EngineFlame')!.idleScale).toBe(0.1);
     expect(currentRoot()).toBe(cur); // single live instance, no leaks
   });

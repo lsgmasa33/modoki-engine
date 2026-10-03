@@ -1498,6 +1498,35 @@ describe('a duplicate carries its stored roots\' kept R2 state, under identities
     expect(guidOfId(inside(copyGuid, 'Gone'))).toBe(copyRow.guid);
   });
 
+  // Hunt seed 7191: a MEMBER nested root (PQ's Qrow) holds no kept state of its own — its owner's entry keeps the orphan
+  // rows under its key. A duplicate promotes the copy to a stored root of its own (#1756), which must take that share.
+  it('a duplicated member nested root takes its owner\'s kept rows under its key, re-keyed and re-minted', async () => {
+    // Mutation: drop `ownerKept` in `copySnapshot`'s `keptOf` — the copy saves no orphan row, and its Gone comes back at
+    // Q's 0. Mutation: skip it in `collectKeptMints` — the copy's row pins BEEF too (two members, one guid, #1293).
+    install(pqDoc(), qDoc());
+    const sc = scene(PQ);
+    (sc.entities as unknown as Array<Record<string, unknown>>)[1]!.members = { [`/${gQrow}/${DEAD}`]: { guid: BEEF, name: 'Gone', traits: { Transform: { x: 4 } } } };
+    await load(sc);
+    const copyGuid = guidOfId(duplicateEntity(inside(INST, 'QR'), () => {})!);
+    const saved = await save();
+    const find = (v: unknown): Record<string, unknown> | undefined => {
+      if (!v || typeof v !== 'object') return undefined;
+      if ((v as { guid?: unknown }).guid === copyGuid && (v as { prefab?: unknown }).prefab) return v as Record<string, unknown>;
+      for (const c of Object.values(v)) { const hit = find(c); if (hit) return hit; }
+      return undefined;
+    };
+    const copyRow = (find(saved)?.members as Record<string, { guid?: string; name?: string; traits?: unknown }> | undefined)?.[`/${DEAD}`];
+    expect(copyRow?.traits).toEqual({ Transform: { x: 4 } });
+    expect(copyRow?.name).toBe('Gone');
+    expect(copyRow?.guid).toBeTruthy();
+    expect(copyRow?.guid).not.toBe(BEEF);
+    const withGone = { ...qDoc(), entities: [...qDoc().entities, row(3, 'Gone', 1, DEAD)] };
+    install(withGone);
+    await load(saved);
+    expect(x(inside(copyGuid, 'Gone'))).toBe(4);
+    expect(guidOfId(inside(copyGuid, 'Gone'))).toBe(copyRow!.guid);
+  });
+
   it('a legacy channel into a missing frame: the copy saves it too, and both apply it once the frame is back', async () => {
     // Mutation: drop `kept` from the snapshot — the copy saves no `nestedOverrides`, and its QX comes back at Q's 0.
     install(tDoc());

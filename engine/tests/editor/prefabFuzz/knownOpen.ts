@@ -113,6 +113,24 @@ const linkBookedTwice = (f: StepFailure): boolean => {
   return lines.every((l) => KEPT.test(l) || restated(l));
 };
 
+/** #2063's sibling (hunt seed 8004): the old capture states a RESTORE (`traitRemovals: {T: false}`) on a member no layer
+ *  removes T from, which the record (rightly) does not hold. Vacuous: a reload restores nothing, so only the file's bytes
+ *  differ. Only a capture side that is all restores, with the record stating nothing there, and no cached prefab removing
+ *  T at that node (its own row, or a reference row's member row for it). */
+const vacuousRestore = (f: Failure): boolean => {
+  if (f.check !== 'I25 the record is not the capture') return false;
+  const m = /^\S+ \S*\/([0-9a-f-]{36}): undefined vs (\{"traitRemovals":\{[^{}]*\}\})$/.exec(f.detail);
+  if (!m) return false;
+  const restores = (JSON.parse(m[2]!) as { traitRemovals: Record<string, boolean> }).traitRemovals;
+  if (Object.values(restores).some((v) => v !== false)) return false;
+  const node = m[1]!;
+  type Row = { nodeGuid?: string; removedTraits?: string[]; traitRemovals?: Record<string, boolean>; members?: Record<string, Row> };
+  const removes = (r: Row | undefined, t: string) => !!r && (r.removedTraits?.includes(t) || r.traitRemovals?.[t] === true);
+  return Object.keys(restores).every((t) => !getAllAssets().some((a) => a.type === 'prefab'
+    && !!(getCachedPrefabSync(a.guid)?.entities as Row[] | undefined)?.some((e) => (e.nodeGuid === node && removes(e, t))
+      || Object.entries(e.members ?? {}).some(([k, r]) => k.endsWith(node) && removes(r, t)))));
+};
+
 /** #2061: the end walk's redo of an instantiate respawns a FRESH instance after its nested prefab was trashed, so a missing
  *  nested row's placeholder takes the template row's name, while the no-op rebuild's capture names it from the kept orphan
  *  row the earlier reload stored under the same root guid (`"C" vs "QR"`). Only a name on a live ROW placeholder, and only
@@ -230,6 +248,19 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => f.check === 'save→reload is not the identity' && /^\/1000000b-0000-4000-8000-[0-9a-f]+: undefined vs .*\(an entity was gained\)/.test(f.detail),
   },
   {
+    issue: 2063,
+    what: "#2063's sibling (hunt seed 8004, S7.3-exposed): duplicate, add a child, duplicate, Apply a member's component removal to its nested prefab; OR's record, reprojected fresh, states nothing on that member, while the old capture writes a vacuous restore (traitRemovals {Transform: false}) no layer needs. Main writes the same bytes with the record stale. The file's bytes differ, nothing a reload shows: an S6 writer acceptance case.",
+    repro: [
+      {kind: 'duplicate', u: [0.03413783456198871, 0.016128105344250798, 0.0018854951485991478, 0.3534541209228337, 0.7941476691048592, 0.6432676510885358, 0.9444652060046792, 0.07949005952104926]},
+      {kind: 'addChild', u: [0.12928652833215892, 0.42889489978551865, 0.265474597690627, 0.6893578884191811, 0.8305221966002136, 0.4527408753056079, 0.487001319648698, 0.5449036918580532]},
+      {kind: 'duplicate', u: [0.7256983604747802, 0.007711391197517514, 0.06003849231638014, 0.7175237217452377, 0.7810866506770253, 0.4057686429005116, 0.8911883099935949, 0.5475387549959123]},
+      {kind: 'apply', u: [0.8698288635350764, 0.23344396008178592, 0.2521734593901783, 0.3387978451792151, 0.18762129521928728, 0.006252508843317628, 0.6819386167917401, 0.11940287635661662]},
+      {kind: 'paste', u: [0.33335884497500956, 0.19453366426751018, 0.30241627083159983, 0.3949150762055069, 0.6194343185052276, 0.5457824829500169, 0.5210922542028129, 0.050197884906083345]},
+    ],
+    reproduces: (f) => vacuousRestore(f),
+    tolerates: (f) => vacuousRestore(f),
+  },
+  {
     issue: 2061,
     what: "#2061 (the first three ops of #2058's hunt seed 7393, reached once #2059's fix cleared the P1 that stopped them): instantiate P, trash Q. The end walk's redo of the instantiate respawns P fresh, so QR's row placeholder takes P's row name \"C\"; the no-op rebuild names it \"QR\" from the kept orphan row the walk's earlier reload stored under that root guid. Pre-existing; S7 (#2046) moves undo respawns onto records",
     repro: [
@@ -288,7 +319,8 @@ export interface Reach {
   skips?: string[];
 }
 
-export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[] }[] = [
+/** `runTag`: an entry re-pinned by editing its draws runs under the tag it was recorded with (`RunOpts.runTag`, #1946). */
+export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[]; runTag?: number }[] = [
   {
     issue: 2010,
     what: "#2010 (hunt seed 1153, #2009; was KNOWN_OPEN): an agent call's ONE undo entry (a composite) whose added entity went with a member a saved prefab edit deleted. Its undo half-applied (the other op undone, the added one refused). Now every sub's check is asked first and the entry refuses whole, before any change (rule 8, ruling R); the extra undo reaches it as an op",
@@ -1253,6 +1285,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     // #1869: this Apply first moved a member within its frame (the fuzzer's retired directed branch), then applied every
     // key. A member no longer moves, so the repro applies every key (`u[1] = 0`) without the move.
     reaches: { op: 11, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    runTag: 0xd7eb85010000, // #1947 re-pinned: the draws above were remapped to the targets they picked before a placed instance went last
     repro: [
       { kind: 'renamePrefab', u: [0.29216481326147914, 0.1476494751404971, 0.18551874696277082, 0.07410656800493598, 0.41970898350700736, 0.4152033708523959, 0.13034801022149622, 0.09932499984279275] },
       { kind: 'createPrefab', u: [0.5039114304818213, 0.255739972461015, 0.09370358125306666, 0.7442081868648529, 0.380464835325256, 0.46510340296663344, 0.25256184837780893, 0.05835147784091532] },
@@ -1265,7 +1298,7 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       { kind: 'instantiate', u: [0.29211976029910147, 0.15278238710016012, 0.25975321140140295, 0.7465326695237309, 0.994651313405484, 0.5035853921435773, 0.6328171074856073, 0.6932727838866413] },
       { kind: 'prefabEdit', u: [0.3292363465297967, 0.798240183852613, 0.011706580873578787, 0.7644205500837415, 0.3508245141711086, 0.12864016951061785, 0.8345876485109329, 0.7216439375188202], inner: [] },
       { kind: 'trashPrefab', u: [0.4036154255736619, 0.43466546991840005, 0.38601681031286716, 0.2412711256183684, 0.09834549622610211, 0.639129497576505, 0.9453888835851103, 0.30100506939925253] },
-      { kind: 'apply', u: [0.7839175323024392,  0,  0.42464192933402956,  0.6151037919335067,  0.8330991917755455,  0.19254334270954132,  0.9538525966927409,  0.8849528867285699] },
+      { kind: 'apply', u: [0.6875,  0,  0.42464192933402956,  0.6151037919335067,  0.8330991917755455,  0.19254334270954132,  0.9538525966927409,  0.8849528867285699] },
     ],
   },
   {
@@ -1397,21 +1430,22 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     issue: 1872,
     what: "Windows hunt seed 6053: a template-added REFERENCE node re-anchored to its frame root (P's prefab edit deleted its anchor), edited inside by a scene delete, pinned the whole list at the root; the load's fold replaced only the nodes whose own anchor was the root, so the template's copies spawned beside the pinned ones (I7 duplicate guid on the next reload)",
     reaches: { op: 14, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    runTag: 0x4abc96b50000, // #1947 re-pinned: the draws above were remapped to the targets they picked before a placed instance went last
     repro: [
       { kind: 'instantiate', u: [0.6727333776652813, 0.03602659655734897, 0.6944148486945778, 0.7366161625832319, 0.040293456986546516, 0.30280971992760897, 0.260529940482229, 0.5547153684310615] },
       { kind: 'duplicate', u: [0.23169829766266048, 0.4410246934276074, 0.8222101412247866, 0.3506382517516613, 0.6698429598473012, 0.6916433696169406, 0.6952236338984221, 0.20826734835281968] },
       { kind: 'instantiate', u: [0.6082416258286685, 0.3922657244838774, 0.35303167859092355, 0.6436697214376181, 0.668862575897947, 0.5312209650874138, 0.0540543629322201, 0.04668264742940664] },
       { kind: 'reparent', u: [0.6502893504220992, 0.47112358920276165, 0.7188535134773701, 0.2169447394553572, 0.4893360927235335, 0.5293548754416406, 0.8961892125662416, 0.09683129144832492] },
       { kind: 'prefabEdit', u: [0.6752093727700412, 0.48999632708728313, 0.1664101337082684, 0.3519437697250396, 0.9695968751329929, 0.541721326764673, 0.19388855854049325, 0.141506714746356], inner: [] },
-      { kind: 'apply', u: [0.0887219572905451, 0.7974996655248106, 0.7777760927565396, 0.7506156349554658, 0.7280220629181713, 0.8423147306311876, 0.4382405795622617, 0.9358075894415379] },
-      { kind: 'duplicate', u: [0.8536271995399147, 0.5478534940630198, 0.9882300053723156, 0.45068583777174354, 0.4275446659885347, 0.6499504465609789, 0.17712222854606807, 0.6391849115025252] },
-      { kind: 'addChild', u: [0.8861947644036263, 0.3740362850949168, 0.6131360183935612, 0.5300964876078069, 0.5953033079858869, 0.43441235669888556, 0.9592510822694749, 0.4432985186576843] },
+      { kind: 'apply', u: [0.038461538461538464, 0.7974996655248106, 0.7777760927565396, 0.7506156349554658, 0.7280220629181713, 0.8423147306311876, 0.4382405795622617, 0.9358075894415379] },
+      { kind: 'duplicate', u: [0.7424242424242424, 0.5478534940630198, 0.9882300053723156, 0.45068583777174354, 0.4275446659885347, 0.6499504465609789, 0.17712222854606807, 0.6391849115025252] },
+      { kind: 'addChild', u: [0.8861947644036263, 0.2714285714285714, 0.6131360183935612, 0.5300964876078069, 0.5953033079858869, 0.43441235669888556, 0.9592510822694749, 0.4432985186576843] },
       { kind: 'saveReload', u: [0.5821434087119997, 0.6170384893193841, 0.5426212782040238, 0.6075585458893329, 0.598365475423634, 0.5460347866173834, 0.07424886478111148, 0.16196894622407854] },
-      { kind: 'reparent', u: [0.2691115913912654, 0.7177944688592106, 0.3226120152976364, 0.42646927130408585, 0.7878745435737073, 0.9163731141015887, 0.5520495988894254, 0.8863208296243101] },
-      { kind: 'createPrefab', u: [0.42128309258259833, 0.7291045738384128, 0.3913924724329263, 0.8703403077088296, 0.8042178256437182, 0.7335473310668021, 0.11902031418867409, 0.4835782435256988] },
+      { kind: 'reparent', u: [0.041666666666666664, 0.7177944688592106, 0.20833333333333331, 0.42646927130408585, 0.7878745435737073, 0.9163731141015887, 0.5520495988894254, 0.8863208296243101] },
+      { kind: 'createPrefab', u: [0.06944444444444445, 0.7291045738384128, 0.3913924724329263, 0.8703403077088296, 0.8042178256437182, 0.7335473310668021, 0.11902031418867409, 0.4835782435256988] },
       { kind: 'prefabEdit', u: [0.6768674780614674, 0.5850495675113052, 0.036219006637111306, 0.4407619808334857, 0.6837912634946406, 0.4771320461295545, 0.5534138723742217, 0.7143814351875335], inner: [{ kind: 'delete', u: [0.27599901403300464, 0.5311330147087574, 0.21392283774912357, 0.4606079605873674, 0.8785075128544122, 0.323012778069824, 0.46160522871650755, 0.7822509927209467] }, { kind: 'reparent', u: [0.15744089521467686, 0.5380053559783846, 0.38548832666128874, 0.5302761339116842, 0.8363188181538135, 0.40198767371475697, 0.3032138596754521, 0.4694216903299093] }, { kind: 'instantiate', u: [0.3857515521813184, 0.6117347273975611, 0.9937147260643542, 0.288557460764423, 0.7372464118525386, 0.8324874786194414, 0.45630949968472123, 0.2181201062630862] }] },
-      { kind: 'createPrefab', u: [0.754655567696318, 0.9903104931581765, 0.85263856430538, 0.014787685824558139, 0.012711717747151852, 0.7945738902781159, 0.22637150320224464, 0.47174792527221143] },
-      { kind: 'delete', u: [0.8748915053438395, 0.556681145215407, 0.7585619639139622, 0.4336816961877048, 0.9701537557411939, 0.9024638626724482, 0.7584799681790173, 0.25685738073661923] },
+      { kind: 'createPrefab', u: [0.10606060606060606, 0.9903104931581765, 0.85263856430538, 0.014787685824558139, 0.012711717747151852, 0.7945738902781159, 0.22637150320224464, 0.47174792527221143] },
+      { kind: 'delete', u: [0.7424242424242424, 0.556681145215407, 0.7585619639139622, 0.4336816961877048, 0.9701537557411939, 0.9024638626724482, 0.7584799681790173, 0.25685738073661923] },
       { kind: 'prefabEdit', u: [0.9416578407399356, 0.13801936781965196, 0.054412305587902665, 0.19675762369297445, 0.19520224956795573, 0.5733210209291428, 0.23114062659442425, 0.39696667110547423], inner: [] },
     ],
   },
@@ -1723,6 +1757,97 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     ],
   },
   {
+    issue: 2046,
+    what: "#2046 S7.1 (hunt seed 7106, revert-weighted): instantiate, Revert, an edit back to the template's value, undo, then the instance's prefab trashed: after the reload the walk's undo of the Revert finds its frame no instance of that prefab any more, and refuses through entityRef in ruling R's words (\"<name>\" is no longer an instance of …), as every other step's refusal reads; it once said \"the Revert's instance is no longer …\", which no allowlist knows",
+    reaches: { op: 1, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'instantiate', u: [0.05711629241704941, 0.8835600221063942, 0.5781427333131433, 0.8600298452656716, 0.997266581049189, 0.09439356788061559, 0.6481521350797266, 0.6919603005517274] },
+      { kind: 'revert', u: [0.6142673620488495, 0.2713138770777732, 0.7694136004429311, 0.3055989390704781, 0.36081884684972465, 0.33908099215477705, 0.39060342055745423, 0.12377393641509116] },
+      { kind: 'editField', u: [0.7437389111146331, 0.4659465607255697, 0.3414313308894634, 0.5529283776413649, 0.890810688957572, 0.26672234456054866, 0.3816684416960925, 0.1986275026574731], variant: 'toBase' },
+      { kind: 'undo', u: [0.2718520106282085, 0.20602649403735995, 0.1706115803681314, 0.7161209422629327, 0.047590398229658604, 0.7910298160277307, 0.4129182412289083, 0.39739417820237577] },
+      { kind: 'trashPrefab', u: [0.8409131714142859, 0.5572398933582008, 0.33799825864844024, 0.17335968860425055, 0.7683512882795185, 0.6962184438016266, 0.7586153382435441, 0.4462128314189613] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.1 (hunt seed 7211, revert-weighted): delete a member, Revert the removal, rename then trash the outer prefab: after the reload the outer root is a Missing Prefab placeholder and the Revert's frame a scene-added reference node still shown under it. Undo and redo rebuild from the outermost PROJECTABLE root (the node), re-seed it there, and hold only the records the Revert changed",
+    reaches: { op: 1, outcome: 'done', skips: ['assetDelete: undo to the start identity', 'assetDelete: redo to the end identity'] },
+    repro: [
+      { kind: 'delete', u: [0.9557824705261737, 0.4095125677995384, 0.9671995351091027, 0.8781274638604373, 0.15437448932789266, 0.9699225500226021, 0.59082493907772, 0.0977980075404048] },
+      { kind: 'revert', u: [0.9178850213065743, 0.16444419836625457, 0.3271348325069994, 0.7128983770962805, 0.7439583938103169, 0.7741733950097114, 0.2098460050765425, 0.5991194704547524] },
+      { kind: 'renamePrefab', u: [0.1978795633185655, 0.7041519291233271, 0.6339440292213112, 0.903602994279936, 0.5930001984816045, 0.6707794957328588, 0.7129211851861328, 0.10842364770360291] },
+      { kind: 'trashPrefab', u: [0.9860278903506696, 0.8087249484378844, 0.9387383256107569, 0.20167196448892355, 0.6573540912941098, 0.20397650031372905, 0.23738472280092537, 0.4871779412496835] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.1 (hunt seed 7180, revert-weighted): detach, add a child, Apply it (a template-added node of a nested frame), an outside edit, then Revert: the reprojection pins exactly what the old save pins, so the template-added node's a+ row gets no guid (a pin there matched no member, was kept as an orphan row and written by the next save)",
+    reaches: { op: 4, outcome: 'done' },
+    repro: [
+      { kind: 'detach', u: [0.8666855653282255, 0.20951053290627897, 0.45859654643572867, 0.30506770964711905, 0.8127530228812248, 0.9902768167667091, 0.007150326622650027, 0.47653619083575904] },
+      { kind: 'addChild', u: [0.6134136237669736, 0.5768098337575793, 0.39202977274544537, 0.2318538948893547, 0.5272691659629345, 0.7825782338622957, 0.8187195237260312, 0.7410154691897333] },
+      { kind: 'apply', u: [0.7484856233932078, 0.4808379807509482, 0.9611606618855149, 0.2707494816277176, 0.40927455946803093, 0.709763644495979, 0.4179386501200497, 0.30059280898422003] },
+      { kind: 'fileMutate', u: [0.7869242636952549, 0.6841396752279252, 0.3284403537400067, 0.1518406744580716, 0.9789406408090144, 0.5383732581976801, 0.0731429778970778, 0.640561449341476] },
+      { kind: 'revert', u: [0.05527145625092089, 0.7611915788147599, 0.30892440071329474, 0.49319102009758353, 0.6285661072470248, 0.34565233322791755, 0.05739857838489115, 0.7722912475001067] },
+    ],
+  },
+  {
+    issue: 2058,
+    what: "#2058 (hunt seed 7387, S7.2's hunt; retired by #2046 S7.3): an Apply, then a nested prefab trashed and the scene saved and reloaded, so the instance holds a Missing Prefab ROW placeholder: the end-of-run no-op rebuild (every stored instance refreshed onto its own document) rebuilt it from the CAPTURE, whose respawn expanded the trashed prefab's members under the placeholder, where the reload shows it empty (#2028 ruling D). The Apply's undo and redo now restore records in place, so the walk leaves the records fresh and the refresh reprojects the tree from its record, whose load keeps the row placeholder empty. (The walk stops at an undo refused after the trash, ruling R's, as it did before; the Apply's undo and redo ran before it.) Mutation: the Apply's undo always taking the snapshot reproduces it",
+    reaches: { op: 2, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'editField', u: [0.684557231143117, 0.6574248794931918, 0.8663541537243873, 0.1941434508189559, 0.8271013505291194, 0.4779641507193446, 0.5695215961895883, 0.6995494493748993], variant: 'toBase' },
+      { kind: 'duplicate', u: [0.38672873727045953, 0.0614225456956774, 0.795251734321937, 0.09568195440806448, 0.8367833448573947, 0.11771281412802637, 0.11317364289425313, 0.5921810725703835] },
+      { kind: 'apply', u: [0.37730975868180394, 0.9260992896743119, 0.78113649552688, 0.6059525064192712, 0.5119001402053982, 0.8304910447914153, 0.6607204028405249, 0.6195035995915532] },
+      { kind: 'trashPrefab', u: [0.5021876925602555, 0.07549543934874237, 0.9857850559055805, 0.48671753285452724, 0.49865975766442716, 0.4209823305718601, 0.9676178365480155, 0.7240658372174948] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.3 (hunt seed 7541, Apply-weighted): an instance placed under a member of a nested frame, then an outside edit removes that member from its template. The fan-out reprojected the tree from its record, whose fold leaves the held user node unplaced (its `own` link unused), so the save lost the placed instance's records; the old settle keeps that row whole as an R2 orphan, user node included. A tree holding such a link is rebuilt from the capture until the fold carries it (#2036's family, an S6 entry criterion: `reprojectsExactly`). Mutation: drop the `own` test there",
+    reaches: { op: 2, outcome: 'done', skips: ['outsideEdit: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'prefabEdit', u: [0.6682230876758695, 0.6278471737168729, 0.6566486030351371, 0.2655958402901888, 0.09963067132048309, 0.7226695355493575, 0.787791658192873, 0.6373910219408572], inner: [] },
+      { kind: 'instantiate', u: [0.9272065302357078, 0.6484451829455793, 0.5377096778247505, 0.5266080931760371, 0.5569795118644834, 0.9516146217938513, 0.7980581494048238, 0.7121199739631265] },
+      { kind: 'outsideEdit', u: [0.6909451545216143, 0.9168438434135169, 0.9456593347713351, 0.34207710484042764, 0.3977784626185894, 0.6053131583612412, 0.6410007362719625, 0.5584042852278799], variant: 'removeLeaf' },
+    ],
+  },
+  {
+    issue: 2058,
+    what: "#2058 (hunt seed 7395, S7.2's hunt): a duplicate, its nested prefab trashed, a prefab edit entered and left, then a delete of a node of the Missing Prefab ROW: the editor refuses it in the scene too (#2028 close-out: a delete would come back on reload, and the panels toast it), and the harness counted only the under-placeholder child as a scene refusal, so it read the refusal as an op that threw. Mutation: drop 'missing-prefab-row' from editRefusable",
+    reaches: { op: 3, outcome: 'refused', skips: ['assetDelete: undo to the start identity', 'assetDelete: redo to the end identity'] },
+    repro: [
+      { kind: 'duplicate', u: [0.05223376024514437, 0.11405750131234527, 0.5913086000364274, 0.364982504863292, 0.06482559815049171, 0.6461077849380672, 0.23906716099008918, 0.10373092931695282] },
+      { kind: 'trashPrefab', u: [0.6854987577535212, 0.24980279942974448, 0.8638446554541588, 0.73848806344904, 0.4498169731814414, 0.41810061945579946, 0.4251072737388313, 0.9887261465191841] },
+      { kind: 'prefabEdit', u: [0.06144445529207587, 0.9135972552467138, 0.9489198597148061, 0.8838190287351608, 0.9681011836510152, 0.016010392690077424, 0.42900670412927866, 0.2746883174404502], inner: [] },
+      { kind: 'delete', u: [0.9899101760238409, 0.32720587053336203, 0.31582447048276663, 0.6247820644639432, 0.6641123646404594, 0.34023633948527277, 0.21246912982314825, 0.5178476548753679] },
+    ],
+  },
+  {
+    issue: 2058,
+    what: "#2058 (hunt seed 7439, S7.2's hunt): a component removed on a member and applied, a file-direct add, a prefab edit entered and left, then a delete of a node whose tree holds that removal. Today's undo respawned the snapshot and rebased it, and the member came back without its traitRemovals. The undo now restores the tree from the records the delete found (#2046 S7.4, D-8c). Mutation: deleteTrees returning null (the snapshot path)",
+    reaches: { op: 4, outcome: 'done' },
+    repro: [
+      { kind: 'removeComponent', u: [0.4016896963585168, 0.007681625662371516, 0.5667402951512486, 0.9890332913491875, 0.1799913311842829, 0.5370815806090832, 0.12090458441525698, 0.6345629475545138] },
+      { kind: 'apply', u: [0.44262342783622444, 0.18647924973629415, 0.8396003255620599, 0.8578529178630561, 0.32422461546957493, 0.8450644291006029, 0.03611173201352358, 0.46802256465889513] },
+      { kind: 'fileMutate', u: [0.5461484503466636, 0.9187530749477446, 0.6291360317263752, 0.7246098848991096, 0.8838080489076674, 0.12754320539534092, 0.8656333019025624, 0.9536185825709254] },
+      { kind: 'prefabEdit', u: [0.34342407435178757, 0.7348052102606744, 0.9516561448108405, 0.19445253629237413, 0.3412048197351396, 0.9105195782613009, 0.15784245054237545, 0.57945885672234], inner: [] },
+      { kind: 'delete', u: [0.31580525380559266, 0.8078755231108516, 0.9931265243794769, 0.36045118421316147, 0.18930701771751046, 0.22135075205005705, 0.8834776291623712, 0.0522306642960757] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 178, the #2007 oracle's): an agent places an instance under a member, a prefab edit drops that member's anchor (the node is kept as an R2 orphan, not live), then a delete of an ancestor member. The door dropped every own link under the member, the held one too, so the record lost a node no act removed (I25; the record-path undo then lost it from the scene). It drops only the links of the nodes that go with the delete. Mutation: drop the gone filter in beginDelete's member branch",
+    reaches: { op: 4, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589] },
+      { kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{ kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656] }] },
+      { kind: 'duplicate', u: [0.5001395551953465, 0.5671875621192157, 0.7579644594807178, 0.9319786985870451, 0.05941782356239855, 0.3195134764537215, 0.7089909338392317, 0.7977708335965872] },
+      { kind: 'instantiate', u: [0.9505329302046448, 0.6067074490711093, 0.4167693150229752, 0.41477229772135615, 0.26970920502208173, 0.021757659735158086, 0.6905693716835231, 0.2421865495853126] },
+      { kind: 'delete', u: [0.27554806089028716, 0.27155902539379895, 0.3325552644673735, 0.49350595520809293, 0.08413512958213687, 0.6091446462087333, 0.9786754157394171, 0.6282922080717981] },
+    ],
+  },
+  {
     issue: 2059,
     what: "#2059 (#2058 hunt seed 7393): Q trashed (its frame kept live, #1862), a component removed from A inside O1's frame N, a prefab edit entered and left. The leave's rebuild made QR a Missing Prefab ROW placeholder, which has no PrefabInstance, so the save could not key the user node hung at it and wrote N's whole frame as a nestedStructure slot: A's traitRemovals left its row (I23), and the slot pinned O's row N. The placeholder now keys its row",
     reaches: { op: 4, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
@@ -1754,6 +1879,157 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       {kind: 'undo', u: [0.17663414310663939, 0.01229062769562006, 0.5800135440658778, 0.717533276649192, 0.5507293122354895, 0.4764806858729571, 0.7154232081957161, 0.24112055450677872]},
       {kind: 'addComponent', u: [0.4504307541064918, 0.3548886945936829, 0.3065341168548912, 0.7175041695591062, 0.7666598793584853, 0.32540461677126586, 0.4841995006427169, 0.6778079124633223]},
       {kind: 'prefabEdit', u: [0.2107876797672361, 0.3341078688390553, 0.9170295137446374, 0.4216249173041433, 0.6825626569334418, 0.24313193350099027, 0.27615417796187103, 0.772553448099643], inner: []},
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.3 (hunt seed 7529, its Inspector form: op 4 a remove-component at u0 0.05): a duplicate, two Applies (the first adds Extra to the template), a detach, then the walk undoes both Applies \u2014 the second on the snapshot path, whose reload re-parses Extra's pin into the duplicate's record (rule 5 keeps pins verbatim), the first on the record path. Restoring only the applying tree left the duplicate's pin, which R2 wrote back once Extra left the template. The record-path Apply undo now restores every tree its fan-out reached. Mutation: fannedTrees returning []",
+    reaches: { op: 6, outcome: 'done' },
+    repro: [
+      { kind: 'duplicate', u: [0.31062624184414744, 0.3666461752727628, 0.8137603790964931, 0.2738102728035301, 0.46801008423790336, 0.7417469269130379, 0.5252596070058644, 0.5062182217370719] },
+      { kind: 'apply', u: [0.8455492360517383, 0.06505395355634391, 0.4249293925240636, 0.4202402662485838, 0.14156741625629365, 0.3208854841068387, 0.07244061282835901, 0.829421377973631], check: 'rebuild-reload' },
+      { kind: 'apply', u: [0.6324158848728985, 0.9137728046625853, 0.9645229163579643, 0.7501681114081293, 0.15780299180187285, 0.7850499716587365, 0.4731107889674604, 0.35550313256680965] },
+      { kind: 'detach', u: [0.875508168945089, 0.21957755647599697, 0.32388726784847677, 0.5085330756846815, 0.6705171386711299, 0.7154986003879458, 0.1997983290348202, 0.6187672424130142] },
+      { kind: 'removeComponent', u: [0.05, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] },
+      { kind: 'revert', u: [0.3441046914085746, 0.4330248632468283, 0.5587305675726384, 0.5226122869644314, 0.5494070227723569, 0.9459768950473517, 0.10556867439299822, 0.30025702342391014] },
+      { kind: 'undo', u: [0.9620828565675765, 0.2953206389211118, 0.7212974312715232, 0.8505266183055937, 0.6257061592768878, 0.00843795738182962, 0.2778746257536113, 0.4688322979491204] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.3 (hunt seed 7529, its Inspector form: op 4 a remove-component at u0 0.85): a duplicate, two Applies (the first adds Extra to the template), a detach, then the walk undoes both Applies \u2014 the second on the snapshot path, whose reload re-parses Extra's pin into the duplicate's record (rule 5 keeps pins verbatim), the first on the record path. Restoring only the applying tree left the duplicate's pin, which R2 wrote back once Extra left the template. The record-path Apply undo now restores every tree its fan-out reached. Mutation: fannedTrees returning []",
+    reaches: { op: 6, outcome: 'done' },
+    repro: [
+      { kind: 'duplicate', u: [0.31062624184414744, 0.3666461752727628, 0.8137603790964931, 0.2738102728035301, 0.46801008423790336, 0.7417469269130379, 0.5252596070058644, 0.5062182217370719] },
+      { kind: 'apply', u: [0.8455492360517383, 0.06505395355634391, 0.4249293925240636, 0.4202402662485838, 0.14156741625629365, 0.3208854841068387, 0.07244061282835901, 0.829421377973631], check: 'rebuild-reload' },
+      { kind: 'apply', u: [0.6324158848728985, 0.9137728046625853, 0.9645229163579643, 0.7501681114081293, 0.15780299180187285, 0.7850499716587365, 0.4731107889674604, 0.35550313256680965] },
+      { kind: 'detach', u: [0.875508168945089, 0.21957755647599697, 0.32388726784847677, 0.5085330756846815, 0.6705171386711299, 0.7154986003879458, 0.1997983290348202, 0.6187672424130142] },
+      { kind: 'removeComponent', u: [0.85, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] },
+      { kind: 'revert', u: [0.3441046914085746, 0.4330248632468283, 0.5587305675726384, 0.5226122869644314, 0.5494070227723569, 0.9459768950473517, 0.10556867439299822, 0.30025702342391014] },
+      { kind: 'undo', u: [0.9620828565675765, 0.2953206389211118, 0.7212974312715232, 0.8505266183055937, 0.6257061592768878, 0.00843795738182962, 0.2778746257536113, 0.4688322979491204] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 8143): a duplicate of a whole instance carried the source's records with their identity pins dropped; an outside edit then removed member M from the nested prefab, and the copy's written entry lost M's pin, which the source's record keeps verbatim (rule 5; I23). seatCopy now remaps the pins to the copy. Red before the fix.",
+    reaches: { op: 1, outcome: 'done', skips: ['outsideEdit: redo to the end identity', 'outsideEdit: undo to the start identity'] },
+    repro: [
+      { kind: 'duplicate', u: [0.06824695318937302, 0.9580431887879968, 0.4989391958806664, 0.5355879284907132, 0.49227592488750815, 0.7383780700620264, 0.10785214276984334, 0.5785648836754262] },
+      { kind: 'outsideEdit', u: [0.9003972166683525, 0.822162056574598, 0.4309288829099387, 0.906360968016088, 0.30230539524927735, 0.8691769591532648, 0.6574258769396693, 0.6641046751756221], variant: 'removeLeaf' },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 8003): the same pin drop as seed 8143, after a Create Prefab: the duplicate's record lost a nested member's pin once an outside edit removed the member (I23). Red before the pin remap.",
+    reaches: { op: 2, outcome: 'done', skips: ['outsideEdit: redo to the end identity', 'outsideEdit: undo to the start identity'] },
+    repro: [
+      { kind: 'createPrefab', u: [0.07143824337981641, 0.4798726129811257, 0.05589173664338887, 0.0722446118015796, 0.5288414196111262, 0.7963873299304396, 0.781542751006782, 0.32557702134363353] },
+      { kind: 'duplicate', u: [0.004379888763651252, 0.6322648683562875, 0.5469309231266379, 0.34353901469148695, 0.8814033709932119, 0.9856538700405508, 0.21757454657927155, 0.7782286352012306] },
+      { kind: 'outsideEdit', u: [0.601544889388606, 0.5710396165959537, 0.12006324576213956, 0.30906898947432637, 0.29287730157375336, 0.05698111420497298, 0.4693968687206507, 0.8135321056470275], variant: 'removeLeaf', check: 'rebuild-reload' },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 8065): a duplicate on records copied a live override mark its source's record does not state (one main's save\u2192reload loses too), so the copy did not show what its record states (P1). The first duplicate is now reprojected from the copy's records. Red before.",
+    reaches: { op: 3, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'delete', u: [0.3944016939494759, 0.3042436051182449, 0.3392090583220124, 0.42906573764048517, 0.5264308403711766, 0.7022041934542358, 0.6958230840973556, 0.310592528199777] },
+      { kind: 'apply', u: [0.08194353221915662, 0.7376372702419758, 0.9988445921335369, 0.35941504943184555, 0.8201908664777875, 0.2723333491012454, 0.3433348387479782, 0.5921867352444679] },
+      { kind: 'prefabEdit', u: [0.38638174277730286, 0.2177149059716612, 0.05568758165463805, 0.7848013369366527, 0.10637750336900353, 0.2317671540658921, 0.12128460919484496, 0.051552186254411936], inner: [{ kind: 'duplicate', u: [0.8054975746199489, 0.1066612359136343, 0.19205517135560513, 0.058958540903404355, 0.3057897249236703, 0.44322852906771004, 0.9612414145376533, 0.17365209478884935] }] },
+      { kind: 'duplicate', u: [0.014652273384854198, 0.06403444544412196, 0.2768217565026134, 0.9535738911945373, 0.5386096760630608, 0.40441033453680575, 0.9863441728521138, 0.0433313874527812] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 8148): a copy's record kept the SOURCE's guid on a template-added node's legacy EntityAttributes.guid field record, where the copy plan derives the copy's (I25). seatCopy now remaps guid values in a row's traits and parent and drops a stated node identity. Red before.",
+    reaches: { op: 19, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      { kind: 'duplicate', u: [0.05169026996009052, 0.28711254452355206, 0.02811229764483869, 0.9968492758926004, 0.5290691445115954, 0.9030731257516891, 0.7541016407776624, 0.26193152694031596] },
+      { kind: 'prefabEdit', u: [0.7495016534812748, 0.08828822220675647, 0.915106943808496, 0.47189401811920106, 0.09904030989855528, 0.09577209851704538, 0.8006000751629472, 0.7452948344871402], inner: [{ kind: 'addChild', u: [0.6512792746070772, 0.31114898691885173, 0.45225654216483235, 0.9955862569622695, 0.4479365369770676, 0.744655485264957, 0.5858288588933647, 0.0505000832490623] }] },
+      { kind: 'delete', u: [0.7096411362290382, 0.6279408014379442, 0.8322468432597816, 0.33094449038617313, 0.782070049084723, 0.23142873030155897, 0.23871167935431004, 0.29420980508439243] },
+      { kind: 'agentSceneOps', u: [0.11414338392205536, 0.4353632777929306, 0.0775541733019054, 0.7670493351761252, 0.814902801765129, 0.7994696358218789, 0.9814828610979021, 0.07193102850578725] },
+      { kind: 'createPrefab', u: [0.9860690392088145, 0.008877877844497561, 0.1986061711795628, 0.8116618667263538, 0.31494757160544395, 0.8214358098339289, 0.6682216555345803, 0.03229547245427966] },
+      { kind: 'undo', u: [0.9879818230401725, 0.20033378875814378, 0.17380604334175587, 0.8771674095187336, 0.7106565241701901, 0.3299936205148697, 0.3020079608540982, 0.15238352492451668] },
+      { kind: 'duplicate', u: [0.027788663050159812, 0.18688913201913238, 0.9540878031402826, 0.36095677339471877, 0.44246127060614526, 0.8482934371568263, 0.6750193266198039, 0.23147446406073868] },
+      { kind: 'delete', u: [0.8658697144128382, 0.23828752734698355, 0.9476149312686175, 0.3718613716773689, 0.7969241417013109, 0.5810064754914492, 0.09519669855944812, 0.827623974531889] },
+      { kind: 'delete', u: [0.7549870687071234, 0.11728409677743912, 0.9821571034844965, 0.4139315541833639, 0.9250756779219955, 0.30365767958573997, 0.6197612083051354, 0.055700400145724416] },
+      { kind: 'prefabEdit', u: [0.9222361335996538, 0.6130686113610864, 0.2944876439869404, 0.8990091199520975, 0.7567621525377035, 0.43583200336433947, 0.24677760154008865, 0.18099636700935662], inner: [] },
+      { kind: 'copy', u: [0.5580925885587931, 0.23384692636318505, 0.3286111468914896, 0.19251803937368095, 0.7850542676169425, 0.9030375625006855, 0.49129793094471097, 0.6781739755533636] },
+      { kind: 'paste', u: [0.08991651772521436, 0.510505253681913, 0.36089844279922545, 0.33562289201654494, 0.3306885012425482, 0.738747997675091, 0.032108531100675464, 0.020280753960832953] },
+      { kind: 'prefabEdit', u: [0.05782840750180185, 0.009846006985753775, 0.5023146937601268, 0.9215559135191143, 0.16646846081130207, 0.22287502023391426, 0.05970040918327868, 0.7652986745815724], inner: [] },
+      { kind: 'instantiate', u: [0.9903482887893915, 0.3789575560949743, 0.40255061839707196, 0.9241162927355617, 0.3620945792645216, 0.06992988428100944, 0.7752086010295898, 0.4666115655563772] },
+      { kind: 'createPrefab', u: [0.8739737775176764, 0.4048307896591723, 0.13951588328927755, 0.6442113628145307, 0.6271468936465681, 0.9041343573480844, 0.15507118846289814, 0.7372345675248653] },
+      { kind: 'agentInstantiate', u: [0.8059459829237312, 0.7412474830634892, 0.655910934554413, 0.263824105495587, 0.9107244242914021, 0.01720334030687809, 0.05884718708693981, 0.7667855962645262] },
+      { kind: 'duplicate', u: [0.8083393778651953, 0.6696273915003985, 0.22239272249862552, 0.11101503320969641, 0.7222827065270394, 0.1454292587004602, 0.47354420460760593, 0.056383696384727955] },
+      { kind: 'prefabEdit', u: [0.764504098566249, 0.016534572700038552, 0.3909252842422575, 0.580238011199981, 0.0358760308008641, 0.34865781967528164, 0.6458572135306895, 0.9004734097979963], inner: [] },
+      { kind: 'createPrefab', u: [0.5245359442196786, 0.0017471967730671167, 0.2369432260747999, 0.5342661668546498, 0.22586003155447543, 0.10413823882117867, 0.9829283661674708, 0.8409275419544429] },
+      { kind: 'duplicate', u: [0.1540834412444383, 0.6160896795336157, 0.9541841975878924, 0.9801520865876228, 0.997353790095076, 0.7342269013170153, 0.11350730643607676, 0.9507483099587262] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 8034): a Detach left a plain node M in the outer instance's tree; deleting M took the record path, whose undo did not bring M back, so the Detach's undo was refused. A scene-owned target inside a surviving tree now takes the snapshot path. Red before.",
+    reaches: { op: 1, outcome: 'done' },
+    repro: [
+      { kind: 'detach', u: [0.9874082391615957, 0.9755883195903152, 0.1643878857139498, 0.45765086193569005, 0.2732548355124891, 0.044606906827539206, 0.1985863868612796, 0.3453728877939284] },
+      { kind: 'delete', u: [0.9668145182076842, 0.07539966702461243, 0.3142816429026425, 0.03462071460671723, 0.4093935461714864, 0.31127314339391887, 0.6847104672342539, 0.9647207329981029] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.3 (hunt seed 8026): an Apply, then its prefab trashed and the scene saved and reloaded, so the applied instance is a Missing Prefab placeholder; the Apply's record-path undo could not rebuild it and threw. A tree no longer live and projectable now takes the snapshot path. Red before.",
+    reaches: { op: 5, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      { kind: 'agentInstantiate', u: [0.23931622109375894, 0.6828764616511762, 0.20874715689569712, 0.6649643303826451, 0.8394388484302908, 0.24637979362159967, 0.3663606063928455, 0.5263698312919587] },
+      { kind: 'createPrefab', u: [0.521141035715118, 0.3634001766331494, 0.2441828742157668, 0.41762988455593586, 0.11325941351242363, 0.718239156762138, 0.918099281610921, 0.2538754891138524] },
+      { kind: 'editField', u: [0.9522066323552281, 0.8253611149266362, 0.4984479579143226, 0.42141578486189246, 0.0021668937988579273, 0.2453370401635766, 0.2599978372454643, 0.24032284948043525] },
+      { kind: 'instantiate', u: [0.6828442120458931, 0.493980233091861, 0.5205718840006739, 0.7969117625616491, 0.17249909648671746, 0.6158085505012423, 0.09262497792951763, 0.346234513213858] },
+      { kind: 'renamePrefab', u: [0.19837979669682682, 0.7584262460004538, 0.45234767999500036, 0.9546268268022686, 0.3175351796671748, 0.9130424889735878, 0.6352581565733999, 0.9359234212897718] },
+      { kind: 'apply', u: [0.813612857600674, 0.8643246728461236, 0.14287046226672828, 0.7086902218870819, 0.2642263553570956, 0.8661213670857251, 0.7097897867206484, 0.6149427534546703] },
+      { kind: 'trashPrefab', u: [0.572670761262998, 0.25325350323691964, 0.96043481095694, 0.6201538573950529, 0.8990526755806059, 0.11888902704231441, 0.41319657443091273, 0.06620226078666747] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.4 (hunt seed 7191; hub ruling 2026-10-03: data loss on an ordinary route): a nested prefab trashed, then a MEMBER nested root (R in OR) duplicated \u2014 the copy, promoted to its own instance, got none of OR's kept orphan rows under R's key, so its Missing Prefab row placeholder lost its {guid, name} pin on save (QR came back as C under a derived guid). Surfaced by a Revert leaving the record fresh (P1). The snapshot now carries the owner's share (ownerKept), which the promoted copy takes as its kept state, re-minted (#1788's shape).",
+    reaches: { op: 6, outcome: 'done' },
+    repro: [
+      { kind: 'trashPrefab', u: [0.7790063789580017, 0.931367318611592, 0.59756507887505, 0.25093060405924916, 0.875525520183146, 0.822669715853408, 0.9970179586671293, 0.7175876775290817] },
+      { kind: 'saveReload', u: [0.5323197576217353, 0.11310383258387446, 0.422352442285046, 0.5505110830999911, 0.1007166535127908, 0.12945394567213953, 0.5193218239583075, 0.9048621957190335] },
+      { kind: 'detach', u: [0.353675645776093, 0.9417889043688774, 0.7088176324032247, 0.23630525940097868, 0.17897568154148757, 0.3359164306893945, 0.2745239925570786, 0.5848237569443882] },
+      { kind: 'duplicate', u: [0.19415016961283982, 0.4474799770396203, 0.9411376256030053, 0.5816613845527172, 0.7377476533874869, 0.5583138961810619, 0.4969835449010134, 0.41582099674269557] },
+      { kind: 'fileMutate', u: [0.5606632409617305, 0.2846169436816126, 0.5131777341011912, 0.38927842071279883, 0.8741908387746662, 0.4059190391562879, 0.3794119181111455, 0.9432923083659261] },
+      { kind: 'duplicate', u: [0.5552007004152983, 0.20096299168653786, 0.8917422175873071, 0.6357061716262251, 0.2474950491450727, 0.5353377636056393, 0.06109403306618333, 0.7934353048913181] },
+      { kind: 'revert', u: [0.9889315299224108, 0.9169710406567901, 0.011744194896891713, 0.41307879192754626, 0.7000407399609685, 0.15838396083563566, 0.19087399588897824, 0.2469632790889591] },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 (hunt seed 8268): an agent places an instance, an outside edit removes member B from its prefab. The placed instance's record held no identity pins, so B's pin went with the member; rule 5 keeps a pin verbatim. The outside change no longer marks the store stale (S7.3), so this record was compared. place now pins the members' current identity (\u00a7 3.2). Red before.",
+    reaches: { op: 1, outcome: 'done', skips: ['outsideEdit: redo to the end identity', 'outsideEdit: undo to the start identity'] },
+    repro: [
+      { kind: 'agentInstantiate', u: [0.6951360604725778, 0.7513575721532106, 0.8488628019113094, 0.34339370415546, 0.8892016371246427, 0.6355646152514964, 0.6624239387456328, 0.6951701815705746] },
+      { kind: 'outsideEdit', u: [0.5733773135580122, 0.7309380758088082, 0.1346131560858339, 0.4414016667287797, 0.3684636203106493, 0.84353843703866, 0.9833090498577803, 0.5583217048551887], variant: 'removeLeaf' },
+    ],
+  },
+  {
+    issue: 2046,
+    what: "#2046 S7.3 (hunt seed 8262): a Create Prefab over OR's file (a new document guid), a field edit on its nested R, an Apply into OR, then undo \u00d73. The Apply undo parks the restored document (#1868), and the fold check read the file the Apply left, because the runtime cache does not key that guid. It now reads the editor cache too, as the editor's reader does (a harness gap, red before).",
+    reaches: { op: 12, outcome: 'done' },
+    repro: [
+      { kind: 'delete', u: [0.9573243150953203, 0.17224706802517176, 0.15048126387409866, 0.9953436898067594, 0.40881972666829824, 0.7224720064550638, 0.14438458671793342, 0.2779348117765039] },
+      { kind: 'instantiate', u: [0.22615192970260978, 0.9566911114379764, 0.6137593388557434, 0.12314433744177222, 0.5615467398893088, 0.4613880480173975, 0.05394384707324207, 0.6656962370034307] },
+      { kind: 'duplicate', u: [0.43525223550386727, 0.15091237961314619, 0.030816643498837948, 0.6207047074567527, 0.05222811549901962, 0.6594485121313483, 0.940728003391996, 0.7626225841231644] },
+      { kind: 'delete', u: [0.5281082014553249, 0.6542919089552015, 0.7034178467001766, 0.08039831067435443, 0.7500688915606588, 0.755343534052372, 0.15888685430400074, 0.02505578170530498] },
+      { kind: 'delete', u: [0.9067258907016367, 0.818623008672148, 0.6645286558195949, 0.19807181134819984, 0.5003396526444703, 0.8383687997702509, 0.9921113476157188, 0.6320838243700564] },
+      { kind: 'undo', u: [0.6165804895572364, 0.5834672492928803, 0.6761112646199763, 0.667208633152768, 0.5368157576303929, 0.21161764254793525, 0.4627969574648887, 0.46774839283898473] },
+      { kind: 'editField', u: [0.6460334465373307, 0.992605343228206, 0.9573200547602028, 0.996970898937434, 0.037249288987368345, 0.49646884319372475, 0.5533279848750681, 0.20825782581232488] },
+      { kind: 'undo', u: [0.7462126053869724, 0.7048715548589826, 0.5840038675814867, 0.3789348602294922, 0.4249982794281095, 0.9122921624220908, 0.36703837011009455, 0.36013193777762353] },
+      { kind: 'createPrefab', u: [0.032962492667138577, 0.14349306910298765, 0.024683492723852396, 0.1575108307879418, 0.48672293848358095, 0.34121010708622634, 0.10490421438589692, 0.0436649105977267] },
+      { kind: 'editField', u: [0.3938702498562634, 0.7078287210315466, 0.8597655789926648, 0.19656174955889583, 0.33590986696071923, 0.22449952899478376, 0.03099035006016493, 0.6427373278420419] },
+      { kind: 'editField', u: [0.3087176049593836, 0.08641076786443591, 0.48011893942020833, 0.11065501789562404, 0.38283666386269033, 0.6341514706145972, 0.41544443368911743, 0.5414899603929371] },
+      { kind: 'apply', u: [0.1346119437366724, 0.8548611195292324, 0.6233382462523878, 0.004290478304028511, 0.4399559604935348, 0.44068856397643685, 0.37521811039187014, 0.42619797331281006] },
+      { kind: 'undo', u: [0.727975323330611, 0.14003844745457172, 0.19168123044073582, 0.31353538925759494, 0.3851139785256237, 0.08903217664919794, 0.07624079426750541, 0.3546358032617718] },
     ],
   },
 ];

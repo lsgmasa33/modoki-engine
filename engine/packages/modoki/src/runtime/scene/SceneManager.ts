@@ -128,6 +128,8 @@ import { loadRig2DNow } from '../loaders/rig2dCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { fillInstanceStoreReporting } from '../prefab/instanceLoad';
+import { takeRecordBank } from '../prefab/recordBank';
+import { markStale, setInstanceRecord, storedInstance, type StoredInstance } from '../prefab/instanceStore';
 import { assetUrl } from '../loaders/assetUrl';
 import {
   loadSceneFile,
@@ -822,6 +824,9 @@ class SceneManagerImpl implements SceneManager {
       // read the frame as expanded from whatever its cache holds, which a prefab change that caused this very
       // reload has already replaced — so a kept base's members were diffed against another member's row.
       const carriedFrameDocs = new Map<number, { source: string; doc: TemplateDoc }>();
+      // …and each carried stored root's instance record (#2046 S7.6): the carry is the live tree, flat, so the record it
+      // projected from still states it in the new world. Without it the root arrived unrecorded and re-seeded from a capture.
+      const carriedRecords: StoredInstance[] = [];
       const carryWorld = getCurrentWorld();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
@@ -831,6 +836,9 @@ class SceneManagerImpl implements SceneManager {
         if (markers) carriedMarkers.set(entry.id, markers);
         const frameDoc = old ? frameRootDoc(carryWorld, old) : undefined;
         if (frameDoc) carriedFrameDocs.set(entry.id, frameDoc);
+        const guid = (entry.traits['EntityAttributes'] as { guid?: string } | undefined)?.guid;
+        const stored = guid ? storedInstance(carryWorld, guid) : undefined;
+        if (stored) carriedRecords.push(structuredClone(stored));
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
       const persistentResources = collectResourceRefsFromEntities(persistentOnlySnapshots);
@@ -854,6 +862,8 @@ class SceneManagerImpl implements SceneManager {
       // primary's entities keep the schema default '' — Phase 3's load-bearing
       // "empty means primary" rule).
       nextWorld = createWorld();
+      // The exact records a leaver banked for this key (#2046 S7.6, `recordBank.ts`), for the primary's entry loop.
+      const recordBank = takeRecordBank(path);
       // Override marks are keyed by raw ecs id, so they must be dropped when the
       // WORLD changes — once, here, rather than once per `loadSceneFile` call. A
       // chain loads N scene files into this ONE world (bases first, primary last),
@@ -1000,7 +1010,7 @@ class SceneManagerImpl implements SceneManager {
         // #2001 S4: the file's instance records, parsed beside the old expansion into this world's store. A shadow —
         // nothing builds or saves from it yet (`runtime/prefab/instanceStore.ts`) — so a parse failure must not fail
         // the load: it reports and leaves that owner unstored.
-        fillInstanceStoreReporting(stagingWorld, sceneData);
+        fillInstanceStoreReporting(stagingWorld, sceneData, isPrimary ? recordBank : undefined);
 
         if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
@@ -1058,6 +1068,11 @@ class SceneManagerImpl implements SceneManager {
             },
           },
         );
+        // The carried roots' records (captured above), seated as they stood: a stale one stays stale.
+        for (const s of carriedRecords) {
+          setInstanceRecord(nextWorld, s.record);
+          if (s.stale) markStale(nextWorld, s.stale, [s.record.rootGuid]);
+        }
       }
 
       if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');

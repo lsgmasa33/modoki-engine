@@ -21,7 +21,8 @@ import { settleSwallowedKeptState } from './prefabTokens';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
 import { unkeyedNodes, stripCreatedKeys, stripKeysNow } from './capturedKeys';
-import { staleAround } from '../../runtime/prefab/instanceStore';
+import { markStale, staleAround } from '../../runtime/prefab/instanceStore';
+import { guidOfEntity, storedRootsAbove, storedRootsUnder } from '../instance/instanceKeys';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -552,7 +553,7 @@ function tagCreatedPrefabUnmarked(
   const piMeta = getTraitByName('PrefabInstance');
   const before = piMeta ? (readTraitData(rootEcsId, piMeta) as { source?: string } | null)?.source : undefined;
   // Taken without stripping (#1278), before the tag, then kept to what the tag wrote (`writes`).
-  const snapshot = detachPrefabInstance(rootEcsId, { strip: false });
+  const snapshot = detachPrefabInstanceUnmarked(rootEcsId, { strip: false });
   const { guidRemap, writes, refused } = tagTree(rootEcsId, source, writtenPrefab, { refuseQuietly: !!redo, onLinked: opts?.onLinked });
   if (refused) {
     stripKeysNow(unkeyed);
@@ -681,11 +682,39 @@ function dropUnpackedRootKeptState(rootId: number, before: string | undefined, w
   return () => restoreKeptState(rootGuid, kept);
 }
 
-// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
-// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
+/** The records an op on the tree at `rootEcsId` reaches: every record-owning root above it, at it and under it. */
+function treeRootGuids(rootEcsId: number | undefined): string[] {
+  if (rootEcsId == null || !findEntity(rootEcsId)) return [];
+  return [...storedRootsAbove(rootEcsId), ...storedRootsUnder(rootEcsId)].map(guidOfEntity).filter(Boolean);
+}
+
+/**
+ * #2046 S7.5: mark stale, before the op and after it, only the records of the tree it acts on ({@link treeRootGuids}, read
+ * both times: the op can make the root a stored root, or unmake it) and every guid it renames, old and new — not the whole
+ * store. Every other tree keeps its exact list (rule 8), and a fan-out inside the op (a Replace's rebase) reprojects that
+ * tree from it (rule 7). Without a root (`rootOf` gives none) the whole store, as `staleAround`.
+ */
+function staleTreeAround<A extends unknown[], R>(by: string, fn: (...args: A) => R, rootOf: (...args: NoInfer<A>) => number | undefined,
+  renamed: (out: NoInfer<R>) => ReadonlyMap<string, string> | undefined = () => undefined): (...args: A) => R {
+  return (...args: A): R => {
+    const root = rootOf(...args);
+    if (root == null) return staleAround(by, fn)(...args);
+    const before = treeRootGuids(root);
+    markStale(getCurrentWorld(), by, before);
+    let out: R;
+    try { out = fn(...args); } catch (err) { markStale(getCurrentWorld(), by, [...before, ...treeRootGuids(root)]); throw err; }
+    const names = renamed(out);
+    markStale(getCurrentWorld(), by, [...before, ...treeRootGuids(root), ...(names ? [...names.keys(), ...names.values()] : [])]);
+    return out;
+  };
+}
+
+// #2001 S4 (#2014): detach does not maintain the instance list yet, so it marks the store stale once it finishes —
+// wrapped here, at the export, so no return path can skip it (`instanceStore.ts`). Create Prefab's tag and untag, and the
+// relink its undo makes, mark the tree they act on only (#2046 S7.5).
 export const detachPrefabInstance = staleAround('detach', detachPrefabInstanceUnmarked);
-export const reattachPrefabInstance = staleAround('detach', reattachPrefabInstanceUnmarked);
+export const reattachPrefabInstance = staleTreeAround('detach', reattachPrefabInstanceUnmarked, (...a) => a[1]?.rootEcsId);
 export const reattachDetachedInstance = staleAround('detach', reattachDetachedInstanceUnmarked);
-export const tagCreatedPrefab = staleAround('createPrefab', tagCreatedPrefabUnmarked);
-export const tagEntityTreeAsInstance = staleAround('createPrefab', tagEntityTreeAsInstanceUnmarked);
-export const untagEntityTreeAsInstance = staleAround('createPrefab', untagEntityTreeAsInstanceUnmarked);
+export const tagCreatedPrefab = staleTreeAround('createPrefab', tagCreatedPrefabUnmarked, (...a) => a[0], (out) => out.guidRemap);
+export const tagEntityTreeAsInstance = staleTreeAround('createPrefab', tagEntityTreeAsInstanceUnmarked, (...a) => a[0], (out) => out);
+export const untagEntityTreeAsInstance = staleTreeAround('createPrefab', untagEntityTreeAsInstanceUnmarked, (...a) => a[0]);

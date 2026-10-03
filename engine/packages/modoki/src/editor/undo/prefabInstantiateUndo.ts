@@ -36,6 +36,13 @@ function rootGuidOf(rootId: number): string | undefined {
   return eaMeta ? durableGuid(readTraitData(rootId, eaMeta)?.guid as string) || undefined : undefined;
 }
 
+/** `rootId`'s order among its siblings, or undefined. */
+function sortOrderOf(rootId: number): number | undefined {
+  const eaMeta = getTraitByName('EntityAttributes');
+  const v = eaMeta ? readTraitData(rootId, eaMeta)?.sortOrder : undefined;
+  return typeof v === 'number' ? v : undefined;
+}
+
 export function makePrefabInstantiateAction(opts: {
   label: string;
   /** Entity id from the initial (pre-`pushAction`) instantiation. */
@@ -45,7 +52,7 @@ export function makePrefabInstantiateAction(opts: {
    *  which case the live id is left unchanged, matching the original
    *  early-return behavior (nothing new exists to track). `rootGuid` is the root guid to mint instead of a fresh one
    *  (`instantiatePrefabInstance`'s `rootGuid`): the members derive from it. */
-  respawn: (rootGuid: string | undefined) => Promise<number | null>;
+  respawn: (rootGuid: string | undefined, sortOrder: number | undefined) => Promise<number | null>;
   /** Tear down the live instance. Safe to call with a stale id (no-op). */
   remove: (id: number) => void;
 }): UndoAction {
@@ -56,6 +63,8 @@ export function makePrefabInstantiateAction(opts: {
   // Recorded at action-creation time, and re-read after every redo: a redo that could not take it (another live entity
   // holds it) keeps the guid the respawn minted, and the next undo→redo restores that one.
   let rootGuid = rootGuidOf(opts.initialId);
+  // …and its place among its siblings (#1947): the redo puts the instance back where it was, not at a new end (#1941).
+  let sortOrder = sortOrderOf(opts.initialId);
   return {
     label: opts.label,
     // The scene the new instance belongs to: a base, when it was dropped under a base entity (#1429).
@@ -71,7 +80,7 @@ export function makePrefabInstantiateAction(opts: {
       // undoes the step before this one, as it would after any dropped entry.
       let id: number | null;
       try {
-        id = await opts.respawn(rootGuid);
+        id = await opts.respawn(rootGuid, sortOrder);
       } catch (e) {
         // A prefab-edit refusal (#1817, #1836) is a refusal too: the redo would place what the edit world cannot save.
         if (e instanceof StalePrefabRead || e instanceof PrefabEditRefusalError) throw new UndoRefusedError(e.message, e.message);
@@ -92,6 +101,7 @@ export function makePrefabInstantiateAction(opts: {
         return;
       }
       rootGuid = rootGuidOf(id);
+      sortOrder = sortOrderOf(id);
       currentRef = entityRef(id);
     },
   };

@@ -234,7 +234,8 @@ export async function flushWatcher(be: FuzzBackend, before: Map<string, string>)
  *  fresh disk and open its scene through the real load. The scene holds O (with an own edit on a nested member), P,
  *  H and a plain parent with a child. `setupNest` is the fixture's last step, run through the real instantiate: Q
  *  dropped under H's root, a scene-added reference node. */
-export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promise<void>, key: string): Promise<Fixture> {
+/** `pinnedTag`: the run tag to use instead of {@link tagFor}`(key)` — a re-pinned entry's, whose draws were edited (#1946). */
+export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promise<void>, key: string, pinnedTag?: number): Promise<Fixture> {
   setRunMode('stopped');
   _resetHistoryContexts();
   _resetSceneAdoptionForTests();
@@ -245,7 +246,7 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
   useEditorStore.setState({ editingPrefab: null, showToast: () => {} } as never);
   be.reset();
   clearManifest();
-  runTag = tagFor(key);
+  runTag = pinnedTag ?? tagFor(key);
   uuidCounter = 0;
   const f = newFixture(runTag);
   const tag = hex(runTag, 12);

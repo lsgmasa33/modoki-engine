@@ -31,7 +31,8 @@ import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core
 import { findEntity, writeTraitField, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
 import { markOverride, unmarkOverride, getOverrideMarkSet, getStoredOverrideMarks, getCarriedOverrideMarks, restoreOverrideMarks, clearOverrideMarks, ROTATION_MARKS } from '../../runtime/loaders/overrideMarks';
 import { markUIDirty } from '../../runtime/core/uiDirty';
-import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
+import { markStale } from '../../runtime/prefab/instanceStore';
 import { relinkDetachedMembers, type DetachedMember } from '../../runtime/core/ecs/memberHome';
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { baseTokenResolver } from '../scene/prefabTokens';
@@ -265,6 +266,58 @@ function restorableSortOrderWrite(ids: readonly number[]): (id: number, sort: nu
   };
 }
 
+/** Put back the rows a field step found or left (#2046 S7.2; rule 8: undo and redo restore the EXACT list, never a
+ *  re-derived one — D-8a, D-8b) after its live writes. A row that cannot be put (its record cannot be had: a frame
+ *  whose prefab is missing, which the capture cannot state) leaves the records stale, as every step that does not
+ *  maintain them does, and its fields take the base the marks name (`takeUnmarkedFromBase`, which reads such a frame's
+ *  built document, #1939 rule 2), as before S7. */
+export function putFieldRows(ids: readonly number[], rows: readonly (instanceEdits.RowSnap | null)[] | null, trait: string, fields: readonly string[]): void {
+  if (rows && instanceEdits.putRows(ids, rows, trait, fields)) return;
+  markStale(getCurrentWorld(), 'undo');
+  const meta = getTraitByName(trait);
+  if (meta) for (const id of ids) takeUnmarkedFromBase(id, [meta], [...fields]);
+}
+
+/**
+ * A field edit a gesture wrote LIVE, committed as one undo step (the collider points' drag, #1941 site 3): `after` is
+ * set now and recorded; the undo and redo put back each side's value, marks and rows (#2046 S7.2, rule 8), recomputing
+ * nothing. Returned, not pushed: the caller pushes it. `setLive` writes the value raw (the drag's own writer).
+ */
+export function makeLiveFieldEditAction<T>(
+  entityId: number, trait: string, field: string, setLive: (id: number, value: T) => void, before: T, after: T, label: string,
+): UndoAction {
+  const oldMarks = markStateOf(entityId, trait, [field]); // put back by the undo (#1709)
+  // From a record fresh before the commit, or none: the gesture already wrote live, so a re-seed would capture its value
+  // (#2046 S7 close-out review F1). Without them the step marks the records stale, as a step that keeps none.
+  const oldRows = instanceEdits.priorRowsOf([entityId]);
+  setLive(entityId, after);
+  markOverrideIfInstance(entityId, trait, field);
+  const newMarks = markStateOf(entityId, trait, [field]);
+  const newRows = oldRows && instanceEdits.rowsOf([entityId]);
+  const ref = entityRef(entityId);
+  const put = (value: T, marks: MarkState, rows: typeof oldRows) => {
+    // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
+    const id = ref.require();
+    setLive(id, value);
+    putMarksOnly(id, trait, marks);
+    putFieldRows([id], rows, trait, [field]);
+  };
+  return { label, undo: () => put(before, oldMarks, oldRows), redo: () => put(after, newMarks, newRows), ...(oldRows ? { maintainsRecords: true as const } : {}) };
+}
+
+/** The marks half of {@link putMarkState}, with no value taken from a base: for a step that puts its rows back
+ *  (`instanceEdits.putRows`, #2046 S7.2), which shows an unrecorded field at the fold of the RECORD instead (D-8b: the
+ *  base read off the capture was a second, re-derived answer to the same question). False when the entity is gone. */
+export function putMarksOnly(entityId: number, traitName: string, state: MarkState): boolean {
+  const e = findEntity(entityId);
+  if (!e) return false;
+  for (const [f, marked] of Object.entries(state)) {
+    if (marked) markOverride(e, traitName, f);
+    else unmarkOverride(e, traitName, f);
+  }
+  return true;
+}
+
 /** Whether each of `fields` of `traitName` is marked on the entity now: taken before a write, so its undo can put
  *  the marks back with {@link putMarkState} (and after it, for the redo). */
 export type MarkState = Record<string, boolean>;
@@ -276,12 +329,7 @@ export function markStateOf(entityId: number, traitName: string, fields: readonl
   return out;
 }
 export function putMarkState(entityId: number, traitName: string, state: MarkState): void {
-  const e = findEntity(entityId);
-  if (!e) return;
-  for (const [f, marked] of Object.entries(state)) {
-    if (marked) markOverride(e, traitName, f);
-    else unmarkOverride(e, traitName, f);
-  }
+  if (!putMarksOnly(entityId, traitName, state)) return;
   const meta = getTraitByName(traitName);
   if (meta) takeUnmarkedFromBase(entityId, [meta], Object.keys(state));
 }
@@ -294,15 +342,22 @@ export function captureMarks(entityId: number, trait?: string): MarkCapture {
   const all = e ? [...(getCarriedOverrideMarks(e) ?? [])] : [];
   return trait ? { trait, keys: all.filter((k) => k.startsWith(`${trait}.`)) } : { keys: all };
 }
+/** The marks half of {@link restoreMarks}, with no value taken from a base: for a step that puts its rows back
+ *  (`instanceEdits.putRows`, #2046 S7.2; see {@link putMarksOnly}). False when the entity is gone. */
+export function restoreMarksOnly(entityId: number, capture: MarkCapture): boolean {
+  const e = findEntity(entityId);
+  if (!e) return false;
+  if (!capture.trait) clearOverrideMarks(e);
+  else for (const k of [...(getStoredOverrideMarks(e) ?? [])]) if (k.startsWith(`${capture.trait}.`)) unmarkOverride(e, capture.trait, k.slice(capture.trait.length + 1));
+  restoreOverrideMarks(e, capture.keys);
+  return true;
+}
+
 /** Put a {@link captureMarks} back: the marks in its scope become exactly the captured ones, and the fields they leave
  *  unmarked take the CURRENT template's values ({@link takeUnmarkedFromBase}). A trait the current template no longer
  *  gives the member is the instance's own now, an added component, so its fields are recorded (`recordAdded`). */
 export function restoreMarks(entityId: number, capture: MarkCapture): void {
-  const e = findEntity(entityId);
-  if (!e) return;
-  if (!capture.trait) clearOverrideMarks(e);
-  else for (const k of [...(getStoredOverrideMarks(e) ?? [])]) if (k.startsWith(`${capture.trait}.`)) unmarkOverride(e, capture.trait, k.slice(capture.trait.length + 1));
-  restoreOverrideMarks(e, capture.keys);
+  if (!restoreMarksOnly(entityId, capture)) return;
   const meta = capture.trait ? getTraitByName(capture.trait) : undefined;
   if (!capture.trait || meta) takeUnmarkedFromBase(entityId, meta ? [meta] : undefined, undefined, true);
 }

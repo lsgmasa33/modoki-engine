@@ -30,8 +30,10 @@ import { setActionCallback, pushAction, writeTraitFieldWithUndo } from '@modoki/
 import { type PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { applyToPrefabSelective } from '../../packages/modoki/src/editor/scene/prefabApply';
+import { rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { serializeScene } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { freshInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -167,5 +169,48 @@ describe('Apply leaves no override behind on the instance it applied from (#1469
 
     await saveRetuneReload(retuned(retuned(getCachedPrefabSync(P)!, 'A', 'x', 9), 'A', 'y', 8));
     expect(tf('Root1', 'A')).toMatchObject({ x: 9, y: 3 });
+  });
+});
+
+// #2046 S7.3 (rule 7, § 3.2's fan-out row): an Apply changes only the applying instance's list. Every OTHER instance of
+// the prefab is reprojected from its own record onto the new template — its list kept exactly, fresh — not rebuilt from
+// a capture of its live tree. The applying instance is still rebuilt from the capture (its U15 subtraction), so its
+// records are left stale.
+describe('Apply reprojects the other instances from their records (#2046 S7.3)', () => {
+  it('another instance keeps its exact record, fresh, and shows the applied value under its own override', async () => {
+    install(template());
+    await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
+    writeTraitFieldWithUndo(member('Root2', 'B').id, getTraitByName('Transform')!, 'y', 3);
+    writeTraitFieldWithUndo(member('Root1', 'A').id, getTraitByName('Transform')!, 'x', 5);
+    const before = structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT2));
+    expect(before?.list.rows.size).toBeGreaterThan(0); // precondition: Root2 holds a record of its own
+
+    const result = await applyToPrefabSelective(rootId('Root1'), new Set([`${gA}.Transform.x`]));
+    expect(result.applied).toBe(true);
+    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before);
+    expect(tf('Root2', 'A').x).toBe(5); // the new template's value
+    expect(tf('Root2', 'B').y).toBe(3); // its own override
+    expect(freshInstanceRecord(getCurrentWorld(), ROOT1)).toBeUndefined(); // the applying tree: rebuilt from the capture
+  });
+});
+
+// #2046 S7.3: a rebase rebuilds from the capture only the trees whose record is stale (or missing), and leaves stale only
+// THEIR records: a tree it reprojected from its own record keeps it fresh, exactly as it was.
+// Mutation: have `rebuildStaleFrames` mark the whole store stale when it captured anything — Root2's record goes stale.
+describe('a rebase leaves stale only the entries it rebuilt from the capture (#2046 S7.3)', () => {
+  it('a fresh tree is reprojected and keeps its record; a tree with none is captured', async () => {
+    install(template());
+    await load(scene([{ guid: ROOT1, name: 'Root1' }, { guid: ROOT2, name: 'Root2' }]));
+    writeTraitFieldWithUndo(member('Root2', 'B').id, getTraitByName('Transform')!, 'y', 3);
+    const before = structuredClone(freshInstanceRecord(getCurrentWorld(), ROOT2));
+    expect(before, 'premise: Root2 holds a fresh record').toBeTruthy();
+    expect(freshInstanceRecord(getCurrentWorld(), ROOT1), 'premise: Root1 holds none (the capture path)').toBeUndefined();
+
+    install(retuned(getCachedPrefabSync(P)!, 'A', 'x', 9) as { id: string });
+    expect(await rebaseStaleInstances()).toBe(2);
+    expect(tf('Root1', 'A').x).toBe(9);
+    expect(tf('Root2', 'A').x).toBe(9);
+    expect(tf('Root2', 'B').y).toBe(3);
+    expect(freshInstanceRecord(getCurrentWorld(), ROOT2)).toEqual(before);
   });
 });

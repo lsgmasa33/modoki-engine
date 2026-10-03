@@ -25,6 +25,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   },
 }));
 import { getTraitByName, getAllEntities, getCurrentWorld } from '@modoki/engine/runtime';
+import { markStale } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { makeFuzzBackend } from './prefabFuzz/backend';
 import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
@@ -231,6 +232,11 @@ describe('#1934 L1: a copy belongs to the scene that carried it', () => {
 });
 
 describe('#1939 item 2 (serious): the copy store is carried across an Apply undo\'s world swap', () => {
+  // #2046 S7.3: an Apply's undo restores the records in place and reloads no world, so it swaps nothing: the snapshot
+  // reload these cases pin is now its FALLBACK, taken when the store cannot state the world (a step since left the
+  // records behind). Each case leaves them stale before its undo and redo (`stranded`) to reach it; the record path is
+  // the last case.
+  const stranded = () => markStale(getCurrentWorld(), 'a step that did not maintain the records');
   // Hunt seed 1268's route, directed. The Apply's snapshot is taken while Q is present, so it carries no copy of Q; Q is
   // trashed after (its live frames kept, the save carries its copy); the Apply's undo reloads the snapshot. Without the
   // carry, Q's frames came back unexpanded and the next save wrote no copy for them.
@@ -253,6 +259,7 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {}), 'premise: the save carries Q').toContain(f.prefabs.Q.guid);
+    stranded();
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
     expect(qCount(), 'ruling B: no Q frame expands').toBe(0);
@@ -283,19 +290,47 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     await trash(f, 'Q');
     const live = qCount();
     expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    stranded();
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
     expect(qCount()).toBe(0);
     // The redo reloads the OTHER side's snapshot, under another minted id, from a world that now has a loaded primary:
     // the re-key branch (close-out review). Then the undo again.
+    stranded();
     expect((await undoStep('redo')).did).toBe(true);
     await settle();
     expect(qCount(), 'redo').toBe(0);
+    stranded();
     expect((await undoStep('undo')).did).toBe(true);
     await settle();
     expect(qCount(), 'second undo').toBe(0);
     const asPath = f.scenePath.replace(/[^/]+$/, 'untitled-c2.json');
     expect((await saveScene({ path: asPath, allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(asPath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+  });
+
+  // The record path (#2046 S7.3): no swap, so nothing is loaded — Q's frames stay live, as every op in the world keeps a
+  // trashed prefab's frames (#1862), across the undo and the redo, and the save still carries Q's copy.
+  // Mutation: have the undo take the snapshot always (`storeStatesTheWorld` false) → the frames come back as placeholders.
+  it('with the records fresh, the undo and redo keep a trashed prefab\'s frames live, and the save carries its copy', async () => {
+    const f = await startRun(be, noNest, 'c2-undo-records');
+    const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
+    const p1 = p1Id(f);
+    expect(writeTraitFieldWithUndo(p1, TF(), 'x', 5)).toBeFalsy();
+    await settle();
+    const keys = collectInstanceOverrideKeys(p1, getCachedPrefabSync(f.prefabs.P.guid)!);
+    expect((await applyToPrefabWithUndo(p1, new Set(keys.all.filter((k) => k.includes('Transform'))))).applied).toBe(true);
+    await settle();
+    await trash(f, 'Q');
+    const live = qCount();
+    expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    expect((await undoStep('undo')).did).toBe(true); // the Apply
+    await settle();
+    expect(qCount(), 'undo').toBe(live);
+    expect((await undoStep('redo')).did).toBe(true);
+    await settle();
+    expect(qCount(), 'redo').toBe(live);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
 });

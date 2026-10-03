@@ -46,7 +46,7 @@ import { parkedPrefab, parkedPrefabEntry, beginAssetWrites, parkPrefab, discardD
 import { UndoRefusedError } from '../undo/undoFailure';
 import { useEditorStore } from '../store/editorStore';
 import { localIdCounter, storedLocalIdCounter, advanceLocalIdCounter, markUnstated, sameDocumentContent, canonicalJson, LOCAL_ID_MARK_VERSION, type CountedDoc } from '../../runtime/core/localIdCounter';
-import { staleAround } from '../../runtime/prefab/instanceStore';
+import { markStale } from '../../runtime/prefab/instanceStore';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -88,6 +88,8 @@ export interface PrefabCommitOptions {
   /** The caller's own rebuild, run once the caches hold the document and before the rebase: Apply's refresh (with its
    *  guid remap and applied-field subtraction), Create Prefab's tag of the tree it wrote. Not run when the world left. */
   rebuild?: (landed: { path: string }) => void | Promise<void>;
+  /** The `rebuild` keeps the records it touches as they must stand (#2046): the commit marks no record stale for it. */
+  maintainsRecords?: boolean;
   /** `false`: skip the rebase. For a caller whose `rebuild` replaces the world and rebases it itself (Apply's undo
    *  reloads a scene snapshot). */
   rebase?: boolean;
@@ -199,7 +201,7 @@ export interface PrefabRestore {
 /** Write `doc` to the prefab `source` names — or trash it, for `null` — as ONE step. See the module comment. */
 export async function commitPrefabWrite(source: string, doc: PrefabFile | null, opts: PrefabCommitOptions): Promise<PrefabCommitResult> {
   const res = await commitPrefabWrites([{ source, doc, expected: opts.expected, bytes: opts.bytes }], {
-    overwrite: opts.overwrite, rebase: opts.rebase,
+    overwrite: opts.overwrite, rebase: opts.rebase, ...(opts.maintainsRecords ? { maintainsRecords: true } : {}),
     rebuild: opts.rebuild ? (landed) => opts.rebuild!({ path: landed.paths[0]! }) : undefined,
   });
   const { paths, stranded: _stranded, failed: _failed, ...rest } = res;
@@ -209,7 +211,7 @@ export async function commitPrefabWrite(source: string, doc: PrefabFile | null, 
 /** Several prefab files written as ONE step — {@link commitPrefabChanges} with every change landing `'file'`. */
 export async function commitPrefabWrites(
   writes: readonly PrefabWrite[],
-  opts: { overwrite?: boolean; rebuild?: (landed: { paths: string[] }) => void | Promise<void>; rebase?: boolean } = {},
+  opts: { overwrite?: boolean; rebuild?: (landed: { paths: string[] }) => void | Promise<void>; rebase?: boolean; maintainsRecords?: boolean } = {},
 ): Promise<PrefabCommitsResult> {
   const { refusal: _refusal, ...res } = await commitPrefabChanges(writes.map((w) => ({ ...w, land: 'file' as const })), opts);
   return res;
@@ -221,10 +223,10 @@ export async function commitPrefabWrites(
  *  document and before the rebase. */
 export async function parkPrefabChanges(
   restores: readonly PrefabRestore[],
-  opts: { rebuild?: () => void | Promise<void>; rebase?: boolean } = {},
+  opts: { rebuild?: () => void | Promise<void>; rebase?: boolean; maintainsRecords?: boolean } = {},
 ): Promise<void> {
   const res = await commitPrefabChanges(restores.map((r) => ({ source: r.source, doc: r.doc, expected: r.from, land: 'park' as const })), {
-    rebase: opts.rebase, ...(opts.rebuild ? { rebuild: () => opts.rebuild!() } : {}),
+    rebase: opts.rebase, ...(opts.rebuild ? { rebuild: () => opts.rebuild!() } : {}), ...(opts.maintainsRecords ? { maintainsRecords: true } : {}),
   });
   if (res.refusal) throw res.refusal;
 }
@@ -355,6 +357,9 @@ async function commitPrefabChangesUnmarked(
   changes: readonly PrefabChange[],
   opts: {
     overwrite?: boolean; rebuild?: (landed: { paths: string[] }) => void | Promise<void>; rebase?: boolean;
+    /** The caller's `rebuild` maintains the instance records itself (it marks stale what it rebuilds from the capture,
+     *  #2046 S7.3): the step does not mark the whole store stale for running it. */
+    maintainsRecords?: boolean;
     /** `'adopt'`: the file CHANGED (the watcher, a discard), so every read of it in flight is older than it (#1752). False
      *  for an adopt of a file that did not change (the prefab-edit open, the leave repair). Default true. */
     fileChanged?: boolean;
@@ -1104,6 +1109,14 @@ function expectsDocument(expected: PrefabExpectation, doc: PrefabFile): boolean 
   return prefabTextIsDocument(typeof expected === 'string' ? expected : jsonFileBody(expected), doc);
 }
 
-// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
-// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
-export const commitPrefabChanges = staleAround('prefabWrite', commitPrefabChangesUnmarked);
+/** {@link commitPrefabChangesUnmarked}, marking the instance store stale when the step does not maintain the list: it
+ *  ran a caller's `rebuild` that does not say it maintains the records (an op S7 has not moved onto records yet, which
+ *  rebuilds from the capture), or it threw
+ *  part-way (#2001 S4, `instanceStore.ts`). The landing itself changes no record, and its rebase reprojects a tree with a
+ *  fresh record from the store and marks only what it rebuilt from the capture (`rebuildStaleFrames`, #2046 S7.3). */
+export const commitPrefabChanges: typeof commitPrefabChangesUnmarked = async (changes, opts = {}) => {
+  let out: Awaited<ReturnType<typeof commitPrefabChangesUnmarked>>;
+  try { out = await commitPrefabChangesUnmarked(changes, opts); } catch (err) { markStale(getCurrentWorld(), 'prefabWrite'); throw err; }
+  if (opts.rebuild && !opts.maintainsRecords) markStale(getCurrentWorld(), 'prefabWrite');
+  return out;
+};

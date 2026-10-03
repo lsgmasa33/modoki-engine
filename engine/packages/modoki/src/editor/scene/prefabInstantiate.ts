@@ -103,6 +103,8 @@ export async function instantiatePrefabInstance(
   /** The root guid to mint instead of a fresh one: an undo step's redo putting its instance back (`prefabInstantiateUndo.ts`).
    *  Minted BEFORE the members derive, so they derive from it as a reload derives them. */
   rootGuid?: string,
+  /** The order among its siblings that redo puts back (#1947); omitted, the instance goes last. */
+  sortOrder?: number,
 ): Promise<number> {
   // Loaded here, not at the top: the refusal reads the loaded scene through `SceneManager`, and a static import put that
   // whole module under every reader of this one. Before the read-token check, so check → spawn stays synchronous.
@@ -138,7 +140,7 @@ export async function instantiatePrefabInstance(
   const live = piMeta ? (readTraitData(rootId, piMeta)?.source as string | undefined) : undefined;
   if (live) primeEditorPrefabCache(live, prefab);
   // #2001 S4: the door's `place` — the new record (an empty list), linked into the instance it lands under, if any.
-  instanceEdits.place(rootId);
+  instanceEdits.place(rootId, sortOrder === undefined ? {} : { sortOrder });
   return rootId;
 }
 

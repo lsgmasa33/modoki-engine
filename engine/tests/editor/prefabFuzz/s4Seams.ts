@@ -27,7 +27,7 @@ import { capturedRecordsOf, editorPrefabReader } from '../../../packages/modoki/
 import { baseTrait } from '../../../packages/modoki/src/editor/instance/instanceEdits';
 import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
 import { soaSchema } from '../../../packages/modoki/src/runtime/core/ecs/traitSchema';
-import { allStoredRoots, guidOfEntity, outermostStoredRoot } from '../../../packages/modoki/src/editor/instance/instanceKeys';
+import { allStoredRoots, guidOfEntity, outermostStoredRoot, projectionRootOf } from '../../../packages/modoki/src/editor/instance/instanceKeys';
 import type { ShadowSeams } from './shadow';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { findEntityByGuid, findEntityById } from '../../../packages/modoki/src/runtime/core/ecs/world';
@@ -37,7 +37,10 @@ import type { OpKind } from './ops';
 
 /** The fuzzer ops whose writer calls the door (the review's § Census rows). `paste` covers a cut's paste (a reparent).
  *  An instance copy (duplicate/paste of a subtree holding an instance) marks its records stale itself. */
-export const DOOR_OPS: ReadonlySet<OpKind> = new Set<OpKind>(['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'reparent', 'duplicate', 'paste', 'instantiate']);
+export const DOOR_OPS: ReadonlySet<OpKind> = new Set<OpKind>(['editField', 'addComponent', 'removeComponent', 'addChild', 'delete', 'reparent', 'duplicate', 'paste', 'instantiate',
+  // #2046 S7: the ops moved onto records, each in its step's order. An undo or redo of a step not moved yet leaves the
+  // records stale (`undoStep`), so I25 judges only what a moved step's undo and redo maintained.
+  'revert', 'undo', 'redo']);
 
 /** What the translations reached, for the non-vacuity pins (the harness counts the comparisons and skips itself). */
 export const s4Seen = { removedKept: 0, removedKeptOrphan: 0, removedComponentKept: 0, known1942: 0, known1829: 0, known1931: 0 };
@@ -186,7 +189,9 @@ export const s4Seams: ShadowSeams = {
     // orphan's own reference node, held where its anchor went: the capture states it, and the re-seed records it), so it
     // is looked for in every tree's capture. Stated by none: null, a record of nothing.
     const id = liveRootOf(rootGuid);
-    const tops = id !== undefined ? [outermostStoredRoot(id) || id] : allStoredRoots().filter((r) => outermostStoredRoot(r) === r);
+    // The tree the re-seed captures (`reseedFromCapture`): below a Missing Prefab placeholder, the outermost projectable
+    // root — the placeholder states no tree to capture (#2046 S7.3: a record there now stays fresh across a rebase).
+    const tops = id !== undefined ? [projectionRootOf(id) || outermostStoredRoot(id) || id] : allStoredRoots().filter((r) => outermostStoredRoot(r) === r);
     let cap: InstanceRecord | undefined;
     for (const top of tops) if ((cap = capturedRecordsOf(top)?.find((r) => r.rootGuid === rootGuid))) break;
     if (!cap) return null;
@@ -210,6 +215,15 @@ export const s4Seams: ShadowSeams = {
     const topEnt = top !== undefined ? findEntityById(top) : undefined;
     const topSource = topEnt && !unresolvedRefOf(topEnt as never) ? (topEnt.get(getTraitByName('PrefabInstance')!.trait) as { source?: string } | undefined)?.source : undefined;
     if (topSource && !getCachedPrefabSync(topSource)) return { skip: 'its outermost instance\'s prefab is trashed (the save keeps that frame, #1862)' };
+    // …or a frame BETWEEN them (an instance nested in a trashed prefab's frame, hunt seed 8110): the capture of the top
+    // cannot state what lies inside that frame either.
+    const pi = getTraitByName('PrefabInstance')!;
+    for (let a = id !== undefined ? findEntityById(id) : undefined, n = 0; a && n < 1024; n++) {
+      const ea = a.get(getTraitByName('EntityAttributes')!.trait) as { parentId?: number } | undefined;
+      const src = !unresolvedRefOf(a as never) ? (a.get(pi.trait) as { source?: string } | undefined)?.source : undefined;
+      if (src && !getCachedPrefabSync(src)) return { skip: 'an enclosing frame\'s prefab is trashed (the save keeps that frame, #1862)' };
+      a = ea?.parentId ? findEntityById(ea.parentId) : undefined;
+    }
     return translated(rec);
   },
   unrecorded: (rootGuid) => unrecordedBy(getCurrentWorld(), rootGuid),

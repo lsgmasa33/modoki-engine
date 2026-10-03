@@ -40,6 +40,7 @@ import { ensureGuid } from '../../packages/modoki/src/editor/undo/entityRef';
 import { nestedFrameMoves } from '../../packages/modoki/src/editor/scene/prefabChain';
 import { undo, redo, canRedo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { freshInstanceRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -253,13 +254,25 @@ describe('the review cases (#1665 close-out)', () => {
     expect(nameOf(parentOfBox())).toBe('Flame');
   });
 
-  it('a template checked out to a pre-v5 copy (same rows, no nodeGuids): the override still comes back', async () => {
+  // #2046 S7 (rule 7, rule 5): the undo puts back the exact RECORD, keyed by the member's minted identity. A template
+  // checked out to a pre-v5 copy (same rows, no nodeGuids) names its members by derived identities instead, so the record
+  // targets nothing there and is KEPT, unused, as a reload of the same scene keeps it — and it applies again once the
+  // template is back (below). Before S7 the undo re-captured by localId and showed it. Reachable only through an old editor's save
+  // or a git checkout of a pre-v5 file (0 of the 121 corpus prefabs lack nodeGuids): filed low-priority, not escalated.
+  it('a template checked out to a pre-v5 copy (same rows, no nodeGuids): the override is kept unused, not lost', async () => {
     await revertedShip();
     const unkeyed = (d: PrefabFile) => JSON.parse(JSON.stringify(d), (k, v) => (k === 'nodeGuid' ? undefined : v)) as PrefabFile;
     await templateChanges(unkeyed(shipV1()));
 
     await quietly(() => undo());
+    expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(0); // its target is not in this template
+    const rec = freshInstanceRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))!;
+    expect(rec.list.rows.get(`/${G(2)}`)?.traits?.Transform).toEqual({ x: 5 }); // kept, not lost
+
+    // The template back: the rebase reprojects the tree from its record (#2046 S7.3), so the kept override applies again.
+    await templateChanges(shipV1());
     expect(xOf(member(rootOf(SHIP), 'Flame'))).toBe(5);
+    expect(freshInstanceRecord(getCurrentWorld(), ensureGuid(rootOf(SHIP)))?.list.rows.get(`/${G(2)}`)?.traits?.Transform).toEqual({ x: 5 });
   });
 
   it('Detach undo after the scene was RELOADED plain (the production route): brought onto the current template', async () => {

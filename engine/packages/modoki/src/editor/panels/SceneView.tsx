@@ -19,7 +19,7 @@ import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/tra
 import { localFit2DOf } from '../../runtime/core/ecs/localFit2D';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
-import { markOverrideIfInstance, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
+import { makeLiveFieldEditAction } from '../undo/overrideMarkWrites';
 import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
@@ -1236,17 +1236,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       if (afterStr === beforeStr) { setPointsLive(entityId, colMeta, beforeStr); return; }
       // A Missing Prefab placeholder's save drops the edit (#1818): put the points back, and push nothing.
       if (placeholderGestureRefusal([entityId], 'Collider2D')) { setPointsLive(entityId, colMeta, beforeStr); return; }
-      const oldMarks = markStateOf(entityId, 'Collider2D', ['points']); // put back by the undo (#1709)
-      setPointsLive(entityId, colMeta, afterStr);
-      markOverrideIfInstance(entityId, 'Collider2D', 'points');
+      // Applies `after` now and records it; its undo and redo put back each side exactly (#1941 site 3, #2046 S7.2).
+      const action = makeLiveFieldEditAction(entityId, 'Collider2D', 'points', (id, s: string) => setPointsLive(id, colMeta, s), beforeStr, afterStr, 'Edit Collider2D.points');
       notifyFieldEdited(entityId, 'Collider2D', 'points', afterStr);
-      const ref = entityRef(entityId);
-      pushAction({
-        label: 'Edit Collider2D.points',
-        // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
-        undo: () => { const id = ref.require(); setPointsLive(id, colMeta, beforeStr); putMarkState(id, 'Collider2D', oldMarks); },
-        redo: () => { const id = ref.require(); setPointsLive(id, colMeta, afterStr); markOverrideIfInstance(id, 'Collider2D', 'points'); },
-      });
+      pushAction(action);
     }
 
     // Shared by `pick2DEntityAtViewportPoint` and `pickEntityAtViewportPoint` below (opus-reviewer,

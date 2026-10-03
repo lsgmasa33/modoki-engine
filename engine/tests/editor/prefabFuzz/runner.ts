@@ -23,7 +23,8 @@ import { isStoredRoot } from '../../../packages/modoki/src/runtime/core/assetRef
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { findEntityByGuid } from '../../../packages/modoki/src/runtime/core/ecs/world';
 import { unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
-import { shadowSeams, listDiff, assertNotSelf, liveStoredRoots, type ShadowSeams } from './shadow';
+import { shadowSeams, listDiff, p5Diff, assertNotSelf, liveStoredRoots, type ShadowSeams } from './shadow';
+import type { OverrideList } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
 import { checkRecord, type StoredOwner } from '../foldOracle';
 import { foldInstance } from '../../../packages/modoki/src/runtime/prefab/foldInstance';
 import { parseInstanceRecord, parseReferenceNode } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
@@ -48,6 +49,9 @@ export interface RunOpts {
   /** A step failure a KNOWN_OPEN entry TOLERATES (`KnownOpen.tolerates`): counted and set aside, so the run goes on
    *  checking everything after it. The self-test runs without it, which is how an entry that stops reproducing is found. */
   tolerate?: (f: Failure) => boolean;
+  /** The run tag, instead of the one the list's JSON derives (`tagFor`): every derived guid, and so every guid tie-break,
+   *  carries it, so an entry whose draws were edited to re-pin it keeps the tag its path was checked under (#1946). */
+  runTag?: number;
 }
 export interface RunResult { failure?: StepFailure; trace: string[] }
 
@@ -345,6 +349,36 @@ async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]
   return out;
 }
 
+/** The lists P5 compares: every record the shadow judges now, by root guid, cloned. Undefined with no seams installed. */
+function p5Lists(): Map<string, OverrideList> | undefined {
+  const seams = shadowSeams();
+  if (!seams) return undefined;
+  const out = new Map<string, OverrideList>();
+  for (const rec of seams.records()) {
+    const judged = seams.judge ? seams.judge(rec) : rec.list;
+    if (!('skip' in judged)) out.set(rec.rootGuid, structuredClone(rec.list));
+  }
+  return out;
+}
+
+/** P5 after record-neutral op `kind`: each list taken before it ({@link p5Lists}) against its record now. */
+function p5Check(before: ReadonlyMap<string, OverrideList>, kind: string): Failure[] {
+  const seams = shadowSeams();
+  if (!seams) return [];
+  const now = new Map(seams.records().map((r) => [r.rootGuid, r] as const));
+  for (const [guid, list] of before) {
+    const rec = now.get(guid);
+    if (!rec) { ran(`P5 not compared after ${kind}: no record`); continue; }
+    const judged = seams.judge ? seams.judge(rec) : rec.list;
+    if ('skip' in judged) { ran(`P5 not compared after ${kind}: ${judged.skip}`); continue; }
+    ran('P5 compared a record');
+    ran(`P5 compared after ${kind}`);
+    const d = p5Diff(list, rec.list);
+    if (d) return [{ check: 'P5 a record-neutral op changed a record', detail: `${guid} ${d}` }];
+  }
+  return [];
+}
+
 /** #2009, P1 by the FOLD (S1's parser and S2's fold, before S5's `reproject` exists): after every op, each top-level
  *  instance's LIVE tree is `foldInstance(parse(entry))` of the entry the scene serializes for it now — the comparison
  *  is #2007's oracle (`foldOracle.ts` `checkInstance`, the rules' two placeholder translations included), asked of
@@ -353,7 +387,9 @@ async function shadowChecks(seams: ShadowSeams, kind: string): Promise<Failure[]
  *  change on its next reload. The reader is what the editor holds: the runtime cache (a parked write, #1868), then disk. */
 export function foldCheck(be: FuzzBackend, scene: { entities?: SceneEntityEntry[]; embeddedPrefabs?: unknown }): Failure[] {
   const read: PrefabReader = (g) => {
-    const cached = getCachedPrefab(g) as PrefabDoc | undefined;
+    // The editor cache after the runtime one, as the editor's own reader (`editorPrefabReader`): an undo parks the document
+    // it restores there (#1868), and a guid the runtime cache does not key (a Create Prefab's) read the file it left (8262).
+    const cached = (getCachedPrefab(g) ?? getCachedPrefabSync(g) ?? undefined) as PrefabDoc | undefined;
     if (cached) return { doc: cached };
     const p = resolveGuidToPath(g);
     const text = p ? be.read(p) : undefined;
@@ -563,7 +599,7 @@ const FINAL_ROUND_TRIP: Op = { kind: 'saveReload', u: [0, 0, 0, 0, 0, 0, 0, 0] }
 export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts): Promise<RunResult> {
   const trace: string[] = [];
   consoleErrors.length = 0;
-  const f = await startRun(be, setupNest, JSON.stringify(ops));
+  const f = await startRun(be, setupNest, JSON.stringify(ops), opts.runTag);
   const st: RunState = { be, f, clip: null, touched: { drop: new Set(), paste: new Set(), detach: new Set(), create: new Set(), agent: new Set(), fileDirect: new Set() }, lastPrefabs: new Map(), created: [] };
   recordPrefabs(st);
   const history: LocalIdHistory = new Map();
@@ -606,6 +642,10 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // a member taken out of its template, a trashed or renamed prefab). None is an explicit act on an instance, so the
     // scene must state every record afterwards too (Unity's unused overrides; docs/prefabs.md § I18, I23).
     const recordsBefore = RECORD_NEUTRAL.has(op.kind) && !editing() ? recordKeys(JSON.stringify(await serializeScene())) : undefined;
+    // P5 (design § 3.5, #2046 S7): the same audit asked of the DATA. Every record the shadow judges before a record-neutral
+    // op must hold the same list after it. Only once seams are installed; a record the op leaves stale is not compared
+    // (its op has not moved onto records yet), counted per reason.
+    const p5Before = RECORD_NEUTRAL.has(op.kind) && !editing() ? p5Lists() : undefined;
     // Taken before the op, for the rebuild ≡ reload check the generator wrote into it (#1880 T2).
     const sBefore = op.check === 'rebuild-reload' && !editing() ? await serializeScene() : undefined;
     let outcome: string;
@@ -637,6 +677,10 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     const logged = consoleErrors.splice(0);
     const errors = logged.filter((m, k, all) => !opts.expectedError(m, all[k - 1]));
     if (errors.length) return fail(i, label, { check: 'console.error', detail: errors[0].slice(0, 300) });
+    // P5 is judged here, before the T2 check below: that check reloads the scene, after which every record is the file's
+    // parse, which states a list in its own form (a removal the template made redundant goes unstated) — the reload's
+    // doing, not the op's (hunt seed 8624).
+    const p5Failures = p5Before && outcome === 'done' && !editing() ? p5Check(p5Before, op.kind) : [];
     // A T2 op that did not land is counted too (close-out re-review): it checked nothing, and the tally must say so.
     if (sBefore !== undefined && outcome !== 'done') ran(`rebuild≡reload after ${op.kind}: not run (the op was ${outcome})`);
     if (sBefore !== undefined && outcome === 'done') {
@@ -692,6 +736,7 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
       const lost = [...recordsBefore].filter((k) => !now.has(k));
       if (lost.length) failures.push({ check: 'I23 a record no act removed was dropped', detail: `${lost[0]}${lost.length > 1 ? ` (+${lost.length - 1} more)` : ''}` });
     }
+    failures.push(...p5Failures);
     if (!editing()) {
       try {
         const scene = await serializeScene();

@@ -19,7 +19,7 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, setRunMode, readTraitData, writeTraitField,
   loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
-import { clearHistory, setActionCallback, pushAction, undo, redo } from '@modoki/engine/editor';
+import { clearHistory, setActionCallback, pushAction, undo, redo, writeTraitFieldWithUndo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { revertOverridesSelective } from '../../packages/modoki/src/editor/scene/prefabRevert';
@@ -137,7 +137,10 @@ describe('a rebuild keeps the instance in the scene that owns it (#1431)', () =>
 describe('a revert on a base\'s instance dirties the base (#1431)', () => {
   const xOf = (name: string) => readTraitData(getAllEntities().find((e) => e.name === name)!.id, getTraitByName('Transform')!)?.x as number;
   async function revertSlotX() {
-    writeTraitField(getAllEntities().find((e) => e.name === 'Slot')!.id, getTraitByName('Transform')!, 'x', 5);
+    // Through the door (#2046 S7: a Revert takes a RECORD off; a raw write records nothing, and a reload would drop it).
+    writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Slot')!.id, getTraitByName('Transform')!, 'x', 5);
+    clearHistory(); // the write's own entry and dirt are not what this measures: the Revert's push is
+    clearSceneDirty(BASE);
     const result = (await revertOverridesSelective(rootId(), new Set(['2.Transform.x'])))!;
     expect(xOf('Slot')).toBe(0); // precondition: the revert happened
     pushAction({ label: 'Revert prefab overrides', undo: () => {}, redo: () => {}, affectedScenes: result.affectedScenes });

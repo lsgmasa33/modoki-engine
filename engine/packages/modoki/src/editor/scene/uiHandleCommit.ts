@@ -13,7 +13,8 @@ import { entityRef } from '../undo/entityRef';
 import { placeholderGestureRefusal } from '../undo/entityActions';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes } from './sceneDirty';
-import { recordOverridesByDiff, markStateOf, putMarkState } from '../undo/overrideMarkWrites';
+import { recordOverridesByDiff, markStateOf, putMarksOnly, putFieldRows } from '../undo/overrideMarkWrites';
+import * as instanceEdits from '../instance/instanceEdits';
 
 export type UIHandleTrait = 'UIElement' | 'UIAnchor';
 
@@ -50,15 +51,21 @@ export function commitUIHandleDrag(
   if (placeholderGestureRefusal([entityId], trait)) { writeUIHandleValues(entityId, trait, { ...before }); return; }
   // Marks are untouched since the drag started (its live writes are raw), so this is the state the undo restores.
   const oldMarks = markStateOf(entityId, trait, changed);
+  // From a record fresh before the commit, or none: the drag already wrote live, so a re-seed would capture the dragged
+  // values (review F1). Without them the step marks the records stale, as a step that keeps none.
+  const oldRows = instanceEdits.priorRowsOf([entityId]);
   recordOverridesByDiff(entityId, meta, changed);
   const newMarks = markStateOf(entityId, trait, changed);
+  const newRows = oldRows && instanceEdits.rowsOf([entityId]);
   const ref = entityRef(entityId);
   const b = { ...before }, a = { ...after };
   pushAction({
     label,
     // `require` (I19): a target that is gone, or a placeholder now, refuses rather than reading as done.
-    undo: () => { const id = ref.require(); writeUIHandleValues(id, trait, b); putMarkState(id, trait, oldMarks); },
-    redo: () => { const id = ref.require(); writeUIHandleValues(id, trait, a); putMarkState(id, trait, newMarks); },
+    // Each side's marks and rows go back exactly (#2046 S7.2, rule 8).
+    undo: () => { const id = ref.require(); writeUIHandleValues(id, trait, b); putMarksOnly(id, trait, oldMarks); putFieldRows([id], oldRows, trait, changed); },
+    redo: () => { const id = ref.require(); writeUIHandleValues(id, trait, a); putMarksOnly(id, trait, newMarks); putFieldRows([id], newRows, trait, changed); },
+    ...(oldRows ? { maintainsRecords: true as const } : {}),
     // Without it the scene the member belongs to was never marked dirty, so a save could skip it.
     affectedScenes: resolveAffectedScenes([entityId]),
   });

@@ -7,6 +7,8 @@
  *  plus throwaway lights + an HDR environment so the prefab is visible. On save we
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
+import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
+import { bankInstanceRecords, cloneInstanceStore, dropRecordBank, steadyRecords, type RecordBank } from '../../runtime/prefab/recordBank';
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { onGuidRemap, remapGuidMapKeys } from '../../runtime/core/ecs/guidRemap';
 import type { Entity, World } from 'koota';
@@ -20,7 +22,7 @@ import { getCachedPrefabSync, preloadNestedPrefabs, fetchPrefabSource, prefabRea
 import { serializePrefab } from './prefabSerialize';
 import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
-import { collectResourceRefs, getCurrentScenePath, saveScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
+import { collectResourceRefs, getCurrentScenePath, saveScene, serializeScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { peekDirtyAsset } from './dirtyAssets';
 import { beginFreshFileRead } from './freshFileRead';
 import { captureSavePoint } from '../undo/undoManager';
@@ -442,22 +444,30 @@ export async function openPrefabForEditing(
   const stillNewest = beginWorldRequest();
   // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
   const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
+  const banked: OpenBank = {};
   try {
     // The undo in flight finishes BEFORE the fetch below (#1579 close-out review): an Apply undo installs the prefab
     // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
     // the edit world was built from the applied document, and saving it put the Apply back on disk.
     if (worldSwitch.idle) await worldSwitch.idle;
-    return await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready, stillNewest);
+    return await openPrefabForEditingSwitching(asset, opts, worldSwitch.ready, stillNewest, banked);
   } finally {
     worldSwitch.release();
+    // An open that banked the scene's records and then did not enter (refused, superseded, its load failed) leaves no
+    // bank for a later load of that scene to take (#2046 S7 close-out review).
+    if (banked.bank && !banked.entered) dropRecordBank(banked.key!, banked.bank);
   }
 }
+
+/** The bank an edit-open made of the scene's records (`bankSceneRecords`), and whether the open entered the edit world. */
+interface OpenBank { key?: string; bank?: RecordBank; entered?: boolean }
 
 async function openPrefabForEditingSwitching(
   asset: { path: string; name: string },
   opts: { confirmDiscard?: (action: string) => Promise<boolean>; discardUnsaved?: boolean },
   switchReady: () => Promise<void> | null,
   stillNewest: () => boolean,
+  banked: OpenBank,
 ): Promise<EditOpenRefusal | undefined> {
   // The read's token, taken before the fetch (#1752, `prefabRead.ts`): a write landing during it seats the newer document,
   // and seeding this one after it put the older bytes back in both caches — then built the edit world from them.
@@ -543,6 +553,7 @@ async function openPrefabForEditingSwitching(
   if (refused) return refused;
   if (getCurrentScenePath() && !opts.discardUnsaved) await saveScene();
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
+  Object.assign(banked, await bankSceneRecords());
   // The REQUEST-order check `loadScene` makes after its `ready()` (#1700), here after the last await before the swap: a
   // newer request made while this one waited — the human's dialog above can stay open indefinitely — owns the world, and
   // swapping now would replace the newer scene with this older request's edit world. The world rule cannot see it: after
@@ -594,6 +605,7 @@ async function openPrefabForEditingSwitching(
     // cancel this open and the swap can fail or be replaced — and the session still open (another prefab's) would be left
     // with no baseline, refusing every save, including the gate's own Save of it.
     editBaseline = { guid, doc: opened };
+    banked.entered = true;
     // The caches hold the file and the world edits it: what the release would do in prefab edit (caches only) is done.
     // Not at the seed: an open cancelled after it leaves the scene world, whose instances the release must still rebase.
     fileRead?.landed();
@@ -1047,7 +1059,7 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
  *  Returns the scene path we returned to, or null when there was nothing to go
  *  back to (the store flag is cleared either way, so the editor is never left
  *  stuck in a prefab-edit mode with no prefab world). */
-export async function exitPrefabEditing(): Promise<string | null> {
+async function exitPrefabEditingUnmarked(): Promise<string | null> {
   const target = returnSceneTarget();
   const since = adoptionCount();
   if (target) await loadScene(target);
@@ -1058,6 +1070,29 @@ export async function exitPrefabEditing(): Promise<string | null> {
   // not by the outcome: a load superseded by one that then failed reads 'superseded' and still adopted.
   await endPrefabEditInPlace(since);
   return target;
+}
+
+// #2046 S7.6: the Exit's reload of the return scene takes back the records the open banked (`bankSceneRecords`) where its
+// file still states them, and parses fresh ones elsewhere — so a leave that reloaded a scene marks nothing. One with no
+// scene to go back to, or that throws, marks the store stale, as before.
+export const exitPrefabEditing = staleAroundUnless('prefabLeave', exitPrefabEditingUnmarked, (target) => target !== null);
+
+/** Bank the scene world's exact records for the Exit's reload of its file (`recordBank.ts`), with the entries the world
+ *  serializes to now — after the open's save, so they are the file's when that save landed. A world with no file (an
+ *  untitled scene, or an edit world opening another prefab: the outer open's bank stands) banks nothing. An entry the
+ *  file no longer states as banked (a save that failed or was skipped, an outside edit while away) keeps its parse. */
+async function bankSceneRecords(): Promise<{ key: string; bank: RecordBank } | undefined> {
+  const key = sceneManager.getCurrent()?.path;
+  if (!getCurrentScenePath() || !key) return undefined;
+  const world = getCurrentWorld();
+  const recordsAt = cloneInstanceStore(world); // before the await: see `steadyRecords`
+  try {
+    const { entities } = await serializeScene();
+    if (getCurrentWorld() === world) return { key, bank: bankInstanceRecords(key, steadyRecords(recordsAt, world), entities as unknown as SceneEntityEntry[], 'prefabLeave') };
+  } catch (err) {
+    console.warn(`[PrefabEdit] the scene's instance records were not banked for the return (#2046 S7.6): ${(err as Error)?.message ?? err}`);
+  }
+  return undefined;
 }
 
 /** The scene an Exit from the current prefab edit would reload, or null for none: the one choice `exitPrefabEditing`

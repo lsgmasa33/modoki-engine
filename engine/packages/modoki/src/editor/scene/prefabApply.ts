@@ -49,7 +49,8 @@ import {
   carryPromotedGuids, deletePromotedNodes, insertAddedSubtree, movedRowsOf, promoteReferenceMoves,
   rehangPromotionSurvivors, snapshotPromotedGuids,
 } from './prefabApplyStructure';
-import { staleAround } from '../../runtime/prefab/instanceStore';
+import { markStale } from '../../runtime/prefab/instanceStore';
+import { guidOfEntity, outermostStoredRoot, storedRootsUnder } from '../instance/instanceKeys';
 
 /** A frame root's durable guid ('' when it has none): what an Apply's plan names a frame by, since the ids it holds can be
  *  dead or recycled once an earlier write's refresh has rebuilt the scene entry around it (#1880 F6). */
@@ -1303,6 +1304,8 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   // Several files are ONE step (#1692's `commitPrefabWrites`): U13's second file, or an override on an enclosing prefab,
   // lands with the frame's own or not at all.
   const committed = await commitPrefabWrites(plan.writes.map((w) => ({ source: w.source, doc: w.doc, expected: w.expected })), {
+    // Each refresh below marks stale what it rebuilds from the capture, and the export marks the applying tree (#2046 S7.3).
+    maintainsRecords: true,
     rebuild: async () => {
       // Delete the live plain entities for applied additions BEFORE any refresh, so the re-instantiated prefab member
       // replaces them instead of duplicating. Before the loop, not in the frame's turn: an added node written only into an
@@ -1391,6 +1394,22 @@ async function commitApplyPlan(plan: ApplyPlan): Promise<ApplyResult> {
   };
 }
 
-// #2001 S4 (#2014): these ops do not maintain the instance list yet (S7 moves them onto records), so each marks the
-// store stale once it finishes — wrapped here, at the export, so no return path can skip it (`instanceStore.ts`).
-export const applyToPrefabSelective = staleAround('apply', applyToPrefabSelectiveUnmarked);
+/** {@link applyToPrefabSelectiveUnmarked}, keeping the instance store's records true (#2046 S7.3). The fan-out reprojects
+ *  every other tree from its record and marks stale the entries it rebuilt from the capture (`refreshInstances`); the
+ *  applying tree is one of those (its applied records leave it by the capture's subtraction, U15), marked here too for
+ *  what the Apply did to it outside the refresh (a promotion's keys, its survivors' re-hang). Every record when it
+ *  throws part-way. */
+export const applyToPrefabSelective: typeof applyToPrefabSelectiveUnmarked = async (rootInstanceId, ...rest) => {
+  const world = getCurrentWorld();
+  const top = outermostStoredRoot(rootInstanceId) || rootInstanceId;
+  const entry = guidOfEntity(top);
+  // Every stored root in the entry NOW, by guid: a promoted scene-added instance is a row after the Apply.
+  const before = [top, ...storedRootsUnder(top)].map(guidOfEntity);
+  let out: ApplyResult;
+  try { out = await applyToPrefabSelectiveUnmarked(rootInstanceId, ...rest); } catch (err) { markStale(getCurrentWorld(), 'apply'); throw err; }
+  if (out.applied || out.landed) {
+    const id = findEntityByGuid(entry)?.id();
+    markStale(world, 'apply', [...before, ...(id ? storedRootsUnder(id).map(guidOfEntity) : [])]);
+  }
+  return out;
+};

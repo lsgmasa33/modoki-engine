@@ -13,25 +13,37 @@ import { pushAction } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
 import { entityRef } from './entityRef';
 import { useEditorStore } from '../store/editorStore';
-import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { preloadRebuildEntry, keptEnclosingSource } from '../scene/prefabRebuild';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
-import { rebuildFrameFromSide, preloadRebuildEntry } from '../scene/prefabRebuild';
-import { revertOverridesSelective, unrecordReverted, type RevertResult } from '../scene/prefabRevert';
+import { readTraitData } from '../../runtime/core/ecs/entityUtils';
+import { revertOverridesSelective, type RevertResult } from '../scene/prefabRevert';
+import { restoreSide, type RecordsSide } from '../instance/instanceHistory';
 
 /** Revert the selected overrides on instance `rootInstanceId` AND record one undo entry. Resolves the Revert's result,
  *  or null when nothing was reverted (see `revertOverridesSelective`). Selects the rebuilt root. The caller gives a
- *  stale-instance refusal its own words first (`staleInstanceRefusal`) — Revert's null cannot carry one (#1483). */
+ *  stale-instance refusal its own words first (`staleInstanceRefusal`) — Revert's null cannot carry one (#1483).
+ *
+ *  Undo and redo put back the EXACT records the Revert changed (#2001 S7, rule 8) and rebuild the instance tree from
+ *  them, onto the editor's CURRENT documents (#1665): a template change in between reaches the instance as a reload
+ *  would show it. Nothing is re-derived from a capture. */
 export async function revertOverridesWithUndo(rootInstanceId: number, selectedKeys: Set<string>): Promise<RevertResult | null> {
   const result = await revertOverridesSelective(rootInstanceId, selectedKeys);
   if (!result) return null;
-  // The rebuild assigns new ECS ids but keeps the instance root's guid (`rebuildFromEntry` carries it over), so a
-  // guid-based ref re-finds the live root across each rebuild AND across a world rebuild (Play→Stop).
-  const ref = entityRef(result.newRootId);
   useEditorStore.getState().selectEntity(result.newRootId);
-  const { source, fullSide, reducedSide, reverted, affectedScenes } = result;
+  const { source, frameGuid, topGuid, before, after, affectedScenes } = result;
+  // The tree is rebuilt from the reverted FRAME upward (`projectionRootOf`): the root that held it at the Revert can be a
+  // Missing Prefab placeholder by now (its prefab trashed and the scene reloaded), with the frame still shown under it.
   // Both directions rebuild an instance ROOT of `source` (I20). After a world swap its guid can name a Missing Prefab
-  // placeholder (the prefab was deleted), and rebuilding from the capture expanded a second instance on the
-  // placeholder's guid beside it (#1819, I7). `require` refuses that, and a root that is gone, before anything changes.
+  // placeholder (the prefab was deleted), or a plain entity, and rebuilding there expanded a second instance on the
+  // guid beside it (#1819, I7). A frame inside a frame the rebuild keeps live (#1862) would be left as it is, so the step
+  // would change nothing while reporting that it did (#1880 F7d close-out review 1). Each is refused before anything
+  // changes, as Apply's undo refuses (#1664): `runStep` drops the entry (#310) and toasts the reason.
+  // Both directions rebuild an instance ROOT of `source` (I20), found by the frame's durable guid, which every rebuild
+  // keeps — across a world swap too (Play→Stop). `require` refuses a frame that is gone, one that is now a Missing Prefab
+  // placeholder (its prefab deleted, #1819: rebuilding there expanded a second instance on its guid), and one that is no
+  // instance of `source` any more, each in its own words, before anything changes (#1664): `runStep` drops the entry.
+  const ref = entityRef(result.newRootId);
   const expect = {
     check: (id: number) => {
       const meta = getTraitByName('PrefabInstance');
@@ -39,31 +51,27 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
       return pi && pi.rootInstanceId === id && pi.source === source ? null : `is no longer an instance of ${source}`;
     },
   };
-  const rebuildTo = async (side: RevertResult['fullSide'], unrecord: readonly string[] = []) => {
-    const cur = ref.require(expect);
-    // The rebuild is a sync load of the instance's whole scene entry, and a prefab missing from the cache reads as one it
-    // cannot expand (#1284, #1880 F7a). undoManager awaits undo/redo under its own mutex, so awaiting here is supported
-    // rather than merely tolerated.
-    await preloadRebuildEntry(cur);
-    const after = ref.require(expect); // asked again: the await above can span a world swap
-    const id = rebuildFrameFromSide(after, side);
-    if (id != null) unrecordReverted(id, unrecord);
-    // Refused BEFORE anything was rebuilt, as Apply's undo refuses (#1664): `runStep` drops the entry (#310) and, since
-    // nothing changed, dirties nothing and toasts the reason rather than a bare "FAILED".
-    if (id == null) {
+  const restore = async (side: RecordsSide) => {
+    await preloadRebuildEntry(ref.require(expect));
+    const frame = ref.require(expect); // asked again: the await above can span a world swap
+    // A frame inside a frame the rebuild keeps live (#1862) would be left as it is: the step would change nothing while
+    // reporting that it did (#1880 F7d close-out review 1).
+    const done = !keptEnclosingSource(frame) ? restoreSide(side, frameGuid || topGuid) : null;
+    if (!done) {
       throw new UndoRefusedError(
         `the scene entry holding this instance of "${source}" is gone, or its prefab or one around it cannot be read ` +
           '(trashed), so the Revert cannot be put back or re-applied onto it; nothing was changed.',
         'the scene entry holding this instance is gone, or its prefab or one around it cannot be read',
       );
     }
-    useEditorStore.getState().selectEntity(id);
+    useEditorStore.getState().selectEntity((frameGuid && findEntityByGuid(frameGuid)?.id()) || done.root);
   };
   pushAction({
     label: 'Revert prefab overrides',
     affectedScenes,
-    undo: () => rebuildTo(fullSide),
-    redo: () => rebuildTo(reducedSide, reverted),
+    maintainsRecords: true,
+    undo: () => restore(before),
+    redo: () => restore(after),
   });
   return result;
 }

@@ -48,6 +48,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   // A rebuild ends with the load's derive pass (#1387), which indexes each guid it mints.
   indexEntityGuid: () => {},
   findEntityById: (id: number) => index.get(id),
+  // By the guid EntityAttributes holds: the refresh names the entries it rebuilt by guid (#2046 S7.3).
+  findEntityByGuid: (g: string) => [...index.values()].find((e: any) => e.has(EntityAttributes) && e.get(EntityAttributes).guid === g),
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   // The pre-capture snapshot of the tree's unkeyed nodes (#1884, `capturedKeys.ts`).

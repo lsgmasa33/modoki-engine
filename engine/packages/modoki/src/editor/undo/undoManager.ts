@@ -72,6 +72,10 @@ export interface UndoAction {
    *  for a reparent. Merged into the emitted event and snapshot-cloned at emit so the
    *  record is immutable. Plain serializable data only. */
   journalPayload?: Record<string, unknown>;
+  /** #2001 S7 (#2046): this action's undo and redo put back the exact instance records they change (rule 8,
+   *  `editor/instance/instanceHistory.ts`), so the store stays fresh after them. A step that FAILS still marks it stale:
+   *  it may have stopped partway. */
+  maintainsRecords?: true;
   /** Internal tag for coalescing consecutive selection-only actions */
   _isSelection?: boolean;
   /** This action's undo/redo/initial-apply writes straight to a FILE (e.g.
@@ -744,6 +748,8 @@ export function pushAction(action: UndoAction) {
         && _coalesce && _coalesce.key === action.coalesceKey
         && now - _coalesce.at <= COALESCE_MS) {
       top.redo = action.redo;     // advance to the latest value…
+      // The merged entry maintains the records only when both halves do: its undo is the first's, its redo the latest's.
+      if (!action.maintainsRecords) delete top.maintainsRecords;
       top.label = action.label;   // …keep the ORIGINAL undo (pre-chain state)
       if (edits) recordForward(top, action.affectedScenes ?? []); // …and a new state, leaving the chain's `before`
       // NOTE: we deliberately do NOT advance `top.detail` here. The `!edit` journal
@@ -1028,14 +1034,19 @@ export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
     _coalesce = null; // any explicit undo/redo ends the current edit chain
     const action = (direction === 'undo' ? undoStack : redoStack).pop();
     if (!action) return { did: false, label: null, refused: null, failed: null, shortfall: null, dropped: false };
+    // …and stale BEFORE it runs too: a rebase inside the step reads the store (#2046 S7.3), and a record this step is
+    // about to leave behind must send it to the capture instead of reprojecting the step's work away.
+    const at = peekCurrentWorld();
+    if (at && !action.maintainsRecords) markStale(at, direction);
     const { ok, failed, shortfall, dropped } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
-    // #2001 S4: undo and redo do not maintain the instance list yet (S7: "undo restores the exact list", rule 8), so
-    // every record is stale after one, whatever the step touched or refused (`runtime/prefab/instanceStore.ts`).
-    // The world current NOW (an undo can swap it), and none is made: no world, no records.
+    // #2001 S4: a step that does not maintain the instance list (S7 moves each onto records: "undo restores the exact
+    // list", rule 8) leaves every record stale, whatever it touched or refused (`runtime/prefab/instanceStore.ts`). One
+    // that does (`maintainsRecords`) leaves them fresh, unless it failed. The world current NOW (an undo can swap it),
+    // and none is made: no world, no records.
     const world = peekCurrentWorld();
-    if (world) markStale(world, direction);
+    if (world && (!action.maintainsRecords || failed)) markStale(world, direction);
     return { did: ok, label: action.label, refused: null, failed, shortfall, dropped };
   });
 }

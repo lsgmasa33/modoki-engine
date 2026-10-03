@@ -104,6 +104,21 @@ export function storedRootsUnder(entityId: number): number[] {
   return out;
 }
 
+/** The root a reprojection of the tree holding `entityId` rebuilds: the OUTERMOST stored root above it (F6-U (i)) that is
+ *  no Missing Prefab placeholder and lies under none. A reference node the scene added at a placeholder's root still shows
+ *  there (#2018) with a record of its own; the placeholder above it has nothing to project (rule 9), so the node is the
+ *  unit. 0 when `entityId` is in no instance that can be projected. */
+export function projectionRootOf(entityId: number): number {
+  let unit = 0;
+  const { byId } = handles();
+  for (const id of storedRootsAbove(entityId)) {
+    const e = byId.get(id);
+    if (!e || unresolvedRefOf(e as never)) break;
+    unit = id;
+  }
+  return unit;
+}
+
 export function guidOfEntity(id: number): string {
   return handles().guidOf(id);
 }
