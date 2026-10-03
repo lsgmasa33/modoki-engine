@@ -1127,6 +1127,19 @@ every reader takes it.
     fired, but it was wrong on two axes if it ever had — backslashed on win32 **and** cwd-relative
     rather than repo-relative, so every forward-slash `OWNERS` row would have missed at once. Dropped
     rather than normalised: the fallback had no reachable caller to serve.
+  - ⚠️ **Instance 11 (#2126) was the rel-discard shape again, with no backslash in it — the two
+    spellings were of the ROOT.** `check-prefab-churn.mjs` wrote `.map(({ abs }) => abs)` and then
+    `path.relative(ROOT, abs)`, with `abs` joined onto git's toplevel and ROOT from the script's own
+    `import.meta.url`. On the `windows-latest` runner `os.tmpdir()` is the 8.3 short name
+    (`C:\Users\RUNNER~1`) and git reports the long one, so the rel came out as
+    `../../../../../runneradmin/…`, `git show HEAD:<rel>` refused it with 128, and `isGitVerdict`
+    rightly read that as git's verdict: every committed prefab printed `NEW FILE (untracked)` and its
+    diff was skipped. Separator normalisation cannot fix this — the `.split(path.sep).join('/')` was
+    there. Only KEEPING git's `rel` does, which is the fix. A symlink does NOT reach it in normal use —
+    Node realpaths the main module, and that realpath expands a symlink but not an 8.3 name — so
+    its macOS test forces the symlink spelling with `--preserve-symlinks-main`. The script had sat in
+    `corpusConsumerPins`' `NOT_A_GUARD` as *"it asserts nothing"*, which is true and beside the point:
+    a review gate that skips a diff is a false green to the person reading it.
 - **A path-valued field on a PERSISTED record is normalised by the module that owns the record, on
   READ as well as on write — never by each caller** (#849). `deviceClaimsStore.mjs` does this
   (`foreignClaimFor`, `ownAdbClaim`: `path.resolve(held.clone) === clone`); `buildClaimsStore.mjs`

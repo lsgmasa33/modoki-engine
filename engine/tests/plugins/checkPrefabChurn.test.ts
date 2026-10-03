@@ -40,8 +40,9 @@ const write = (repo: string, rel: string, data: unknown): void => {
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, `${JSON.stringify(data, null, 2)}\n`);
 };
-const run = (repo: string): { status: number; out: string } => {
-  const r = spawnSync('node', [path.join(repo, SCRIPT_REL), 'games/x'], { cwd: repo, encoding: 'utf8' });
+/** `nodeArgs` lets a test run the script under a path spelling git does not report (#2126). */
+const run = (repo: string, nodeArgs: string[] = []): { status: number; out: string } => {
+  const r = spawnSync('node', [...nodeArgs, path.join(repo, SCRIPT_REL), 'games/x'], { cwd: repo, encoding: 'utf8' });
   return { status: r.status ?? -1, out: `${r.stdout}${r.stderr}` };
 };
 
@@ -111,5 +112,32 @@ describe('check-prefab-churn reads a reference row\'s statement', () => {
     // Stated in both forms for one member: which wins is the parser's rule, not this module's.
     expect(rowStatement({ overrides: { 1: { Transform: { x: 3 } } }, members: { '/': { traits: { Transform: { x: 4 } } } } }, inner)).toBeNull();
     expect(canonicalJson(rowStatement({ prefab: P }, inner))).toBe('{}');
+  });
+});
+
+/** #2126: the script ran from a path spelled differently from git's toplevel — on the Windows runner `os.tmpdir()` is the
+ *  8.3 short name (`C:\\Users\\RUNNER~1`) and git reports the long one. The script recomputed each file's repo path as
+ *  `path.relative(ROOT, abs)` between the two spellings, got `../../../../runneradmin/…`, and `git show HEAD:<that>` failed
+ *  — read as "not in HEAD", so every committed prefab printed NEW FILE (untracked) and its diff was skipped. A Mac has no
+ *  short names, so the same mechanism is driven here by a symlink: `--preserve-symlinks-main` keeps the script's own path
+ *  (its ROOT) in the link's spelling, while git reports the real directory.
+ *
+ *  Mutation (measured): `rel` recomputed as `path.relative(ROOT, abs)` again — this test prints NEW FILE (untracked)
+ *  and `rewritten: 0`. */
+describe('check-prefab-churn under a path spelling git does not report (#2126)', () => {
+  it('diffs a committed prefab instead of reporting it untracked', () => {
+    tmp = makeRepo();
+    write(tmp, P_REL, inner);
+    write(tmp, O_REL, outer(5, { overrides: { 2: { Transform: { x: 3 } } } }));
+    git(tmp, ['add', '-A']);
+    git(tmp, ['commit', '-q', '-m', 'base']);
+    write(tmp, O_REL, outer(10, { members: { [`/${gA}`]: { traits: { Transform: { x: 4 } } } } }));
+    // The link lives in its own scratch dir so the afterEach's rm of `tmp` and the scratch cleanup each own one thing.
+    const link = path.join(makeScratchDir('modoki-prefab-churn-link-'), 'repo');
+    fs.symlinkSync(tmp, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const { out } = run(link, ['--preserve-symlinks-main']);
+    expect(out).not.toMatch(/NEW FILE|outside repository/);
+    expect(out).toMatch(/rewritten: 1 /);
+    expect(out).toMatch(/NESTED N#2\.members absent -> .*"x":4/);
   });
 });

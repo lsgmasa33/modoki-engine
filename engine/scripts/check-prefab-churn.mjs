@@ -71,7 +71,7 @@ function findPrefabs(proj) {
     match: /\.prefab\.json$/,
     exclude: ['ios', 'android'],
     floor: 0,
-  }).map(({ abs }) => abs).sort();
+  });
 }
 
 // `members` is where a v10 row states everything the older channels did (#2001 S6); `moved` / `templateMoved` are the
@@ -88,7 +88,7 @@ let totalPrefabs = 0, totalChanged = 0, problems = 0, regressions = 0, restated 
 const nestedById = new Map();
 for (const proj of process.argv.slice(2)) {
   if (!fs.existsSync(path.join(ROOT, proj))) continue;
-  for (const abs of findPrefabs(proj.split(path.sep).join('/'))) {
+  for (const { abs } of findPrefabs(proj.split(path.sep).join('/'))) {
     try { const d = parseJsonText(fs.readFileSync(abs, 'utf8')); if (typeof d?.id === 'string') nestedById.set(d.id, d); }
     catch { /* reported as UNPARSEABLE by the main loop when it changed */ }
   }
@@ -100,11 +100,16 @@ for (const proj of process.argv.slice(2)) {
   const files = findPrefabs(proj.split(path.sep).join('/'));
   if (!files.length) { console.log(`${proj}: no prefabs`); continue; }
 
-  for (const abs of files) {
-    // POSIX-normalized — see check-scene-churn.mjs: git tree paths are forward-slash on every
-    // OS, so an un-normalized rel makes every `git show` throw on Windows and every committed
-    // prefab report as "NEW FILE (untracked)".
-    const rel = path.relative(ROOT, abs).split(path.sep).join('/');
+  for (const { rel, abs } of files) {
+    // `rel` is git's own repo path, used verbatim — never recomputed as `path.relative(ROOT, abs)`
+    // (#2126). `abs` is spelled from git's toplevel and ROOT from this file's own path, and the two
+    // can differ for one directory: on Windows an 8.3 short name (`C:\Users\RUNNER~1`, the CI
+    // runner's `os.tmpdir()`) against git's long one — Node's realpath of the main module does not
+    // expand short names. (A symlink reaches it only under `--preserve-symlinks-main`, which is how
+    // the test drives it on a Mac.) The relative path between them climbs out of the repo, `git show`
+    // refuses it with status 128, and that verdict reads as "not in HEAD" — every committed prefab
+    // printed "NEW FILE (untracked)" and its diff was skipped. It is also already POSIX, which the
+    // `git show` below needs on Windows (the note in check-scene-churn.mjs).
     totalPrefabs++;
     let old;
     // ⚠️ `maxBuffer`: Node defaults to 1 MiB, and the largest tracked prefab is

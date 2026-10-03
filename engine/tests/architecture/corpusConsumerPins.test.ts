@@ -81,7 +81,6 @@ const SELF = 'engine/tests/architecture/corpusConsumerPins.test.ts';
  *  detection with no staleness check, so a script that gained a pin, stopped discarding `rel`, or
  *  was deleted kept its row forever. */
 const NOT_A_GUARD: ReadonlyArray<{ item: string; reason: string }> = [
-  { item: 'engine/scripts/check-prefab-churn.mjs', reason: 'a churn report script — it asserts nothing' },
   { item: 'engine/scripts/migrate-font-family-refs.mjs', reason: 'a one-shot migration — it rewrites files and vouches for nothing' },
 ];
 
