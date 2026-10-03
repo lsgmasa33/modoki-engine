@@ -54,7 +54,8 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { getTraitByName } from '../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 import { openPrefabForEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { loadScene, setCurrentScenePath, markSceneSaved } from '../../packages/modoki/src/editor/scene/serialize';
+import { loadScene, setCurrentScenePath, markSceneSaved, adoptWorldReloadedFromDisk, clearUnreadableScenes } from '../../packages/modoki/src/editor/scene/serialize';
+import { SceneFormatRefusedError } from '../../packages/modoki/src/runtime/loaders/sceneFormatGate';
 import { _resetSceneAdoptionForTests } from '../../packages/modoki/src/editor/scene/sceneAdoption';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 import { _resetHistoryContexts, swapHistory } from '../../packages/modoki/src/editor/undo/undoManager';
@@ -77,7 +78,7 @@ function spawnNamed(name: string) {
 beforeEach(() => {
   for (const k of ['log', 'warn', 'info'] as const) vi.spyOn(console, k).mockImplementation(() => {});
   setRunMode('stopped'); _resetHistoryContexts(); swapHistory(''); setCurrentScenePath(null); markSceneSaved();
-  useEditorStore.getState().closePrefabEditor(); _resetSceneAdoptionForTests();
+  useEditorStore.getState().closePrefabEditor(); _resetSceneAdoptionForTests(); clearUnreadableScenes();
   sm.path = ''; sm.holdTail.clear(); writes.length = 0;
   // @ts-expect-error stub
   globalThis.fetch = vi.fn(async (url: string) => { const d = String(url).includes('Barrel') ? doc('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee2698', 'Barrel') : doc('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee1698', 'Crate'); return { ok: true, status: 200, text: async () => JSON.stringify(d), json: async () => d }; });
@@ -121,6 +122,24 @@ describe('a prefab edit-open saves the scene only when its caller keeps the edit
     releaseOther(); await load;
     expect(sm.path, 'premise: the newer load won').toBe(OTHER);
     expect(useEditorStore.getState().editingPrefab, 'premise: the edit-open did not enter').toBeNull();
+    expect(writes.filter((w) => w.path === SCENE)).toEqual([]);
+  });
+});
+
+// #2128: the open's auto-save can be refused because the scene's FILE is one this build refused to read — here a hot
+// reload refused a newer format written outside, leaving the old world bound to it. The save writes nothing, so the open
+// must not swap that world away either: it refuses, like a save the world rule refuses. Mutation checked: ignore the
+// save's `'unreadable-file'` (the pre-#2128 `await saveScene()`) → red; drop the save guard → red (Station is written).
+describe('a prefab edit-open over a scene file this build refused to read (#2128)', () => {
+  it('refuses: nothing is written to the newer file and the world on screen is kept', async () => {
+    await loadScene(SCENE);
+    writes.length = 0;
+    spawnNamed('Work');
+    const refusal = Object.assign(new SceneFormatRefusedError('Scene not loaded: its format version (99) is newer than this engine supports (20).', 'too-new'), { scenePath: SCENE });
+    await expect(adoptWorldReloadedFromDisk(SCENE, () => Promise.reject(refusal))).rejects.toBe(refusal);
+    const r = await openPrefabForEditing(P1);
+    expect(r).toMatchObject({ refused: expect.stringMatching(/refused to read .*Station\.json/) });
+    expect(useEditorStore.getState().editingPrefab).toBeNull();
     expect(writes.filter((w) => w.path === SCENE)).toEqual([]);
   });
 });

@@ -733,6 +733,71 @@ scene as-is would drop its pre-v8 shapes on the next save.
   the CURRENT terminal step's stamp follows the constant, and that stops being true the
   moment a new terminal step is added without moving the stamp to it.
 
+### A refused scene file is never a save target (#2128)
+
+A scene this build cannot read is **refused** at load (`assertSceneFormatReadable`: too new, too old,
+an unreadable version, and since #2128 a primary file that is not JSON at all). The refusal protects
+the file's bytes, and **a save is the one thing that can still destroy them.** It writes whatever world
+is on screen to whatever path is bound, so any route that binds a refused file to a world NOT read from
+it turns the refusal into data loss.
+
+**What happened (OBSERVED on v0.7.3 and main, QA-SCENE-0009/0010).** The boot walk
+(`createEditor.tsx`, `loadFirstScene`) refused its only candidate, a scene one format ahead. Then it ran
+its fallback, which builds the game's `initWorld` world and binds the **last candidate's** path to it,
+so a project whose configured scene does not exist yet saves there. That fallback never asked *why* the
+candidate missed. The refused Warp was bound to an empty world, and the next Cmd+S wrote
+`entities: []` over 37 entities. v0.7.3 also stamped a new scene id, so other scenes' base refs to it
+broke too. The explicit open was always safe: a refused `loadScene` never adopts, so the previous scene
+stays bound. Only the fallback bound a path without reading it.
+
+**The rule has two mechanisms. Either one alone keeps the file, and each has its own test**
+(`tests/editor/refusedSceneNeverSaveTarget.test.ts`):
+
+1. **The boot fallback binds nothing the walk refused** (`walkBootScenes`). The world is unbound,
+   `scenePath` is null, and a save asks for a path (Cmd+S opens Save As; an agent `save_all` answers
+   `needs-path`). A candidate that is **absent** is still bound. The two cases are told apart because
+   absence is a `'failed'` load (a 404, or the dev server's index.html fallback, `MissingAssetError`),
+   while a refusal is `'refused'`. ⚠️ **It is decided by the walk's OUTCOME, not by asking whether that
+   file was recorded as unreadable.** A scene refused because a **base** of its chain is too new is
+   readable itself, so only the base is recorded, and the first version of this fix bound that scene to
+   the empty world and emptied it (#2128 review).
+2. **Every write of a scene file refuses one a read refused, however its path got bound.** `saveScene`
+   (the bound path or an explicit one, checked before it serializes) answers `reason: 'unreadable-file'`,
+   with the read's own refusal in `error`. ⚠️ A **human** Cmd+S over the bound file is offered the Save
+   As panel instead, like an untitled scene. The editor has no other Save As for a scene, so a flat
+   refusal left work made after a refused hot reload with Discard as its only exit. Agents
+   (`allowDialog: false`) and the prefab edit-open's auto-save are refused. Save All's dirty **bases**
+   (`saveOtherLoadedScenes`) are refused the same way and stay dirty.
+
+**The record** (`_unreadableScenes`, `serialize.ts`) has four rules:
+
+- **Recorded** by every route that READS a scene file: `loadScene`'s refusal branch and the hot reload
+  (`adoptWorldReloadedFromDisk`). `SceneManager` stamps `SceneFormatRefusedError.scenePath` with the
+  file it actually refused. A load walks the primary AND its base chain, so a refused base is recorded,
+  not the scene that was asked for.
+- **Forgotten** only where bytes were fetched after all. That means `forgetScenesRead` after a load's
+  or a hot reload's adopt, covering every chain entry it did not carry across. ⚠️ It is **not**
+  forgotten on every `baseScene: 'loaded'` offer: an undo restore (`applyPrefabUndo`) offers that over a
+  snapshot, and forgetting there let Cmd+Z then Cmd+S empty the file. It is also forgotten on a
+  `setCurrentScenePath(…, 'bound')`, which is a file the human chose for a write: the Save As dialog's
+  Replace or Create Scene. Those are the rule's two deliberate exceptions, and the native panel asked the
+  human to confirm the replace.
+- **Moved** with the file on a rename (`applyMovesToOpenScene`), or it would protect the old name only.
+- **The second route into the same hole is the hot reload.** A newer build rewrites the open scene (or a
+  base of it) outside, the reload is refused, and the OLD world stays bound to the now-newer file.
+  Before this rule, Cmd+S, or Save All for a dirty base, wrote the old world over it.
+
+The prefab **edit-open** auto-saves the open scene on its way in, without a dialog. When that save
+answers `'unreadable-file'`, the open refuses instead of swapping away a world it could not save. A boot
+candidate's refusal is logged at `warn` (#91); the walk raises the one real error if every candidate
+missed.
+
+**A corrupt primary file is refused, not failed.** `SceneManager` turns a `parseAssetJson` failure
+whose cause is a `SyntaxError` into `unparsableSceneError` (`refusedIfCorrupt`), which is the wording
+the Node-side callers already used. Its bytes exist and can be repaired by hand, unlike a missing
+file's, so it gets the same protection. A missing or network-dropped file has no `SyntaxError` cause
+and stays `'failed'`. A corrupt BASE still reads as "no such base" (`fetchSceneMeta`), as before.
+
 ### Re-saving legacy scenes (the sha-churn migration)
 
 A scene committed before the migrations above stays on disk in its old, verbose shape until

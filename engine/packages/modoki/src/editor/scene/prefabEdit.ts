@@ -580,8 +580,17 @@ async function openPrefabForEditingSwitching(
     try {
       blocked = await runSerialisedSave(async () => {
         const b = decide();
-        if (!b && getCurrentScenePath()) await saveScene();
-        return b;
+        if (b || !getCurrentScenePath()) return b;
+        // No dialog: a refused file would otherwise open Save As, and an agent's edit-open cannot answer one (#2128).
+        const saved = await saveScene({ allowDialog: false });
+        // The open scene's file is one this build refused to read (#2128): the save wrote nothing, and swapping now
+        // would discard the world it could not keep. Any other unsaved outcome keeps its pre-#2128 handling.
+        if (saved.reason === 'unreadable-file') {
+          const refused = `the scene was not saved and the prefab was not opened: ${saved.error}`;
+          console.warn(`[PrefabEdit] "${asset.name}" was not entered: ${refused}`);
+          return { refused };
+        }
+        return undefined;
       }, { maxWaitMs: opts.saveQueueWaitMs });
     } catch (e) {
       if (!(e instanceof SaveQueueBusyError)) throw e;

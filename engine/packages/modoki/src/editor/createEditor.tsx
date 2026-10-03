@@ -24,7 +24,7 @@ import { getCurrentWorld, spawnEntity } from '../runtime/core/ecs/world';
 import { Camera } from '../runtime/traits/Camera';
 import { Transform } from '../runtime/core/traits/Transform';
 import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
-import { getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, type SceneLoadOutcome } from './scene/serialize';
+import { getCurrentScenePath, setScenePersistenceProject, lastSceneKey, beginBootSceneWalk, sceneFileKey, type SceneLoadOutcome } from './scene/serialize';
 import { matchFsRuntimeAsset, isProjectRoot, getOpenProjectRoots, toOpenProjectScenePath } from './scene/openProjectScenePath';
 import { applyEditorIdentity } from './editorHost';
 import { withAdoption } from './scene/sceneAdoption';
@@ -192,6 +192,34 @@ export async function canonicalBootScenePath(
     /* fall back to the raw candidate */
   }
   return scenePath;
+}
+
+/** The boot walk, and the path its fallback binds when no candidate loaded (#2128). `loadFirstScene` with its `load`
+ *  wrapped to see every candidate it REFUSED. Pure over its injected collaborators — exported for unit testing.
+ *
+ *  `fallbackPath` is the last candidate, so a project whose configured scene does not exist yet saves there, unless the
+ *  walk refused it. A refused candidate's file holds bytes this build will not read, and bound to the fallback's world
+ *  the next Cmd+S wrote that world over it: a newer-format Warp emptied of 37 entities. It is the walk's OUTCOME that
+ *  decides, not a lookup of that file: a scene refused because a BASE of its chain is too new is readable itself, and
+ *  only the base was recorded as unreadable — it was bound and emptied the same way (#2128 review). The walk is the
+ *  first read of the session, so the walk's own outcomes are the whole answer here. `saveScene` refuses a recorded file
+ *  too, so this keeps the editor's path truthful and is not the only guard. */
+export async function walkBootScenes(
+  candidates: string[],
+  deps: Parameters<typeof loadFirstScene>[1],
+): Promise<{ loaded: string | null; fallbackPath: string | null }> {
+  const refused = new Set<string>();
+  const loaded = await loadFirstScene(candidates, {
+    ...deps,
+    load: async (p) => {
+      const outcome = await deps.load(p);
+      if (outcome === 'refused') refused.add(sceneFileKey(p));
+      return outcome;
+    },
+  });
+  const last = candidates[candidates.length - 1];
+  const fallbackPath = last && !refused.has(sceneFileKey(last)) ? last : null;
+  return { loaded, fallbackPath };
 }
 
 /** Load the first candidate that loads, canonicalizing each to its working-copy
@@ -801,7 +829,7 @@ export function createEditor(options: EditorOptions): React.ComponentType {
     // external-edit hot-reload round-trip in a built/cloud editor (gap #2); pass
     // the project's game id so its game-scoped managers activate (the canonical
     // path carries no `/games/<id>/` segment to derive it from).
-    const loadedPath = await loadFirstScene(candidates, {
+    const { loaded: loadedPath, fallbackPath } = await walkBootScenes(candidates, {
       canonicalize: (p) => canonicalBootScenePath(p, fetch, projectRoot),
       // `probing`: a miss on one candidate is a normal step of the fallback walk, not an error
       // (#91) — loadFirstScene raises the single real error if they ALL miss.
@@ -845,10 +873,10 @@ export function createEditor(options: EditorOptions): React.ComponentType {
       restoreLastAnimationClip();
       return;
     }
-    const scenePath = candidates[candidates.length - 1] ?? null;
+    const scenePath = fallbackPath;
 
     // Nothing loaded: the fallback populates the world already on screen, in place, and adopts it through the one owner
-    // (#1698) — the path it names is the last candidate's, as before. No await runs between the populate and the adopt,
+    // (#1698) — the path it names is the last candidate's, unless the walk refused to read that file (#2128). No await runs between the populate and the adopt,
     // so no other switch can land in between.
     await withAdoption('boot-fallback', async (adoption) => {
       // Try initWorld (game-provided setup)

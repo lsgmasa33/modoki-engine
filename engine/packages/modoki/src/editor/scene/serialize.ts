@@ -15,7 +15,7 @@ import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
 import { writeAssetFile, saveSceneCopy, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
-import { movedSceneFile, type PathMove } from '../utils/assetPaths';
+import { applyMove, movedSceneFile, type PathMove } from '../utils/assetPaths';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
 import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
@@ -790,6 +790,54 @@ export function collectResourceRefs(entities: SerializedEntity[]): ResourceRef[]
 
 let _currentScenePath: string | null = null;
 
+// ── Scene files this build refused to read (#2128) ─────
+//
+// ⚠️ THE RULE: a scene file the editor REFUSED to read is never written by a save it was not explicitly pointed at. Its
+// bytes are a newer build's work (or a corrupt file a human can still repair), and no world on screen was read from
+// them, so a save would replace them with whatever is on screen. The boot walk once ended in "Booting an empty world"
+// with a refused last candidate bound, and the next Cmd+S emptied a 37-entity scene (#2128); a refused hot reload leaves
+// the OLD world bound to the newer file in the same way, and a refused BASE stays loaded under the scene.
+//  - RECORDED by every route that READS a scene file — `loadScene` and the hot reload — under the file the loader
+//    refused (`SceneFormatRefusedError.scenePath`: the primary, or the base of its chain that was refused).
+//  - ENFORCED where a scene file is written: `saveScene` (the bound path or an explicit one) and
+//    `saveOtherLoadedScenes` (a dirty base). The boot fallback binds nothing it refused (`createEditor.tsx`).
+//  - FORGOTTEN only where the file's bytes were read after all (`forgetScenesRead`, after a load's or a hot reload's
+//    adopt — NOT on every `baseScene: 'loaded'` offer: an undo restore offers that over a snapshot, never a fetch), or
+//    where the human chose the file for a write (`setCurrentScenePath(…, 'bound')`: the Save As dialog's Replace,
+//    Create Scene). Those two are the deliberate exceptions: the native panel asked them to confirm the replace.
+//  - MOVED with the file (`applyMovesToOpenScene`), so a rename does not shed it.
+const _unreadableScenes = new Map<string, string>();
+/** One spelling per scene FILE: the open project's `/@fs/` form folded to `/assets/` (#1898), then `normScenePath`. */
+export function sceneFileKey(path: string): string { return normScenePath(toOpenProjectScenePath(path)); }
+/** Record the scene file a load refused (#2128). Anything that is not a format refusal is not a statement about the
+ *  file's bytes (a 404, a network drop, a cancel), and is ignored. */
+function noteUnreadableScene(e: unknown, requested: string): void {
+  if (!(e instanceof SceneFormatRefusedError)) return;
+  _unreadableScenes.set(sceneFileKey(e.scenePath ?? requested), e.message);
+}
+/** Why `path` must not be written: the refusal this build gave when it tried to read it, or undefined (#2128). */
+export function unreadableSceneReason(path: string): string | undefined {
+  return _unreadableScenes.get(sceneFileKey(path));
+}
+function forgetUnreadableScene(path: string): void {
+  _unreadableScenes.delete(sceneFileKey(path));
+}
+/** A load or hot reload just adopted a world READ from these files: every loaded scene it fetched, the primary and each
+ *  base it did not carry across (`keptBaseGuids` were not re-read, so their record stands). ⚠️ No test can tell that
+ *  filter from "forget every loaded scene" today: a refused base's forced reload is carried into the next load (#1422),
+ *  so a load that KEEPS a refused base does not succeed. It states which files were read, should that carry change. */
+function forgetScenesRead(keptBaseGuids: ReadonlySet<string>): void {
+  if (!_unreadableScenes.size) return; // the common case: every load of a session that never refused one
+  for (const e of sceneManager.getLoadedScenes().values()) if (!keptBaseGuids.has(e.guid)) forgetUnreadableScene(e.path);
+}
+/** Test seam: forget every refusal recorded so far. */
+export function clearUnreadableScenes(): void { _unreadableScenes.clear(); }
+/** The refusal a save gives a file this build could not read, in one wording for the primary and a base. */
+function unreadableSaveError(path: string, why: string): string {
+  return `this build refused to read ${path} (${why}), so saving would replace it with a world that was never loaded `
+    + 'from it. Save this world to another file instead (Cmd+S asks for one; an agent passes save_all {path}).';
+}
+
 /** Per-project localStorage key for the "last opened scene", scoped by project
  *  name so one project's scene path never leaks into another's (which would 404).
  *  Single source of truth for BOTH the writer (setCurrentScenePath) and the reader
@@ -825,6 +873,16 @@ const scenePathListeners = new Set<() => void>();
  *  the guid, so only paths change, confirmed by `movedSceneFile`. A DELETE (`to: null`) is left as it is. `openSceneTo` is
  *  the open scene's new path when it moved, for the undo stacks to follow. Called by `applyAssetPathMoves`. */
 export function applyMovesToOpenScene(moves: readonly PathMove[]): { notes: string[]; openSceneTo?: string } {
+  // A refused file keeps its refusal under its new name (#2128); a deleted one has nothing left to protect.
+  for (const [key, why] of [..._unreadableScenes]) {
+    for (const m of moves) {
+      const to = applyMove(key, { ...m, from: sceneFileKey(m.from) });
+      if (to === undefined) continue;
+      _unreadableScenes.delete(key);
+      if (to !== null) _unreadableScenes.set(sceneFileKey(to), why);
+      break;
+    }
+  }
   const movedTo = movedSceneFile(moves);
   // The primary's guid, read BEFORE the entries move: it is what confirms the open scene's own file moved.
   const openKey = _currentScenePath ? normScenePath(_currentScenePath) : undefined;
@@ -862,6 +920,8 @@ export function setCurrentScenePath(scenePath: string | null, how: 'bound' | 'ad
   const changed = path !== _currentScenePath;
   _currentScenePath = path;
   const bound = changed && path && how === 'bound' ? dropParkOnReplacedFile(path) : {};
+  // A bind the user asked for writes or replaces the file, so a refusal recorded against it no longer describes it.
+  if (path && how === 'bound') forgetUnreadableScene(path);
   if (changed) notifyListeners([...scenePathListeners], 'scene path', []);
   if (path) {
     // Per-project key: what createEditor restores on startup, AND what prefab-edit's
@@ -1027,10 +1087,12 @@ export function worldHasUnsavedEdits(): boolean {
  *  the reload starts, and whichever route adopts that key next pays it (#1744, #1750 S7). */
 export async function adoptWorldReloadedFromDisk(scenePath: string, reload: () => Promise<SceneLoadResult>): Promise<void> {
   await withAdoption('hot-reload', async (adoption) => {
-    const { world, keptBaseGuids } = await reload();
+    // A refused reload leaves the world read from the OLD bytes bound to a file that now holds newer ones (#2128).
+    const { world, keptBaseGuids } = await reload().catch((e: unknown) => { noteUnreadableScene(e, scenePath); throw e; });
     // The path and base too: a reload that overtakes an adopted prefab edit-open (which takes no replacement token)
     // replaces an edit world, whose path is null (close-out review of #1698).
     if (!adoption.offer({ world, path: scenePath, baseScene: 'loaded', history: { key: scenePath, keptBaseGuids } })) return;
+    forgetScenesRead(keptBaseGuids); // #2128
     // Not only kept bases: in Play a `Persistent` root is carried too, whatever scene owns it (review of 4f0b839d0; #1863).
     // Everything the reload re-expanded from disk compares equal and is left alone.
     const rebuilt = await rebaseStaleInstances();
@@ -1245,8 +1307,11 @@ export interface SaveResult {
   path: string | null;
   /** `'switching'`: a scene switch is still landing, so the editor's path does not describe the world on screen yet
    *  (#1750) — refused, never waited for; saving again once the scene is open works. */
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'switching' | 'prefab-edit' | 'target-loaded' | 'superseded';
-  /** Why the write was refused, in the route's words (#1811), when `reason` is `'write-failed'` for the primary. */
+  /** `'unreadable-file'`: the target is a scene file this build refused to read (#2128), so nothing was written. */
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'switching' | 'prefab-edit' | 'target-loaded' | 'superseded'
+    | 'unreadable-file';
+  /** Why the write was refused, in the route's words (#1811), when `reason` is `'write-failed'` for the primary — or
+   *  the refusal the file got when this build tried to read it, for `'unreadable-file'`. */
   error?: string;
   /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
    *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
@@ -1489,6 +1554,19 @@ export async function saveScene(opts: {
     console.warn(`[Editor] Save refused — ${notAuthored}. Stop preview/play (and let it finish reverting) before saving so preview mutations don't reach disk.`);
     return { saved: false, path: explicitPath || _currentScenePath, reason: 'playing' };
   }
+  // A file this build refused to read is never written over (#2128): the bound one, or one named explicitly (a Save As
+  // too). Before the serialize, which mints guids into the live world, so a refused save changes nothing. A HUMAN save of
+  // the bound one is offered the Save As panel instead, as an untitled scene is: the editor has no other Save As for a
+  // scene, and refusing outright left work made after a refused hot reload with Discard as its only exit.
+  const saveTarget = explicitPath || _currentScenePath;
+  const unreadable = saveTarget ? unreadableSceneReason(saveTarget) : undefined;
+  const askForPath = !!unreadable && !explicitPath && allowDialog;
+  if (unreadable && !askForPath) {
+    const error = unreadableSaveError(saveTarget!, unreadable);
+    console.warn(`[Editor] Save refused — ${error}`);
+    return { saved: false, path: saveTarget, reason: 'unreadable-file', error };
+  }
+  if (askForPath) console.warn(`[Editor] Not saving over ${saveTarget}: ${unreadable}. Asking for another file.`);
   // The world these bytes are, captured BEFORE serializing: `serializeScene` itself awaits (prefab sources), and a first
   // save binds its file only to this world (#1712 close-out reviews — read after, a Create Scene landing inside the
   // serialize was taken for the world the bytes came from).
@@ -1517,7 +1595,7 @@ export async function saveScene(opts: {
 
   // The open scene's own file is written under the spelling it was opened with (#1273) — a
   // case-variant `path` names the same file, and adopting it would give the manifest a second key.
-  const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
+  const knownPath = askForPath ? null : kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
   // scene.id is always populated by serializeScene (required field).
   if (knownPath) {
     const r = await writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAt, worldSerialized);
@@ -1938,6 +2016,7 @@ async function loadSceneRequest(
         history: { key: scenePath, keptBaseGuids, ...(read.coversHeldChange ? { freshIncoming: true } : {}) },
       });
       if (!adopted) return 'superseded';
+      forgetScenesRead(keptBaseGuids); // #2128: the files it fetched were readable after all
       onAdopted(world);
       read.landed();
       // Reported for the scene the editor adopted, even when a newer request began (#1425 — close-out review of #1698):
@@ -1978,9 +2057,12 @@ async function loadSceneRequest(
     // and `getLastSceneLoadFailureMessage()` for a caller that needs the text (e.g.
     // agentEditorOps.ts's `load-scene` op), are.
     if (e instanceof SceneFormatRefusedError) {
+      noteUnreadableScene(e, scenePath);
       _lastLoadFailureMessage = e.message;
       const msg = `[Editor] Refused to load scene "${scenePath}": ${e.message}`;
-      console.error(msg);
+      // A boot candidate's refusal is a miss the walk may recover from (#91); the walk raises the one real error.
+      if (opts?.probing) console.warn(msg);
+      else console.error(msg);
       useEditorStore.getState().showToast(`Scene not loaded: ${e.message}`, 'warn');
       return 'refused';
     }
@@ -2227,6 +2309,15 @@ async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; gu
   const loadedScenes = [...sceneManager.getLoadedScenes().values()];
   for (const entry of loadedScenes) {
     if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
+    // A base whose file a hot reload refused is still on screen as the OLD world (#2128): writing it replaces the newer
+    // bytes. Left dirty, like every other base this loop cannot write.
+    const unreadable = unreadableSceneReason(entry.path);
+    if (unreadable) {
+      const reason = unreadableSaveError(entry.path, unreadable);
+      console.error(`[Editor] Refused to save "${entry.path}": ${reason}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason });
+      continue;
+    }
     // Asked per base, not once by the caller: each write before this one awaited, and Play (or a pose preview) can start
     // there — this base would then serialize the RUNTIME world into its file (#1904 close-out, fifth review).
     const notAuthored = whyWorldNotAuthored();

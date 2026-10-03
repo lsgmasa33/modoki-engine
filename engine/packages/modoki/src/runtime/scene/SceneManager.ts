@@ -131,6 +131,7 @@ import { fillInstanceStoreReporting } from '../prefab/instanceLoad';
 import { takeRecordBank } from '../prefab/recordBank';
 import { markStale, setInstanceRecord, storedInstance, type StoredInstance } from '../prefab/instanceStore';
 import { assetUrl } from '../loaders/assetUrl';
+import { SceneFormatRefusedError, unparsableSceneError } from '../loaders/sceneFormatGate';
 import {
   loadSceneFile,
   collectResourceRefsFromEntities,
@@ -646,7 +647,7 @@ class SceneManagerImpl implements SceneManager {
         // this fires on a perfectly healthy boot whose first candidate is a stale remembered
         // path, and the resulting red console error is indistinguishable from a real failure to
         // `smoke-packaged.sh` / `assert-app-renders.sh`, both of which fail on ANY console error.
-        data = await parseAssetJson(res, path) as SceneData;
+        data = await parseAssetJson(res, path).catch((e: unknown) => { throw refusedIfCorrupt(e, path); }) as SceneData;
         } finally { endBootSpan(fetchSpan); }
       }
       // Register scene id in the manifest so the editor can recover it on save
@@ -771,7 +772,13 @@ class SceneManagerImpl implements SceneManager {
         // `loadSceneFile`'s own classification stays in place as the backstop for
         // every other caller (tests, tools, future direct callers) — both call the same
         // `assertSceneFormatReadable`, so the two sites cannot disagree on the verdict.
-        assertSceneFormatReadable(sceneData);
+        try {
+          assertSceneFormatReadable(sceneData);
+        } catch (e) {
+          // Which FILE of the chain was refused (#2128): the editor never saves over it.
+          if (e instanceof SceneFormatRefusedError) e.scenePath = ref.path;
+          throw e;
+        }
         const sid = sceneIdByPath.get(ref.path)!;
         const refs = await bootSpanAsync(
           'scene-collect-refs', () => this.collectSceneResourceRefs(sid, sceneData, controller, enteredGeneration), ref.path);
@@ -2201,4 +2208,17 @@ export function getCurrentSceneId(): number | undefined {
 // Expose for debug console: window.__sceneManager
 if (typeof window !== 'undefined') {
   (window as Window & { __sceneManager?: SceneManager }).__sceneManager = sceneManager;
+}
+
+/** A scene file that EXISTS but is not JSON is refused like one in a format this build cannot read (#2128), not failed
+ *  like a missing one: its bytes are there and the editor must never save an empty world over them. `parseAssetJson`
+ *  keeps the `SyntaxError` as the cause of a real parse failure; an absent file (`MissingAssetError`, the SPA
+ *  fallback) or a network drop has none, and passes through unchanged. The Node-side callers already refuse it in the
+ *  same words (`unparsableSceneError`). */
+function refusedIfCorrupt(e: unknown, path: string): unknown {
+  const cause = (e as { cause?: unknown } | null)?.cause;
+  if (!(cause instanceof SyntaxError)) return e;
+  const refused = unparsableSceneError(cause.message);
+  refused.scenePath = path;
+  return refused;
 }

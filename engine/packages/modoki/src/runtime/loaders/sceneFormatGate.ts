@@ -19,6 +19,9 @@ import { classifyFormatVersion } from '../core/formatVersion';
  *  differently to it than to a generic failure". */
 export class SceneFormatRefusedError extends Error {
   readonly reason: 'too-new' | 'too-old' | 'unreadable';
+  /** The scene FILE refused, stamped by `SceneManager` (#2128). A load walks the primary AND its base chain, so the
+   *  refused file is not always the one asked for; the editor records this one, so it never saves over it. */
+  scenePath?: string;
   constructor(message: string, reason: 'too-new' | 'too-old' | 'unreadable') {
     super(message);
     this.name = 'SceneFormatRefusedError';
