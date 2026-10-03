@@ -1262,6 +1262,15 @@ The packaged artifacts there are **NOT shippable** — unsigned, and the beforeP
 silently skip when `toktx`/`msdf-atlas-gen` are absent, which those jobs do not install. Debug
 packaging with them; never distribute them.
 
+⚠️ **The `check` runners have no pinned `toktx` either, so a test that runs a real KTX2 encode is
+green in the local `verify` and red on all three legs** (#2113: three B3 tests, red from their merge
+until the first run that was not cancelled by the next push). A texture test that is not about the
+encode uses a sharp-only format (a `ui` type, or `format: 'webp'`/`'png'`), or fakes `convertTexture`
+when the sidecar cannot name a format; a test of the encode itself skips on `ensureKtxCli()`
+(`texturePipeline.integration.test.ts`). Reproduce locally with `MODOKI_TOOLCHAIN_DIR=<an empty dir>
+npm test`. That also hides `adb`, `gltfpack` and `@gltf-transform/cli`, which a runner resolves from
+the system, so `deviceAndroidDiagBudget` and `modelPipeline.integration` fail under it and pass on CI.
+
 Caveats that matter: it is a **subset** gate (no `games/`, so anything game-dependent still runs
 only locally — **and that is bigger than it sounds: 20 test files skip outright there**, see
 § "The 20 files no runner checks on Windows" above), it tests the **transformed snapshot** rather

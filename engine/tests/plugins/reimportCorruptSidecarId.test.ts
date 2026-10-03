@@ -6,8 +6,12 @@
  * supplied none, so a merge conflict anywhere in a texture's sidecar re-minted the texture on its next reimport, and
  * every scene and prefab reference to it dangled. The handlers now take the id from `reimportSidecarId`.
  *
- * The texture handler runs for real here (sharp-built PNG, the real conversion): it is the one every other handler
- * copied the mint from, and the source guard below holds the other five to the same helper.
+ * The texture handler runs for real here: it is the one every other handler copied the mint from, and the source
+ * guard below holds the other five to the same helper. Only `convertTexture` is faked (#2113). A corrupt sidecar reads
+ * as `{}`, so the handler converts with the default settings, which are KTX2, and that needs the pinned toktx the
+ * public CI runners do not have. The sidecar cannot ask for a sharp-only format here, because it is the corrupt file.
+ * The conversion has no part in which `id` is kept: the handler's read, `reimportSidecarId` and `writeMetaSidecar`
+ * decide that, and all three are real.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'fs';
@@ -18,6 +22,14 @@ import { reimportSidecarId } from '../../plugins/meta-sidecar';
 import { clearManifest, registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { guidToKeep } from '../../packages/modoki/src/editor/scene/guidToKeep';
 import { readScannedSource } from '@modoki/engine/testing';
+
+vi.mock('../../plugins/texture-convert', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../plugins/texture-convert')>()),
+  convertTexture: vi.fn(async () => ({
+    hash: 'h1', variants: ['uastc'], cached: false, width: 16, height: 16, srcWidth: 16, srcHeight: 16, mipLevels: 5,
+    variantBytes: { uastc: 1 },
+  } satisfies import('../../plugins/texture-convert').ConvertResult)),
+}));
 
 const G = 'aaaaaaaa-1111-4111-8111-111111111111';
 const S0 = 'bbbbbbbb-2222-4222-8222-222222222222';
@@ -31,12 +43,11 @@ const conflicted = (text: string) => text.replace('"x": 0,', '<<<<<<< HEAD\n    
 let warn: ReturnType<typeof vi.spyOn> | undefined;
 afterEach(() => { warn?.mockRestore(); warn = undefined; });
 
-async function scratchTexture(sidecarText: string): Promise<{ root: string; abs: string }> {
+function scratchTexture(sidecarText: string): { root: string; abs: string } {
   const root = makeScratchDir('modoki-b3-r11-');
   const abs = path.join(root, 'assets', 't.png');
   fs.mkdirSync(path.dirname(abs), { recursive: true });
-  const sharp = (await import('sharp')).default;
-  await sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 200, g: 40, b: 40, alpha: 1 } } }).png().toFile(abs);
+  fs.writeFileSync(abs, 'pretend-png');
   fs.writeFileSync(abs + '.meta.json', sidecarText);
   return { root, abs };
 }
@@ -47,18 +58,18 @@ const idOnDisk = (abs: string) => JSON.parse(fs.readFileSync(abs + '.meta.json',
 describe('a reimport over a corrupt sidecar (B3 R11)', () => {
   it('keeps the GUID a merge conflict left readable, and still quarantines the damaged file', async () => {
     warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { root, abs } = await scratchTexture(conflicted(sidecar()));
+    const { root, abs } = scratchTexture(conflicted(sidecar()));
     await reimport(root, abs);
     expect(idOnDisk(abs)).toBe(G);
     expect(fs.readFileSync(abs + '.meta.json.corrupt', 'utf-8')).toContain('<<<<<<<');
-  }, 30_000);
+  });
 
   it('mints a fresh GUID when the damaged sidecar carries none it can recover (rule 11)', async () => {
     warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { root, abs } = await scratchTexture('{ "version": 2, <<<<<<< HEAD');
+    const { root, abs } = scratchTexture('{ "version": 2, <<<<<<< HEAD');
     await reimport(root, abs);
     expect(idOnDisk(abs)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  }, 30_000);
+  });
 
   it('the id the handler read wins over the one on disk', () => {
     const root = makeScratchDir('modoki-b3-r11-');

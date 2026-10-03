@@ -44,7 +44,9 @@ async function builtinTexture(): Promise<string> {
   const abs = path.join(engine, 'favicon.png');
   const sharp = (await import('sharp')).default;
   await sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 10, g: 200, b: 40, alpha: 1 } } }).png().toFile(abs);
-  fs.writeFileSync(abs + '.meta.json', JSON.stringify({ id: G, version: 2, type: '2d' }, null, 2) + '\n');
+  // `ui` and not `2d`: a `ui` texture bakes to WebP alone, which sharp encodes. A `2d` one also bakes KTX2, and that
+  // needs the pinned toktx, which the public CI runners do not have (#2113). The bake still runs for real.
+  fs.writeFileSync(abs + '.meta.json', JSON.stringify({ id: G, version: 2, type: 'ui' }, null, 2) + '\n');
   return abs;
 }
 
