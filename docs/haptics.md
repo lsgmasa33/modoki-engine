@@ -161,11 +161,9 @@ in one build; judged the new one *"better than before"*; and said *"make it defa
   `celebrate`, `court.heartLost`). It gets the new default like every game that carries the plugin.
 - **`androidError`'s `THUD` is 300 ms on the S22** — longer than the 50 ms beat it replaces.
   Unjudged.
-- ⚠️ **Android 12 (API 31 and 32) is unmeasured, and it is inside the shipping floor.** There the
-  usage rides audio attributes, and if the system files the notifications under touch feedback, a
-  player with touch vibration turned off would lose `success` / `warning` / `error` on a capable
-  phone, where the old waveform buzzed. Raised in review from memory of the platform, not
-  observed: no Android 12 phone is in the device roster.
+- **Android 12 is measured on an API 31 emulator only**: no Android 12 phone is in the roster, and
+  API 32 takes the same code path but was not run. There every preset is sent as TOUCH, because Android 12's stand-in for the media usage
+  played with all vibration turned off (#2122). § "What the phone's vibration settings gate".
 - **`refuse` and `court.heartLost` now lose their first beat every time.** Both open with two
   `impact.heavy` 90 ms apart; as `HEAVY_CLICK` the first is always reported
   `cancelled_superseded` by the second (observed in Court on the S22, 2026-10-03), where the old
@@ -192,8 +190,57 @@ effect or a primitive:
   Weaveling plays it on every letter of a drag. The S22's own click and tick primitives are 20 ms.
 - ⚠️ **`warning` is one long buzz on a phone with amplitude control.** The plugin's amplitude array
   is 255 in the "off" slots too, so the three beats it meant never separate.
-- The app passes no usage; Android infers TOUCH for a short one- or two-segment waveform and MEDIA
-  for a longer one. The phone's touch-feedback setting therefore gates the first four only.
+- The app passes no usage; on the S22 (Android 14) Android infers TOUCH for a short one- or
+  two-segment waveform and MEDIA for a longer one. ⚠️ **Android 12 inferred TOUCH for every shape
+  measured** (`impact.light` and the three notifications, `warning`'s 210 ms included; on the
+  emulator, below).
+
+### What the phone's vibration settings gate (#2114, #2122)
+
+Measured 2026-10-03 on **API 31 and API 34 emulators** (`google_apis` arm64, the AOSP example
+vibrator HAL, which reports `CLICK`/`TICK` and every primitive, so the new path is taken). No
+Android 12 phone is in the roster. The new path was fired through the **real plugin** in a Slime
+Shooter debug build: `playHapticEffect` was called over the WebView's CDP. The old path was fired
+from a probe app making `@capacitor/haptics`' exact call, `createWaveform` with no attributes. Each
+setting was written the way the Settings app writes it, and the results were read from
+`dumpsys vibrator_manager`, which records the usage per vibration on both versions.
+
+**Android 12 (API 31)**: the Touch feedback switch writes only `haptic_feedback_enabled=0`, and the
+master "Use vibration & haptics" switch writes `vibrate_on=0` and every intensity 0.
+
+| Call | Usage recorded | Touch feedback off | Touch intensity 0 | All vibration off |
+|---|---|---|---|---|
+| Old path (`impact.light` and the three notifications) | TOUCH | plays | ignored | ignored |
+| New path since #2122 (sonification): `success` fired through the real plugin, the rest inferred from the usage | TOUCH | plays | ignored | ignored |
+| New notifications before #2122 (`USAGE_MEDIA`) | **UNKNOWN** | plays | **plays** | **plays** |
+
+- **The touch-feedback switch gates nothing at the vibrator.** `haptic_feedback_enabled` is read
+  by `View.performHapticFeedback`, not by the vibrator service, so every call on both paths still
+  played. **#2114's risk was not real**: no setting silenced the new notifications where the old
+  ones played.
+- ⚠️ **Why every preset goes as sonification below API 33 (#2122)**: Android 12 has no media
+  vibration usage. `AudioAttributes.USAGE_MEDIA` becomes UNKNOWN, and no setting gates UNKNOWN,
+  the master switch included, so `success` / `warning` / `error` played with all vibration turned
+  off. Sonification becomes TOUCH, which is what the old call got there for every shape measured
+  (`impact.light` and all three notifications). That was the hub's choice over routing the notifications to the old call, which would
+  have undone the new default on Android 12, and over `USAGE_NOTIFICATION`, which would have put
+  game feedback under "Notification vibration". Verified on the real plugin by a revert-run: under
+  the master switch, `success` was UNKNOWN and `finished` before the fix, and TOUCH and
+  `ignored_for_settings` after it.
+
+**Android 14 (API 34)**: the Touch feedback switch writes `haptic_feedback_enabled=0` **and**
+`haptic_feedback_intensity=0`; the master switch writes `vibrate_on=0` only. A separate "Media
+vibration" setting exists.
+
+| New path (`VibrationAttributes`) | Usage recorded | Touch feedback off | All vibration off |
+|---|---|---|---|
+| `impact.light` | TOUCH | ignored | ignored |
+| `success` | MEDIA | plays | ignored |
+
+- **The master switch gates MEDIA on Android 14**, so #2122 is an Android 12 defect. API 33, the
+  first level on this branch, was not run.
+- An AOSP image is not an OEM build. The usage mapping happens in the framework, but an OEM can
+  change the settings layer (One UI has its own intensity sliders).
 
 ### The switch and the mapping
 
@@ -245,9 +292,10 @@ the defaults are the trait's defaults, so the Inspector shows what is in force.
   there takes the old call. **Not yet observed on an A23** — covered by a unit test only.
 - **The usage is kept**: the native call passes TOUCH for the impacts and `select`, MEDIA for the
   notifications, matching what Android inferred before (table above, measured both ways on the
-  S22, Android 14). ⚠️ **Not measured on Android 12** (API 31 and 32): the usage-carrying overload
-  is API 33, so there the request goes through audio attributes, and what usage the notifications
-  land in is unverified.
+  S22, Android 14). ⚠️ **Android 12 (API 31 and 32) is different**: the usage-carrying overload is
+  API 33, so there the request goes through audio attributes. The notifications would land in
+  UNKNOWN, not MEDIA, and nothing gates UNKNOWN, so every preset is sent as sonification (TOUCH) there
+  instead (§ "What the phone's vibration settings gate", #2122).
 - **iOS is untouched**: the backend is only chosen when the platform is Android and the build's
   `capacitor-modoki-system` has the two methods (`hapticCapabilities`, `playHapticEffect`). Only
   projects that carry that plugin (Court, Slime Shooter, Weaveling today) can take the new path.

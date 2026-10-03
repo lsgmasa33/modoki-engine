@@ -90,8 +90,9 @@ export interface ModokiSystemPlugin {
    * Android only (#2103): play one predefined effect, or a composition of primitives.
    *
    * `delayMs` is the gap after the previous primitive ENDS. `usage` picks the vibration usage the
-   * request is sent under, so the phone's own touch-feedback setting gates it the same way it
-   * gates the waveform this replaces.
+   * request is sent under on Android 13 and later, so the phone's settings gate it the same way
+   * they gate the waveform this replaces. Android 12 sends every request as touch, whatever
+   * `usage` says (#2122: it has no media usage, and what it substitutes is gated by nothing).
    *
    * Resolves `{played: false}` rather than rejecting when the vibrator does not report the effect
    * (or any one primitive) as supported, or an unknown name was passed — Android would otherwise

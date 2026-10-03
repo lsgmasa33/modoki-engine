@@ -221,10 +221,11 @@ public class ModokiSystemPlugin extends Plugin {
                     vibrator.vibrate(effect, new VibrationAttributes.Builder().setUsage(usage).build());
                 } else {
                     // Android 12: no VibrationAttributes overload, so the usage rides audio
-                    // attributes. Sonification becomes the touch usage; what the media one becomes
-                    // there is unverified (measured only on Android 14).
-                    int usage = media ? AudioAttributes.USAGE_MEDIA : AudioAttributes.USAGE_ASSISTANCE_SONIFICATION;
-                    vibrator.vibrate(effect, new AudioAttributes.Builder().setUsage(usage).build());
+                    // attributes, and every preset goes as sonification, which becomes TOUCH. There
+                    // is no media vibration usage there: USAGE_MEDIA becomes UNKNOWN, which no
+                    // setting gates, the "all vibration off" switch included (#2122, API 31
+                    // emulator). TOUCH is also what the old waveform call got there, notifications included.
+                    vibrator.vibrate(effect, new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).build());
                 }
                 played = true;
             }

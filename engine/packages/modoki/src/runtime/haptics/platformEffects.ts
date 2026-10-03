@@ -64,7 +64,8 @@ export { DEFAULT_ANDROID_EFFECTS, DEFAULT_PLATFORM_EFFECTS } from '../traits/hap
  * Which vibration usage a preset is sent under. NOT tunable: these are the usages Android infers
  * for today's waveforms (measured on the S22: the impacts and `select` land in TOUCH, the three
  * notifications in MEDIA), so the phone's own touch-feedback setting gates the same presets on
- * both paths.
+ * both paths. Android 13 and later only: below API 33 the native side sends every preset as
+ * touch whatever this says (#2122, docs/haptics.md § "What the phone's vibration settings gate").
  */
 export const PRESET_VIBRATION_USAGE: Readonly<Record<HapticPreset, 'touch' | 'media'>> = Object.freeze({
   'impact.light': 'touch',
