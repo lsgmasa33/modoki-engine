@@ -14,7 +14,7 @@ import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
-import { parseBuildTarget, nativeHealPlatforms } from './buildTarget.mjs';
+import { parseBuildTarget, nativeHealPlatforms, viteBuildEnv } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { TSC_NODE_ARGS } from './tscHeap.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
@@ -369,7 +369,8 @@ try {
   // Either way the packaged editor should not write inside its own bundle at all, and the fix is
   // to hand Vite a CJS config, whose loader branch compiles in memory. Which config, and why the
   // choice is by file existence, is `viteConfigChoice.mjs` — not restated here.
-  run(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)]);
+  // NODE_ENV pinned for this child only — a dev server's `development` would ship the debug bridge (#2092).
+  execFileSync(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)], { stdio: 'inherit', cwd: repoRoot, env: viteBuildEnv(runEnv) });
   if (stampStart) {
     const projectRoot = path.resolve(repoRoot, proj);
     const stamp = settleBuildStamp(stampStart, readHeadCommit(projectRoot));

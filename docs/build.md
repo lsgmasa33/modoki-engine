@@ -741,6 +741,16 @@ bundles and calls `engine/toolchain`'s own `detect()` rather than probing for it
 second probe is precisely what this module was consolidated to remove (#159). Full detail:
 [editor-toolchain.md](./editor-toolchain.md).
 
+⚠️ **A build started here runs inside the Vite DEV server, so it inherits `NODE_ENV=development`** — and a
+`vite build` child that inherits that builds with `import.meta.env.DEV` true, which opens `engine/app/main.tsx`'s
+debug-bridge gate whatever `build.debugBuild` says (#2092: every Build-menu release AAB since debug went off
+shipped the bridge JS, which then logged a Crashlytics non-fatal on each launch). So `build-web.mjs` and
+`build-subgame.mjs` (the editor's OTA publish) hand their vite child `viteBuildEnv(env)` (`buildTarget.mjs`),
+which pins `NODE_ENV=production`; `npm install` and the native heal keep the plain env. Guarded at the call sites
+by `engine/tests/architecture/viteBuildEnvPinned.test.ts`, end to end by `npm run smoke:debug-flag` (its flag-off
+leg builds under `NODE_ENV=development`). Check an artifact with
+`unzip -l app-release.aab | grep public/assets/bridge-` — it must print nothing.
+
 ### From an agent: `modoki_build` IS that menu item
 
 An agent does not need the CLI recipes below. **`modoki_build {platform}`** drives the same

@@ -12,6 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
+import { viteBuildEnv } from './buildTarget.mjs';
 import { isProjectDir } from './projectRoots.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
 import { readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp, BUILD_STAMP_FILENAME } from './ota/buildStamp.mjs';
@@ -85,10 +86,11 @@ try {
   // conversion, the SSR-postprocessor loader), which is worse than the EPERM it fixes.
   // #326: same as build-web.mjs — a packaged editor must be handed the CJS config, whose Vite
   // loader branch compiles in memory instead of writing `.vite-temp` inside the signed bundle.
-  // This site was missed when that landed; nothing calls it from the editor UI TODAY (a sub-game
-  // build is still run by hand, see docs/ota-subgame-modules.md), so the bug was latent — which
-  // is exactly how it would have shipped the moment that gets wired to a button.
-  run(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)]);
+  // This site was missed when that landed, while a sub-game build was still run by hand; the editor's
+  // OTA publish now runs it (vite-asset-scanner.ts), from inside a dev server.
+  // #2092 — so NODE_ENV is pinned for this child: a dev server's `development` would build the OTA bundle
+  // with `import.meta.env.DEV` true and ship every DEV-gated branch to devices (`viteBuildEnv`).
+  execFileSync(node, [viteBin, 'build', '--config', chooseViteConfig(engineDir)], { stdio: 'inherit', cwd: repoRoot, env: viteBuildEnv(runEnv) });
   const stamp = settleBuildStamp(stampStart, readHeadCommit(abs));
   writeBuildStamp(subgameOutDir(abs), stamp);
   console.log(`[build-subgame] ${BUILD_STAMP_FILENAME}: commit ${stamp.commit ?? 'unknown'}, dirty ${stamp.dirty ?? 'unknown'}.`);

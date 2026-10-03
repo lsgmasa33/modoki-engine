@@ -83,3 +83,16 @@ export function nativeHealPlatforms(env, exists) {
   if (named === 'ios' || named === 'android') return exists(named) ? [named] : [];
   return /** @type {Array<'ios' | 'android'>} */ (['ios', 'android']).filter((p) => exists(p));
 }
+
+/** The env for build-web's `vite build` child: `env` with `NODE_ENV` pinned to `production` (#2092).
+ *
+ *  Every target this script builds ships, so its bundle must be a production one. A Vite DEV SERVER
+ *  sets `NODE_ENV=development` in its own process, and `/api/build` runs from inside one (the editor,
+ *  or a bare `vite`), so without the pin this script inherits it and Vite builds with
+ *  `import.meta.env.DEV === true`. That opens `main.tsx`'s debug-bridge gate (`DEV || … ||
+ *  __MODOKI_DEBUG_BUILD__`) whatever `build.debugBuild` says: Court, Weaveling and Ice Reef release
+ *  AABs carried `bridge-*.js` with the flag off. Only the vite child gets the pin: `runEnv` also
+ *  runs `npm install`, which under `NODE_ENV=production` skips devDependencies. */
+export function viteBuildEnv(env) {
+  return { ...env, NODE_ENV: 'production' };
+}

@@ -3,7 +3,7 @@
  *  this file exhaustively covers the parsing logic itself, including the F1/F2 regressions found
  *  in review. */
 import { describe, it, expect } from 'vitest';
-import { parseBuildTarget, VALID_TARGETS, nativeHealPlatforms } from '../../scripts/buildTarget.mjs';
+import { parseBuildTarget, VALID_TARGETS, nativeHealPlatforms, viteBuildEnv } from '../../scripts/buildTarget.mjs';
 
 describe('parseBuildTarget', () => {
   it('sanity: VALID_TARGETS is web/native/playable', () => {
@@ -115,5 +115,17 @@ describe('nativeHealPlatforms (#1062) — which platforms build-web.mjs heals fo
   it('an unknown value is ignored — falls back to the folders rather than healing nothing', () => {
     expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: 'windows' }, both)).toEqual(['ios', 'android']);
     expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: '' }, both)).toEqual(['ios', 'android']);
+  });
+});
+
+describe('viteBuildEnv (#2092)', () => {
+  it('pins NODE_ENV to production over an inherited dev-server development', () => {
+    const env = viteBuildEnv({ NODE_ENV: 'development', PATH: '/bin', MODOKI_BUILD_TARGET: 'native' });
+    expect(env).toEqual({ NODE_ENV: 'production', PATH: '/bin', MODOKI_BUILD_TARGET: 'native' });
+  });
+  it('sets it when nothing was inherited, and leaves the input untouched', () => {
+    const input = { PATH: '/bin' };
+    expect(viteBuildEnv(input).NODE_ENV).toBe('production');
+    expect(input).toEqual({ PATH: '/bin' });
   });
 });

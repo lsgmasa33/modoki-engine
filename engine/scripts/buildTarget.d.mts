@@ -29,3 +29,9 @@ export declare function nativeHealPlatforms(
   env: Record<string, string | undefined>,
   exists: (platform: 'ios' | 'android') => boolean,
 ): Array<'ios' | 'android'>;
+
+/** The env for build-web's `vite build` child: `env` with `NODE_ENV` pinned to `production`, so a dev
+ *  server's inherited `development` cannot ship the debug bridge (#2092). */
+export declare function viteBuildEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined>;

@@ -100,7 +100,10 @@ function buildAndCount(flag) {
   console.log(`[smoke-debug-flag] building ${project} with debugBuild=${flag}…`);
   execFileSync('node', ['engine/scripts/build-web.mjs', '--target', 'web'], {
     cwd: REPO_ROOT, stdio: ['ignore', 'ignore', 'inherit'],
-    env: { ...process.env, MODOKI_PROJECT: project },
+    // NODE_ENV=development models a build started inside the editor's dev server, which is where every
+    // Build-menu and `/api/build` build runs — the flag-off leg passed for months without it while those
+    // builds shipped the bridge (#2092).
+    env: { ...process.env, MODOKI_PROJECT: project, NODE_ENV: 'development' },
   });
 
   const counts = Object.fromEntries(MARKERS.map((m) => [m, 0]));
