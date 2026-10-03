@@ -26,7 +26,7 @@ import { onWorldSwap } from '../core/ecs/world';
 import { pickHapticBackend, type HapticBackend } from './backends';
 import { resolveHapticPattern, type HapticPreset } from './patterns';
 import {
-  DEFAULT_ANDROID_EFFECTS, parseAndroidEffect, isAndroidEffectSpecValid, type PlatformHapticEffect,
+  DEFAULT_ANDROID_EFFECTS, DEFAULT_PLATFORM_EFFECTS, parseAndroidEffect, isAndroidEffectSpecValid, type PlatformHapticEffect,
 } from './platformEffects';
 import { createTeardownToken } from '../core/liveness';
 
@@ -34,6 +34,16 @@ let backend: HapticBackend | null = null;
 function activeBackend(): HapticBackend {
   if (!backend) backend = pickHapticBackend();
   return backend;
+}
+
+/**
+ * Pick the backend now rather than at the first play. The Android backend asks the vibrator what
+ * it supports when it is created, and until that answer arrives every preset takes the old call —
+ * so a backend created BY the first play makes the session's first haptic the old buzz (observed
+ * on the S22, #2103). `hapticsSystem` calls this every frame; after the first it is a no-op.
+ */
+export function warmHapticBackend(): void {
+  activeBackend();
 }
 
 /** Test seam — swap in a fake backend, or force a re-pick. A sample measured through the outgoing
@@ -48,11 +58,11 @@ export function setHapticBackend(b: HapticBackend | null): void {
  *  these fire from inside gesture handling. */
 let enabled = true;
 let masterIntensity = 1;
-let platformEffects = false;
+let platformEffects = DEFAULT_PLATFORM_EFFECTS;
 let androidEffects: Readonly<Record<HapticPreset, string>> = DEFAULT_ANDROID_EFFECTS;
 
 /** Apply the live `HapticSettings`. A copy, never a play. The two platform fields are optional so
- *  a caller that only knows the gates leaves them at the trait's own defaults (off). */
+ *  a caller that only knows the gates leaves them at the trait's own defaults. */
 export function configureHaptics(opts: {
   enabled: boolean;
   masterIntensity: number;
@@ -61,11 +71,12 @@ export function configureHaptics(opts: {
 }): void {
   enabled = opts.enabled;
   masterIntensity = Math.max(0, Math.min(1, opts.masterIntensity));
-  platformEffects = opts.platformEffects ?? false;
+  platformEffects = opts.platformEffects ?? DEFAULT_PLATFORM_EFFECTS;
   androidEffects = opts.androidEffects ?? DEFAULT_ANDROID_EFFECTS;
   // Parse (and so validate) HERE, where the authored value arrives, not at the first play: the
   // editor's backend cannot vibrate and never reaches a play, and the editor is where the value is
-  // typed. With the switch off too — a typo should not wait for the day it is turned on.
+  // typed (this runs there while the game is playing; the system is idle when it is stopped). With
+  // the switch off too — a typo should not wait for the day it is turned on.
   for (const preset of ANDROID_PRESETS) {
     const text = androidEffects[preset];
     if (typeof text === 'string') parsedEffect(preset, text);
@@ -203,7 +214,7 @@ export function disposeHaptics(): void {
   clearHapticLatency(); // already invalidates latency liveness — no separate invalidation needed here
   enabled = true;
   masterIntensity = 1;
-  platformEffects = false;
+  platformEffects = DEFAULT_PLATFORM_EFFECTS;
   androidEffects = DEFAULT_ANDROID_EFFECTS;
   parsedEffects.clear();
   backend = null;

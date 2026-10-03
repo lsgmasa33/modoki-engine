@@ -7,8 +7,9 @@ import type { HapticPreset } from '../haptics/patterns';
  * Here, beside the trait, rather than in `haptics/`: `haptics` already imports `traits`, and a
  * trait importing a value back from `haptics` is a cross-folder cycle (`noNewCycles.test.ts`).
  *
- * Starting values, unjudged: nobody has felt these against the old path yet. `success`, `warning`
- * and `error` keep the beat shapes `@capacitor/haptics` asks for today.
+ * `success`, `warning` and `error` keep the beat shapes `@capacitor/haptics` asked for. The owner
+ * felt the set as a whole on the Galaxy S22 and judged it better than the old path (2026-10-03);
+ * no preset was judged on its own.
  */
 export const DEFAULT_ANDROID_EFFECTS: Readonly<Record<HapticPreset, string>> = Object.freeze({
   'impact.light': 'effect:TICK',
@@ -19,3 +20,10 @@ export const DEFAULT_ANDROID_EFFECTS: Readonly<Record<HapticPreset, string>> = O
   warning: 'CLICK, CLICK+40, CLICK+50',
   error: 'TICK@0.6, THUD+45',
 });
+
+/**
+ * `HapticSettings.platformEffects`' default, and what the service runs at with no `HapticSettings`
+ * in the scene. ON since the owner's verdict on the S22 (2026-10-03, *"make it default"*). One
+ * constant, so the trait and the service cannot disagree about what an unauthored game gets.
+ */
+export const DEFAULT_PLATFORM_EFFECTS = true;

@@ -1,8 +1,8 @@
 /**
- * Android platform haptic effects (#2103) — the A/B path beside `@capacitor/haptics`.
+ * Android platform haptic effects (#2103) — the default path on a vibrator that reports them.
  *
  * What has to hold, each of which fails silently on a phone:
- *  - OFF (the default) hands the backend nothing, so today's path is untouched;
+ *  - ON is the default, from one constant, and OFF hands the backend nothing (the old path);
  *  - every authored mapping field on `HapticSettings` is READ — perturbed here, not left at its
  *    default, because a value equal to the default cannot tell "read" from "ignored";
  *  - a vibrator that does not report an effect keeps the classic call for that preset (the A23
@@ -33,6 +33,8 @@ class RecordingBackend implements HapticBackend {
     this.played.push({ preset, platform });
   }
 }
+
+const TICK_EFFECT: PlatformHapticEffect = { kind: 'effect', effect: 'TICK' };
 
 let rec: RecordingBackend;
 beforeEach(() => {
@@ -75,12 +77,17 @@ describe('the authored mapping format', () => {
 });
 
 describe('the switch', () => {
-  it('OFF hands the backend no platform effect, and OFF is what an older caller gets', () => {
-    configureHaptics({ enabled: true, masterIntensity: 1 });
-    playHaptic('impact.light');
+  it('OFF hands the backend no platform effect', () => {
     configureHaptics({ enabled: true, masterIntensity: 1, platformEffects: false });
     playHaptic('select');
-    expect(rec.played.map((p) => p.platform)).toEqual([undefined, undefined]);
+    expect(rec.played.map((p) => p.platform)).toEqual([undefined]);
+  });
+
+  it('ON is the default: with nothing configured at all, and for a caller that passes only the gates', () => {
+    playHaptic('impact.light');   // a scene with no HapticSettings never configures the service
+    configureHaptics({ enabled: true, masterIntensity: 1 });
+    playHaptic('impact.light');
+    expect(rec.played.map((p) => p.platform)).toEqual([TICK_EFFECT, TICK_EFFECT]);
   });
 
   it('ON hands over the preset\'s mapping', () => {
@@ -112,18 +119,16 @@ describe('the switch', () => {
     expect(String(warn.mock.calls[0][0])).toContain("'warning'");
   });
 
-  it('disposeHaptics turns the switch back off and forgets an authored mapping', () => {
+  it('disposeHaptics returns the switch and the mapping to their defaults', () => {
     configureHaptics({
-      enabled: true, masterIntensity: 1, platformEffects: true,
+      enabled: true, masterIntensity: 1, platformEffects: false,
       androidEffects: { ...DEFAULT_ANDROID_EFFECTS, select: 'LOW_TICK' },
     });
     disposeHaptics();
     setHapticBackend(rec);
     playHaptic('select');
-    expect(rec.played[0].platform).toBeUndefined();   // the switch is off again
-    configureHaptics({ enabled: true, masterIntensity: 1, platformEffects: true });
-    playHaptic('select');
-    expect(rec.played[1].platform).toEqual(parseAndroidEffect(DEFAULT_ANDROID_EFFECTS.select));   // not LOW_TICK
+    // ON again (it was off), and the default mapping (it was LOW_TICK).
+    expect(rec.played[0].platform).toEqual(parseAndroidEffect(DEFAULT_ANDROID_EFFECTS.select));
   });
 
   it('an EMPTY mapping is a choice, not a mistake: no platform effect and no warning', () => {
@@ -164,21 +169,22 @@ describe('HapticSettings is the authoring surface, and every field of it is read
     expect(rec.played[0].platform).toBeUndefined();
   });
 
-  it('the trait ships OFF with the documented defaults', () => {
+  it('the trait ships ON with the documented defaults — what a scene authoring `HapticSettings: {}` resolves to', () => {
     const world = createWorld();
     const s = world.spawn(HapticSettings()).get(HapticSettings)!;
-    expect(s.platformEffects).toBe(false);
+    expect(s.platformEffects).toBe(true);
     for (const preset of PRESETS) expect(s[ANDROID_EFFECT_FIELDS[preset]]).toBe(DEFAULT_ANDROID_EFFECTS[preset]);
   });
 
   it('the debug-menu helpers write and read the trait', () => {
     const world = createWorld();
     setCurrentWorld(world);
-    expect(setHapticPlatformEffects(true)).toBe(false);   // no HapticSettings yet
+    expect(setHapticPlatformEffects(false)).toBe(false);   // no HapticSettings yet: nothing to write
+    expect(hapticPlatformEffectsOn()).toBe(true);          // and the service is at the default, ON
     world.spawn(HapticSettings({ enabled: false }));
-    expect(hapticPlatformEffectsOn()).toBe(false);
-    expect(setHapticPlatformEffects(true)).toBe(true);
-    expect(hapticPlatformEffectsOn()).toBe(true);
+    expect(hapticPlatformEffectsOn()).toBe(true);          // the trait's default: a checkbox starts ticked
+    expect(setHapticPlatformEffects(false)).toBe(true);
+    expect(hapticPlatformEffectsOn()).toBe(false);         // and still flips to the old path
     expect(world.queryFirst(HapticSettings)?.get(HapticSettings)?.enabled).toBe(false);   // the rest is kept
   });
 });
@@ -313,6 +319,18 @@ describe('which backend a platform gets', () => {
     await flush();
     await b.play('impact.light', TICK);
     expect(requests).toEqual([{ effect: 'TICK', usage: 'touch' }]);   // reached Capacitor.Plugins.ModokiSystem
+  });
+
+  it('the FIRST haptic of a session is already the new path: the system warms the backend before any play', async () => {
+    native('android', ['openUrl', ...HAPTIC_METHODS]);
+    const { plugin, requests } = fakePlugin(S22);
+    cap.Plugins = { ...cap.Plugins, ModokiSystem: plugin };
+    setHapticBackend(null);                 // as at boot: nothing picked yet
+    hapticsSystem(createWorld());           // one frame, in a scene with no HapticSettings at all
+    await flush();                          // the capability answer arrives
+    playHaptic('impact.light');
+    await flush();
+    expect(requests).toEqual([{ effect: 'TICK', usage: 'touch' }]);
   });
 
   it('Android whose binary predates the methods keeps the classic backend, each method required', () => {

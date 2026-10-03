@@ -77,7 +77,7 @@ refactor cannot quietly rebuild a private table.
   lets us scale one, so anything in between would be a lie. The field exists so a strength slider
   does not need a trait migration the day a backend can honour it.
 
-- **`platformEffects`** and the seven **`android…`** mapping fields — Android only, off by
+- **`platformEffects`** and the seven **`android…`** mapping fields — Android only, **on** by
   default. See "Android: the vibrator's own effects" below.
 
 `hapticsSystem` copies the trait into the service each frame, which is why the trait is the single
@@ -128,8 +128,8 @@ no build instrumentation. This is how every number below was measured. ⚠️ It
 
 **It is hardware-tiered, not OS-tiered.** `minSdkVersion 31` across every native project puts the
 whole modern Android API unconditionally in range, so the engine never branches on OS version to
-decide what a phone can render (the one `Build.VERSION` check in the path is which `vibrate`
-overload carries the usage, #2103). What differs is the vibrator:
+decide what a phone can render (the two `Build.VERSION` checks in the #2103 native path are a
+below-Android-12 guard and which `vibrate` overload carries the usage). What differs is the vibrator:
 
 | | Galaxy S22 | Galaxy A23 |
 |---|---|---|
@@ -148,11 +148,29 @@ the 73ms one came back `cancelled_superseded`. That truncation is **benign and m
 a clipped first beat is what makes two beats read as two; let it run in full and it merges with beat
 two into one long buzz. Widen if anything.
 
-## Android: the vibrator's own effects (#2103) — an A/B switch, unjudged
+## Android: the vibrator's own effects (#2103) — the default
 
-**Status: built, measured as REQUESTS, and not yet judged by feel.** The owner reported
-(2026-10-03) that Weaveling on the Galaxy S22 feels like a buzz, not a tap. The switch below ships
-**off**; nothing here claims the new path is better.
+**Status: the default, on the owner's verdict.** The owner reported (2026-10-03) that Weaveling on
+the Galaxy S22 felt like a buzz, not a tap; felt the old and new paths back to back on that phone
+in one build; judged the new one *"better than before"*; and said *"make it default"*.
+
+⚠️ **What that verdict covers, and what it does not:**
+- It was given for the set as a whole, on the S22, in Weaveling. **No preset was judged on its
+  own**, so the seven mapping defaults are still first values, not tuned ones.
+- **Court has had no feel check**, and it builds patterns from these presets (`refuse`,
+  `celebrate`, `court.heartLost`). It gets the new default like every game that carries the plugin.
+- **`androidError`'s `THUD` is 300 ms on the S22** — longer than the 50 ms beat it replaces.
+  Unjudged.
+- ⚠️ **Android 12 (API 31 and 32) is unmeasured, and it is inside the shipping floor.** There the
+  usage rides audio attributes, and if the system files the notifications under touch feedback, a
+  player with touch vibration turned off would lose `success` / `warning` / `error` on a capable
+  phone, where the old waveform buzzed. Raised in review from memory of the platform, not
+  observed: no Android 12 phone is in the device roster.
+- **`refuse` and `court.heartLost` now lose their first beat every time.** Both open with two
+  `impact.heavy` 90 ms apart; as `HEAVY_CLICK` the first is always reported
+  `cancelled_superseded` by the second (observed in Court on the S22, 2026-10-03), where the old
+  60 ms step was clipped only sometimes. § "What the tiers can render" calls that clipping benign
+  for the old path; whether it still reads as two beats here is unjudged.
 
 ### What `@capacitor/haptics` asks an Android vibrator for
 
@@ -179,8 +197,18 @@ effect or a primitive:
 
 ### The switch and the mapping
 
-`HapticSettings.platformEffects` (default **off**). On, each preset plays the mapping authored in
-its own `HapticSettings` field, where the vibrator reports everything that mapping needs:
+`HapticSettings.platformEffects` (default **on**; one constant, `DEFAULT_PLATFORM_EFFECTS`, is the
+trait's default and what the service runs at in a scene with no `HapticSettings`). On, each preset
+plays the mapping authored in its own `HapticSettings` field, where the vibrator reports everything
+that mapping needs. Off is the old path for every preset.
+
+**Observed on the S22 after a fresh launch, nothing toggled (2026-10-03):** Weaveling, Slime
+Shooter and Court each requested `Prebaked{…}` / `Primitive{…}` effects from their first haptic.
+
+**What each game resolves to on a fresh launch** (read from the scenes, 2026-10-03): Court,
+Slime Shooter and Weaveling each author `HapticSettings: {}` in their one scene, with no field
+written, so all three take the default: **on**. No scene or prefab authors `platformEffects`.
+Every other project lacks the plugin and keeps the old path whatever the trait says.
 
 | Field | Default | Requested on the S22 (measured) |
 |---|---|---|
@@ -195,8 +223,9 @@ its own `HapticSettings` field, where the vibrator reports everything that mappi
 The format (`runtime/haptics/platformEffects.ts`): `effect:NAME` is a predefined effect;
 `NAME@scale+gapMs, …` is a run of primitives, scale 0 to 1 (default 1), gap in ms after the
 previous one ends (default 0). **An empty field keeps the old call for that preset**, so one preset
-can be compared at a time. A string that is not valid warns once on the console — in the editor
-too, as it is typed, since that is where it is authored — and keeps the old call. These are authored values because the owner will want them different after feeling them;
+can be compared at a time. A string that is not valid warns once on the console and keeps the old
+call. That includes the editor, but only while the game is PLAYING: `hapticsSystem` is what reads
+the trait, and it does not run in a stopped or paused editor. These are authored values because the owner will want them different after feeling them;
 the defaults are the trait's defaults, so the Inspector shows what is in force.
 
 - **Every field is read**, by walking `ANDROID_EFFECT_FIELDS` rather than naming seven fields.
@@ -204,6 +233,10 @@ the defaults are the trait's defaults, so the Inspector shows what is in force.
   `androidSelect` to `LOW_TICK@0.3`, `androidSuccess` to `CLICK@0.5, THUD@0.9+120`,
   `androidImpactLight` to `effect:DOUBLE_CLICK`, and `androidImpactMedium` to empty (which
   requested the old 43 ms step again).
+- **The first haptic of a session is the new path too.** The backend asks the vibrator what it
+  supports when it is created and plays the old call until the answer arrives, so `hapticsSystem`
+  creates it on its first frame rather than leaving that to the first play. Found on the S22: a
+  fresh launch requested the old 50 ms step once, then the new effects.
 - **Capability is decided per preset, per play**, from what the vibrator reports
   (`areEffectsSupported` = YES, `arePrimitivesSupported`). One unsupported primitive sends the
   whole preset to the old call. ⚠️ This matters because Android substitutes a generic vibration for
@@ -219,20 +252,21 @@ the defaults are the trait's defaults, so the Inspector shows what is in force.
   `capacitor-modoki-system` has the two methods (`hapticCapabilities`, `playHapticEffect`). Only
   projects that carry that plugin (Court, Slime Shooter, Weaveling today) can take the new path.
 - **A/B on a phone**: Weaveling and Slime Shooter have a checkbox on the debug menu's Debug tab,
-  "Android tap effects". It writes the trait for the session; a relaunch returns to the authored
-  value. The debug menu needs a `build.debugBuild` build.
+  "Android tap effects". It starts ticked (it shows the trait), and unticking it is the old path.
+  It writes the trait for the session; a relaunch returns to the authored value. The debug menu
+  needs a `build.debugBuild` build.
 
 ⚠️ **What `dumpsys` cannot say**: it reports the request, not what the motor rendered, and its
 `durationMs` is the system's bookkeeping (it logged 100 ms for the `TICK` effect and 385 ms for the
 `error` composition, whose `THUD` primitive is 300 ms on this phone). Whether any of it feels like
-a tap is the owner's call, and `androidError`'s `THUD` is the first value to question.
+a tap was the owner's call (above).
 
 ## Why presets, and not a custom-waveform plugin
 
 ⚠️ **#2103 does not reopen this.** The Android effects above are still the seven presets, mapped
-to effects the phone already has: no asset format, no iOS change, no Core Haptics, and sequencing
-between pattern steps is still JS timers. What it does revise is one line below — the spike's
-"it felt good" on the S22 was not a comparison against the phone's own effects.
+to effects the phone already has: no asset format, no iOS behaviour change, no Core Haptics, and
+sequencing between pattern steps is still JS timers. What it does revise is the last bullet
+below.
 
 
 The obvious design is a `.haptic.json` asset compiled to `CHHapticEngine` (iOS) and
@@ -263,6 +297,10 @@ throwaway spike wired presets into Court and put numbers on it (2026-08-09):
   Adopting the plugin would *introduce* all of that to a platform that currently has none of it.
 - **It felt good** on the S22, the A23 and an iPhone 8, judged by hand across several levels — both
   as the original spike and, re-checked on all three afterwards, as the engine subsystem.
+  ⚠️ **Superseded for the S22** (owner, 2026-10-03): that was never a comparison against the
+  phone's own effects. Felt side by side, the owner judges the vibrator's own effects better there,
+  and they are now the default on vibrators that report them. It still stands for the A23 and
+  iOS, where nothing changed.
 
 What would reopen it: a game that genuinely needs `intensity` × `sharpness` as independent axes, or
 a continuous ramp. Court needed neither, and neither does anything shipped.

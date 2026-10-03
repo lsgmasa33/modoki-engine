@@ -39,6 +39,7 @@
 import { registerEngineAction, refuseAction } from '../core/actionRegistry';
 import { getCurrentWorld } from '../core/ecs/worldRegistry';
 import { HapticSettings } from '../traits/HapticSettings';
+import { DEFAULT_PLATFORM_EFFECTS } from '../traits/hapticEffectDefaults';
 import { playHaptic } from '../haptics/hapticsService';
 
 /** Default for `haptics.play` with no payload — the lightest thing in the vocabulary, which is
@@ -59,9 +60,10 @@ function setEnabled(next: boolean): boolean {
   return true;
 }
 
-/** Is the Android platform-effects path on (#2103)? False with no `HapticSettings` in the scene. */
+/** Is the Android platform-effects path on (#2103)? With no `HapticSettings` in the scene the
+ *  service runs at the default, so that is the answer. */
 export function hapticPlatformEffectsOn(): boolean {
-  return settingsEntity()?.get(HapticSettings)?.platformEffects ?? false;
+  return settingsEntity()?.get(HapticSettings)?.platformEffects ?? DEFAULT_PLATFORM_EFFECTS;
 }
 
 /**

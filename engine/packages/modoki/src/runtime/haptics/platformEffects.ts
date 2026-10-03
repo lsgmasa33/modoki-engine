@@ -58,7 +58,7 @@ export const ANDROID_EFFECT_FIELDS = {
 export type AndroidEffectField = (typeof ANDROID_EFFECT_FIELDS)[HapticPreset];
 
 /** The default mapping per preset. Defined beside the trait whose defaults it is. */
-export { DEFAULT_ANDROID_EFFECTS } from '../traits/hapticEffectDefaults';
+export { DEFAULT_ANDROID_EFFECTS, DEFAULT_PLATFORM_EFFECTS } from '../traits/hapticEffectDefaults';
 
 /**
  * Which vibration usage a preset is sent under. NOT tunable: these are the usages Android infers

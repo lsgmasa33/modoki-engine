@@ -17,13 +17,15 @@
 
 import type { World } from 'koota';
 import { HapticSettings } from '../traits/HapticSettings';
-import { configureHaptics } from './hapticsService';
+import { configureHaptics, warmHapticBackend } from './hapticsService';
 import { ANDROID_EFFECT_FIELDS } from './platformEffects';
 import type { HapticPreset } from './patterns';
 
 const PRESETS = Object.keys(ANDROID_EFFECT_FIELDS) as HapticPreset[];
 
 export function hapticsSystem(world: World): void {
+  // Before the settings lookup: a scene with no HapticSettings still plays haptics.
+  warmHapticBackend();
   const e = world.queryFirst(HapticSettings);
   if (!e) return;
   const s = e.get(HapticSettings);

@@ -1,5 +1,5 @@
 import { trait } from 'koota';
-import { DEFAULT_ANDROID_EFFECTS } from './hapticEffectDefaults';
+import { DEFAULT_ANDROID_EFFECTS, DEFAULT_PLATFORM_EFFECTS } from './hapticEffectDefaults';
 
 /**
  * Haptics resource — the singleton knobs for device haptic feedback.
@@ -28,11 +28,12 @@ export const HapticSettings = trait({
   masterIntensity: 1,
   /**
    * Android only (#2103): play presets as the vibrator's own predefined effects and primitives
-   * where it reports them, instead of `@capacitor/haptics`' timed amplitude steps. OFF by default:
-   * nobody has judged the new feel yet, so this is an A/B switch, not a shipped behaviour. No
-   * effect on iOS, or on a vibrator that reports none (the Galaxy A23).
+   * where it reports them, instead of `@capacitor/haptics`' timed amplitude steps. ON by default
+   * (owner, 2026-10-03, after feeling both on the Galaxy S22); turning it off is the old path, and
+   * is what a game's debug menu does to compare the two. No effect on iOS, or on a vibrator that
+   * reports none (the Galaxy A23).
    */
-  platformEffects: false,
+  platformEffects: DEFAULT_PLATFORM_EFFECTS,
   /**
    * What each preset asks an Android vibrator for when `platformEffects` is on. One string per
    * preset, in the format `runtime/haptics/platformEffects.ts` documents (`effect:TICK`,
