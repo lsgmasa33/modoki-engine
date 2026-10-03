@@ -29,6 +29,7 @@ import { resolveAffectedScenes } from '../scene/sceneDirty';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { durableGuid } from '../../runtime/core/assetRefRules';
+import * as instanceEdits from '../instance/instanceEdits';
 
 /** The durable guid `rootId` carries, or undefined (#1210: a runtime guid belongs to the world it was minted in). */
 function rootGuidOf(rootId: number): string | undefined {
@@ -71,7 +72,17 @@ export function makePrefabInstantiateAction(opts: {
     affectedScenes: resolveAffectedScenes([opts.initialId]),
     // By guid only (#1827, I19): the raw id it used to fall back to names, after a world swap, whatever entity holds
     // that id now, and the undo deleted it. A root that is gone, or has become a placeholder, refuses.
-    undo: () => { opts.remove(currentRef.require()); },
+    // #2001 S8: both directions keep the instance records exact. The redo re-runs the placement, which goes through the
+    // door (`instantiatePrefabInstance`: `beginAddChild` + `place`); the undo is the door's delete of the root it placed
+    // (its record goes, with every record under it, and the `own` link of the member it was dropped on), so the records
+    // are what they were before the placement.
+    maintainsRecords: true,
+    undo: () => {
+      const id = currentRef.require();
+      const commit = instanceEdits.beginDelete([id]);
+      opts.remove(id);
+      commit();
+    },
     redo: async () => {
       // A respawn REFUSED because the prefab was written while it was read (#1752): nothing was spawned, and the step is
       // DROPPED with its notice (`UndoRefusedError`, #1664's contract) rather than left on the redo stack. The file it

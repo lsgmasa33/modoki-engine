@@ -32,6 +32,8 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   unregisterEntity: (e: { id(): number }) => entityIndex.delete(e.id()),
   destroyEntity: (e: { id(): number; destroy(): void }) => { entityIndex.delete(e.id()); e.destroy(); },
   setStructureCallback: vi.fn(),
+  // Read at module load by the instance door's import graph (the undo deletes through `instanceEdits`, #2001 S8a).
+  onWorldSwap: () => () => {},
   findEntityByGuid: (guid: string) => {
     let found: unknown;
     testWorld.query(EntityAttributes).updateEach(([ea]: [{ guid: string }], e: unknown) => {

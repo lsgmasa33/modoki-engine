@@ -174,7 +174,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { entity: { name: 'ContractProbe' }, space: 'local', position: [1, 2, 3] },
-    notes: "Routes a prefab-instance edit into its overrides, where a plain setTrait is ignored. `space` is REQUIRED (no default): it was documented as 'World' while writing LOCAL fields, and a default would relocate that mistake into the caller's head rather than removing it.",
+    notes: "Records a prefab-instance edit on the instance's override list (a save writes it as the entry's `members` rows), where a plain setTrait is ignored. `space` is REQUIRED (no default): it was documented as 'World' while writing LOCAL fields, and a default would relocate that mistake into the caller's head rather than removing it.",
   },
   modoki_validate_scene: {
     kind: 'read', method: 'GET', route: '/api/validate-scene', requires: ['project'], aim: 'asset',

@@ -11,8 +11,9 @@
  * door itself (F2 needs "is there a record already"), the I25 shadow in the fuzzer and the save-time drift check.
  *
  * ── Stale records ──
- * The ops S7 moves onto records (Revert, undo/redo, Apply and its fan-out, paste/duplicate of an instance, delete-undo,
- * Create Prefab/Replace, Detach, the world swap, Stop, an outside edit) do not maintain the list yet. Each one MARKS the
+ * The ops S7 and S8 move onto records (Revert, an undo/redo step that does not keep them (`undoManager.ts`
+ * `keepsRecords`), Apply and its fan-out, paste/duplicate of an instance, delete-undo, Create Prefab/Replace, Detach,
+ * the world swap, Stop, an outside edit) do not all maintain the list yet. Each one that does not MARKS the
  * records it may have changed stale, naming itself (`markStale`). A stale record says nothing: the door re-seeds it from
  * the old capture before writing to it (`editor/instance/instanceSync.ts`), and the shadow and the drift check skip it.
  * The list of ops that mark is closed and explicit, so a writer that is neither the door nor one of them is a BYPASS,

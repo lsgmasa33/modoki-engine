@@ -20,8 +20,9 @@
  *  — never `dist/`, `ios/`, `android/` build outputs.
  *
  *  Usage:
- *    node engine/scripts/migrate-font-family-refs.mjs            # dry-run (report only)
- *    node engine/scripts/migrate-font-family-refs.mjs --write    # apply the rewrites
+ *    npx tsx engine/scripts/migrate-font-family-refs.mjs            # dry-run (report only); plain
+ *                                                                # `node` cannot load fontNaming.ts
+ *    npx tsx engine/scripts/migrate-font-family-refs.mjs --write    # apply the rewrites
  */
 
 import { readFile, writeFile, readdir } from 'node:fs/promises';
@@ -30,13 +31,11 @@ import { fileURLToPath } from 'node:url';
 import { parseFontFilename } from '../packages/modoki/src/runtime/loaders/fontNaming.ts';
 import { repoFiles } from './repoCorpus.mjs';
 import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
+import { migrateFontFamilies } from './fontFamilyMigration.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
 const WRITE = process.argv.includes('--write');
-
-const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const isGuid = (s) => typeof s === 'string' && GUID_RE.test(s);
 
 /** Every file under `<projectRel>` (a repo-relative POSIX path, e.g. `games/sling`) whose
  *  git-relative path satisfies `match` — git-backed enumeration (#771/#799) replaces the
@@ -82,47 +81,12 @@ for (const rootDir of ['games', 'demos']) {
     for (const file of files) {
       let json;
       try { json = parseJsonText(await readFile(file, 'utf-8')); } catch { continue; }
-      let dirty = false;
-      const migratedFamilies = new Set();
-
-      const visitTraits = (traits) => {
-        const ui = traits?.UIElement;
-        if (!ui || typeof ui !== 'object') return;
-        const v = ui.fontFamily;
-        if (typeof v !== 'string' || !v || isGuid(v)) return;
-        const guid = index.get(v);
-        if (!guid) {
-          if (!unmatched.has(v)) unmatched.set(v, []);
-          unmatched.get(v).push(file.slice(ROOT.length + 1));
-          return;
-        }
-        ui.fontFamily = guid;
-        migratedFamilies.add(v);
-        dirty = true; changedRefs++;
-      };
-
-      // Entities, their prefab-instance overrides, and any added subtrees.
-      const visitEntry = (entry) => {
-        if (!entry || typeof entry !== 'object') return;
-        visitTraits(entry.traits);
-        for (const bag of Object.values(entry.overrides ?? {})) visitTraits(bag);
-        for (const added of entry.added ?? []) visitEntry(added);
-        for (const child of entry.children ?? []) visitEntry(child);
-      };
-      for (const entry of json.entities ?? []) visitEntry(entry);
-
-      // The scene's resources[] entry for a migrated family: `{type:'font', path:'<name>'}`
-      // becomes `{type:'font-family', path:'<guid>'}`. Left alone when its family was not
-      // migrated, so a partially-migrated scene stays loadable.
-      if (Array.isArray(json.resources)) {
-        for (const r of json.resources) {
-          if (r?.type === 'font' && typeof r.path === 'string' && migratedFamilies.has(r.path)) {
-            r.type = 'font-family';
-            r.path = index.get(r.path);
-            dirty = true;
-          }
-        }
-        json.resources.sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.path).localeCompare(String(b.path)));
+      // Every trait bag at any depth (#2119), and the resources[] entry of each migrated family.
+      const { dirty, refs, unmatched: missed } = migrateFontFamilies(json, index);
+      changedRefs += refs;
+      for (const v of missed) {
+        if (!unmatched.has(v)) unmatched.set(v, []);
+        unmatched.get(v).push(file.slice(ROOT.length + 1));
       }
 
       if (dirty) {

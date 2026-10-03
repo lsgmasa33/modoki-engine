@@ -34,6 +34,7 @@ import { existsSync } from 'node:fs';
 import { join, resolve, relative } from 'node:path';
 import { repoRoot, repoFiles } from './repoCorpus.mjs';
 import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
+import { walkObjects } from './jsonWalk.mjs';
 
 const ROOT = repoRoot();
 const args = process.argv.slice(2);
@@ -51,22 +52,39 @@ const TRAIT_REFS = {
   Environment: ['hdrPath'],
 };
 
+/** guid → asset, from the asset IDs the repo itself holds (#2119): a binary's `.meta.json`
+ *  sidecar and a JSON asset's own top-level `id`, which is where the editor's scanner reads them.
+ *  The root `assets.manifest.json` is a build output that is rarely regenerated (it still listed
+ *  deleted projects), so a game's refs read through it alone showed every one as missing; it is
+ *  read only for a guid the repo does not hold. */
 async function loadManifest() {
-  const candidates = [
-    join(ROOT, 'assets.manifest.json'),
-    join(ROOT, 'public', 'assets.manifest.json'),
-    join(ROOT, 'dist', 'assets.manifest.json'),
-  ];
-  for (const p of candidates) {
-    if (!existsSync(p)) continue;
-    const data = parseJsonText(await readFile(p, 'utf-8'));
-    const byGuid = new Map();
-    for (const a of (data.assets ?? [])) {
-      if (a.guid) byGuid.set(a.guid, a);
-    }
-    return { byGuid, source: p };
+  const byGuid = new Map();
+  const sources = [];
+  let fromRepo = 0;
+  for (const f of repoFiles({ match: /\.json$/i, floor: 1 })) {
+    const sidecar = /\.meta\.json$/i.test(f.rel);
+    let data;
+    try { data = parseJsonText(await readFile(f.abs, 'utf-8')); } catch { continue; }
+    if (!data || typeof data !== 'object' || !isGuid(data.id)) continue;
+    const path = '/' + (sidecar ? f.rel.replace(/\.meta\.json$/i, '') : f.rel);
+    const type = sidecar ? 'file' : (/\.([a-z0-9-]+)\.json$/i.exec(f.rel)?.[1] ?? 'json');
+    // An id two files carry (a calibration copy of a level, say): the shipped asset wins, whatever
+    // the sort order, so the ref prints the file the game actually loads.
+    const had = byGuid.get(data.id);
+    if (had && (had.path.includes('/runtime/assets/') || !path.includes('/runtime/assets/'))) continue;
+    if (!had) fromRepo++;
+    byGuid.set(data.id, { guid: data.id, path, type });
   }
-  return { byGuid: new Map(), source: null };
+  if (fromRepo) sources.push(`repo asset ids (${fromRepo})`);
+  const manifestPath = join(ROOT, 'assets.manifest.json');
+  if (existsSync(manifestPath)) {
+    const data = parseJsonText(await readFile(manifestPath, 'utf-8'));
+    for (const a of (data.assets ?? [])) {
+      if (a.guid && !byGuid.has(a.guid)) byGuid.set(a.guid, a);
+    }
+    sources.push(relative(ROOT, manifestPath));
+  }
+  return { byGuid, source: sources.length ? sources.join(' + ') : null };
 }
 
 function resolveRef(ref, manifest) {
@@ -78,42 +96,33 @@ function resolveRef(ref, manifest) {
     : { kind: 'missing', display: `${ref}  →  ⚠️  NOT IN MANIFEST` };
 }
 
-function walkRefs(obj, manifest, out, breadcrumb) {
-  if (Array.isArray(obj)) {
-    for (let i = 0; i < obj.length; i++) walkRefs(obj[i], manifest, out, `${breadcrumb}[${i}]`);
-    return;
-  }
-  if (!obj || typeof obj !== 'object') return;
-
-  // Direct trait fields: surface every ref we know to look for
-  for (const [traitName, fields] of Object.entries(TRAIT_REFS)) {
-    if (obj[traitName] && typeof obj[traitName] === 'object' && obj[traitName] !== true) {
+function walkRefs(json, manifest, out) {
+  // Every object at any depth (#2119): a v20 scene / v10 prefab states its records on
+  // `members[key].traits` and its user nodes in `members[key].own`, and a walk that named its
+  // containers (`entities`, `overrides`) printed none of them.
+  walkObjects(json, (obj, at) => {
+    for (const [traitName, fields] of Object.entries(TRAIT_REFS)) {
+      const bag = obj[traitName];
+      if (!bag || typeof bag !== 'object' || Array.isArray(bag)) continue;
       for (const f of fields) {
-        const v = obj[traitName][f];
-        if (typeof v === 'string' && v) {
-          out.push({ at: `${breadcrumb}.${traitName}.${f}`, ref: v, ...resolveRef(v, manifest) });
+        const v = bag[f];
+        if (typeof v === 'string' && v) out.push({ at: `${at}.${traitName}.${f}`, ref: v, ...resolveRef(v, manifest) });
+      }
+    }
+    // A scene entry's or a prefab reference row's prefab
+    if (typeof obj.prefab === 'string' && obj.prefab) {
+      out.push({ at: `${at}.prefab`, ref: obj.prefab, ...resolveRef(obj.prefab, manifest) });
+    }
+    // The resources list
+    if (Array.isArray(obj.resources)) {
+      for (let i = 0; i < obj.resources.length; i++) {
+        const r = obj.resources[i];
+        if (r && typeof r.path === 'string') {
+          out.push({ at: `${at}.resources[${i}](${r.type})`, ref: r.path, ...resolveRef(r.path, manifest) });
         }
       }
     }
-  }
-  // Top-level prefab field on a scene entity
-  if (typeof obj.prefab === 'string' && obj.prefab) {
-    out.push({ at: `${breadcrumb}.prefab`, ref: obj.prefab, ...resolveRef(obj.prefab, manifest) });
-  }
-  // Resources list
-  if (Array.isArray(obj.resources)) {
-    for (let i = 0; i < obj.resources.length; i++) {
-      const r = obj.resources[i];
-      if (r && typeof r.path === 'string') {
-        out.push({ at: `${breadcrumb}.resources[${i}](${r.type})`, ref: r.path, ...resolveRef(r.path, manifest) });
-      }
-    }
-  }
-
-  // Recurse into known nested containers
-  for (const key of ['entities', 'overrides']) {
-    if (key in obj) walkRefs(obj[key], manifest, out, `${breadcrumb}.${key}`);
-  }
+  });
 }
 
 async function showFile(filePath, manifest) {
@@ -122,7 +131,7 @@ async function showFile(filePath, manifest) {
   try { json = parseJsonText(txt); } catch (e) { console.warn(`[skip] ${filePath}: ${e.message}`); return; }
 
   const out = [];
-  walkRefs(json, manifest, out, 'root');
+  walkRefs(json, manifest, out);
 
   console.log(`\n== ${relative(ROOT, filePath)} ==`);
   if (json.id) console.log(`   file.id: ${json.id}`);

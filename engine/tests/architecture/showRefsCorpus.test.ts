@@ -83,6 +83,16 @@ describe.skipIf(!INTERNAL)('show-refs.mjs --all (#805)', () => {
     expect(manifestLine).not.toContain('(none found');
   });
 
+  it("prints a v20 instance's member-row refs, resolved (#2119)", () => {
+    // Before, the walk read a trait only on the entry itself and recursed into `entities` and
+    // `overrides` alone, so a member row's `Renderable3D.mesh` was never printed; and the root
+    // manifest it resolved through was stale, so every ref in a game read as missing.
+    const lines = stdout.split('\n');
+    const memberRefs = lines.flatMap((l, i) => (/\.members\[".*"\]\.traits\./.test(l) ? [lines[i + 1] ?? ''] : []));
+    expect(memberRefs.length).toBeGreaterThan(0);
+    expect(memberRefs.filter((l) => l.includes('→  /games/')).length).toBeGreaterThan(0);
+  });
+
   it('reaches a floored total well under the real count, so ordinary churn cannot turn this red', () => {
     expect(sections.length).toBeGreaterThan(TOTAL_FLOOR);
   });

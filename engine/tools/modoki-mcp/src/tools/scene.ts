@@ -169,7 +169,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
     "Set an entity's Transform (position / rotation / scale) in ONE call — the fast " +
       'path for placing, scaling, or rotating an entity without hand-building a ' +
       'mutate_scene op. Only the components you pass are changed (partial merge). ' +
-      'Handles prefab INSTANCES correctly (routes the edit into the instance overrides, ' +
+      'Handles prefab INSTANCES correctly (records the edit on the instance\'s override list, ' +
       'where a plain setTrait would be silently ignored). Goes through modoki_mutate_scene under ' +
       'the hood, so the same persistence behaviour applies (see its description): live + undoable ' +
       'when the editor has this scene open, file-direct otherwise. `path` defaults to the active ' +

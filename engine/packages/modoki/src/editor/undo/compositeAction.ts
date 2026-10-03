@@ -42,7 +42,7 @@
  */
 
 import {
-  pushAction, beginActionCapture, endActionCapture, runOnStepChain,
+  pushAction, beginActionCapture, endActionCapture, runOnStepChain, keepsRecords,
   type UndoAction,
 } from './undoManager';
 import { UndoRefusedError } from './undoFailure';
@@ -236,6 +236,8 @@ export function composeUndoActions(
   };
   if (opts.coalesceKey != null) action.coalesceKey = opts.coalesceKey;
   if (subs.every((a) => a._isSelection)) action._isSelection = true;
+  // Each sub puts back its own records, in order (#2001 S8): the batch does when every sub does.
+  if (subs.every(keepsRecords)) action.maintainsRecords = true;
   if (subs.every((a) => a._isFileDirect)) action._isFileDirect = true;
   // One sub that rebuilt the live world makes the batch one that did (#1857).
   if (action._isFileDirect && subs.some((a) => a._rebasesLiveFrames)) action._rebasesLiveFrames = true;

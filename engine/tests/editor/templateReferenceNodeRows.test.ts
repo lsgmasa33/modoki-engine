@@ -187,6 +187,27 @@ beforeEach(() => { setRunModeForAuthoring('stopped'); });
 
 describe('a template reference node does not pin what its inner prefab put there (#1538)', () => {
   // The case #1538 was observed with. Mutation: in `captureNestedRef`, skip the template branch (the scene rule).
+  // #2125: a v10 node states its root on a `"/"` row. Prefab edit loads the template as a capture-form scene, and the
+  // settle of a template node's rows never set the `"/"` row aside, so it warned about a row naming no node and kept
+  // it as an orphan. Mutation: `keepTemplateNodeOrphans` passing `members` unstripped to `applyStoredMemberRows`.
+  it('a node\'s "/" row is its root\'s, not an orphan row, in the prefab-edit world (#2125)', async () => {
+    install(midDoc());
+    const warn = vi.spyOn(console, 'warn');
+    try {
+      const root = await openInEditor(outer2({ members: { '/': { traits: { Transform: { x: 5 } } } } }));
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((l) => /names? no node the template still declares/.test(l))).toEqual([]);
+      const midRoot = all().find((e) => e.name === 'MidRoot' && under(e.id, 'InnerRoot'))!;
+      expect(traitOf(midRoot.id, 'Transform')?.x).toBe(5);
+      const saved = serializePrefab(root, OUTER2)!;
+      expect(v10RowsOf(refNodeOf(saved))['/']?.traits?.Transform).toMatchObject({ x: 5 });
+      // The silent loss it also fixes: the kept orphan row was written back OVER an edit of the nested root.
+      expect(writeTraitFieldWithUndo(midRoot.id, getTraitByName('Transform')!, 'x', 7)).toBeNull();
+      expect(v10RowsOf(refNodeOf(serializePrefab(root, OUTER2)!))['/']?.traits?.Transform).toMatchObject({ x: 7 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('an untouched save writes neither a slot nor rows, and MID restoring Leaf reaches OUTER2', async () => {
     install(midDoc({ removed: [2] }));
     const root = await openInEditor(outer2());

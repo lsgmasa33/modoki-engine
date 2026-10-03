@@ -1811,13 +1811,23 @@ export function entryRowsOf(
  *  whose unused part alone is kept (`keepUnusedLegacy`), as today's; its `traitRemovals` to `removedTraits`; and its
  *  `own` links nowhere, since the projection placed them and today's capture finds them in the live tree. The root's
  *  placement fields the row states (its `name`, hub ruling 2026-10-02, design § 10.4) are its placement, never a record
- *  the settle may call unused. An earlier file's rows pass unchanged. */
+ *  the settle may call unused.
+ *
+ *  At EVERY version (#2125): no writer before v20 states a `"/"` key (a v16–v19 row key is a chain of guids), so a `"/"`
+ *  row in an earlier-stamped world is a v10 reference row's, which prefab edit loads as a capture-form (v19) scene, and
+ *  it names the root there too. Left in `members`, the settle judged it a row naming no node: one false orphan warning
+ *  per nested row on every open, and a kept orphan the save wrote back over the edit world's own root value. Before
+ *  v20 the row's other statements (a `parent`, which the root's placement decides, or a whole list) stay on a `"/"`
+ *  row of their own, kept and reported unused as that file's load always did; from v20 they are the list's alone. */
 function rootRowAsLegacy(
   world: World, rootEcsId: number, members: Record<string, SceneMemberRow>, legacy: KeptLegacy, sceneVersion: number | undefined,
 ): { members: Record<string, SceneMemberRow>; legacy: KeptLegacy } {
   const row = members['/'];
-  if (sceneVersion === undefined || sceneVersion < INSTANCE_MODEL_SCENE_VERSION || !isRecord(row)) return { members, legacy };
-  const { '/': _root, ...rest } = members;
+  if (!isRecord(row)) return { members, legacy };
+  const { '/': _root, ...stripped } = members;
+  const residual = sceneVersion !== undefined && sceneVersion >= INSTANCE_MODEL_SCENE_VERSION ? {}
+    : Object.fromEntries(Object.entries(row).filter(([k]) => !ROOT_ROW_STRIPPED.includes(k)));
+  const rest: Record<string, SceneMemberRow> = Object.keys(residual).length ? { ...stripped, '/': residual as SceneMemberRow } : stripped;
   const piMeta = getTraitByName('PrefabInstance');
   const root = piMeta ? findEntityById(rootEcsId, world) as EntityHandle | undefined : undefined;
   const lid = root?.has(piMeta!.trait) ? (root.get(piMeta!.trait) as { localId?: number }).localId : undefined;
@@ -1834,6 +1844,8 @@ function rootRowAsLegacy(
   return { members: rest, legacy: out };
 }
 const ROOT_PLACEMENT_FIELDS = ['name', 'sortOrder', 'editorFolder', 'sourceScene'];
+/** What {@link rootRowAsLegacy} restates or the projection places: the rest of a `"/"` row stays a row. */
+const ROOT_ROW_STRIPPED = ['traits', 'traitRemovals', 'own', 'guid', 'name'];
 
 /** One warning per owner for the values {@link splitMalformedChannels} took out. */
 function warnMalformed(owner: string, malformed: readonly MalformedValue[]): void {
@@ -1917,9 +1929,11 @@ function keepTemplateNodeOrphans(world: World, entryRootId: number, keyed: reado
   for (const [key, members, source, node] of keyed) {
     const roots = (byKey.get(key) ?? []).filter(under);
     if (roots.length !== 1) continue;
-    applyStoredMemberRows(world, roots[0]!, members, source, undefined, true, read, node ?? undefined);
+    // A v10 template's node states its root on a `"/"` row (#2125), as a v20 scene node does.
+    const v10 = rootRowAsLegacy(world, roots[0]!, members, legacyOf(node ?? {}), undefined);
+    applyStoredMemberRows(world, roots[0]!, v10.members, source, undefined, true, read, node ?? undefined);
     // …and its legacy channels no frame of its document takes (#1780's legacy half, a pre-v5 node's #1738 member 3).
-    keepUnusedLegacy(world, roots[0]!, source, legacyOf(node ?? {}), read);
+    keepUnusedLegacy(world, roots[0]!, source, v10.legacy, read);
   }
 }
 

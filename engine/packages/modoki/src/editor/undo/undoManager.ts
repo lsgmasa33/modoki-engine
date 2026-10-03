@@ -716,6 +716,13 @@ export function endActionCapture(frame: UndoAction[]): UndoAction[] {
   return frame;
 }
 
+/** Does running `action` (either way) leave the instance store's records exact? One that maintains them
+ *  (`maintainsRecords`), a selection change, and an asset-file edit that rebuilds no live frame (#1857's
+ *  `_rebasesLiveFrames`): the last two touch no instance at all (#2001 S8). Every other step marks them stale. */
+export function keepsRecords(action: Pick<UndoAction, 'maintainsRecords' | '_isSelection' | '_isFileDirect' | '_rebasesLiveFrames'>): boolean {
+  return !!action.maintainsRecords || !!action._isSelection || (!!action._isFileDirect && !action._rebasesLiveFrames);
+}
+
 /** Push a new action. Clears redo stack. */
 export function pushAction(action: UndoAction) {
   // Dropped inside a step's window (a closure's own push must not clear the redo stack it is about to land on). ⚠️ The
@@ -1038,7 +1045,7 @@ export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
     // …and stale BEFORE it runs too: a rebase inside the step reads the store (#2046 S7.3), and a record this step is
     // about to leave behind must send it to the capture instead of reprojecting the step's work away.
     const at = peekCurrentWorld();
-    if (at && !action.maintainsRecords) markStale(at, direction);
+    if (at && !keepsRecords(action)) markStale(at, direction);
     const { ok, failed, shortfall, dropped } = direction === 'undo'
       ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
       : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
@@ -1047,7 +1054,7 @@ export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
     // that does (`maintainsRecords`) leaves them fresh, unless it failed. The world current NOW (an undo can swap it),
     // and none is made: no world, no records.
     const world = peekCurrentWorld();
-    if (world && (!action.maintainsRecords || failed)) markStale(world, direction);
+    if (world && (!keepsRecords(action) || failed)) markStale(world, direction);
     return { did: ok, label: action.label, refused: null, failed, shortfall, dropped };
   });
 }

@@ -17,7 +17,9 @@
  * the old writer's semantics differ from a rule, or no rule answers, the comment cites which, and the I25 shadow reports
  * every case where this door's list and the old capture disagree.
  *
- * Undo and redo do NOT pass through here (S7 moves them): the undo manager marks the store stale instead.
+ * Most undo and redo steps do NOT pass through here: the undo manager marks the store stale around a step that does not
+ * keep its records (`keepsRecords`). Those that do write through the door, or seat the exact records they hold
+ * (`instanceHistory.ts`): an Instantiate's undo is this door's delete of the root it placed (#2001 S8a).
  */
 import type { World } from 'koota';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
@@ -449,7 +451,9 @@ function beginAddChildImpl(parentId: number): void {
  *   any instance under it.
  */
 function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrentWorld()): () => void {
-  const ea = getTraitByName('EntityAttributes')!;
+  // No instance type registered (a bare world): there is no record to edit, and nothing to report.
+  const ea = getTraitByName('EntityAttributes');
+  if (!ea || !getTraitByName('PrefabInstance')) return NOOP;
   const parentOf = (id: number) => ((findEntity(id)?.get(ea.trait) as { parentId?: number } | undefined)?.parentId ?? 0);
   const set = new Set(entityIds);
   const top = entityIds.filter((id) => { for (let p = parentOf(id), n = 0; p && n < 1024; p = parentOf(p), n++) if (set.has(p)) return false; return true; });
