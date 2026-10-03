@@ -190,6 +190,11 @@ const EXPECTED_ERRORS: { pattern: RegExp; after?: RegExp; why: string }[] = [
     why: 'the same ruling, for a delete\'s undo whose members\' instance root is gone (`requireRootLinks`)',
   },
   {
+    pattern: /^\[entityActions\] refused: "[^"]*" stands in for a part of a missing nested prefab, which only that prefab can state/,
+    why: '#2056 review (hunt seed 1212): a Duplicate, Copy or Cut of a missing nested ROW\'s placeholder is refused '
+      + '(`rowPlaceholderCopyRefusal`): the copy would be saved nowhere; the op reports "refused"',
+  },
+  {
     pattern: /^\[entityActions\] refused: "[^"]*" is a Missing Prefab now/,
     why: '#1818 (I21): an edit the placeholder\'s save would drop is refused where it is made (`placeholderWriteRefusal`), '
       + 'and says so; the op reports "refused"',

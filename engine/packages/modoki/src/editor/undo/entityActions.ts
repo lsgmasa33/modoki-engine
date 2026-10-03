@@ -33,7 +33,7 @@ import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { arrive, checkRef, refsCheck, type StepCheck, type CheckPass } from './stepCheck';
 import { entityRef, ensureGuid, buildGuidIndex, resolveWith, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
-import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf } from './placeholderGate';
+import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf, rowPlaceholderCopyRefusal } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
 import { notifyFieldEdited } from '../animation/recording';
 import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
@@ -1178,6 +1178,8 @@ export function duplicateEntity(
   entityId: number,
   selectEntity: (id: number | null) => void,
 ): number | null {
+  const rowCopy = rowPlaceholderCopyRefusal(entityId);
+  if (rowCopy) { reportWriteRefusal(rowCopy); return null; }
   const captured = snapshotEntity(entityId);
   if (!captured) return null;
   // Mint fresh guids for the whole copied subtree ONCE (stable across undo/redo), and decide each node's prefab link by
@@ -1254,6 +1256,8 @@ export interface EntityClipboard {
 
 /** Take `entityId` onto the clipboard, or null when it has no snapshot. */
 export function clipEntity(entityId: number, op: 'copy' | 'cut'): EntityClipboard | null {
+  const rowCopy = rowPlaceholderCopyRefusal(entityId);
+  if (rowCopy) { reportWriteRefusal(rowCopy); return null; }
   const snapshot = snapshotEntity(entityId);
   // mint:false — cutting must not write a guid into the source; the world check below covers a guid-less one.
   if (!snapshot) return null;

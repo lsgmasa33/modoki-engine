@@ -94,7 +94,9 @@ async function setupNest(f: Fixture): Promise<void> {
  *  - `assetDelete`: a Move to Trash of a prefab something the walk must restore still REFERENCES — the scene at the
  *    segment's start or now, or a prefab file then or now (`trashedPrefabReferenced`). It is not undoable (#1868, owner
  *    ruling D2; Unity: "You cannot undo the delete assets action."), so the file stays gone for the walk, and the stack's
- *    entries recorded against it (a respawn from it, a rebuild onto it) refuse after it by the same rule as `rulingR`. A
+ *    entries recorded against it (a respawn from it, a rebuild onto it) refuse after it by the same rule as `rulingR` —
+ *    since #2056 at once: the trash shows its instances as placeholders through a reload of its own, which is this
+ *    cause's swap, not a `rulingR` one. A
  *    trash of a prefab nothing references only leaves the baseline (`rebaseForFileOp`), and every check stays on. A
  *    RENAME is never a taint: a scene names a prefab by guid, so the runner only moves the path in the baseline.
  *    ⚠️ Known limit: a prefab only the undo/redo STACK names (placed, then undone, then trashed) is not seen, so its
@@ -762,7 +764,9 @@ export async function runOps(be: FuzzBackend, ops: readonly Op[], opts: RunOpts)
     // swap (an Apply's undo reloads its snapshot) and its second refuse on what that swap left unexpanded — ruling R inside
     // one op, which judged first read as a refusal in a clean segment (seed 6191). Sound either way round: a refused step
     // changes nothing, so every swap this op made came before its refusal.
-    const swapped = getCurrentWorld() !== worldBefore;
+    // A trash swaps the world itself since #2056 (its instances are shown as placeholders through the reload Stop runs):
+    // that is the delete's own consequence, tainted below as `assetDelete`, the cause its entries name.
+    const swapped = getCurrentWorld() !== worldBefore && op.kind !== 'trashPrefab';
     if (swapped && ([...placeholderGuids()].some((g) => !placeholdersBefore.has(g)) || [...unexpandedRows()].some((k) => !unexpandedBefore.has(k)))) taint(seg, 'rulingR');
     noteLive(seg);
     if ((op.kind === 'undo' || op.kind === 'redo') && outcome === 'refused') {

@@ -29,7 +29,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { getAllEntities, getTraitByName } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, authored, worldTree, type Fixture } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, authored, worldTree, evictKeepingFramesLive, withFramesKeptLive, type Fixture } from './prefabFuzz/harness';
 import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
@@ -37,7 +37,6 @@ import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolv
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { findEntity, readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
-import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import { saveScene, saveAll, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { deleteEntitiesWithUndo, writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { enterPlay, stopPlay } from '../../packages/modoki/src/editor/scene/playMode';
@@ -60,11 +59,13 @@ const write = (f: Fixture, sc: SceneFile) => be.write(f.scenePath, `${JSON.strin
 const countOf = (guid: string) => getAllEntities().filter((e) => piOf(e.id)?.source === guid).length;
 const topRoot = (f: Fixture, which: 'O' | 'P') => getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs[which].guid && pi.rootInstanceId === x.id; })!;
 
-/** Trash a fixture prefab as the Assets panel does, and let the watcher see it. */
+/** Trash a fixture prefab as the Assets panel does, and let the watcher see it — its frames kept LIVE
+ *  (`evictKeepingFramesLive`): the state the copy store meets in prefab edit's template or an envelope's world. A scene's
+ *  own trash shows them as placeholders at once (#2056). */
 async function trash(f: Fixture, which: 'P' | 'Q'): Promise<void> {
   const before = be.snapshot();
-  expect((await deleteAssetFiles(deletionPathsFor(f.prefabs[which].path, 'prefab', null))).ok).toBe(true);
-  unbindDeletedAssetEditors([f.prefabs[which].path]);
+  expect((await withFramesKeptLive(be, () => deleteAssetFiles(deletionPathsFor(f.prefabs[which].path, 'prefab', null)))).ok).toBe(true);
+  evictKeepingFramesLive(f.prefabs[which].path);
   await flushWatcher(be, before);
   await settle();
 }

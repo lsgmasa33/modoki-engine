@@ -383,6 +383,11 @@ export function editorPrefabDeleted(source: string): boolean {
   return deletedEditorKeys.has(source);
 }
 
+/** Every key an asset delete evicted with nothing seated under it since — the prefabs that are gone (#2056). */
+export function deletedEditorPrefabKeys(): ReadonlySet<string> {
+  return deletedEditorKeys;
+}
+
 /** The editor cache's half of a prefab write, for `commitPrefabWrite` (prefabCommit.ts) alone: set `source` to the
  *  document just written, or evict it after a trash. The runtime cache is the commit's to update. */
 export function seatEditorPrefabCache(source: string, prefab: PrefabFile | null): void {

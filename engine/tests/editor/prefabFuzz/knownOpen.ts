@@ -54,11 +54,11 @@ export interface KnownOpen {
 // Retired by #1880 F6d (drift, not a fix): #1891's seed 1233 list diverges at its 15th pick once the entry rebuild
 // renumbers ids, and no longer reaches the case. The case is stated id-free, from the run's own documents, in
 // prefabWholeListRebuild.test.ts (passing since F6e).
-/** #1951: the rebuild an outside edit makes lacks an entity the reload of the same bytes has (`<guid>: undefined vs {…}`):
- *  a member a changed prefab gained, under its instance inside a kept frame. Only after an outside edit, never an Apply or
- *  a reverse diff (an entity the rebuild has and the reload lacks). */
-const keptFrameStale = (f: StepFailure): boolean =>
-  f.check === 'a rebuild is not a reload' && f.op.startsWith('outsideEdit') && /^\/[0-9a-f-]{36}: undefined vs \{/.test(f.detail);
+// Retired by #2056 (owner ruling 2026-10-03, "Missing at once, as Unity"): #1951's seed 1027 and #2001's paste row
+// (seed 1012) each needed a live frame of a TRASHED prefab in the scene world, which a trash no longer leaves (its
+// instances become placeholders at once). A kept live frame survives only in prefab edit's template, an envelope's
+// world, or a loaded BASE scene's tree (the trash's reload keeps a base rather than rebuilding it). Neither repro reaches the
+// first two; the fuzz fixture has no base scene, so whether either still reproduces through one is not known (parked).
 
 /** #1829's shape: across a save→reload, the marks of ONE component differ by a field the reload added (the save wrote a
  *  partially stated added component whole). Only a mark list, never a value: `<guid>/marks/<n>: "T.a" vs "T.b"` within
@@ -72,10 +72,6 @@ const partialAddedWidened = (f: StepFailure): boolean => {
     && (f.touched?.fileDirect ?? []).includes(m[1]!);
 };
 
-
-/** #1820's paste assertion after a trash (seed 1012): the pasted frame is still expanded from an older document. */
-const pastedFrameStale = (f: StepFailure): boolean =>
-  f.check === 'op threw' && /^harness: pasted frame "[^"]*" is still expanded from an older \S+ when the paste returns \(#1820\)/.test(f.detail);
 
 /** #2013: today's load keeps a member's `removed` in its orphan store AND applies it — the fold removed that member too,
  *  which the oracle marks `(applied)`. Every divergence line of the step must be one (`foldCheck` reports them all). The
@@ -153,18 +149,6 @@ const redoFreshRowName = (f: Failure): boolean => {
 
 export const KNOWN_OPEN: KnownOpen[] = [
   {
-    issue: 1951,
-    what: "#1951 (hunt seed 1027, pre-existing; low, parked): an instance of H placed inside a live frame of a TRASHED prefab keeps H's old members after H changes outside — the entry's rebuild keeps that frame whole (#1862), so nothing in it is re-expanded, and the reload shows H's new member",
-    repro: [
-      {kind: 'trashPrefab', u: [0.693313981872052, 0.4887022376060486, 0.2338455079589039, 0.8015267017763108, 0.9982616631314158, 0.9926003257278353, 0.17166399210691452, 0.9857021998614073]},
-      {kind: 'instantiate', u: [0.15538944560103118, 0.7801780079025775, 0.3371633195783943, 0.10732766333967447, 0.4623966992367059, 0.23334859986789525, 0.8244502916932106, 0.8450959715992212]},
-      {kind: 'instantiate', u: [0.5373735958710313, 0.4927500218618661, 0.011030459310859442, 0.30226651718840003, 0.12471751752309501, 0.7305856866296381, 0.10899202013388276, 0.4397963718511164]},
-      {kind: 'outsideEdit', u: [0.12397644645534456, 0.004915807629004121, 0.7699898227583617, 0.8006252702325583, 0.9029005409684032, 0.8947316522244364, 0.4904838753864169, 0.833778610220179], check: 'rebuild-reload'},
-    ],
-    reproduces: (f) => keptFrameStale(f),
-    stops: (f, ops) => keptFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
-  },
-  {
     issue: 1829,
     what: "#1829's mechanism by a LEGAL route (#2009 verify seed 8): an agent's file-direct `/api/scene-mutate` (no renderer) states an added component PARTIALLY on an instance root (`overrides[1].Rotate3D = {speed: 2}`); the load marks `speed` only, the save writes the added component whole, so the reload marks `axis` too. The second save is byte-identical and no value changes. RECORDED, not fixed: hub ruling on #1829 (2026-09-29), \"closed under the Unity rule … nothing reads the difference … if an M2-shaped divergence ever gets a reader, option C (Unity's recorded-list model) is the recorded direction\" — which #2001 rule 4 (save writes the list, load → save verbatim) builds",
     repro: [
@@ -185,19 +169,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => orphanBookedTwice(f),
     // Tolerated, not a stop: frequent and benign (the save writes the row once), so the run goes on past it.
     tolerates: (f) => orphanBookedTwice(f as StepFailure),
-  },
-  {
-    issue: 2001,
-    what: "#2001 § 3.2's paste row, S7 (hunt seed 1012, #2009; no agent op): copy a subtree holding a nested Q frame inside P, Apply a change to Q, trash P, paste — the pasted Q frame is still expanded from the PRE-Apply Q when the paste returns, with Q cached (#1820's assertion). Hub ruling 2026-10-02: RECORD, don't fix on the model being replaced; this repro is part of S7's record-based paste acceptance test",
-    repro: [
-      {kind: 'delete', u: [0.5590389100834727, 0.7655044347047806, 0.44698118744418025, 0.02311297389678657, 0.09444080153480172, 0.98244315572083, 0.09199919365346432, 0.6827896372415125]},
-      {kind: 'copy', u: [0.793059557909146, 0.07850893028080463, 0.8062161759007722, 0.8035517330281436, 0.2764330352656543, 0.8323238401208073, 0.26245217374525964, 0.47499521006830037]},
-      {kind: 'apply', u: [0.6550896638073027, 0.3299250395502895, 0.3501399699598551, 0.08212947798892856, 0.8875960973091424, 0.30393532454036176, 0.4322215639986098, 0.8733348441310227], check: 'rebuild-reload'},
-      {kind: 'trashPrefab', u: [0.5543728081975132, 0.558105546515435, 0.80344816041179, 0.12341438280418515, 0.40858249459415674, 0.5091396970674396, 0.03132167900912464, 0.12620670325122774]},
-      {kind: 'paste', u: [0.8836326005402952, 0.804022109368816, 0.46664451458491385, 0.7002741650212556, 0.33111054403707385, 0.6519596504513174, 0.19220631150528789, 0.19979474716819823]},
-    ],
-    reproduces: (f) => pastedFrameStale(f),
-    stops: (f, ops) => pastedFrameStale(f) && ops.slice(0, f.step).some((o) => o.kind === 'trashPrefab'),
   },
   {
     issue: 1931,
@@ -1016,8 +987,8 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   },
   {
     issue: 1831,
-    what: "(harness, G1 M1/M5) a kept frame's reparent and Apply before the round trip, which then failed as M1 (hunt seed 5104)",
-    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    what: "(hunt seed 5104; re-pinned by #2056's review) a reparent of an added node whose nested stored root a load left stale (the trash's reload, or Stop's): the stale record re-seeded its whole tree and replaced the old parent's record object, so the unlink edited an orphan and the stored record kept the link (I25). `beginReparentImpl` now re-seeds the moved roots before it takes the old parent's record. (Was #1831's kept-frame reparent + Apply, whose kept live frame a trash no longer leaves.)",
+    reaches: { op: 6, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
     repro: [
       { kind: 'prefabEdit', u: [0.8762713158503175, 0.03239666367881, 0.11954150861129165, 0.9196045729331672, 0.3753566930536181, 0.5589897979516536, 0.26667742733843625, 0.9626793242059648], inner: [{kind: 'delete', u: [0.4095847448334098, 0.32432481413707137, 0.2858915913384408, 0.7823276342824101, 0.36225294740870595, 0.9154196181334555, 0.005848549073562026, 0.35622050357051194]}, {kind: 'undo', u: [0.33388770720921457, 0.572215726133436, 0.012769023422151804, 0.13426355132833123, 0.418521893909201, 0.9623553154524416, 0.28858965658582747, 0.18201336916536093]}, {kind: 'redo', u: [0.5351214946713299, 0.5260254153981805, 0.0020173119846731424, 0.6366104746703058, 0.5911289998330176, 0.2582283711526543, 0.41223555197939277, 0.9923461589496583]}, {kind: 'redo', u: [0.7061207813676447, 0.712686057202518, 0.991152907256037, 0.697692945599556, 0.8350388244725764, 0.9191796996165067, 0.3809151416644454, 0.5443655350245535]}] },
       { kind: 'editField', u: [0.045991167426109314, 0.5878017456270754, 0.21571285114623606, 0.3114997963421047, 0.5819835742004216, 0.6850799140520394, 0.12637460720725358, 0.4519760166294873] },
@@ -1680,9 +1651,9 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     ],
   },
   {
-    issue: 1914,
-    what: "#1914 R7 merge (hunt seed 1212): P trashed, so a reload expands O's nested P frame from the scene's copy (#1867), and an edit of O's added node Extra (Transform.sx) recorded on O's row. The load's R2 orphan test read the runtime cache alone, so that row was kept as an orphan as well as applied; once the edit was undone the save wrote the stale row back under the capture, and a rebuild (a load of the entry) restored the undone value. The load's `settleEntryRows` now reads `runtimeReaderFor(world)`, as its expansion did",
-    reaches: { op: 7, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    issue: 2056,
+    what: "#2056 review (hunt seed 1212): a Duplicate of a missing nested ROW's placeholder (P trashed, so O's nested P row is one) is refused: its copy was written through no owner's rows, so the reload lost it. (Was #1914's R7 merge, whose live P frame a trash no longer leaves.)",
+    reaches: { op: 6, outcome: 'refused', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
     repro: [
       {kind: 'addChild', u: [0.18742664926685393, 0.30426382343284786, 0.4212738615460694, 0.6239593659993261, 0.2947947233915329, 0.010036298539489508, 0.41152178030461073, 0.17663234402425587]},
       {kind: 'addChild', u: [0.3059104988351464, 0.22330826637335122, 0.022554441587999463, 0.36423116619698703, 0.8034015789162368, 0.7359053157269955, 0.2862185603007674, 0.30399635271169245]},

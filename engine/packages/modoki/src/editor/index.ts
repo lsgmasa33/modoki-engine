@@ -209,6 +209,7 @@ export {
 // is .tsx; the decision is a plain module so it is assertable without a jsdom mount
 // (docs/editor.md § Panels).
 export { reimportPrefabsInPlace, reimportOutsidePrefabChanges, type PrefabReimportReport } from './scene/prefabReimport';
+export { showDeletedPrefabsMissing, deletedPrefabsShown } from './scene/deletedPrefabsMissing';
 export { readUnusedStaleness, readPackedIntoAtlas, readPriorDocument, createPrefabFromEntity, createdFrameRebuiltRefusal, relinkedFramesCheck, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —

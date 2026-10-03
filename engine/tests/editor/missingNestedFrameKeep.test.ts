@@ -20,9 +20,8 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { getTraitByName, getAllEntities } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, type Fixture } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, startRun, settle, piOf, unexpandedRows, flushWatcher, placeholderGuids, evictKeepingFramesLive, withFramesKeptLive, type Fixture } from './prefabFuzz/harness';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
-import { unbindDeletedAssetEditors } from '../../packages/modoki/src/editor/panels/assetEditorBindings';
 import {
   getCachedPrefabSync, preloadNestedPrefabsForSubtree,
 } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -79,15 +78,17 @@ const tx = (id: number, field: string) => (readTraitData(id, getTraitByName('Tra
 /** Q's file as it was when {@link trashQ} trashed it, per fixture — what the scene's copy must hold (#1867). */
 const trashedQ = new Map<Fixture, unknown>();
 
-/** `Assets.tsx`'s `executeDeletion` of Q, as the fuzzer's `trashPrefab` op runs it: no undo entry (#1868, D2). */
+/** `Assets.tsx`'s `executeDeletion` of Q, as the fuzzer's `trashPrefab` op runs it: no undo entry (#1868, D2) — except that
+ *  its frames stay LIVE (`evictKeepingFramesLive`): the state this file's keep machinery (#1862) meets in prefab edit's
+ *  template or an envelope's world. A scene's own trash shows them as placeholders at once (#2056). */
 async function trashQ(f: Fixture, which: 'Q' | 'P' | 'H' = 'Q'): Promise<void> {
   const path = f.prefabs[which].path;
   if (which === 'Q') trashedQ.set(f, JSON.parse(be.read(path)!));
   const deletePaths = deletionPathsFor(path, 'prefab', null);
   const before = be.snapshot();
-  const del = await deleteAssetFiles(deletePaths);
+  const del = await withFramesKeptLive(be, () => deleteAssetFiles(deletePaths));
   if (!del.ok) throw new Error('trash of Q did not complete');
-  unbindDeletedAssetEditors([path]);
+  evictKeepingFramesLive(path);
   // The watcher's pass after it, as the fuzzer runs one after every op: the delete is the editor's own, so it raises
   // nothing, and a later outside write to the path (a hand restore) is then raised as one.
   await flushWatcher(be, before);

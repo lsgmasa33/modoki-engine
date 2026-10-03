@@ -34,6 +34,8 @@ import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templat
 import { ROOT_URL, type FuzzBackend } from './backend';
 import { classifyJsonAssetPath } from '../../../packages/modoki/src/runtime/loaders/assetTypeClassifier';
 import { fingerprintBytes, EDITOR_DELETE_FINGERPRINT } from '../../../plugins/editorWriteGuard';
+import { evictDeletedEditorPrefabs } from '../../../packages/modoki/src/editor/scene/prefabCache';
+import { evictDeletedPrefabs } from '../../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 
 type Handler = (data: unknown) => void;
 
@@ -292,6 +294,27 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
 // ── World readers ────────────────────────────────────────────────────────────────────────────────────────────────
 
 export interface PI { source: string; localId: number; nodeGuid: string; rootInstanceId: number }
+
+/** The state #1862's keep machinery meets: a prefab's file gone and both caches evicted (the trash's I9 repair) while its
+ *  frames are still live. A scene world no longer holds it — the trash shows them as Missing Prefab placeholders at once
+ *  (#2056) — but prefab edit's template and an envelope's world do, until the exit's load. A case about what the keep does
+ *  reaches it with this, in place of the trash's own repair (`unbindDeletedAssetEditors`), which would convert them. */
+export function evictKeepingFramesLive(path: string): void {
+  evictDeletedEditorPrefabs(path);
+  evictDeletedPrefabs(path);
+}
+
+/** `fn` (a delete through the route) with the route's renderer repair answered by {@link evictKeepingFramesLive} alone, so
+ *  the delete leaves its frames live — see there. */
+export async function withFramesKeptLive<T>(be: FuzzBackend, fn: () => Promise<T>): Promise<T> {
+  const relay = be.relay;
+  be.relay = async (op, params) => {
+    if (op !== 'apply-asset-path-moves') return relay(op, params);
+    for (const m of (params as { moves: { from: string; to: string | null }[] }).moves) if (m.to === null) evictKeepingFramesLive(m.from);
+    return { ok: true, notes: [] };
+  };
+  try { return await fn(); } finally { be.relay = relay; }
+}
 
 export function piOf(id: number): PI | undefined {
   const meta = getTraitByName('PrefabInstance');

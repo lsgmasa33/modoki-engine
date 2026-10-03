@@ -177,14 +177,14 @@ function restoreAuthoredEntitiesUnmarked(entries: SerializedEntity[]): void {
  *  Snapshot only — NO `assignGuids`. Neither envelope may write authored data (the whole contract is
  *  that its exit discards every mutation made inside it); minted guids land in the snapshot JSON, not
  *  the live world. */
-export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
+export async function captureAuthoredSnapshot(opts: { bases?: boolean } = {}): Promise<AuthoredSnapshot> {
   // Before the first await: a record an edit changes while the serializes below await is left out (`steadyRecords`).
   const recordsAt = cloneInstanceStore(getCurrentWorld());
   const primary = await serializeScene();
   const key = currentSceneKey();
   const bases = new Map<string, SceneFile>();
   for (const entry of sceneManager.getLoadedScenes().values()) {
-    if (entry.role !== 'base') continue;
+    if (entry.role !== 'base' || opts.bases === false) continue;
     // Defensive per-base catch: if a base fails to serialize, skip ITS replay rather than refuse the
     // whole envelope (its authored state then just isn't restored). This used to fire routinely for a
     // base containing a prefab instance — Phase 12's A8/A9 safety guard — which is now gone, both
@@ -201,7 +201,7 @@ export async function captureAuthoredSnapshot(): Promise<AuthoredSnapshot> {
 /** Put the authored world back: reload the primary under the snapshot's key, then replay the part
  *  the reload carries rather than rebuilds — every base.
  *  The caller has already checked that the key still names the live scene. */
-async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot): Promise<void> {
+async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot, by = 'stop', signal?: AbortSignal): Promise<void> {
   // Counted from the FIRST synchronous line: Stop sets 'stopped' and calls this with no await between,
   // so the Play world is still live for the whole reload with the mode already reading 'stopped'.
   _restoring++;
@@ -209,9 +209,9 @@ async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot): Promise<
     // The restore is the ADOPTER (#1698, hub): it reloads under the SAME key, so it writes no editor scene state, and an
     // older route whose world it replaced — a load still in its tail — adopts nothing.
     await withRestore(async (adoption) => {
-      const bank = snap.records ? bankInstanceRecords(snap.key ?? '', snap.records, snap.primary.entities as unknown as SceneEntityEntry[], 'stop') : undefined;
+      const bank = snap.records ? bankInstanceRecords(snap.key ?? '', snap.records, snap.primary.entities as unknown as SceneEntityEntry[], by) : undefined;
       try {
-        const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData, sceneCopies: snap.copies ?? new Map() });
+        const { world } = await sceneManager.loadScene(snap.key ?? '', { preloaded: snap.primary as unknown as SceneData, sceneCopies: snap.copies ?? new Map(), signal });
         adoption.restored(world);
       } finally {
         // Taken by the load once it made its world; one that threw before that leaves it for no later load to take.
@@ -221,7 +221,9 @@ async function restoreAuthoredSnapshotUnmarked(snap: AuthoredSnapshot): Promise<
     for (const base of snap.bases.values()) restoreAuthoredEntities(base.entities);
     _restoreFailed = false;
   } catch (e) {
-    _restoreFailed = true;
+    // A caller's abort lands before the swap (the trash's reload: an edit landed), so the world it leaves is the authored
+    // one it started from — not a world that may still hold a pose.
+    if (!signal?.aborted) _restoreFailed = true;
     throw e;
   } finally {
     _restoring--;
@@ -254,7 +256,22 @@ onWorldSwap(() => { _restoreFailed = false; });
 
 // #2046 S7.6: the restore's reload takes back the authored world's exact records (banked above) or parses fresh ones from
 // the snapshot, so a restore that lands marks nothing; one that throws marks the store stale, as before (`instanceStore.ts`).
-export const restoreAuthoredSnapshot = staleAroundUnless('stop', restoreAuthoredSnapshotUnmarked, () => true);
+export const restoreAuthoredSnapshot = staleAroundUnless('stop', (snap: AuthoredSnapshot) => restoreAuthoredSnapshotUnmarked(snap), () => true);
+/** The same reload, for a trashed prefab's live frames (#2056, `deletedPrefabsMissing.ts`): the world just captured is put
+ *  back through the load, which makes every instance of a prefab that no longer resolves a Missing Prefab placeholder.
+ *
+ *  Not wrapped in `staleAroundUnless` as Stop's is: its mark BEFORE the call is for an op that rebases the world it runs in,
+ *  and this one touches the live world only by replacing it. A reload its caller ABORTS (an edit landed) keeps that world,
+ *  and the pre-mark left every record in it stale, so the retry's capture banked stale records the load would not take
+ *  (#2056 re-review). Any other throw marks, as Stop's does. */
+export async function reloadCapturedWorld(snap: AuthoredSnapshot, signal?: AbortSignal): Promise<void> {
+  try {
+    await restoreAuthoredSnapshotUnmarked(snap, 'trash', signal);
+  } catch (e) {
+    if (!signal?.aborted) markStale(getCurrentWorld(), 'trash');
+    throw e;
+  }
+}
 
 /** The base replay writes authored values onto a kept base's carried entities without the door, so the records of the
  *  trees it writes — every stored root a base scene owns (`sourceScene` set) — are stale after it. */

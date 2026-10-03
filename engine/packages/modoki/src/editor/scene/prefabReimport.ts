@@ -39,6 +39,7 @@ import { markUIDirty } from '../../runtime/core/uiDirty';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
 import { markStale } from '../../runtime/prefab/instanceStore';
+import { showDeletedPrefabsMissing } from './deletedPrefabsMissing';
 
 export interface PrefabReimportReport {
   /** Each path whose file document both caches now hold, its instances rebased onto it. */
@@ -46,8 +47,10 @@ export interface PrefabReimportReport {
   /** A path whose file could not be read, or is still parked: the editor keeps what it held. */
   failed: { path: string; reason: string }[];
   /** A path whose file is GONE (#1873 R1 r2): both caches evicted as the in-editor delete evicts them, and its live
-   *  instances kept expanded (#1738's evicted state; a save writes them from their frame records, I18). */
+   *  instances shown as Missing Prefab placeholders by {@link reimportOutsidePrefabChanges} (#2056). */
   deleted: string[];
+  /** A gone path whose GUID lives at another path — a MOVE (#2067): its instances stay linked. */
+  moved: { from: string; to: string }[];
   /** A path nothing in the open scene uses — no live frame, no placeholder, no loaded scene's ref (#1702's case): only
    *  the caches were brought up to date. Said as the #1702 gate says it, so an unused prefab is never reported as a
    *  re-import or a delete of instances it does not have. */
@@ -67,7 +70,7 @@ async function reimportPrefabsInPlaceUnmarked(paths: readonly string[], opts: { 
   try {
     const world = getCurrentWorld();
     const res = await commitPrefabChanges(paths.map((path) => ({ source: path, doc: null, expected: null, land: 'adopt' as const })), { rebase: opts.rebase });
-    const adopted = res.adopted ?? { reimported: [], failed: paths.map((path) => ({ path, reason: res.error ?? 'it was not re-imported' })), deleted: [], unused: [], sources: [] };
+    const adopted = res.adopted ?? { reimported: [], failed: paths.map((path) => ({ path, reason: res.error ?? 'it was not re-imported' })), deleted: [], moved: [], unused: [], sources: [] };
     const { sources: seated, ...rest } = adopted;
     const report: PrefabReimportReport = { ...rest, notRebased: [], placeholders: [] };
     const sources = new Set(seated);
@@ -225,6 +228,9 @@ function copiesKeyOf(sourceScene: string | undefined): string {
  *  reload is left to the user. `needsReload` asks the caller for that reload. */
 async function reimportOutsidePrefabChangesUnmarked(paths: readonly string[], opts: { rebase?: boolean } = {}): Promise<{ report: PrefabReimportReport; needsReload: boolean }> {
   const report = await reimportPrefabsInPlace(paths, opts);
+  // A delete's live instances become Missing Prefab placeholders now (#2056) — after the adopt, so the reload reads the
+  // caches it left. A failure is logged by the conversion and leaves the frames live, as before it.
+  if (report.deleted.length) await showDeletedPrefabsMissing().catch(() => {});
   const leftover = report.notRebased.length + report.placeholders.length;
   return { report, needsReload: leftover > 0 && !worldHasUnsavedEdits() };
 }

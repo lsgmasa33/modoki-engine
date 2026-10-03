@@ -218,6 +218,10 @@ const guidToEntry = new Map<string, AssetEntry>();
 const pathToGuid = new Map<string, string>();
 /** The path a pruning load last saw `guid` at, once it pruned it; cleared when the guid is registered again. */
 const prunedPaths = new Map<string, string>();
+/** The guid a path held until a manifest load registered that guid at another path — a move (#2067): a reader that finds a
+ *  file gone asks whether its IDENTITY lives on elsewhere before calling it deleted. Dropped once another file takes the
+ *  path. */
+const movedFromPaths = new Map<string, string>();
 
 
 // Pure ref predicates live in assetRefRules.ts (zero imports, Node-safe) so they
@@ -269,7 +273,9 @@ export function registerAsset(
   const prior = guidToEntry.get(guid);
   if (prior && prior.path !== path) {
     pathToGuid.delete(prior.path);
+    movedFromPaths.set(prior.path, guid);
   }
+  movedFromPaths.delete(path);
   prunedPaths.delete(guid);
   // A RE-IMPORT that changes what this texture's URL resolves to must invalidate every cached
   // resolution of it, exactly as a re-slice does. `_spriteEpochByTexture` was bumped only by
@@ -542,6 +548,14 @@ export function lastKnownPathOf(guid: string): string | undefined {
   return guidToEntry.get(guid)?.path ?? prunedPaths.get(guid);
 }
 
+/** The guid that lived at `path` and now lives at ANOTHER path (a move, #2067), or undefined: never moved from here,
+ *  another file took the path since, or the guid is gone from the manifest. */
+export function guidMovedFrom(path: string): string | undefined {
+  const guid = movedFromPaths.get(path);
+  const now = guid ? guidToEntry.get(guid)?.path : undefined;
+  return guid && now && now !== path ? guid : undefined;
+}
+
 /** Look up the guid registered for a path, or undefined. */
 export function getGuidForPath(path: string): string | undefined {
   return pathToGuid.get(path);
@@ -741,6 +755,7 @@ export function serializeManifest(): AssetManifestFile {
 /** Clear the manifest. Used in tests + when reloading. */
 export function clearManifest(): void {
   prunedPaths.clear();
+  movedFromPaths.clear();
   guidToEntry.clear();
   pathToGuid.clear();
   _manifestGuids.clear();

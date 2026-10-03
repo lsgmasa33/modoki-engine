@@ -141,8 +141,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'ROOT (`/assets/`, `/games/<id>/assets/`) is refused.\n\n' +
       'It also does NOT evict the renderer\'s scene-scoped caches (mesh/material/particle): ' +
       'an asset already loaded into the open scene stays live until the next scene swap, even ' +
-      'though its file is gone. A prefab IS evicted: its live instances stay as they are, and the ' +
-      'next reload shows a Missing Prefab. The panel\'s delete does the same.\n\n' +
+      'though its file is gone. A prefab IS evicted, and its live instances become Missing Prefab ' +
+      'placeholders before the reply, in place (what a reload or Stop shows; not while Play, a ' +
+      'preview or prefab edit is open, whose exit does it). Putting the file back relinks them. ' +
+      'The panel\'s delete does the same.\n\n' +
       'REFUSES (REQUIRES_SAVE) while the editor holds a human\'s UNSAVED edit for a path you are ' +
       'deleting, or for anything inside a folder you are deleting: the delete would destroy it. ' +
       'modoki_save_all first, or discardUnsaved:true. An unsaved live-world scene edit does not ' +

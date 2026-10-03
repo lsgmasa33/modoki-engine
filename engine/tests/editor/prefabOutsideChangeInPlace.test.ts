@@ -220,7 +220,11 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
   // R1 review F2/F3: the editor cache is WARM (the fixture used to leave it cold, so the eviction was unobservable), and the
   // dev editor's delete lands its PRUNED manifest before the event, so the path resolves to no guid by then. Mutation:
   // drop `evictDeletedEditorPrefabs(path)`, or ask "is it used" before the absent check — the editor cache keeps X.
-  it('a delete keeps the live instances as they are, evicts both caches, and reloads nothing', async () => {
+  // #2056: the live instances are then shown as Missing Prefab through the reload Stop runs (`deletedPrefabsMissing.ts`) —
+  // what that load builds is `trashShowsMissing.test.ts`'s; this fixture's `sceneManager.loadScene` is a stub, so here
+  // the adopt is held to asking for it once, with the captured world, over the scene's own key. Mutation: drop the
+  // conversion from `reimportOutsidePrefabChangesUnmarked` → no reload is asked.
+  it('a delete evicts both caches, says so, and asks the reload that shows its instances as Missing Prefab', async () => {
     writeTraitFieldWithUndo(rootOf(HOLDER), getTraitByName('Transform')!, 'x', 3);
     loadManifestJson({ version: 1, assets: [{ guid: X, path: X_PATH, type: 'prefab' }, { guid: H, path: H_PATH, type: 'prefab' }] } as never, { prune: true });
     expect(await getPrefabSource(X), 'premise: the editor cache holds X').not.toBeNull();
@@ -229,13 +233,14 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
     expect(getGuidForPath(X_PATH), 'premise: the pruned manifest no longer maps X').toBeUndefined();
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const world = getCurrentWorld();
+    loadScene.mockImplementation(async () => ({ world }) as never);
     await reloadPrefabFromDisk(X_PATH);
     // Named as a delete of instances the scene HAS — decided through the path X lived at (Mutation: ask only the pruned
     // path's own keys — it reads as unused).
-    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/X\.prefab\.json was deleted outside the editor/);
-    expect(loadScene).not.toHaveBeenCalled();
-    expect(tf(I1, 'XA').y, 'the frame is kept').toBe(0);
-    expect(tf(HI, 'XA').y, 'the nested frame too').toBe(0);
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/X\.prefab\.json was deleted outside the editor — its instances show as Missing Prefab/);
+    expect(loadScene, 'the reload is asked once').toHaveBeenCalledTimes(1);
+    expect(loadScene.mock.calls[0]![1], 'with the world captured before it').toMatchObject({ preloaded: { entities: expect.any(Array) } });
     expect(getCachedPrefabSync(X), 'the editor cache is evicted').toBeNull();
     expect(getCachedPrefab(X), 'and the loader\'s').toBeUndefined();
     expect(tfOf(rootOf(HOLDER)).x).toBe(3);
@@ -347,7 +352,7 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
   /** An outside RENAME (a `git mv`): the manifest maps Y to its new path, and the watcher sends an unlink of the old path
    *  and an add of the new. The owning scene re-acquires Y there (R1 re-review 3). `onAcquireRead` runs inside the add's
    *  second fetch — the acquire's — to land an editor write in that window (R1 re-review 2). */
-  async function renameY(onAcquireRead?: () => void): Promise<void> {
+  async function renameY(onAcquireRead?: () => void, opts: { deleteFirst?: boolean } = {}): Promise<void> {
     const Y_OLD = '/assets/prefabs/Yold.prefab.json';
     const yDoc = (y: number) => ({ id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(9), { y })] });
     registerAsset(Y, Y_OLD, 'prefab');
@@ -357,9 +362,13 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
     setPrefabCache(Y, yDoc(0) as never); // the editor has read Y, so its key is re-seated (not left cold)
     vi.spyOn(sceneManager, 'getLoadedScenes').mockReturnValue(new Map([[187_398, { prefabRefs: new Set([Y, Y_OLD]) }]]) as never);
     route.disk.delete(Y_OLD);
+    if (opts.deleteFirst) {
+      loadManifestJson({ version: 1, assets: [{ guid: X, path: X_PATH, type: 'prefab' }, { guid: H, path: H_PATH, type: 'prefab' }] } as never, { prune: true });
+      await quietly(() => reloadPrefabFromDisk(Y_OLD));
+    }
     route.disk.set(Y_PATH, jsonFileBody(yDoc(7) as never));
     registerAsset(Y, Y_PATH, 'prefab');
-    await quietly(() => reloadPrefabFromDisk(Y_OLD));
+    if (!opts.deleteFirst) await quietly(() => reloadPrefabFromDisk(Y_OLD));
     let reads = 0;
     vi.stubGlobal('fetch', async (u: string) => {
       if (String(u).endsWith(Y_PATH) && ++reads === 2) onAcquireRead?.();
@@ -377,9 +386,11 @@ describe('an outside change to a prefab the open scene uses re-imports it in pla
   });
 
   // Mutation: drop the re-check after the acquires — the stale file bytes overwrite the Apply the editor just seated.
+  // The loader must not hold Y when the add is adopted, or the acquire reads nothing: a DELETE first (the GUID gone from the
+  // manifest), then Y put back at another path in a later batch — a move in one batch rekeys the loader's copy (#2067).
   it('an editor write landing during the acquire\'s read is kept', async () => {
     const applied = { id: Y, version: 6, name: 'Y', rootLocalId: 1, entities: [row(1, 'YR', 0, g(9), { y: 9 })] } as unknown as PrefabFile;
-    await renameY(() => { setPrefabCache(Y, applied); });
+    await renameY(() => { setPrefabCache(Y, applied); }, { deleteFirst: true });
     expect((getCachedPrefabSync(Y)!.entities[0]!.traits as { Transform: { y: number } }).Transform.y, 'the Apply stands').toBe(9);
     releaseAllForScene(187_398);
   });

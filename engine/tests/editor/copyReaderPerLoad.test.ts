@@ -238,7 +238,7 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
   // the last case.
   const stranded = () => markStale(getCurrentWorld(), 'a step that did not maintain the records');
   // Hunt seed 1268's route, directed. The Apply's snapshot is taken while Q is present, so it carries no copy of Q; Q is
-  // trashed after (its live frames kept, the save carries its copy); the Apply's undo reloads the snapshot. Without the
+  // trashed after (its frames shown as placeholders at once, #2056; the save carries its copy); the Apply's undo reloads the snapshot. Without the
   // carry, Q's frames came back unexpanded and the next save wrote no copy for them.
   // Owner ruling B (#2001 S5, #2028): the swap is a load, and no copy expands anything — Q's frames come back as their
   // rows' Missing Prefab placeholders. The carry still matters until S6 stops writing copies: the next save writes Q's.
@@ -255,15 +255,16 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect((await applyToPrefabWithUndo(p1, sel)).applied).toBe(true);
     await settle();
     await trash(f, 'Q');
-    const live = qCount();
-    expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    expect(qCount(), 'premise: the trash shows Q\'s frames as placeholders at once (#2056)').toBe(0);
+    const shown = unexpandedRows().size;
+    expect(shown, 'premise: each Q row its placeholder').toBeGreaterThan(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {}), 'premise: the save carries Q').toContain(f.prefabs.Q.guid);
     stranded();
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
     expect(qCount(), 'ruling B: no Q frame expands').toBe(0);
-    expect(unexpandedRows().size, 'each Q row its placeholder').toBeGreaterThan(0);
+    expect(unexpandedRows().size, 'each Q row its placeholder').toBe(shown);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
@@ -288,8 +289,9 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect((await applyToPrefabWithUndo(p1, new Set(keys.all.filter((k) => k.includes('Transform'))))).applied).toBe(true);
     await settle();
     await trash(f, 'Q');
-    const live = qCount();
-    expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    expect(qCount(), 'premise: the trash shows Q\'s frames as placeholders at once (#2056)').toBe(0);
+    const shown = unexpandedRows().size;
+    expect(shown, 'premise: each Q row its placeholder').toBeGreaterThan(0);
     stranded();
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
@@ -309,10 +311,12 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(Object.keys(JSON.parse(be.read(asPath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });
 
-  // The record path (#2046 S7.3): no swap, so nothing is loaded — Q's frames stay live, as every op in the world keeps a
-  // trashed prefab's frames (#1862), across the undo and the redo, and the save still carries Q's copy.
-  // Mutation: have the undo take the snapshot always (`storeStatesTheWorld` false) → the frames come back as placeholders.
-  it('with the records fresh, the undo and redo keep a trashed prefab\'s frames live, and the save carries its copy', async () => {
+  // The record path (#2046 S7.3): no swap, so nothing is loaded. It once kept a trashed prefab's frames live across the
+  // undo and the redo, where the snapshot reload showed placeholders; since #2056 the trash itself shows the placeholders
+  // (owner ruling, "Missing at once, as Unity"), so the record path and the reload now agree — the placeholders the trash
+  // made stay placeholders, and the save still carries Q's copy.
+  // Mutation: drop the conversion from the trash's repair (`assetEditorBindings.ts`) → Q's frames are live at the premise.
+  it('with the records fresh, the undo and redo keep showing a trashed prefab\'s frames as the placeholders the trash made, and the save carries its copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-records');
     const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
     const p1 = p1Id(f);
@@ -322,14 +326,17 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect((await applyToPrefabWithUndo(p1, new Set(keys.all.filter((k) => k.includes('Transform'))))).applied).toBe(true);
     await settle();
     await trash(f, 'Q');
-    const live = qCount();
-    expect(live, 'premise: Q frames live after the trash').toBeGreaterThan(0);
+    expect(qCount(), 'premise: the trash shows Q\'s frames as placeholders at once (#2056)').toBe(0);
+    const shown = unexpandedRows().size;
+    expect(shown, 'premise: each Q row its placeholder').toBeGreaterThan(0);
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
-    expect(qCount(), 'undo').toBe(live);
+    expect(qCount(), 'undo').toBe(0);
+    expect(unexpandedRows().size, 'undo').toBe(shown);
     expect((await undoStep('redo')).did).toBe(true);
     await settle();
-    expect(qCount(), 'redo').toBe(live);
+    expect(qCount(), 'redo').toBe(0);
+    expect(unexpandedRows().size, 'redo').toBe(shown);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
   });

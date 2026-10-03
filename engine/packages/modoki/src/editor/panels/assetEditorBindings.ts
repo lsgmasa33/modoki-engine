@@ -55,6 +55,7 @@ import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
 import { recordAssetMoves } from '../utils/assetMoveLog';
 import { rekeyEditorPrefabCache, evictDeletedEditorPrefabs } from '../scene/prefabCache';
+import { showDeletedPrefabsMissing } from '../scene/deletedPrefabsMissing';
 
 /** The display name a repaired item should carry after `move`.
  *
@@ -484,17 +485,21 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   // A DELETE evicts both (#1805, #1834, I9): the route marks it as the editor's own too, so no watcher evicted, and the
   // editor's sync readers kept expanding a prefab that no longer exists, and a reload of the owning scene re-expanded it
   // from the loader's entry. The loader keeps the scene's ownership, so the scene's next load fetches the file again if it
-  // is back (a delete is not undoable, #1868; a hand restore from the OS Trash is an outside write). Live instances stay
-  // expanded (#1738's evicted state).
+  // is back (a delete is not undoable, #1868; a hand restore from the OS Trash is an outside write). Live instances of it
+  // then become Missing Prefab placeholders at once (#2056, `deletedPrefabsMissing.ts`) — the same load a reload or a Stop
+  // runs, so the screen does not change at the next one. Awaited by a caller that reports the world (`deletedPrefabsShown`).
+  let deleted = false;
   for (const m of list) {
     if (m.to === null) {
       evictDeletedEditorPrefabs(m.from, !!m.prefix);
       evictDeletedPrefabs(m.from, !!m.prefix);
+      deleted = true;
       continue;
     }
     rekeyCachedPrefab(m.from, m.to, !!m.prefix);
     rekeyEditorPrefabCache(m.from, m.to, !!m.prefix);
   }
+  if (deleted) void showDeletedPrefabsMissing();
   // ⚠️ **Reported HERE, by the pass that did the work (#898).** The notes used to be logged at the
   // panel call sites — `logBindingChanges(applyAssetPathMoves(...))` — and #867 then moved the
   // repair to `/api/move-file`, which runs it FIRST from the backend. `applyMove` matches on

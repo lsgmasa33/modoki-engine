@@ -70,6 +70,15 @@ export function placeholderWriteRefusal(id: number, traitName: string, field?: s
   return placeholderRefusalWords(entityNameOf(id));
 }
 
+/** Why a Duplicate, Copy or Cut of `id` is refused, or null. A missing nested ROW's placeholder is written only through
+ *  its owner's rows (`placeholderWriteRefusal` above), so a copy of it is saved nowhere and the reload loses it (#2056
+ *  review, hunt seed 1212: silent loss, reached by any load that leaves the row missing). Refused by rule 9 (an edit the
+ *  list cannot hold); Unity would make the copy an added Missing Prefab instance, a promotion parked for S6. */
+export function rowPlaceholderCopyRefusal(id: number): string | null {
+  if (!isRowPlaceholder(id)) return null;
+  return `"${entityNameOf(id) || 'Missing Prefab'}" stands in for a part of a missing nested prefab, which only that prefab can state — a copy of it would be saved nowhere. Restore the prefab and reload the scene to copy it`;
+}
+
 /** True when the live entity `id` is a missing nested row's placeholder (#2001 S5, ruling D). */
 export function isRowPlaceholder(id: number): boolean {
   return !!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0]);

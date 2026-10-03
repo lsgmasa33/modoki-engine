@@ -40,6 +40,7 @@ import { answerParkedConflicts } from '../../../packages/modoki/src/editor/scene
 import { emptySpecs } from '../../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { PrefabEditRefusalError } from '../../../packages/modoki/src/editor/scene/prefabEditRefusal';
 import { isPrefabEditWorld } from '../../../packages/modoki/src/editor/scene/prefabEditWorld';
+import { deletedPrefabsShown } from '../../../packages/modoki/src/editor/scene/deletedPrefabsMissing';
 import { authored, piOf, isInstanceRoot, editing, worldTree, placeholderGuids, getCurrentWorld, settle, type Fixture } from './harness';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { canonicalJson } from '../../../packages/modoki/src/runtime/core/localIdCounter';
@@ -714,6 +715,8 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
       if (!del.ok) { st.note = 'delete did not complete'; return 'refused'; }
       const outcome = planDeleteOutcome(deletePaths, [path], del.failed);
       unbindDeletedAssetEditors(outcome.went);
+      // Its live instances become Missing Prefab placeholders (#2056): the op ends once the world shows them.
+      await deletedPrefabsShown();
       st.fileOp = { from: path, to: null };
       return 'done';
     }

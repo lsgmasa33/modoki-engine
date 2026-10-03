@@ -543,10 +543,14 @@ function beginReparentImpl(entityId: number, world: World = getCurrentWorld()): 
     return () => markStale(world, 'reparent of a supplied member', [self.rootGuid]);
   }
   const oldAt = linkAt(parentOf(entityId));
-  const oldRec = oldAt ? recordForWrite(oldAt.rootId, oldAt.rootGuid, world) : null;
   const guid = guidOfEntity(entityId);
   const roots = storedRootsUnder(entityId);
+  // The moved roots' records first: a stale one re-seeds its whole tree from the capture (`reseedFromCapture`), which
+  // REPLACES the old parent's record object, so an `oldRec` taken before it was an orphan the unlink below edited, and
+  // the stored record kept the link (I25; a load that leaves a nested stored root stale — a trash's or Stop's — then a
+  // reparent, #2056 review, hunt seed 5104).
   for (const r of roots) recordForWrite(r, guidOfEntity(r), world);
+  const oldRec = oldAt ? recordForWrite(oldAt.rootId, oldAt.rootGuid, world) : null;
   return ({ compensated, detaching }) => {
     if (detaching) {
       // The move cut links (#1447: members unpacked, an owned nested root promoted): a Detach-like change S7 moves onto

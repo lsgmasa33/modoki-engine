@@ -737,12 +737,20 @@ async function collectEmbeddedPrefabs(
   }
   const out: Record<string, EmbeddedPrefabDoc> = {};
   const frames: Record<string, string[]> = {};
+  // What a stored address can still be anchored on: a guid this save states (the validator's test). The store is the list
+  // as a file or a swap's carry held it, never pruned, so an anchor deleted since would be written back naming nothing
+  // (#2056 review: every trash now runs a load that fills it; a save→reload or Stop after a trash reached it before).
+  // Asked at the save, not pruned from the store: an undo of the delete brings the anchor back, and the next save lists it.
+  const anchorList: string[] = [];
+  collectStrings(entities, anchorList);
+  const anchors = new Set(anchorList);
   for (const guid of [...candidates.keys()].sort()) {
     if (!reached.has(guid)) continue;
     // A deep copy: the file (and a Play snapshot holding it) must not alias the live record's document.
     out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
     // A refused copy's list as the file held it (#1937 C-A): nothing of it expands, so nothing of it is live.
-    frames[guid] = [...new Set([...(live.get(guid) ?? []), ...(refusedCopyFrames(world, scene, guid) ?? [])])].sort();
+    const stored = (refusedCopyFrames(world, scene, guid) ?? []).filter((a) => anchors.has(a.split('/')[0]!));
+    frames[guid] = [...new Set([...(live.get(guid) ?? []), ...stored])].sort();
   }
   return Object.keys(out).length ? { docs: out, frames } : undefined;
 }

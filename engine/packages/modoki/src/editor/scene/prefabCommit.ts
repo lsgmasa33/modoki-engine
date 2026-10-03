@@ -26,15 +26,15 @@
 import { admitPrefabDocument } from '../../runtime/loaders/documentIdentity';
 import { frameRepeatRefusal } from '../../runtime/loaders/frameRepeat';
 import { type PrefabFile } from './prefab';
-import { preloadNestedPrefabs, seatEditorPrefabCache, prefabNestingReader, getCachedPrefabSync, evictDeletedEditorPrefabs } from './prefabCache';
+import { preloadNestedPrefabs, seatEditorPrefabCache, prefabNestingReader, getCachedPrefabSync, evictDeletedEditorPrefabs, rekeyEditorPrefabCache } from './prefabCache';
 import { notePrefabFileChanged } from './prefabRead';
 import { rebaseStaleInstances } from './prefabRebuild';
 import { expandedPrefabRefs, prefabNests } from '../../runtime/loaders/prefabNesting';
 import { postWriteFile, jsonFileBody, readBackendAnswer } from '../backend/editorBackend';
 import { deleteAssetFiles } from '../panels/assetOps';
 import { sha256OfWritten, sha256OfBytes } from '../utils/contentHash';
-import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
-import { replaceCachedPrefab, invalidatePrefab, evictDeletedPrefabs, acquirePrefab, getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
+import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef, guidMovedFrom, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
+import { replaceCachedPrefab, invalidatePrefab, evictDeletedPrefabs, acquirePrefab, getCachedPrefab, rekeyCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { isHtmlFallthrough } from '../../runtime/loaders/assetFetch';
@@ -176,9 +176,13 @@ export interface AdoptReport {
   /** A path whose file could not be read, is still parked, contains itself, or met an editor write: the editor keeps the
    *  document it held. */
   failed: { path: string; reason: string }[];
-  /** A path whose file is GONE (#1873 R1 r2): both caches evicted as the in-editor delete evicts them, and its live
-   *  instances kept expanded (#1738's evicted state; a save writes them from their frame records, I18). */
+  /** A path whose file is GONE (#1873 R1 r2): both caches evicted as the in-editor delete evicts them; the caller then
+   *  shows its live instances as Missing Prefab placeholders (#2056, `showDeletedPrefabsMissing`). */
   deleted: string[];
+  /** A path whose file is gone while its GUID lives at another path (#2067): a MOVE, which identity, not the path, decides
+   *  (docs/mcp-persistence.md rule 2). Both caches' path keys follow it, as the in-editor move's repair does; nothing is
+   *  evicted or tombstoned, and the instances stay live. */
+  moved: { from: string; to: string }[];
   /** A path nothing in the open scene uses (#1702's case): only the caches were brought up to date. */
   unused: string[];
   /** Every key the step seated a live-used prefab under — what the rebase rebuilt from, and what the caller's
@@ -466,8 +470,9 @@ function selfContaining<T extends { doc: PrefabFile | null; guid?: string }>(pla
  *
  *  - The precondition: an editor write that landed while the file was read seated a newer document than those bytes, and
  *    rebased the instances onto it — it is not overwritten (the refresh's rule).
- *  - Exists does NOT refuse here: a file gone is itself adopted. Both caches are evicted as the in-editor delete evicts
- *    them, and the live instances stay expanded (#1862), as Unity keeps a Missing Prefab; a put-back re-seats it.
+ *  - Exists does NOT refuse here: a file gone is itself adopted. A gone file whose GUID lives at another path is a MOVE
+ *    (#2067): its path keys follow it. Otherwise both caches are evicted as the in-editor delete evicts them, and the
+ *    caller shows the live instances as Missing Prefab placeholders (#2056), as Unity does; a put-back re-expands them.
  *  - I16: a file that would contain itself is not seated (hub ruling, 2026-09-30): an outside write cannot be refused, but
  *    seating it would expand a cycle. Said with the prefab that closes it.
  *  - The mark (hub ruling (A)): the file's document is seated with its mark raised to {@link markRecord} and to what both
@@ -479,7 +484,7 @@ function selfContaining<T extends { doc: PrefabFile | null; guid?: string }>(pla
  *    nothing uses has only the keys somebody read brought up to date, and its runtime copy follows the scenes that own
  *    it. Then the rebase, when asked, over every live-used source. */
 async function landAdopts(changes: readonly PrefabChange[], opts: { rebase?: boolean; fileChanged?: boolean; retry?: boolean }): Promise<PrefabChangesResult> {
-  const report: AdoptReport = { reimported: [], failed: [], deleted: [], unused: [], sources: [] };
+  const report: AdoptReport = { reimported: [], failed: [], deleted: [], moved: [], unused: [], sources: [] };
   // What uses a prefab asks the scene manager, whose module this one must not load for every write (a hand-listed runtime
   // mock of a unit test, a load-time cycle): imported by an adopt that READS its file. One the caller read (the
   // prefab-edit open) asks none of it, and seats before its first await — its caller takes a read token over the seat.
@@ -491,6 +496,8 @@ async function landAdopts(changes: readonly PrefabChange[], opts: { rebase?: boo
   const world = getCurrentWorld();
   const paths = changes.map((c) => prefabPathOf(c.source));
   const taken: Array<{ path: string; source: string; keysBefore: string[]; held: Array<PrefabFile | null>; doc: PrefabFile; guid?: string; read: boolean }> = [];
+  /** The paths found gone, judged once every file of the batch is read: a move's new path may come later in it (#2067). */
+  const gone: Array<{ path: string; keysBefore: string[]; held: Array<PrefabFile | null> }> = [];
   /** Every key this step seated a document under — what a cycle refused earlier may have been waiting for. */
   const landed = new Set<string>();
   for (const [i, c] of changes.entries()) {
@@ -515,25 +522,42 @@ async function landAdopts(changes: readonly PrefabChange[], opts: { rebase?: boo
         report.failed.push({ path, reason: 'an editor write landed while its file was read, and the editor keeps that write' });
         continue;
       }
-      if (file === 'absent') {
-        // 4. Gone — adopted as gone (#1873 R1 r2). Asked BEFORE any "is it used" rule (#1873 R1 review F2): the dev editor
-        // loads the delete's PRUNED manifest before this event, so the path resolves to no guid by now — the eviction
-        // finds the guid keys itself (`lastKnownPathOf`), and "used" asks by the guids that LIVED at this path too.
-        const { usedLive, liveSourcesOnceAt, scenesReferencing } = await sceneUse();
-        const gone = new Set([...keysBefore, ...liveSourcesOnceAt(path)]);
-        const usedBefore = usedLive(gone) || scenesReferencing(gone).length > 0;
-        evictDeletedEditorPrefabs(path);
-        evictDeletedPrefabs(path);
-        for (const k of gone) landed.add(k);
-        (usedBefore ? report.deleted : report.unused).push(path);
-        continue;
-      }
+      if (file === 'absent') { gone.push({ path, keysBefore, held }); continue; }
       doc = file === 'unreadable' ? null : file.doc;
       // A half-typed hand edit keeps the document the editor held — and so does JSON that is not a prefab (no `entities`,
       // #1813's `isPrefabDocument`): seated, every synchronous reader of the caches throws on it (close-out review).
       if (!doc || !isPrefabDocument(doc)) { report.failed.push({ path, reason: 'its file could not be read as a prefab, so the editor keeps the document it held' }); continue; }
     }
     taken.push({ path, source: c.source, keysBefore, held, doc, guid: pathGuid ?? doc.id, read: !c.doc });
+  }
+  for (const { path, keysBefore, held } of gone) {
+    // 4a. Moved (#2067; rule 2, identity not path): the GUID that lived here — by the manifest's own record of the move,
+    // by the document a cache held under the path, or by the path's own guid key — lives at another path now: in this
+    // batch, or in the manifest, which a watcher rebuilds before it reports. Unity's import of a moved asset keeps its
+    // instances linked. The caches' path keys follow it; the file at the new path is adopted on its own.
+    const identities = [guidMovedFrom(path), ...held.map((d) => d?.id), ...keysBefore].filter((g): g is string => !!g && isGuid(g));
+    const to = identities.map((g) => taken.find((t) => t.guid === g && t.path !== path)?.path ?? resolveGuidToPath(g)).find((p) => !!p && p !== path);
+    if (to) {
+      rekeyEditorPrefabCache(path, to);
+      rekeyCachedPrefab(path, to);
+      // The rekey is this step's own seat: the new path's adoption below re-checks its keys against what they held when
+      // its file was read, and took the moved document under the new path for an editor write — it kept the old bytes
+      // and said "not re-imported" (live, 2026-10-03). Its baseline is taken again, after the rekey.
+      const dest = taken.find((t) => t.path === to);
+      if (dest) dest.held = dest.keysBefore.map((k) => getCachedPrefabSync(k));
+      report.moved.push({ from: path, to });
+      continue;
+    }
+    // 4b. Gone — adopted as gone (#1873 R1 r2). Asked BEFORE any "is it used" rule (#1873 R1 review F2): the dev editor
+    // loads the delete's PRUNED manifest before this event, so the path resolves to no guid by now — the eviction
+    // finds the guid keys itself (`lastKnownPathOf`), and "used" asks by the guids that LIVED at this path too.
+    const { usedLive, liveSourcesOnceAt, scenesReferencing } = await sceneUse();
+    const keys = new Set([...keysBefore, ...liveSourcesOnceAt(path)]);
+    const usedBefore = usedLive(keys) || scenesReferencing(keys).length > 0;
+    evictDeletedEditorPrefabs(path);
+    evictDeletedPrefabs(path);
+    for (const k of keys) landed.add(k);
+    (usedBefore ? report.deleted : report.unused).push(path);
   }
   // 5. I16, read through this step's documents first.
   const cyclic = new Set<(typeof taken)[number]>();
@@ -608,6 +632,7 @@ async function landAdopts(changes: readonly PrefabChange[], opts: { rebase?: boo
       report.reimported.push(...again.reimported);
       report.failed.push(...again.failed);
       report.deleted.push(...again.deleted);
+      report.moved.push(...again.moved);
       report.unused.push(...again.unused);
       for (const k of again.sources) if (!report.sources.includes(k)) report.sources.push(k);
     }

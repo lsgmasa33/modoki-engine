@@ -65,7 +65,7 @@ detachPrefabInstanceWithUndo, detachRefusal,
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
-  reimportPrefabsInPlace, reimportOutsidePrefabChanges, type PrefabReimportReport,
+  reimportPrefabsInPlace, reimportOutsidePrefabChanges, type PrefabReimportReport, deletedPrefabsShown,
   readEditorJournal, editorJournalSeq, editorJournalDroppedThrough, editorJournalEpoch, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
@@ -1482,7 +1482,8 @@ export function registerEditorAgentOps(): void {
     const { report, needsReload } = await reimportOutsidePrefabChanges(paths, opts);
     // The #1702 gate's own line, for a prefab nothing in the open scene uses (QA-PREFAB-0027 reads it).
     for (const x of report.unused) console.log(`[agentBridge] prefab change not used by the open scene — no reload (${x})`);
-    for (const x of report.deleted) console.log(`[agentBridge] ${x} was deleted outside the editor — its instances stay as they are (a Missing Prefab on the next load)`);
+    for (const x of report.deleted) console.log(`[agentBridge] ${x} was deleted outside the editor — its instances show as Missing Prefab (put the file back to relink them)`);
+    for (const m of report.moved) console.log(`[agentBridge] ${m.from} was moved outside the editor to ${m.to} — its instances stay linked`);
     for (const f of report.failed) console.warn(`[agentBridge] ${f.path} changed on disk but was not re-imported: ${f.reason}`);
     if (report.reimported.length) console.log(`[agentBridge] re-imported ${report.reimported.join(', ')} in place — the scene's unsaved edits and undo are kept`);
     const left = [...report.notRebased.map((n) => n.entity), ...report.placeholders.map((p) => p.entity)];
@@ -3087,7 +3088,7 @@ export function registerEditorAgentOps(): void {
     const suppressed = editing ? null : sceneReloadSuppressedReason();
     if (suppressed) {
       deferPrefabReimport(paths, suppressed);
-      return { reimported: [], failed: [], deleted: [], unused: [], notRebased: [], placeholders: [], deferred: suppressed };
+      return { reimported: [], failed: [], deleted: [], moved: [], unused: [], notRebased: [], placeholders: [], deferred: suppressed };
     }
     // The re-import reads each file fresh (#1902): it applies the outside change the hold lists for it, so the hold drops
     // it — a path it read, that is. One that failed to read keeps its change held, and the release tries again.
@@ -4412,7 +4413,7 @@ export function registerEditorAgentOps(): void {
    *  keeps it because ORDER matters there: the registry must be repaired before the selection
    *  moves, since `AtlasAssetView`'s load effect keys on the selected path for its CAS baseline.
    *  This op is the backstop for every caller that is not the panel. */
-  registerAgentOp('apply-asset-path-moves', (params) => {
+  registerAgentOp('apply-asset-path-moves', async (params) => {
     const { moves } = (params ?? {}) as { moves?: PathMove[] };
     if (!Array.isArray(moves) || moves.length === 0) {
       throw new Error('apply-asset-path-moves requires { moves: [{from, to, prefix?}] }');
@@ -4424,7 +4425,10 @@ export function registerEditorAgentOps(): void {
     }
     // The notes are the repair's own account of what it touched — empty when the move hit nothing
     // bound, parked or selected, which is the overwhelmingly common case.
-    return { ok: true, notes: applyAssetPathMoves(moves) };
+    const notes = applyAssetPathMoves(moves);
+    // A delete's live instances become Missing Prefab placeholders (#2056): the route answers once the world shows them.
+    await deletedPrefabsShown();
+    return { ok: true, notes };
   });
 
   registerAgentOp('read-asset-def', (params) => {
