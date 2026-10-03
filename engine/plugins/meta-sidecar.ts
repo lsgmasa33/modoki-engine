@@ -61,6 +61,7 @@
  */
 
 import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import {
   classifyJsonFormatVersion,
@@ -124,6 +125,39 @@ export function copiedSidecarIdentity(
  *  means deciding what older-versioned sidecars this build can still read — do
  *  not bump it casually. */
 export const SIDECAR_FORMAT_VERSION = 2;
+
+/** Asset roots this process never writes a sidecar into, and the sidecars it holds in memory for them instead (B3 R6,
+ *  #1656). The one such root is the engine's built-in root in the PACKAGED editor (`findAssetRoots` marks it), which
+ *  sits inside the signed app bundle: "the app writes nothing into its own bundle" (#326, #1959). The writer that
+ *  reaches it is the static server's auto-bake. A 2D text in a built-in font misses that font's atlas in the project's
+ *  cache, the font's reimport bakes it, and `writeMetaSidecar` used to record the new `fontCache` in the bundle (and
+ *  add a `.meta.local.json` beside it), which breaks the bundle's code signature. The bake itself is fine: its output
+ *  goes to the project's `.cache/`. So the record it would have written is held here, and `readMetaSidecar` answers
+ *  with it, which is what the serve path re-reads to find the variant. It lasts for the process; the next one re-bakes
+ *  from its cache hit. A DEV clone marks nothing: there the built-in root is the engine repo, and the import-settings
+ *  routes write it on purpose (rule 6). */
+const readOnlySidecarRoots = new Set<string>();
+const heldSidecars = new Map<string, Record<string, unknown>>();
+
+export function markSidecarRootReadOnly(absDir: string): void {
+  readOnlySidecarRoots.add(path.resolve(absDir));
+}
+
+/** True when `absPath` is inside a root `markSidecarRootReadOnly` marked. */
+export function inReadOnlySidecarRoot(absPath: string): boolean {
+  const abs = path.resolve(absPath);
+  for (const root of readOnlySidecarRoots) {
+    const rel = path.relative(root, abs);
+    if (rel && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel)) return true;
+  }
+  return false;
+}
+
+/** For tests: forget every mark and every held sidecar. */
+export function resetReadOnlySidecarRoots(): void {
+  readOnlySidecarRoots.clear();
+  heldSidecars.clear();
+}
 
 export function sidecarPath(absPath: string): string {
   return absPath + '.meta.json';
@@ -334,6 +368,8 @@ export function blocksMissingLocalHalf(absPath: string): CacheBlock[] {
  *  (a stale leftover from a sidecar that was since rewritten without it); the next write through
  *  `writeMetaSidecar` clears it. */
 export function readMetaSidecar(absPath: string): Record<string, unknown> {
+  const held = heldSidecars.get(path.resolve(absPath));
+  if (held) return JSON.parse(JSON.stringify(held)) as Record<string, unknown>;
   const sidecar = sidecarPath(absPath);
   if (!fs.existsSync(sidecar)) return {};
   let meta: Record<string, unknown>;
@@ -512,6 +548,16 @@ export function existingSidecarId(absPath: string): string | undefined {
   }
 }
 
+/** The `id` a reimport writes back: the one it read, else the one the sidecar on disk still carries, else a fresh
+ *  GUID. ⚠️ `readMetaSidecar` answers `{}` for a sidecar that does not parse, so a handler that minted whenever its
+ *  `meta.id` was missing re-minted the asset over a merge conflict whose `id` line was intact (B3 R11), and every
+ *  reference to it dangled. `writeMetaSidecar` cannot repair that: a caller's GUID wins over its salvage there.
+ *  Must be called BEFORE `writeMetaSidecar` quarantines the file. */
+export function reimportSidecarId(meta: Record<string, unknown>, absPath: string): string {
+  if (typeof meta.id === 'string') return meta.id;
+  return existingSidecarId(absPath) ?? crypto.randomUUID();
+}
+
 export function quarantineCorruptSidecar(absPath: string): string | undefined {
   if (classifySidecarOnDisk(absPath).kind !== 'unreadable') return undefined;
   const sidecar = sidecarPath(absPath);
@@ -543,6 +589,16 @@ export function quarantineCorruptSidecar(absPath: string): string | undefined {
  *  supply `version`. */
 export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>): void {
   assertSidecarWritable(absPath);
+  if (inReadOnlySidecarRoot(absPath)) {
+    const held = JSON.parse(JSON.stringify(meta)) as Record<string, unknown>;
+    if (!isGuid(held.id as string | undefined)) {
+      const id = existingSidecarId(absPath);
+      if (id) held.id = id;
+    }
+    held.version = SIDECAR_FORMAT_VERSION;
+    heldSidecars.set(path.resolve(absPath), held);
+    return;
+  }
   // ⚠️ Capture the existing `id` BEFORE the quarantine moves the file away. The editor panels
   // reach here via `/api/read-meta`, which returns `{}` for an unparsable sidecar exactly as it
   // does for a missing one — so the payload they POST carries no `id`, and without this the write
@@ -564,8 +620,9 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
   // per-handler.
   quarantineCorruptSidecar(absPath);
   const committed = JSON.parse(JSON.stringify(meta)) as Record<string, unknown>;
-  // Only when the caller supplied none — a caller that knows the id (the reimport handlers, which
-  // read it before editing) always wins over a textual salvage.
+  // Only when the caller supplied none: a caller's GUID always wins over a textual salvage. So a
+  // caller must not mint one just because its read came back id-less — `readMetaSidecar` reads a
+  // corrupt sidecar as `{}`, and the reimport handlers take theirs from `reimportSidecarId` for that.
   if (salvagedId && !isGuid(committed.id as string | undefined)) committed.id = salvagedId;
   committed.version = SIDECAR_FORMAT_VERSION;
   const local: Record<string, Record<string, unknown>> = {};

@@ -12,11 +12,10 @@
  *    (the build copies it rather than re-encoding — `vite-asset-scanner.ts`). */
 
 import fs from 'fs';
-import { randomUUID } from 'crypto';
 import { resolveEnvSettings, ULTRAHDR_VARIANT_SUFFIX } from '../packages/modoki/src/runtime/core/environmentSettings';
 import { convertEnvironment } from './env-convert';
 import { convertEnvironmentUltraHdr } from './env-ultrahdr';
-import { assertSidecarWritable, readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
+import { assertSidecarWritable, readMetaSidecar, reimportSidecarId, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';
 
 export const environmentReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
@@ -60,7 +59,7 @@ export const environmentReimportHandler: ReimportHandler = async (sourceUrlPath,
       bytes: result.bytes,
     };
   }
-  if (typeof meta.id !== 'string') meta.id = randomUUID();
+  meta.id = reimportSidecarId(meta, absPath);
   meta.environment = settings;
   meta.environmentCache = cache;
   writeMetaSidecar(absPath, meta);

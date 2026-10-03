@@ -11,13 +11,12 @@
  *  ModelPostprocessor value).
  */
 
-import { randomUUID } from 'crypto';
 import path from 'path';
 import { resolveModelSettings, lodUrlSuffix } from '../packages/modoki/src/runtime/loaders/modelSettings';
 import { resolveTextureSettings } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { convertModel, type FixupPostprocessor } from './model-convert';
 import { convertRiggedModel } from './rigged-model-optimize';
-import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
+import { readMetaSidecar, reimportSidecarId, writeMetaSidecar } from './meta-sidecar';
 import { loadProjectConfig } from './load-project-config';
 import type { ModelPostprocessorDecl } from '../project-config';
 import type { ReimportContext, ReimportHandler } from './reimport-registry';
@@ -160,7 +159,7 @@ export const modelReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     const result = await convertRiggedModel({
       projectRoot: ctx.projectRoot, sourceUrlPath, absSource: absPath, settings: texSettings,
     });
-    if (typeof meta.id !== 'string') meta.id = randomUUID();
+    meta.id = reimportSidecarId(meta, absPath);
     // Single-variant modelCache: the rigged runtime loads processedPath whole
     // (no LOD). lodPaths has just the one entry so the dev/build copy loops that
     // iterate lodPaths handle it uniformly.
@@ -190,7 +189,7 @@ export const modelReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     resolvePostprocessor: (id) => resolvePostprocessorForId(id, ctx),
   });
 
-  if (typeof meta.id !== 'string') meta.id = randomUUID();
+  meta.id = reimportSidecarId(meta, absPath);
   meta.model = settings;
   meta.modelCache = {
     hash: result.hash,

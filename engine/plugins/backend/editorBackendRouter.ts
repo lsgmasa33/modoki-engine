@@ -742,8 +742,10 @@ const runningPackaged = (): boolean => process.env.MODOKI_PACKAGED === '1';
  *  ruling 2026-10-03). That root is READ-ONLY through the project routes, as Unity's registry packages are immutable:
  *  its files are shared by every project, and in the packaged editor they sit inside the signed app bundle, where a
  *  write breaks #326's "the app writes nothing into its own bundle". `/api/unused-assets` (never offers them),
- *  `defaultSaveRootDir` (never saves there) and the scan's collision heal (never re-mints a built-in, #2003) already
- *  kept to it; every write route accepted it, and `modoki_delete_asset` trashed the engine's own font, `ok:true`.
+ *  and `defaultSaveRootDir` (never saves there) already kept to it; every write route accepted it, and
+ *  `modoki_delete_asset` trashed the engine's own font, `ok:true`. Writes that are not routes (the auto-bake, the scan
+ *  heals) are kept out of the packaged bundle by `markSidecarRootReadOnly` (B3 R6); in a dev clone the collision heal
+ *  can still re-mint a built-in that a project path was recorded as owning first (#1996).
  *
  *  `devOnly`: the route stays open in a DEV clone and refuses only in the packaged editor. That is the import-settings
  *  pair (`/api/write-meta`, `/api/reimport`), the one editor feature that edits a built-in on purpose: the Inspector

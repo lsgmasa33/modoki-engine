@@ -3,10 +3,9 @@
  *  cache bookkeeping back to the meta. Registered for the `video` asset type.
  *  Mirrors reimport-audio.ts. */
 
-import { randomUUID } from 'crypto';
 import { resolveVideoSettings } from '../packages/modoki/src/runtime/loaders/videoSettings';
 import { convertVideo } from './video-convert';
-import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
+import { readMetaSidecar, reimportSidecarId, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';
 
 export const videoReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
@@ -18,7 +17,7 @@ export const videoReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     absSource: absPath,
     settings,
   });
-  if (typeof meta.id !== 'string') meta.id = randomUUID();
+  meta.id = reimportSidecarId(meta, absPath);
   meta.video = settings;
   // ⚠️ MERGE, never replace — the same mechanism as reimport-audio.ts, see the long note there
   // (#1300). Video's `probeStats` swallows ffprobe failures identically, and this block carries

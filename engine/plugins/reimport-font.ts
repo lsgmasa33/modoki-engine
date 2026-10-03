@@ -5,10 +5,9 @@
  *  (a plain CSS-family-name font never goes through this path, so it stays
  *  guid-less and is referenced by `fontFamily` instead). */
 
-import { randomUUID } from 'crypto';
 import { resolveFontSettings, type FontImportSettings } from '../packages/modoki/src/runtime/core/fontSettings';
 import { convertFont } from './font-convert';
-import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
+import { readMetaSidecar, reimportSidecarId, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';
 
 export const fontReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
@@ -20,7 +19,7 @@ export const fontReimportHandler: ReimportHandler = async (sourceUrlPath, absPat
     absSource: absPath,
     settings,
   });
-  if (typeof meta.id !== 'string') meta.id = randomUUID();
+  meta.id = reimportSidecarId(meta, absPath);
   meta.font = settings;
   meta.fontCache = {
     hash: result.hash,

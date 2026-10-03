@@ -2,10 +2,9 @@
  *  converts the source clip into its derived variant via ffmpeg, and persists the
  *  cache bookkeeping back to the meta. Registered for the `audio` asset type. */
 
-import { randomUUID } from 'crypto';
 import { resolveAudioSettings } from '../packages/modoki/src/runtime/loaders/audioSettings';
 import { convertAudio } from './audio-convert';
-import { readMetaSidecar, writeMetaSidecar } from './meta-sidecar';
+import { readMetaSidecar, reimportSidecarId, writeMetaSidecar } from './meta-sidecar';
 import type { ReimportHandler } from './reimport-registry';
 
 export const audioReimportHandler: ReimportHandler = async (sourceUrlPath, absPath, ctx) => {
@@ -17,7 +16,7 @@ export const audioReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
     absSource: absPath,
     settings,
   });
-  if (typeof meta.id !== 'string') meta.id = randomUUID();
+  meta.id = reimportSidecarId(meta, absPath);
   meta.audio = settings;
   // ⚠️ MERGE, never replace (#1300). `probeStats` swallows every ffprobe failure and returns `{}`
   // — a missing pinned ffprobe included (`withFfprobe`, which since #1297 warns once but still does

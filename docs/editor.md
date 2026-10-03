@@ -4284,8 +4284,18 @@ repo. The save dialog answers the same reason for a location picked there. A cop
 allowed, and is how one project gets a changed built-in: `modoki_duplicate_asset` with a `to` in the
 project, or Reveal in Finder and drop the file into the Assets panel (the Engine section itself
 offers no Duplicate). Drop the file without its `.meta.json`, so the copy gets a GUID of its own. It joins what
-already kept away: `/api/unused-assets` never offers a built-in, `defaultSaveRootDir` never saves
-there, and the scan's collision heal never re-mints one (#2003).
+already kept away: `/api/unused-assets` never offers a built-in, and `defaultSaveRootDir` never saves
+there.
+
+⚠️ **Writes that are not routes (B3 R6, #1656).** In the packaged editor, `findAssetRoots` marks the
+built-in root read-only (`markSidecarRootReadOnly`, `meta-sidecar.ts`). There a `writeMetaSidecar` is
+held in the process's memory instead of written, and a scan GUID heal (`writeAssetGuid`) is refused.
+The writer this stops is the static server's auto-bake. A 2D text in a built-in font misses the
+font's atlas in the project's `.cache/`, and the bake used to record the new `fontCache` in the
+bundle, plus a `.meta.local.json` beside it. In a DEV clone nothing is marked, so the same text
+still writes the built-in's committed sidecar (observed: Nunito, +7 lines), and the collision heal
+can still re-mint a built-in: the prior-owner record (#1996) wins over the built-in-first fallback,
+so a game asset copied INTO the engine root keeps its id and the built-in is re-minted.
 
 ⚠️ **One deliberate exception: the import-settings pair, `/api/write-meta` and `/api/reimport`, stays
 open in a DEV clone and refuses only in the packaged editor** (`devOnly`). The Inspector shows a

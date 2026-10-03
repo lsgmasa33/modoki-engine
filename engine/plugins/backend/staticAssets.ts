@@ -102,9 +102,12 @@ const revalidate = (hash: string) =>
  *  cache-miss SELF-HEALS instead of 404ing — the editor auto-imports a model/
  *  texture whose optimized variant was never baked on this machine/worktree
  *  (the `.cache/` dir is gitignored, so a fresh checkout has the committed meta
- *  hash but no local bytes). Off by default: a packaged Electron build ships
- *  pre-baked variants in `dist/` and has neither `toktx` nor an SSR loader, so it
- *  keeps the loud 404. The Vite dev/editor server turns it on. */
+ *  hash but no local bytes). Off by default, and off in the main process's own backend.
+ *  The Vite server turns it on, and the PACKAGED editor runs that same Vite server
+ *  (`prepareProject`, `electron/main.ts`) with `toktx` shipped, so it bakes there too,
+ *  and for a built-in as well: its variants are not shipped, and the caches are per
+ *  project. A packaged built-in's sidecar is never written; the bake's record is held
+ *  in memory (`markSidecarRootReadOnly`, B3 R6). */
 export interface AutoConvertCaps {
   /** Enable on-demand baking on a variant cache-miss. */
   autoConvert?: boolean;

@@ -58,6 +58,8 @@ import {
   salvageSidecarId,
   CORRUPT_SIDECAR_SUFFIX,
   SIDECAR_FORMAT_VERSION,
+  inReadOnlySidecarRoot,
+  markSidecarRootReadOnly,
 } from './meta-sidecar';
 import { classifyPrefabWrite } from './prefabWriteGuard';
 import { classifyJsonAssetPath, ID_BEARING_TYPES, BINARY_EXT_TYPE, ENGINE_ASSETS_URL_PREFIX } from './assetTypes';
@@ -330,6 +332,12 @@ export function writeAssetGuid(
   absPath: string, type: string, guid: string,
   slices?: { only: (guid: string) => boolean; reminted: Map<string, string>; dropGenerated?: boolean },
 ): boolean {
+  // The packaged editor's built-in root is inside the signed bundle (B3 R6, `markSidecarRootReadOnly`). A heal there
+  // is refused like any other refused heal: the collision stays standing and is warned, and the copy keeps its id.
+  if (inReadOnlySidecarRoot(absPath)) {
+    console.warn(`[assets] not stamping a GUID into ${absPath}: it is inside the packaged editor's read-only built-in root`);
+    return false;
+  }
   try {
     if (ID_BEARING_TYPES.has(type)) {
       // ⚠️ Same reasoning as the sidecar refusal below, applied to the DOCUMENT (#1468 D4): this
@@ -1794,6 +1802,10 @@ export function findAssetRoots(projectRoot: string): AssetRoot[] {
   const modokiAssets = resolveModokiAssetsDir(projectRoot);
   if (modokiAssets) {
     roots.push({ urlPrefix: ENGINE_ASSETS_URL_PREFIX, absDir: modokiAssets });
+    // Packaged, it is inside the signed app bundle: no sidecar write may land there (B3 R6, #326). The process that
+    // reaches it is the Vite child, which inherits MODOKI_PACKAGED from main (`devServer.ts`). Packaged main resolves
+    // no engine root at all (`EDITOR_MODOKI_ASSETS` is empty in its bundle, and its cwd is not the repo).
+    if (process.env.MODOKI_PACKAGED === '1') markSidecarRootReadOnly(modokiAssets);
   }
 
   // Flat one-game project: <projectRoot>/runtime/assets → /assets. A single-game

@@ -18,6 +18,7 @@ import { invalidateTexture } from '../../runtime/loaders/textureResolver';
 import { loadGLB } from '../../runtime/loaders/loadGLB';
 import { getModelPostprocessor } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { newGuid, registerAsset, getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
+import { guidToKeep } from './guidToKeep';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { convertSourceToGLB, needsGLBConversion } from './convertToGLB';
 import { extractRigBones, type RigBoneInfo } from './rigBones';
@@ -710,7 +711,7 @@ async function importRiggedModel(
 ): Promise<number> {
   // Resolve / preserve the GLB's guid (re-import keeps it so refs survive).
   const { meta: existingMeta, pendingRef } = await readMeta(glbPath);
-  const glbGuid = (typeof existingMeta.id === 'string' && isGuid(existingMeta.id)) ? existingMeta.id : newGuid();
+  const glbGuid = guidToKeep(existingMeta.id, glbPath);
   registerAsset(glbGuid, glbPath, 'model');
 
   // Skeleton expansion (P7b): persisted per-model in the meta's rig block, toggled
@@ -958,9 +959,7 @@ async function importModelInner(
   // Re-import preserves the prior id (sidecar `.meta.json`) so external
   // scene/prefab refs survive — a fresh guid would dangle every consumer.
   const { meta: existingGlbMeta, pendingRef } = await readMeta(glbPath);
-  const glbGuid = (typeof existingGlbMeta.id === 'string' && isGuid(existingGlbMeta.id))
-    ? existingGlbMeta.id
-    : newGuid();
+  const glbGuid = guidToKeep(existingGlbMeta.id, glbPath);
   registerAsset(glbGuid, glbPath, 'model');
 
   const templateMap = getTemplatesForModel(glbPath);
