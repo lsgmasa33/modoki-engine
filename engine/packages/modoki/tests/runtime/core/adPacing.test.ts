@@ -1,6 +1,7 @@
 /**
  * Interstitial pacing (#932, promoted in #1312). Each game passes its own numbers; the game-side tests
- * cover what a game adds on top (Weaveling's daily board) and how it maps its config onto the policy.
+ * cover what a game adds on top (Slime Shooter's daily board; Weaveling retired its copy in #2124) and how
+ * it maps its config onto the policy.
  */
 import { describe, it, expect } from 'vitest';
 import { mayShowInterstitial, type InterstitialContext } from '../../../src/runtime/core/adPacing';

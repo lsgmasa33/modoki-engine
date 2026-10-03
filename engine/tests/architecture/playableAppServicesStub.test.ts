@@ -432,7 +432,7 @@ const HANDED_ON_REVIEWED = [
       + 'which a playable never has.',
   },
   {
-    item: "games/wordweave/runtime/debugTab.tsx::ads in <module> > `export const WordweaveAdsTab = createAdsDebugTab(ads.adsDebug);`",
+    item: "games/wordweave/runtime/debugTab.tsx::ads in <module> > `const SharedAdsTab = createAdsDebugTab(ads.adsDebug);`",
     reason: 'Weaveling\'s copy of the same tab (#1474, shared since #1501) — the same handoff into the engine, safe for the same reason.',
   },
   {
