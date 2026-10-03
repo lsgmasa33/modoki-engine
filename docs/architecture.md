@@ -293,7 +293,7 @@ So `runtime/core/appActivity.ts` puts that on the **boot timeline** as spans, ne
 | `page-hidden` / `window-blur` | the page's own `visibilitychange` / `blur`→`focus` edges. Focus counts from a real `blur` only: a webview can report `hasFocus() === false` at launch with nothing covering it |
 | `att-prompt` | the ATT request in `attribution.ts`, which is the system alert on a fresh iOS install |
 | `ads-start` | the ad lifecycle's `sdk.start()`: the consent form (EEA/UK) and SDK init |
-| `sign-in-sheet` | the native sign-in sheet in Court and Weaveling, including the one each opens unasked on a first launch |
+| `sign-in-sheet` | the native sign-in sheet in Court, Weaveling and Ice Reef. Only a button opens it: the Account screen's, the purchase card's, or the save-progress card's (#2091, #2094, #2095) |
 
 **To read a stall, intersect them:** `bootSpansOverlapping(frameIntervalStart, frameIntervalEnd)`.
 A `frame-slow` inside the gap means our own callbacks took the time (the first cold compile does
