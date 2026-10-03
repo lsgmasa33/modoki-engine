@@ -46,7 +46,10 @@ import {
 import {
   getPendingBaseScenePaths, peekBaseSceneEdit, markBaseSceneEdit, discardPendingBaseScenes,
 } from '../scene/pendingBaseScene';
-import type { PathKeyedCause } from '../scene/serialize';
+import { applyMovesToOpenScene, type PathKeyedCause } from '../scene/serialize';
+import { applyMovesToHistory } from '../undo/undoManager';
+import { applyMovesToPlaySnapshot } from '../scene/playMode';
+import { applyMovesToPreviewSnapshot } from '../scene/timelinePreview';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
@@ -349,7 +352,8 @@ export function applyMovesToParkedBaseScenes(moves: Iterable<PathMove>): string[
  *  had no test, no type error and no runtime complaint.
  *
  *  A cause with `keying: 'none'` or `'guid'` is deliberately absent — the live world has no path to
- *  remap, and a scene guid does not change when its file moves. */
+ *  remap, and a scene guid does not change when its file moves. The live world's FILE does have one, though: the open
+ *  scene's path and the loaded scenes' entries, which `applyMovesToOpenScene` repairs (#2078). */
 const PARKED_MOVE_REPAIRS = {
   dirtyAssetPaths: applyMovesToParkedDocs,
   pendingImportSettings: applyMovesToParkedMeta,
@@ -455,6 +459,12 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   }
   // Independently of the bindings: a parked write can belong to an asset whose panel is CLOSED.
   notes.push(...applyMovesToParkedAssets(list));
+  // …and the open scene's own file (#2078): renamed, the next Cmd+S recreated it at the old path with the scene's id.
+  const openScene = applyMovesToOpenScene(list);
+  notes.push(...openScene.notes);
+  applyMovesToHistory(list, openScene.openSceneTo);
+  applyMovesToPlaySnapshot(list);
+  applyMovesToPreviewSnapshot(list);
   // Independently of BOTH of the above: the Assets panel's own "current folder" is also
   // path-keyed state that must follow a move, and wiring it per call site is exactly the
   // mistake this module's header already names — "the first version of this fix covered

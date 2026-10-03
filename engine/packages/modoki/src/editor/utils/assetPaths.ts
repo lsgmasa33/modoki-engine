@@ -5,6 +5,9 @@
 
 import type { SpriteAssetRef } from '../../runtime/loaders/spriteSheet';
 import { JSON_ASSET_SUFFIX_TYPE } from '../../runtime/loaders/assetTypeClassifier';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
+import { resolveGuidToPath } from '../../runtime/loaders/assetManifest';
+import { isGuid } from '../../runtime/core/assetRefRules';
 
 export interface AssetEntry {
   guid?: string;
@@ -232,6 +235,56 @@ export function applyMove(path: string, move: PathMove): string | null | undefin
   }
   if (path !== move.from) return undefined;
   return move.to;
+}
+
+/** The `normScenePath` KEY a scene path has under `moves` (#2078, B3 rule 12): the key-level matcher for every record of
+ *  a scene file that a move carries. Matched as keys, because the editor holds a scene under whatever spelling opened it
+ *  (`/@fs/…`, a typed `./` segment, another case: #1791, #1786) while a move names the on-disk url; an exact match missed
+ *  those, and the record stayed on the old path. A KEY, not a path (below a moved folder the rest is the key's folded
+ *  text): a record that decides where a save WRITES uses {@link movedSceneFile}, which confirms the file and spells it.
+ *  `undefined`: no move touches it, or it was deleted (each record decides what a delete means). */
+export function scenePathMoveKey(moves: readonly PathMove[]): (path: string) => string | undefined {
+  const keyed = moves.map((m) => ({ from: normScenePath(m.from), to: m.to === null ? null : normScenePath(m.to), prefix: m.prefix }));
+  return (path) => {
+    const key = normScenePath(path);
+    if (key === '') return undefined;
+    for (const m of keyed) {
+      const below = key === m.from ? '' : m.prefix && key.startsWith(`${m.from}/`) ? key.slice(m.from.length) : undefined;
+      if (below === undefined) continue;
+      return m.to === null ? undefined : m.to + below;
+    }
+    return undefined;
+  };
+}
+
+/** Where the scene FILE `guid` now lives, if `moves` moved the file `path` names (#2078): the guarded form of
+ *  {@link scenePathMoveKey}, for a record that decides where a save WRITES (the open scene's path, the loaded entries,
+ *  Play's and the preview's snapshots). The key match only nominates. `normScenePath` folds case and decodes escapes, so
+ *  two different files can share a key (`my%20level` and `my level`, #1979), and re-pointing on the key alone aimed
+ *  Cmd+S at the other file. A move keeps the guid, so the manifest confirms it is the same file and gives the on-disk
+ *  spelling: the route lands the manifest before the renderer's repair, when its rebuild succeeds. When it did not
+ *  (`manifestRebuilt: false`, #1835) the guid still names the OLD path, and only an exact-spelling match is trusted, as
+ *  with no guid at all. */
+export function movedSceneFile(moves: readonly PathMove[]): (path: string, guid: string | undefined) => string | undefined {
+  const target = scenePathMoveKey(moves);
+  const exact = (path: string): string | undefined => {
+    for (const m of moves) {
+      const to = applyMove(path, m);
+      if (to !== undefined) return to ?? undefined;
+    }
+    return undefined;
+  };
+  return (path, guid) => {
+    const nominated = target(path);
+    if (nominated === undefined) return undefined;
+    const onDisk = guid !== undefined && isGuid(guid) ? resolveGuidToPath(guid) : undefined;
+    if (onDisk === undefined) return exact(path);
+    const onDiskKey = normScenePath(onDisk);
+    if (onDiskKey === nominated) return onDisk;
+    // The manifest has not seen the move yet: it still holds the file where it was.
+    if (onDiskKey === normScenePath(path)) return exact(path);
+    return undefined;
+  };
 }
 
 /** Collapse a single-folder wrapper chain so redundant manifest roots (e.g. the

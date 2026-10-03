@@ -31,11 +31,23 @@ import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/core/jo
 import { fetchAiSettings, getCachedAiSettings } from '../panels/aiSettingsModel';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { ensurePhysicsReady } from '../../runtime/physics/physicsReady';
+import { movedSceneFile, type PathMove } from '../utils/assetPaths';
+import { toOpenProjectScenePath } from './openProjectScenePath';
 
 /** The authored world captured at the moment Play was pressed — primary, bases (A5) and the key it
  *  belongs to, so a scene swap mid-play can't revert the wrong scene. Captured and restored by
  *  `authoredSnapshot.ts`, the same code the preview session uses (#1547). */
 let _snapshot: AuthoredSnapshot | null = null;
+
+/** A move of the scene Play started in (#2078, B3 rule 12): the authored snapshot's key follows it, as the open scene's
+ *  path does (`applyMovesToOpenScene`). Left on the old path, Stop read the rename as "the scene changed during Play" and
+ *  skipped the revert, so the Play world stayed as the authored one and the next save wrote it. Called by
+ *  `applyAssetPathMoves`. */
+export function applyMovesToPlaySnapshot(moves: readonly PathMove[]): void {
+  const to = _snapshot?.key ? movedSceneFile(moves)(_snapshot.key, _snapshot.primary.id) : undefined;
+  if (to !== undefined) _snapshot = { ..._snapshot!, key: toOpenProjectScenePath(to) };
+}
+
 /** Undo-stack depth captured at the Play press. On Stop we truncate back to this
  *  so during-Play editor edits (discarded by the revert) don't leave incoherent
  *  undo entries — while ALL pre-Play history is preserved (guid-resolved undo

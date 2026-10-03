@@ -15,6 +15,8 @@ import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
 import { writeAssetFile, saveSceneCopy, jsonFileBody } from '../backend/editorBackend';
 import { chooseNewAssetPath } from '../utils/saveDialog';
+import { movedSceneFile, type PathMove } from '../utils/assetPaths';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
 import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
 import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -891,6 +893,24 @@ export function setCurrentBaseScene(baseScene: string | undefined) { _currentBas
 
 export function getCurrentScenePath() { return _currentScenePath; }
 const scenePathListeners = new Set<() => void>();
+/** A rename or move of the open scene's FILE, or of a loaded base's (#2078, B3 rule 12): the editor follows it, so the
+ *  next save writes each file where it now is. `/api/move-file` marks the move as the editor's own, so no watcher event
+ *  tells the editor the file left; before this, Cmd+S recreated the old path carrying the scene's id, the scan re-minted
+ *  that copy, and every later edit went to a file nothing references while the renamed one kept the guid. A move keeps
+ *  the guid, so only paths change, confirmed by `movedSceneFile`. A DELETE (`to: null`) is left as it is. `openSceneTo` is
+ *  the open scene's new path when it moved, for the undo stacks to follow. Called by `applyAssetPathMoves`. */
+export function applyMovesToOpenScene(moves: readonly PathMove[]): { notes: string[]; openSceneTo?: string } {
+  const movedTo = movedSceneFile(moves);
+  // The primary's guid, read BEFORE the entries move: it is what confirms the open scene's own file moved.
+  const openKey = _currentScenePath ? normScenePath(_currentScenePath) : undefined;
+  const primary = [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary' && normScenePath(e.path) === openKey);
+  const to = _currentScenePath ? movedTo(_currentScenePath, primary?.guid) : undefined;
+  sceneManager.remapLoadedScenePaths(movedTo);
+  if (to === undefined || to === _currentScenePath) return { notes: [] };
+  setCurrentScenePath(to, 'moved');
+  return { notes: [`the open scene now saves to ${to}`], openSceneTo: to };
+}
+
 /** Called whenever the editor's scene path changes — a save giving an untitled world a file swaps no world, and a
  *  label reading `openScenePath()` must still follow it (#1718). Returns the unsubscribe. */
 export function onScenePathChange(fn: () => void): () => void {
@@ -903,11 +923,13 @@ export function onScenePathChange(fn: () => void): () => void {
  *  through here, so a route that binds a path gets it without doing anything:
  *   - `'adopted'`: the world was READ from the file's bytes, so the park edited THIS document — it is APPLIED, by the
  *     adoption owner after its baseline (`applyParkToOpenedScene`).
- *   - `'bound'` (every other writer — a save binding a path, Create Scene, the dialog's Create or Replace, a rename): the
+ *   - `'bound'` (every other writer — a save binding a path, Create Scene, the dialog's Create or Replace): the
  *     world was NOT read from the file, so the park edited a DIFFERENT document — it is DROPPED here and the drop is
  *     returned for the caller to report (`droppedBaseSceneEdit`). Applying it would graft one document's edit onto
- *     another's; leaving it, the flush would write it file-direct onto the open scene for the next save to overwrite. */
-export function setCurrentScenePath(scenePath: string | null, how: 'bound' | 'adopted' = 'bound'): { droppedBaseSceneEdit?: true } {
+ *     another's; leaving it, the flush would write it file-direct onto the open scene for the next save to overwrite.
+ *   - `'moved'` (`applyMovesToOpenScene`): the open scene's FILE was renamed or moved. Same document under a new name,
+ *     so nothing is dropped; a park follows the file through the parked-registry repair. */
+export function setCurrentScenePath(scenePath: string | null, how: 'bound' | 'adopted' | 'moved' = 'bound'): { droppedBaseSceneEdit?: true } {
   // ONE spelling for the open project's scenes (#1898): every writer — each load's adoption, save, save-as, new scene —
   // passes through here, and a `/@fs/<abs>/runtime/assets/…` path of the open project is stored as `/assets/…`, the
   // form the edit routes, `modoki_wait_for` and the next boot all compare against. See openProjectScenePath.ts.

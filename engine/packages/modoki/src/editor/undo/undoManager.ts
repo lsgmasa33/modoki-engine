@@ -10,6 +10,7 @@ import { notifyUndoRedoStep } from './undoRedoStep';
 import { canEdit, getRunMode } from '../../runtime/core/playState';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { normScenePath } from '../../runtime/scene/scenePathKey';
+import { scenePathMoveKey, type PathMove } from '../utils/assetPaths';
 import { markStale } from '../../runtime/prefab/instanceStore';
 import { peekCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 import type { StepCheck } from './stepCheck';
@@ -1188,6 +1189,28 @@ export function rekeyUntitledHistory(key: string): void {
   _histories.delete(key);
   _histories.delete('');
   _activeKey = key;
+}
+
+/** A scene FILE moved or was renamed (#2078, B3 rule 12): its stacks follow it, as every other path-keyed record does.
+ *  A parked pair moves with its own key. The LIVE pair moves only with the open scene (`openSceneTo`, the new path
+ *  `applyMovesToOpenScene` confirmed by guid): two files can share a key (`normScenePath` folds case and decodes), and
+ *  moving the live key on the key alone would leave the stacks under another file's name while the scene stays put.
+ *  Left at the old key, the moved scene's next reload (it adopts under the new path) swapped its live stacks out for an
+ *  empty pair, and a file created later at the old path inherited stacks recorded against another world (#1409). A
+ *  delete (`to: null`) leaves them: the swap away from a deleted scene decides what survives. Called by
+ *  `applyAssetPathMoves`. */
+export function applyMovesToHistory(moves: readonly PathMove[], openSceneTo: string | undefined): void {
+  const target = scenePathMoveKey(moves);
+  // Every source out first, then every destination in: a chained `[A→B, B→C]` resolves against the original keys.
+  const planned: Array<[string, { undo: UndoAction[]; redo: UndoAction[] }]> = [];
+  for (const [key, pair] of _histories) {
+    const to = target(key);
+    if (to === undefined) continue;
+    _histories.delete(key);
+    planned.push([to, pair]);
+  }
+  for (const [to, pair] of planned) _histories.set(to, pair);
+  if (openSceneTo !== undefined) _activeKey = normScenePath(openSceneTo);
 }
 
 /** Park only the entries that outlive a discarded world: `_isFileDirect` ones (material, clip,

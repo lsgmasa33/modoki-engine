@@ -33,11 +33,22 @@ import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUnd
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
+import { movedSceneFile, type PathMove } from '../utils/assetPaths';
+import { toOpenProjectScenePath } from './openProjectScenePath';
 
 /** Authored-world snapshot captured at the first pose of a session — primary, bases, and the scene
  *  key it belongs to (so a scene swap mid-preview can't revert the wrong scene). Captured and
  *  restored by `authoredSnapshot.ts`, the same code Play/Stop uses (#1547). */
 let _snap: AuthoredSnapshot | null = null;
+
+/** A move of the scene the preview session started in (#2078, B3 rule 12): the snapshot's key follows it, as Play's
+ *  does (`applyMovesToPlaySnapshot`). Left on the old path, the end of the session read the rename as "the scene
+ *  changed" and kept the posed world as the authored one. Called by `applyAssetPathMoves`. */
+export function applyMovesToPreviewSnapshot(moves: readonly PathMove[]): void {
+  const to = _snap?.key ? movedSceneFile(moves)(_snap.key, _snap.primary.id) : undefined;
+  if (to !== undefined) _snap = { ..._snap!, key: toOpenProjectScenePath(to) };
+}
+
 /** The non-world stores ▶ actions can change (#1551), seated and released WITH `_snap` — see
  *  `previewSideState.ts`. Restored on every end, including the ones that leave the world alone. */
 let _side: PreviewSideState | null = null;

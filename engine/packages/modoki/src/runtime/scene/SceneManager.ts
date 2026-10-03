@@ -306,6 +306,10 @@ export interface SceneManager {
   /** Every scene currently loaded into the active world — the primary plus any
    *  base scenes in its chain. */
   getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry>;
+  /** Re-point loaded scenes at the files' new paths after a move (#2078): the editor renamed the open scene or a loaded
+   *  base. `remap` answers an entry's new path from its path and guid, or `undefined` to leave it. Only the path changes:
+   *  a move keeps the scene's guid. */
+  remapLoadedScenePaths(remap: (path: string, guid: string) => string | undefined): void;
   /** The copies of missing prefabs `world` holds for its loaded scenes, and the documents its live frames of missing prefabs
    *  were expanded from, per scene (#1939 item 2) — what a world swap carries ({@link LoadOptions.sceneCopies}). With
    *  `primaryAs`, the primary's are keyed by that guid: the id of the snapshot the swap reloads, which the load gives its
@@ -447,6 +451,13 @@ class SceneManagerImpl implements SceneManager {
    *  below only ever answers for the primary. */
   getLoadedScenes(): ReadonlyMap<SceneId, LoadedSceneEntry> {
     return this.loadedScenes;
+  }
+
+  remapLoadedScenePaths(remap: (path: string, guid: string) => string | undefined): void {
+    for (const entry of this.loadedScenes.values()) {
+      const to = remap(entry.path, entry.guid);
+      if (to !== undefined) entry.path = to;
+    }
   }
 
   captureSceneCopies(world: World = getCurrentWorld(), primaryAs?: string): SceneCopyCarry {
