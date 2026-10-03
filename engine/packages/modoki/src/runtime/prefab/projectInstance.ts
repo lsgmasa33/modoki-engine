@@ -40,6 +40,7 @@ import { fieldFate } from '../loaders/overrideFate';
 import { noteTemplateDoc } from '../loaders/templateKeyRecovery';
 import { spawnUnresolvedReference } from '../loaders/unresolvedPrefabRefs';
 import { nodeFrameAddress, rowFrameAddress } from '../loaders/frameAddress';
+import { templateNodeRowMoves } from '../loaders/prefabOverrides';
 import {
   applyStructureByLocalToEcs, queueRealizedDeletes, queueRealizedMissing, queueRealizedMove, registerTemplateFrame,
   type AddedEntity, type ExpansionReader,
@@ -345,7 +346,12 @@ function noteFrames(
     for (const ph of fold.placeholders.values()) if (ph.opens?.row && ph.opens.outer === n.key) unexpanded.push(ph.opens.row.localId);
     noteFrameDoc(world, n.frame.source, doc, root, unexpanded);
     const raw = n.opens?.node ? rawTemplateNodeOf(n.opens.node) : undefined;
-    if (raw?.templateMoved && isRecord(raw.templateMoved)) noteNodeMoves(world, root, n.frame.source, doc, raw.templateMoved as Record<string, string>);
+    // A v10 node states its moves on its own rows (#2001 S6), read back into the `templateMoved` spelling.
+    const nodeMoves = {
+      ...templateNodeRowMoves(raw, doc, (g) => { const r = read(g); return 'doc' in r ? r.doc : undefined; }),
+      ...(raw?.templateMoved && isRecord(raw.templateMoved) ? raw.templateMoved as Record<string, string> : {}),
+    };
+    if (Object.keys(nodeMoves).length) noteNodeMoves(world, root, n.frame.source, doc, nodeMoves);
   }
 }
 

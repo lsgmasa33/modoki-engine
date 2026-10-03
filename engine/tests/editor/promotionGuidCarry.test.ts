@@ -10,6 +10,7 @@
  *  Driven through the real loader, the real Apply and the real save. Each case names the mutation that turns it
  *  red. */
 
+import { ownNodes } from './v10Rows';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -445,9 +446,9 @@ describe('promoting an added node keeps its guid (#1660)', () => {
     const keys = collectInstanceOverrideKeys(r1, getCachedPrefabSync(P) as PrefabFile);
     expect((await applyToPrefabSelective(r1, new Set(keys.added))).promotedAdditions).toBeGreaterThan(0);
     const written = takeWritten();
-    const qRow = written.entities.find((e) => e.prefab === Q) as { added?: Array<{ key?: string; guid?: string }> } | undefined;
-    expect(qRow?.added?.[0]).toMatchObject({ guid: '' }); // precondition: a template node…
-    expect(qRow?.added?.[0]?.key).toBeTruthy(); // …with a key
+    const qRow = written.entities.find((e) => e.prefab === Q);
+    expect(ownNodes(qRow)[0]).toMatchObject({ guid: '' }); // precondition: a template node…
+    expect(ownNodes(qRow)[0]?.key).toBeTruthy(); // …with a key
 
     // Mutation: drop `remapWorldGuidRefs(follow)` — navUp keeps naming the deleted Inner.
     const now = under(ROOT1, 'Inner');

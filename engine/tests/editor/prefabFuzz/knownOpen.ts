@@ -20,6 +20,7 @@ import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/p
 import { getAllAssets } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
 import { keptMemberOrphans } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { getAllEntities } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { getTraitByName } from '../../../packages/modoki/src/runtime/core/ecs/traitRegistry';
 
 export interface KnownOpen {
   issue: number;
@@ -60,19 +61,6 @@ export interface KnownOpen {
 // world, or a loaded BASE scene's tree (the trash's reload keeps a base rather than rebuilding it). Neither repro reaches the
 // first two; the fuzz fixture has no base scene, so whether either still reproduces through one is not known (parked).
 
-/** #1829's shape: across a save→reload, the marks of ONE component differ by a field the reload added (the save wrote a
- *  partially stated added component whole). Only a mark list, never a value: `<guid>/marks/<n>: "T.a" vs "T.b"` within
- *  one trait, or a mark the reload added at the end. */
-const partialAddedWidened = (f: StepFailure): boolean => {
-  if (f.check !== 'save→reload is not the identity') return false;
-  const m = /^\/([0-9a-f-]{36})\/marks\/\d+: (?:"(\w+)\.\w+"|undefined) vs "(\w+)\.\w+"$/.exec(f.detail);
-  // On the entry a file-direct write wrote, never just after one ran (review: a mark gained anywhere was claimed).
-  // Never a core trait: Transform, EntityAttributes and PrefabInstance are never a partially stated ADDED component.
-  return !!m && (m[2] === undefined || m[2] === m[3]) && !['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[3]!)
-    && (f.touched?.fileDirect ?? []).includes(m[1]!);
-};
-
-
 /** #1829 on P1 (#2058, hunt seed 7512): the same widening, seen by the store's projection instead of a reload. A respawn
  *  from the old capture (here Create Prefab's undo) marks every field of the partially stated added component, while the
  *  record keeps what the file stated, so the LIVE side carries a mark the projection lacks. Marks are sorted, so at the
@@ -88,6 +76,25 @@ const partialAddedOvermarkedLive = (f: StepFailure): boolean => {
   return (f.touched?.fileDirect ?? []).includes(m[1]!);
 };
 
+/** #1829 on the no-op rebuild's root mark set (hunt seed 178): the rebuild respawns from the old capture, so the REBUILT
+ *  root marks a field of the partially stated added component that the live root (the file's statement) does not. Marks are
+ *  sorted: at the first differing index the rebuilt side's mark sorts first, or the live side has ended. Same component on
+ *  both sides, never a default one, and only a component the root's prefab does not give it (an ADDED one, which is what
+ *  the old capture writes whole). The repro also asks that a file-direct write touched the root; the tolerance cannot (the
+ *  runner's `tolerate` sees no step). */
+const partialAddedOvermarkedRebuild = (f: Failure, step?: StepFailure): boolean => {
+  if (f.check !== 'a no-op rebuild is not the identity') return false;
+  const m = /^\/([0-9a-f-]{36})\/marks\/\d+: (?:"(\w+)\.(\w+)"|undefined) vs "(\w+)\.(\w+)"$/.exec(f.detail);
+  if (!m || ['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[4]!)) return false;
+  if (m[2] !== undefined && (m[2] !== m[4] || !(m[5]! < m[3]!))) return false;
+  if (step && !(step.touched?.fileDirect ?? []).includes(m[1]!)) return false;
+  const root = getAllEntities().find((e) => e.guid === m[1]);
+  const pi = root ? (findEntityByGuid(m[1]!)?.get(getTraitByName('PrefabInstance')!.trait) as { source?: string; localId?: number } | undefined) : undefined;
+  const doc = pi?.source ? getCachedPrefabSync(pi.source) : undefined;
+  const row = (doc?.entities as Array<{ localId?: number; traits?: Record<string, unknown> }> | undefined)?.find((r) => r.localId === (doc as { rootLocalId?: number }).rootLocalId);
+  return !!row && !(m[4]! in (row.traits ?? {}));
+};
+
 /** #2013: today's load keeps a member's `removed` in its orphan store AND applies it — the fold removed that member too,
  *  which the oracle marks `(applied)`. Every divergence line of the step must be one (`foldCheck` reports them all). The
  *  `own` rows first waived here were NOT this: the fold keeps those in neither its anchors nor its unused (#2009 review). */
@@ -97,56 +104,11 @@ const orphanBookedTwice = (f: StepFailure): boolean => {
   return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
 };
 
-/** #1931's mechanism on FIELD records (#2058, hunt seed 7562): a reference node a prefab edit added (`…/a+<key>/…`), a
- *  field edited on one of its members, then a reload. Today's settle keeps that member's field records (kept, as unused)
- *  and the instance shows them too, where the fold of the same entry applies them and lists nothing unused: each line a
- *  kept FIELD leaf on a row reaching into a template-added node. Unlike a link (`linkBookedTwice`), a field leaf carries no
- *  `(applied)` mark, so this cannot tell "the fold applied it" from "the fold lost it": it is a STOP, never tolerated,
- *  and the store's own P1 (the record projected) still judges what S6 writes. */
-const fieldsBookedTwice = (f: StepFailure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
-  return lines.every((l) => /^kept-only unused \S*\/a\+[^/\s]+\/\S+ [A-Z]\w*\.\w+$/.test(l));
-};
-
-/** #2099 (#2058, hunt seed 7615): a Detach unpacks an instance whose content holds a Missing Prefab ROW placeholder; the
- *  live node stays the placeholder, the capture's inline own content writes it plain, and P1's projection (scene-owned
- *  content taken from that capture) shows a plain node where the live tree has the placeholder. */
-const detachedRowPlaceholder = (f: StepFailure): boolean =>
-  f.check === 'P1 the projection of a record is not its live instance' && /^\S+ \/[0-9a-f-]{36}\/row: true vs undefined$/.test(f.detail);
-
 /** #2100 (#2058, hunt seed 7645): a re-add of a removed component clears the removal in the record and the capture (G1),
  *  but the old kept-unused store still holds it: every line a kept removal the fold does not list. */
 const reAddedKeptRemoval = (f: StepFailure): boolean => {
   if (f.check !== 'P1 the live instance is not the fold of its record') return false;
   return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^kept-only unused \S+ -[A-Z]\w*$/.test(l));
-};
-
-/** #1931 member 1's P1 shape (#2023): on a TEMPLATE-ADDED row (`…/a+…`, the rows `templateFrameNodes` decides), today
- *  keeps the row linking a user node as an orphan AND spawns the node. Each line is that kept link, marked
- *  `(applied <guid>)` because the fold links the same guid at the same row, or, once the node is deleted, the record's
- *  link to it at that row: the kept row restates the deleted node, which the save writes and the reload brings back.
- *  That `anchors` line only ADDS to today's list, and only kept links' guids that today shows nowhere at that row, so a
- *  second node lost there, or a fold that anchors one twice, stays red (close-out review). */
-const linkBookedTwice = (f: StepFailure): boolean => {
-  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
-  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
-  const KEPT = /^kept-only unused (\S*\/a\+[^/\s]+) own \(applied (\S+)\)$/;
-  const kept = new Map<string, string[]>();
-  for (const l of lines) { const m = KEPT.exec(l); if (m) kept.set(m[1], [...(kept.get(m[1]) ?? []), m[2]]); }
-  const restated = (l: string): boolean => {
-    const m = /^anchors (\S+): fold (\[.*\]) live (\[.*\])$/.exec(l);
-    if (!m || !kept.has(m[1])) return false;
-    try {
-      const fold = JSON.parse(m[2]) as string[], live = JSON.parse(m[3]) as string[];
-      const rest = [...fold];
-      for (const g of live) { const at = rest.indexOf(g); if (at < 0) return false; rest.splice(at, 1); }
-      const links = [...kept.get(m[1])!];
-      for (const g of rest) { const at = links.indexOf(g); if (at < 0 || live.includes(g)) return false; links.splice(at, 1); }
-      return rest.length > 0;
-    } catch { return false; } // a list `show` cut short
-  };
-  return lines.every((l) => KEPT.test(l) || restated(l));
 };
 
 /** #2063's sibling (hunt seed 8004): the old capture states a RESTORE (`traitRemovals: {T: false}`) on a member no layer
@@ -187,16 +149,23 @@ const redoFreshRowName = (f: Failure): boolean => {
   return templateNamed && keptNamed;
 };
 
+/** #2102: the end walk leaves a member row holding an `added` list the start's row did not state. */
+const heldTemplatePlaceholderAfterUndo = (f: StepFailure): boolean =>
+  f.check === 'undo to the start does not restore the scene' && /^\/entities\/[0-9a-f-]{36}\/members\/[^:]*\/added: undefined vs \[\{/.test(f.detail);
+
 export const KNOWN_OPEN: KnownOpen[] = [
   {
-    issue: 1829,
-    what: "#1829's mechanism by a LEGAL route (#2009 verify seed 8): an agent's file-direct `/api/scene-mutate` (no renderer) states an added component PARTIALLY on an instance root (`overrides[1].Rotate3D = {speed: 2}`); the load marks `speed` only, the save writes the added component whole, so the reload marks `axis` too. The second save is byte-identical and no value changes. RECORDED, not fixed: hub ruling on #1829 (2026-09-29), \"closed under the Unity rule … nothing reads the difference … if an M2-shaped divergence ever gets a reader, option C (Unity's recorded-list model) is the recorded direction\" — which #2001 rule 4 (save writes the list, load → save verbatim) builds",
+    issue: 2102,
+    what: "#2102 (from #2001 S6; was a #1939 regression, hunt seeds 3266, 1269): the undo walk back across the detach re-seeds the record from the old capture while the template reference node is a placeholder; the capture states it as a row `added` node, the parse holds it, and the v20 save writes it back, so a Missing Prefab placeholder and its kept rows outlive the template dropping the node. Forward steps pass. Before:: a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload, and since #2001 S5 an expanded one reloads as a placeholder too, keeping its list (ruling B: no copy expands)",
     repro: [
-      {kind: 'createPrefab', u: [0.7522407586220652, 0.37439649226143956, 0.25634062057361007, 0.9831468125339597, 0.8870674234349281, 0.8410391425713897, 0.5883639119565487, 0.6700334628112614]},
-      {kind: 'fileMutate', u: [0.9580224296078086, 0.1352244857698679, 0.2825196594931185, 0.5995694634038955, 0.8785156579688191, 0.5761606062296778, 0.8552941682282835, 0.6788817942142487]},
+      {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
+      {kind: 'trashPrefab', u: [0.21610835962928832, 0.40136740216985345, 0.25969059206545353, 0.9192028611432761, 0.3998060973826796, 0.17308109835721552, 0.8394311657175422, 0.928628564812243]},
+      {kind: 'saveReload', u: [0.6892608145717531, 0.4650746730621904, 0.21657891012728214, 0.23295434354804456, 0.3015429456718266, 0.5181264781858772, 0.30148910149000585, 0.7050725878216326]},
+      {kind: 'detach', u: [0.4603799900505692, 0.20984725933521986, 0.8734895254019648, 0.8137040538713336, 0.9327120224479586, 0.7904459990095347, 0.9528898776043206, 0.3289412825834006]},
     ],
-    reproduces: (f) => partialAddedWidened(f),
-    stops: (f, ops) => partialAddedWidened(f) && ops.slice(0, f.step).some((o) => o.kind === 'fileMutate'),
+    // Only the end walk's restore, only a row `added` list the start did not state, and only after a trash and a detach.
+    reproduces: (f) => heldTemplatePlaceholderAfterUndo(f),
+    stops: (f, ops) => heldTemplatePlaceholderAfterUndo(f) && ops.some((o) => o.kind === 'trashPrefab') && ops.some((o) => o.kind === 'detach'),
   },
   {
     issue: 1829,
@@ -217,37 +186,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
       const before = ops.slice(0, f.step + 1), file = before.findIndex((o) => o.kind === 'fileMutate');
       const made = before.findIndex((o, i) => i > file && o.kind === 'createPrefab');
       return file >= 0 && made > file && before.some((o, i) => i > made && o.kind === 'undo');
-    },
-  },
-  {
-    issue: 1931,
-    what: "#1931 on field records (#2058, hunt seed 7562): inside a prefab edit an agent instantiates a prefab (a template-added reference node), a field of one of its members is edited in the scene, and a reload keeps those field records as unused while the instance shows the edit (rx 1, marked) and the fold of the saved entry applies them. The save writes the row once and the store's projection matches the live tree; S8 deletes the kept stores",
-    repro: [
-      {kind: 'instantiate', u: [0.3553178678266704, 0.3202563014347106, 0.9194866034667939, 0.8210566870402545, 0.3394866450689733, 0.8027552580460906, 0.5011872530449182, 0.004331377102062106]},
-      {kind: 'prefabEdit', u: [0.2567180048208684, 0.5157781078014523, 0.9649082396645099, 0.07859208155423403, 0.9459575351793319, 0.10621962696313858, 0.5621734824962914, 0.0606699010822922], inner: [{kind: 'duplicate', u: [0.18462588964030147, 0.9115943843498826, 0.041108878795057535, 0.6311799623072147, 0.4605113093275577, 0.8888043891638517, 0.09429000783711672, 0.8082735198549926]}, {kind: 'agentInstantiate', u: [0.7334744080435485, 0.7161771552637219, 0.5013405915815383, 0.3469485710375011, 0.48510887334123254, 0.1125767242629081, 0.7655516711529344, 0.5689263942185789]}]},
-      {kind: 'editField', u: [0.3037849715910852, 0.6581992018036544, 0.5464207823388278, 0.2169429692439735, 0.6270450560841709, 0.3869077356066555, 0.7736029769293964, 0.14747512061148882]},
-    ],
-    reproduces: (f) => fieldsBookedTwice(f),
-    stops: (f) => fieldsBookedTwice(f),
-  },
-  {
-    issue: 2099,
-    what: "#2099 (#2058, hunt seed 7615): a nested prefab trashed and the scene reloaded (its row a Missing Prefab ROW placeholder inside a user-added instance), then that instance detached: the live node stays the placeholder, the save writes it as a plain node and loses the reference. Not the record (its rows are unchanged); the old capture's inline own-content writer. S6's own-content adapter must give it a form",
-    repro: [
-      {kind: 'instantiate', u: [0.26957426965236664, 0.9433535269927233, 0.43205804959870875, 0.16716787684708834, 0.2946264671627432, 0.03375298506580293, 0.2630784371867776, 0.4001484699547291]},
-      {kind: 'trashPrefab', u: [0.8420046551618725, 0.23699884046800435, 0.18811278813518584, 0.017240718007087708, 0.1533514689654112, 0.9918143444228917, 0.7034863331355155, 0.8845562189817429]},
-      {kind: 'saveReload', u: [0.821804279461503, 0.34884613868780434, 0.6294836406596005, 0.10124274692498147, 0.9881440987810493, 0.3039113983977586, 0.42803365737199783, 0.8990707388147712]},
-      {kind: 'detach', u: [0.5516347591765225, 0.5596253755502403, 0.45942430780269206, 0.1479144503828138, 0.24588677333667874, 0.22238363255746663, 0.7948488909751177, 0.8514142651110888]},
-      {kind: 'removeComponent', u: [0.09590236283838749, 0.9604742815718055, 0.20532211777754128, 0.2813355016987771, 0.48125550523400307, 0.8216665666550398, 0.5388927164021879, 0.6306644603610039]},
-    ],
-    reproduces: (f) => detachedRowPlaceholder(f),
-    // A trash, then a detach after it. The detail names the node, not the instance the detach unpacked, so this cannot
-    // prove the detach held that placeholder (#2058 review); another route writing a row placeholder plain after both
-    // would be claimed here.
-    stops: (f, ops) => {
-      if (!detachedRowPlaceholder(f)) return false;
-      const before = ops.slice(0, f.step), trash = before.findIndex((o) => o.kind === 'trashPrefab');
-      return trash >= 0 && before.some((o, i) => i > trash && o.kind === 'detach');
     },
   },
   {
@@ -277,54 +215,6 @@ export const KNOWN_OPEN: KnownOpen[] = [
     tolerates: (f) => orphanBookedTwice(f as StepFailure),
   },
   {
-    issue: 1931,
-    what: "#1931 member 1, the double booking (#2023, hunt seed 424 at length 40, minimized): a user-added node under a TEMPLATE-ADDED node that a template member row's `own` states. Today's orphan test (`templateFrameNodes`) reads only `added`, so the scene row linking the node is kept as an orphan while it is also applied: P1 reads a kept link the fold links at the same row, `(applied)`",
-    repro: [
-      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
-      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
-      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
-      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
-      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
-      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
-      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
-      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
-      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
-      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
-      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
-      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
-      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
-    ],
-    reproduces: (f) => linkBookedTwice(f),
-    // Tolerated, not a stop: the run goes on, and the resurrection below needs it to reach the delete and the reload.
-    tolerates: (f) => linkBookedTwice(f as StepFailure),
-  },
-  {
-    issue: 1931,
-    what: "#1931 member 1, the resurrection (#2023): the same kept orphan row, then delete the node, save, reload: it comes BACK (rule 3: deleting a user-added node removes its record). S4's door drops the record; the old capture still links the node (I25 translates it, `keptDeletedLinks`), and the save writes that link. Acceptance case for #2001 S6 (the save writes the list): when it passes, delete this entry. The translation stays while the capture does (S8), or until a `templateFrameNodes` fix",
-    repro: [
-      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
-      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
-      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
-      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
-      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
-      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
-      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
-      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
-      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
-      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
-      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
-      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
-      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
-      // Aimed at the node: candidate 5 of 13 since #2001 S5 spawns the same entities in another order (7 of 13 before),
-      // which left the old aim on another entity, and the entry passing for that reason alone.
-      {kind: 'delete', u: [0.4230769230769231, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
-    ],
-    // The deleted node itself comes back (its guid's run-independent part: the run's 12th mint), not some other gain.
-    // No `stops`: a stop matching a gained entity would claim every such hunt finding, so a hunt that reaches this
-    // reports it.
-    reproduces: (f) => f.check === 'save→reload is not the identity' && /^\/1000000b-0000-4000-8000-[0-9a-f]+: undefined vs .*\(an entity was gained\)/.test(f.detail),
-  },
-  {
     issue: 2063,
     what: "#2063's sibling (hunt seed 8004, S7.3-exposed): duplicate, add a child, duplicate, Apply a member's component removal to its nested prefab; OR's record, reprojected fresh, states nothing on that member, while the old capture writes a vacuous restore (traitRemovals {Transform: false}) no layer needs. Main writes the same bytes with the record stale. The file's bytes differ, nothing a reload shows: an S6 writer acceptance case.",
     repro: [
@@ -348,6 +238,19 @@ export const KNOWN_OPEN: KnownOpen[] = [
     reproduces: (f) => redoFreshRowName(f),
     // Tolerated, not a stop: it fires in the end-of-run respawn check, which REGRESSIONS reach too (#2058's 7393 for #2059).
     tolerates: (f) => redoFreshRowName(f),
+  },
+  {
+    issue: 1829,
+    what: "#1829 seen by the no-op rebuild's ROOT mark set (#2001 S6.0's check; hunt seed 178, first four ops): a file-direct write states an added component partially on an instance root (`Rotate3D: {speed: 2}` on the v20 root row); the load marks `speed`, and the record and the saved file state `speed` alone. The end walk's no-op rebuild goes through the old capture, which writes the component whole, so the rebuilt root marks `axis` too. Values agree. The same widening as the P1 entry above, by the rebuild instead of an undo's respawn. Hub ruling 2026-10-03 (recorded on #1829): the old capture is not fixed",
+    repro: [
+      {kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589]},
+      {kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656]}]},
+      {kind: 'duplicate', u: [0.5001395551953465, 0.5671875621192157, 0.7579644594807178, 0.9319786985870451, 0.05941782356239855, 0.3195134764537215, 0.7089909338392317, 0.7977708335965872]},
+      {kind: 'fileMutate', u: [0.05135307228192687, 0.1036165130790323, 0.8781819136347622, 0.6264823584351689, 0.9609711277298629, 0.36748331831768155, 0.6097434072289616, 0.9252105096820742]},
+    ],
+    reproduces: (f) => partialAddedOvermarkedRebuild(f, f),
+    // Tolerated, not a stop: it fires in the end-of-run rebuild check, after every other check of the run.
+    tolerates: (f) => partialAddedOvermarkedRebuild(f),
   },
 ];
 
@@ -399,6 +302,103 @@ export interface Reach {
 /** `runTag`: an entry re-pinned by editing its draws runs under the tag it was recorded with (`RunOpts.runTag`, #1946). */
 export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[]; runTag?: number }[] = [
   {
+    issue: 2001,
+    what: "#2001 S6 (hunt seed 178 at the verify length; the oracle fuzz's seed 178): a delete of a nested instance that holds a user's instance with a removed member, in a tree a record of which the store cannot restore exactly — so its undo and redo fall back to the snapshot. The undo's save wrote the removed member's row without its pin (the delete had dropped the instance's record, so the re-seed had none to carry it from), and the redo's wrote no pin for the members inside the deleted instance (the re-seed dropped the pins under a row stated removed). Fixed: the fallback undo seats the before-records stale (the re-seed then carries the pin), and the re-seed carries the pins a stale record holds under a row stated removed. Mutations: without the seating, red at the undo; without the carry, red at the redo.",
+    reaches: { op: 5, outcome: 'done' },
+    repro: [
+      {kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589]},
+      {kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656]}]},
+      {kind: 'duplicate', u: [0.5001395551953465, 0.5671875621192157, 0.7579644594807178, 0.9319786985870451, 0.05941782356239855, 0.3195134764537215, 0.7089909338392317, 0.7977708335965872]},
+      {kind: 'fileMutate', u: [0.05135307228192687, 0.1036165130790323, 0.8781819136347622, 0.6264823584351689, 0.9609711277298629, 0.36748331831768155, 0.6097434072289616, 0.9252105096820742]},
+      {kind: 'instantiate', u: [0.9505329302046448, 0.6067074490711093, 0.4167693150229752, 0.41477229772135615, 0.26970920502208173, 0.021757659735158086, 0.6905693716835231, 0.2421865495853126]},
+      {kind: 'delete', u: [0.27554806089028716, 0.27155902539379895, 0.3325552644673735, 0.49350595520809293, 0.08413512958213687, 0.6091446462087333, 0.9786754157394171, 0.6282922080717981]},
+    ],
+  },
+  {
+    issue: 2001,
+    what: "#2001 S6 (hunt seed 178): an instance the user added under a member; a prefab edit deletes that member in the template, so the instance is HELD with its owner's row, not live; then a delete elsewhere. The reload after the prefab edit parsed a record for the held instance into the store, where nothing live answers for it: I25 'a stored record has no live instance'. Before S6 every record was stale after a prefab edit, so none was compared. The load now drops a seeded record that has no entity (`fillInstanceStoreReporting`).",
+    reaches: { op: 2, outcome: 'done', skips: ['prefabEditSave: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      {kind: 'agentInstantiate', u: [0.8289649484213442, 0.45128455059602857, 0.5751742965076119, 0.5908240049611777, 0.7225717976689339, 0.04018327035009861, 0.30001199222169816, 0.5947466057259589]},
+      {kind: 'prefabEdit', u: [0.43255663593299687, 0.4682694443035871, 0.1532983456272632, 0.29019599547609687, 0.4104846369009465, 0.9832396351266652, 0.5306948709767312, 0.7135171783156693], inner: [{kind: 'delete', u: [0.7833136622793972, 0.8184588793665171, 0.2849972709082067, 0.8266630317084491, 0.4073482546955347, 0.2752895476296544, 0.8164297712501138, 0.9005102918017656]}]},
+      {kind: 'delete', u: [0.052215380826964974, 0.5728705800138414, 0.1882128375582397, 0.29563508299179375, 0.2143971344921738, 0.559692716691643, 0.11373174306936562, 0.2423913551028818]},
+    ],
+  },
+  {
+    issue: 2099,
+    what: "Retired from KNOWN_OPEN by #2001 S6 (Detach makes the row placeholder a reference placeholder that keeps its prefab and records, option (a)): passes with its record judged. Before: #2099 (#2058, hunt seed 7615): a nested prefab trashed and the scene reloaded (its row a Missing Prefab ROW placeholder inside a user-added instance), then that instance detached: the live node stays the placeholder, the save writes it as a plain node and loses the reference. Not the record (its rows are unchanged); the old capture's inline own-content writer. S6's own-content adapter must give it a form",
+    reaches: { op: 3, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    repro: [
+      {kind: 'instantiate', u: [0.26957426965236664, 0.9433535269927233, 0.43205804959870875, 0.16716787684708834, 0.2946264671627432, 0.03375298506580293, 0.2630784371867776, 0.4001484699547291]},
+      {kind: 'trashPrefab', u: [0.8420046551618725, 0.23699884046800435, 0.18811278813518584, 0.017240718007087708, 0.1533514689654112, 0.9918143444228917, 0.7034863331355155, 0.8845562189817429]},
+      {kind: 'saveReload', u: [0.821804279461503, 0.34884613868780434, 0.6294836406596005, 0.10124274692498147, 0.9881440987810493, 0.3039113983977586, 0.42803365737199783, 0.8990707388147712]},
+      {kind: 'detach', u: [0.5516347591765225, 0.5596253755502403, 0.45942430780269206, 0.1479144503828138, 0.24588677333667874, 0.22238363255746663, 0.7948488909751177, 0.8514142651110888]},
+      {kind: 'removeComponent', u: [0.09590236283838749, 0.9604742815718055, 0.20532211777754128, 0.2813355016987771, 0.48125550523400307, 0.8216665666550398, 0.5388927164021879, 0.6306644603610039]},
+    ],
+  },
+  {
+    issue: 1829,
+    what: "Retired from KNOWN_OPEN by #2001 S6 (the save writes the list; a file-direct write lands on the v20 root row): passes with its record judged. #1829's mechanism by a LEGAL route (#2009 verify seed 8): an agent's file-direct `/api/scene-mutate` (no renderer) states an added component PARTIALLY on an instance root (`overrides[1].Rotate3D = {speed: 2}`); the load marks `speed` only, the save writes the added component whole, so the reload marks `axis` too. The second save is byte-identical and no value changes. RECORDED, not fixed: hub ruling on #1829 (2026-09-29), \"closed under the Unity rule … nothing reads the difference … if an M2-shaped divergence ever gets a reader, option C (Unity's recorded-list model) is the recorded direction\" — which #2001 rule 4 (save writes the list, load → save verbatim) builds",
+    reaches: { op: 1, outcome: 'done' },
+    repro: [
+      {kind: 'createPrefab', u: [0.7522407586220652, 0.37439649226143956, 0.25634062057361007, 0.9831468125339597, 0.8870674234349281, 0.8410391425713897, 0.5883639119565487, 0.6700334628112614]},
+      {kind: 'fileMutate', u: [0.9580224296078086, 0.1352244857698679, 0.2825196594931185, 0.5995694634038955, 0.8785156579688191, 0.5761606062296778, 0.8552941682282835, 0.6788817942142487]},
+    ],
+  },
+  {
+    issue: 1931,
+    what: "Retired from KNOWN_OPEN by #2001 S6 (a row a live keyed node answers to is not kept as an orphan): passes with its record judged. #1931 on field records (#2058, hunt seed 7562): inside a prefab edit an agent instantiates a prefab (a template-added reference node), a field of one of its members is edited in the scene, and a reload keeps those field records as unused while the instance shows the edit (rx 1, marked) and the fold of the saved entry applies them. The save writes the row once and the store's projection matches the live tree; S8 deletes the kept stores",
+    reaches: { op: 2, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'instantiate', u: [0.3553178678266704, 0.3202563014347106, 0.9194866034667939, 0.8210566870402545, 0.3394866450689733, 0.8027552580460906, 0.5011872530449182, 0.004331377102062106]},
+      {kind: 'prefabEdit', u: [0.2567180048208684, 0.5157781078014523, 0.9649082396645099, 0.07859208155423403, 0.9459575351793319, 0.10621962696313858, 0.5621734824962914, 0.0606699010822922], inner: [{kind: 'duplicate', u: [0.18462588964030147, 0.9115943843498826, 0.041108878795057535, 0.6311799623072147, 0.4605113093275577, 0.8888043891638517, 0.09429000783711672, 0.8082735198549926]}, {kind: 'agentInstantiate', u: [0.7334744080435485, 0.7161771552637219, 0.5013405915815383, 0.3469485710375011, 0.48510887334123254, 0.1125767242629081, 0.7655516711529344, 0.5689263942185789]}]},
+      {kind: 'editField', u: [0.3037849715910852, 0.6581992018036544, 0.5464207823388278, 0.2169429692439735, 0.6270450560841709, 0.3869077356066555, 0.7736029769293964, 0.14747512061148882]},
+    ],
+  },
+  {
+    issue: 1931,
+    what: "Retired from KNOWN_OPEN by #2001 S6 (a row a live keyed node answers to is not kept as an orphan): passes with its record judged. #1931 member 1, the double booking (#2023, hunt seed 424 at length 40, minimized): a user-added node under a TEMPLATE-ADDED node that a template member row's `own` states. Today's orphan test (`templateFrameNodes`) reads only `added`, so the scene row linking the node is kept as an orphan while it is also applied: P1 reads a kept link the fold links at the same row, `(applied)`",
+    reaches: { op: 12, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
+      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
+      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
+      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
+      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
+      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
+      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
+      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
+      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
+      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
+      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
+      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
+      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
+    ],
+  },
+  {
+    issue: 1931,
+    what: "Retired from KNOWN_OPEN by #2001 S6 (the save writes the list, so a deleted user node's link is not written back): passes. #1931 member 1, the resurrection (#2023): the same kept orphan row, then delete the node, save, reload: it comes BACK (rule 3: deleting a user-added node removes its record). S4's door drops the record; the old capture still links the node (I25 translates it, `keptDeletedLinks`), and the save writes that link. Acceptance case for #2001 S6 (the save writes the list): when it passes, delete this entry. The translation stays while the capture does (S8), or until a `templateFrameNodes` fix",
+    reaches: { op: 13, outcome: 'done', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo to the start identity'] },
+    repro: [
+      {kind: 'instantiate', u: [0.2857817530166358, 0.9284016664605588, 0.649960428243503, 0.5427095263730735, 0.9669198917690665, 0.8001215348485857, 0.900856226682663, 0.0963143389672041]},
+      {kind: 'duplicate', u: [0.15816113911569118, 0.9515254036523402, 0.8443623438943177, 0.4220756853464991, 0.5434891583863646, 0.9449774052482098, 0.1401588509324938, 0.46159138693474233]},
+      {kind: 'delete', u: [0.05741695920005441, 0.8868564167059958, 0.47131400066427886, 0.5693536289036274, 0.3330700451042503, 0.7767054934520274, 0.02306409366428852, 0.8408651002682745]},
+      {kind: 'delete', u: [0.1418403887655586, 0.19947309186682105, 0.6577057961840183, 0.10861318395473063, 0.9620441927108914, 0.677882160525769, 0.9087244416587055, 0.4423560122959316]},
+      {kind: 'prefabEdit', u: [0.4955128540750593, 0.337934962939471, 0.5833717784844339, 0.08358659548684955, 0.32279041362926364, 0.24495570012368262, 0.41111092851497233, 0.6657589443493634], inner: []},
+      {kind: 'copy', u: [0.3733978213276714, 0.2373261817265302, 0.30191857693716884, 0.9676332524977624, 0.8589652895461768, 0.5494110491126776, 0.7625488345511258, 0.8052388962823898]},
+      {kind: 'reparent', u: [0.3463803620543331, 0.9813279476948082, 0.08980768476612866, 0.2374727656133473, 0.9892638474702835, 0.8537727212533355, 0.6754100432153791, 0.228248312138021]},
+      {kind: 'prefabEdit', u: [0.5191101194359362, 0.7420770146418363, 0.908827519742772, 0.9848883061204106, 0.5835732913110405, 0.15095963678322732, 0.41091505880467594, 0.35761508299037814], inner: []},
+      {kind: 'paste', u: [0.7678091169800609, 0.633487269282341, 0.6555189511273056, 0.984277096344158, 0.06900391704402864, 0.1731909541413188, 0.310907892184332, 0.6845735490787774]},
+      {kind: 'createPrefab', u: [0.008936043130233884, 0.41878328332677484, 0.875039060600102, 0.97259825700894, 0.7782009451184422, 0.13161385687999427, 0.8811372972559184, 0.28231658739969134]},
+      {kind: 'addChild', u: [0.7749213674105704, 0.983871849719435, 0.008836206514388323, 0.11602484388276935, 0.341921808430925, 0.2716327745001763, 0.8146954199764878, 0.6940517644397914]},
+      {kind: 'agentSetTraits', u: [0.39146748604252934, 0.3616935759782791, 0.12520293658599257, 0.7667932074982673, 0.007214169716462493, 0.43052898230962455, 0.31170611502602696, 0.6623050251509994]},
+      {kind: 'apply', u: [0.13892446854151785, 0.3386817444115877, 0.6297706798650324, 0.5721126820426434, 0.8362997488584369, 0.04098253371194005, 0.9929939683061093, 0.6810038974508643]},
+      // Aimed at the node: candidate 5 of 13 since #2001 S5 spawns the same entities in another order (7 of 13 before),
+      // which left the old aim on another entity, and the entry passing for that reason alone.
+      {kind: 'delete', u: [0.4230769230769231, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+    ],
+  },
+  {
     issue: 2010,
     what: "#2010 (hunt seed 1153, #2009; was KNOWN_OPEN): an agent call's ONE undo entry (a composite) whose added entity went with a member a saved prefab edit deleted. Its undo half-applied (the other op undone, the added one refused). Now every sub's check is asked first and the entry refuses whole, before any change (rule 8, ruling R); the extra undo reaches it as an op",
     reaches: { op: 6, outcome: 'refused', skips: ['prefabEditSave: redo to the end identity', 'prefabEditSave: undo op refusal forgiven', 'prefabEditSave: undo to the start identity'] },
@@ -428,17 +428,6 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
     repro: [
       {kind: 'trashPrefab', u: [0.9199938054662198, 0.23703388520516455, 0.35904134321026504, 0.5552934117149562, 0.4747692556120455, 0.17824304103851318, 0.2595838194247335, 0.14314630953595042]},
       {kind: 'apply', u: [0.013209617463871837, 0.7259964346885681, 0.41166331013664603, 0.3558924614917487, 0.569496892625466, 0.45171762513928115, 0.633732000598684, 0.7274762492161244], check: 'rebuild-reload'},
-    ],
-  },
-  {
-    issue: 1939,
-    what: "#1939 (hunt seeds 3266, 1269, #1934 C1): a template reference node of a trashed prefab; a detach of the instance holding it makes its frame an ENTRY. A placeholder entry stays one across the reload, and since #2001 S5 an expanded one reloads as a placeholder too, keeping its list (ruling B: no copy expands)",
-    reaches: { op: 3, outcome: 'done' },
-    repro: [
-      {kind: 'prefabEdit', u: [0.2832771616522223, 0.07422894821502268, 0.7528395308181643, 0.3064988814294338, 0.2902603386901319, 0.7280649025924504, 0.5037771083880216, 0.8082152912393212], inner: [{kind: 'instantiate', u: [0.13935406086966395, 0.8303816181141883, 0.6744375759735703, 0.2890225602313876, 0.2257074019871652, 0.9767554379068315, 0.2289160017389804, 0.8437706183176488]}]},
-      {kind: 'trashPrefab', u: [0.21610835962928832, 0.40136740216985345, 0.25969059206545353, 0.9192028611432761, 0.3998060973826796, 0.17308109835721552, 0.8394311657175422, 0.928628564812243]},
-      {kind: 'saveReload', u: [0.6892608145717531, 0.4650746730621904, 0.21657891012728214, 0.23295434354804456, 0.3015429456718266, 0.5181264781858772, 0.30148910149000585, 0.7050725878216326]},
-      {kind: 'detach', u: [0.4603799900505692, 0.20984725933521986, 0.8734895254019648, 0.8137040538713336, 0.9327120224479586, 0.7904459990095347, 0.9528898776043206, 0.3289412825834006]},
     ],
   },
   {

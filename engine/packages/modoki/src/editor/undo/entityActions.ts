@@ -25,7 +25,7 @@ import { copyUnresolvedRef, recordGuidMints, keptGuidMints } from './unresolvedR
 import { keptOrphanRowsOf, keptStateOf, keptUnusedRowsOf, restoreKeptState, type KeptState } from '../../runtime/core/ecs/keptOrphanRows';
 import { reparentSuffixes, reparentWrite, mergeTrs, IDENTITY_TRS, type PoseHierarchy } from '../../runtime/scene/transformSpace';
 import { pushAction, peekUndo, type EditDetail } from './undoManager';
-import { markStale } from '../../runtime/prefab/instanceStore';
+import { markStale, storedInstance, setInstanceRecord } from '../../runtime/prefab/instanceStore';
 import { packedOf, type PackedEntity } from '../../runtime/core/ecs/entityTable';
 import { frame2DFitNow } from '../../runtime/rendering/frame2D';
 import { currentFieldGesture } from './fieldGesture';
@@ -1697,7 +1697,17 @@ export function deleteEntitiesWithUndo(
       // that drops a node a record holds): the snapshot, with the records marked stale around it as for any such step.
       if (!restorable(viaRecords.map((t) => t.records.side), viaRecords)) {
         markStale(getCurrentWorld(), 'undo');
-        try { undoViaSnapshot(); } finally { markStale(getCurrentWorld(), 'undo'); }
+        try { undoViaSnapshot(); } finally {
+          // The delete dropped the records of the instances it took. Each one that is back is seated as it stood before
+          // the delete, STALE: its re-seed from the capture then carries what only a record holds — the pin of a member
+          // removed inside it, which is not live for the capture to read (#2001 S6, hunt seed 178: the undo's save
+          // wrote that row without its guid).
+          const world = getCurrentWorld();
+          for (const t of viaRecords) for (const [g, r] of t.records.side.records) {
+            if (r && !storedInstance(world, g) && findEntityByGuid(g)) setInstanceRecord(world, structuredClone(r));
+          }
+          markStale(world, 'undo');
+        }
         return;
       }
       // The refusals first, as on the snapshot path (I19).

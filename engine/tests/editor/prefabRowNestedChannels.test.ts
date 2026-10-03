@@ -11,6 +11,8 @@
  *  Driven through the real loader, the real editor capture and the real prefab-edit scene builder.
  *  Each case names the mutation that must turn it red. */
 
+import { rowsOf, v9Channels } from './v10Rows';
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -135,6 +137,12 @@ const sceneWith = (entry: Record<string, unknown> = {}): SceneData => ({
 
 const LEAF_UNDER_MID = 'Holder/OuterRoot/Panel/Button/MidRoot/Slot/InnerRoot/Leaf';
 const DELETE_LEAF = { '3': { added: [], removed: [2], removedTraits: {} } };
+/** The v10 row keys of MID's nested INNER root and of its Leaf, on a MID row: these documents predate v5, so each
+ *  component is the identity the load derives for the row. */
+const INNER_KEY = `/${preV5NodeGuid(MID, 3)}`;
+const LEAF_KEY = `${INNER_KEY}/${preV5NodeGuid(INNER, 2)}`;
+/** The rows a saved v20 entry states for a member three frames down (`/<row>/<row>/<member>`): the leaf's. */
+const leafRows = (entry: Record<string, unknown>) => Object.entries((entry.members ?? {}) as Record<string, unknown>).filter(([k]) => k.split('/').length === 4).map(([, r]) => r);
 
 beforeEach(() => {
   setRunMode('stopped');
@@ -159,7 +167,9 @@ describe('Apply to Prefab keeps a promoted reference node\'s nestedStructure (#1
     const written = writes.map((w) => JSON.parse(w.content) as PrefabFile).find((p) => p.id === OUTER);
     expect(written).toBeDefined();
     const midRow = written!.entities.find((e) => e.prefab === MID)!;
-    expect(midRow.nestedStructure).toEqual(DELETE_LEAF);
+    // Prefab v10 (#2001 S6): the delete is the member's own row, keyed through MID's row 3 by identity.
+    expect(rowsOf(midRow)[LEAF_KEY]).toEqual({ removed: true });
+    expect(v9Channels(midRow)).toEqual([]);
 
     // A fresh instance of the promoted prefab — loader and editor alike — no longer shows the member.
     install(written!);
@@ -197,7 +207,9 @@ describe('a prefab row\'s own nestedStructure expands in both loaders (#1381)', 
     expect(namePaths()).toContain(LEAF_UNDER_MID); // outer layer owns the interior, whole
     const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
     const entry = saved.entities.find((e) => e.prefab === OUTER)!;
-    expect(entry.nestedStructure).toEqual({ '5.3': { added: [], removed: [], removedTraits: {} } });
+    // Scene v20 (#2001 S6): the un-delete is `removed: false` on the member's own row (the row key reaches through both
+    // nested frames), beside the `"/"` row.
+    expect(leafRows(entry)).toEqual([{ removed: false }]);
     await load(saved as unknown as SceneData);
     expect(namePaths()).toContain(LEAF_UNDER_MID);
   });
@@ -209,7 +221,7 @@ describe('a prefab row\'s own nestedStructure expands in both loaders (#1381)', 
     install(outerDoc({ nestedStructure: DELETE_LEAF }));
     await load(sceneWith());
     const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
-    expect(saved.entities.find((e) => e.prefab === OUTER)!.nestedStructure).toEqual({ '5.3': DELETE_LEAF['3'] });
+    expect(leafRows(saved.entities.find((e) => e.prefab === OUTER)!)).toEqual([{ removed: true }]);
     await load(saved as unknown as SceneData);
     expect(namePaths()).not.toContain(LEAF_UNDER_MID);
     const again = await serializeScene();
@@ -241,8 +253,13 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     const doc = outerDoc({ nestedOverrides: RENAME_LEAF, nestedStructure: { '3': { added: [], removed: [], removedTraits: { 1: ['Transform'] } } } }) as PrefabFile;
     const root = await openInEditor(doc);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedOverrides).toEqual(RENAME_LEAF);
-    expect(midRowOf(saved).nestedStructure).toEqual(doc.entities.find((e) => e.prefab === MID)!.nestedStructure);
+    // Prefab v10 (#2001 S6): both are stated as rows, the value on Leaf's and the removal on the nested root's, and a
+    // second save of what the first wrote is the same.
+    expect(rowsOf(midRowOf(saved))[LEAF_KEY]).toEqual({ traits: { EntityAttributes: { name: 'Renamed' } } });
+    expect(rowsOf(midRowOf(saved))[INNER_KEY]).toEqual({ traitRemovals: { Transform: true } });
+    expect(v9Channels(midRowOf(saved))).toEqual([]);
+    const again = serializePrefab(await openInEditor(JSON.parse(JSON.stringify(saved)) as PrefabFile), OUTER)!;
+    expect(JSON.stringify(rowsOf(midRowOf(again)))).toBe(JSON.stringify(rowsOf(midRowOf(saved))));
   });
 
   // Mutation: replace the capture with a pass-through of the file's value — the edits below go red.
@@ -252,8 +269,9 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     rename(innerUnderMid(), 'InnerRenamed');
     deleteEntitiesWithUndo([leaf]);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedOverrides).toEqual({ '3': { 1: { EntityAttributes: { name: 'InnerRenamed' } } } });
-    expect(midRowOf(saved).nestedStructure).toEqual(DELETE_LEAF);
+    expect(rowsOf(midRowOf(saved))[INNER_KEY]).toEqual({ traits: { EntityAttributes: { name: 'InnerRenamed' } } });
+    expect(rowsOf(midRowOf(saved))[LEAF_KEY]).toEqual({ removed: true });
+    expect(v9Channels(midRowOf(saved))).toEqual([]);
   });
 
   // Review finding 1. When MID's own row 3 authors structure, a slot-less MID row in OUTER sees a
@@ -264,13 +282,15 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     install({ ...midDoc, entities: [...midDoc.entities.slice(0, 2), row(3, 'MidNested', 2, { prefab: INNER, removed: [2] })] } as PrefabFile);
     const root = await openInEditor(outerDoc({}) as PrefabFile);
     expect(getAllEntities().filter((e) => e.name === 'Leaf')).toHaveLength(1); // precondition: MID removed its own Leaf
-    expect(midRowOf(serializePrefab(root, OUTER)!).nestedStructure).toBeUndefined();
+    expect(Object.keys(rowsOf(midRowOf(serializePrefab(root, OUTER)!))).filter((k) => k !== '/')).toEqual([]);
     // …while a real edit against that baseline is still captured.
     const { spawnEntity, Transform, EntityAttributes } = await import('@modoki/engine/runtime');
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: innerUnderMid() }));
-    const edited = midRowOf(serializePrefab(root, OUTER)!).nestedStructure as Record<string, { added: Array<{ name: string }>; removed: number[] }>;
-    expect(edited['3']!.removed).toEqual([2]);
-    expect(edited['3']!.added.map((n) => n.name)).toEqual(['Extra']);
+    // Prefab v10 (#2001 S6): the node is the nested root's row's `own`. The capture still states the edited frame's lists
+    // whole (a v9 slot carried MID's `removed: [2]` along), so Leaf's removal is restated as its row.
+    const edited = rowsOf(midRowOf(serializePrefab(root, OUTER)!));
+    expect(edited[INNER_KEY]?.own?.map((n) => n.name)).toEqual(['Extra']);
+    expect(edited[LEAF_KEY]).toEqual({ removed: true });
   });
 
   // Re-review findings 1 and 2: the row writer's equality is over CONTENT, not the shape a writer
@@ -290,7 +310,7 @@ describe('the prefab editor shows and saves a row\'s nested channels (#1381, #13
     install({ ...midDoc, entities: [...midDoc.entities.slice(0, 2), row(3, 'MidNested', 2, { prefab: INNER, added })] } as PrefabFile);
     const root = await openInEditor(outerDoc({}) as PrefabFile);
     for (const n of added) expect(getAllEntities().some((e) => e.name === n.name)).toBe(true); // precondition: expanded
-    expect(midRowOf(serializePrefab(root, OUTER)!).nestedStructure).toBeUndefined();
+    expect(Object.keys(rowsOf(midRowOf(serializePrefab(root, OUTER)!))).filter((k) => k !== '/')).toEqual([]);
   });
 
   // Re-review finding 3. Mutation: count every non-root entity of the lost subtree as `extra`.

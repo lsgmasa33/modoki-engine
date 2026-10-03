@@ -14,7 +14,16 @@
  *
  *  Regenerate the frozen forms (ONLY on the pre-S5 load, or when the owner rules a new visible change): run this file with
  *  `MODOKI_FOLD_ORACLE_FREEZE=1`. `MODOKI_FOLD_ORACLE_DUMP=<dir>` writes every form in full (translated and not), for a
- *  before/after diff. */
+ *  before/after diff.
+ *
+ *  ⚠️ ONE corpus form was replaced by hand at the S6 corpus re-save (#2001), because the INPUT changed, not the load: the
+ *  Spaceship instance of space-console's Station scene. Its file stated `EngineFlame.idleScale` for two nested roots in
+ *  `nestedOverrides`; the v20 save states the same two records on their member rows. This suite does not register that
+ *  game's component, so both are kept records, and the form names where each is kept: `(legacy)` before, the row's key
+ *  after. Measured with `MODOKI_FOLD_ORACLE_DUMP` on both files at one build: those two labels are the whole difference
+ *  (the nodes are the same), and the file as it was before the re-save still gives the old form. The other 40 corpus
+ *  instances give their frozen form from the re-saved files, unchanged. The replacement is kept by owner ruling (relayed
+ *  by the hub, 2026-10-03). */
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { createWorld } from 'koota';

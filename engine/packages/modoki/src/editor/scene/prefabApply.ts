@@ -51,6 +51,9 @@ import {
 } from './prefabApplyStructure';
 import { markStale } from '../../runtime/prefab/instanceStore';
 import { guidOfEntity, outermostStoredRoot, storedRootsUnder } from '../instance/instanceKeys';
+import { editorPrefabReader } from '../instance/instanceSync';
+import { writeTemplateForm } from '../../runtime/prefab/templateFormDocument';
+import type { PrefabDoc, PrefabReader as PrefabDocReader } from '../../runtime/prefab/instanceRecord';
 
 /** A frame root's durable guid ('' when it has none): what an Apply's plan names a frame by, since the ids it holds can be
  *  dead or recycled once an earlier write's refresh has rebuilt the scene entry around it (#1880 F6). */
@@ -1221,6 +1224,13 @@ async function planApply(
   // enclosing document only loses an override here and mints nothing: its clone's mark, or the one the commit states
   // from its rows when the file had none (#1797).
   advanceLocalIdCounter(newPrefab, oldPrefab, nextLocalId.v);
+  // Prefab v10 (#2001 S6): every document this Apply writes states its reference rows' lists as `members`. The edits
+  // above were made in whichever channel the row held; a nested document this plan also writes is read as written.
+  {
+    const docs = new Map<string, PrefabFile>([...(writtenCount ? [newPrefab] : []), ...outerWrites.map((e) => e.doc)].filter((d) => d.id).map((d) => [d.id!, d]));
+    const readPlanned: PrefabDocReader = (g) => (docs.has(g) ? { doc: docs.get(g) as unknown as PrefabDoc } : editorPrefabReader(g));
+    for (const [id, doc] of docs) writeTemplateForm(doc as unknown as PrefabDoc, id, readPlanned);
+  }
   for (const x of appliedTargets) x.key = spell(x.key);
   const applied = [...new Map(appliedTargets.map((x) => [x.key, x] as const)).values()];
   return {

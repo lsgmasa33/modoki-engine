@@ -37,12 +37,10 @@ import { unresolvedRefOf } from '../../packages/modoki/src/runtime/core/unresolv
 import { templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { findEntity, readTraitData } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { deleteAssetFiles, deletionPathsFor } from '../../packages/modoki/src/editor/panels/assetOps';
-import { saveScene, saveAll, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
+import { saveScene, loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { deleteEntitiesWithUndo, writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { enterPlay, stopPlay } from '../../packages/modoki/src/editor/scene/playMode';
 import { validateSceneData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
-import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
-import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -81,7 +79,6 @@ async function reload(f: Fixture): Promise<void> {
 describe('#1939 item 1: a copy restores exactly the frames its scene listed live at the save', () => {
   it('F3/T14: three Q frames live at the save, one inside a TEMPLATE reference node of O, are listed; each reloads its placeholder; the file round-trips', async () => {
     // O's row N states a keyed reference node PN of P under N's A, so O1 holds three Q frames: P1's C, N's C, and PN's C.
-    // Mutation: in `liveFrameAddresser`, give a frame inside a reference node no address → the list holds 2.
     const f = await startRun(be, noNest, 'lf-template-node');
     const o = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: unknown[] }> };
     o.entities[1]!.added!.push({ parentLocalId: 2, guid: '', key: 'k-pn', name: 'PN', prefab: f.prefabs.P.guid, traits: { EntityAttributes: { name: 'PN', parentId: 0 } }, children: [] });
@@ -93,9 +90,9 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     await trash(f, 'Q');
     expect(countOf(f.prefabs.Q.guid), 'premise: the trash keeps them').toBe(6);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const listed = file(f).embeddedPrefabFrames![f.prefabs.Q.guid]!;
-    expect(listed).toHaveLength(3);
-    expect(listed.filter((a) => a.includes('/+k-pn/'))).toHaveLength(1);
+    // Until scene v20 the save listed the three frames beside Q's copy; a v20 save writes neither (#2001 S6).
+    expect(file(f).embeddedPrefabs).toBeUndefined();
+    expect(file(f).embeddedPrefabFrames).toBeUndefined();
     await reload(f);
     expect(countOf(f.prefabs.Q.guid), 'ruling B: no Q frame expands').toBe(0);
     expect(unexpandedRows().size, 'each Q row its placeholder').toBe(3);
@@ -106,14 +103,17 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
 
   it('C1: a placeholder ENTRY saved beside a live instance of its prefab, and the listed one, both reload as placeholders', async () => {
     const f = await startRun(be, noNest, 'lf-c1');
+    const pDoc = JSON.parse(be.read(f.prefabs.P.path)!) as unknown;
     await trash(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const sc = file(f);
     const p1Guid = topRoot(f, 'P').guid!;
-    expect(sc.embeddedPrefabFrames![f.prefabs.P.guid], 'premise: P1 is listed').toContain(p1Guid);
+    // As a v19 editor left it: P's copy, with P1 listed live (a v20 save writes neither, so they are put in by hand).
+    sc.embeddedPrefabs = { [f.prefabs.P.guid]: pDoc };
+    sc.embeddedPrefabFrames = { [f.prefabs.P.guid]: [p1Guid] };
     // A second entry of P that was a Missing Prefab placeholder at the save: its record, and no list entry.
     const p2Guid = p1Guid.replace(/^.{8}/, '12121212');
-    sc.entities.push({ prefab: f.prefabs.P.guid, guid: p2Guid, traits: { EntityAttributes: { name: 'P2', parentId: 0 }, Transform: { x: 20, y: 0, z: 0 } } });
+    sc.entities.push({ prefab: f.prefabs.P.guid, guid: p2Guid, traits: { EntityAttributes: { sortOrder: 9 } }, members: { '/': { traits: { EntityAttributes: { name: 'P2' }, Transform: { x: 20, y: 0, z: 0 } } } } });
     write(f, sc);
     await reload(f);
     expect(placeholderGuids().has(p2Guid)).toBe(true);
@@ -123,10 +123,14 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
   it('an address that resolves to nothing is ignored, and the validator names an unanchored one; the load completes', async () => {
     // Mutation: drop `embeddedPrefabFrameWarnings` from `validateSceneData` → the anchor warning is not reported.
     const f = await startRun(be, noNest, 'lf-unresolved');
+    const pDoc = JSON.parse(be.read(f.prefabs.P.path)!) as unknown;
     await trash(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const sc = file(f);
-    const list = sc.embeddedPrefabFrames![f.prefabs.P.guid]!;
+    // A v19 file's copy and list, by hand (a v20 save writes neither).
+    sc.embeddedPrefabs = { [f.prefabs.P.guid]: pDoc };
+    const list = [topRoot(f, 'P').guid!];
+    sc.embeddedPrefabFrames = { [f.prefabs.P.guid]: list };
     const ghost = 'abababab-0000-4000-8000-000000000001';
     list.push(ghost, `${list[0]}/eeeeeeee-0000-4000-8fff-000000000001`, `${list[0]}/+no-such-key`);
     write(f, sc);
@@ -141,11 +145,13 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
   it('a list that is not a list is ignored with a warning, never a throw', async () => {
     // (A frame with no address answered by the rows rule; ruling B retired that with every expansion from a copy.)
     const f = await startRun(be, noNest, 'lf-unaddressable');
+    const pDoc = JSON.parse(be.read(f.prefabs.P.path)!) as unknown;
     await trash(f, 'P');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    // A malformed list: warned and ignored, and the load completes.
+    // A malformed list beside a v19 file's copy (by hand: a v20 save writes neither): warned and ignored, and the load completes.
     const bad = file(f);
-    (bad.embeddedPrefabFrames as Record<string, unknown>)[f.prefabs.P.guid] = 'not a list';
+    bad.embeddedPrefabs = { [f.prefabs.P.guid]: pDoc };
+    bad.embeddedPrefabFrames = { [f.prefabs.P.guid]: 'not a list' } as never;
     write(f, bad);
     expect(validateSceneData(bad).warnings).toContain(`embeddedPrefabFrames['${f.prefabs.P.guid}']: not a list of frame addresses — the loader ignores it, and the copy answers by the member rows`);
     const warn = vi.spyOn(console, 'warn');
@@ -190,12 +196,10 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
   });
 });
 
-describe('#1939 item 2: the copy store crosses a world swap', () => {
-  it('a frame of a missing prefab destroyed during Play is back after Stop, as its placeholder, and its copy is kept (Unity discards Play state)', async () => {
+describe('#1939 item 2: a world swap', () => {
+  it('a frame of a missing prefab destroyed during Play is back after Stop, as its placeholder (Unity discards Play state)', async () => {
     // Stop reloads the edit world's snapshot: a load, so ruling B shows every Q frame as its row's placeholder (#2001 S5,
-    // #2028). The copy is held twice: by the snapshot taken at Play, and by the edit world's carry
-    // (`AuthoredSnapshot.copies`). Mutation, compound: strip the snapshot's `embeddedPrefabs` in `captureAuthoredSnapshot`
-    // and restore with no carry → the save after Stop writes no copy of Q.
+    // #2028). (Until scene v20 the save after Stop also wrote Q's copy, carried by the snapshot; a v20 save writes none.)
     const f = await startRun(be, noNest, 'lf-stop');
     await trash(f, 'Q');
     const live = countOf(f.prefabs.Q.guid);
@@ -210,41 +214,10 @@ describe('#1939 item 2: the copy store crosses a world swap', () => {
     expect(countOf(f.prefabs.Q.guid)).toBe(0);
     expect(unexpandedRows().size, 'O1\'s Q frame is back, as a placeholder, with P1\'s').toBe(live / 2);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(file(f).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+    expect(file(f).embeddedPrefabs).toBeUndefined();
   });
-
-  it('H1: a kept base keeps its copies across a level switch and back, and its next save still writes them', async () => {
-    // F (the fixture scene) is the base of two levels. Its file carries Q's copy with no frame listed live: P1's and O1's
-    // Q rows stay unexpanded (I18 writes the copy back verbatim). Switching L → L2 → L keeps F, carried flat each time.
-    // Mutation: make `loadScene`'s default carry empty (`opts.sceneCopies ?? new Map()`) → F's save drops Q's copy.
-    const f = await startRun(be, noNest, 'lf-h1');
-    await trash(f, 'Q');
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const fsc = file(f);
-    fsc.embeddedPrefabFrames![f.prefabs.Q.guid] = [];
-    write(f, fsc);
-    const level = (name: string, tag: string) => {
-      const path = f.scenePath.replace(/Fuzz\.json$/, `${name}.json`);
-      const guid = f.sceneGuid.replace(/^.{8}/, tag);
-      be.write(path, `${JSON.stringify({ id: guid, version: SCENE_FORMAT_VERSION, name, createdAt: '2026-01-01T00:00:00.000Z', resources: [], baseScene: f.sceneGuid, entities: [] }, null, 2)}\n`);
-      registerAsset(guid, path, 'scene');
-      return path;
-    };
-    const l1 = level('Level', 'abababab');
-    const l2 = level('Level2', 'acacacac');
-    be.marked.clear();
-    expect((await loadSceneReporting(l1)).outcome).toBe('loaded');
-    await settle();
-    expect(unexpandedRows().size, 'premise: F\'s Q rows unexpanded').toBeGreaterThan(0);
-    expect((await loadSceneReporting(l2)).outcome).toBe('loaded'); // F kept
-    await settle();
-    expect((await loadSceneReporting(l1)).outcome).toBe('loaded'); // and back: F kept again
-    await settle();
-    expect(writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Plain')!.id, TF(), 'x', 3)).toBeFalsy();
-    await settle();
-    expect((await saveAll({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(file(f).embeddedPrefabs ?? {})).toEqual([f.prefabs.Q.guid]);
-  });
+  // H1 (a kept base's copies carried across a level switch, so its next save wrote them) went with the copy writer:
+  // a v20 save writes no copy, whatever was carried (#2001 S6).
 });
 
 describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by the rules a reload does', () => {
@@ -294,12 +267,9 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     await reload(f);
     await trash(f, 'Q');
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const sc = file(f);
-    sc.embeddedPrefabFrames![f.prefabs.Q.guid] = sc.embeddedPrefabFrames![f.prefabs.Q.guid]!.filter((a) => !a.endsWith('/+k-q2'));
-    write(f, sc);
     await reload(f);
     const k1 = () => getAllEntities().filter((e) => templateKeyOf(findEntity(e.id) as never) === 'k-q1').map((e) => piOf(e.id)?.source ?? unresolvedRefOf(findEntity(e.id) as never)?.source);
-    expect(k1(), 'premise: k-q1 is a live Q frame').toEqual([f.prefabs.Q.guid]);
+    expect(k1(), 'premise: k-q1 is Q\'s (its placeholder, ruling B)').toEqual([f.prefabs.Q.guid]);
     const o2 = JSON.parse(be.read(f.prefabs.O.path)!) as { entities: Array<{ added?: Array<Record<string, unknown>> }> };
     for (const n of o2.entities[1]!.added!) if (n.key === 'k-q1') n.prefab = f.prefabs.H.guid;
     before = be.snapshot();
@@ -316,19 +286,20 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
   });
 
   it('3081, rule 2: an undo on a frame of a missing prefab takes an unmarked field from the document the frame was built from', async () => {
-    // P1's root is set to x 7 (an override), P's template is then changed outside to x 7 too, and P is trashed: P1 is kept
-    // live on its record, which says 7. Undoing the edit drops the mark, so the field is unmarked and must show the
-    // template's value, as it does with P present. (A reload showed the same from the scene's copy; ruling B, #2028: it
-    // shows P1's placeholder now.)
-    // Mutation: `takeUnmarkedFromBase` reads `getCachedPrefabSync(source)` again → P1 keeps the undo's restored 0.
+    // P1's member A is set to y 7 (an override), P's template is then changed outside to y 7 too, and P is trashed: P1 is
+    // kept live on its record, which says 7. Undoing the edit drops the mark, so the field is unmarked and must show the
+    // template's value, as it does with P present. (A reload shows P1's placeholder: ruling B, #2028.)
+    // On member A, not the root: a v20 `/` row states the root's position, so that field is never unmarked (#2001 S6).
+    // Mutation: `takeUnmarkedFromBase` reads `getCachedPrefabSync(source)` again → A keeps the undo's restored 0.
     const f = await startRun(be, noNest, 'lf-unmarked-from-record');
-    const p1 = () => topRoot(f, 'P');
-    const x = () => readTraitData(p1().id, TF())!.x as number;
-    expect(x(), 'premise: P1 starts at 0').toBe(0);
-    expect(writeTraitFieldWithUndo(p1().id, TF(), 'x', 7)).toBeFalsy();
+    const a = () => getAllEntities().find((e) => e.name === 'A' && piOf(e.id)?.rootInstanceId === topRoot(f, 'P').id)!;
+    const y = () => readTraitData(a().id, TF())!.y as number;
+    expect(y(), 'premise: A starts at 0').toBe(0);
+    expect(writeTraitFieldWithUndo(a().id, TF(), 'y', 7)).toBeFalsy();
     await settle();
-    const p = JSON.parse(be.read(f.prefabs.P.path)!) as { entities: Array<{ traits: { Transform?: Record<string, number> } }> };
-    p.entities[0]!.traits.Transform = { ...(p.entities[0]!.traits.Transform ?? {}), x: 7 };
+    const p = JSON.parse(be.read(f.prefabs.P.path)!) as { entities: Array<{ name?: string; traits: { Transform?: Record<string, number> } }> };
+    const row = p.entities.find((r) => r.name === 'A')!;
+    row.traits.Transform = { ...(row.traits.Transform ?? {}), y: 7 };
     const before = be.snapshot();
     be.write(f.prefabs.P.path, `${JSON.stringify(p, null, 2)}\n`);
     await flushWatcher(be, before);
@@ -337,7 +308,7 @@ describe('#1939 hunts 1031 and 3081: the editor meets a copy-restored frame by t
     expect(getCachedPrefabSync(f.prefabs.P.guid), 'premise: P is out of the cache').toBeNull();
     expect((await undoStep('undo')).did, 'premise: the edit undoes').toBe(true);
     await settle();
-    expect(x()).toBe(7);
+    expect(y()).toBe(7);
   });
 });
 

@@ -12,7 +12,8 @@
  *
  *  Also bumps each rewritten scene's `version` to `SCENE_FORMAT_VERSION` (a scene below
  *  `FLAT_KEYED_GUIDS_SCENE_VERSION` to the rung before it, as `migrate-assets.mjs` does: only the loader renames
- *  keyed-node guids, #1876) and each rewritten
+ *  keyed-node guids, #1876; a scene or a prefab below the instance model's rung to the version before that one,
+ *  #2001 S6) and each rewritten
  *  prefab's to `PREFAB_FORMAT_VERSION`, both read from `runtime/core/version.ts` as TEXT rather
  *  than hardcoded — and never DOWNWARDS: a document stamped higher than the target is skipped
  *  untouched, because a newer build wrote it and this one cannot claim to understand it (#1468).
@@ -75,6 +76,16 @@ if (!prefabVersionMatch) {
   process.exit(1);
 }
 const PREFAB_FORMAT_VERSION = Number(prefabVersionMatch[1]);
+// The rungs of the prefab instance model (#2001 S6), which only a load and a save in the editor take: they move an
+// instance's records onto its member rows, and that needs the prefab documents. A file below one is stamped to the
+// version before it, never past it (a scene stamped past it has its entries read by rules its form does not follow).
+const modelRung = (name) => {
+  const m = versionSrc.match(new RegExp(`${name}\\s*=\\s*(\\d+)`));
+  if (!m) { console.error(`could not read ${name} from runtime/core/version.ts`); process.exit(1); }
+  return Number(m[1]);
+};
+const SCENE_MODEL_RUNG = modelRung('INSTANCE_MODEL_SCENE_VERSION');
+const PREFAB_MODEL_RUNG = modelRung('TEMPLATE_FORM_PREFAB_VERSION');
 
 /** Every scene/prefab file the REPO knows about, enumerated through GIT rather than by walking
  *  the filesystem.
@@ -217,6 +228,12 @@ function visitEntry(entry, filePath, dirtyRef) {
       if (migrateTraits(bag, { file, name, localId, location, carrier: 'create' })) dirtyRef.dirty = true;
     }
   }
+  // Member rows (scene v20, prefab v10): `traits` is an override bag, `own` (`added` before v20) holds subtrees.
+  for (const [key, row] of Object.entries(entry.members ?? {})) {
+    if (!row || typeof row !== 'object') continue;
+    if (migrateTraits(row.traits, { file, name, localId, location: `members['${key}'].traits`, carrier: 'create' })) dirtyRef.dirty = true;
+    for (const node of [...(row.own ?? []), ...(row.added ?? [])]) visitEntry(node, filePath, dirtyRef);
+  }
 }
 
 async function migrateFile(file) {
@@ -246,7 +263,10 @@ async function migrateFile(file) {
     console.log(`SKIP ${file.slice(ROOT.length + 1)}: format ${json.version} is newer than ${target} — written by a newer build`);
     return;
   }
-  json.version = isPrefab || (typeof json.version === 'number' && json.version >= LOADER_RUNG) ? target : LOADER_RUNG - 1;
+  const v = typeof json.version === 'number' ? json.version : -1;
+  json.version = isPrefab
+    ? (v >= PREFAB_MODEL_RUNG ? target : PREFAB_MODEL_RUNG - 1)
+    : v >= SCENE_MODEL_RUNG ? target : v >= LOADER_RUNG ? SCENE_MODEL_RUNG - 1 : LOADER_RUNG - 1;
 
   changedFiles++;
   console.log(`${WRITE ? 'rewrote' : 'would rewrite'} ${file.slice(ROOT.length + 1)}`);

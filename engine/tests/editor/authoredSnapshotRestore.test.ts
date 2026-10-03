@@ -172,4 +172,27 @@ describe('a PREFAB entry is replayed only as far as it states (#1547 re-review)'
       expect(xOf(btn)).toBe(3);
     } finally { g.dispose(); }
   });
+
+  it('a scene v20 entry is replayed from its "/" row: the root\'s posed fields return to what the row states (#2001 S6)', async () => {
+    const g = createTestWorld({});
+    try {
+      const btn = g.spawn(EntityAttributes({ name: 'Button', guid: HUD_CHILD, isActive: false } as never), Transform({ x: 3, y: 2 } as never));
+      // What a v20 save writes for a root: its placement on the entry's own traits, its records on the "/" row.
+      const entry = {
+        guid: HUD_CHILD, prefab: '/assets/prefabs/button.prefab.json', traits: { EntityAttributes: { sortOrder: 0 } },
+        members: { '/': { traits: { EntityAttributes: { name: 'Button', isActive: false }, Transform: { x: 3 } } } },
+      };
+      const snap: AuthoredSnapshot = { primary: { entities: [] } as never, key: '/l.json', bases: new Map([['b', { entities: [entry] } as never]]) };
+      vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({} as never);
+      // Play (or a preview) posed it: moved, renamed by nothing, shown.
+      setX(btn, 40);
+      btn.set(EntityAttributes, { ...(btn.get(EntityAttributes) as object), isActive: true } as never);
+      await restoreAuthoredSnapshot(snap);
+      // MUTATION TARGET: drop the `rootRow` branch — the row is not read, and x stays 40 and isActive true.
+      expect(xOf(btn)).toBe(3);
+      expect((btn.get(EntityAttributes) as { isActive: boolean }).isActive).toBe(false);
+      // A field the row does not state comes from the template, which this pass cannot see: left as it is.
+      expect((btn.get(Transform) as { y: number }).y).toBe(2);
+    } finally { g.dispose(); }
+  });
 });

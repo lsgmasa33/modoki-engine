@@ -361,6 +361,33 @@ describe('#1707: a nested row composes its member rows and an outer slot, as the
     expect(memberAddressOfRowKey(host(), `/${gKid}/${gKid}`, get)).toBeNull();   // not a row of Host
     expect(memberAddressOfRowKey(host(), `/${gRow}/${gKid}`, () => null)).toBeNull(); // the frame does not resolve
   });
+
+  it('memberAddressOfRowKey addresses the "/" row at the prefab root (scene v20 / prefab v10, #2001 S6)', async () => {
+    // Mutation: drop the "/" branch — the key splits to one empty component and answers null.
+    const { memberAddressOfRowKey } = await getPure();
+    const get = (ref: string) => cachedPrefabs.get(ref) ?? null;
+    expect(memberAddressOfRowKey(host(), '/', get)).toEqual({ path: [], localId: 1 });
+    expect(memberAddressOfRowKey({ ...host(), rootLocalId: 3 }, '/', get)).toEqual({ path: [], localId: 3 });
+  });
+
+  it('templateNodeRowMoves spells a node\'s member-token row parents as the legacy templateMoved (#2001 S6)', async () => {
+    // Mutations: drop the `.`-join (a nested key spells one localId), or the keyed `+<key>` component — each red.
+    const { templateNodeRowMoves } = await getPure();
+    cachedPrefabs.set('Child', child({}));
+    const get = (ref: string) => cachedPrefabs.get(ref) ?? null;
+    const node = { members: {
+      [`/${gRow}`]: { parent: '@member:1' },                          // a member of the node's prefab
+      [`/${gRow}/${gKid}`]: { parent: '@member:2' },                  // a member of a nested frame
+      [`/${gRow}/a+extra`]: { parent: '@member:3' },                  // a keyed node of that frame
+      '/': { parent: '@member:4' },                                   // the frame root moves nowhere
+      [`/${G(7)}`]: { parent: '@member:5' },                          // names no row: left out
+      [`/${gKid}/${gKid}`]: { parent: '@member:6' },                  // not a row of Host: left out
+    } };
+    expect(templateNodeRowMoves(node, host(), get)).toEqual({ 2: '@member:1', '2.2': '@member:2', '2.+extra': '@member:3' });
+    // A guid parent is the scene's own move, never the template's; a row with no parent states no move.
+    expect(templateNodeRowMoves({ members: { [`/${gRow}`]: { parent: G(9) }, [`/${gRow}/${gKid}`]: { traits: {} } } }, host(), get)).toEqual({});
+    expect(templateNodeRowMoves(undefined, host(), get)).toEqual({});
+  });
 });
 
 describe('effectivePrefabMemberTraits — any member, not just the root (#1031 review F1)', () => {
@@ -398,6 +425,25 @@ describe('effectivePrefabRootTraits — what parity cannot see (#1031)', () => {
     get.mockClear();
     expect(effectivePrefabRootTraits(withId, get)).toBeNull();
     expect(get.mock.calls.length, 'with an id: refused on the first re-entry').toBeLessThanOrEqual(1);
+  });
+
+  it('a layer\'s "/" row states the frame\'s ROOT (prefab v10 / scene v20, #2001 S6): its fields land on the root, its removal takes the component', async () => {
+    // What a v10 reference row hands the fold (`prefabInstances`' `rowOptions`): the row's `members`, `"/"` included.
+    // Before the S6 corpus re-save every corpus row stated its root in `overrides[rootLocalId]`, so nothing read this.
+    const { effectivePrefabRootTraits, effectivePrefabMemberTraits } = await getPure();
+    const tile = { id: 'Tile', rootLocalId: 1, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Tile' }, UIElement: { width: 10, height: 10 }, Light: { intensity: 1 } } },
+      { localId: 2, traits: { EntityAttributes: { name: 'Face', parentId: 1 }, UIElement: { width: 5 } } },
+    ] };
+    const members = { '/': { traits: { EntityAttributes: { name: 'Tile7' }, UIElement: { width: 3 } }, traitRemovals: { Light: true } } };
+    const root = effectivePrefabRootTraits(tile, () => null, { members })!;
+    expect((root.EntityAttributes as { name?: string }).name).toBe('Tile7');
+    expect(root.UIElement).toEqual({ width: 3, height: 10 });
+    expect(root.Light).toBeUndefined();
+    // Only the root: the row names no other member.
+    expect(effectivePrefabMemberTraits(tile, 2, () => null, { members })!.UIElement).toEqual({ width: 5 });
+    // And the same root with no layer is the file's own.
+    expect(effectivePrefabRootTraits(tile, () => null)!.UIElement).toEqual({ width: 10, height: 10 });
   });
 
   it('a resolver that throws is an unresolved child, not a crash', async () => {

@@ -209,6 +209,14 @@ export function deriveGuid(seed: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+/** The node identity a PRE-v5 document's row (no `nodeGuid`: v0.7.2 and earlier wrote prefab v4) has in
+ *  memory (design § 2.7, § 10.5). Deterministic in (document, localId); the first editor write of that document
+ *  must mint exactly this value, so a scene's converted keys never orphan. `lid:` is no member-step
+ *  spelling (`parseStep`), so this seed can never equal a derived member guid's. */
+export function preV5NodeGuid(docGuid: string, localId: number): string {
+  return deriveGuid(`${docGuid}|lid:${localId}`);
+}
+
 /** The guid a prefab-instance MEMBER derives on load: `anchor` is the durable guid of its nearest
  *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
  *  ({@link memberStepId}; a keyed added node steps as `'+' + key` — `addedKeyStep`, #1387, which

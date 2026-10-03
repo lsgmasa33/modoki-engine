@@ -31,10 +31,11 @@ boot(be);
 const MOVE = { '2.+k-extra': '@member:2' };
 
 describe('#1883 ruling C: a legacy move of a keyed node is ignored at load and kept by the prefab-edit save', () => {
-  // Mutation: drop `keptMoves` from `savePrefabEditReport`'s `serializePrefab` call — the no-op save writes no `moved`
-  // (L2). And for the edit world: apply every move in `applyEditWorldMoves` (`appliedMoves(prefab.moved)` →
+  // Mutation: drop `keptMoves` from `savePrefabEditReport`'s `serializePrefab` call — the first save (of the v4 `moved`)
+  // writes no record; drop `keepKeyedNodeParents` from `serializePrefabEditWorld` — the second save (of the v10 row)
+  // writes none (both measured, #2001 S6). And for the edit world: apply every move in `applyEditWorldMoves` (`appliedMoves(prefab.moved)` →
   // `prefab.moved`) — Extra shows under OR.
-  it('a no-op prefab-edit save of O writes the move back; the edit world shows the node at its template place', async () => {
+  it('a no-op prefab-edit save of O writes the move back, from a v4 document and from the v10 row it then holds; the edit world shows the node at its template place', async () => {
     const f = await startRun(be, async () => {}, 'keyed-legacy-move');
     const doc = JSON.parse(be.read(f.prefabs.O.path)!) as Record<string, unknown>;
     be.write(f.prefabs.O.path, `${JSON.stringify({ ...doc, moved: MOVE }, null, 2)}\n`);
@@ -46,6 +47,21 @@ describe('#1883 ruling C: a legacy move of a keyed node is ignored at load and k
     expect((await savePrefabEditReport({})).saved).toBe(true);
     await exitPrefabEditing();
     await settle();
-    expect((JSON.parse(be.read(f.prefabs.O.path)!) as { moved?: unknown }).moved).toEqual(MOVE);
+    // Prefab v10 (#2001 S6): the move is a `parent` record on the row of the frame holding the node, its token one frame
+    // up (it was written from the document's root), and the document states no `moved`.
+    const saved = () => JSON.parse(be.read(f.prefabs.O.path)!) as { moved?: unknown; entities: Array<{ localId: number; members?: Record<string, unknown> }> };
+    const kept = () => saved().entities.find((e) => e.localId === 2)!.members?.['/a+k-extra'];
+    expect(saved().moved).toBeUndefined();
+    expect(kept()).toEqual({ parent: '@member:^.2' });
+    // …and the v10 row reads the same way: not shown, and written back by the next save, which captures the live tree
+    // and so cannot restate a record that applies nowhere.
+    expect(await openPrefabForEditing({ path: f.prefabs.O.path, name: 'O' }, { confirmDiscard: async () => true })).toBeFalsy();
+    const again = authored().find((e) => e.name === 'Extra')!;
+    expect(authored().find((e) => e.id === again.parentId)?.name).toBe('A');
+    expect((await savePrefabEditReport({})).saved).toBe(true);
+    await exitPrefabEditing();
+    await settle();
+    expect(saved().moved).toBeUndefined();
+    expect(kept()).toEqual({ parent: '@member:^.2' });
   });
 });

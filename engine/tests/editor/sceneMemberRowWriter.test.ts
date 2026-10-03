@@ -7,6 +7,7 @@
  *  on the row lands on the member it names. The legacy channel is asserted EMPTY where a row carried the
  *  edit, so a writer that wrote both could not pass. */
 
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -138,7 +139,7 @@ beforeEach(() => { setRunMode('stopped'); prefabs.clear(); clearKeptMemberOrphan
 afterAll(() => { getCurrentWorld()?.destroy(); });
 
 describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
-  it('top frame: each channel goes on the row, the root`s own edit stays legacy — and survives a renumber', async () => {
+  it('top frame: each channel goes on the row, the root`s own edit goes on its `/` row — and survives a renumber', async () => {
     install(template());
     await load(scene(P));
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
@@ -148,15 +149,17 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     addChild('A', 'Extra');
 
     const entry = await entryOf();
-    // The root has no row: its edit is the only thing left in `overrides`, under the root's localId.
-    expect(Object.keys(entry.overrides ?? {})).toEqual(['1']);
+    // Scene v20 (#2001 S6): the root's edit is on its own `"/"` row; no legacy channel is written.
+    expect(entry.overrides).toBeUndefined();
+    expect(entry.members!['/']!.traits).toMatchObject({ Transform: { x: 9 } });
     expect(entry.removed).toBeUndefined();
     expect(entry.removedTraits).toBeUndefined();
     expect(entry.added).toBeUndefined();
     expect(entry.members![`/${gA}`]!.traits).toEqual({ Transform: { x: 5 } });
-    expect(entry.members![`/${gA}`]!.added!.map((n) => n.name)).toEqual(['Extra']);
-    expect(entry.members![`/${gB}`]!.removedTraits).toEqual(['Renderable3DPrimitive']);
-    expect(entry.members![`/${gC}`]).toEqual({ removed: true });
+    expect(entry.members![`/${gA}`]!.own!.map((n) => n.name)).toEqual(['Extra']);
+    expect((entry.members![`/${gB}`] as { traitRemovals?: unknown }).traitRemovals).toEqual({ Renderable3DPrimitive: true });
+    // A removed member's row keeps its pin (the guid it had), beside the removal.
+    expect(entry.members![`/${gC}`]).toMatchObject({ removed: true });
 
     install(renumbered());
     await load(scene(P, entry as never));
@@ -179,15 +182,23 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     expect(entry.members![`/${gA}`]!.traits).toEqual({ Transform: { x: 0 } });
   });
 
-  it('a PRE-v5 template`s members have no row, so their edits stay in the legacy channels', async () => {
+  it('a PRE-v5 template`s members are keyed by their derived guid, and their edits go on those rows', async () => {
     install(template([2, 3, 4], false));
     await load(scene(P));
     writeTraitFieldWithUndo(one('A').id, meta('Transform'), 'x', 5);
     deleteEntitiesWithUndo([one('C').id]);
     const entry = await entryOf();
-    expect(entry.overrides?.[2]).toEqual({ Transform: { x: 5 } });
-    expect(entry.removed).toEqual([4]);
-    expect(entry.members).toBeUndefined();
+    // Scene v20 (#2001 S6): one form. A pre-v5 member is keyed by the guid derived from its localId (`preV5NodeGuid`),
+    // and its row states no pin (the live member has no key to pin by).
+    expect(entry.overrides).toBeUndefined();
+    expect(entry.removed).toBeUndefined();
+    expect(Object.keys(entry.members!).sort()).toEqual(['/', `/${preV5NodeGuid(P, 2)}`, `/${preV5NodeGuid(P, 4)}`].sort());
+    expect(entry.members![`/${preV5NodeGuid(P, 2)}`]).toEqual({ traits: { Transform: { x: 5 } } });
+    expect(entry.members![`/${preV5NodeGuid(P, 4)}`]).toEqual({ removed: true });
+    await load(scene(P, entry as never));
+    expect(tf('A')?.x).toBe(5);
+    expect(count('C')).toBe(0);
+    expect(count('B')).toBe(1);
   });
 
   it('nested frame: a nested member`s edit, a removal and an addition at the nested ROOT all go on rows', async () => {
@@ -201,7 +212,7 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     expect(entry.nestedOverrides).toBeUndefined();
     expect(entry.nestedStructure).toBeUndefined();
     expect(entry.members![`/${gN}/${gA}`]!.traits).toEqual({ Transform: { x: 5 } });
-    expect(entry.members![`/${gN}/${gB}`]).toEqual({ removed: true });
+    expect(entry.members![`/${gN}/${gB}`]).toMatchObject({ removed: true });
     // v17 (#1516): the scene's own node is appended (`own`), not a list that replaces the row's.
     expect(entry.members![`/${gN}`]!.own!.map((n) => n.name)).toEqual(['Extra']);
 
@@ -213,7 +224,7 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     expect(parentName('Extra')).toBe('R');
   });
 
-  it('a nested frame whose template is PRE-v5 keeps its structure in the legacy slot, whole', async () => {
+  it('a nested frame whose template is PRE-v5 states its removal on a row keyed by the derived guid', async () => {
     // The outer row N has an identity, so the frame itself is keyable — but the inner template minted
     // none, so a removed inner member has no key. A nested frame's structure goes all-rows or
     // all-legacy (`moveChannelsOntoRows`), and here it must be all legacy.
@@ -221,8 +232,9 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     await load(scene(O));
     deleteEntitiesWithUndo([one('B').id]);
     const entry = await entryOf();
-    expect(entry.nestedStructure?.['3']?.removed).toEqual([3]);
-    expect(Object.values(entry.members ?? {}).some((r) => r.removed)).toBe(false);
+    // Scene v20 (#2001 S6): one form — the removal is a row, keyed through N by the inner member's derived guid.
+    expect(entry.nestedStructure).toBeUndefined();
+    expect(entry.members![`/${gN}/${preV5NodeGuid(P, 3)}`]).toEqual({ removed: true });
     await load(scene(O, entry as never));
     expect(count('B')).toBe(0);
     expect(count('A')).toBe(1);
@@ -237,7 +249,7 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
 
     const entry = await entryOf();
     expect(entry.added).toBeUndefined();
-    const ref = entry.members![`/${gSlot}`]!.added![0]!;
+    const ref = entry.members![`/${gSlot}`]!.own![0]!;
     expect(ref.prefab).toBe(P);
     expect(ref.overrides).toBeUndefined();
     expect(ref.members![`/${gA}`]!.traits).toEqual({ Transform: { x: 5 } });
@@ -270,8 +282,8 @@ describe('the writer puts a member`s edits on its row (#1468 Phase 4)', () => {
     const guidA = one('A').guid;
 
     const entry = await entryOf();
-    const xNode = entry.members![`/${gSlot}`]!.added![0]!;
-    const yNode = xNode.members![`/eeeeeeee-0000-4000-8000-000000000b09`]!.added![0]!;
+    const xNode = entry.members![`/${gSlot}`]!.own![0]!;
+    const yNode = xNode.members![`/eeeeeeee-0000-4000-8000-000000000b09`]!.own![0]!;
     expect(yNode.members![`/${gA}`]).toMatchObject({ guid: guidA, traits: { Transform: { x: 5 } } });
 
     install(renumbered(), outer(true), q);
@@ -453,7 +465,13 @@ describe('a NESTED frame restates each member against the PREFAB baseline (#1468
     // Bytes, not toEqual: toEqual cannot see order. The rows are written in KEY order whatever order the capture found
     // them in (`moveChannelsOntoRows`' sort), so the file does not churn between saves (#1670).
     expect(Object.keys(e1.members!)).toEqual(Object.keys(e1.members!).sort());
-    expect(JSON.stringify(await entryOf())).toBe(JSON.stringify(e1));
+    // Compared from the reload on: this bare loader seeds no instance record, so the save after it captures, and a
+    // capture has no pin for a removed member (the first save's record kept A's from the delete). The editor's load
+    // parses the record from the file, pin and all (`prefabFuzz` holds that round trip).
+    const e2 = strip(await entryOf());
+    expect({ ...e2.members![`/${gN}/${gK}/${gA}`] }).toEqual({ removed: true });
+    await load(scene(O, e2 as never));
+    expect(JSON.stringify(await entryOf())).toBe(JSON.stringify(e2));
   });
 
   it('a node the prefab row ADDED and the scene deleted stays deleted', async () => {

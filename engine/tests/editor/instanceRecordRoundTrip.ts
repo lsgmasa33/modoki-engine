@@ -41,8 +41,9 @@ export function toV10Row(row: object, fields: Record<string, unknown>): Record<s
  *  what no row could take (`docHeld`). An instance must fold the same against these as against the originals: P2 parses
  *  against the originals only, so this is what proves the chain reads the writer's own rows. `stats.converted` counts
  *  the rows that stated a legacy channel and no longer do: without it, a conversion that did nothing would compare each
- *  original with itself and pass (#2008 review round 3). */
-export function toV10Docs(docs: ReadonlyMap<string, PrefabDoc>, read: PrefabReader, stats?: { converted: number }): Map<string, PrefabDoc> {
+ *  original with itself and pass (#2008 review round 3). `stats.native` (when given) counts the rows a file already
+ *  states on `members` and in no legacy channel: those ARE the writer's rows, read as the file has them. */
+export function toV10Docs(docs: ReadonlyMap<string, PrefabDoc>, read: PrefabReader, stats?: { converted: number; native?: number }): Map<string, PrefabDoc> {
   const out = new Map<string, PrefabDoc>();
   for (const [guid, doc] of docs) {
     const { rows, docHeld } = parseTemplateLists(doc, guid, read);
@@ -53,6 +54,8 @@ export function toV10Docs(docs: ReadonlyMap<string, PrefabDoc>, read: PrefabRead
       const row = toV10Row(r, serializeTemplateOwner(t.list).fields);
       const legacy = (o: object) => LEGACY_ROW_CHANNELS.some((k) => k !== 'members' && k in o);
       if (stats && legacy(r) && !legacy(row)) stats.converted++;
+      // A row its file already states in the v10 form (the corpus since the S6 re-save): the writer's own rows, read as they are.
+      else if (stats && stats.native !== undefined && !legacy(r) && 'members' in r) stats.native++;
       return row as unknown as PrefabDocRow;
     });
     out.set(guid, { ...rest, ...serializeTemplateDocHeld(docHeld), entities });

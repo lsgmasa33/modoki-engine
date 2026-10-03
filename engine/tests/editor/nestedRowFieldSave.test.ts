@@ -21,6 +21,8 @@
  *  Driven through the real loader, the real capture and the real Apply. Each case names the mutation that turns
  *  it red. */
 
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { statedBeyondRoot } from './v10Rows';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -315,6 +317,43 @@ describe('a refresh under a user-added reference node (#1498 design)', () => {
   });
 });
 
+describe('#2001 S6: Apply onto a prefab v10 row that already states the field', () => {
+  // The Apply's writer still puts a value in the row's legacy channel (`overrides[<localId>]`), and the conversion to the
+  // v10 form reads legacy channels first and ROWS OVER them: unhandled, the row's old statement would win and the applied
+  // value would be lost. Both a member's row and the nested ROOT's (`"/"`), each applied twice: the first Apply turns
+  // the hand-written v9 fixture into a v10 file, the second lands on the row that first one wrote.
+  const lastO = () => writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === O).pop()!;
+  // Mutations (each measured, one case red each): `memberKeyAt` answering null for the frame root where the slot's row
+  // expands the frame (the v9 rule) — the nested-root case keeps 5 at the second Apply; `rowIdentity` without the derived
+  // identity — the no-node-ids case does.
+  const preV5P = () => { const d = pDoc(); return { ...d, version: 4, entities: d.entities.map(({ nodeGuid: _g, ...e }) => e) }; };
+  for (const [who, lid, rowKey, p] of [
+    ['a member', 2, `/${gA}`, pDoc], ['the nested root', 1, '/', pDoc],
+    ['a member of a prefab with no node ids', 2, `/${preV5NodeGuid(P, 2)}`, preV5P],
+  ] as const) {
+    it(`${who}: the applied value replaces the row's, and every instance shows it`, async () => {
+      const name = lid === 1 ? 'R' : 'A';
+      install(p(), oWith({ [lid]: { Transform: { x: 3 } } }));
+      await load(scene(O, [ROOT1, ROOT2]));
+      for (const v of [5, 9]) {
+        setTf(inInstance(ROOT1, name), 'x', v);
+        // Listed on the nested instance, and sent to the ENCLOSING prefab (O), whose row N it lands on.
+        const nested = inInstance(ROOT1, 'R');
+        const keys = collectInstanceOverrideKeys(nested, getCachedPrefabSync(P) as PrefabFile).fields.filter((k) => k.endsWith('.Transform.x'));
+        expect(keys.length, `premise: one field to apply (${v})`).toBe(1);
+        const res = await applyToPrefabSelective(nested, new Set(keys), { perKey: { [keys[0]!]: O } });
+        expect([res.applied, res.targets]).toEqual([true, [{ key: keys[0], target: O }]]);
+        const row = lastO().entities.find((e) => e.localId === 4) as unknown as { overrides?: unknown; members?: Record<string, { traits?: Record<string, Record<string, unknown>> }> };
+        expect(row.overrides, 'the row is in the v10 form').toBeUndefined();
+        expect(row.members?.[rowKey]?.traits?.Transform?.x).toBe(v);
+        install(lastO());
+        await load((await saved()).scene);
+        expect([x(inInstance(ROOT1, name)), x(inInstance(ROOT2, name))]).toEqual([v, v]);
+      }
+    });
+  }
+});
+
 describe('Apply from a nested instance whose field the outer row also sets (#1492; U13 supersedes ruling b, #1693)', () => {
   const nestedRoot = () => inInstance(ROOT1, 'R');
   const keysOf = (root: number) => collectInstanceOverrideKeys(root, getCachedPrefabSync(P) as PrefabFile).fields;
@@ -344,7 +383,8 @@ describe('Apply from a nested instance whose field the outer row also sets (#149
     // U13's drop in `planApply` — O keeps its row's 3, ROOT2 still shows 3, and O is not written.
     await applyBoth();
     const oWritten = writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === O).pop();
-    expect(oWritten?.entities.find((e) => e.localId === 4)?.overrides?.[2]?.Transform).toBeUndefined();
+    expect(oWritten).toBeDefined();
+    expect(statedBeyondRoot(oWritten!.entities.find((e) => e.localId === 4)).filter((s) => s.endsWith(':Transform'))).toEqual([]);
     expect([x(inInstance(ROOT1, 'A')), x(inInstance(ROOT2, 'A'))]).toEqual([5, 5]);
     expect(keysOf(nestedRoot())).toEqual([]);
     await reload();
@@ -894,7 +934,11 @@ describe('a save leaves what a TEMPLATE row authors inside its nested frame to t
       await load(scene(O, [ROOT1]));
       setTf(inInstance(ROOT1, 'XA'), 'x', 5); // an edit, so the save restates the node with rows for XA and XB
       await reloadUnder(p4NoXb()); // the template drops XB: its row is an orphan now
-      setTf(inInstance(ROOT1, 'XA'), 'x', 3); // back to the node's value
+      // The edit REVERTED (back to the node's value). Typed back by hand it stays an override since #2001 S6 (the save
+      // writes the list, and an override equal to its base is still one, as in Unity), and 7 would rightly not arrive.
+      const xaRoot = (readTraitData(inInstance(ROOT1, 'XA'), meta('PrefabInstance')) as { rootInstanceId: number }).rootInstanceId;
+      await revertOverridesSelective(xaRoot, new Set([`${gXA4}.Transform.x`]));
+      expect(x(inInstance(ROOT1, 'XA'))).toBe(3);
       await reloadUnder(p4NoXb(), withX(7));
       expect(x(inInstance(ROOT1, 'XA'))).toBe(7);
     });

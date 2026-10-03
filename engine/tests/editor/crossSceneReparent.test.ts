@@ -364,11 +364,14 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       const live = getCurrentWorld().entities.find((e) => e.id() === coin)!;
       expect(attrs(coin)).toMatchObject({ parentId: slot, sourceScene: BASE });
       expect(live.has(PrefabInstance)).toBe(true);
-      const base = (await serializeScene({ scene: BASE_FILE })).entities as Array<{ name?: string; added?: Array<{ name?: string; prefab?: string; guid?: string }> }>;
-      const kitAdded = base.find((e) => e.name === 'Kit')?.added ?? [];
+      // Scene v20 (#2001 S6): a node the scene added is inline on its anchor's row (`own`), and a reference node's own
+      // root records are on its `"/"` row.
+      type Own = { name?: string; prefab?: string; guid?: string; members?: Record<string, { traits?: { Transform?: { x?: number } } }> };
+      const base = (await serializeScene({ scene: BASE_FILE })).entities as Array<{ name?: string; members?: Record<string, { own?: Own[] }> }>;
+      const kitAdded = Object.values(base.find((e) => e.name === 'Kit')?.members ?? {}).flatMap((r) => r.own ?? []);
       // The document's guid, never the path it was placed from (I22, #1828).
       expect(kitAdded).toEqual([expect.objectContaining({ prefab: 'c1436000-0000-4000-8000-000000000001', guid: attrs(coin).guid })]);
-      expect((kitAdded[0] as { overrides?: Record<string, { Transform?: { x?: number } }> }).overrides?.['1']?.Transform?.x).toBeCloseTo(-10);
+      expect(kitAdded[0]!.members?.['/']?.traits?.Transform?.x).toBeCloseTo(-10);
       expect(await namesIn()).not.toContain(attrs(coin).guid);
       // Undo puts the coin's marks back as they were. Mutation: drop `restoreMarks` in moveEntityToScene's undo.
       const marks = () => [...(getOverrideMarkSet(getCurrentWorld().entities.find((e) => e.id() === coin)!) ?? [])];
@@ -389,19 +392,23 @@ describe('a CREATE under a base entity is born in that base (#1429, owner option
       id: 'c1709000-0000-4000-8000-000000000001', version: 2, name: 'Coin', rootLocalId: 1,
       entities: [{ localId: 1, name: 'Coin', traits: { EntityAttributes: { name: 'Coin', parentId: 0 }, Transform: {} } }],
     } as never);
-    type Entry = { name?: string; guid?: string; overrides?: Record<string, { EntityAttributes?: { sortOrder?: number } }>; added?: Entry[] };
+    // Scene v20 (#2001 S6): an inline reference node states its sibling order on its `"/"` row; a top-level entry, as
+    // placement on its own traits.
+    type Own = { guid?: string; members?: Record<string, { traits?: { EntityAttributes?: { sortOrder?: number } } }> };
+    type Entry = { name?: string; guid?: string; traits?: { EntityAttributes?: { sortOrder?: number } }; members?: Record<string, { own?: Own[] }> };
+    const ownOf = (e: Entry | undefined) => Object.values(e?.members ?? {}).flatMap((r) => r.own ?? []);
     try {
       const { rootId: moved } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
       await runAgentOp('reparent-entity', { guid: attrs(moved).guid, parentGuid: attrs(slot).guid, sortOrder: 7, moveToScene: true });
       const base = (await serializeScene({ scene: BASE_FILE })).entities as Entry[];
-      const kitAdded = base.find((e) => e.name === 'Kit')?.added ?? [];
-      expect(kitAdded.find((n) => n.guid === attrs(moved).guid)?.overrides?.['1']?.EntityAttributes?.sortOrder).toBe(7);
+      const kitAdded = ownOf(base.find((e) => e.name === 'Kit'));
+      expect(kitAdded.find((n) => n.guid === attrs(moved).guid)?.members?.['/']?.traits?.EntityAttributes?.sortOrder).toBe(7);
 
       const holder = spawn('Holder');
       const { rootId: kept } = await runAgentOp('prefab', { action: 'instantiate', path: COIN }) as { rootId: number };
       await runAgentOp('reparent-entity', { guid: attrs(kept).guid, parentGuid: guidOf(holder), sortOrder: 7 });
       const primary = (await serializeScene()).entities as Entry[];
-      expect(primary.find((e) => e.guid === attrs(kept).guid)?.overrides?.['1']?.EntityAttributes?.sortOrder).toBe(7);
+      expect(primary.find((e) => e.guid === attrs(kept).guid)?.traits?.EntityAttributes?.sortOrder).toBe(7);
     } finally { setPrefabCache(COIN, null); }
   });
 

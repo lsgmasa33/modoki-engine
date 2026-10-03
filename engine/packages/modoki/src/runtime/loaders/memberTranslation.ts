@@ -20,10 +20,12 @@
  *  Pure: no cache, no trait registry. `prefabOverrides.ts` imports it, and that module must stay free
  *  of anything that registers a trait at import time. */
 
-import { isGuid } from '../core/assetRefRules';
+import { isGuid, preV5NodeGuid } from '../core/assetRefRules';
 
 /** What this module reads of a prefab document. */
 export interface MemberDoc {
+  /** The document's own guid: what a pre-v5 row's derived identity is keyed from ({@link docRows}). */
+  id?: string;
   entities?: ReadonlyArray<{ localId?: number; nodeGuid?: string; prefab?: string }>;
   rootLocalId?: number;
 }
@@ -33,14 +35,19 @@ export type MemberDocReader = (prefabRef: string) => MemberDoc | null | undefine
  *  a child prefab) other than the document's own root. */
 export interface MemberRowAt { localId: number; prefab?: string; nested: boolean }
 
-/** `nodeGuid` → the row of `doc` carrying it. Only rows with a real identity (a guid) are indexed: a
- *  pre-v5 row has none, and a number is not a name. */
+/** Row identity → the row of `doc` carrying it: its `nodeGuid`, or for a PRE-v5 row (none) the identity the instance
+ *  model derives for it from the document's guid and the row's localId (`preV5NodeGuid`), which is what a scene v20
+ *  entry and a prefab v10 row key such a member by (#2001 S6). Without it a row stated about a pre-v5 member named
+ *  nothing here, and the nodes it added were taken for the scene's own and saved a second time. A pre-v5 document with
+ *  no `id` indexes nothing for those rows: a number is not a name. */
 export function docRows(doc: MemberDoc | null | undefined): Map<string, MemberRowAt> {
   const out = new Map<string, MemberRowAt>();
   const rootLocalId = doc?.rootLocalId ?? 1;
   for (const pe of doc?.entities ?? []) {
-    if (!pe.nodeGuid || !pe.localId || !isGuid(pe.nodeGuid)) continue;
-    out.set(pe.nodeGuid, { localId: pe.localId, ...(pe.prefab ? { prefab: pe.prefab } : {}), nested: !!pe.prefab && pe.localId !== rootLocalId });
+    if (!pe.localId) continue;
+    const identity = pe.nodeGuid && isGuid(pe.nodeGuid) ? pe.nodeGuid : !pe.nodeGuid && doc?.id ? preV5NodeGuid(doc.id, pe.localId) : '';
+    if (!identity) continue;
+    out.set(identity, { localId: pe.localId, ...(pe.prefab ? { prefab: pe.prefab } : {}), nested: !!pe.prefab && pe.localId !== rootLocalId });
   }
   return out;
 }

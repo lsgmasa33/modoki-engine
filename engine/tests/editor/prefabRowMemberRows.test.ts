@@ -9,6 +9,7 @@
  *  Driven through the real prefab-edit scene builder, the real save, and both loaders. Each case names the mutation
  *  that turns it red. */
 
+import { v9Channels } from './v10Rows';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { setRunMode as setRunModeForAuthoring } from '../../packages/modoki/src/runtime/core/playState';
 import { createWorld } from 'koota';
@@ -168,7 +169,7 @@ describe('an outer prefab\'s edit in a nested frame does not pin what the inner 
     expect(named('Leaf')).toHaveLength(0); // precondition: MID removed Leaf
     addExtra();
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedStructure).toBeUndefined();
+    expect(v9Channels(midRowOf(saved))).toEqual([]);
     expect(Object.values(midRowOf(saved).members ?? {}).some((r) => r.removed !== undefined)).toBe(false);
     install(midDoc());
     await eachExpansion(saved, (where) => {
@@ -185,7 +186,7 @@ describe('an outer prefab\'s edit in a nested frame does not pin what the inner 
     const root = await openInEditor(outerDoc() as PrefabFile);
     writeTraitFieldWithUndo(named('N1')[0]!.id, getTraitByName('Transform')!, 'y', 5);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedStructure).toBeUndefined();
+    expect(v9Channels(midRowOf(saved))).toEqual([]);
     expect(midRowOf(saved).members).toEqual({ [`/${G_MID_NESTED}/a+${K1}`]: { traits: { Transform: { y: 5 } } } });
     install(midDoc({ added: [n(K1, 'N1', 9), n(K2, 'N2', 7)] }));
     await eachExpansion(saved, (where) => {
@@ -202,7 +203,7 @@ describe('an outer prefab\'s edit in a nested frame does not pin what the inner 
     expect(traitOf(leaf, 'UIAction')).toBeUndefined(); // precondition
     removeTraitFromEntitiesWithUndo([leaf], getTraitByName('UIFocusable')!);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedStructure).toBeUndefined();
+    expect(v9Channels(midRowOf(saved))).toEqual([]);
     expect(midRowOf(saved).members).toEqual({ [`/${G_MID_NESTED}/${G_LEAF}`]: { traitRemovals: { UIFocusable: true } } });
     install(midDoc());
     await eachExpansion(saved, (where) => {
@@ -218,7 +219,7 @@ describe('an outer prefab\'s edit in a nested frame does not pin what the inner 
     const root = await openInEditor(outerDoc() as PrefabFile);
     const saved = midRowOf(serializePrefab(root, OUTER)!);
     expect(saved.members).toBeUndefined();
-    expect(saved.nestedStructure).toBeUndefined();
+    expect(v9Channels(saved)).toEqual([]);
   });
 
   // Mutation: drop the `members` forward in `buildPrefabEditScene` — the edit world shows Leaf again, and the re-save
@@ -245,8 +246,13 @@ describe('a scene over a prefab row\'s rows (#1533)', () => {
     await load(sceneWith());
     expect(named('Leaf')).toHaveLength(0);
     const entry = (await serializeScene()).entities.find((e) => (e as { prefab?: string }).prefab === OUTER) as unknown as Record<string, unknown>;
-    // A scene row always states its member's identity (`guid`, `name`, v16); nothing structural may ride with it.
-    const rows = Object.values((entry.members ?? {}) as Record<string, Record<string, unknown>>);
+    // A scene row always states its member's identity (`guid`, `name`, v16); nothing structural may ride with it. The
+    // `"/"` row (scene v20, #2001 S6) states the root's name, always, and nothing else here.
+    const members = (entry.members ?? {}) as Record<string, Record<string, unknown>>;
+    expect(Object.keys(members['/'] ?? {})).toEqual(['traits']);
+    expect(Object.keys((members['/']!.traits as Record<string, unknown>))).toEqual(['EntityAttributes']);
+    const rows = Object.entries(members).filter(([k]) => k !== '/').map(([, r]) => r);
+    expect(rows.length).toBeGreaterThan(0);
     expect(rows.flatMap((r) => Object.keys(r).filter((k) => k !== 'guid' && k !== 'name'))).toEqual([]);
     expect(entry.nestedStructure).toBeUndefined();
   });

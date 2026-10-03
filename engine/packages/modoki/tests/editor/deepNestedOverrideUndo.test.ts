@@ -159,10 +159,13 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
       undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(index.get(a)); },
     });
 
-    // After the edit: deep override serializes onto D's path "2.2".
+    // After the edit: the deep override is the row keyed by D's B-row then B's A-row (scene v20; pre-v5 documents, so each
+    // component is the derived node guid).
+    const { preV5NodeGuid } = await import('../../src/runtime/loaders/frameChain');
+    const deepKey = `/${preV5NodeGuid(D, 2)}/${preV5NodeGuid(B, 2)}`;
     let scene = await serializeScene();
     let top = scene.entities.find((e) => e.prefab === D)!;
-    expect(top.nestedOverrides).toEqual({ '2.2': { 1: { Transform: { x: 7 } } } });
+    expect((top.members as any)[deepKey]).toEqual({ traits: { Transform: { x: 7 } } });
 
     // UNDO (awaited — undoManager is async): member back to base, no deep override.
     const undone = await undo();
@@ -170,7 +173,8 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
     expect((index.get(a)!.get(Transform) as any).x).toBe(0);
     scene = await serializeScene();
     top = scene.entities.find((e) => e.prefab === D)!;
-    expect(top.nestedOverrides ?? {}).toEqual({});
+    expect((top.members as any)[deepKey]).toBeUndefined();
+    expect(top.nestedOverrides).toBeUndefined();
 
     // REDO: the deep override returns exactly.
     const redone = await redo();
@@ -178,6 +182,6 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
     expect((index.get(a)!.get(Transform) as any).x).toBe(7);
     scene = await serializeScene();
     top = scene.entities.find((e) => e.prefab === D)!;
-    expect(top.nestedOverrides).toEqual({ '2.2': { 1: { Transform: { x: 7 } } } });
+    expect((top.members as any)[deepKey]).toEqual({ traits: { Transform: { x: 7 } } });
   });
 });

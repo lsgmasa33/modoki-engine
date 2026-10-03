@@ -12,6 +12,7 @@
  *  and asserts the second save writes the control's record. Then the prefab comes back and the reload shows the edits.
  *  Driven through the real loader and the real `serializeScene`. Each case names the mutation that turns it red. */
 
+import { ownNodes } from './v10Rows';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -124,6 +125,7 @@ async function loadInto(data: SceneData): Promise<void> {
     onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure, load) => {
       const id = instantiatePrefabIntoWorld(
         getCurrentWorld(), (prefabs.get(source) ?? load?.read(source)) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
+        { frame: load?.frame, sceneVersion: load?.sceneVersion },
       );
       if (id && rootGuid) {
         for (const e of getCurrentWorld().entities) {
@@ -156,6 +158,20 @@ const save = async () => JSON.parse(JSON.stringify(await serializeScene())) as S
  *  re-emit that reorders a node's keys churned every no-edit save of the file (#1722). */
 const expectSameBytes = (got: unknown, want: unknown) => expect(JSON.stringify(got)).toBe(JSON.stringify(want));
 const entryOf = (s: SceneData, guid: string) => (s.entities as unknown as Array<Record<string, unknown>>).find((e) => e.guid === guid);
+type Rows = Record<string, { guid?: string; name?: string; traits?: Record<string, Record<string, unknown>> } & Record<string, unknown>>;
+const rowsOf = (entry: Record<string, unknown>) => (entry.members ?? {}) as Rows;
+/** What a scene v20 entry states of its root's `EntityAttributes` (#2001 S6): the placement on the entry's own traits (its
+ *  order; `parentId` left out), and the other fields on the `/` row (the name left out: that row states it always). */
+const rootEa = (entry: Record<string, unknown>): Record<string, unknown> => {
+  const { parentId: _p, ...placed } = ((entry.traits as Record<string, Record<string, unknown>> | undefined)?.EntityAttributes ?? {});
+  const { name: _n, ...row } = (rowsOf(entry)['/']?.traits?.EntityAttributes ?? {});
+  return { ...row, ...placed };
+};
+/** The `EntityAttributes` fields the `/` row states beside the name. */
+const rootRowEa = (entry: Record<string, unknown>): Record<string, unknown> => {
+  const { name: _n, ...row } = (rowsOf(entry)['/']?.traits?.EntityAttributes ?? {});
+  return row;
+};
 
 /** Holder → a scene instance of `prefab` (guid INST). */
 const scene = (prefab: string, extra: unknown[] = []): SceneData => ({
@@ -348,14 +364,14 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
     const saved = await save();
     expect(entryOf(saved, INST)).toEqual(entry);
     const copy = entryOf(saved, copyGuid)!;
-    // The same overrides but the copy's own place: F7's root order (#1914 R6), which the duplicate's position sets.
-    const sansOrder = (ov: unknown) => JSON.parse(JSON.stringify(ov ?? {}), (k, v) => (k === 'sortOrder' ? undefined : v)) as unknown;
-    expect(sansOrder(copy.overrides)).toEqual(sansOrder(entry.overrides));
-    const pinOf = (e: Record<string, unknown>) => Object.values(e.members as Record<string, { guid?: string; traits?: unknown }>)[0]!;
+    // The same records but the copy's own place: the root's order is the entry's placement, which the duplicate's position sets.
+    expect(rowsOf(copy)['/']).toEqual(rowsOf(entry)['/']);
+    expect(rootEa(copy).sortOrder).not.toBe(rootEa(entry).sortOrder);
+    const pinOf = (e: Record<string, unknown>) => rowsOf(e)[`/${gA}`]!;
     expect(pinOf(copy).traits).toEqual(pinOf(entry).traits);
     expect(pinOf(copy).guid).toBeTruthy();
     expect(pinOf(copy).guid).not.toBe(pinOf(entry).guid);
-    expect((copy.traits as { PrefabInstance: { rootInstanceId: string } }).PrefabInstance.rootInstanceId).toBe(copyGuid);
+    expect(copy.prefab).toBe(P);
 
     install(pDoc());
     await load(saved);
@@ -365,7 +381,9 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
   });
 
   it('a duplicate\'s refs between its record and the entities copied with it follow the copy, both ways (#1763)', async () => {
-    // Member A (in the record) targets Kid, a plain child of the placeholder; Kid targets A's pinned guid. Mutations:
+    // Member A (in the record) targets Kid, a plain child of the placeholder; Kid targets A's pinned guid. It is also the
+    // test of the save's own rule that a guid inside a component's VALUE states no node (#2001 S6, `consumedBy` in
+    // `instanceSave.ts`): read as a statement, Kid was written nowhere and one Kid of two reloaded (measured). Mutations:
     // `copyUnresolvedRef` given only the record's own mints (the pre-fix remap) — the copy's A still drives the original
     // Kid; the trait loop given `planCopyGuids`' `remap` — the copy's Kid still drives the original's A.
     const KID = 'dddddddd-0000-4000-8000-000000001607';
@@ -376,7 +394,7 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
     writeTraitFieldWithUndo(inside(INST, 'A'), meta('Transform'), 'x', 5);
     const control = await save();
     const entry = entryOf(control, INST)! as { members: Record<string, { guid: string; traits: Record<string, unknown> }> };
-    const pinA = Object.values(entry.members)[0]!;
+    const pinA = entry.members[`/${gA}`]!;
     pinA.traits.UIAction = UIA(KID);
     (control.entities as unknown[]).push({ id: 99, traits: { EntityAttributes: { name: 'Kid', parentId: INST, guid: KID }, UIAction: UIA(pinA.guid) } });
     uninstall(P);
@@ -429,25 +447,24 @@ describe('the placeholder\'s lifecycle (#1699)', () => {
     reparentEntity(rootOf(INST), 0);
     const saved = entryOf(await save(), INST)!;
     expect(saved.name).toBe('Renamed');
-    expect((saved.traits as Record<string, unknown>).EntityAttributes).toBeUndefined();
-    expect({ ...saved, name: entry.name, traits: entry.traits }).toEqual(entry);
+    expect(rowsOf(saved)['/']!.traits!.EntityAttributes).toEqual({ name: 'Renamed' });
+    expect((saved.traits as Record<string, unknown>).EntityAttributes, 'the top level: no parent stated').toEqual({ sortOrder: 0 });
+    const rootRow = { ...rowsOf(saved)['/'], traits: { ...rowsOf(saved)['/']!.traits, EntityAttributes: { name: entry.name } } };
+    expect({ ...saved, name: entry.name, traits: entry.traits, members: { ...rowsOf(saved), '/': rootRow } }).toEqual(entry);
   });
 });
 
 describe('a placeholder takes the sibling position its entry states as a ROOT override (#1850)', () => {
   const sortOrder = (id: number) => (readTraitData(id, meta('EntityAttributes')) as { sortOrder: number }).sortOrder;
-  const rootOverride = (entry: Record<string, unknown>) => {
-    const lid = ((entry.traits as Record<string, unknown>).PrefabInstance as { localId: number }).localId;
-    return (entry.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[lid]?.EntityAttributes;
-  };
+  const rootOverride = rootEa;
   async function reorderedThenMissing() {
     install(pDoc());
     await load(scene(P));
     writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 3);
     const control = await save();
     const entry = entryOf(control, INST)!;
-    expect(rootOverride(entry)?.sortOrder).toBe(3); // precondition: a live instance's save states it as a root override
-    expect(((entry.traits as Record<string, unknown>).EntityAttributes as Record<string, unknown>).sortOrder).toBeUndefined();
+    expect(rootOverride(entry)?.sortOrder).toBe(3); // precondition: a live instance's save states its root's order
+    expect(rootRowEa(entry).sortOrder, 'in one home: the entry\'s placement, not the / row').toBeUndefined();
     uninstall(P);
     await load(control);
     clearHistory();
@@ -469,7 +486,7 @@ describe('a placeholder takes the sibling position its entry states as a ROOT ov
     const saved = await save();
     const entry = entryOf(saved, INST)!;
     expect(rootOverride(entry)?.sortOrder).toBe(5);
-    expect(((entry.traits as Record<string, unknown>).EntityAttributes as Record<string, unknown> | undefined)?.sortOrder).toBeUndefined();
+    expect(rootRowEa(entry).sortOrder).toBeUndefined();
     install(pDoc());
     await load(saved);
     expect(sortOrder(rootOf(INST))).toBe(5);
@@ -498,10 +515,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
   const SIB = 'dddddddd-0000-4000-8000-000000001895';
   const ea = (id: number) => readTraitData(id, meta('EntityAttributes')) as { sortOrder: number; isActive: boolean };
   const traitsEa = (entry: Record<string, unknown>) => (entry.traits as Record<string, unknown>).EntityAttributes as Record<string, unknown> | undefined;
-  const rootOverrideEa = (entry: Record<string, unknown>) => {
-    const lid = ((entry.traits as Record<string, unknown>).PrefabInstance as { localId: number }).localId;
-    return (entry.overrides as Record<number, Record<string, Record<string, unknown>>> | undefined)?.[lid]?.EntityAttributes;
-  };
+  const rootOverrideEa = rootEa;
   /** P whose ROOT row states `fields` (a Create Prefab copies the entity's `EntityAttributes` into it, #1895's route). */
   const pWith = (fields: Record<string, unknown>) => {
     const d = pDoc();
@@ -538,8 +552,9 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
       await liveThenTrashed({ sortOrder: 3 });
       expect(ea(rootOf(INST)).sortOrder).toBe(3); // precondition: from the template
       const first = await save();
-      expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
-      expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
+      // Scene v20: the root's order is the entry's placement, its one home (not the `/` row).
+      expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER, sortOrder: 3 });
+      expect(rootRowEa(entryOf(first, INST)!)).toEqual({});
       await load(asLoaded(first));
       expect(expanded()).toBe(isExpanded);
       expect(ea(rootOf(INST)).sortOrder).toBe(3);
@@ -551,7 +566,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
       // placeholder reloads active.
       await liveThenTrashed({ isActive: false });
       const first = await save();
-      expect(traitsEa(entryOf(first, INST)!)).toEqual({ isActive: false, parentId: HOLDER });
+      expect(traitsEa(entryOf(first, INST)!)).toEqual({ isActive: false, parentId: HOLDER, sortOrder: 0 });
       await load(asLoaded(first));
       expect(expanded()).toBe(isExpanded);
       expect(ea(rootOf(INST)).isActive).toBe(false);
@@ -580,8 +595,8 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     writeTraitFieldWithUndo(rootOf(INST), meta('EntityAttributes'), 'sortOrder', 3); // a marked reorder: an override
     uninstall(P);
     const first = await save();
-    expect(rootOverrideEa(entryOf(first, INST)!)?.sortOrder).toBe(3);
-    expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER });
+    expect(traitsEa(entryOf(first, INST)!)).toEqual({ parentId: HOLDER, sortOrder: 3 });
+    expect(rootRowEa(entryOf(first, INST)!)).toEqual({});
     await load(beforeTopCopies(first)); // the placeholder's placement is what is asked
     expect(entitiesText(await save())).toBe(entitiesText(first));
   });
@@ -626,8 +641,9 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     clearHistory();
     uninstall(Q);
   };
-  const addedUnderA = (sc: SceneData) => Object.values(entryOf(sc, INST)!.members as Record<string, { added?: Array<{ guid: string; traits?: Record<string, unknown> }> }>)
-    .flatMap((m) => m.added ?? []);
+  /** The nodes the scene hung under A: a v20 row's `own` links. */
+  const addedUnderA = (sc: SceneData) => Object.values(entryOf(sc, INST)!.members as Record<string, { own?: Array<{ guid: string; traits?: Record<string, unknown> }> }>)
+    .flatMap((m) => m.own ?? []);
 
   it('a scene-added reference NODE of a trashed prefab keeps its place: save → reload → save writes the same bytes (#1897)', async () => {
     // Mutation: `spawnUnresolvedReference` seats nothing — the placeholder reloads at 0, and A's added list reads [QR, Sib]
@@ -636,7 +652,7 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     const first = await save();
     const node = addedUnderA(first).find((n) => n.guid === QINST)!;
     expect(node.traits).toEqual({ EntityAttributes: { sortOrder: 2 } });
-    expect(addedUnderA(first).map((n) => n.guid)).toEqual([SIB, QINST]);
+    expect(addedUnderA(first).map((n) => n.guid).sort()).toEqual([SIB, QINST].sort());
     await load(first);
     expect(ea(rootOf(QINST)).sortOrder).toBe(2);
     expect(entitiesText(await save())).toBe(entitiesText(first));
@@ -706,11 +722,8 @@ describe('a live instance of a TRASHED prefab keeps its place across save → re
     const first = await save();
     expect(addedUnderA(first).find((n) => n.guid === QINST)!.traits).toEqual({});
     await nodeUnderA({ sortOrder: 2 });
-    // A node that was a placeholder at the save reloads as one (#1939): the list names no live frame of Q.
-    const sc = await save() as SceneData & { embeddedPrefabFrames?: Record<string, string[]> };
-    expect(sc.embeddedPrefabFrames![Q]).toEqual([QINST]);
-    sc.embeddedPrefabFrames![Q] = [];
-    await load(sc);
+    // A node of a missing prefab reloads as its placeholder (ruling B, #2028).
+    await load(await save());
     // #1901 (owner ruling, shape 2): the node shape keeps both now, so the gate lets them through.
     expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'sortOrder')).toBeNull();
     expect(placeholderWriteRefusal(rootOf(QINST), 'EntityAttributes', 'isActive')).toBeNull();
@@ -803,8 +816,8 @@ describe('a Missing Prefab placeholder that lands inside an instance reloads as 
     writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'sortOrder', 0);
     writeTraitFieldWithUndo(idOf(QINST), meta('EntityAttributes'), 'isActive', true);
     expect(reparentEntity(idOf(QINST), inside(INST, 'A'))).toBe(true);
-    const node = (entryOf(await save(), INST)!.members as Record<string, { added?: Array<{ guid: string; traits?: unknown }> }>)[`/${gA}`]!
-      .added!.find((n) => n.guid === QINST)!;
+    const node = (entryOf(await save(), INST)!.members as Record<string, { own?: Array<{ guid: string; traits?: unknown }> }>)[`/${gA}`]!
+      .own!.find((n) => n.guid === QINST)!;
     expect(node.traits).toEqual({});
   });
 
@@ -1209,7 +1222,9 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
     expect(getAllEntities().filter((e) => e.name === 'VExtra')).toEqual([]);
     expect(getAllEntities().find((e) => e.guid === INST)?.missingPrefab).toBe(true);
     const s1 = await save();
-    expect(entryOf(s1, INST)).toMatchObject({ prefab: V, overrides: { 2: { Transform: { x: 5 } } } });
+    // Scene v20: the record of V's row 2 is the row keyed by that row's node guid (V loads, so the key can be formed).
+    expect(entryOf(s1, INST)).toMatchObject({ prefab: V, members: { '/eeeeeeee-0000-4000-8000-000000001763': { traits: { Transform: { x: 5 } } } } });
+    expect(entryOf(s1, INST)!.overrides).toBeUndefined();
     await load(s1);
     expectSameBytes(entryOf(await save(), INST), entryOf(s1, INST));
   });
@@ -1221,7 +1236,7 @@ describe('a scene entry whose prefab loads but expands to no root keeps its entr
     await load(scene(P, [{ id: 3, prefab: Q, guid: QINST, traits: { EntityAttributes: { name: 'QInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
     reparentEntity(rootOf(QINST), inside(INST, 'A'));
     const control = JSON.parse(JSON.stringify(await save()).split(Q).join(V)) as SceneData;
-    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { added?: unknown[] }>)[`/${gA}`]!.added;
+    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { own?: unknown[] }>)[`/${gA}`]!.own;
     expect(JSON.stringify(nodeOf(control))).toContain(V); // precondition: the node now references V
     uninstall(Q);
     install(vDoc());
@@ -1377,7 +1392,7 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
     await load(scene(P, [{ id: 3, prefab: T, guid: QINST, traits: { EntityAttributes: { name: 'TInst', parentId: 'dddddddd-0000-4000-8000-000000001600' } } }]));
     reparentEntity(rootOf(QINST), inside(INST, 'A'));
     const control = await save();
-    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { added?: Array<Record<string, unknown>> }>)[`/${gA}`]!.added![0]!;
+    const nodeOf = (sd: SceneData) => (entryOf(sd, INST)!.members as Record<string, { own?: Array<Record<string, unknown>> }>)[`/${gA}`]!.own![0]!;
     nodeOf(control).nestedOverrides = channel;
     uninstall(Q);
     await load(control);
@@ -1393,6 +1408,7 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
     // T's row 3, whose Q is missing. Mutation: keep no legacy for a keyed node in `keepTemplateNodeOrphans` — the node is
     // written without its channel. (Its writer is `captureRowChannels`, through `finishTemplateReferenceNode`.)
     const T3 = 'cccccccc-0000-4000-8000-000000001741';
+    uninstall(Q); // an earlier case left it installed; resolved, a v10 save states the channel as rows instead
     install(pDoc(), tDoc());
     const t3 = { id: T3, version: 5, name: 'T3', rootLocalId: 1, entities: [
       row(1, 'R3', 0, 'eeeeeeee-0000-4000-8000-000000001745'),
@@ -1404,13 +1420,16 @@ describe('a pre-v5 legacy channel into a missing nested frame is written back (#
     await load(buildPrefabEditScene(t3 as never) as SceneData);
     const out = serializePrefabEditWorld(T3);
     if ('error' in out) throw new Error(out.error);
-    const node = (out.prefab.entities.find((e) => e.localId === 2) as { added?: Array<Record<string, unknown>> }).added?.[0];
+    // Prefab v10 (#2001 S6): the node is the row's `own` under P's A; its channel names a frame that did not resolve, so
+    // it is written back as it was read (the one legacy form a v10 writer keeps, docs/prefabs.md § Format rule).
+    const node = ownNodes(out.prefab.entities.find((e) => e.localId === 2))[0] as Record<string, unknown> | undefined;
     expect(node?.nestedOverrides).toEqual(channel);
   });
 
   it('the template side: a prefab-edit save of a template whose row reaches into it keeps the row\'s channel', async () => {
     // T2 = R2 → row 2 expanding T, whose own row 3 expands the missing Q. Mutation: drop the kept-channel merge in
     // `captureRowChannels` — the row is written without its `nestedOverrides`.
+    uninstall(Q);
     install(tDoc());
     const t2 = { id: T2, version: 4, name: 'T2', rootLocalId: 1, entities: [
       bare(row(1, 'R2', 0, 'x')),
@@ -1549,7 +1568,7 @@ describe('a duplicate carries its stored roots\' kept R2 state, under identities
     // Mutation: leave `kept` un-remapped — the copy's Gone still targets the original's A.
     install(pDoc());
     await load(scene(P));
-    const pinA = Object.values(entryOf(await save(), INST)!.members as Record<string, { guid: string }>)[0]!.guid;
+    const pinA = (entryOf(await save(), INST)!.members as Record<string, { guid: string }>)[`/${gA}`]!.guid;
     const sc = withOrphan({ UIAction: UIA(pinA) });
     (sc.entities as unknown[]).push({ id: 99, traits: { EntityAttributes: { name: 'Kid', parentId: INST, guid: KID }, UIAction: UIA(BEEF) } });
     await load(sc);
@@ -2011,7 +2030,9 @@ describe('Apply\'s promotion of a scene-added reference node keeps its kept R2 s
     const { key } = await setUp();
     expect((await applyToPrefabSelective(rootOf(INST), new Set([key]))).applied).toBe(true);
     const promoted = written(P)!.entities.find((e) => e.prefab === Q)!;
-    expect(promoted.members).toEqual({ [`/${DEAD}`]: { traits: { Transform: { x: 4 } } } });
+    // Beside the row's own `"/"` row (prefab v10: the nested root's name and order).
+    expect(Object.keys(promoted.members ?? {})).toEqual(['/', `/${DEAD}`]);
+    expect(promoted.members?.[`/${DEAD}`]).toEqual({ traits: { Transform: { x: 4 } } });
     expect(JSON.stringify(promoted)).not.toContain(BEEF); // no scene identity in a template (#1293)
     const saved = await save();
     expect(orphanRow(saved)).toEqual({ guid: BEEF, name: 'Gone' });
@@ -2231,11 +2252,10 @@ describe('Create Prefab from an instance ROOT drops the old prefab\'s kept rows 
 describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the explicit choice)', () => {
   // The delete now evicts the editor cache (`applyAssetPathMoves`' delete branch). The live instance is left EXPANDED —
   // #1738's evicted state — and every writer captures it from its frame record, so the save writes what it wrote before
-  // the delete, plus the copy of P (F8 = A1, top level since #1935; written until S6). Owner ruling B (#2001 S5, #2028):
-  // the reload does not expand the copy — the instance is its Missing Prefab placeholder, keeping its edit as a record —
-  // and the next save writes the same bytes. Mutation: drop `evictDeletedEditorPrefabs` from the delete branch — the
-  // editor cache still answers for the deleted prefab. Mutation (#1935): leave top-level frames out of
-  // `collectEmbeddedPrefabs` again — no copy.
+  // the delete (no copy of P: scene v20, #2001 S6). Owner ruling B (#2001 S5, #2028): the reload shows the instance as
+  // its Missing Prefab placeholder, keeping its edit as a record, and the next save writes the same bytes.
+  // Mutation: drop `evictDeletedEditorPrefabs` from the delete branch — the editor cache still answers for the deleted
+  // prefab.
   const P_PATH = '/assets/p1805.prefab.json';
   it('the editor cache forgets it, the live instance stays, and the save writes the entry byte for byte', async () => {
     registerAsset(P, P_PATH, 'prefab');
@@ -2249,7 +2269,7 @@ describe('an Assets delete of a prefab a live instance uses (#1805, I9 — the e
     expect(x(inside(INST, 'A'))).toBe(6); // still expanded
     const saved = await save();
     expectSameBytes(entryOf(saved, INST), before);
-    expect(Object.keys(saved.embeddedPrefabs ?? {})).toEqual([P]); // the scene's backup of P
+    expect(saved.embeddedPrefabs).toBeUndefined(); // scene v20 writes no copy of P (#2001 S6)
     // The editor saves under the id its load read (`ownLoadedEntry`), so the copies the load kept pair with the save's. This
     // harness keeps no loaded entry and saves under '' — reloaded under a non-guid id, the load keys them '' too. Before S5
     // the reload expanded the copy, and the live frame carried it whatever the key.

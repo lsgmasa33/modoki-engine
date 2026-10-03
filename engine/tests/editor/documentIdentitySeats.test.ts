@@ -13,7 +13,6 @@ import {
   getCurrentWorld, setCurrentWorld, getAllEntities, setRunMode, loadSceneFile, instantiatePrefabIntoWorld, destroyEntity,
   type SceneData,
 } from '@modoki/engine/runtime';
-import { captureSceneCopies, restoreSceneCopies } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { clearManifest, registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { acquirePrefab, getCachedPrefab, replaceCachedPrefab, disposeAllCachedResources } from '../../packages/modoki/src/runtime/loaders/meshTemplateCache';
 import { fetchPrefabSource, seatEditorPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefabCache';
@@ -131,6 +130,8 @@ async function load(data: SceneData, freshWorld = true): Promise<void> {
   });
 }
 const entryOf = (s: SceneData) => (s.entities as unknown as Array<Record<string, unknown>>).find((e) => e.guid === ROOT);
+/** The rows a saved entry states beside its root's own `"/"` row (scene v20, #2001 S6: that one names the root, always). */
+const statedRows = (s: SceneData) => { const { '/': _root, ...rest } = (entryOf(s)?.members ?? {}) as Record<string, unknown>; return rest; };
 const scene = (entry: Record<string, unknown>, extra: Record<string, unknown> = {}): SceneData => ({
   id: 's1937', version: 19, name: 'S', resources: [],
   entities: [{ id: 1, prefab: GUID, guid: ROOT, traits: { EntityAttributes: { name: 'Inst', parentId: 0 } }, ...entry }],
@@ -146,7 +147,7 @@ describe('an instance of a refused prefab is a Damaged Prefab placeholder that k
     const placeholder = getAllEntities().find((e) => e.missingPrefab);
     expect(placeholder?.damagedPrefab).toMatch(/template key k1/);
     const s1 = await serializeScene() as unknown as SceneData;
-    expect(entryOf(s1)?.members).toEqual(members);
+    expect(statedRows(s1)).toEqual(members);
     await load(s1);
     const s2 = await serializeScene() as unknown as SceneData;
     expect(JSON.stringify(s2.entities)).toBe(JSON.stringify(s1.entities));
@@ -162,7 +163,7 @@ describe('an instance of a refused prefab is a Damaged Prefab placeholder that k
     onDisk = repeatedKey();
     await load(scene({}));
     expect(getAllEntities().some((e) => e.missingPrefab)).toBe(true);
-    expect(entryOf(await serializeScene() as unknown as SceneData)?.members).toBeUndefined();
+    expect(statedRows(await serializeScene() as unknown as SceneData)).toEqual({});
   });
 });
 
@@ -187,7 +188,7 @@ describe('a malformed channel on a prefab\'s nested row refuses the instance (#1
       expect(placeholder?.damagedPrefab).toMatch(/nested row N \(localId 3\) states .* in a shape no reader takes/);
       expect(getAllEntities().some((e) => e.name === 'R'), 'nothing of D expanded').toBe(false);
       const s1 = await serializeScene() as unknown as SceneData;
-      expect(entryOf(s1)?.members).toEqual(members);
+      expect(statedRows(s1)).toEqual(members);
       await load(s1);
       expect(JSON.stringify((await serializeScene() as unknown as SceneData).entities)).toBe(JSON.stringify(s1.entities));
     });
@@ -201,7 +202,7 @@ describe('a malformed channel on a prefab\'s nested row refuses the instance (#1
     onDisk = d;
     await load(scene({ members }));
     expect(getAllEntities().find((e) => e.missingPrefab)?.damagedPrefab).toMatch(/reference node Ref \(key k-ref\) states removed in a shape no reader takes/);
-    expect(entryOf(await serializeScene() as unknown as SceneData)?.members).toEqual(members);
+    expect(statedRows(await serializeScene() as unknown as SceneData)).toEqual(members);
   });
 
   // #1948 close-out R2: a reference node under a plain node's `children` states no `parentLocalId` (the spawner does not
@@ -227,38 +228,18 @@ describe('a malformed channel on a prefab\'s nested row refuses the instance (#1
   });
 });
 
-describe('a scene\'s copy that cannot be admitted is kept for the save and never expanded (#1937 T13)', () => {
-  // Mutations: drop the damaged copy (today's `ignored`) — the save loses it; keep it in the expansion's store — the
-  // instance expands from it.
-  // With #1939's list (merged): the copy's "live at the save" list is written back as the file held it, too — nothing of a
-  // refused copy is live, and a save writing the live ones alone turned it into []. Mutation: write the live list only
-  // (`refusedCopyFrames` dropped from `collectEmbeddedPrefabs`) — the list is [].
-  it('a copy giving two rows one localId, its prefab missing', async () => {
+/** #1937 T13 kept a scene's refused copy for the save. Scene v20 (#2001 S6) writes NO prefab copies: the instance's own
+ *  list is the record, and a prefab that is missing shows a Missing Prefab placeholder that keeps it. So a refused copy
+ *  in an older file is read (never expanded), and the save leaves it out with every other copy. */
+describe('a scene\'s copy that cannot be admitted is never expanded, and a v20 save writes no copy (#1937 T13, #2001 S6)', () => {
+  it('a copy giving two rows one localId, its prefab missing: a placeholder, its entry kept, no copy written', async () => {
     onDisk = undefined;
     const damaged = repeatedLocalId();
     await load(scene({}, { embeddedPrefabs: { [GUID]: damaged }, embeddedPrefabFrames: { [GUID]: [ROOT] } }));
     expect(getAllEntities().some((e) => e.missingPrefab)).toBe(true);
-    const s1 = await serializeScene() as unknown as SceneData & { embeddedPrefabs?: Record<string, unknown>; embeddedPrefabFrames?: Record<string, string[]> };
-    expect(s1.embeddedPrefabs?.[GUID]).toEqual(damaged);
-    expect(s1.embeddedPrefabFrames?.[GUID]).toEqual([ROOT]);
-  });
-  // Merged with #1939's swap carry: a world swap (an Apply's undo, Play→Stop) carries the scene's copies into the next
-  // world. Mutation: carry the good-copy store only (drop the damaged loop in `captureSceneCopies`) — the swapped world's
-  // save loses the copy.
-  it('a world swap carries the refused copy: the next world\'s save still writes it', async () => {
-    onDisk = undefined;
-    const damaged = repeatedLocalId();
-    // The scene key: '' for this file (its id is no guid), the key the save outside a scene manager writes.
-    await load(scene({}, { embeddedPrefabs: { [GUID]: damaged }, embeddedPrefabFrames: { [GUID]: [ROOT] } }));
-    const carry = captureSceneCopies(getCurrentWorld(), { of: () => '', keeps: (s) => s === '' });
-    // The next world: the carry first, then a load of a file that carries no copy (a snapshot taken before the trash).
-    const prev = getCurrentWorld();
-    setCurrentWorld(createWorld());
-    prev?.destroy();
-    restoreSceneCopies(getCurrentWorld(), carry);
-    await load(scene({}), false);
-    const s = await serializeScene() as unknown as SceneData & { embeddedPrefabs?: Record<string, unknown>; embeddedPrefabFrames?: Record<string, string[]> };
-    expect(s.embeddedPrefabs?.[GUID]).toEqual(damaged);
-    expect(s.embeddedPrefabFrames?.[GUID]).toEqual([ROOT]);
+    const s1 = await serializeScene() as unknown as SceneData & { embeddedPrefabs?: unknown; embeddedPrefabFrames?: unknown };
+    expect(entryOf(s1)?.prefab).toBe(GUID);
+    expect(s1.embeddedPrefabs).toBeUndefined();
+    expect(s1.embeddedPrefabFrames).toBeUndefined();
   });
 });

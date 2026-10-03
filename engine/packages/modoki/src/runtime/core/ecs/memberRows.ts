@@ -45,7 +45,7 @@
 import type { Entity, World } from 'koota';
 import { getCurrentWorld, findEntityById } from './world';
 import { getTraitByName } from './traitRegistry';
-import { durableGuid, formatMemberRowKey, isOwnedRoot, isStoredRoot, memberNodeId, type MemberPi } from '../assetRefRules';
+import { durableGuid, formatMemberRowKey, isOwnedRoot, isStoredRoot, memberNodeId, preV5NodeGuid, type MemberPi } from '../assetRefRules';
 import { worldIdentityParents } from './identityParents';
 import { templateKeyOf } from '../templateIdentity';
 import { rowPlaceholderOf } from '../unresolvedPrefabRef';
@@ -74,9 +74,9 @@ type RowPi = (NonNullable<MemberPi> & { nodeGuid?: string; parentNodeGuid?: stri
  *  The normal move path cannot even produce the second one (an unpack REMOVES `PrefabInstance`, so
  *  the entity is an added node here), but this is the save path and the encoding no longer enforces
  *  the invariant — which is exactly why R8 says a check has to exist rather than be relied upon. */
-export function memberRowKeysIn(rootEcsId: number, world: World = getCurrentWorld()): Map<number, string> {
+export function memberRowKeysIn(rootEcsId: number, world: World = getCurrentWorld(), derivePreV5 = false): Map<number, string> {
   const out = new Map<number, string>();
-  for (const [id, row] of memberRowsIn(rootEcsId, world)) if (row.key) out.set(id, row.key);
+  for (const [id, row] of memberRowsIn(rootEcsId, world, derivePreV5)) if (row.key) out.set(id, row.key);
   return out;
 }
 
@@ -100,7 +100,13 @@ export type MemberRowAt = { key: string; frameRoot: number; rowLocalId: number }
 /** Every live member of the instance tree rooted at `rootEcsId` — the ONE walk, so a caller that
  *  needs to reach a member's TEMPLATE position does not re-derive which document and which row that
  *  is. {@link memberRowKeysIn} is this, narrowed to the members that HAVE a key. */
-export function memberRowsIn(rootEcsId: number, world: World = getCurrentWorld()): Map<number, MemberRowAt> {
+export function memberRowsIn(
+  rootEcsId: number, world: World = getCurrentWorld(),
+  /** Key a member of a pre-v5 frame by its DERIVED identity (`identityOf` below) instead of leaving it unkeyed. Only a
+   *  reader of stored rows asks (the load's settle): the old capture still writes such a member's statements in the
+   *  legacy channels, which a writer of rows would otherwise have to restate. */
+  derivePreV5 = false,
+): Map<number, MemberRowAt> {
   const out = new Map<number, MemberRowAt>();
   const piMeta = getTraitByName('PrefabInstance');
   const eaMeta = getTraitByName('EntityAttributes');
@@ -137,6 +143,18 @@ export function memberRowsIn(rootEcsId: number, world: World = getCurrentWorld()
    *  are part of this instance tree and their moves are capturable — it just cannot name them, so
    *  the chain comes back with an empty component and `formatMemberRowKey` refuses the key. Folding
    *  "I cannot name you" into "you are not mine" is what made every pre-v5 move uncapturable. */
+  /** A member's identity in its frame: its minted one, or (`derivePreV5`) in a frame whose document predates v5 (no
+   *  `nodeGuid` to stamp) the one the instance model derives from that document and the member's row (`preV5NodeGuid`,
+   *  #2001 S6) — what a scene v20 entry and a prefab v10 row key such a member by. Unkeyed, a row about it named no live
+   *  member: the settle kept it as an orphan beside the nodes it had applied, and a prefab-edit save wrote them twice. */
+  const identityOf = (id: number, pi: RowPi | undefined): string => {
+    const minted = memberNodeId(pi);
+    if (minted || !pi || !derivePreV5) return minted;
+    const owned = isOwnedRoot(pi, id);
+    const lid = (owned ? pi.parentLocalId : pi.localId) ?? 0;
+    const doc = (piById.get(frameRootOf(id)) as { source?: string } | null | undefined)?.source;
+    return lid && doc ? preV5NodeGuid(doc, lid) : '';
+  };
   const chains = new Map<number, string[] | null>();
   const frameChain = (id: number): string[] | null => {
     if (id === rootEcsId) return [];
@@ -149,7 +167,7 @@ export function memberRowsIn(rootEcsId: number, world: World = getCurrentWorld()
     if (root === rootEcsId) chain = [];
     else {
       const above = frameChain(root);
-      chain = above && [...above, memberNodeId(piById.get(root))];
+      chain = above && [...above, identityOf(root, piById.get(root))];
     }
     chains.set(id, chain);
     return chain;
@@ -166,7 +184,7 @@ export function memberRowsIn(rootEcsId: number, world: World = getCurrentWorld()
     const pi = piById.get(id)!;
     // '' when any component is missing — exclusion 4, and `formatMemberRowKey` is the one place that
     // decides it, so no caller has to re-spell "a pre-v5 member has no row".
-    const key = formatMemberRowKey([...chain, memberNodeId(pi)]);
+    const key = formatMemberRowKey([...chain, identityOf(id, pi)]);
     out.set(id, { key, frameRoot: frameRootOf(id), rowLocalId: (isOwnedRoot(pi, id) ? pi.parentLocalId : pi.localId) ?? 0 });
   }
   return out;
@@ -232,7 +250,7 @@ export function memberRowsToWrite(rootEcsId: number, world: World = getCurrentWo
  *
  *  In the runtime because the LOAD asks it too (#2038): which of a scene's rows name a node that is live now, member row
  *  or not. The editor reads it as `instanceKeyMap`. */
-export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld()): Map<number, string> {
+export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld(), /** As {@link memberRowsIn}'s. */ derivePreV5 = false): Map<number, string> {
   const ea = getTraitByName('EntityAttributes')?.trait;
   const pi = getTraitByName('PrefabInstance')?.trait;
   const keyOf = new Map<number, string>([[rootId, '/']]);
@@ -244,7 +262,7 @@ export function instanceRowKeysIn(rootId: number, world: World = getCurrentWorld
     const e = byId.get(id);
     return e && e.has(pi) ? (e.get(pi) as MemberPi) : null;
   };
-  for (const [id, k] of memberRowKeysIn(rootId, world)) keyOf.set(id, k);
+  for (const [id, k] of memberRowKeysIn(rootId, world, derivePreV5)) keyOf.set(id, k);
   const tk = (id: number) => templateKeyOf(byId.get(id) as never);
   const refNode = (id: number) => isStoredRoot(piOf(id), id) && !!tk(id);
   /** The frame a keyed node's children are keyed in: an owned nested root and a template-added reference node open their

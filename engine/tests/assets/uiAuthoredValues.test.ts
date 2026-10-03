@@ -15,6 +15,8 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import { validateSceneData, collapsedNewlineWarnings } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { buildSceneSchema } from '../../packages/modoki/src/runtime/scene/sceneSchema';
+import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { assertDeclaredListIsComplete } from '../helpers/declaredList';
@@ -82,11 +84,16 @@ describe('committed UI content authors no #671/#809 finding', () => {
   it('no scene/prefab authors an inert entry-prefab-root value or a multiplier-shaped lineHeight', () => {
     const prefabsByGuid = loadPrefabsByGuid();
     const getPrefab = (ref: string) => prefabsByGuid.get(ref);
+    registerAllTraits();
+    const schema = buildSceneSchema();
     const findings: string[] = [];
     for (const { rel, abs } of scenes) {
       let data: unknown;
       try { data = JSON.parse(fs.readFileSync(abs, 'utf8')); } catch { continue; } // a louder failure elsewhere
-      const { warnings } = validateSceneData(data, undefined, getPrefab, undefined);
+      // WITH the trait schema: the prefab writer spells a component out in full, so an entry prefab's root saved by
+      // the editor states `flexShrink: 1`, the trait's default. The validator tells that from an authored value only
+      // when it has the schema (`entryPrefabRootWarnings`), as the editor's own call does (`agentBridge`).
+      const { warnings } = validateSceneData(data, schema, getPrefab, undefined);
       for (const w of warnings) if (isGuardedFinding(w)) findings.push(`${rel} -> ${w}`);
     }
     expect(

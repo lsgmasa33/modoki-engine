@@ -788,3 +788,25 @@ describe('close-out review: a scene REFERENCE node keeps #2019 beside and #2020 
     expect(own({ [`/${N3}`]: { own: [n(96)] }, [alias]: { added: [n(99)] } })).toContain(G(96));
   });
 });
+
+describe('the v20 entry states its placement in the trait\'s own key order (#2001 S6, the corpus re-save)', () => {
+  it('sortOrder, parentId, editorFolder, sourceScene: a subsequence of EntityAttributes\' schema, as a plain entity\'s is written', async () => {
+    const { EntityAttributes } = await import('../../packages/modoki/src/runtime/core/traits/EntityAttributes');
+    const order = Object.keys((EntityAttributes as unknown as { schema: Record<string, unknown> }).schema);
+    const rec = parseInstanceRecord(entry({ traits: { EntityAttributes: { parentId: G(70), sortOrder: 3, editorFolder: 'F', sourceScene: 'S' }, PrefabInstance: { source: 'P', localId: 1, rootInstanceId: ROOT } } }), reader(), V15).record;
+    const written = serializeInstanceRecord(rec, { identity: new Map(), sceneOwned: () => undefined }).entry as { traits: { EntityAttributes: Record<string, unknown> } };
+    const keys = Object.keys(written.traits.EntityAttributes);
+    expect(keys).toEqual(['sortOrder', 'parentId', 'editorFolder', 'sourceScene']);
+    expect(keys.map((k) => order.indexOf(k))).toEqual([...keys.map((k) => order.indexOf(k))].sort((a, b) => a - b));
+  });
+
+  it('the save\'s live placement keeps that order, a placeholder\'s isActive included (`placedAsLive`)', async () => {
+    const { placedAsLive } = await import('../../packages/modoki/src/editor/instance/instanceSave');
+    const live = { name: 'N', parentGuid: G(70), sortOrder: 3, editorFolder: 'F', isActive: false };
+    const base = { name: 'N', prefab: 'P', guid: ROOT, traits: { EntityAttributes: { sourceScene: 'S' } } };
+    const shown = placedAsLive(base as never, live, { placeholder: false, missing: false });
+    expect(Object.keys(shown.traits!.EntityAttributes as object)).toEqual(['sortOrder', 'parentId', 'editorFolder', 'sourceScene']);
+    const placeholder = placedAsLive(base as never, live, { placeholder: true, missing: true });
+    expect(Object.keys(placeholder.traits!.EntityAttributes as object)).toEqual(['isActive', 'sortOrder', 'parentId', 'editorFolder', 'sourceScene']);
+  });
+});

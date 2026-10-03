@@ -85,7 +85,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getAllTraits: () => TRAITS,
 }));
 
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getPrefabRevision: () => 0 }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getPrefabRevision: () => 0, getCachedPrefab: () => undefined }));
 
 /** The manifest seam `getPrefabSource` resolves through. Deliberately NOT stubbed out to
  *  return the prefab directly — the warmer's whole job is to perform this fetch, so a

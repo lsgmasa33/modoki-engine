@@ -1,28 +1,22 @@
-/** #1872 — a template-added node the load RE-ANCHORED to its frame root (a prefab edit deleted its anchor) round-trips as
- *  ONE node when a whole `added` list is pinned at that root, in either order.
+/** A template-added node whose ANCHOR member an inner prefab's edit deletes (#1872, and #2001 S6 for prefab v10).
  *
- *  An edited template REFERENCE node has no node-row address, so the save pins its member's whole `added` list, where
- *  the node is PLACED (`chainNodesAsPlaced`: a node whose anchor row the document lost sits at the root). The load's
- *  fold replaces only the nodes the TEMPLATE anchors at the list's member. So the diff also writes a by-key `removed`
- *  node row (scene form; the list's own key in template form) for each node the load re-anchored into a pinned list
- *  (`reanchoredKeys`, `diffFrameAdded`'s `pinnedOver`); node rows apply by key wherever the template anchors the node.
+ *  O's row N (a P) adds nodes under P's member A. Which rule applies is decided by HOW the row names the anchor
+ *  (docs/prefabs.md § Format rule):
  *
- *  - 6053's order (win's hunt seed, whose shrunk list is in `prefabFuzz/knownOpen.ts` REGRESSIONS): the anchor goes,
- *    then the scene edits inside the re-anchored node. Without the node rows the template's copies spawned beside the
- *    pinned ones: every node twice on one guid, and the deleted QR back.
- *  - The reversed order (the close-out review's): the scene pins the root's list while the anchor still exists, then
- *    the anchor goes. A fold that replaced every node PLACED at the root (the first fix) lost O's Extra for good.
- *  - The anchor comes BACK (an outside edit restoring the prefab): the removed rows still name the template's nodes.
- *  - A rebuild in place (another instance's Apply refreshes this frame) diffs through the same `diffFrameAdded`.
+ *  - **A v10 row names it by identity** (`members["/<A's nodeGuid>"].own`). When A goes, the row's target is gone: the
+ *    nodes are not shown, the row is kept by every writer, and they return with the member (B′, #1880 F3a). Before
+ *    prefab v10 the row named A by localId and the load re-anchored the nodes to N's root (#1872's own cases, where the
+ *    scene then pinned a whole `added` list over them); an editor-saved prefab no longer reaches that.
+ *  - **A v9 row names it by localId** (`added[].parentLocalId`). A node whose localId names no row is re-anchored at the
+ *    frame root, as it always was, and the first v10 save stores it on the `"/"` row, where it stays.
  *
- *  - A TEMPLATE-form save (H's prefab edit nests O), where the list carries the node's key (the close-out re-review).
- *  - A key used twice in O's own frame (the re-review's other finding) is refused at O's seat since #1937 C-A: its
- *    instances are Damaged Prefab placeholders that keep their record, so the whole list can no longer come from it.
+ *  The whole-list fold #1872 fixed is still read (a v16 scene's `added` on a member row); its regression is the
+ *  fuzzer's seed 6053 (`prefabFuzz/knownOpen.ts` REGRESSIONS).
  *
- *  Each: one copy, and a second save byte-identical to the first. Mutations, each red on exactly its cases: the fold
- *  replacing everything PLACED at the anchor (the reversed order); no scene-form removed rows (every scene-form case);
- *  removed rows in template form too (the template-form case); no key-named replacement in the fold (the template-form
- *  case); the rebuild subtracting a pinned-over node (the rebuild).
+ *  Mutations (measured): the old row fold applying a row whose component names no member at the frame root
+ *  (`foldMemberRowChannels`: `if (at) apply(…)` given an `else apply(rootLocalId, row, false)`) — the H case red, and
+ *  only it (a top-level instance is built by the new fold); the row capture without the kept orphan rows
+ *  (`captureRowChannels`: `keptMemberOrphans(rootGuid) ?? {}` → `{}`) — "O's own prefab-edit save" red, and only it.
  *
  *  Driven through the prefab fuzzer's harness: the real backend route, SceneManager, both caches, prefab edit and the
  *  simulated watcher. */
@@ -124,115 +118,139 @@ async function applyFromSecondO(f: Fixture): Promise<void> {
   await settle();
 }
 
-/** Save, reload, and hold what must hold after it: one Extra and one nested P under N, no I7, the scene's delete kept;
- *  then a second save byte-identical to the first. */
-async function roundTripsAsOne(f: Fixture, deletedGuid: string, anchorBack = false): Promise<void> {
-  expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-  const first = be.read(f.scenePath)!;
-  expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-  await settle();
-  expect(duplicateGuids()).toEqual([]);
-  const { n } = frame();
-  // At N's root while the anchor A is gone; once A comes back, under A — so then counted anywhere in N, and its parent
-  // asserted by the caller (review: counting anywhere for every case let a misplacement under the nested R pass).
-  const count = (name: string) => (anchorBack ? inSubtree(name, n.id) : byName(name, n.id)).length;
-  expect(count('Extra'), 'one Extra under N').toBe(1);
-  expect(count('R'), 'one nested P under N').toBe(1);
-  expect(authored().some((e) => e.guid === deletedGuid), 'the scene\'s delete of QR holds').toBe(false);
-  expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-  expect(be.read(f.scenePath)).toBe(first);
-}
-
-describe('a re-anchored template node pinned in a whole list is ONE node (#1872)', () => {
-  it("6053's order: the anchor goes, then the scene edits inside the re-anchored reference node", async () => {
-    const f = await startRun(be, async () => {}, 'reanchored-6053');
-    await nestPInO(f, 'A');
-    await deleteAInP(f);
-    expect(frame().nested, 'premise: the nested P is re-anchored to N\'s root').toBeTruthy();
-    const qr = await deleteInsideNested();
-    await roundTripsAsOne(f, qr);
-  });
-
-  it('the reversed order: the scene pins the root\'s list while the anchor exists, then the anchor goes', async () => {
-    const f = await startRun(be, async () => {}, 'reanchored-pinFirst');
-    await nestPInO(f, 'root');
-    const qr = await deleteInsideNested();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    await deleteAInP(f); // O's Extra, anchored at A, is re-anchored to N's root by the reload that leaving edit does
-    await roundTripsAsOne(f, qr);
-  });
-
-  it('the anchor comes BACK (an outside edit restores the prefab): still one copy', async () => {
-    const f = await startRun(be, async () => {}, 'reanchored-comesBack');
-    await nestPInO(f, 'A');
-    const pBefore = be.read(f.prefabs.P.path)!;
-    await deleteAInP(f);
-    const qr = await deleteInsideNested();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+describe('a template-added node whose anchor member is deleted (#1872; prefab v10, #2001 S6)', () => {
+  type ORow = { localId: number; members?: Record<string, { own?: Array<{ name?: string; key?: string }> }> };
+  const oRowN = (f: Fixture) => (JSON.parse(be.read(f.prefabs.O.path)!) as { entities: ORow[] }).entities.find((e) => e.localId === 2)!;
+  const aKey = (pBytes: string) => `/${(JSON.parse(pBytes) as { entities: Array<{ name: string; nodeGuid: string }> }).entities.find((e) => e.name === 'A')!.nodeGuid}`;
+  const ownNames = (f: Fixture, key: string) => (oRowN(f).members?.[key]?.own ?? []).map((n) => n.name).sort();
+  /** A checkout of P from before the delete reaches the editor. */
+  async function restoreP(f: Fixture, bytes: string): Promise<void> {
     const before = be.snapshot();
-    be.write(f.prefabs.P.path, pBefore); // a checkout of P from before the delete
+    be.write(f.prefabs.P.path, bytes);
     await flushWatcher(be, before);
     await settle();
-    await roundTripsAsOne(f, qr, true);
-    // The restore REACHED the editor: Extra is back under its anchor. Until the fuzz watcher keyed a mark by its bytes
-    // (#2009), P's own earlier prefab-edit save left a mark that took this outside write for the editor's, nothing
-    // reloaded, and the case ran with the anchor still gone.
-    const parentName = (name: string) => { const e = inSubtree(name, frame().n.id)[0]!; return authored().find((x) => x.id === e.parentId)?.name; };
-    expect(parentName('Extra')).toBe('A');
-    expect(parentName('R'), 'the nested P, anchored at A too').toBe('A');
-  });
-
-  it('a rebuild in place (another O instance\'s Apply refreshes this frame): still one copy', async () => {
-    const f = await startRun(be, async () => {}, 'reanchored-rebuild');
-    await nestPInO(f, 'A');
-    await deleteAInP(f);
-    const qr = await deleteInsideNested();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
-    await applyFromSecondO(f);
-    // The refresh, before any save: one copy in the live world.
-    expect(duplicateGuids()).toEqual([]);
-    expect(byName('Extra', frame().n.id).length).toBe(1);
-    await roundTripsAsOne(f, qr);
-  });
-
-  // Since #1914 R3b a delete inside the template reference node is a row reaching into it, and N's list is not written
-  // at all (`rows`); a key used twice in the frame, which no node row can name, still makes H write the list whole
-  // (`whole`, as the case below).
-  it("a TEMPLATE-form save (H's prefab edit nests O and deletes inside the re-anchored node): one copy in every H instance", async () => {
-    // The list a prefab's own rows pin carries each node's KEY, so a removed row on that key removed the list's copy
-    // too, and every instance of H lost Extra and the nested P (#1872 re-review). Template form states it by the key.
-    // (Its `whole` mode — a key O's frame used twice — is refused at O's seat since #1937 C-A: the case below.)
-    const f = await startRun(be, async () => {}, 'reanchored-templateForm-rows');
-    await nestPInO(f, 'A');
-    await deleteAInP(f);
-    await editAndSave(f.prefabs.H.path, 'H', async () => {
-      const hr = authored().find((e) => e.name === 'HR' && !e.parentId)!;
-      expect(await placePrefabFromPath(f.prefabs.O.path, { tag: 'test', parentId: hr.id })).toBeTruthy();
-      await settle();
-      const or = authored().find((e) => e.name === 'OR')!;
-      const n = byName('R', or.id)[0]!;
-      const nested = byName('R', n.id)[0]!;
-      deleteEntitiesWithUndo([byName('QR', nested.id)[0]!.id]);
-      await settle();
-    });
-    const hDoc = be.read(f.prefabs.H.path)!;
-    expect([hDoc.includes('"added"'), hDoc.includes('/a+')], 'premise: how H stated the delete').toEqual([false, true]);
+  }
+  const parentName = (name: string) => { const e = inSubtree(name, frame().n.id)[0]; return e && authored().find((x) => x.id === e.parentId)?.name; };
+  async function sceneRoundTripIsStable(f: Fixture): Promise<void> {
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     const first = be.read(f.scenePath)!;
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
     expect(duplicateGuids()).toEqual([]);
-    const hr = authored().find((e) => e.name === 'HR' && e.guid?.startsWith('ffffffff-0000-4000-8003-'))!;
-    const or = byName('OR', hr.id)[0]!;
-    const n = byName('R', or.id)[0]!;
-    expect(byName('Extra', n.id).length, 'one Extra under the H instance\'s N').toBe(1);
-    const nested = byName('R', n.id);
-    expect(nested.length, 'one nested P under the H instance\'s N').toBe(1);
-    expect(byName('QR', nested[0]!.id).length, "H's delete inside it holds").toBe(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
     expect(be.read(f.scenePath)).toBe(first);
+  }
+
+  it('the anchor goes: the row\'s nodes are not shown, the row is kept, and they return under the anchor when it comes back', async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone');
+    await nestPInO(f, 'A');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    const key = aKey(pBefore);
+    expect(ownNames(f, key), 'premise: O\'s v10 row names the anchor by identity').toEqual(['Extra', 'R']);
+    await deleteAInP(f);
+    expect(inSubtree('Extra', frame().n.id).length, 'Extra is not shown').toBe(0);
+    expect(frame().nested, 'nor the nested P').toBeUndefined();
+    await sceneRoundTripIsStable(f);
+    expect(inSubtree('Extra', frame().n.id).length).toBe(0);
+    expect(ownNames(f, key), 'O still states both').toEqual(['Extra', 'R']);
+    await restoreP(f, pBefore);
+    expect(inSubtree('Extra', frame().n.id).length).toBe(1);
+    expect(parentName('Extra')).toBe('A');
+    expect(parentName('R'), 'the nested P, anchored at A too').toBe('A');
+    expect(duplicateGuids()).toEqual([]);
+  });
+
+  it('a node the row adds at the frame ROOT stays when another anchor goes, with the scene\'s edit inside it', async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone-rootNode');
+    await nestPInO(f, 'root');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    const qr = await deleteInsideNested();
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    await deleteAInP(f);
+    await sceneRoundTripIsStable(f);
+    const { n } = frame();
+    expect(byName('R', n.id).length, 'one nested P under N').toBe(1);
+    expect(inSubtree('Extra', n.id).length, 'Extra, anchored at A, is not shown').toBe(0);
+    expect(authored().some((e) => e.guid === qr), 'the scene\'s delete of QR holds').toBe(false);
+    await restoreP(f, pBefore);
+    expect(parentName('Extra')).toBe('A');
+    expect(byName('R', frame().n.id).length).toBe(1);
+    expect(authored().some((e) => e.guid === qr), 'and still holds once A is back').toBe(false);
+  });
+
+  it('a rebuild in place (another O instance\'s Apply writes O) keeps the row', async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone-rebuild');
+    await nestPInO(f, 'A');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    const key = aKey(pBefore);
+    await deleteAInP(f);
+    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    await applyFromSecondO(f);
+    expect(duplicateGuids()).toEqual([]);
+    expect(inSubtree('Extra', frame().n.id).length).toBe(0);
+    expect(ownNames(f, key), 'the Apply wrote O with the row kept').toEqual(['Extra', 'R']);
+    await sceneRoundTripIsStable(f);
+    await restoreP(f, pBefore);
+    expect(parentName('Extra')).toBe('A');
+    expect(parentName('R')).toBe('A');
+  });
+
+  it('O\'s own prefab-edit save while the anchor is gone keeps the row', async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone-ownSave');
+    await nestPInO(f, 'A');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    const key = aKey(pBefore);
+    await deleteAInP(f);
+    await editAndSave(f.prefabs.O.path, 'O', async () => {
+      const n = authored().find((e) => e.name === 'R')!;
+      expect(inSubtree('Extra', n.id).length, 'not shown in O\'s own edit either').toBe(0);
+      expect(writeTraitFieldWithUndo(n.id, getTraitByName('Transform')!, 'x', 4)).toBeFalsy();
+    });
+    expect(ownNames(f, key), 'the save, which captures the live tree, wrote the row back').toEqual(['Extra', 'R']);
+    await restoreP(f, pBefore);
+    expect(parentName('Extra')).toBe('A');
+    expect(parentName('R')).toBe('A');
+  });
+
+  it("a prefab that nests O while the anchor is gone (H's edit) shows them once the anchor is back", async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone-templateForm');
+    await nestPInO(f, 'A');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    await deleteAInP(f);
+    await editAndSave(f.prefabs.H.path, 'H', async () => {
+      const hr = authored().find((e) => e.name === 'HR' && !e.parentId)!;
+      expect(await placePrefabFromPath(f.prefabs.O.path, { tag: 'test', parentId: hr.id })).toBeTruthy();
+      await settle();
+    });
+    await sceneRoundTripIsStable(f);
+    expect(inSubtree('Extra', hInstanceN().id).length).toBe(0);
+    await restoreP(f, pBefore);
+    const n = hInstanceN();
+    expect(inSubtree('Extra', n.id).length, 'one Extra in the H instance\'s N').toBe(1);
+    expect(byName('R', byName('A', n.id)[0]!.id).length, 'and one nested P, under A').toBe(1);
+    expect(duplicateGuids()).toEqual([]);
+  });
+
+  it('a v9 row (the anchor named by localId): the node is re-anchored at the frame root, and the first v10 save stores it on the "/" row', async () => {
+    const f = await startRun(be, async () => {}, 'anchor-gone-legacyRow');
+    const pBefore = be.read(f.prefabs.P.path)!;
+    expect(be.read(f.prefabs.O.path)!.includes('"parentLocalId": 2'), 'premise: the fixture\'s O states Extra under localId 2').toBe(true);
+    await deleteAInP(f);
+    expect(byName('Extra', frame().n.id).length, 're-anchored to N\'s root').toBe(1);
+    await editAndSave(f.prefabs.O.path, 'O', async () => {
+      expect(writeTraitFieldWithUndo(authored().find((e) => e.name === 'R')!.id, getTraitByName('Transform')!, 'x', 4)).toBeFalsy();
+    });
+    expect(ownNames(f, '/')).toEqual(['Extra']);
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    expect(byName('Extra', frame().n.id).length).toBe(1);
+    await restoreP(f, pBefore);
+    expect(byName('Extra', frame().n.id).length, 'it stays where the row now states it').toBe(1);
+    expect(duplicateGuids()).toEqual([]);
   });
 
   it('a key used twice in O\'s frame is refused at O\'s seat: a Damaged Prefab placeholder keeps the record, and the fixed file brings it back (#1937 C-A)', async () => {
@@ -267,37 +285,6 @@ describe('a re-anchored template node pinned in a whole list is ONE node (#1872)
     await settle();
     expect(getAllEntities().some((e) => e.missingPrefab), 'O expands again').toBe(false);
     expect((readTraitData(frame().n.id, getTraitByName('Transform')!) as { x: number }).x, 'with the scene\'s edit').toBe(7);
-  });
-
-  it("a TEMPLATE-form DELETE of a pinned-over node holds: H's edit deletes the re-anchored Extra (third review)", async () => {
-    // Template form states a node the list HOLDS by its key; one the edit deleted is in no list, and without a removed
-    // row the template's copy came back in H's edit and in every H instance. Mutation: skip the row for every
-    // pinned-over key in template form — red.
-    const f = await startRun(be, async () => {}, 'reanchored-templateDelete');
-    await nestPInO(f, 'A');
-    await deleteAInP(f);
-    await editAndSave(f.prefabs.H.path, 'H', async () => {
-      const hr = authored().find((e) => e.name === 'HR' && !e.parentId)!;
-      expect(await placePrefabFromPath(f.prefabs.O.path, { tag: 'test', parentId: hr.id })).toBeTruthy();
-      await settle();
-      const n = byName('R', authored().find((e) => e.name === 'OR')!.id)[0]!;
-      deleteEntitiesWithUndo([byName('QR', byName('R', n.id)[0]!.id)[0]!.id]); // pins N's root list whole
-      await settle();
-      deleteEntitiesWithUndo([byName('Extra', n.id)[0]!.id]);
-      await settle();
-    });
-    expect(await openPrefabForEditing({ path: f.prefabs.H.path, name: 'H' }, { confirmDiscard: async () => true })).toBeFalsy();
-    expect(byName('Extra', byName('R', authored().find((e) => e.name === 'OR')!.id)[0]!.id).length, "in H's own edit").toBe(0);
-    await exitPrefabEditing();
-    await settle();
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    const first = be.read(f.scenePath)!;
-    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
-    await settle();
-    expect(byName('Extra', hInstanceN().id).length, 'in the scene\'s H instance').toBe(0);
-    expect(byName('R', hInstanceN().id).length, 'the nested P stays').toBe(1);
-    expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(be.read(f.scenePath)).toBe(first);
   });
 
   it('a key one frame\'s lists give two nodes is REFUSED: placing the prefab is refused with the reason (#1937 C-A, #1933 L5)', async () => {

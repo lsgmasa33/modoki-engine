@@ -7,6 +7,7 @@
  *  simulated watcher. */
 
 import { describe, it, expect, vi } from 'vitest';
+import { ownNodes } from './v10Rows';
 import fs from 'fs';
 
 // The OS trash, stubbed to delete from the scratch directory, as prefabFuzz.test.ts does.
@@ -39,8 +40,9 @@ const looseInScene = () => {
   const a = authored().find((e) => e.name === 'A' && e.parentId === n.id)!;
   return authored().find((e) => e.name === 'Loose' && e.parentId === a.id)!;
 };
-type ODoc = { entities: Array<{ localId: number; added?: Array<{ name: string; key?: string }> }> };
-const looseIn = (text: string) => (JSON.parse(text) as ODoc).entities.find((e) => e.localId === 2)!.added!.find((n) => n.name === 'Loose')!;
+type ODoc = { entities: Array<{ localId: number; added?: Array<{ name?: string; key?: string }> }> };
+/** Loose on O's row N: in the row's `added` as the hand edit wrote it, among the row's `own` nodes once the editor saved it (prefab v10). */
+const looseIn = (text: string) => { const n = (JSON.parse(text) as ODoc).entities.find((e) => e.localId === 2)!; return [...(n.added ?? []), ...ownNodes(n)].find((x) => x.name === 'Loose')!; };
 
 describe('a minted key is persisted by the prefab\'s first editor save (#1937 C-A)', () => {
   // Mutation: the editor's seats take the RAW document (`fetchPrefabSource` and `seatEditorEntry` skip the admitted copy)

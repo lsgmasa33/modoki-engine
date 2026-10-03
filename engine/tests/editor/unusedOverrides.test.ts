@@ -4,7 +4,9 @@
  *  until an explicit Remove. recordedOverrideList.test.ts pins the four F5 cases in the legacy localId form; these pin the
  *  other carriers: a member ROW, a scene-added reference node, the legacy structure channels, and a prefab-edit save. */
 
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { ownNodes, rowsOf } from './v10Rows';
 import { createWorld } from 'koota';
 
 const prefabs = new Map<string, unknown>();
@@ -172,8 +174,9 @@ describe('the legacy structure channels\' unused records are written back (#1914
   // Rotate3D" stayed green for a restore (`traitRemovals: {Rotate3D: false}`), the opposite statement (#1933).
   it('a removal of a component the member\'s document row does not define (B has no Rotate3D)', async () => {
     const s = await twoSaves(scene({ removedTraits: { 3: ['Rotate3D'] } }));
-    expect(rowOf(s, 3).removedTraits).toEqual(['Rotate3D']);
-    expect(rowOf(s, 3).traitRemovals).toBeUndefined();
+    // Scene v20 (#2001 S6): one form — the kept removal is the row's `traitRemovals` record.
+    expect(rowOf(s, 3).traitRemovals).toEqual({ Rotate3D: true });
+    expect(rowOf(s, 3).removedTraits).toBeUndefined();
   });
 
   // Mutation: in `unusedLegacy`, keep nothing inside a REACHED frame (drop `if (inner) nestedOverrides[key] = inner;`) — the
@@ -260,7 +263,10 @@ describe('a legacy move of a KEYED node is ignored at load and kept by every sav
     install(withMove());
     await load(buildPrefabEditScene(withMove()) as SceneData);
     const root = getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id;
-    expect(serializePrefab(root, O, { keptMoves: { '2.+k-extra': '@member:2' } })!.moved).toEqual({ '2.+k-extra': '@member:2' });
+    // Prefab v10 (#2001 S6): stated as a `parent` record on N's row for the node, the token one frame up.
+    const out = serializePrefab(root, O, { keptMoves: { '2.+k-extra': '@member:2' } })!;
+    expect(out.moved).toBeUndefined();
+    expect(rowsOf(out.entities.find((e) => e.prefab === P))['/a+k-extra']).toEqual({ parent: '@member:^.2' });
   });
 });
 
@@ -388,10 +394,13 @@ describe('the #1914 close-out\'s untested carriers (#1933)', () => {
     if ('error' in out) throw new Error(out.error);
     return out.prefab;
   };
-  const tMoved = (doc: PrefabFile) => ((doc.entities.find((e) => e.prefab === PL) as unknown as { added: Array<{ templateMoved?: unknown }> }).added[0]!.templateMoved);
+  /** The moves the reference node T states (prefab v10: `parent` records on its own rows), by row key. */
+  const tMoved = (doc: PrefabFile) => Object.fromEntries(Object.entries(rowsOf(ownNodes(doc.entities.find((e) => e.prefab === PL))[0])).filter(([, r]) => r.parent !== undefined).map(([k, r]) => [k, r.parent]));
 
   // Mutation: `templateMoved = captured` in `finishTemplateReferenceNode` (prefabCapture.ts) — the keyed-only statement
   // saves as undefined, and the mixed one loses its keyed half.
+  // And for the second save, which reads the v10 node (#2001 S6): drop `keepKeyedNodeParents` from
+  // `serializePrefabEditWorld` — the keyed move goes from both (measured).
   for (const [label, moved] of [
     ['a keyed legacy move alone', { '4.+k-extra': '@member:3' }],
     ['a keyed legacy move beside a live plain move', { '4.+k-extra': '@member:3', 3: '@member:2' }],
@@ -402,10 +411,65 @@ describe('the #1914 close-out\'s untested carriers (#1933)', () => {
       // The keyed move applies nowhere (Extra at its template place), and a plain one is live.
       expect(parentOf('Extra')).toBe('X');
       if ('3' in moved) expect(parentOf('BT')).toBe('AT');
-      expect(tMoved(first)).toEqual(moved);
-      expect(tMoved(await editSave(JSON.parse(JSON.stringify(first)) as PrefabFile))).toEqual(moved);
+      // Prefab v10 (#2001 S6): each move is a `parent` record on the node's own row for the member, keyed by identity.
+      const want = { [`/${h(14)}/a+k-extra`]: '@member:3', ...('3' in moved ? { [`/${h(13)}`]: '@member:2' } : {}) };
+      expect(tMoved(first)).toEqual(want);
+      expect(tMoved(await editSave(JSON.parse(JSON.stringify(first)) as PrefabFile))).toEqual(want);
     });
   }
+
+  // A SCENE instance of OT once OT is v10 (#2001 S6 close-out): the node T states its move of BT as a `parent` on its own
+  // row, not as `templateMoved`, and the frame record the old capture reads its template moves from (`noteNodeMoves`)
+  // took only `templateMoved`. So a capture of the instance (every save here; a stale record's re-seed in the editor)
+  // restated the template's move as the instance's own `parent` row, pinning BT under AT for good.
+  // Mutation: note only `templateMoved` again (`templateNodeRowMoves` out of `noteFrames`, projectInstance.ts) — the v10
+  // case red, nothing else. (A SCENE reference node, which `spawnReferenceNode` notes, is the next two cases.)
+  for (const form of ['v9', 'v10'] as const) {
+    it(`a scene instance of a ${form} OT does not restate T's template move as its own`, async () => {
+      chain();
+      const legacy = oWithT({ 3: '@member:2' });
+      install(form === 'v9' ? legacy : await editSave(legacy));
+      await load(scene({}, OT));
+      expect(parentOf('BT')).toBe('AT');
+      const rows = Object.entries((entryOf(await saved()).members ?? {}) as Record<string, { parent?: unknown }>);
+      expect(rows.filter(([, r]) => r.parent !== undefined)).toEqual([]);
+    });
+  }
+
+  // The same for a SCENE reference node (close-out re-review): a member token on its row is its converted
+  // `templateMoved`, a template move (`foldInstance`, #2007 item 8), and only a guid there is the scene's own move. Once
+  // a v20 save writes the node, `templateMoved` is gone, so `spawnReferenceNode` noted no move, and a no-edit save
+  // rewrote BT's token as AT's guid: the template's move pinned as the scene's.
+  // Mutation: drop `templateNodeRowMoves` from `spawnReferenceNode`'s note — s2's row states a guid.
+  it('a scene reference node\'s template move stays a template move across two saves', async () => {
+    chain();
+    install(oWithT({}));
+    await load(scene({ added: [{ guid: 'ffffffff-0000-4000-8000-000000193377', name: 'T', prefab: PT, parentLocalId: 1, traits: {}, children: [], templateMoved: { 3: '@member:2' } }] }, PL));
+    expect(parentOf('BT')).toBe('AT');
+    const btRow = (s: SceneData) => Object.entries((entryOf(s).members ?? {}) as Record<string, { own?: Array<{ members?: Record<string, { parent?: unknown }> }> }>)
+      .flatMap(([, r]) => r.own ?? []).map((n) => n.members?.[`/${h(13)}`]?.parent);
+    const s1 = await saved();
+    expect(btRow(s1)).toEqual(['@member:2']);
+    await load(s1);
+    expect(parentOf('BT')).toBe('AT');
+    expect(btRow(await saved())).toEqual(['@member:2']);
+  });
+
+  // ...and a guid on that row is the scene's OWN move, which must survive the capture as the scene's. A behaviour pin, not
+  // the falsifier of the token filter in `templateNodeRowMoves`: with that filter off this stays green (measured), since
+  // the frame record's readers parse only member tokens and skip a guid there anyway.
+  it('a scene reference node\'s own move (a guid parent) is kept across a save', async () => {
+    chain();
+    install(oWithT({}));
+    await load(scene({ added: [{ guid: 'ffffffff-0000-4000-8000-000000193377', name: 'T', prefab: PT, parentLocalId: 1, traits: {}, children: [], templateMoved: { 3: '@member:2' } }] }, PL));
+    const s1 = JSON.parse(JSON.stringify(await saved())) as SceneData;
+    const node = Object.values((entryOf(s1).members ?? {}) as Record<string, { own?: Array<{ members: Record<string, { parent?: unknown }> }> }>).flatMap((r) => r.own ?? [])[0]!;
+    node.members[`/${h(13)}`] = { ...node.members[`/${h(13)}`], parent: OTHER };
+    await load(s1);
+    expect(parentOf('BT')).toBe('Other');
+    const again = Object.values((entryOf(await saved()).members ?? {}) as Record<string, { own?: Array<{ members?: Record<string, { parent?: unknown }> }> }>).flatMap((r) => r.own ?? []);
+    expect(again.map((n) => n.members?.[`/${h(13)}`]?.parent)).toEqual([OTHER]);
+  });
 
   // Gap 2: `withKeptLegacy`'s `nestedOverrides` merge (#1914 R4) — a pre-v5 P has no nodeGuid, so N's members keep the
   // legacy path channel, and a live capture of N's frame meets the record the load kept as unused in that same frame.
@@ -420,9 +484,16 @@ describe('the #1914 close-out\'s untested carriers (#1933)', () => {
     install(oDoc({}));
     const channel = { 2: { 3: { Transform: { x: 5, retiredField: 7 } }, 9: { Transform: { x: 9 } } } };
     await load(scene({ nestedOverrides: channel }, O));
-    expect(entryOf(await saved()).nestedOverrides).toEqual(channel);
+    // Scene v20 (#2001 S6): the record a member takes is its row (keyed through N by the pre-v5 member's derived guid),
+    // unknown field and all; the record of a localId the frame does not have stays held in the legacy channel.
+    const bRow = (s: SceneData) => (entryOf(s).members as Record<string, Record<string, unknown>>)[`/${g(8)}/${preV5NodeGuid(P, 3)}`];
+    const s1 = await saved();
+    expect(bRow(s1)).toEqual({ traits: { Transform: { x: 5, retiredField: 7 } } });
+    expect(entryOf(s1).nestedOverrides).toEqual({ 2: { 9: { Transform: { x: 9 } } } });
     writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'B')!.id, getTraitByName('Transform')!, 'x', 6);
-    expect(entryOf(await saved()).nestedOverrides).toEqual({ 2: { 3: { Transform: { x: 6, retiredField: 7 } }, 9: { Transform: { x: 9 } } } });
+    const s2 = await saved();
+    expect(bRow(s2)).toEqual({ traits: { Transform: { x: 6, retiredField: 7 } } });
+    expect(entryOf(s2).nestedOverrides).toEqual({ 2: { 9: { Transform: { x: 9 } } } });
   });
 
   // Gap 3: Apply's filter of the prefab's own `moved` (prefabApply.ts) drops a move whose member or parent the apply
@@ -440,7 +511,11 @@ describe('the #1914 close-out\'s untested carriers (#1933)', () => {
       const root = getAllEntities().find((e) => e.guid === ROOT1)!.id;
       writeTraitFieldWithUndo(root, getTraitByName('Transform')!, 'x', 4);
       expect((await applyToPrefabSelective(root, new Set([`${g(7)}.Transform.x`]))).applied).toBe(true);
-      expect((getCachedPrefabSync(O) as unknown as { moved?: unknown }).moved).toEqual(keyed);
+      // Prefab v10 (#2001 S6): the move of a node the row still adds is its row's `parent` record; one whose node is gone
+      // names no member, and stays on the document as the file held it.
+      const after = getCachedPrefabSync(O) as unknown as PrefabFile;
+      expect(after.moved).toEqual({ '2.+k-gone': '@member:1' });
+      expect(rowsOf(after.entities.find((e) => e.prefab === P))['/a+k-extra']).toEqual({ parent: '@member:^.9' });
     } finally {
       vi.unstubAllGlobals();
     }
@@ -546,7 +621,7 @@ describe('a component whose trait is not registered is neither removed nor lost 
   it('a removal the file states is kept, counted, and takes effect once the trait registers', async () => {
     install(withOn3('LateTraitN1b', { speed: 2 })); install(oDoc({}));
     const depth1 = await twoSaves(scene({ members: { [`/${g(3)}`]: { removedTraits: ['LateTraitN1b'] } } }));
-    expect(rowOf(depth1, 3).removedTraits).toEqual(['LateTraitN1b']);
+    expect(rowOf(depth1, 3).traitRemovals).toEqual({ LateTraitN1b: true });
     expect(collectInstanceOverrideListing(rootId(), prefabs.get(P) as PrefabFile).unusedOverrides).toBe(1);
     const depth2 = await twoSaves(scene({ members: { [`/${g(8)}/${g(3)}`]: { traitRemovals: { LateTraitN1b: true } } } }, O));
     expect((entryOf(depth2).members as Record<string, Record<string, unknown>>)[`/${g(8)}/${g(3)}`]!.traitRemovals).toEqual({ LateTraitN1b: true });
@@ -703,7 +778,7 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
   const tNode = (traits: Record<string, unknown> = {}) => ({ parentLocalId: 2, guid: '', key: 'k-t', name: 'TNode', traits: { EntityAttributes: { name: 'TNode', parentId: 0 }, Transform: { x: 1, y: 0, z: 0 }, ...traits }, children: [] });
   const tNodeOf = (out: ReturnType<typeof serializePrefabEditWorld>) => {
     if ('error' in out) throw new Error(out.error);
-    return (out.prefab.entities.find((e) => e.localId === 2) as unknown as { added: Array<{ key?: string; traits: Record<string, unknown> }> }).added.find((n) => n.key === 'k-t')!;
+    return ownNodes(out.prefab.entities.find((e) => e.localId === 2)).find((n) => n.key === 'k-t') as { key?: string; traits: Record<string, unknown> };
   };
   // ── #1944, the UI half: the Inspector row and its Remove — the one deliberate act that drops the data. ──
   // Mutations: removeMissingComponent leaves the name in the bag — save 1 keeps it; the undo's restore is a no-op — the
@@ -770,9 +845,11 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
     const doc = oDoc({ added: [tNode({ RetiredTraitN1bE: { speed: 6 } })] });
     install(doc);
     await load(buildPrefabEditScene(doc) as SceneData);
-    const first = tNodeOf(serializePrefabEditWorld(O));
+    const saved1 = serializePrefabEditWorld(O);
+    const first = tNodeOf(saved1);
     expect(first.traits.RetiredTraitN1bE).toEqual({ speed: 6 });
-    const again = oDoc({ added: [first] });
+    // The second save reads what the first wrote: the node in the row's `own` (prefab v10, #2001 S6).
+    const again = JSON.parse(JSON.stringify((saved1 as { prefab: PrefabFile }).prefab)) as PrefabFile;
     install(again);
     await load(buildPrefabEditScene(again) as SceneData);
     expect(JSON.stringify(tNodeOf(serializePrefabEditWorld(O)))).toBe(JSON.stringify(first));
@@ -787,7 +864,7 @@ describe('an unregistered component on an ordinary entity survives a save (#1933
     const sn = (i: number, traits: Record<string, unknown> = {}) => ({ parentLocalId: 1, guid: `dddddddd-0000-4000-8000-00000019485${i}`, name: `SN${i}`, traits: { EntityAttributes: { name: `SN${i}`, parentId: 0, guid: `dddddddd-0000-4000-8000-00000019485${i}` }, Transform: { x: i, y: 0, z: 0 }, ...traits }, children: [] });
     const s = await twoSaves(scene({ members: { [`/${g(8)}`]: { removed: true } }, added: [sn(1, { RetiredTraitSN: { speed: 1 } }), sn(2), sn(3)] }, O));
     expect(JSON.stringify(s), 'TNode\'s component reaches no entity').not.toContain('RetiredTraitRecycle');
-    const sn1 = (entryOf(s).added as Array<{ name: string; traits: Record<string, unknown> }>).find((n) => n.name === 'SN1')!;
+    const sn1 = ((entryOf(s).members as Record<string, { own?: Array<{ name: string; traits: Record<string, unknown> }> }>)['/']!.own!).find((n) => n.name === 'SN1')!;
     expect(sn1.traits.RetiredTraitSN).toEqual({ speed: 1 });
   });
 
@@ -1023,7 +1100,7 @@ describe('an untouched instance whose frame repeats a key across two documents w
   const vetted = () => new Map<string, unknown>([[PN, { ...pnDoc(), entities: pnDoc().entities.map((e) => (e.localId === 2 ? { ...e, added: [{ ...dupNode(9), key: 'k-vetted' }, keep] } : e)) }]]);
   /** Statement rows: a member row beyond the identity (guid, name) every keyed member gets. */
   const statements = (s: SceneData) => Object.fromEntries(Object.entries((entryOf(s).members ?? {}) as Record<string, Record<string, unknown>>)
-    .filter(([, r]) => Object.keys(r).some((k) => k !== 'guid' && k !== 'name')));
+    .filter(([k, r]) => k !== '/' && Object.keys(r).some((x) => x !== 'guid' && x !== 'name'))); // the `"/"` row names the root (v20)
 
   // Mutation: restore the `twice` branch (every anchor of the frame whole) — the save writes N/QA's lists.
   it('saved untouched: no members, and a reload saves the same', async () => {
@@ -1103,7 +1180,7 @@ describe('a key two prefab files give one frame refuses the instance (#1933 L5)'
     expect(placeholder?.damagedPrefab).toMatch(/template key k-dup to two nodes in one frame/);
     expect(getAllEntities().some((e) => e.name.startsWith('Dup'))).toBe(false);
     const s1 = await saved();
-    expect(entryOf(s1).members).toEqual(entry.members);
+    expect(entryOf(s1).members).toEqual({ '/': { traits: { EntityAttributes: { name: 'Inst' } } }, ...entry.members });
     await load(s1);
     expect(JSON.stringify((await saved()).entities)).toBe(JSON.stringify(s1.entities));
   });
@@ -1145,7 +1222,9 @@ describe('a key two prefab files give one frame refuses the instance (#1933 L5)'
     expect(getAllEntities().some((e) => e.name.startsWith('Dup'))).toBe(false);
     expect(getAllEntities().find((e) => e.missingPrefab)?.damagedPrefab).toMatch(/template key k-dup/);
     const s1 = await saved();
-    expect(entryOf(s1).added).toEqual([node]);
+    // Scene v20 (#2001 S6): the node is inline on the root's `"/"` row, and states its own root row (the name its
+    // expansion shows is the template root's, #2028; the placeholder shows the node's).
+    expect((entryOf(s1).members as Record<string, { own?: unknown[] }>)['/']!.own).toEqual([{ ...node, parentLocalId: 0, members: { '/': { traits: { EntityAttributes: { name: 'OR', sortOrder: 0 } } } } }]);
     await load(s1);
     expect(JSON.stringify((await saved()).entities)).toBe(JSON.stringify(s1.entities));
   });
@@ -1195,6 +1274,6 @@ describe('an unregistered component stays on its own entity (close-out review #4
   // for a captured root (`!prefabRootCaptured &&`) — save 1 drops it.
   it('a prefab instance root\'s unregistered extra component is written back, byte-stable', async () => {
     const s1 = await twoSaves(scene({ traits: { EntityAttributes: { name: 'Inst', parentId: 0 }, RetiredTraitRoot: { speed: 9 } } }));
-    expect((entryOf(s1).traits as Record<string, unknown>).RetiredTraitRoot).toEqual({ speed: 9 });
+    expect((entryOf(s1).members as Record<string, { traits: Record<string, unknown> }>)['/']!.traits.RetiredTraitRoot).toEqual({ speed: 9 });
   });
 });

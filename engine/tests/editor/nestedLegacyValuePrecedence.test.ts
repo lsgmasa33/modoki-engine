@@ -7,8 +7,16 @@
  *
  *  The fuzzer's fixture (`prefabFuzz/harness.ts`): O's row N states `members['/gC/gM'].traits.Transform.y = 8` for the M
  *  it nests (O → R(N, a P) → QR(C, a Q) → M). H nests O once O is placed in H's prefab edit. Mutation for both cases:
- *  `foldStructureLayers` skips `layer.values` (`prefabOverrides.ts`) — M reloads at the inner row's 8. */
+ *  `foldStructureLayers` skips `layer.values` (`prefabOverrides.ts`) — M reloads at the inner row's 8.
+ *
+ *  Since prefab v10 (#2001 S6) both writers state the value on a member row instead, so the first two cases measure the
+ *  row form end to end and the last one the v9 form.
+ *  ⚠️ The `layer.values` mutation above is GREEN on all three now (measured, #2001 S6): these loads are built by the new
+ *  fold from the parsed lists, not by `foldStructureLayers`. What turns them red (measured): the parser skipping a row's
+ *  legacy `nestedOverrides` (`convertOwner`, `parseInstanceRecord.ts`) — all three, since both writers capture in the
+ *  legacy channel and state it through the parser. */
 
+import { rowsOf, v9Channels } from './v10Rows';
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'fs';
 
@@ -21,7 +29,8 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 import { getTraitByName, readTraitData } from '@modoki/engine/runtime';
 import { makeFuzzBackend } from './prefabFuzz/backend';
-import { boot, bridge, memoryStorage, startRun, settle, authored, piOf, type Fixture } from './prefabFuzz/harness';
+import { boot, bridge, memoryStorage, startRun, settle, authored, piOf, flushWatcher, type Fixture } from './prefabFuzz/harness';
+import { loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { writeTraitFieldWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
@@ -61,10 +70,11 @@ describe('#1877 S4: an outer prefab\'s legacy nested value beats an inner templa
   it('a prefab-edit save of the nested M.y: H reopened and the scene\'s H1 both show it', async () => {
     const f = await startRun(be, async () => {}, 'legacy-value-edit-save');
     await nestOInH(f, 3);
-    // The writer still states it in legacy `nestedOverrides` (the shape this fix makes win): pinned, so a writer change
-    // that moves it onto rows is seen here rather than silently making the case vacuous.
-    const row = (JSON.parse(be.read(f.prefabs.H.path)!) as { entities: Array<{ prefab?: string; nestedOverrides?: unknown }> }).entities.find((e) => e.prefab);
-    expect(row?.nestedOverrides).toBeDefined();
+    // Since prefab v10 (#2001 S6) the writer states it on H's row for O as a member row, three frames deep, and in no
+    // legacy channel: pinned, so the case says which form it measures. The legacy form is the last case's.
+    const row = (JSON.parse(be.read(f.prefabs.H.path)!) as { entities: Array<{ prefab?: string }> }).entities.find((e) => e.prefab);
+    expect(v9Channels(row)).toEqual([]);
+    expect(Object.entries(rowsOf(row)).filter(([, r]) => r.traits?.Transform?.y === 3).map(([k]) => k.split('/').length - 1)).toEqual([3]);
     expect(ty(mUnder(under('OR', h1().id)[0]!.id).id)).toBe(3);
     expect(await openPrefabForEditing({ path: f.prefabs.H.path, name: 'H' }, { confirmDiscard: async () => true })).toBeFalsy();
     expect(ty(mUnder(authored().find((e) => e.name === 'OR')!.id).id)).toBe(3);
@@ -92,12 +102,35 @@ describe('#1877 S4: an outer prefab\'s legacy nested value beats an inner templa
     expect(r.applied).toBe(true);
     await settle();
     expect(ty(mUnder(under('OR', h1().id)[0]!.id).id)).toBe(5);
-    // Written where the fix matters, legacy `nestedOverrides` on H's row for O: pinned, as above.
-    const row = (JSON.parse(be.read(f.prefabs.H.path)!) as { entities: Array<{ prefab?: string; nestedOverrides?: Record<string, unknown> }> }).entities.find((e) => e.prefab);
-    expect(Object.keys(row?.nestedOverrides ?? {})).toEqual(['2.4']);
+    // Written on H's row for O as a member row (prefab v10): pinned, as above.
+    const row = (JSON.parse(be.read(f.prefabs.H.path)!) as { entities: Array<{ prefab?: string }> }).entities.find((e) => e.prefab);
+    expect(v9Channels(row)).toEqual([]);
+    expect(Object.entries(rowsOf(row)).filter(([, r]) => r.traits?.Transform?.y === 5).map(([k]) => k.split('/').length - 1)).toEqual([3]);
     // H read on its own (prefab edit), so no scene layer above it can supply the value: H's statement must win.
     expect(await openPrefabForEditing({ path: f.prefabs.H.path, name: 'H' }, { confirmDiscard: async () => true })).toBeFalsy();
     expect(ty(mUnder(authored().find((e) => e.name === 'OR')!.id).id)).toBe(5);
+    await exitPrefabEditing();
+    await settle();
+  });
+
+  it('a v9 file (the value in H\'s row `nestedOverrides`, as every build before prefab v10 wrote it): the scene\'s H1 and H reopened both show it', async () => {
+    // No writer produces this form any more (#2001 S6), so it is put in the file: the released editors' files hold it.
+    // Mutation: see the header (the parser skipping `nestedOverrides`: M shows the inner row's 8).
+    const f = await startRun(be, async () => {}, 'legacy-value-v9-file');
+    await nestOInH(f);
+    const doc = JSON.parse(be.read(f.prefabs.H.path)!) as { entities: Array<Record<string, unknown> & { prefab?: string }> };
+    const row = doc.entities.find((e) => e.prefab)!;
+    const mLid = (JSON.parse(be.read(f.prefabs.Q.path)!) as { entities: Array<{ name: string; localId: number }> }).entities.find((e) => e.name === 'M')!.localId;
+    row.nestedOverrides = { '2.4': { [mLid]: { Transform: { y: 3 } } } };
+    const before = be.snapshot();
+    be.write(f.prefabs.H.path, `${JSON.stringify(doc, null, 2)}\n`);
+    await flushWatcher(be, before);
+    await settle();
+    expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
+    await settle();
+    expect(ty(mUnder(under('OR', h1().id)[0]!.id).id)).toBe(3);
+    expect(await openPrefabForEditing({ path: f.prefabs.H.path, name: 'H' }, { confirmDiscard: async () => true })).toBeFalsy();
+    expect(ty(mUnder(authored().find((e) => e.name === 'OR')!.id).id)).toBe(3);
     await exitPrefabEditing();
     await settle();
   });

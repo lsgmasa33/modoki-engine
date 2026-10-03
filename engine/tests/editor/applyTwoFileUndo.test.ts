@@ -3,6 +3,7 @@
  *  undo restores the row as well", owner, 2026-09-28). Driven through `applyToPrefabWithUndo` and the undo history, over
  *  a fake route that honours if-match as the real one does. */
 
+import { ownNodes, rowAtKey, v9Channels } from './v10Rows';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { prefabApplyRefusal } from '../../app/editor/agentEditorOps';
 import { OpRefusal } from '../../app/debug/opRefusal';
@@ -211,7 +212,8 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
     expect(res.applied).toBe(true);
     expect(res.writes?.map((w) => w.source)).toEqual([P, O]); // innermost first
     expect((disk(P).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
-    expect(disk(O).entities[1]!.overrides?.[2]?.Transform).toBeUndefined(); // U13: the row's override went
+    expect(rowAtKey(disk(O).entities[1], G(2))?.traits?.Transform).toBeUndefined(); // U13: the row's override went
+    expect(v9Channels(disk(O).entities[1])).toEqual([]);
     expect(tfX(byName('A'))).toBe(5);
 
     expect(tfX(inO(ROOT2, 'A'))).toBe(5); // U13: the other O instance shows it too
@@ -229,7 +231,8 @@ describe('U13: a two-file Apply is undone and redone as one', () => {
     // Both back to what the files hold, so nothing is left for Save.
     expect([parked(P), parked(O)]).toEqual([undefined, undefined]);
     expect(((getCachedPrefabSync(P) as PrefabFile).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
-    expect((getCachedPrefabSync(O) as PrefabFile).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
+    expect(rowAtKey((getCachedPrefabSync(O) as PrefabFile).entities[1], G(2))?.traits?.Transform).toBeUndefined();
+    expect(v9Channels((getCachedPrefabSync(O) as PrefabFile).entities[1])).toEqual([]);
     expect([tfX(byName('A')), tfX(inO(ROOT2, 'A'))]).toEqual([5, 5]);
   });
 
@@ -265,7 +268,8 @@ describe('#1715: an added node applied as an override on O\'s row, beside a fiel
     const res = await quietly(() => applyToPrefabWithUndo(nested, new Set([addKey, fieldKey]), { perKey: { [addKey]: O } }));
     expect(res.applied).toBe(true);
     expect(res.writes?.map((w) => w.source)).toEqual([P, O]);
-    expect(disk(O).entities[1]!.added?.map((n) => n.name)).toEqual(['Extra']);
+    expect(ownNodes(disk(O).entities[1]).map((n) => n.name)).toEqual(['Extra']);
+    expect(v9Channels(disk(O).entities[1])).toEqual([]);
     const extras = () => all().filter((e) => e.name === 'Extra');
     expect(extras().length).toBe(2); // one per O instance, the scene's own gone
     expect(extras().some((e) => e.guid === extraGuid)).toBe(false);
@@ -373,7 +377,8 @@ describe('#1729: an id-less ENCLOSING prefab written by U13 round-trips through 
 
     await quietly(() => redo());
     expect(((getCachedPrefabSync(P) as PrefabFile).entities[1]!.traits.Transform as { x: number }).x).toBe(5);
-    expect((getCachedPrefabSync(O) as PrefabFile).entities[1]!.overrides?.[2]?.Transform).toBeUndefined();
+    expect(rowAtKey((getCachedPrefabSync(O) as PrefabFile).entities[1], G(2))?.traits?.Transform).toBeUndefined();
+    expect(v9Channels((getCachedPrefabSync(O) as PrefabFile).entities[1])).toEqual([]);
     expect((getCachedPrefabSync(O) as PrefabFile).id).toBe(oWrite.after.id);
     expect(parked(O)).toBeUndefined();
   });

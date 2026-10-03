@@ -19,6 +19,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { orderEntitiesForSave } from '../../packages/modoki/src/runtime/core/ecs/entityOrder';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -123,11 +124,14 @@ function prefabRootSortOrder(
  *  editor had written CORRECTLY — and the guard then certified the damage as canonical.
  *
  *  Returns `null` when a key cannot be reconstructed; the caller skips the file. */
-function adaptEntity(entry: SceneEntity) {
+function adaptEntity(entry: SceneEntity, version = 0) {
   const attrs = entry.traits?.EntityAttributes;
   const guid = entry.guid || attrs?.guid || '';
   let sortOrder: number;
-  if (entry.prefab) {
+  if (entry.prefab && version >= INSTANCE_MODEL_SCENE_VERSION && typeof attrs?.sortOrder === 'number') {
+    // Scene v20 (#2001 S6): the root's order is the entry's own, always written (`serializeInstanceRecord`).
+    sortOrder = attrs.sortOrder;
+  } else if (entry.prefab) {
     const resolved = prefabRootSortOrder(entry.prefab, entry.overrides);
     if (resolved === null) return null;
     sortOrder = resolved;
@@ -141,10 +145,10 @@ type Adapted = NonNullable<ReturnType<typeof adaptEntity>>;
 
 /** Adapt a whole file, or `null` if ANY entity is unresolvable — order is a whole-array
  *  property, so one unknown sort key makes the entire comparison meaningless. */
-function adaptFile(entities: SceneEntity[]): Adapted[] | null {
+function adaptFile(entities: SceneEntity[], version = 0): Adapted[] | null {
   const out: Adapted[] = [];
   for (const e of entities) {
-    const a = adaptEntity(e);
+    const a = adaptEntity(e, version);
     if (!a) return null;
     out.push(a);
   }
@@ -154,7 +158,7 @@ function adaptFile(entities: SceneEntity[]): Adapted[] | null {
 function readScenes(): { file: string; entities: SceneEntity[]; adapted: Adapted[] | null }[] {
   const out: { file: string; entities: SceneEntity[]; adapted: Adapted[] | null }[] = [];
   for (const file of sceneFiles()) {
-    let data: { entities?: SceneEntity[] };
+    let data: { version?: number; entities?: SceneEntity[] };
     try {
       data = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
@@ -162,7 +166,7 @@ function readScenes(): { file: string; entities: SceneEntity[]; adapted: Adapted
     }
     const entities = data.entities;
     if (!Array.isArray(entities) || entities.length < 2) continue;
-    out.push({ file, entities, adapted: adaptFile(entities) });
+    out.push({ file, entities, adapted: adaptFile(entities, typeof data.version === 'number' ? data.version : 0) });
   }
   return out;
 }

@@ -40,7 +40,7 @@ import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { collectInstanceOverrideKeys } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
 import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../packages/modoki/src/runtime/loaders/loadSceneFile';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
-import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -84,10 +84,8 @@ const rowWithY = (f: Fixture, guid: string, y: number) => {
   return Object.keys(e.members ?? {}).find((k) => e.members![k]!.traits?.Transform?.y === y);
 };
 
-/** O1 deleted; M.y = 6 on P1's Q frame; trash Q, then P; save; reload as a build BEFORE #1935 wrote the file, so P1
- *  reloads as its placeholder while the world holds the copy of Q its Q frame was expanded from. That older build copied
- *  the NESTED frame (Q) and never a top-level one (P): the file is today's save without P's copy. Since #1935 today's own
- *  file expands P1 from P's copy, so this is the shape the in-place return still meets a placeholder in. */
+/** O1 deleted; M.y = 6 on P1's Q frame; trash Q, then P; save; reload, so P1 is its placeholder (ruling B). A v20 save
+ *  writes no copy of P or Q (#2001 S6), which is the file an in-place return of P meets. */
 async function missingBoth(key: string) {
   const f = await startRun(be, noNest, key);
   const o1 = getAllEntities().find((x) => { const pi = piOf(x.id); return x.parentId === 0 && pi?.source === f.prefabs.O.guid && pi.rootInstanceId === x.id; })!.id;
@@ -102,11 +100,9 @@ async function missingBoth(key: string) {
   await trash(f, 'P');
   expect((await saveScene({ allowDialog: false })).saved).toBe(true);
   const file = JSON.parse(be.read(f.scenePath)!) as { embeddedPrefabs?: Record<string, unknown> };
-  expect(Object.keys(file.embeddedPrefabs ?? {}).sort(), 'premise: the save copies P and Q').toEqual([f.prefabs.P.guid, f.prefabs.Q.guid].sort());
+  expect(file.embeddedPrefabs, 'premise: a v20 save writes no copy').toBeUndefined();
   const rowKey = rowWithY(f, p1Guid, 6);
   expect(rowKey, 'premise: P1 states M.y = 6 on a member row').toBeTruthy();
-  delete file.embeddedPrefabs![f.prefabs.P.guid]; // the file as the build before #1935 wrote it
-  be.write(f.scenePath, `${JSON.stringify(file, null, 2)}\n`);
   expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
   await settle();
   expect(placeholderGuids().has(p1Guid), 'premise: P1 reloads as a placeholder').toBe(true);
@@ -151,7 +147,7 @@ describe('#1934 S1: a load refuses an expansion that read with another reader', 
   /** A one-entry scene placing P, loaded into the live world with `expandWith` choosing the callback's reader. */
   async function loadP(f: Fixture, opts: { read?: ExpansionReader; expandWith: (handed: ExpansionReader | undefined) => ExpansionReader | undefined }) {
     const world = getCurrentWorld();
-    const scene = { version: SCENE_FORMAT_VERSION, resources: [], entities: [{ id: 1, prefab: f.prefabs.P.guid, guid: 'abcdabcd-0000-4000-8000-000000000001', traits: { EntityAttributes: { name: 'Probe', parentId: 0 } } }] } as unknown as SceneData;
+    const scene = { version: CAPTURE_FORM_SCENE_VERSION, resources: [], entities: [{ id: 1, prefab: f.prefabs.P.guid, guid: 'abcdabcd-0000-4000-8000-000000000001', traits: { EntityAttributes: { name: 'Probe', parentId: 0 } } }] } as unknown as SceneData;
     return loadSceneFile(scene, {
       world, clearMarks: false, loadModels: false, read: opts.read,
       fetchPrefab: async (r) => (getCachedPrefabSync(r) as object | null) ?? null,
@@ -182,16 +178,16 @@ describe('#1934 S1: a load refuses an expansion that read with another reader', 
   });
 });
 
-describe('#1934 L1: a copy belongs to the scene that carried it', () => {
-  it('a base whose own frames were unexpanded is not saved with its level\'s copy, and its reload expands nothing new', async () => {
-    // Mutation: in `collectEmbeddedPrefabs` read every scene's copies (`embeddedPrefabGuids` over all keys) → the base's
-    // file gains the level's copy of Q, and its next reload expands the base's Q frames (2 → 0 unexpanded).
+describe('#1934 L1: a base and its level, a nested prefab missing', () => {
+  it('a base whose own frames were unexpanded is saved with no copy, as its level is, and its reload expands nothing new', async () => {
+    // Until scene v20 the level's save carried Q's copy and the base's must not take it (`collectEmbeddedPrefabs`). A v20
+    // save writes no copy for either (#2001 S6); what is left is that the base reloads as it was saved.
     const f = await startRun(be, noNest, 'l1-chain');
     const lPath = f.scenePath.replace(/Fuzz\.json$/, 'Level.json');
     const lGuid = f.sceneGuid.replace(/^.{8}/, 'abababab');
     const loGuid = lGuid.replace(/^.{8}/, 'acacacac');
     const level = {
-      id: lGuid, version: SCENE_FORMAT_VERSION, name: 'Level', createdAt: '2026-01-01T00:00:00.000Z', resources: [], baseScene: f.sceneGuid,
+      id: lGuid, version: CAPTURE_FORM_SCENE_VERSION, name: 'Level', createdAt: '2026-01-01T00:00:00.000Z', resources: [], baseScene: f.sceneGuid,
       entities: [{ id: 1, prefab: f.prefabs.O.guid, guid: loGuid, traits: { EntityAttributes: { name: 'LO', parentId: 0 }, Transform: { x: 9, y: 0, z: 0 } } }],
     };
     be.write(lPath, `${JSON.stringify(level, null, 2)}\n`);
@@ -211,11 +207,11 @@ describe('#1934 L1: a copy belongs to the scene that carried it', () => {
     await settle();
     expect((await saveAll({ allowDialog: false })).saved).toBe(true);
     await trash(f, 'Q');
-    // An edit in L only: L's save carries the copy (its Q frames are live), F is not written.
+    // An edit in L only: L is saved, F is not written.
     expect(writeTraitFieldWithUndo(getAllEntities().find((e) => e.guid === loGuid)!.id, TF(), 'x', 10)).toBeFalsy();
     await settle();
     expect((await saveAll({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys((JSON.parse(be.read(lPath)!) as { embeddedPrefabs?: object }).embeddedPrefabs ?? {}), 'premise: L carries Q').toEqual([f.prefabs.Q.guid]);
+    expect((JSON.parse(be.read(lPath)!) as { embeddedPrefabs?: object }).embeddedPrefabs, 'L carries no copy (v20)').toBeUndefined();
     expect((JSON.parse(be.read(f.scenePath)!) as { embeddedPrefabs?: object }).embeddedPrefabs, 'premise: F carries none').toBeUndefined();
     // Reopen: F loads before L's copy is in the world, so F's own Q frames stay unexpanded (fork A).
     await reopenLevel();
@@ -231,7 +227,7 @@ describe('#1934 L1: a copy belongs to the scene that carried it', () => {
   });
 });
 
-describe('#1939 item 2 (serious): the copy store is carried across an Apply undo\'s world swap', () => {
+describe('#1939 item 2 (serious): an Apply undo\'s world swap, a nested prefab missing', () => {
   // #2046 S7.3: an Apply's undo restores the records in place and reloads no world, so it swaps nothing: the snapshot
   // reload these cases pin is now its FALLBACK, taken when the store cannot state the world (a step since left the
   // records behind). Each case leaves them stale before its undo and redo (`stranded`) to reach it; the record path is
@@ -241,9 +237,8 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
   // trashed after (its frames shown as placeholders at once, #2056; the save carries its copy); the Apply's undo reloads the snapshot. Without the
   // carry, Q's frames came back unexpanded and the next save wrote no copy for them.
   // Owner ruling B (#2001 S5, #2028): the swap is a load, and no copy expands anything — Q's frames come back as their
-  // rows' Missing Prefab placeholders. The carry still matters until S6 stops writing copies: the next save writes Q's.
-  // Mutation: drop `sceneCopies` from `applyPrefabUndo.ts`' three restores → the save after the undo has no copy of Q.
-  it('undoing an Apply after a nested prefab was trashed shows its frames as placeholders and keeps its copy', async () => {
+  // rows' Missing Prefab placeholders. Scene v20 writes no copy (#2001 S6), so the carry no longer reaches a file.
+  it('undoing an Apply after a nested prefab was trashed shows its frames as placeholders; no save writes a copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-swap');
     const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
     const p1 = p1Id(f);
@@ -259,22 +254,21 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     const shown = unexpandedRows().size;
     expect(shown, 'premise: each Q row its placeholder').toBeGreaterThan(0);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {}), 'premise: the save carries Q').toContain(f.prefabs.Q.guid);
+    expect(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs).toBeUndefined();
     stranded();
     expect((await undoStep('undo')).did).toBe(true); // the Apply
     await settle();
     expect(qCount(), 'ruling B: no Q frame expands').toBe(0);
     expect(unexpandedRows().size, 'each Q row its placeholder').toBe(shown);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+    expect(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs).toBeUndefined();
   });
 
   // #1948 S2: the same route in an UNTITLED world (New Scene, P placed). Its snapshot's id is minted at the Apply's
   // serialize, and a New Scene world has no loaded scene, so a carry keyed by the world it came from matched nothing the
   // reload loads and the swap's chain filter dropped all of it.
-  // Ruling B as above: the frames come back as placeholders on every swap, and the copy survives each to the Save As.
-  // Mutation: `SceneManager.captureSceneCopies` ignores `primaryAs` → the Save As writes no copy of Q.
-  it('an untitled world: each swap shows the frames as placeholders, and Save As writes the copy', async () => {
+  // Ruling B as above: the frames come back as placeholders on every swap. (Until v20 the Save As wrote Q's copy.)
+  it('an untitled world: each swap shows the frames as placeholders, and Save As writes no copy', async () => {
     const f = await startRun(be, noNest, 'c2-undo-untitled');
     await newScene();
     await settle();
@@ -308,15 +302,15 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(qCount(), 'second undo').toBe(0);
     const asPath = f.scenePath.replace(/[^/]+$/, 'untitled-c2.json');
     expect((await saveScene({ path: asPath, allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(JSON.parse(be.read(asPath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+    expect(JSON.parse(be.read(asPath)!).embeddedPrefabs).toBeUndefined();
   });
 
   // The record path (#2046 S7.3): no swap, so nothing is loaded. It once kept a trashed prefab's frames live across the
   // undo and the redo, where the snapshot reload showed placeholders; since #2056 the trash itself shows the placeholders
   // (owner ruling, "Missing at once, as Unity"), so the record path and the reload now agree — the placeholders the trash
-  // made stay placeholders, and the save still carries Q's copy.
+  // made stay placeholders.
   // Mutation: drop the conversion from the trash's repair (`assetEditorBindings.ts`) → Q's frames are live at the premise.
-  it('with the records fresh, the undo and redo keep showing a trashed prefab\'s frames as the placeholders the trash made, and the save carries its copy', async () => {
+  it('with the records fresh, the undo and redo keep showing a trashed prefab\'s frames as the placeholders the trash made', async () => {
     const f = await startRun(be, noNest, 'c2-undo-records');
     const qCount = () => getAllEntities().filter((e) => piOf(e.id)?.source === f.prefabs.Q.guid).length;
     const p1 = p1Id(f);
@@ -338,6 +332,6 @@ describe('#1939 item 2 (serious): the copy store is carried across an Apply undo
     expect(qCount(), 'redo').toBe(0);
     expect(unexpandedRows().size, 'redo').toBe(shown);
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    expect(Object.keys(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs ?? {})).toContain(f.prefabs.Q.guid);
+    expect(JSON.parse(be.read(f.scenePath)!).embeddedPrefabs).toBeUndefined();
   });
 });

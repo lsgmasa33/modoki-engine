@@ -102,7 +102,7 @@ import { clearAllOverrideMarks, getCarriedOverrideMarks, restoreOverrideMarks } 
 import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
 import { frameRootDoc, noteFrameRootDoc, type TemplateDoc } from '../core/ecs/identityParents';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
-import { SCENE_FORMAT_VERSION } from '../core/version';
+import { CAPTURE_FORM_SCENE_VERSION } from '../core/version';
 
 import { Persistent } from '../traits/Persistent';
 import { Time } from '../core/traits/Time';
@@ -1054,9 +1054,10 @@ class SceneManagerImpl implements SceneManager {
       // a double setJournalTick every frame). One combined entity list, one call.
       if (carriedSnapshots.length > 0) {
         await loadSceneFile(
-          // Snapshots come from the live (already-migrated) world, so tag them
-          // current — an older version would re-run migrations needlessly.
-          { version: SCENE_FORMAT_VERSION, resources: [], entities: carriedSnapshots },
+          // Snapshots come from the live (already-migrated) world, flattened: a carried instance's root is in the
+          // old capture's trait form, so they are tagged with that form's version (#2001 S6). The one rung
+          // above it only stamps.
+          { version: CAPTURE_FORM_SCENE_VERSION, resources: [], entities: carriedSnapshots },
           {
             world: nextWorld,
             clearMarks: false, // once-per-world clear above owns this (A9 defect 1)

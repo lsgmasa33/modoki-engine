@@ -814,7 +814,7 @@ describe("structural edits inside an owned nested instance round-trip (#1358)", 
   // empty; a row that authors structure is therefore always stated by the scene, because once the
   // scene addresses a path it owns all three lists (see the F1 test above — that is what makes an
   // empty list representable). Asserted so the asymmetry is pinned rather than assumed.
-  it('the slot IS written for a row that authors structure, even with no scene edit', async () => {
+  it('the structure IS stated for a row that authors a key-less node, even with no scene edit', async () => {
     const WIDGET = 'dddddddd-0000-4000-8000-000000000002';
     const outerRowAdded = { id: OUTER, rootLocalId: 1, entities: [
       row(1, 'OuterRoot', 0), row(2, 'Panel', 1),
@@ -828,7 +828,13 @@ describe("structural edits inside an owned nested instance round-trip (#1358)", 
     sc.entities[1]!.added = undefined;
     await load(sc as unknown as SceneData);
     const saved = await serializeScene() as unknown as { entities: Array<Record<string, unknown>> };
-    expect(saved.entities.find((e) => e.prefab === OUTER)!.nestedStructure).toBeDefined();
+    // Scene v20 (#2001 S6): the same restatement in the row form — no legacy slot; the row's key-less node (a document
+    // from before #1937's mint) is stated as the scene's own on the nested root's row, and the template's is cut.
+    const entry = saved.entities.find((e) => e.prefab === OUTER)!;
+    expect(entry.nestedStructure).toBeUndefined();
+    const rows = Object.entries(entry.members as Record<string, { own?: Array<{ guid?: string }>; removed?: boolean }>);
+    expect(rows.flatMap(([, r]) => r.own ?? []).map((n) => n.guid)).toEqual([WIDGET]);
+    expect(rows.filter(([k, r]) => k.endsWith(`/a+${WIDGET}`) && r.removed === true)).toHaveLength(1);
     // And it round-trips: the row's Widget is still there, exactly once.
     await load(saved as unknown as SceneData);
     expect(paths().filter((x) => x.endsWith('Widget'))).toHaveLength(1);
@@ -935,8 +941,12 @@ describe('edits inside a USER-ADDED nested instance\'s own nested rows round-tri
     rename(idAt('Holder/OuterRoot/Panel/Button/MidRoot/Slot/InnerRoot'), 'InnerRenamed');
     const edited = await serializeScene() as unknown as Saved;
     await load(edited as unknown as SceneData);
+    // Compared from the reload on: this bare loader seeds no instance record, so the save after it captures, and a
+    // capture has no pin for a removed member (the first save's record kept Leaf's from the delete). The editor's load
+    // parses the record from the file, pin and all (`prefabFuzz` holds that round trip).
     const again = await serializeScene() as unknown as Saved;
-    expect(JSON.stringify(midNode(again))).toBe(JSON.stringify(midNode(edited)));
+    await load(again as unknown as SceneData);
+    expect(JSON.stringify(midNode(await serializeScene() as unknown as Saved))).toBe(JSON.stringify(midNode(again)));
   });
 });
 
@@ -1131,6 +1141,7 @@ describe('Apply over a move from before #1869, and what the Apply dialog says (#
       deleteEntitiesWithUndo([idAt('Holder/OuterRoot/InnerRoot')]);
       const gone = await applyToPrefabSelective(idAt('Holder/OuterRoot'), new Set(['-removed.4']));
       expect(gone.prefabAfter!.moved).toBeUndefined();
+      expect(JSON.stringify(gone.prefabAfter!.entities)).not.toContain('"parent":'); // nor as a v10 row's move
       expect(idAt('Holder2/OuterRoot/Panel/Button')).toBeGreaterThan(0);
     } finally { prefabs.delete(OUTER_M); setPrefabCache(OUTER_M, null); }
   });
@@ -1239,7 +1250,9 @@ describe('a prefab written from a tree with moved members keeps the moves (#1437
 
   it('nothing moved: no `moved` is written', async () => {
     await load(grouped());
-    expect(serializePrefab(idAt('Group'))!.moved).toBeUndefined();
+    const file = serializePrefab(idAt('Group'))!;
+    expect(file.moved).toBeUndefined();
+    expect(JSON.stringify(file.entities)).not.toContain('"parent":'); // nor as a v10 row's move
   });
 });
 

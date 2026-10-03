@@ -10,11 +10,11 @@
 
 import type { AddedEntity, NestedStructureDelta, SceneMemberRow } from './loadSceneFile';
 import type { PrefabDoc, PrefabDocRow, PrefabReader, RowKey } from '../prefab/instanceRecord';
-import { deriveGuid, nodeRowComponent, nodeRowKey, parseSteps } from '../core/assetRefRules';
+import { nodeRowComponent, nodeRowKey, parseSteps, preV5NodeGuid } from '../core/assetRefRules';
 import { isMemberToken } from '../core/templateRefs';
 import { splitMalformedChannels } from './malformedChannels';
 import {
-  foldRowStep, foldStructureLayers, frameKeyIndex, overRowsOf,
+  foldRowStep, foldStructureLayers, frameKeyIndex, overRowsOf, ownRootRow,
   type ForwardState, type FrameChannels, type MemberRowChannels, type StructureLayer,
 } from './prefabOverrides';
 
@@ -26,13 +26,7 @@ export const badRows = (members: unknown): boolean => isRecord(members) && Objec
 
 // ── Identity of a document row ──────────────────────────────────────────────────────────────────────
 
-/** The node identity a PRE-v5 document's row (no `nodeGuid`: v0.7.2 and earlier wrote prefab v4) has in
- *  memory (§ 2.7, § 10.5). Deterministic in (document, localId); the first editor write of that document
- *  must mint exactly this value, so a scene's converted keys never orphan. `lid:` is no member-step
- *  spelling (`parseStep`), so this seed can never equal a derived member guid's. */
-export function preV5NodeGuid(docGuid: string, localId: number): string {
-  return deriveGuid(`${docGuid}|lid:${localId}`);
-}
+export { preV5NodeGuid };
 
 /** One FRAME of an instance: the document that supplies it, and the row key of its root (`''` for the
  *  owner's own top frame, whose root is `"/"`). */
@@ -113,7 +107,7 @@ export function chainStep(c: Chain, component: string, read: PrefabReader): Chai
     if (!('doc' in got)) return { unresolved: true };
     const frame = frameOf(`${c.frame.prefix}/${component}`, got.doc, node.prefab);
     const layers: Layer[] = [
-      { slots: node.nestedStructure, rows: node.members, values: node.overrides, valuePaths: node.nestedOverrides },
+      { slots: node.nestedStructure, rows: node.members, ...ownRootRow(node.members), values: node.overrides, valuePaths: node.nestedOverrides },
       ...overRowsOf<AddedEntity>(node).map((o): Layer => ({ rows: o.rows, rootRow: o.rootRow })),
     ];
     const folded = foldStructureLayers(got.doc as never, layers, 0, { added: node.added, removed: node.removed, removedTraits: node.removedTraits });

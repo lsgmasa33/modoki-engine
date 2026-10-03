@@ -31,7 +31,6 @@ import { type PrefabFile } from './prefab';
 import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { loadSceneFile, instantiatePrefabIntoWorld, type ExpansionReader, type SceneData } from '../../runtime/loaders/loadSceneFile';
-import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
 import { openScenePath } from '../../runtime/scene/openScenePath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isGuid } from '../../runtime/core/assetRefRules';
@@ -169,7 +168,8 @@ async function reexpandEntryPlaceholder(id: number): Promise<void> {
   const children = all.filter((e) => e.parentId === id).map((e) => e.id);
   // Its guid is the new root's: the placeholder goes first, or the load's own pass-1 entity collides with it.
   destroyEntity(handle, world);
-  await loadSceneFile({ id: 'reimport', version: SCENE_FORMAT_VERSION, name: '', resources: [], entities: [entry] } as unknown as SceneData, {
+  // Read by the rules of the file the kept entry came from (`UnresolvedPrefabRef.version`, #2001 S6).
+  await loadSceneFile({ id: 'reimport', version: ref.version, name: '', resources: [], entities: [entry] } as unknown as SceneData, {
     world,
     clearMarks: false,
     scenePath: live.sourceScene || openScenePath() || undefined,

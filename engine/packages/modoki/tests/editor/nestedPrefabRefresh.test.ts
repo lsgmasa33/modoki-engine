@@ -108,7 +108,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => TRAITS.find((t) => t.name === n),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn(), getCachedPrefab: () => undefined }));
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   newGuid: () => 'gen-guid',
   registerAsset: vi.fn(),
@@ -200,8 +200,12 @@ describe('nested override serialization', () => {
     const out = serializePrefab(outerRoot, OUTER)!;
     const ref = out.entities.find((e) => e.prefab)!;
     expect(ref.prefab).toBe(INNER);
-    // The override rides on the reference row in the CHILD's localId space (I2 = 2).
-    expect(ref.overrides?.[2]?.Transform?.x).toBe(5);
+    // The override rides on the reference row, on I2's member row (prefab v10). INNER has no node ids, so the row is keyed
+    // by the identity the instance model derives for its localId 2.
+    const { preV5NodeGuid } = await import('../../src/runtime/core/assetRefRules');
+    const rows = (ref as unknown as { members?: Record<string, { traits?: Record<string, Record<string, unknown>> }> }).members ?? {};
+    expect(rows[`/${preV5NodeGuid(INNER, 2)}`]?.traits?.Transform).toEqual({ x: 5 });
+    expect(ref.overrides).toBeUndefined();
   });
 });
 

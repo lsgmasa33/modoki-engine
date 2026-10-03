@@ -7,6 +7,8 @@
  *
  *  Driven through the real loader, capture, save and rebuild. Each case names the mutation that turns it red. */
 
+import { valuesByLocalId, ownNodes, rowsOf as v10RowsOf, v9Channels } from './v10Rows';
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -115,9 +117,10 @@ async function load(data: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure) => {
+    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure, expansion) => {
       const id = instantiatePrefabIntoWorld(
         getCurrentWorld(), prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
+        { frame: expansion?.frame, sceneVersion: expansion?.sceneVersion },
       );
       if (id && rootGuid) {
         for (const e of getCurrentWorld().entities) {
@@ -144,6 +147,11 @@ const inInstance = (guid: string, name: string): number => {
   return hits[0]!.id;
 };
 const meta = (t: string) => getTraitByName(t)!;
+/** What a written row states about its prefab's members, by localId (the v10 row keys them by identity). */
+const ov = (owner: unknown) => valuesByLocalId(owner, (g) => prefabs.get(g), preV5NodeGuid).overrides;
+/** …its members below the root (a v10 owner states its root's name and order on the `"/"` row). */
+const membersOv = (owner: unknown) => { const o = { ...ov(owner) }; delete o[(prefabs.get((owner as { prefab: string }).prefab) as { rootLocalId: number }).rootLocalId]; return o; };
+const nestedOv = (owner: unknown) => valuesByLocalId(owner, (g) => prefabs.get(g), preV5NodeGuid).nestedOverrides;
 const x = (id: number) => (readTraitData(id, meta('Transform')) as { x: number }).x;
 
 beforeEach(() => {
@@ -373,7 +381,7 @@ describe('#1659: every value Apply writes into a template goes through ONE write
     addTraitToEntitiesWithUndo([qRoot], meta('UIFocusable'), { navDown: 'dddddddd-0000-4000-8000-000000001660' });
     await applyKeys(rootOf(ROOT1), (k) => k.startsWith('+added.'));
     const qRow = written(P)!.entities.find((e) => e.prefab === Q)!;
-    const nav = (qRow.overrides?.[1]?.UIFocusable as { navDown?: string } | undefined)?.navDown;
+    const nav = (ov(qRow)[1]?.UIFocusable as { navDown?: string } | undefined)?.navDown;
     expect(nav && isMemberToken(nav)).toBe(true);
     const q2 = getAllEntities().find((e) => e.name === 'QR' && e.id !== qRoot && getAllEntities().some((a) => a.name === 'QA' && a.parentId === e.id))!;
     const q2a = getAllEntities().find((e) => e.name === 'QA' && e.parentId === q2.id)!;
@@ -401,7 +409,7 @@ describe('#1658 / owner ruling C: an edit on a nested instance can be applied to
     const res = await applyToPrefabSelective(nestedRoot(), new Set([speedKey]));
     expect(res.targets).toEqual([{ key: speedKey, target: O }]);
     expect(written(P)).toBeUndefined();
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Rotate3D).toEqual({ axis: 'x', speed: 7 });
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Rotate3D).toEqual({ axis: 'x', speed: 7 });
     expect([rotate(inInstance(ROOT1, 'A'))?.speed, rotate(inInstance(ROOT2, 'A'))?.speed]).toEqual([7, 7]); // every O
     expect(listed()).not.toContain(speedKey); // the source keeps no override of it (U15)
   });
@@ -413,7 +421,7 @@ describe('#1658 / owner ruling C: an edit on a nested instance can be applied to
     const res = await applyToPrefabSelective(nestedRoot(), new Set([speedKey]), { default: 'frame' });
     expect(res.targets).toEqual([{ key: speedKey, target: P }]);
     expect(written(P)!.entities.find((e) => e.localId === 2)!.traits.Rotate3D).toMatchObject({ axis: 'x', speed: 7 });
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Rotate3D).toBeUndefined();
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Rotate3D).toBeUndefined();
     expect(res.alsoReverted?.map((r) => r.source)).toEqual([O]);
     expect([rotate(inInstance(ROOT1, 'A'))?.speed, rotate(inInstance(ROOT2, 'A'))?.speed]).toEqual([7, 7]);
   });
@@ -432,7 +440,7 @@ describe('#1658 / owner ruling C: an edit on a nested instance can be applied to
     const res = await applyToPrefabSelective(nestedRoot(), new Set([key]));
     expect(res.targets).toEqual([{ key, target: O }]);
     expect(written(P)).toBeUndefined();
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Rotate3D).toBeUndefined();
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Rotate3D).toBeUndefined();
     expect([rotate(inInstance(ROOT1, 'A')), rotate(inInstance(ROOT2, 'A'))]).toEqual([null, null]);
   });
 
@@ -491,7 +499,7 @@ describe('#1693 P5–P6 close-out review: the cases the second review drove', ()
     const key = `-trait.${gA}.Rotate3D`;
     const res = await applyToPrefabSelective(nestedRoot(), new Set([key]));
     expect(res.targets).toEqual([{ key, target: P }]);
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Rotate3D).toBeUndefined();
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Rotate3D).toBeUndefined();
     expect([rotate(inInstance(ROOT1, 'A')), rotate(inInstance(ROOT2, 'A'))]).toEqual([null, null]);
     expect(listed()).toEqual([]);
   });
@@ -577,7 +585,7 @@ describe('#1693 P5–P6 close-out review: the cases the second review drove', ()
     const speed = `${gA}.Rotate3D.speed`;
     const axis = `${gA}.Rotate3D.axis`;
     const res = await applyToPrefabSelective(nestedRoot(), new Set([speed, axis]), { perKey: { [speed]: O, [axis]: 'frame' } });
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Rotate3D?.speed).toBe(7);
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Rotate3D?.speed).toBe(7);
     expect((res.alsoReverted ?? []).flatMap((r) => r.keys)).not.toContain(`${gA}.Rotate3D.speed`);
     expect(rotate(inInstance(ROOT2, 'A'))).toMatchObject({ axis: 'z', speed: 7 });
   });
@@ -611,7 +619,7 @@ describe('U14 (owner, 2026-09-28): Apply on the OUTER instance offers its nested
     const res = await applyToPrefabSelective(rootOf(ROOT1), new Set([...keys.all.filter((k) => !keys.defaultOverrides.includes(k)), ...keys.nested]));
     expect(res.targets).toEqual([{ key: nestedKey, target: O }]);
     expect(written(P)).toBeUndefined();
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Transform).toEqual({ x: 5 });
+    expect(ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.Transform).toEqual({ x: 5 });
     expect([tfx(inInstance(ROOT1, 'A')), tfx(inInstance(ROOT2, 'A'))]).toEqual([5, 5]);
     expect(outerKeys().nested).toEqual([]);
   });
@@ -626,7 +634,7 @@ describe('U14 (owner, 2026-09-28): Apply on the OUTER instance offers its nested
     expect(keys.nested).toContain(`${gN}:${gA}.UIFocusable.focusOrder`);
     expect(keys.nested.some((k) => k.includes('+trait.'))).toBe(false);
     await applyToPrefabSelective(rootOf(ROOT1), new Set(keys.nested));
-    expect((written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.UIFocusable as { focusOrder?: number } | undefined)?.focusOrder).toBe(2);
+    expect((ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.UIFocusable as { focusOrder?: number } | undefined)?.focusOrder).toBe(2);
   });
 
   it('picked explicitly, "Apply to Prefab \'P\'" writes P\'s template instead', async () => {
@@ -663,7 +671,7 @@ describe('U12 for a removed NODE: a member the scene deleted inside a nested ins
     const res = await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
     expect(res.targets).toEqual([{ key, target: O }]);
     expect(written(P)).toBeUndefined();
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.removed).toEqual([2]);
+    expect(v10RowsOf(written(O)!.entities.find((e) => e.localId === 4))[`/${gA}`]?.removed).toBe(true);
     expect(names().filter((n) => n === 'A')).toEqual([]);
   });
 
@@ -675,7 +683,7 @@ describe('U12 for a removed NODE: a member the scene deleted inside a nested ins
     expect(keys.nested).toContain(key);
     const res = await applyToPrefabSelective(rootOf(ROOT1), new Set([key]));
     expect(res.targets).toEqual([{ key, target: O }]);
-    expect(written(O)!.entities.find((e) => e.localId === 4)!.removed).toEqual([2]);
+    expect(v10RowsOf(written(O)!.entities.find((e) => e.localId === 4))[`/${gA}`]?.removed).toBe(true);
     expect(names().filter((n) => n === 'A')).toEqual([]);
   });
 });
@@ -717,8 +725,11 @@ describe('#1715: a node the scene added inside a nested instance can be added by
     const res = await applyToPrefabSelective(inInstance(ROOT1, 'R'), new Set([key]), { perKey: { [key]: O } });
     expect(res.targets).toEqual([{ key, target: O }]);
     expect(written(P)).toBeUndefined();
-    const added = written(O)!.entities.find((e) => e.localId === 4)!.added!;
-    expect(added.map((n) => [n.name, n.parentLocalId, n.guid, !!n.key, n.children.map((c) => c.name)])).toEqual([['Extra', 2, '', true, ['Extra2']]]);
+    // On A's row (a v9 row said `parentLocalId: 2`): the anchor is the row's key.
+    const rowN = written(O)!.entities.find((e) => e.localId === 4);
+    expect(v9Channels(rowN)).toEqual([]);
+    expect(ownNodes(rowN)).toHaveLength(1);
+    expect((v10RowsOf(rowN)[`/${gA}`]?.own ?? []).map((n) => [n.name, n.guid, !!n.key, (n.children ?? []).map((c) => c.name)])).toEqual([['Extra', '', true, ['Extra2']]]);
     expect([count('Extra'), count('Extra2')]).toEqual([2, 2]);
     inInstance(ROOT1, 'Extra'); inInstance(ROOT2, 'Extra'); // one in each (throws on zero or two)
   });
@@ -861,7 +872,7 @@ describe('#1715: a node the scene added inside a nested instance can be added by
     const keys = collectInstanceOverrideKeys(rootOf(ROOT1), getCachedPrefabSync(O) as PrefabFile);
     expect(keys.nested.length).toBeGreaterThan(0); // precondition: the nested A's component is listed on O
     await applyToPrefabSelective(rootOf(ROOT1), new Set([...keys.all, ...keys.nested]));
-    const nav = (written(O)!.entities.find((e) => e.localId === 4)!.overrides?.[2]?.UIFocusable as { navDown?: string } | undefined)?.navDown;
+    const nav = (ov(written(O)!.entities.find((e) => e.localId === 4)!)[2]?.UIFocusable as { navDown?: string } | undefined)?.navDown;
     expect(nav && isMemberToken(nav)).toBe(true);
     for (const root of [ROOT1, ROOT2]) expect(focus(inInstance(root, 'A'))?.navDown).toBe(guidOf(inInstance(root, 'X')));
   });
@@ -1217,7 +1228,9 @@ describe('#1730: Revert of a member the scene REMOVED inside a nested instance b
       await load(legacyScene());
       expect(named('L')).toEqual([]); // precondition: nothing expanded for C
       const { scene: s, entry } = await saved();
-      expect(entry.nestedOverrides).toEqual({ '4.3': { 2: { Transform: { x: 7 } } } });
+      // Scene v20 (#2001 S6): kept as the row the channel names (through N and C to L), which no member takes yet.
+      expect(entry.nestedOverrides).toBeUndefined();
+      expect(Object.entries(entry.members as Record<string, unknown>).filter(([k]) => k.split('/').length === 4).map(([, r]) => r)).toEqual([{ traits: { Transform: { x: 7 } } }]);
       install(qDoc());
       await load(s);
       expect(xsOf('L')).toEqual([7]);
@@ -1733,8 +1746,8 @@ describe('#1736: an Apply is ONE plan of per-key effects, keyed by SLOT — the 
       const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, kq]), { perKey: { [kq]: Q } }));
       expect(res.applied).toBe(true);
       const o = written(O)!;
-      expect(o.entities.find((e) => e.localId === 4)!.overrides?.[2]?.Transform).toEqual({ x: 5 });
-      expect(o.entities.find((e) => e.localId === 5)!.overrides?.[2]?.Transform).toBeUndefined();
+      expect(ov(o.entities.find((e) => e.localId === 4)!)[2]?.Transform).toEqual({ x: 5 });
+      expect(ov(o.entities.find((e) => e.localId === 5)!)[2]?.Transform).toBeUndefined();
       expect(res.alsoReverted).toEqual([{ source: O, keys: [kq] }]);
       expect(res.effects?.find((e) => e.key === kq)!.alsoReverts).toEqual([{ source: O, name: 'O', keys: [kq], what: ['its override of Transform.x on QA'] }]);
       expect(tfx(under('Slot2', 'QA'))).toBe(7);
@@ -1753,7 +1766,7 @@ describe('#1736: an Apply is ONE plan of per-key effects, keyed by SLOT — the 
       writeTraitFieldWithUndo(under('Slot2', 'A'), meta('Transform'), 'x', 7);
       const res = await quietly(() => applyToPrefabSelective(rootOf(ROOT1), new Set([k1, k2]), { perKey: { [k2]: P } }));
       expect(res.applied).toBe(true);
-      expect(written(O)!.entities.find((e) => e.localId === 5)!.overrides?.[2]?.Transform).toBeUndefined();
+      expect(ov(written(O)!.entities.find((e) => e.localId === 5)!)[2]?.Transform).toBeUndefined();
       expect([tfx(under('Slot', 'A')), tfx(under('Slot2', 'A'))]).toEqual([5, 7]);
     });
   });
@@ -1961,7 +1974,8 @@ describe('#1781: a template reference node whose statement adds a component is n
       expect(focus(where), at).toBeTruthy(); // precondition
       removeTraitFromEntitiesWithUndo([named(where)[0]!.id], meta('UIFocusable'));
       const { scene: s, entry } = await saved();
-      expect(JSON.stringify(entry).includes('"key":"kT1781"'), at).toBe(loose); // which path stated it
+      // Scene v20 (#2001 S6): one path — a row reaching into T, key-less sibling or not; A's list is never written whole.
+      expect([JSON.stringify(entry).includes('"key":"kT1781"'), JSON.stringify(entry).includes('/a+kT1781/')], at).toEqual([false, true]);
       if (loose) install(sDoc(), qDoc(), pDoc(), withT(stmt, loose));
       await load(s);
       expect(focus(where), at).toBeNull();
@@ -1992,8 +2006,8 @@ describe('#1781: a template reference node whose statement adds a component is n
       const { scene: s, entry } = await saved();
       const text = JSON.stringify(entry);
       // `whole`: A's list, T's copy in it carrying T's key. `rows`: a row reaching into T, and no list.
-      if (loose) expect(text).toContain('"key":"kT1781"');
-      else expect([text.includes('/a+kT1781'), text.includes('"added"')]).toEqual([true, false]);
+      // Scene v20 (#2001 S6): `whole` writes rows too (the key-less sibling is `own` on A's row); no list, no copy of T.
+      expect([text.includes('/a+kT1781'), text.includes('"added"'), text.includes('"key":"kT1781"')]).toEqual([true, false, false]);
       expect(text).not.toContain('focusOrder'); // T's value is not the scene's to state
       if (loose) install(sDoc(), qDoc(), pDoc(), withT(stmt(3), loose));
       await load(s);
@@ -2030,11 +2044,14 @@ describe('#1781: a template reference node whose statement adds a component is n
 
   // #1804, the WRITER twin: a prefab-edit save of O measured T's frames against the bare documents too, so a no-edit save
   // rewrote T's statement with every schema default, and its name as the child root's (QR).
-  const nodeT = (o: PrefabFile) => (o.entities.flatMap((e) => (e as { added?: Array<Record<string, unknown>> }).added ?? []))
+  // In a hand-written v9 fixture the node sits in the row's `added`; in a file the writer wrote, on the row's rows.
+  const nodeT = (o: PrefabFile) => (o.entities.flatMap((e) => [...((e as { added?: Array<Record<string, unknown>> }).added ?? []), ...(ownNodes(e) as unknown as Array<Record<string, unknown>>)]))
     .find((n) => n.key === 'kT1781')!;
   for (const [where, stmt] of [['a nested frame', { nestedOverrides: { 3: { 2: { UIFocusable: { focusOrder: 3 } } } } }], ['its root frame', { overrides: { 2: { UIFocusable: { focusOrder: 3 } } } }]] as const) {
     it(`#1804: an untouched prefab-edit save of O rewrites T's statement into ${where} as it was, and its name`, async () => {
       // Mutation: drop the chain node's seed in `finishTemplateReferenceNode` — the component is written whole.
+      // …and (#2001 S6, measured): in `seededNodeDelta`, drop `nodeRowValues` from `stated` — the SECOND save below, which reads
+      // the statement from the v10 row the first wrote, writes the component whole (the root-frame case only).
       const o = withT(stmt);
       install(sDoc(), qDoc(), pDoc(), o);
       await load(buildPrefabEditScene(o as never));
@@ -2042,8 +2059,8 @@ describe('#1781: a template reference node whose statement adds a component is n
       const t = nodeT(first);
       const want = nodeT(o as unknown as PrefabFile);
       expect(t.name).toBe('T');
-      expect(t.nestedOverrides ?? {}).toEqual(want.nestedOverrides ?? {});
-      expect(t.overrides ?? {}).toEqual(want.overrides ?? {});
+      expect(nestedOv(t)).toEqual(want.nestedOverrides ?? {});
+      expect(membersOv(t)).toEqual(want.overrides ?? {});
       // …and a file the writer wrote rewrites byte for byte (the fixture above is hand-written, so its bytes are not the
       // writer's: an empty `overrides`, no `traits` bag).
       install(first);
@@ -2060,7 +2077,7 @@ describe('#1781: a template reference node whose statement adds a component is n
       install(sDoc(), qDoc(), pDoc(), o);
       await load(buildPrefabEditScene(o as never));
       const first = serializePrefab(editRoot(), O) as PrefabFile;
-      expect({ overrides: nodeT(first).overrides ?? {}, nestedOverrides: nodeT(first).nestedOverrides ?? {} })
+      expect({ overrides: membersOv(nodeT(first)), nestedOverrides: nestedOv(nodeT(first)) })
         .toEqual({ overrides: nodeT(o as unknown as PrefabFile).overrides ?? {}, nestedOverrides: nodeT(o as unknown as PrefabFile).nestedOverrides ?? {} });
       install(first);
       await load(buildPrefabEditScene(first as never));
@@ -2074,7 +2091,7 @@ describe('#1781: a template reference node whose statement adds a component is n
     await load(buildPrefabEditScene(o as never));
     writeTraitFieldWithUndo(named('K')[0]!.id, meta('UIFocusable'), 'focusOrder', 6);
     const t = nodeT(serializePrefab(editRoot(), O) as PrefabFile);
-    expect(t.nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 6 } } } });
+    expect(nestedOv(t)).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 6 } } } });
   });
 
   it('#1804: an edit to a field the statement does NOT set is written beside the statement, and reopens', async () => {
@@ -2084,7 +2101,7 @@ describe('#1781: a template reference node whose statement adds a component is n
     await load(buildPrefabEditScene(o as never));
     writeTraitFieldWithUndo(named('K')[0]!.id, meta('UIFocusable'), 'focusable', false);
     const first = serializePrefab(editRoot(), O) as PrefabFile;
-    expect(nodeT(first).nestedOverrides).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 3, focusable: false } } } });
+    expect(nestedOv(nodeT(first))).toEqual({ 3: { 2: { UIFocusable: { focusOrder: 3, focusable: false } } } });
     install(first);
     await load(buildPrefabEditScene(first as never));
     expect(focus('K')).toMatchObject({ focusable: false, focusOrder: 3 });

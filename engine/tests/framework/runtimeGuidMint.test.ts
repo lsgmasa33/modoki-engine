@@ -249,10 +249,16 @@ describe('copies and string refs under a real mint (#1210)', () => {
     expect(isRuntimeGuid(guidOf(added))).toBe(true);
     expect(rootId).toBeGreaterThan(0);
     const scene = await serializeScene(); // the Play snapshot path: throws under vitest on a leak
-    const entry = scene.entities.find((e) => (e as { prefab?: string }).prefab === KIT) as { added?: Array<{ guid: string; traits: Record<string, { guid?: string }> }> };
-    const node = entry.added!.find((n) => (n.traits.EntityAttributes as { name?: string }).name === 'Spark')!;
-    expect(node.guid).toBe('');
+    // Scene v20 (#2001 S6): the node is inline on its anchor's row (`own`), under the guid its load derives.
+    const entry = scene.entities.find((e) => (e as { prefab?: string }).prefab === KIT) as unknown as { members: Record<string, { own?: Array<{ guid: string; name: string; traits: Record<string, { guid?: string }> }> }> };
+    const node = Object.values(entry.members).flatMap((r) => r.own ?? []).find((n) => n.name === 'Spark')!;
+    expect(node).toBeDefined();
+    expect(isRuntimeGuid(node.guid)).toBe(false);
+    expect(node.guid).not.toBe(guidOf(added));
     expect(node.traits.EntityAttributes.guid).toBeUndefined();
+    // …and ONLY there. Mutation: drop the `unguided` clause in `consumedBy` (`instanceSave.ts`) — the live node, whose
+    // runtime guid no entry can state, is also written as an entity of its own and comes back twice after Stop.
+    expect(scene.entities.filter((e) => e.name === 'Spark')).toEqual([]);
   });
 
   // #1377. Mutation: drop `delete copy.parentId` in `snapshotAddedTraits`.

@@ -206,11 +206,12 @@ function* traitFields(url: string, entityLabel: string, traits: unknown): Genera
 }
 
 /** Every (trait, field) instance across every entity in a scene/prefab file — its own `traits`,
- *  plus every prefab-instance override slot (`entity.overrides[localId] → { trait: { field } }`,
- *  see docs/prefab-structural-overrides.md). Both share the same trait→field→value shape. */
+ *  plus every prefab-instance override slot: `entity.overrides[localId] → { trait: { field } }`
+ *  (docs/prefab-structural-overrides.md), and since scene v20 / prefab v10 (#2001 S6) the member
+ *  rows, `entity.members[key].traits`. All three share the same trait→field→value shape. */
 function collectFieldInstances(a: { url: string; abs: string }): FieldInstance[] {
   const json = JSON.parse(fs.readFileSync(a.abs, 'utf-8')) as {
-    entities?: { name?: string; localId?: number; id?: number; traits?: unknown; overrides?: Record<string, unknown> }[];
+    entities?: { name?: string; localId?: number; id?: number; traits?: unknown; overrides?: Record<string, unknown>; members?: Record<string, { traits?: unknown } | undefined> }[];
   };
   const out: FieldInstance[] = [];
   for (const e of json.entities ?? []) {
@@ -218,6 +219,9 @@ function collectFieldInstances(a: { url: string; abs: string }): FieldInstance[]
     out.push(...traitFields(a.url, label, e.traits));
     for (const [localId, ov] of Object.entries(e.overrides ?? {})) {
       out.push(...traitFields(a.url, `${label} (override of localId ${localId})`, ov));
+    }
+    for (const [key, row] of Object.entries(e.members ?? {})) {
+      out.push(...traitFields(a.url, `${label} (member row ${key})`, row?.traits));
     }
   }
   return out;

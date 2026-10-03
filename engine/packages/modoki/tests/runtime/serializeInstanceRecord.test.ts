@@ -95,10 +95,12 @@ describe('serializeInstanceRecord: the scene v20 entry (#2008)', () => {
       expect(entry.members![`/${M1}`]).toEqual({ guid: G1, name: 'Button' });
     });
 
-    it('parsed pins are kept verbatim over the projection\'s; the projection fills only a pin the list lacks', () => {
+    it('a parsed pin keeps its guid over the projection\'s, and names the member as it is live; the projection fills a pin the list lacks', () => {
+      // The name is the live member's (S6): the old capture wrote it at every save, so two saves of one live tree agree
+      // whichever way the record's pin was made. Mutation: write the parsed name — M1 reads 'Old'.
       const rec = record({ [`/${M1}`]: { guid: G1, name: 'Old' }, [`/${M2}`]: { guid: G2 } });
       const { entry } = serializeInstanceRecord(rec, ctx({ [`/${M1}`]: { guid: G2, name: 'New' }, [`/${M2}`]: { guid: G1, name: 'Filled' } }));
-      expect(entry.members![`/${M1}`]).toEqual({ guid: G1, name: 'Old' });
+      expect(entry.members![`/${M1}`]).toEqual({ guid: G1, name: 'New' });
       expect(entry.members![`/${M2}`]).toEqual({ guid: G2, name: 'Filled' });
     });
 
@@ -114,12 +116,14 @@ describe('serializeInstanceRecord: the scene v20 entry (#2008)', () => {
       expect(entry.members![`/${M1}`].own).toEqual([{ parentLocalId: 0, guid: OWN, name: 'Badge', traits: { Transform: { x: 1 } }, children: [] }]);
     });
 
-    it('a node the projection could not place is written from held.heldOwn, verbatim, in link order', () => {
+    it('a node the projection could not place is written from held.heldOwn, verbatim, in sibling order', () => {
+      // Sibling order (sortOrder, then guid), not the order of the links (S6): a capture-seeded record lists them in
+      // another order than a door-maintained one. Mutation: drop the sort in `ownNodes` — the list reads [OWN2, OWN].
       const rec = record({ [`/${M1}`]: { own: [{ guid: OWN2 }, { guid: OWN }] } }, {
         held: { heldOwn: new Map([[`/${M1}`, [node(OWN, 'Held'), node(OWN2, 'Held2')]]]) },
       });
       const own = serializeInstanceRecord(rec, ctx()).entry.members![`/${M1}`].own!;
-      expect(own.map((n) => [n.guid, n.name, n.parentLocalId])).toEqual([[OWN2, 'Held2', 0], [OWN, 'Held', 0]]);
+      expect(own.map((n) => [n.guid, n.name, n.parentLocalId])).toEqual([[OWN, 'Held', 0], [OWN2, 'Held2', 0]]);
     });
 
     it('a held node no link names is still written, after the linked ones, even under a row the list does not hold', () => {

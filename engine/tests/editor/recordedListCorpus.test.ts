@@ -85,9 +85,10 @@ async function load(data: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure) => {
+    onInstantiatePrefab: async (source, parentId, rootTf, _o, _x, overrides, structure, nested, rootGuid, _f, nestedStructure, expansion) => {
       const id = instantiatePrefabIntoWorld(
         getCurrentWorld(), prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
+        { frame: expansion?.frame, sceneVersion: expansion?.sceneVersion },
       );
       if (id && rootGuid) {
         for (const e of getCurrentWorld().entities) {
@@ -157,6 +158,11 @@ function statementSignatures(e: Record<string, unknown>): Map<string, number> {
   for (const frame of Object.values(isObj(e.nestedOverrides) ? e.nestedOverrides : {})) for (const b of Object.values(isObj(frame) ? frame : {})) bag(b);
   structure({ added: e.added, removed: e.removed, removedTraits: e.removedTraits, moved: e.moved });
   for (const s of Object.values(isObj(e.nestedStructure) ? e.nestedStructure : {})) structure(s);
+  // Scene v20 (#2001 S6): the root's records are the `/` row, which always names the root (identity, as the capture
+  // form's entry `traits` did: not a record), and the root's order is the entry's own placement.
+  const v20 = isObj(e.members) && isObj(e.members['/']) && !('localId' in e);
+  const placed = v20 && isObj(e.traits) && isObj(e.traits.EntityAttributes) ? e.traits.EntityAttributes.sortOrder : undefined;
+  if (placed !== undefined) add(`EntityAttributes.sortOrder=${JSON.stringify(placed)}`);
   for (const r of Object.values(isObj(e.members) ? e.members : {})) {
     if (!isObj(r)) continue;
     bag(r.traits);
@@ -172,6 +178,12 @@ function statementSignatures(e: Record<string, unknown>): Map<string, number> {
 
 /** F7 (#1914 R6): every instance records its root's sortOrder, so a save may state one its file did not. */
 const isF7Order = (s: string) => s.startsWith('EntityAttributes.sortOrder=');
+/** Scene v20 (#2001 S6): every entry's `/` row names its root (design § 10.4), so a save states a root name its file left
+ *  to the entry's `traits`. Only the name that row states is let through. */
+const rootNameOf = (e: Record<string, unknown>): string | undefined => {
+  const name = ((e.members as Record<string, { traits?: { EntityAttributes?: { name?: unknown } } }> | undefined)?.['/'])?.traits?.EntityAttributes?.name;
+  return typeof name === 'string' ? `EntityAttributes.name=${JSON.stringify(name)}` : undefined;
+};
 /** A bag's mention of a component — bookkeeping for `+T`, not a statement of its own. */
 const isMention = (s: string) => s.startsWith('@');
 
@@ -216,7 +228,8 @@ function statementsGained(file: Record<string, unknown>, saved: Record<string, u
     const filled = (s: string) => /^[^.+@~-][^.]*\./.test(s) && (had.get(`+${s.slice(0, s.indexOf('.'))}`) ?? 0) > 0;
     const rotation = (s: string) => ROTATION_MARKS.some((k) => s.startsWith(`${k}=`))
       && [...had.keys()].some((h) => ROTATION_MARKS.some((k) => h.startsWith(`${k}=`)));
-    for (const [s, n] of has) if (!isMention(s) && !isF7Order(s) && (had.get(s) ?? 0) < n && !filled(s) && !rotation(s)) gained.push(`${label} ${s}`);
+    const rootName = rootNameOf(e);
+    for (const [s, n] of has) if (!isMention(s) && !isF7Order(s) && (had.get(s) ?? 0) < n - (s === rootName ? 1 : 0) && !filled(s) && !rotation(s)) gained.push(`${label} ${s}`);
   }
   return gained;
 }
@@ -260,6 +273,15 @@ describe('statementsGained, the corpus check that a save states nothing its file
   });
 });
 
+/** #2115 (open, low): a capture-path save of a row stating a component this suite does not register writes that row's
+ *  keys in another order once. Each scene here is checked for exactly that, so a fix turns its entry red.
+ *  Empty since the S6 corpus re-save (#2001): the one case was space-console's Station scene as committed in the capture
+ *  form (v13). Saved as v20 its rows are in the stable order already, so a load and two saves of it are byte-equal
+ *  like every other scene's. #2115 itself is not fixed; its repro is that file at a3d863512. */
+const KEY_ORDER_ONCE: ReadonlySet<string> = new Set();
+const keySorted = (v: unknown): unknown => (Array.isArray(v) ? v.map(keySorted)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, keySorted(x)])) : v);
+
 let scenesWithRecords = 0;
 let docsChecked = 0;
 
@@ -286,7 +308,14 @@ describe.skipIf(!hasInternalGames())('I23: a load→save carries the recorded li
         expect(statementsLost(file, first)).toEqual([]);
         expect(statementsGained(file, first)).toEqual([]);
         expect(fromSave).toEqual(fromFile);
-        expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+        if (process.env.MODOKI_RECORD_CORPUS_DEBUG) writeFileSync(`${process.env.MODOKI_RECORD_CORPUS_DEBUG}/${rel.replace(/\//g, '_')}.json`, JSON.stringify({ a: first, b: second }, null, 1));
+        if (KEY_ORDER_ONCE.has(rel)) {
+          // #2115: the same statements, one row's keys in another order, and stable from the second save on.
+          expect(JSON.stringify(second)).not.toBe(JSON.stringify(first));
+          expect(JSON.stringify(keySorted(second))).toBe(JSON.stringify(keySorted(first)));
+          await load(second as unknown as SceneData);
+          expect(JSON.stringify(await saveScene())).toBe(JSON.stringify(second));
+        } else expect(JSON.stringify(second)).toBe(JSON.stringify(first));
         vi.unstubAllGlobals();
       });
     }

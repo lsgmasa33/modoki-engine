@@ -17,29 +17,33 @@
  *     the empty placeholder, and capturing that would lose the record one save later. */
 
 import { trait } from 'koota';
+import { CAPTURE_FORM_SCENE_VERSION } from './version';
 
-/** `record` is JSON, so the marker's data is a value: a copy of it cannot alias the original's. */
-export const UnresolvedPrefabRef = trait({ source: '', kind: '' as '' | 'entry' | 'node' | 'row', record: '' });
+/** `record` is JSON, so the marker's data is a value: a copy of it cannot alias the original's. `version` is the scene
+ *  format the record was READ in (#2001 S6): a record is kept verbatim, so whoever parses it again (a re-seed, the
+ *  prefab's return) must read it by the rules of the file it came from — a v20 entry's name and root order are read
+ *  differently from an older one's. 0: not stated, the old capture's form. */
+export const UnresolvedPrefabRef = trait({ source: '', kind: '' as '' | 'entry' | 'node' | 'row', record: '', version: 0 });
 
 export type UnresolvedKind = 'entry' | 'node';
 
 type Handle = { has(t: unknown): boolean; get(t: unknown): unknown; set(t: unknown, d: unknown): void; add(...t: unknown[]): void };
 
 /** Put the marker on `entity`: `record` is what the file held for the reference to `source`. */
-export function markUnresolved(entity: Handle | undefined | null, source: string, kind: UnresolvedKind, record: unknown): void {
+export function markUnresolved(entity: Handle | undefined | null, source: string, kind: UnresolvedKind, record: unknown, version = 0): void {
   if (!entity || !source) return;
-  const data = { source, kind, record: JSON.stringify(record) };
+  const data = { source, kind, record: JSON.stringify(record), version };
   if (entity.has(UnresolvedPrefabRef)) entity.set(UnresolvedPrefabRef, data);
   else entity.add(UnresolvedPrefabRef(data));
 }
 
 /** The record on `entity`, as a fresh object, or undefined when it carries none. */
-export function unresolvedRefOf(entity: Handle | undefined | null): { source: string; kind: UnresolvedKind; record: Record<string, unknown> } | undefined {
+export function unresolvedRefOf(entity: Handle | undefined | null): { source: string; kind: UnresolvedKind; record: Record<string, unknown>; version: number } | undefined {
   if (!entity || !entity.has(UnresolvedPrefabRef)) return undefined;
-  const d = entity.get(UnresolvedPrefabRef) as { source: string; kind: string; record: string };
+  const d = entity.get(UnresolvedPrefabRef) as { source: string; kind: string; record: string; version?: number };
   if (!d.source || (d.kind !== 'entry' && d.kind !== 'node')) return undefined;
   try {
-    return { source: d.source, kind: d.kind, record: JSON.parse(d.record) as Record<string, unknown> };
+    return { source: d.source, kind: d.kind, record: JSON.parse(d.record) as Record<string, unknown>, version: d.version || CAPTURE_FORM_SCENE_VERSION };
   } catch {
     return undefined;
   }
@@ -61,7 +65,7 @@ export interface RowPlaceholder {
 /** Mark `entity` as the placeholder of a nested row. */
 export function markRowPlaceholder(entity: Handle | undefined | null, row: RowPlaceholder): void {
   if (!entity || !row.source) return;
-  const data = { source: row.source, kind: 'row' as const, record: JSON.stringify({ localId: row.localId, nodeGuid: row.nodeGuid, reason: row.reason }) };
+  const data = { source: row.source, kind: 'row' as const, record: JSON.stringify({ localId: row.localId, nodeGuid: row.nodeGuid, reason: row.reason }), version: 0 };
   if (entity.has(UnresolvedPrefabRef)) entity.set(UnresolvedPrefabRef, data);
   else entity.add(UnresolvedPrefabRef(data));
 }

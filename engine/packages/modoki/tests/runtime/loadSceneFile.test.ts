@@ -1850,6 +1850,21 @@ describe('migrateV12toV13 (UIAnchor.zIndex removal)', () => {
     expect((node.added[0].children[0].traits.UIAnchor as any).zIndex).toBeUndefined();
   });
 
+  // #2001 S6: from scene v20 / prefab v10 an instance's records are on its member rows. A row's `traits` is a per-field
+  // diff (the carrier is created, as for an override bag); `own` holds whole nodes, each with rows of its own.
+  // Mutation (measured): drop the `members` walk in `migrateUIAnchorZIndexStructured` — every value below stays on
+  // UIAnchor and this case is red.
+  it('reaches a member row\'s traits, the nodes a row adds, and the rows of such a node', async () => {
+    const { migrateUIAnchorZIndexStructured } = await import('../../src/runtime/loaders/uiAnchorZIndexMigration');
+    const inner = { '/': { traits: { UIAnchor: { zIndex: 9 } } as Record<string, Record<string, unknown>> } };
+    const own = { traits: { UIAnchor: { zIndex: 6 }, UIElement: {} } as Record<string, Record<string, unknown>>, children: [], members: inner };
+    const node = { members: { '/': { traits: { UIAnchor: { zIndex: 4 } } as Record<string, Record<string, unknown>> }, '/m': { own: [own] } } };
+    migrateUIAnchorZIndexStructured(node);
+    expect(node.members['/'].traits).toEqual({ UIAnchor: {}, UIElement: { zIndex: 4 } });
+    expect(own.traits).toEqual({ UIAnchor: {}, UIElement: { zIndex: 6 } });
+    expect(inner['/'].traits).toEqual({ UIAnchor: {}, UIElement: { zIndex: 9 } });
+  });
+
   it('migrateV12toV13 (via loadSceneFile) reaches all four locations, not just top-level traits', async () => {
     const { loadSceneFile } = await getLoader();
     const data = {

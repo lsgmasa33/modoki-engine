@@ -19,6 +19,7 @@
  *  (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged. */
 import { emptyDocMap } from '../core/docKeys';
 import { nodeRowKey } from '../core/assetRefRules';
+import { isMemberToken } from '../core/templateRefs';
 import { docRows, placedAnchor } from './memberTranslation';
 
 /** localId → trait name → field → value. */
@@ -637,6 +638,14 @@ export function descendMemberRowKeys<R>(rows: Record<string, R> | undefined, com
   return out;
 }
 
+/** A template owner's `"/"` row (prefab v10, #2001 S6), as the layer's `rootRow`: what the owner states about the root
+ *  of the frame it expands, which a v9 owner stated in `overrides[rootLid]`, `removedTraits[rootLid]` and the `added`
+ *  nodes under the root. The direct-row fold skips the key (it names no member of the frame), so it lands once. */
+export function ownRootRow<R>(members: Record<string, R> | undefined): { rootRow?: R } {
+  const row = members?.['/'];
+  return isRecord(row) ? { rootRow: row } : {};
+}
+
 /** One structural LAYER over an instance frame (#1533): what one document says about the frame's
  *  structure — a scene entry or reference node (the outermost), or a prefab nested ROW on the way
  *  down. Everything is keyed from the frame it is handed to.
@@ -691,7 +700,7 @@ export function descendStructureLayers<D, R>(
 ): { layers: StructureLayer<D, R>[]; direct?: D; directOwn?: boolean; foldFrom: number } {
   const lid = row.localId ?? 0;
   // The row's own layer is its TEMPLATE's statement: never the writer's own (#1914).
-  const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members, values: row.overrides, valuePaths: row.nestedOverrides }];
+  const out: StructureLayer<D, R>[] = [{ slots: row.nestedStructure, rows: row.members, ...ownRootRow(row.members), values: row.overrides, valuePaths: row.nestedOverrides }];
   let direct: D | undefined;
   let directOwn: boolean | undefined;
   let foldFrom = 0;
@@ -966,7 +975,7 @@ function foldRowOf(e: Record<string, unknown>): AnyFoldRow {
 /** The document the fold reads: its well-formed rows, in order. */
 function foldDocOf(prefab: Record<string, unknown>): AnyFoldDoc {
   const entities = (prefab.entities as unknown[]).filter(isRecord).map(foldRowOf);
-  return { entities, rootLocalId: typeof prefab.rootLocalId === 'number' ? prefab.rootLocalId : undefined };
+  return { ...(typeof prefab.id === 'string' ? { id: prefab.id } : {}), entities, rootLocalId: typeof prefab.rootLocalId === 'number' ? prefab.rootLocalId : undefined };
 }
 
 /** The frame an instance of `doc` is, under the outer layer `opts` describes: the layer's direct member rows folded over
@@ -975,7 +984,9 @@ function foldDocOf(prefab: Record<string, unknown>): AnyFoldDoc {
 function topFrame(doc: AnyFoldDoc, opts: EffectiveMemberOptions): FrameFold {
   const slots = isRecord(opts.nestedStructure) ? opts.nestedStructure as Record<string, AnySlot> : undefined;
   const rows = isRecord(opts.members) ? opts.members as Record<string, AnyRow> : undefined;
-  const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows, valuePaths: isRecord(opts.nestedOverrides) ? opts.nestedOverrides as NestedOverridePaths : undefined }];
+  // The layer's `"/"` row states the frame's ROOT (prefab v10 / scene v20, #2001 S6): it is this layer's `rootRow`, as a
+  // nested row's is (`layersInto`). Without it a v10 row's root override (a pooled tile's name, a resized root) is not read.
+  const layers: StructureLayer<AnySlot, AnyRow>[] = [{ slots, rows, ...ownRootRow(rows), valuePaths: isRecord(opts.nestedOverrides) ? opts.nestedOverrides as NestedOverridePaths : undefined }];
   const lower = { overrides: opts.overrides, removedTraits: opts.removedTraits };
   const { channels, forwardRoots } = rows ? foldStructureLayers(doc, layers, 0, lower) : { channels: lower, forwardRoots: [] };
   return { overrides: channels.overrides, removedTraits: channels.removedTraits, forward: { layers, forwardRoots } };
@@ -1099,6 +1110,8 @@ export function memberAddressOfRowKey(
   getPrefab: (ref: string) => unknown,
 ): { path: number[]; localId: number } | null {
   if (!key.startsWith('/') || !isRecord(prefab) || !Array.isArray(prefab.entities)) return null;
+  // The `"/"` row is the instance's own root (scene v20 / prefab v10, #2001 S6), at the prefab's root localId.
+  if (key === '/') return { path: [], localId: (prefab.rootLocalId as number | undefined) ?? 1 };
   const components = key.slice(1).split('/');
   let doc: Record<string, unknown> = prefab;
   const path: number[] = [];
@@ -1116,6 +1129,42 @@ export function memberAddressOfRowKey(
     doc = child;
   }
   return null;
+}
+
+/** The TEMPLATE moves a reference node states on its own rows (#2001 S6), spelled as the legacy `templateMoved` they
+ *  replaced: one `<localId>` per frame from `doc` (the node's prefab) down, joined by `.`, a keyed node as `+<key>`, the
+ *  token unchanged. A template move is a `parent` that is a member token: every one on a template node's rows (prefab
+ *  v10), and on a SCENE reference node's rows its converted `templateMoved` (a guid there is the scene's own move,
+ *  `foldInstance`, #2007 item 8), so a guid is not taken (defensive: the record's readers parse only member tokens and
+ *  would skip one anyway, measured on the guid-move case in `unusedOverrides.test.ts`). For the frame record the old capture reads its template
+ *  moves from (`noteNodeMoves`), which knew only `templateMoved`: without it a capture restated the template's move as
+ *  the instance's own. A key that names nothing in the documents is left out. Goes with the old capture (S8). */
+export function templateNodeRowMoves(
+  node: { members?: unknown } | null | undefined, doc: unknown, getPrefab: (ref: string) => unknown,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!node || !isRecord(node.members)) return out;
+  for (const [key, row] of Object.entries(node.members)) {
+    if (!isRecord(row) || !isMemberToken(row.parent) || !key.startsWith('/') || key === '/') continue;
+    const components = key.slice(1).split('/');
+    const parts: string[] = [];
+    let d: unknown = doc;
+    for (let i = 0; i < components.length && d !== undefined; i++) {
+      const component = components[i]!;
+      const nodeKey = nodeRowKey(component);
+      if (nodeKey) { if (i === components.length - 1) parts.push(`+${nodeKey}`); else d = undefined; continue; }
+      if (!isRecord(d) || !Array.isArray(d.entities)) { d = undefined; continue; }
+      const at = docRows(foldDocOf(d)).get(component);
+      if (!at) { d = undefined; continue; }
+      parts.push(String(at.localId));
+      if (i < components.length - 1) {
+        if (!at.prefab || i >= MAX_NEST_DEPTH) { d = undefined; continue; }
+        try { d = getPrefab(at.prefab); } catch { d = undefined; }
+      }
+    }
+    if (d !== undefined && parts.length === components.length) out[parts.join('.')] = row.parent;
+  }
+  return out;
 }
 
 function resolveMember(

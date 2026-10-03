@@ -37,7 +37,7 @@ const projects = [...new Set(corpus.map((f) => projectOf(f.rel)))].map((id) => {
   return { id, docs, scenes: files.filter((f) => f.rel.endsWith('.scene.json') && /"prefab":\s*"/.test(readFileSync(f.abs, 'utf8'))) };
 });
 
-const seen = { instances: 0, rows: 0, ownNodes: 0, templateLists: 0, converted: 0 };
+const seen = { instances: 0, rows: 0, ownNodes: 0, templateLists: 0, converted: 0, native: 0 };
 
 describe.skipIf(!hasInternalGames())('#2008 P2: serialize and parse are inverse over the corpus', () => {
   for (const project of projects) {
@@ -93,6 +93,8 @@ describe.skipIf(!hasInternalGames())('#2008 P2: serialize and parse are inverse 
     expect(seen.rows).toBeGreaterThan(20);
     expect(seen.ownNodes, 'a scene-owned added node').toBeGreaterThan(0);
     expect(seen.templateLists).toBeGreaterThan(20);
-    expect(seen.converted, 'a reference row the v10 fold read in converted form').toBeGreaterThan(0);
+    // The corpus's reference rows are prefab v10 since the S6 re-save (#2001), so the fold reads the writer's rows as the
+    // files state them; a row still in a legacy channel is converted first. The conversion itself is the fuzz file's.
+    expect(seen.converted + seen.native, 'a reference row the fold read in the v10 form (converted, or stated so by its file)').toBeGreaterThan(10);
   });
 });

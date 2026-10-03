@@ -1632,3 +1632,51 @@ describe('validateSceneData — entry-kind pass (#671)', () => {
   });
 });
 
+
+/** #2001 S6 — a scene v20 instance entry stores no `PrefabInstance`: the prefab is the entry's `prefab`, the root's
+ *  records sit on the `"/"` row and the members' on their rows. The instance pass was gated on the stored trait, so on
+ *  a v20 file it composed nothing, size-checked nothing and ref-checked no row, and the prefab ref itself (the trait
+ *  table's `PrefabInstance.source`) went unchecked. */
+describe('validateSceneData — a scene v20 instance entry (no stored PrefabInstance, #2001 S6)', () => {
+  const PREFAB_GUID = 'b2c3d4e5-2001-4006-8000-444455556666';
+  const ROOT_GUID = 'b2c3d4e5-2001-4006-8000-000000000001';
+  const gKid = 'b2c3d4e5-2001-4006-8000-000000000002';
+  const prefab = {
+    id: PREFAB_GUID, version: 10, name: 'Panel', rootLocalId: 1,
+    entities: [
+      { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 }, UIAnchor: { anchor: 'bottom-stretch' } } },
+      { localId: 2, name: 'Kid', nodeGuid: gKid, traits: { EntityAttributes: { name: 'Kid', parentId: 1 }, UIAnchor: { anchor: 'top-stretch' } } },
+    ],
+  };
+  const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? prefab : undefined);
+  const entry = (members: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    id: 1, name: 'Instance', guid: ROOT_GUID, prefab: PREFAB_GUID,
+    traits: { EntityAttributes: { parentId: '', sortOrder: 0 } }, members, ...extra,
+  });
+
+  it("warns for a size the ROOT row sets on an axis the prefab's root anchor stretches", () => {
+    // Mutations: gate the pass on the stored trait again — silent; give the "/" key no address — silent.
+    const res = validateSceneData(scene([entry({ '/': { traits: { UIElement: { width: 90, widthUnit: '%' } } } })]), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/members\[\/\]\.traits\.UIElement\.width is inert.*bottom-stretch.*from its prefab, localId 1\)/s);
+  });
+
+  it("warns for a size a MEMBER row sets on an axis that member's anchor stretches", () => {
+    const res = validateSceneData(scene([entry({ [`/${gKid}`]: { guid: 'b2c3d4e5-2001-4006-8000-000000000003', traits: { UIElement: { width: 50, widthUnit: '%' } } } })]), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/members\[\/b2c3d4e5[^\]]+\]\.traits\.UIElement\.width is inert.*top-stretch.*from its prefab, localId 2\)/s);
+  });
+
+  it("ref-checks the entry's prefab, and checks a v19 entry holding both forms once", () => {
+    const resolver = makeAssetRefResolver(['b2c3d4e5-2001-4006-8000-0000000000ff']); // a manifest without the prefab
+    const v20 = validateSceneData(scene([entry({})]), undefined, undefined, resolver);
+    expect(v20.warnings.filter((w) => /\(#1\)\.prefab: '.*' is a well-formed GUID but no asset/.test(w))).toHaveLength(1);
+    const both = entry({}, { traits: { EntityAttributes: { parentId: '' }, PrefabInstance: { source: PREFAB_GUID, localId: 1, rootInstanceId: ROOT_GUID } } });
+    const v19 = validateSceneData(scene([both]), undefined, undefined, resolver);
+    expect(v19.warnings.filter((w) => w.includes(`'${PREFAB_GUID}' is a well-formed GUID but no asset`))).toHaveLength(1);
+    expect(validateSceneData(scene([entry({})]), undefined, undefined, makeAssetRefResolver([PREFAB_GUID])).warnings).toEqual([]);
+  });
+
+  it('flags an entry whose prefab is its own guid', () => {
+    const res = validateSceneData(scene([{ ...entry({}), prefab: ROOT_GUID }]));
+    expect(res.warnings.join('\n')).toMatch(/\(#1\)\.prefab references its own entity \(self-reference\)/);
+  });
+});

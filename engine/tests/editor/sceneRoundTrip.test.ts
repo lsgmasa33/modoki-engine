@@ -6,6 +6,7 @@
  *  prefab instances with per-field overrides. No fixture file: the input world
  *  is built in code so it can't drift from the current schema. */
 
+import { recordsOf } from './v20Rows';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import {
@@ -36,11 +37,13 @@ async function reloadInFreshWorld(
     // Serialize strips the prefab's own traits from the root, so without this the
     // named entities never reappear — they're rebuilt from the prefab here.
     onDeletePlaceholder: (id) => deleteEntity(id),
-    onInstantiatePrefab: async (source, parentId, rootTf, _placeholderId, _rootExtra, overrides) => {
+    onInstantiatePrefab: async (source, parentId, rootTf, _placeholderId, _rootExtra, overrides, structure, nestedOverrides, rootGuid, _folder, nestedStructure, load) => {
       const prefab = await fetchPrefab(source);
       if (!prefab) return undefined;
-      // Returned as SceneManager does, so the loader retargets placeholder refs (#1353).
-      return instantiatePrefabIntoWorld(getCurrentWorld(), prefab, parentId, rootTf, source, overrides) || undefined;
+      // Returned as SceneManager does, so the loader retargets placeholder refs (#1353). Every channel is handed on, as
+      // SceneManager hands them: a scene v20 entry states its records in `members` (`structure`), not in `overrides`.
+      return instantiatePrefabIntoWorld(getCurrentWorld(), prefab, parentId, rootTf, source, overrides, structure, undefined, nestedOverrides, nestedStructure,
+        { read: load?.read, frame: load?.frame, ...(rootGuid ? { rootGuid } : {}), ...(load?.sceneVersion !== undefined ? { sceneVersion: load.sceneVersion } : {}) }) || undefined;
     },
   });
 }
@@ -185,7 +188,7 @@ describe('prefab instance round-trip', () => {
     // Child is not serialized as its own entity — it's re-instantiated from the prefab.
     expect(scene.entities.find(e => e.name === 'PChild')).toBeUndefined();
     // Only the changed field is captured as an override on localId 2.
-    expect(rootEntry!.overrides?.[2]?.Transform?.x).toBe(99);
+    expect(recordsOf(rootEntry, makePrefab(), 2)?.Transform?.x).toBe(99);
   });
 
   it('a prefab instance REPARENTED under a plain entity keeps its instance link + parent on reload', async () => {
@@ -256,7 +259,7 @@ describe('prefab instance round-trip', () => {
     findEntity(rootId)!.add(getTraitByName('Animator')!.trait({ clips: BANK, clip: 'skin' }));
 
     const scene1 = await serializeScene();
-    expect(scene1.entities.find(e => e.name === 'PRoot')!.overrides?.[1]?.Animator)
+    expect(recordsOf(scene1.entities.find(e => e.name === 'PRoot'), makePrefab(), 1)?.Animator)
       .toMatchObject({ clips: BANK, clip: 'skin' });
 
     await reloadInFreshWorld(scene1, async (s) => (s === SOURCE ? makePrefab() : null));
@@ -270,7 +273,7 @@ describe('prefab instance round-trip', () => {
     // …and it still serializes, so the value is stable rather than decaying per save.
     setPrefabSource(reloaded, { id: SOURCE });
     const scene2 = await serializeScene();
-    expect(scene2.entities.find(e => e.name === 'PRoot')!.overrides?.[1]?.Animator)
+    expect(recordsOf(scene2.entities.find(e => e.name === 'PRoot'), makePrefab(), 1)?.Animator)
       .toMatchObject({ clips: BANK, clip: 'skin' });
   });
 });
@@ -333,8 +336,8 @@ describe('prefab override over a schema field with no Inspector row (integration
 
     const scene = await serializeScene();
     const entry = scene.entities.find((e) => e.prefab === SOURCE);
-    expect(entry?.overrides?.[1]?.Animator?.clips).toBe(BANK);
-    expect(entry?.overrides?.[1]?.Animator?.clip).toBe('skin');
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator?.clips).toBe(BANK);
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator?.clip).toBe('skin');
   });
 
   it('RE-APPLIES it on load — the instance comes up with the populated bank', async () => {
@@ -371,8 +374,8 @@ describe('prefab override over a schema field with no Inspector row (integration
     const twice = await serializeScene();
 
     const entry = twice.entities.find((e) => e.prefab === SOURCE);
-    expect(entry?.overrides?.[1]?.Animator?.clips).toBe(BANK);
-    expect(entry?.overrides?.[1]?.Animator?.clip).toBe('skin');
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator?.clips).toBe(BANK);
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator?.clip).toBe('skin');
   });
 
   it('never writes a runtimeOnly read-back field into the file', async () => {
@@ -388,7 +391,7 @@ describe('prefab override over a schema field with no Inspector row (integration
 
     const scene = await serializeScene();
     const entry = scene.entities.find((e) => e.prefab === SOURCE);
-    expect(entry?.overrides?.[1]?.Animator ?? {}).not.toHaveProperty('activeClip');
-    expect(entry?.overrides?.[1]?.Animator ?? {}).not.toHaveProperty('fadeElapsed');
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator ?? {}).not.toHaveProperty('activeClip');
+    expect(recordsOf(entry, makePrefab(), 1)?.Animator ?? {}).not.toHaveProperty('fadeElapsed');
   });
 });

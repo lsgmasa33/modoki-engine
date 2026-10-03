@@ -12,7 +12,7 @@ import type { AddedEntity, SceneEntityEntry } from '../loaders/loadSceneFile';
 import { getCachedPrefab } from '../loaders/meshTemplateCache';
 import type { ParsedInstance, PrefabDoc, PrefabReader, SceneOwnedNode } from './instanceRecord';
 import { parseInstanceRecord, parseReferenceNode, type ParseOptions } from './parseInstanceRecord';
-import { markStale, setInstanceRecord, storedInstance } from './instanceStore';
+import { dropInstanceRecord, markStale, setInstanceRecord, storedInstance } from './instanceStore';
 import { adoptBankedRecords, type RecordBank } from './recordBank';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { findEntityById, findEntityByGuid } from '../core/ecs/world';
@@ -168,11 +168,12 @@ function buildParentLinks(world: World, data: { entities?: SceneEntityEntry[] },
 export function fillInstanceStoreReporting(world: World, data: { entities?: SceneEntityEntry[]; embeddedPrefabs?: unknown; version?: unknown }, bank?: RecordBank): void {
   let opts: ParseOptions;
   try { opts = sceneParseOptions(data); } catch (err) { console.error(`[instanceStore] could not read the scene's instance options (#2001 S4): ${(err as Error)?.message ?? err}`); return; }
+  const seeded: string[] = [];
   for (const entry of Array.isArray(data.entities) ? data.entities : []) {
     try {
       if (!isInstanceEntry(entry)) continue;
       const parts = recordsOf(parseInstanceRecord(entry, cachedPrefabReader, opts), cachedPrefabReader, opts);
-      for (const p of parts) setInstanceRecord(world, p.record);
+      for (const p of parts) { setInstanceRecord(world, p.record); seeded.push(p.record.rootGuid); }
       // #2046 S7.6: a world the editor reloads from its own text takes back the exact lists it held (`recordBank.ts`).
       if (bank) adoptBankedRecords(world, bank, entry, parts.map((p) => p.record.rootGuid), cachedPrefabReader);
     } catch (err) {
@@ -180,4 +181,9 @@ export function fillInstanceStoreReporting(world: World, data: { entities?: Scen
     }
   }
   try { buildParentLinks(world, data, opts); } catch (err) { console.error(`[instanceStore] could not build the scene's parent links (#2028): ${(err as Error)?.message ?? err}`); }
+  // A record is a live stored root's (or a shown placeholder's). An inline reference node the load did not spawn — one
+  // linked on a row whose member the template no longer has, HELD with that row — has no entity: its statement stays in
+  // its owner's kept row, which is what the save writes it from, and a record of its own in the store would outlive its
+  // owner's delete and answer for whatever later took its guid.
+  for (const g of seeded) if (!findEntityByGuid(g, world)) dropInstanceRecord(world, g);
 }

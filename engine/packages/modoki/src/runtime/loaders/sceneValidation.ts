@@ -314,44 +314,53 @@ export function refFieldWarnings(traits: unknown, label: string, assetExists?: A
       const v = fields[field];
       if (typeof v !== 'string' || v === '') continue;
       if (traitName === 'Renderable2D' && field === 'sprite' && PRIMITIVE_SPRITES.has(v)) continue;
-      if (isExternalUrl(v)) continue;
-      if (isGuid(v)) {
-        // #292 — GUID SHAPE was the whole check until now, so a ref to an asset that had
-        // been deleted from the manifest validated clean and failed later, at load/render
-        // time. Only reachable when the caller injected a resolver that can answer
-        // authoritatively (see `AssetRefResolver`); without one this stays the shape-only
-        // pass it has always been.
-        if (assetExists) {
-          const verdict = assetExists(v);
-          if (verdict === 'missing') {
-            out.push(
-              `${label}.${traitName}.${field}: '${v}' is a well-formed GUID but no asset in the manifest has it `
-              + `— the asset was deleted or never imported, so this reference will not resolve at load`,
-            );
-          } else if (verdict === 'case-mismatch') {
-            // Deliberately NOT the message above: the asset is right there, and telling
-            // this author it was "deleted or never imported" sends them hunting a file they
-            // are looking at. See `AssetRefVerdict` for why case decides resolution.
-            out.push(
-              `${label}.${traitName}.${field}: '${v}' matches a manifest asset only when letter case is ignored `
-              + `— asset refs resolve through a case-SENSITIVE lookup, so this will not resolve at load. `
-              + `Re-author the ref with the manifest's exact casing (guids are minted lowercase).`,
-            );
-          }
-        }
-        continue;
-      }
-      // Every field in this registry holds a manifest-asset GUID — `Text2D.font` /
-      // `Text3D.font` / `UIElement.fontFamily` included — so a font PATH is a
-      // literal-path violation here like any other (QA-INSP-0004, #231).
-      if (isInternalAssetPath(v)) {
+      out.push(...refValueWarnings(v, `${label}.${traitName}.${field}`, assetExists));
+    }
+  }
+  return out;
+}
+
+/** The ref rule for ONE value, written at `where` (`<entity>.<Trait>.<field>`, or a v20 entry's `prefab`): a GUID
+ *  must name an asset when a resolver can answer, an internal asset path or any other string is refused, and an
+ *  external URL passes. Shared by {@link refFieldWarnings} and the entry-level `prefab` check. */
+function refValueWarnings(v: string, where: string, assetExists?: AssetRefResolver): string[] {
+  const out: string[] = [];
+  if (isExternalUrl(v)) return out;
+  if (isGuid(v)) {
+    // #292 — GUID SHAPE was the whole check until now, so a ref to an asset that had
+    // been deleted from the manifest validated clean and failed later, at load/render
+    // time. Only reachable when the caller injected a resolver that can answer
+    // authoritatively (see `AssetRefResolver`); without one this stays the shape-only
+    // pass it has always been.
+    if (assetExists) {
+      const verdict = assetExists(v);
+      if (verdict === 'missing') {
         out.push(
-          `${label}.${traitName}.${field}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
+          `${where}: '${v}' is a well-formed GUID but no asset in the manifest has it `
+          + `— the asset was deleted or never imported, so this reference will not resolve at load`,
         );
-      } else {
-        out.push(`${label}.${traitName}.${field}: '${v}' is not a GUID or URL`);
+      } else if (verdict === 'case-mismatch') {
+        // Deliberately NOT the message above: the asset is right there, and telling
+        // this author it was "deleted or never imported" sends them hunting a file they
+        // are looking at. See `AssetRefVerdict` for why case decides resolution.
+        out.push(
+          `${where}: '${v}' matches a manifest asset only when letter case is ignored `
+          + `— asset refs resolve through a case-SENSITIVE lookup, so this will not resolve at load. `
+          + `Re-author the ref with the manifest's exact casing (guids are minted lowercase).`,
+        );
       }
     }
+    return out;
+  }
+  // Every field in this registry holds a manifest-asset GUID — `Text2D.font` /
+  // `Text3D.font` / `UIElement.fontFamily` included — so a font PATH is a
+  // literal-path violation here like any other (QA-INSP-0004, #231).
+  if (isInternalAssetPath(v)) {
+    out.push(
+      `${where}: internal asset path '${v}' — references must be a GUID (use the asset's id / .meta.json sidecar)`,
+    );
+  } else {
+    out.push(`${where}: '${v}' is not a GUID or URL`);
   }
   return out;
 }
@@ -851,6 +860,12 @@ export function validateSceneData(
     // An instance's channels in a shape no reader takes (#1938 C-B step 2): the load keeps each verbatim and the save
     // writes it back, so this is a warning, not an error — the same split the load makes.
     if (typeof (entity as { prefab?: unknown }).prefab === 'string') {
+      // The instance's prefab ref. A v20 entry states it only here (no stored `PrefabInstance`, #2001 S6), so
+      // the trait table's `PrefabInstance.source` row no longer reaches it; an older entry holding both is
+      // checked once, through the trait.
+      const prefabRef = (entity as { prefab: string }).prefab;
+      const storedSource = (entity.traits?.PrefabInstance as { source?: unknown } | undefined)?.source;
+      if (prefabRef && storedSource !== prefabRef) warnings.push(...refValueWarnings(prefabRef, `${label}.prefab`, assetExists));
       const { malformed } = splitMalformedChannels(entity as object);
       if (malformed.length) warnings.push(`${label}: ${malformed.length} value(s) in a shape no reader takes (kept as written): ${malformedPaths(malformed)}`);
     }
@@ -926,11 +941,16 @@ export function validateSceneData(
     // scene-wide, after this loop.
     warnings.push(...jsonBankWarnings(e.traits, label, assetExists));
 
-    // Prefab self-reference: an instance whose source is its OWN guid would recurse.
+    // Prefab self-reference: an instance whose source is its OWN guid would recurse. The source is the entry's
+    // `prefab` (the only place a v20 entry states it, #2001 S6), else an older entry's stored `PrefabInstance`.
     const pi = e.traits?.PrefabInstance;
-    if (pi && typeof pi === 'object' && ownGuid) {
-      const src = (pi as { source?: unknown }).source;
-      if (typeof src === 'string' && src === ownGuid) warnings.push(`${label}.PrefabInstance.source references its own entity (self-reference)`);
+    const entryPrefab = (e as { prefab?: unknown }).prefab;
+    const instanceSource: unknown = typeof entryPrefab === 'string' && entryPrefab
+      ? entryPrefab
+      : pi && typeof pi === 'object' ? (pi as { source?: unknown }).source : undefined;
+    const sourceWhere = typeof entryPrefab === 'string' && entryPrefab ? 'prefab' : 'PrefabInstance.source';
+    if (typeof instanceSource === 'string' && ownGuid && instanceSource === ownGuid) {
+      warnings.push(`${label}.${sourceWhere} references its own entity (self-reference)`);
     }
 
     // UIElement size vs UIAnchor stretch — the prefab-instance twin of the direct
@@ -941,11 +961,11 @@ export function validateSceneData(
     // prefab needs I/O this module deliberately doesn't do (module docs), so it's
     // BYOD: `getPrefab` is caller-injected and optional; without it this stays silent
     // (a conservative false negative, never a wrong claim).
-    if (pi && typeof pi === 'object') {
+    if (typeof entryPrefab === 'string' || (pi && typeof pi === 'object')) {
       const overrides = e.overrides;
       const members = (e as { members?: unknown }).members;
       if ((overrides && typeof overrides === 'object') || (members && typeof members === 'object')) {
-        const src = (pi as { source?: unknown }).source;
+        const src = instanceSource;
         let prefab: unknown;
         if (typeof src === 'string' && src && getPrefab) {
           try { prefab = getPrefab(src); } catch { prefab = undefined; }

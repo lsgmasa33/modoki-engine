@@ -194,16 +194,20 @@ nothing. The editor `collectResourceRefs` (serialize.ts) **delegates** to the
 runtime `collectResourceRefsFromEntities` (loadSceneFile.ts) — one shared
 implementation rather than two that can drift.
 
-A prefab that is missing at the save, top-level or nested, is copied into the file's
-top-level `embeddedPrefabs` (scene v19, #1867, top level #1935), and the copies' own
-refs join `resources`, so the load acquires what a frame expanded from a copy draws.
+⚠️ **Superseded by #2001 (owner ruling B): this paragraph and the next section's first
+paragraph describe scene v19.** Since S5 no copy expands a frame, and since S6 (scene
+v20) the save writes no copy. A missing prefab's instance is a Missing Prefab
+placeholder with its list ([plans/prefab-instance-model.md](plans/prefab-instance-model.md)
+§§ 10.8, 10.10). In v19, a prefab that is missing at the save, top-level or nested, was
+copied into the file's top-level `embeddedPrefabs` (#1867, top level #1935), and the
+copies' own refs joined `resources`, so the load acquired what a frame expanded from a copy drew.
 What is copied, what reads it, and why Apply/Revert still refuse such a frame:
 [prefabs.md](prefabs.md) § "A scene backs up a missing prefab".
 
 ## Load / re-expand
 
-An instance whose prefab is missing expands from the copy of it that ITS OWN scene
-file carries (`embeddedPrefabs`, v19, #1867; never another scene's, #1934 F1): a
+(v19, superseded above.) An instance whose prefab was missing expanded from the copy of it that ITS OWN scene
+file carried (`embeddedPrefabs`, v19, #1867; never another scene's, #1934 F1): a
 top-level instance whenever the copy is there (#1935), a nested frame only if it was
 live at the save. The load's one reader is the caller's cache, then those copies, so a
 prefab that loads always wins, and the expansion and the settle read the same

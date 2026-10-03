@@ -100,6 +100,21 @@ function foldText(read: PrefabReader, rec: InstanceRecord): string | null {
   } catch { return null; }
 }
 
+/** `banked` with every identity pin the file states that it does not hold (#2001 S6). A pin is identity, not an override:
+ *  the save writes one for each PRESENT member from the live tree (design § 2.7), so a record need not hold it — until the
+ *  member is no longer live. A world reloaded with a prefab gone (a trash's own reload, #2056) shows a placeholder there,
+ *  and from then on the record is the pins' only home: seated without them, the next save wrote the entry with no pin and
+ *  no row under the missing frame. The list is otherwise the banked one, exactly. */
+function withStatedPins(banked: InstanceRecord, parsed: InstanceRecord): InstanceRecord {
+  for (const [key, row] of parsed.list.rows) {
+    if (row.guid === undefined) continue;
+    const have = banked.list.rows.get(key);
+    if (!have) banked.list.rows.set(key, { guid: row.guid, ...(row.name !== undefined ? { name: row.name } : {}) });
+    else if (have.guid === undefined) { have.guid = row.guid; if (have.name === undefined && row.name !== undefined) have.name = row.name; }
+  }
+  return banked;
+}
+
 /** After the load parsed `entry`'s records into `world` (`rootGuids`): seat each banked record the rules above allow. */
 export function adoptBankedRecords(world: World, bank: RecordBank, entry: SceneEntityEntry, rootGuids: readonly string[], read: PrefabReader): void {
   const g = entryGuid(entry);
@@ -109,7 +124,7 @@ export function adoptBankedRecords(world: World, bank: RecordBank, entry: SceneE
     const banked = same ? bank.stored.get(rootGuid) : undefined;
     const parsed = storedInstance(world, rootGuid);
     const want = banked && !banked.stale && parsed ? foldText(read, banked.record) : null;
-    if (want !== null && want === foldText(read, parsed!.record)) setInstanceRecord(world, structuredClone(banked!.record));
+    if (want !== null && want === foldText(read, parsed!.record)) setInstanceRecord(world, withStatedPins(structuredClone(banked!.record), parsed!.record));
     else unseated.push(rootGuid);
   }
   if (unseated.length) markStale(world, bank.by, unseated);

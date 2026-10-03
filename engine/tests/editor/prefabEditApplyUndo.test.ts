@@ -17,6 +17,7 @@
  *  durable nodeGuid to the new entity that inherited its sentinel. The cases above cannot see that: they find
  *  entities by sentinel and compare guid-free documents. */
 
+import { ownNodes } from './v10Rows';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -243,7 +244,7 @@ describe('undoing an Apply made in the prefab editor rebuilds that world (#1573)
   it('a node the file adds under an instance keeps its key across the undo', async () => {
     install(outerKeyedDoc());
     await quietly(() => loadPrefabEditWorld(OUTER, outerKeyedDoc()));
-    const keyOf = () => saved().entities.find((e) => e.localId === 2)!.added?.find((n) => n.name === 'Authored')?.key;
+    const keyOf = () => ownNodes(saved().entities.find((e) => e.localId === 2)).find((n) => n.name === 'Authored')?.key;
     expect(keyOf()).toBe(KA); // precondition
     writeTraitFieldWithUndo(inRow('A', 'Box'), getTraitByName('Transform')!, 'x', 5);
     const before = saved();

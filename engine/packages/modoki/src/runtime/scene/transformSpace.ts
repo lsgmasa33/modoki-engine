@@ -66,6 +66,9 @@ const _euler = new THREE.Euler();
  *  loader). Such an ancestor is still treated as identity. Left explicit rather than silently
  *  half-fixed — it needs prefab resolution, which is a bigger change than this conversion. */
 function instanceOverrideTraits(e: MutableEntity): Record<string, unknown> | undefined {
+  // Scene v20 (#2001 S6): the root's records are its `"/"` row's; an entry in that form states no localId channel.
+  const row = e.prefab ? e.members?.['/']?.traits : undefined;
+  if (row && typeof row === 'object') return row;
   const pi = e.traits?.PrefabInstance;
   const localId = e.prefab && pi && typeof pi === 'object' ? (pi as { localId?: number }).localId : undefined;
   if (localId == null) return undefined;

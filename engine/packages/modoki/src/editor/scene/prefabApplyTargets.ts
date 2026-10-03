@@ -15,6 +15,7 @@ import type { FrameBase } from './prefabBase';
 import type { PrefabFile, PrefabEntity } from './prefab';
 import type { AddedEntity, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
 import { expandedPrefabRefs } from '../../runtime/loaders/prefabNesting';
+import { preV5NodeGuid } from '../../runtime/core/assetRefRules';
 
 /** One outer place an edit of the frame can be written: level `level` of the chain, as its row `rowLid`. */
 export interface LevelSlot {
@@ -25,8 +26,12 @@ export interface LevelSlot {
   rowLid: number;
   /** Row localIds below that row, down to the frame — the `nestedOverrides` key; empty when the row expands the frame. */
   path: number[];
-  /** The `nodeGuid` of each row on `path` (a member row's key components), or null when one has none (pre-v5). */
+  /** The identity of each row on `path` (a member row's key components: its `nodeGuid`, or the derived one of a row with
+   *  none, `rowIdentity`), or null when a step is not a row. */
   pathGuids: string[] | null;
+  /** Every row on `path` has a `nodeGuid` of its own. A row with a derived identity can carry a VALUE (a v10 row keys it
+   *  so), but the added-node refusal below still asks for a minted one (`addedNodeRefusal`). */
+  minted: boolean;
 }
 
 /** The outer places of `base`'s frame, outermost first (`level` 0 … n−1; the frame's own template is level n). */
@@ -39,17 +44,29 @@ export function chainSlots(base: FrameBase): LevelSlot[] {
     if (next.step.kind !== 'row') continue;
     const path: number[] = [];
     let guids: string[] | null = [];
+    let minted = true;
     for (let i = j + 2; i <= n; i++) {
       const step = levels[i]!.step;
-      if (step.kind !== 'row') { guids = null; break; }
+      if (step.kind !== 'row') { guids = null; minted = false; break; }
       path.push(step.row);
-      const g = rowAt(levels[i - 1]!.doc, step.row)?.nodeGuid;
+      const g = rowIdentity(levels[i - 1]!.doc, step.row);
+      if (!rowAt(levels[i - 1]!.doc, step.row)?.nodeGuid) minted = false;
       if (g && guids) guids.push(g);
       else guids = null;
     }
-    out.push({ level: j, source: levels[j]!.source, name: levels[j]!.doc?.name ?? levels[j]!.source, rowLid: next.step.row, path, pathGuids: guids });
+    out.push({ level: j, source: levels[j]!.source, name: levels[j]!.doc?.name ?? levels[j]!.source, rowLid: next.step.row, path, pathGuids: guids, minted });
   }
   return out;
+}
+
+/** The identity a member row names row `lid` of `doc` by: its `nodeGuid`, or for a document with none (pre-v5) the one
+ *  the instance model derives (`preV5NodeGuid`), which is what a prefab v10 row and a scene v20 entry key such a member
+ *  by (#2001 S6). '' when the document has no such row. Unnamed, an Apply onto a row that already stated the field wrote
+ *  the new value in the legacy channel under it, and the row's old one won. */
+function rowIdentity(doc: PrefabFile | null | undefined, lid: number): string {
+  const row = rowAt(doc, lid);
+  if (!row) return '';
+  return row.nodeGuid || (doc?.id ? preV5NodeGuid(doc.id, lid) : '');
 }
 
 /** Where a template REFERENCE node above `base`'s chain states the frame's members (#1731): the rows below the node down to
@@ -63,7 +80,7 @@ export function nodeSlot(base: FrameBase): { path: number[]; pathGuids: string[]
     const step = levels[i]!.step;
     if (step.kind !== 'row') { guids = null; break; }
     path.push(step.row);
-    const g = rowAt(levels[i - 1]!.doc, step.row)?.nodeGuid;
+    const g = rowIdentity(levels[i - 1]!.doc, step.row);
     if (g && guids) guids.push(g);
     else guids = null;
   }
@@ -72,12 +89,14 @@ export function nodeSlot(base: FrameBase): { path: number[]; pathGuids: string[]
 
 /** The member-row key for member `lid` of the frame (document `frameDoc`) at `slot`, or null when none can name it: a
  *  row on the path or the member itself has no `nodeGuid`. The frame's own ROOT is named by the path alone — the row a
- *  level states about a nested root is forwarded to it (`foldMemberRowChannels`' `forwardRoot`) — and has none where the
- *  slot's row expands the frame (its statements are the row's own `overrides`). */
+ *  level states about a nested root is forwarded to it (`foldMemberRowChannels`' `forwardRoot`) — and where the slot's
+ *  row expands the frame it is the row's `"/"` (prefab v10, #2001 S6; a v9 row stated it in its own `overrides`, which
+ *  the channel half of each reader below still takes). Null there, an Apply onto a row whose `"/"` already stated the
+ *  field wrote the new value under it, and the row's old one won. */
 export function memberKeyAt(slot: Pick<LevelSlot, 'pathGuids'>, frameDoc: PrefabFile, lid: number): string | null {
   if (!slot.pathGuids) return null;
-  if (lid === (frameDoc.rootLocalId ?? 1)) return slot.pathGuids.length ? `/${slot.pathGuids.join('/')}` : null;
-  const g = rowAt(frameDoc, lid)?.nodeGuid;
+  if (lid === (frameDoc.rootLocalId ?? 1)) return `/${slot.pathGuids.join('/')}`;
+  const g = rowIdentity(frameDoc, lid);
   return g ? `/${[...slot.pathGuids, g].join('/')}` : null;
 }
 
@@ -213,7 +232,9 @@ export function addedNodeRefusal(slot: LevelSlot, frameDoc: PrefabFile, node: Ad
   if (expandedPrefabRefs([node]).length) {
     return `it holds an added prefab instance, which can be applied to Prefab '${frameName}' itself only — apply it there, or unpack the added instance first`;
   }
-  if (slot.path.length && !memberKeyAt(slot, frameDoc, node.parentLocalId)) {
+  // A minted identity all the way (the rule before a derived one could name a row, #2001 S6): not widened here.
+  const anchorMinted = node.parentLocalId === (frameDoc.rootLocalId ?? 1) || !!rowAt(frameDoc, node.parentLocalId)?.nodeGuid;
+  if (slot.path.length && !(slot.minted && anchorMinted)) {
     return `Prefab '${slot.name}' cannot name the member it hangs under (a row on the way has no identity) — re-save it once`;
   }
   return null;

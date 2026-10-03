@@ -9,7 +9,7 @@ import { expandsToRoot } from '../../runtime/loaders/prefabRoot';
 import { placedAnchor, translateLocalIds, translateCarried } from '../../runtime/loaders/memberTranslation';
 import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { memberRowKeysIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
+import { instanceRowKeysIn, memberRowKeysIn, memberRowsToWrite, rowWritingRoot } from '../../runtime/core/ecs/memberRows';
 import { isPrefabEditRowGuid, PREFAB_EDIT_ROOT_GUID } from './prefabEditGuids';
 import { diffFrameAdded, type FrameAddedDiff, type NodeDiffDeps } from './nodeRowDiff';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
@@ -18,7 +18,7 @@ import { withMissingComponents } from '../../runtime/core/ecs/missingComponents'
 import { filterAuthoringVisible } from './authoringScope';
 import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { newGuid, isGuid } from '../../runtime/loaders/assetManifest';
-import { durableGuid, nodeRowComponent, isMemberDerivation, memberPathSteps, isStoredRoot, appliedMoves, keyedMoves } from '../../runtime/core/assetRefRules';
+import { durableGuid, nodeRowComponent, nodeRowKey, isMemberDerivation, memberPathSteps, isStoredRoot, appliedMoves, keyedMoves } from '../../runtime/core/assetRefRules';
 import { templateKeyOf, setTemplateKey } from '../../runtime/core/templateIdentity';
 import { templateKeysOf } from '../../runtime/loaders/templateKeyRecovery';
 import { frameRespell } from '../../runtime/loaders/frameRespell';
@@ -27,8 +27,8 @@ import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, InstanceSt
 import { asAddedNode, nodePlacement } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { rowPlaceholderOf, unresolvedRefOf, UnresolvedPrefabRef } from '../../runtime/core/unresolvedPrefabRef';
 import { keptUnusedRows, keptMemberOrphans, keptLegacyChannels, mergeOverrideMaps, nestedPathKey, memberPathIndex, nodeChannels, mapNodeChannels } from '../../runtime/loaders/loadSceneFile';
-import { type OverrideMap, foldStructureLayers, frameKeyIndex } from '../../runtime/loaders/prefabOverrides';
-import { nodeForward, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
+import { type OverrideMap, foldStructureLayers, frameKeyIndex, ownRootRow } from '../../runtime/loaders/prefabOverrides';
+import { nodeForward, nodeRowValues, chainLayer, layerAddedTraits, levelDoc, captureDoc, withKeptLegacy, withKeptLocalRecords, withKeptUnused, withMalformedBack, withKeptSlots, frameBase, type ForwardState, type LayerStructure } from './prefabBase';
 import { parseMemberToken, memberToken, memberPathKey, memberPathLookup, type MemberStep } from '../../runtime/core/templateRefs';
 import { childrenBySibling, localToEcsGuid, type PrefabFile } from './prefab';
 import { getCachedPrefabSync, recoverTemplateKey } from './prefabCache';
@@ -86,8 +86,16 @@ export function captureRowChannels(rootEcs: number, source: string, childPrefab:
   // identity out, so #1293 holds; the identity stays in the scene (`settleSwallowedKeptState`).
   const ownRows = keepsTemplateRows(rootEcs, rootGuid) || bakingKeptState;
   const kept = ownRows ? keptMemberOrphans(rootGuid) ?? {} : {};
+  // …but never a kept REMOVAL of a template node (`…/a+<key>: {removed}`) that a live node answers to (#2001 S6): the row
+  // was kept when no node held the key, and a node does now (a scene-form round trip of a pre-v5 chain respawns the node
+  // by guid and the key is recovered, #2116). Written back beside a node this save states nothing for, it removed the
+  // node at the next open.
+  let liveKeys: Set<string> | undefined;
+  const staleRemoval = (key: string, row: SceneMemberRow): boolean =>
+    row.removed === true && !!nodeRowKey(key.slice(key.lastIndexOf('/') + 1))
+    && (liveKeys ??= new Set(instanceRowKeysIn(rootEcs, getCurrentWorld(), true).values())).has(key);
   for (const [key, row] of Object.entries(kept)) {
-    if (members[key]) continue;
+    if (members[key] || staleRemoval(key, row)) continue;
     const t = templateRowOf(row);
     if (t) members[key] = t;
   }
@@ -1551,7 +1559,7 @@ function referenceNodeRows(
   const doc = ecs && source ? captureDoc(ecs, source) : null;
   if (!ecs || !source || !doc) return null;
   const lower = { overrides: chain.overrides, added: chain.added, removed: chain.removed, removedTraits: chain.removedTraits };
-  const at = chain.members ? foldStructureLayers(doc, [{ rows: chain.members }], 0, lower).channels : lower;
+  const at = chain.members ? foldStructureLayers(doc, [{ rows: chain.members, ...ownRootRow(chain.members) }], 0, lower).channels : lower;
   const seed = nodeForward(chain, doc);
   const structure = captureInstanceStructure(ecs, doc, { rows: true, readOnly: true, layerTraits: layerAddedTraits({ overrides: at.overrides ?? {} }, doc), againstRecords: opts.againstRecords, frameEdits: opts.frameEdits });
   // A move inside the node is the scene's identity statement, which these rows have no place for.
@@ -1823,7 +1831,11 @@ function seededNodeDelta(ecs: number, source: string, doc: PrefabFile, chain: Ad
   seed: ForwardState; rootLayer: OverrideMap; root: OverrideMap; nested: NestedOverridePaths; removals: boolean;
 } {
   const seed = nodeForward(chain, doc);
-  const rootLayer = mergeOverrideMaps(chainLayer(ecs, source, [], doc, seed).overrides, chain.overrides ?? {});
+  // …and the values the statement puts on its ROWS (prefab v10, #2001 S6): a v10 node states a member's values on the
+  // member's row and its root's on `"/"`, where a v9 node stated both in `overrides`. Left out, a second save of a v10
+  // file rewrote the statement with every schema default (#1804, again).
+  const stated = mergeOverrideMaps(nodeRowValues(chain, doc), chain.overrides ?? {});
+  const rootLayer = mergeOverrideMaps(chainLayer(ecs, source, [], doc, seed).overrides, stated);
   const root = captureNestedSceneDelta(ecs, doc, rootLayer);
   const bareRoot = captureInstanceStructure(ecs, doc, { readOnly: true });
   const seeded = captureNestedChannels(ecs, source, bareRoot.ownedNested, { readOnly: true, seed });

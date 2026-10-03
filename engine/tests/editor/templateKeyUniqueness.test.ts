@@ -6,6 +6,7 @@
  *
  *  Driven through the real loader, copy and Apply. Each case names the mutation that turns it red. */
 
+import { ownNodes } from './v10Rows';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -313,7 +314,7 @@ describe('a promotion does not carry a key its target document already declares'
     const res = await applyToPrefabSelective(named('SR', ROOT2).id, new Set(keys), { perKey: { [keys[0]!]: O } });
     expect(res.targets).toEqual([{ key: keys[0], target: O }]);
     const written = writes.map((w) => JSON.parse(w.content) as PrefabFile).filter((d) => d.id === O).pop()!;
-    const promoted = written.entities.find((e) => e.localId === 3)!.added!;
+    const promoted = ownNodes(written.entities.find((e) => e.localId === 3));
     expect(promoted).toHaveLength(1);
     expect(promoted[0]!.key).toBeTruthy();
     expect(promoted[0]!.key).not.toBe(KX);

@@ -290,6 +290,12 @@ function setAsideLeaf(before: unknown, after: Record<string, unknown>, d: string
     b = b[k]; a = a[k];
   }
   const leaf = steps[steps.length - 1]!;
+  // A sorted list of strings (a mark set): the tolerated diff is ONE entry `after` holds and `before` does not, at this
+  // index. Only that entry is set aside, so the compare goes on to every other mark.
+  if (Array.isArray(b) && Array.isArray(a) && /^\d+$/.test(leaf) && typeof a[Number(leaf)] === 'string' && !b.includes(a[Number(leaf)])) {
+    a.splice(Number(leaf), 1);
+    return true;
+  }
   if (!plain(b) || !plain(a) || plain(b[leaf]) || plain(a[leaf]) || b[leaf] === undefined || a[leaf] === undefined) return false;
   a[leaf] = structuredClone(b[leaf]);
   return true;

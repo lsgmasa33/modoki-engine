@@ -38,7 +38,6 @@
 
 import { getAllEntities, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
-import { keptOrphanRowsOf } from '../../runtime/core/ecs/keptOrphanRows';
 import { PREFAB_EDIT_ROOT_GUID, SCAFFOLD_PREFIX } from './prefabEditGuids';
 import { PREFAB_EDIT_SCENE_PREFIX, prefabEditWorldPath } from './prefabEditWorld';
 import { prefabNests, type NestingReader } from '../../runtime/loaders/prefabNesting';
@@ -76,7 +75,7 @@ export function prefabEditRefusal(gesture: PrefabEditGesture): PrefabEditRefusal
   // In the scene and in prefab edit alike (the header): a NEW link under a placeholder. A reorder is not one.
   if (gesture.kind !== 'delete' && gesture.parentId && underMissingPrefab(gesture.parentId, byId)
     && !(gesture.kind === 'reparent' && byId.get(gesture.id)?.parentId === gesture.parentId)) return refuse('under-missing-prefab');
-  // In the scene and in prefab edit alike: a delete the kept list cannot hold (rule 9; #2028 close-out review).
+  // In the scene and in prefab edit alike: a delete of a missing row's placeholder (rule 9; #2028 close-out review).
   if (gesture.kind === 'delete' && missingRowDelete(gesture.ids, byId)) return refuse('missing-prefab-row');
   const world = prefabEditWorldPath();
   if (!world) return null;
@@ -122,54 +121,25 @@ function underMissingPrefab(id: number, byId: ReadonlyMap<number, EntityInfo>): 
   return false;
 }
 
-/** A delete that a missing nested row's kept list cannot hold (#2001 S5, ruling D; rule 9): the row's placeholder
- *  itself (its save restates the row from the file), or a node under it that the kept rows state (#2018: shown there,
- *  but written back from the file, so it returned on reload). Only the delete's ROOTS are asked: deleting an ancestor
- *  member or the instance takes the row with it, which its own save records. A node the user added under the
- *  placeholder this session is the live capture's, which a delete removes, and is not refused. */
+/** A delete of a missing nested row's placeholder itself (#2001 S5, ruling D; rule 9): its save restates the row from
+ *  the file, so the delete came back on reload. Only the delete's ROOTS are asked: deleting an ancestor member or the
+ *  instance takes the row with it, which its own save records. A node under the placeholder is not refused, whether
+ *  the user added it this session or the kept rows state it (refused too until #2001 S6, when the scene's save began
+ *  writing the record, which holds that node's removal).
+ *  ⚠️ The placeholder's own removal is one the record can hold as well, and the v20 save writes it; it stays refused
+ *  because a re-seed of a stale record reads the old capture, which cannot state it (measured: I25 red on #2058's
+ *  repro with the refusal off). It can be lifted when S8 deletes that capture. */
 function missingRowDelete(ids: readonly number[], byId: ReadonlyMap<number, EntityInfo>): boolean {
   const picked = new Set(ids);
-  const isRow = (id: number) => !!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0]);
   for (const id of picked) {
-    const above: number[] = [];
+    if (!rowPlaceholderOf(findEntity(id) as Parameters<typeof rowPlaceholderOf>[0])) continue;
+    let covered = false;
     const seen = new Set<number>([id]);
-    for (let cur = byId.get(byId.get(id)?.parentId ?? 0); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
+    for (let cur = byId.get(byId.get(id)?.parentId ?? 0); cur && !seen.has(cur.id) && !covered; cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
       seen.add(cur.id);
-      above.push(cur.id);
+      covered = picked.has(cur.id);
     }
-    if (above.some((a) => picked.has(a))) continue;
-    if (isRow(id)) return true;
-    const row = above.findIndex(isRow);
-    if (row < 0) continue;
-    const subtree = guidsUnder(id, byId);
-    for (const owner of above.slice(row + 1)) {
-      const kept = keptOrphanRowsOf(byId.get(owner)?.guid ?? '');
-      if (kept && statesAny(kept, subtree)) return true;
-    }
-  }
-  return false;
-}
-
-/** The guids of `id` and everything under it. */
-function guidsUnder(id: number, byId: ReadonlyMap<number, EntityInfo>): Set<string> {
-  const out = new Set<string>();
-  const kids = new Map<number, number[]>();
-  for (const e of byId.values()) if (e.parentId) (kids.get(e.parentId) ?? kids.set(e.parentId, []).get(e.parentId)!).push(e.id);
-  for (const stack = [id]; stack.length;) {
-    const cur = stack.pop()!;
-    const g = byId.get(cur)?.guid;
-    if (g) out.add(g);
-    stack.push(...(kids.get(cur) ?? []));
-  }
-  return out;
-}
-
-/** Whether a kept row states a node with one of `guids` (its `own` links or `added` nodes). */
-function statesAny(rows: Record<string, object>, guids: ReadonlySet<string>): boolean {
-  for (const row of Object.values(rows)) {
-    for (const list of [(row as { own?: unknown }).own, (row as { added?: unknown }).added]) {
-      if (Array.isArray(list) && list.some((n) => typeof (n as { guid?: unknown })?.guid === 'string' && guids.has((n as { guid: string }).guid))) return true;
-    }
+    if (!covered) return true;
   }
   return false;
 }

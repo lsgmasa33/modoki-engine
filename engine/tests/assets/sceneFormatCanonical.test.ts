@@ -248,6 +248,9 @@ function serializerShapeFindings(
         if (!(k in shape.schema)) continue;
         // runtimeOnly is runtimeOnlyFieldsOffDisk's ban — one ledger per ban (#1123), not two here.
         if (shape.fields[k]?.runtimeOnly) continue;
+        // An instance entry ALWAYS states its root's order, 0 included (scene v20, #2001 S6:
+        // `serializeInstanceRecord`, the root records its order as Unity's `m_RootOrder` does).
+        if (typeof e.prefab === 'string' && name === 'EntityAttributes' && k === 'sortOrder') continue;
         if (!isFieldWritten(bag[k], shape.schema, k, shape.fields[k])) {
           found.defaults.push({ item: `${file}::${who}::${name}.${k}`, site: `${file}: ${e.name} ${name}.${k} = ${JSON.stringify(bag[k])}` });
         }
@@ -321,6 +324,16 @@ describe('serializerShapeFindings', () => {
     expect(bad.defaults.map((d) => d.item)).toEqual([`f::E::Transform.${k0}`]);
     const good = serializerShapeFindings({ entities: [{ name: 'E', traits: { Transform: { [k0]: def + 1 } } }] }, 'f', shapes);
     expect(good.defaults).toEqual([]);
+  });
+
+  it('never flags an instance entry\'s root order at 0 (scene v20 always writes it), and still flags a plain entity\'s', () => {
+    const inst = serializerShapeFindings({ entities: [{ name: 'I', prefab: 'p', guid: 'g', traits: { EntityAttributes: { sortOrder: 0 } } }] }, 'f', shapes);
+    expect(inst.defaults).toEqual([]);
+    const plain = serializerShapeFindings({ entities: [{ name: 'E', traits: { EntityAttributes: { sortOrder: 0 } } }] }, 'f', shapes);
+    expect(plain.defaults.map((d) => d.item)).toEqual(['f::E::EntityAttributes.sortOrder']);
+    // Only that one field: another default on an instance entry is still what a save would drop.
+    const other = serializerShapeFindings({ entities: [{ name: 'I', prefab: 'p', guid: 'g', traits: { EntityAttributes: { sortOrder: 0, isActive: true } } }] }, 'f', shapes);
+    expect(other.defaults.map((d) => d.item)).toEqual(['f::I::EntityAttributes.isActive']);
   });
 
   it('never flags an entityId field at its default (the serializer always writes those) nor an unregistered trait', () => {

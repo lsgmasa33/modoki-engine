@@ -455,7 +455,7 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
   const top = entityIds.filter((id) => { for (let p = parentOf(id), n = 0; p && n < 1024; p = parentOf(p), n++) if (set.has(p)) return false; return true; });
   // What each top's commit does, read now (before the delete): data, applied in one pass below.
   type Item =
-    | { kind: 'member'; rec: InstanceRecord; key: RowKey; underKeys: Set<RowKey>; gone: Set<string>; nested: string[] }
+    | { kind: 'member'; rec: InstanceRecord; key: RowKey; underKeys: Set<RowKey>; gone: Set<string>; nested: string[]; pins: Map<RowKey, { guid: string; name?: string }> }
     | { kind: 'unlink'; at: ReturnType<typeof linkAt>; rec: InstanceRecord | null; guid: string; nested: string[] };
   const items: Item[] = [];
   for (const id of top) {
@@ -466,7 +466,18 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
       if (!rec) continue;
       // Member keys are FLAT within a frame (§ 2.1): the member's descendants are found in the live tree, before the
       // delete, as every keyed node of its instance under it; a frame they open keys its rows under their own key.
-      items.push({ kind: 'member', rec, key: t.key, underKeys: keyedSubtree(t.rootId, id), gone: liveGuidsUnder(id), nested });
+      const underKeys = keyedSubtree(t.rootId, id);
+      // The identity of each member that goes (rule 5, § 10.4 "a pin is never derived away while its member is gone"):
+      // while a member is live the save states its pin from the live tree (§ 2.7), so the record need not hold it. Once
+      // it is deleted the record is the pin's only home (#2001 S6: the save writes the list), and a Revert of the
+      // removal must bring the member back under the guid it had.
+      const pins = new Map<RowKey, { guid: string; name?: string }>();
+      for (const [mid, k] of memberRowsToWrite(t.rootId, world)) {
+        if (!underKeys.has(k)) continue;
+        const name = (findEntity(mid)?.get(ea.trait) as { name?: string } | undefined)?.name;
+        pins.set(k, { guid: guidOfEntity(mid), ...(name ? { name } : {}) });
+      }
+      items.push({ kind: 'member', rec, key: t.key, underKeys, gone: liveGuidsUnder(id), nested, pins });
       continue;
     }
     // An instance's own root, a scene-owned node, or a plain entity: unlink from the instance it hangs in, if any.
@@ -479,6 +490,10 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
         const { rec, key, underKeys, gone } = item;
         const under = (k: RowKey) => underKeys.has(k) || [...underKeys].some((u) => k.startsWith(`${u}/`));
         rowOf(rec, key).removed = true;
+        for (const [k, pin] of item.pins) {
+          const row = rowOf(rec, k);
+          if (row.guid === undefined) { row.guid = pin.guid; if (row.name === undefined && pin.name !== undefined) row.name = pin.name; }
+        }
         // Only the links of the nodes that go WITH it: a link the record holds for a node that is not live (its anchor
         // dropped from the template, kept as an R2 orphan) names nothing this delete removed (I23; hunt seed 178).
         for (const k of [...rec.list.rows.keys()]) {
@@ -661,7 +676,9 @@ function seatCopyImpl(records: ReadonlyMap<string, InstanceRecord>, remap: Reado
     const id = to ? findEntityByGuid(to, world)?.id() : undefined;
     const attrs = id ? findEntity(id)?.get(ea.trait) as { name?: string; sortOrder?: number; editorFolder?: string; sourceScene?: string } | undefined : undefined;
     // A link, or a pin, naming a node the copy does not hold would be a second claimant of the source's node.
-    const unmapped = [...src.list.rows.values()].some((row) => row.own?.some((o) => !remap.has(o.guid)) || (row.guid !== undefined && !remap.has(row.guid)));
+    // Not the pin of a member the source REMOVED (kept in its record since #2001 S6): the copy holds no such node, so
+    // nothing of the copy's can claim it; that pin is left behind below.
+    const unmapped = [...src.list.rows.values()].some((row) => row.own?.some((o) => !remap.has(o.guid)) || (row.guid !== undefined && !row.removed && !remap.has(row.guid)));
     if (!to || !id || !attrs || unmapped) {
       markStale(world, 'duplicateInstance', storedRootsAbove(copyId).map(guidOfEntity));
       return false;
@@ -677,7 +694,13 @@ function seatCopyImpl(records: ReadonlyMap<string, InstanceRecord>, remap: Reado
     if (!attrs.sourceScene) delete rec.placement.sourceScene;
     for (const [k, row] of [...rec.list.rows]) {
       // The pin follows the copy (rule 5: a pin is identity, kept verbatim even once the template drops its member).
-      if (row.guid !== undefined) row.guid = remap.get(row.guid)!;
+      // A removed member's pin is the SOURCE's member's identity: the copy never held that node, so it carries the removal
+      // alone, and a Revert brings the member back under the identity the copy derives for it.
+      if (row.guid !== undefined) {
+        const to = remap.get(row.guid);
+        if (to) row.guid = to;
+        else { delete row.guid; delete row.name; }
+      }
       // A value naming a node the copy holds follows the copy, as the copy's live values do (`copySnapshot`, #1338); a
       // stated node guid (identity, a legacy field record) is the copy plan's to give, which derives it (hunt seed 8148).
       if (row.traits) {

@@ -11,7 +11,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, markStructureDirty, readTraitData, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getGuidForPath, isGuid, resolveRef, lastKnownPathOf } from '../../runtime/loaders/assetManifest';
 import { UndoRefusedError } from '../undo/undoFailure';
-import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf, markRowPlaceholder, markUnresolved, type RowPlaceholder } from '../../runtime/core/unresolvedPrefabRef';
 import { durableGuid, isStoredRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { entityRef, type EntityRef } from '../undo/entityRef';
 import { clearOverrideMarks, restoreOverrideMarks, unmarkOverride, getStoredOverrideMarks } from '../../runtime/loaders/overrideMarks';
@@ -22,7 +22,11 @@ import { rebaseStaleInstances } from './prefabRebuild';
 import { planMatchesFile, planMismatch, planPrefabRows } from './prefabSerialize';
 import { unkeyedNodes, stripCreatedKeys, stripKeysNow } from './capturedKeys';
 import { markStale, staleAround } from '../../runtime/prefab/instanceStore';
-import { guidOfEntity, storedRootsAbove, storedRootsUnder } from '../instance/instanceKeys';
+import { guidOfEntity, instanceKeyMap, storedRootsAbove, storedRootsUnder } from '../instance/instanceKeys';
+import { recordForWrite } from '../instance/instanceSync';
+import { serializeInstanceRecord } from '../../runtime/prefab/serializeInstanceRecord';
+import { ROOT_ROW_KEY, type InstanceRecord } from '../../runtime/prefab/instanceRecord';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../runtime/core/version';
 
 // ── File I/O ────────────────────────────────────────────
 
@@ -297,7 +301,41 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
 /** `keys`: each template-keyed node the detach unkeyed, with its RECORD (#1914 R3a: a template's plain node records its own
  *  edits, as a member does, and the undo that makes it the template's node again must make them its own again — after a
  *  reload in between, the plain node it became holds none). */
-export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string; marks?: MarkCapture }[]; }
+/** `placeholders`: each Missing Prefab ROW placeholder the detach turned into a reference placeholder (#2099), with the
+ *  row it stood for, so the undo makes it the row's again. */
+export interface DetachSnapshot { links: DetachedInstanceTrait[]; orphans: DetachedMember[]; keys?: { ref: EntityRef; key: string; marks?: MarkCapture }[]; placeholders?: { ref: EntityRef; row: RowPlaceholder }[]; }
+
+/**
+ * The reference a Missing Prefab ROW placeholder keeps once its instance is detached (#2099; owner 2026-10-03, option (a):
+ * the row stays a Missing Prefab placeholder that keeps its reference and its kept records, and is an instance again
+ * when the prefab returns). The row was the template's; unpacked, nothing supplies it, so it is written as a reference
+ * node the scene holds: `prefab` plus the records the detached instance's list held on and under the row, re-keyed from
+ * the row (scene v20 form). Read BEFORE the strip: the row's key is its instance's.
+ *
+ * ⚠️ Only the SCENE's records. What the unpacked prefab's own row stated inside the missing prefab's members is not
+ * carried: an unpack bakes values into live nodes, and a missing prefab has none to bake into.
+ */
+function detachedRowRecord(id: number, row: RowPlaceholder): Record<string, unknown> {
+  const info = getAllEntities().find((e) => e.id === id);
+  const guid = info?.guid ?? '', name = info?.name ?? '';
+  const node: Record<string, unknown> = { parentLocalId: 0, guid, name, traits: {}, children: [], prefab: row.source };
+  const holder = storedRootsAbove(id)[0];
+  const key = holder ? instanceKeyMap(holder).get(id) : undefined;
+  const rec = holder && key ? recordForWrite(holder, guidOfEntity(holder)) : null;
+  if (!rec || !key) return node;
+  const rows: InstanceRecord['list']['rows'] = new Map();
+  for (const [k, r] of rec.list.rows) {
+    if (k === key) {
+      // The row's own records are the reference's root's; its pin was the row's identity, which the node's guid is now.
+      const { guid: _pin, name: _pinName, ...own } = structuredClone(r);
+      if (Object.keys(own).length) rows.set(ROOT_ROW_KEY, own);
+    } else if (k.startsWith(`${key}/`)) rows.set(k.slice(key.length), structuredClone(r));
+  }
+  if (!rows.size) return node;
+  const kept: InstanceRecord = { rootGuid: guid, source: row.source, placement: { name, sortOrder: 0 } as InstanceRecord['placement'], list: { ...rec.list, rows }, held: {} };
+  const { entry } = serializeInstanceRecord(kept, { identity: new Map(), sceneOwned: () => undefined });
+  return entry.members ? { ...node, members: entry.members } : node;
+}
 
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
  *  root and EVERY descendant in its identity subtree (nested instances included), turning
@@ -365,7 +403,13 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
   }
   let orphans: DetachedMember[] = [];
   const keys: { ref: EntityRef; key: string; marks?: MarkCapture }[] = [];
+  const placeholders: { ref: EntityRef; row: RowPlaceholder }[] = [];
   if (strip) {
+    // A missing nested row's placeholder keeps its reference (#2099), read while its instance's keys still stand.
+    const kept = tree.flatMap((info) => {
+      const row = rowPlaceholderOf(findEntity(info.id) as never);
+      return row ? [{ id: info.id, row, record: detachedRowRecord(info.id, row) }] : [];
+    });
     orphans = recordDetachedMarks(endFrames(new Set(snapshot.map((s) => s.id)))); // BEFORE the strip: the owner walk reads these links
     for (const s of snapshot) findEntity(s.id)?.remove(PrefabInstanceMeta.trait);
     // …and every TEMPLATE KEY in the tree (#1874): the key is template identity too, on a node the template added — a plain
@@ -383,9 +427,13 @@ function detachPrefabInstanceUnmarked(rootEcsId: number, opts?: { strip?: boolea
       keys.push({ ref: entityRef(info.id), key, marks: captureMarks(info.id) });
       e.remove(TemplateAddedKey);
     }
+    for (const { id, row, record } of kept) {
+      placeholders.push({ ref: entityRef(id), row });
+      markUnresolved(findEntity(id) as never, row.source, 'node', record, INSTANCE_MODEL_SCENE_VERSION);
+    }
   }
   if (snapshot.length) markStructureDirty();
-  return { links: snapshot, orphans, ...(keys.length ? { keys } : {}) };
+  return { links: snapshot, orphans, ...(keys.length ? { keys } : {}), ...(placeholders.length ? { placeholders } : {}) };
 }
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
@@ -398,8 +446,14 @@ function reattachPrefabInstanceUnmarked(
   opts?: { rootEcsId?: number },
 ): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  const { links: snapshot, orphans, keys = [] } = detached;
+  const { links: snapshot, orphans, keys = [], placeholders = [] } = detached;
   if (!PrefabInstanceMeta || (!snapshot.length && !orphans.length)) return 0;
+  // The row placeholders the detach made reference placeholders (#2099) are their rows' again.
+  for (const { ref, row } of placeholders) {
+    const live = ref.resolve();
+    const entity = live == null ? undefined : findEntity(live);
+    if (entity) markRowPlaceholder(entity as never, row);
+  }
   // The template keys the detach stripped (#1874), before the links: a rebase after this reads a node's key to know it for
   // the template's. One whose node no longer resolves counts with the links below.
   let missedKeys = 0;

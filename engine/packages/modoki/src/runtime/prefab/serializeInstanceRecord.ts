@@ -18,7 +18,7 @@
  * Byte stability (rule 4: load → save is verbatim from v20 on): rows are written sorted by key, as today's row writer
  * sorts them (`moveChannelsOntoRows`); each row's fields in one fixed order; traits and fields in the record's own order.
  *
- * Dead code at S3: nothing calls it until the save flips (S6).
+ * The scene save calls it since S6 (`editor/instance/instanceSave.ts`); a reprojection writes its entry with it too.
  */
 import type { AddedEntity, SceneEntityEntry, SceneMemberRow } from '../loaders/loadSceneFile';
 import {
@@ -104,9 +104,11 @@ interface Report {
  *   identity is `entry.guid` (`rootGuid`), never a `"/"` pin.
  */
 export function serializeInstanceRecord(rec: InstanceRecord, ctx: SerializeContext): SerializedInstance {
+  // In the trait's own key order (sortOrder before parentId), as a plain entity's `EntityAttributes` is written
+  // (`sceneFormatCanonical.test.ts` reads every committed scene for it).
   const ea: Record<string, unknown> = {};
-  if (rec.placement.parent) ea.parentId = rec.placement.parent;
   ea.sortOrder = rec.placement.sortOrder;
+  if (rec.placement.parent) ea.parentId = rec.placement.parent;
   if (rec.placement.editorFolder) ea.editorFolder = rec.placement.editorFolder;
   if (rec.placement.sourceScene) ea.sourceScene = rec.placement.sourceScene;
 
@@ -180,7 +182,9 @@ function sceneRow(rec: InstanceRecord, ctx: SerializeContext, key: RowKey, repor
   // identity fills only a pin the list does not hold.
   const guid = r?.guid ?? id?.guid;
   if (guid !== undefined) row.guid = guid;
-  const name = r?.name ?? id?.name;
+  // The name only makes the file readable (`MemberIdentity`): a present member's is its live one, as the old row writer
+  // wrote it at every save, so two saves of one live tree agree whatever route the record's pin came by (S6).
+  const name = id?.name ?? r?.name;
   if (name !== undefined) row.name = name;
   if (r?.parent !== undefined) row.parent = r.parent;
 
@@ -221,7 +225,21 @@ function ownNodes(
     written.add(guid);
   }
   for (const node of held) if (!written.has(node.guid)) out.push({ ...structuredClone(node), parentLocalId: 0 });
-  return out;
+  // Written in SIBLING order (the rule of `compareSiblings`, `entityOrder.ts`: sortOrder, then guid, then name), as the scene's own entities are, not in the order
+  // the links were made: a record seeded from a capture lists them in another order than one the door maintained, and
+  // the file must not depend on which wrote it (save → reload → save is the same bytes).
+  out.sort((a, b) => siblingOrderOf(a) - siblingOrderOf(b) || (a.guid ?? '').localeCompare(b.guid ?? '') || (a.name ?? '').localeCompare(b.name ?? ''));
+  // Nothing to write (every link dangling): no `own` at all, so the row reads back as it would have with no link.
+  return out.length ? out : undefined;
+}
+
+/** The sibling position a written node states: a reference node's on its own `/` row, a plain node's on its traits; 0
+ *  where neither states one (the trait default). */
+function siblingOrderOf(n: AddedEntity): number {
+  const ea = (t: unknown): unknown => (t && typeof t === 'object' ? (t as { EntityAttributes?: { sortOrder?: unknown } }).EntityAttributes?.sortOrder : undefined);
+  const row = ea((n as { members?: Record<string, { traits?: unknown }> }).members?.['/']?.traits);
+  const own = ea(n.traits);
+  return typeof row === 'number' ? row : typeof own === 'number' ? own : 0;
 }
 
 // ── Template form ───────────────────────────────────────────────────────────────────────────────────────

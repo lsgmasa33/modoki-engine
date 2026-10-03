@@ -51,8 +51,10 @@ export function legacyView<T>(entry: T, readDoc: (guid: string) => unknown): T {
         out.nestedStructure = ns;
       }
     };
-    for (const [key, row] of Object.entries(e.members)) {
-      const at = resolve(top, key, readDoc);
+    for (const [key, stated] of Object.entries(e.members)) {
+      const row = legacyRow(stated, key === '/');
+      // Scene v20 (#2001 S6): the root's own records are on its `"/"` row.
+      const at = key === '/' ? { path: [], lid: top.rootLocalId ?? 1 } as ReturnType<typeof resolve> : resolve(top, key, readDoc);
       if (!at) continue;
       if (!at.nestedRoot) { apply(at, row); continue; }
       // A nested root's row: deleting it is its OUTER frame's statement, the rest is its own frame's.
@@ -63,6 +65,24 @@ export function legacyView<T>(entry: T, readDoc: (guid: string) => unknown): T {
   }
   if (out.added) out.added = out.added.map((n) => (n.prefab ? legacyView(n, readDoc) : n));
   return out as unknown as T;
+}
+
+/** A v20 row in the channel names the view folds: `own` is the row's added nodes, `traitRemovals` its removed traits.
+ *  The root row's name and order are PLACEMENT (always stated), not an override, so the view leaves them out. */
+function legacyRow(row: Row, root: boolean): Row {
+  const r = row as Row & { own?: Node[]; traitRemovals?: Record<string, unknown> };
+  const out: Row = { ...row };
+  const added = [...(r.added ?? []), ...(r.own ?? [])];
+  if (added.length) out.added = added;
+  const gone = [...(r.removedTraits ?? []), ...Object.entries(r.traitRemovals ?? {}).filter(([, v]) => v === true).map(([t]) => t)];
+  if (gone.length) out.removedTraits = gone;
+  if (root && r.traits) {
+    const { EntityAttributes: ea, ...rest } = r.traits as Record<string, unknown>;
+    const { name: _n, sortOrder: _s, ...attrs } = (ea && typeof ea === 'object' ? ea : {}) as Record<string, unknown>;
+    const traits = { ...rest, ...(Object.keys(attrs).length ? { EntityAttributes: attrs } : {}) };
+    if (Object.keys(traits).length) out.traits = traits as Row['traits']; else delete out.traits;
+  }
+  return out;
 }
 
 /** {@link legacyView} over every entity of a saved scene. */

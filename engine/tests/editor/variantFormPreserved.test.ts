@@ -110,12 +110,16 @@ describe('the Prefab Variant form loads as a Damaged Prefab placeholder and roun
       // Only the placeholder: none of the variant's or its base's nodes were built.
       expect(live.map((e) => (e.get(ea) as { name: string }).name)).toEqual(['Inst']);
       expect(unresolvedRefOf(live[0] as never)).toMatchObject({ source: P, kind: 'entry' });
-      const first = (await serializeScene()).entities;
-      await load({ id: 'ssssssss-0000-4000-8000-000000002042', version: 19, name: 'S', resources: [], entities: first } as unknown as SceneData);
+      const saved = await serializeScene();
+      const first = saved.entities;
+      await load({ id: 'ssssssss-0000-4000-8000-000000002042', version: saved.version, name: 'S', resources: [], entities: first } as unknown as SceneData);
       const second = (await serializeScene()).entities;
       expect(JSON.stringify(second)).toBe(JSON.stringify(first));
       expect(first).toHaveLength(1);
-      expect(first[0]).toMatchObject({ prefab: P, guid: G, overrides: ENTRY.overrides, traits: { EntityAttributes: { name: 'Inst' } } });
+      // Scene v20 (#2001 S6): the file holds one form, so the kept record is written as the list states it — the root's
+      // record on the `"/"` row — and from then on byte for byte (the comparison above).
+      expect(first[0]).toMatchObject({ prefab: P, guid: G, name: 'Inst', members: { '/': { traits: { ...ENTRY.overrides[1], EntityAttributes: { name: 'Inst' } } } } });
+      expect(first[0]).not.toHaveProperty('overrides');
       expect(first[0]).not.toHaveProperty('added');
     } finally {
       vi.unstubAllGlobals();

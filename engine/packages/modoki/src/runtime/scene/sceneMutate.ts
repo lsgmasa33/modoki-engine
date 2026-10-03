@@ -11,6 +11,7 @@
  *  a fresh guid. */
 
 import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../core/version';
 import { traitRemoveRefusal, traitWriteRefusal, fieldWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentLinkRefusal, type ParentGraph } from '../core/ecs/parentLink';
 import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, storedTransformOf, fileHierarchy, fittedOnChain, reparentSuffixes, reparentWrite, isTemplatePlaced, sameTrsMatrix, sameRotationScale, IDENTITY_TRS, type TRS } from './transformSpace';
@@ -23,6 +24,8 @@ export interface MutableEntity {
   traits: Record<string, Record<string, unknown> | boolean>;
   prefab?: string;
   overrides?: Record<number, Record<string, Record<string, unknown>>>;
+  /** Scene v20 (#2001 S6): an instance entry's records by row key; the root's own on the `"/"` row. */
+  members?: Record<string, { traits?: Record<string, unknown>; [key: string]: unknown }>;
   /** Prefab INSTANCE nodes store their identity guid at the node top level
    *  (not in EntityAttributes, which comes from the expanded prefab). */
   guid?: string;
@@ -281,7 +284,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           }
         }
         // Prefab-instance roots route trait writes into their overrides (see helper).
-        const container = traitWriteContainer(entity);
+        const container = traitWriteContainer(entity, scene);
         if (Object.keys(fields).length === 0) {
           // No fields → treat as a tag (presence). Don't clobber existing data.
           // Only count as changed when the tag was actually added — re-tagging an
@@ -314,6 +317,19 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
             write = rest;
             if (Object.keys(write).length === 0) { changed++; continue; }
           }
+          if (op.trait === 'EntityAttributes' && isInstanceModelEntry(entity, scene)) {
+            // A v20 root's sibling order and folder are PLACEMENT too, on the entry's own traits (design § 2.2): on the
+            // `"/"` row no reader takes them.
+            const placed: Record<string, unknown> = {};
+            const rest: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(write)) (k === 'sortOrder' || k === 'editorFolder' ? placed : rest)[k] = v;
+            if (Object.keys(placed).length) {
+              const own = entity.traits.EntityAttributes;
+              entity.traits.EntityAttributes = { ...(own && typeof own === 'object' ? own : {}), ...placed };
+              write = rest;
+              if (Object.keys(write).length === 0) { changed++; continue; }
+            }
+          }
           if (existing === undefined && container === entity.traits) addedTraits.push({ op: i, id: entity.id, guid: entityGuid(entity), trait: op.trait });
           container[op.trait] = { ...base, ...write };
           changed++;
@@ -327,7 +343,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         // Removing a trait the entity doesn't have is a genuine no-op (not an
         // error) — mirrors removeTraitFromEntitiesWithUndo's skip-if-absent.
         // Prefab-instance roots remove the override (same container as setTrait).
-        const container = traitWriteContainer(entity);
+        const container = traitWriteContainer(entity, scene);
         if (container[op.trait] !== undefined) {
           delete container[op.trait];
           changed++;
@@ -597,7 +613,15 @@ function worldFieldsToLocal(
  *  which is the bug that made `setTrait Transform` on an instance apply scale but
  *  not position. Route into `overrides[rootLocalId]` (created on demand) so the
  *  edit is authoritative. */
-function traitWriteContainer(entity: MutableEntity): Record<string, unknown> {
+function traitWriteContainer(entity: MutableEntity, scene: MutableScene): Record<string, unknown> {
+  // Scene v20 (#2001 S6): the root's records are its `"/"` row's (design § 2.2, § 10.3). The entry carries no
+  // `PrefabInstance` and no localId channel, and a trait written on the entry's own `traits` would be read as the
+  // pre-model "extra root trait" form.
+  if (isInstanceModelEntry(entity, scene)) {
+    entity.members ??= {};
+    const row = (entity.members['/'] ??= {});
+    return (row.traits ??= {});
+  }
   const pi = entity.traits?.PrefabInstance;
   const localId = entity.prefab && pi && typeof pi === 'object'
     ? (pi as { localId?: number }).localId
@@ -608,6 +632,11 @@ function traitWriteContainer(entity: MutableEntity): Record<string, unknown> {
     return entity.overrides[localId] as Record<string, unknown>;
   }
   return entity.traits as Record<string, unknown>;
+}
+
+/** Whether `entity` is a prefab instance entry in the instance model's form: a `prefab` ref in a scene of v20 or later. */
+function isInstanceModelEntry(entity: MutableEntity, scene: MutableScene): boolean {
+  return !!entity.prefab && typeof scene.version === 'number' && scene.version >= INSTANCE_MODEL_SCENE_VERSION;
 }
 
 /** A serialized parentId reference: a GUID string (current files), a numeric file id

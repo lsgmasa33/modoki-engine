@@ -12,6 +12,7 @@
  *  its marks; neither is what this file pins). The restore's rebase is REAL: it rebuilds the carried O instance built
  *  from the document being undone, as production does. */
 
+import { rowAtKey, v9Channels } from './v10Rows';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createWorld } from 'koota';
@@ -206,7 +207,8 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
     //   And: drop the rebuild of the applied frame from its capture (`rederiveBaseInstances`) — the same [3, 3].
     const res = await applyFive(O);
     expect(res.writes?.map((w) => w.source)).toEqual([O]);
-    expect((disk(O).entities[1]!.overrides?.[2]?.Transform as { x: number }).x).toBe(5);
+    expect(rowAtKey(disk(O).entities[1], G(2))?.traits?.Transform).toEqual({ x: 5 });
+    expect(v9Channels(disk(O).entities[1])).toEqual([]);
     expect(xs()).toEqual([5, 5]);
     expect(ownKeys()).toEqual([]); // U15: the value is O's now, not the instance's
 
@@ -218,7 +220,8 @@ describe('#1724: undo of an Apply on a base scene\'s nested instance keeps the i
     expect(isSceneDirty(BASE)).toBe(true);
 
     await quietly(() => redo());
-    expect((disk(O).entities[1]!.overrides?.[2]?.Transform as { x: number }).x).toBe(5);
+    expect(rowAtKey(disk(O).entities[1], G(2))?.traits?.Transform).toEqual({ x: 5 });
+    expect(v9Channels(disk(O).entities[1])).toEqual([]);
     expect(xs()).toEqual([5, 5]);
     expect(ownKeys()).toEqual([]);
   });

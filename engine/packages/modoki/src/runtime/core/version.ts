@@ -91,14 +91,29 @@ export const ENGINE_VERSION = '0.1.0';
 // REFUSE reason: an older build would ignore the copies and drop them on its next save. Beside it (#1939, no bump: an
 // optional field a v19 reader without it ignores, and a copy with no list answers by the earlier rules),
 // `embeddedPrefabFrames`: per copy, the addresses of the frames live at the save, which the reload expands and no other.
-export const SCENE_FORMAT_VERSION = 19;
+// v20: the prefab instance model (#2001 S6, rule 4: save writes the list). An instance entry states every override on
+// `members`, keyed by minted identity: the root's own records on the `"/"` row (its name always, a default override), its
+// placement (`parentId`, `sortOrder`, `editorFolder`) on the entry's own `traits.EntityAttributes`, a scene-owned node
+// inline in its anchor row's `own`. The localId and path channels (`overrides`, `added`, `removed`, `removedTraits`,
+// `moved`, `nestedOverrides`, `nestedStructure`) are read from an older file and never written again, except verbatim
+// for a value no reader could interpret (`held.unparsed`) or an instance whose prefab is missing (`held.pendingLegacy`).
+// `embeddedPrefabs` / `embeddedPrefabFrames` are no longer written or read for expansion (owner ruling B). The rung only
+// stamps: the conversion needs the prefab documents, so it runs in `parseInstanceRecord` at load. Required for the REFUSE
+// reason: an older build would read `members["/"]` as nothing and drop the root's edits on its next save.
+export const SCENE_FORMAT_VERSION = 20;
 /** The scene format whose keyed-node guids are frame-rooted (#1809): a file below it is renamed on load. A literal, not
  *  {@link SCENE_FORMAT_VERSION}, which moves on with every later bump while this stays the version the rule arrived in. */
 export const FLAT_KEYED_GUIDS_SCENE_VERSION = 18;
 /** The scene format of the prefab instance model (#2001): from it on, an instance entry's own `name` is not read — the
  *  `"/"` row's name is the root name's one home (hub ruling 2026-10-02, design § 10.4). A literal, for the same reason as
- *  {@link FLAT_KEYED_GUIDS_SCENE_VERSION}; files are not stamped with it until #2001 S5. */
+ *  {@link FLAT_KEYED_GUIDS_SCENE_VERSION}. Files are stamped with it since #2001 S6. */
 export const INSTANCE_MODEL_SCENE_VERSION = 20;
+/** The scene version an instance entry in the OLD CAPTURE's form reads as (#2001 S6): the localId and path channels, the
+ *  entry's own `name`. Files are no longer written in it, but until S8 deletes the capture the editor still builds such
+ *  entries IN MEMORY (a rebuild's, a re-seed's, a Missing Prefab placeholder's kept record, the base-scene carry), and
+ *  each one says so with this version: read as the current format, its entry name and root order would be read by the
+ *  v20 rules and lost. A literal, the last version before {@link INSTANCE_MODEL_SCENE_VERSION}. */
+export const CAPTURE_FORM_SCENE_VERSION = 19;
 
 /** The oldest scene format this build reads; an older scene, or one with no `version` at all, is
  *  REFUSED. No released editor ever wrote a scene below v8: the first tag, v0.1.0, wrote 8, and v8
@@ -152,8 +167,23 @@ export const MIN_READABLE_SCENE_FORMAT_VERSION = 8;
  *  names no entity, and its tokenizer writes that raw guid back (a guid no frame names falls through as itself), so the
  *  reference is rewritten into a dangling guid. The write gate stops that save. Reads stay compatible both ways: this
  *  build reads a v8 token through `memberPathLookup` (the anchor steps dropped), and an older build only fails to
- *  resolve a flat one. No migration: no committed prefab held a keyed node or a member token when this landed. */
-export const PREFAB_FORMAT_VERSION = 9;
+ *  resolve a flat one. No migration: no committed prefab held a keyed node or a member token when this landed.
+ *
+ *  v10: a reference row (and a template reference node) states its nested instance's LIST as `members` in template form
+ *  (#2001 S6, docs/plans/prefab-instance-model.md § 2.2): the nested root on `"/"`, a member's values on its row's
+ *  `traits`, added nodes on `own`, removals as `removed` / `traitRemovals`, a move as a `parent` token. The channels a
+ *  v9 row used (`overrides`, `added`, `removed`, `removedTraits`, `nestedOverrides`, `nestedStructure`, `moved`,
+ *  `templateMoved`) are written only as a value held verbatim: a row whose nested prefab did not resolve, or a record
+ *  naming a localId the frame lacks. What an older build's SAVE would destroy: it reads the rows of a v10 row as member
+ *  rows it half knows (no `"/"` row, no `traits`), shows the nested instance with the inner template's values, and its
+ *  serializer would write that back. The write gate stops the save. No migration ladder: this build reads a v9 row
+ *  through the one parser (`parseTemplateLists`, legacy channels first, rows over them) and writes v10 at its next save. */
+export const PREFAB_FORMAT_VERSION = 10;
+/** The prefab format whose reference rows are in template form (#2001 S6, the v10 note above). Only a load and a save
+ *  in the editor take a file there (the conversion reads the nested prefabs), so a script that rewrites a prefab below
+ *  it stamps the file no further than the version before. A literal, not {@link PREFAB_FORMAT_VERSION}, for the reason
+ *  {@link FLAT_KEYED_GUIDS_SCENE_VERSION} is one. */
+export const TEMPLATE_FORM_PREFAB_VERSION = 10;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

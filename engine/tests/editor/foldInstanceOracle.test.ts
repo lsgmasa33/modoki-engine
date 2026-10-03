@@ -251,7 +251,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const keyed = { ...mine(2), guid: G(91), key: 'k1', name: 'K1' };
       const { lines, saved } = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { traits: { Transform: { x: 4 } }, added: [keyed, mine(2)] } }) })] });
       expect(lines).toEqual([]);
-      expect(rowsOf(saved)[QA]).toEqual({ added: [expect.objectContaining({ guid: MINE })] });
+      // Scene v20 (#2001 S6): the user's link is `own` on the cut row (appended, never a list that replaces).
+      expect(rowsOf(saved)[QA]).toEqual({ own: [expect.objectContaining({ guid: MINE })] });
       expect(JSON.stringify(saved)).not.toContain(G(91));
     });
 
@@ -262,7 +263,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
       const keyed = { ...mine(2), guid: G(91), key: 'zz', name: 'ZZ' };
       const first = await loadSave({ version: 15, entities: [top({ members: cut({ [QA]: { added: [keyed, mine(2)] } }) })] });
       expect(first.lines).toEqual([]);
-      expect(rowsOf(first.saved)[QA]).toEqual({ added: [expect.objectContaining({ guid: MINE })], own: [expect.objectContaining({ guid: G(91), key: 'zz' })] });
+      // Scene v20 (#2001 S6): both are the user's links, written in the one list a link is written in.
+      expect(rowsOf(first.saved)[QA]).toEqual({ own: [expect.objectContaining({ guid: MINE }), expect.objectContaining({ guid: G(91), key: 'zz' })] });
       const second = await loadSave(first.saved);
       expect(second.lines).toEqual([]);
       expect(rowsOf(second.saved)).toEqual(rowsOf(first.saved));
@@ -318,7 +320,7 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
             await loadSave({ version: 15, entities: [top({ members: { [at]: { own: [kid] } } })] });
             deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]);
             const s1 = await save();
-            expect(rowsOf(s1)[R]).toEqual({ removed: true });
+            expect(rowsOf(s1)[R]).toEqual({ guid: expect.any(String), name: 'Q', removed: true }); // the delete keeps the member's pin (S6)
             expect(JSON.stringify(rowsOf(s1)[at])).toContain(KID);
             install(withK1(prefab), Q, S); // the edit is undone
             const back = await loadSave(s1);
@@ -352,7 +354,7 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
           await loadSave({ version: 15, entities: [top({ members: { [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
           deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]);
           const s1 = await save();
-          expect(rowsOf(s1)[R]).toEqual({ removed: true });
+          expect(rowsOf(s1)[R]).toEqual({ guid: expect.any(String), name: 'Q', removed: true });
           expect(rowsOf(s1)[QA]).toEqual({ added: [expect.objectContaining({ key: 'k1', children: [expect.objectContaining({ guid: KID })] })] });
           install(withK1(), Q, S); // the edit is undone
           const back = await loadSave(s1);
@@ -423,7 +425,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
           install(withK1(), Q, S);
           const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [NODE]: { own: [node(99)] }, [QA]: { added: [{ ...k1(), children: [kid] }] } } })] });
           expect(first.lines).toEqual([]);
-          expect(rowsOf(first.saved)[NODE]).toEqual({ own: [expect.objectContaining({ guid: G(99) }), expect.objectContaining({ guid: KID })] });
+          // In sibling order (both at sortOrder 0, so by guid): the writer's order, not the order the links were made in.
+          expect(rowsOf(first.saved)[NODE]).toEqual({ own: [expect.objectContaining({ guid: KID }), expect.objectContaining({ guid: G(99) })] });
           expect(rowsOf((await loadSave(first.saved)).saved)).toEqual(rowsOf(first.saved));
         });
         // …and a guid the stated row holds in EITHER list is not lifted again (the #2041 review: one list at a time wrote it twice).
@@ -460,7 +463,8 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
           try {
             const first = await loadSave({ version: 15, entities: [top({ members: { [R]: { removed: true }, [QA]: qa } })] });
             expect(first.lines).toEqual([]);
-            expect(rowsOf(first.saved)[QA]).toEqual({ added: [expect.objectContaining({ key: 'k1', nestedStructure: expect.anything() })] });
+            // `heldRemainder` (#2006): the whole list is a HELD one, read back additively.
+            expect(rowsOf(first.saved)[QA]).toEqual({ added: [expect.objectContaining({ key: 'k1', nestedStructure: expect.anything() })], heldRemainder: true });
             expect(rowsOf((await loadSave(first.saved)).saved)).toEqual(rowsOf(first.saved));
           } finally { warn.mockRestore(); }
         });
@@ -553,7 +557,7 @@ describe('#2007 oracle: synthetic cases the corpus does not reach', () => {
         deleteEntitiesWithUndo([[...getCurrentWorld().entities].find((x) => (x.get(ea()) as { name?: string } | undefined)?.name === 'Q')!.id()]); // R's root takes Q's root name
         const s1 = await save();
         // Shape A, written by an editor save: the orphan the delete could not reach, beside the cut.
-        expect(rowsOf(s1)[R]).toEqual({ removed: true });
+        expect(rowsOf(s1)[R]).toEqual({ guid: expect.any(String), name: 'Q', removed: true });
         expect(JSON.stringify(rowsOf(s1)[QA])).toContain(MINE);
         install(P, Q); // the template edit is undone
         const back = await loadSave(s1);

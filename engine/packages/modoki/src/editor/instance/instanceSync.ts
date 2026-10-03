@@ -17,20 +17,21 @@ import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world'
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { durableGuid } from '../../runtime/core/assetRefRules';
-import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
 import type { SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { recordsOf } from '../../runtime/prefab/instanceLoad';
 import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
-import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { CAPTURE_FORM_SCENE_VERSION } from '../../runtime/core/version';
 import { parseInstanceRecord } from '../../runtime/prefab/parseInstanceRecord';
-import { freshInstanceRecord, setInstanceRecord } from '../../runtime/prefab/instanceStore';
+import { freshInstanceRecord, setInstanceRecord, storedInstance } from '../../runtime/prefab/instanceStore';
 import type { InstanceRecord, PrefabDoc, PrefabReader } from '../../runtime/prefab/instanceRecord';
 import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/identityParents';
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { captureInstanceEntry } from '../scene/instanceEntry';
 import { savedFrameDoc } from '../scene/prefabRebuild';
 import { soaSchema } from '../../runtime/core/ecs/traitSchema';
+import { withMissingComponents } from '../../runtime/core/ecs/missingComponents';
 import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
 import { foldInstance } from '../../runtime/prefab/foldInstance';
 import { guidOfEntity, instanceKeyMap, outermostStoredRoot, projectionRootOf, storedRootsUnder } from './instanceKeys';
@@ -44,9 +45,16 @@ export const editorPrefabReader: PrefabReader = (guid) => {
   return doc ? { doc } : { missing: true };
 };
 
+/** The scene version {@link capturedEntryOf}'s entry for `rootId` reads as: a Missing Prefab placeholder's kept record
+ *  is in the form of the file it was read from (`UnresolvedPrefabRef.version`); anything captured is in the capture's. */
+export function captureFormVersionOf(rootId: number): number {
+  return unresolvedRefOf(findEntity(rootId))?.version ?? CAPTURE_FORM_SCENE_VERSION;
+}
+
 /** What the old save would write for stored root `rootId`, as a scene entry; null when it cannot be stated (no root guid,
  *  or the prefab is in no cache — the save would fall back to its frame record, which a re-seed does not attempt). */
-export function capturedEntryOf(rootId: number): SceneEntityEntry | null {
+/** `consumed`: filled with every live entity the capture states (`captureInstanceEntry`'s), for a caller that asks. */
+export function capturedEntryOf(rootId: number, consumed?: Set<number>): SceneEntityEntry | null {
   const ea = getTraitByName('EntityAttributes'), pi = getTraitByName('PrefabInstance');
   const entity = findEntity(rootId);
   if (!ea || !pi || !entity) return null;
@@ -67,11 +75,13 @@ export function capturedEntryOf(rootId: number): SceneEntityEntry | null {
   const current = source ? getCachedPrefabSync(source) : null;
   if (!source || !current) return null;
   const prefab = savedFrameDoc(rootId, source, current);
-  const { entry } = captureInstanceEntry(rootId, source, prefab, guid);
-  return {
-    id: 0, name: attrs.name ?? '', prefab: source, guid, ...entry,
-    traits: Object.keys(placement).length ? { EntityAttributes: placement } : {},
-  } as unknown as SceneEntityEntry;
+  const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guid);
+  if (consumed) for (const id of consumedEcsIds) consumed.add(id);
+  // A component this build registers no trait for, kept for the root verbatim (#1933 N1b): the old save writes it on the
+  // entry's `traits`, where the parse reads the root's extra components from. Left out, a re-seeded record lost it, and
+  // the save that writes the record (S6) with it.
+  const traits = withMissingComponents(Object.keys(placement).length ? { EntityAttributes: placement } : {}, guid, rootId);
+  return { id: 0, name: attrs.name ?? '', prefab: source, guid, ...entry, traits } as unknown as SceneEntityEntry;
 }
 
 /** The records the old capture implies for the instance tree at OUTERMOST stored root `topRootId` (its own, then every
@@ -84,8 +94,8 @@ export function capturedRecordsOf(topRootId: number): InstanceRecord[] | null {
     const held = new Set<string>();
     const ea = getTraitByName('EntityAttributes')!;
     for (const e of getCurrentWorld().entities) { const g = (e.get(ea.trait) as { guid?: string } | undefined)?.guid; if (g) held.add(g); }
-    // The entry is what today's save would write, so it is read as a file of today's format.
-    const opts = { held: (g: string) => held.has(g), sceneVersion: SCENE_FORMAT_VERSION };
+    // The entry is in the old capture's form, so it is read as a file of that form's version.
+    const opts = { held: (g: string) => held.has(g), sceneVersion: captureFormVersionOf(topRootId) };
     return recordsOf(parseInstanceRecord(entry, editorPrefabReader, opts), editorPrefabReader, opts).map((p) => p.record);
   } finally {
     closeIdentityScope();
@@ -100,7 +110,29 @@ export function reseedFromCapture(rootId: number, world: World = getCurrentWorld
   const top = projectionRootOf(rootId) || outermostStoredRoot(rootId) || rootId;
   const recs = capturedRecordsOf(top);
   if (!recs) return false;
-  for (const r of recs) setInstanceRecord(world, withoutUnstatedAddedFields(r, world));
+  for (const r of recs) {
+    // The pin the record it replaces held, on a row the capture still states (rule 5; § 10.4 "a pin is never derived away
+    // while its member is gone"): the capture states a pin only for a member that is LIVE, so a deleted member's row came
+    // back as its removal alone, and the save that writes the list (S6) wrote it with no identity beside it. Only onto a
+    // row the capture states: a row it does not state at all (a member of a frame that left) is not brought back.
+    const was = storedInstance(world, r.rootGuid)?.record;
+    for (const [key, row] of r.list.rows) {
+      const pin = row.guid === undefined ? was?.list.rows.get(key) : undefined;
+      if (pin?.guid === undefined) continue;
+      row.guid = pin.guid;
+      if (row.name === undefined && pin.name !== undefined) row.name = pin.name;
+    }
+    // …and the pins of the members INSIDE a nested instance the capture states as removed: its frame's rows are keyed
+    // under its own, none of them is live, and the capture states the removal alone. The door's delete put each one's pin
+    // in the record; a re-seed that dropped them wrote the file without them (an undo then redo of the delete that falls
+    // back to the snapshot, hunt seed 178). Only a pin (`guid`, `name`), and only under a row stated removed.
+    const removed = [...r.list.rows].filter(([, row]) => row.removed === true).map(([k]) => `${k}/`);
+    if (removed.length) for (const [key, pin] of was?.list.rows ?? []) {
+      if (r.list.rows.has(key) || pin.guid === undefined || !removed.some((p) => key.startsWith(p))) continue;
+      r.list.rows.set(key, { guid: pin.guid, ...(pin.name !== undefined ? { name: pin.name } : {}) });
+    }
+    setInstanceRecord(world, withoutUnstatedAddedFields(r, world));
+  }
   return true;
 }
 
@@ -124,10 +156,6 @@ function withoutUnstatedAddedFields(rec: InstanceRecord, world: World): Instance
       const id = byKey.get(key);
       const live = id === undefined ? undefined : findEntity(id);
       if (!live) continue;
-      // A placeholder (a row whose prefab is missing, or a reference node's) has no marks and no base the fold can state:
-      // nothing there can be told apart from a statement, so it keeps every field (#2058 review: a rotation's default
-      // axes were dropped there, and came back wrong once the prefab returned).
-      if (unresolvedRefOf(live as never) || rowPlaceholderOf(live as never)) continue;
       const marks = getOverrideMarkSet(live as never);
       const dflt = (f: string) => (typeof schema[f] === 'function' ? (schema[f] as () => unknown)() : schema[f]);
       const unstated = Object.keys(bag).filter((f) => f in schema && !marks?.has(`${t}.${f}`) && JSON.stringify((bag as Bag)[f]) === JSON.stringify(dflt(f)));
@@ -141,10 +169,15 @@ function withoutUnstatedAddedFields(rec: InstanceRecord, world: World): Instance
 }
 
 /** Whether the base (every layer below this record's own row) supplies `trait` at `key`, or cannot be read there: a key the
- *  fold does not reach (a placeholder, a frame it cannot expand) answers true, so the caller keeps the field. It holds the
- *  narrowing to #1829's scope, components the base LACKS: today no capture states an unmarked field of a component the base
- *  supplies (it writes those by their marks, and a rotation marked whole), so no reachable case turns on it (#2058 review;
- *  `instanceEditsDoor.test.ts` pins that premise). */
+ *  fold does not reach (a placeholder, a frame it cannot expand) answers true, so the caller keeps the field. A
+ *  placeholder (a row whose prefab is missing, or a reference node's) has no marks and no base the fold can state, so
+ *  nothing there can be told apart from a statement (#2058 review: a rotation's default axes were dropped there, and came
+ *  back wrong once the prefab returned; `reseedAtRowPlaceholder.test.ts`). This is the one guard for it: a second, asking
+ *  the live node whether it is a placeholder, sat in the caller and was removed in #2001 S6 (either alone kept the test
+ *  green, so neither was tested).
+ *  The other half holds the narrowing to #1829's scope, components the base LACKS: today no capture states an unmarked
+ *  field of a component the base supplies (it writes those by their marks, and a rotation marked whole), so no reachable
+ *  case turns on it (#2058 review; `instanceEditsDoor.test.ts` pins that premise). */
 function baseHas(rec: InstanceRecord, key: string, trait: string): boolean {
   const probe = structuredClone(rec);
   delete probe.list.rows.get(key)!.traits![trait];

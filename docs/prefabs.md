@@ -2928,6 +2928,12 @@ its folder, because those are what the Hierarchy can change. The name is the liv
 
 #### A scene backs up a missing prefab (#1914 F8 = A1, #1867, scene v19; top level #1935)
 
+> **Superseded by #2001 (owner ruling B).** Since S5 no copy expands a frame: an instance whose prefab is missing loads
+> as its Missing Prefab placeholder with its list ([plans/prefab-instance-model.md](plans/prefab-instance-model.md)
+> § 10.8). Since S6 (scene v20) a save writes no `embeddedPrefabs` or `embeddedPrefabFrames` (§ 10.10). A v19 file's
+> copies are noted on load and ignored, and the validator still checks their shape. The section below records the
+> v19 mechanism until S8 deletes its code (`collectEmbeddedPrefabs`, the copy carry).
+
 **A scene saved while a prefab is missing carries a copy of that prefab's document, and a reload with the prefab still
 missing expands that scene's instances from the copy, top-level, nested and reference nodes alike** (each only if it was
 live at the save; see below). This is Unity's scene

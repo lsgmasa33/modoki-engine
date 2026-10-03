@@ -63,6 +63,15 @@ if (!versionMatch) {
   process.exit(1);
 }
 const PREFAB_FORMAT_VERSION = Number(versionMatch[1]);
+// The template-form rung (#2001 S6) is taken only by a load and a save in the editor (the conversion reads the nested
+// prefabs), so a file below it is stamped to the version before it, never past it.
+const rungMatch = versionSrc.match(/TEMPLATE_FORM_PREFAB_VERSION\s*=\s*(\d+)/);
+if (!rungMatch) {
+  console.error('could not read TEMPLATE_FORM_PREFAB_VERSION from runtime/core/version.ts');
+  process.exit(1);
+}
+const TEMPLATE_FORM_RUNG = Number(rungMatch[1]);
+const stampFor = (version) => (version >= TEMPLATE_FORM_RUNG ? PREFAB_FORMAT_VERSION : TEMPLATE_FORM_RUNG - 1);
 
 /** Insert one line into `raw` immediately after the unique line that `anchor` matches, at that
  *  line's own indentation, and return the new text — or `null` when the anchor does not match
@@ -115,7 +124,7 @@ for (const { rel, abs } of targets) {
   const doc = parseJsonText(raw);
   const rows = Array.isArray(doc.entities) ? doc.entities : [];
   const needs = rows.filter((r) => !r.nodeGuid).length;
-  if (needs === 0 && (doc.version ?? 0) >= PREFAB_FORMAT_VERSION) { alreadyDone++; continue; }
+  if (needs === 0 && (doc.version ?? 0) >= stampFor(doc.version ?? 0)) { alreadyDone++; continue; }
 
   // The document this script MEANS to write. `nodeGuid` is rebuilt into position rather than
   // assigned, so it sits where the serializer puts it — `{ localId, nodeGuid, name, traits }`.
@@ -126,7 +135,7 @@ for (const { rel, abs } of targets) {
     ...doc,
     // `Math.max`, never a bare assignment: a format marker that can go BACKWARDS is worse than
     // none — see the `version` docblock in editor/scene/prefab.ts on the rule this replaced.
-    version: Math.max(PREFAB_FORMAT_VERSION, doc.version ?? 0),
+    version: Math.max(stampFor(doc.version ?? 0), doc.version ?? 0),
     entities: rows.map((row) => {
       if (row.nodeGuid) return row;
       const { localId, ...rest } = row;

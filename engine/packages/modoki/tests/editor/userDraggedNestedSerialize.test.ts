@@ -152,13 +152,13 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
 
     // NOT written as a standalone top-level entry…
     expect(scene.entities.filter((e) => e.prefab === Q)).toHaveLength(0);
-    // …but folded into the P instance's `added` as a reference node anchored at
-    // P2's localId (2), carrying Q's source.
+    // …but stated by the P instance's entry: a reference node in the `own` links of P2's row (scene v20; P is a pre-v5
+    // document, so the row is keyed by the node guid derived for localId 2), carrying Q's source.
     const pEntry = scene.entities.find((e) => e.prefab === P)!;
-    expect(pEntry.added).toBeTruthy();
-    const ref = pEntry.added!.find((n) => n.prefab === Q)!;
-    expect(ref).toBeTruthy();
-    expect(ref.parentLocalId).toBe(2); // P2's localId
+    const { preV5NodeGuid } = await import('../../src/runtime/loaders/frameChain');
+    const own = (pEntry.members as any)[`/${preV5NodeGuid(P, 2)}`]?.own as Array<{ prefab?: string }> | undefined;
+    expect(own?.find((n) => n.prefab === Q)).toBeTruthy();
+    expect(pEntry.added).toBeUndefined();
   });
 
   it('re-expands the dragged instance under the SAME member on reload (exact placement)', async () => {
@@ -172,14 +172,14 @@ describe('user-dragged nested instance (no parentLocalId) round-trips under its 
 
     const scene = await serializeScene();
     const pEntry = scene.entities.find((e) => e.prefab === P)!;
-    const struct = { added: pEntry.added, removed: pEntry.removed, removedTraits: pEntry.removedTraits };
-
-    // Reload into a fresh world: re-instantiate P, then re-apply its structure
-    // (mirrors the runtime load path, editor side).
+    // Reload into a fresh world as the scene load expands the entry: the spawner, handed the rows and the file's version.
     testWorld = createWorld(); index.clear();
-    const { applyStructureByRootInstance } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
-    const pRoot2 = await instantiatePrefabAsync(pPrefab as any); setPrefabSource(pRoot2, { id: P });
-    applyStructureByRootInstance(pRoot2, pPrefab as any, struct as any);
+    const { instantiatePrefabIntoWorld } = await import('../../src/runtime/loaders/loadSceneFile');
+    const { getCachedPrefabSync } = await import('../../src/editor/scene/prefabCache');
+    const { SCENE_FORMAT_VERSION } = await import('../../src/runtime/core/version');
+    const pRoot2 = instantiatePrefabIntoWorld(testWorld, pPrefab as any, 0, undefined, P, undefined, { members: pEntry.members } as any, undefined, undefined, undefined,
+      { read: (g: string) => getCachedPrefabSync(g) as any, sceneVersion: SCENE_FORMAT_VERSION });
+    expect(pRoot2).toBeGreaterThan(0);
 
     // The dragged Q instance exists again, parented under the live P2 member.
     const q1 = findByName('Q1');

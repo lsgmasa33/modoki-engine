@@ -150,7 +150,13 @@ function restoreAuthoredEntitiesUnmarked(entries: SerializedEntity[]): void {
     // `EntityAttributes: { parentId }` (or `{ editorFolder }`), and schema-filling that blanked the
     // instance's name to '' and forced isActive on, on every Stop and every ⏹ Exit.
     const sparseAgainstSchema = !entry.prefab;
-    if (entry.prefab && entry.overrides && piMeta && liveEntity.has(piMeta.trait)) {
+    const rootRow = entry.prefab ? (entry.members as Record<string, { traits?: Record<string, Record<string, unknown> | boolean> }> | undefined)?.['/']?.traits : undefined;
+    if (rootRow) {
+      // Scene v20 (#2001 S6): the root's records are its `"/"` row's, its placement the entry's own `EntityAttributes`.
+      const placed = entry.traits.EntityAttributes, stated = rootRow.EntityAttributes;
+      const ea = { ...(typeof placed === 'object' ? placed : {}), ...(typeof stated === 'object' ? stated : {}) };
+      fieldsByTrait = { ...rootRow, ...(Object.keys(ea).length ? { EntityAttributes: ea } : {}) };
+    } else if (entry.prefab && entry.overrides && piMeta && liveEntity.has(piMeta.trait)) {
       const localId = (liveEntity.get(piMeta.trait) as { localId?: number }).localId;
       fieldsByTrait = (localId != null ? entry.overrides[localId] : undefined) ?? {};
     }

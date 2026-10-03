@@ -115,6 +115,13 @@ const dPrefab = { id: D, version: 2 as const, name: 'D', rootLocalId: 1, entitie
   { localId: 2, name: 'B1', prefab: B, traits: { EntityAttributes: { name: 'B1', parentId: 1, guid: '' } } },
 ] };
 
+/** Scene v20 (#2001 S6): the deep member's record is the row keyed by its path of node identities, D's B-row then B's
+ *  A-row. These documents are pre-v5 (their rows carry no node guid), so each component is the derived one. */
+const deepKey = async () => {
+  const { preV5NodeGuid } = await import('../../src/runtime/loaders/frameChain');
+  return `/${preV5NodeGuid(D, 2)}/${preV5NodeGuid(B, 2)}`;
+};
+
 function aRoot(): number {
   let id = 0;
   testWorld.query(PrefabInstance).updateEach(([pi], e) => { const p = pi as any; if (p.source === A && p.rootInstanceId === e.id()) id = e.id(); });
@@ -122,7 +129,7 @@ function aRoot(): number {
 }
 
 describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
-  it('writes the deep edit as a path-keyed nestedOverrides on the top instance', async () => {
+  it('writes the deep edit as a path-keyed row on the top instance', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
@@ -136,8 +143,9 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const scene = await serializeScene();
     const top = scene.entities.find((e) => e.prefab === D)!;
     expect(top).toBeTruthy();
-    // Path "2.2": D's B-row (2) → B's A-row (2). Value is the scene's deep edit.
-    expect(top.nestedOverrides).toEqual({ '2.2': { 1: { Transform: { x: 7 } } } });
+    // D's B-row (2) → B's A-row (2). Value is the scene's deep edit.
+    expect((top.members as any)[await deepKey()]).toEqual({ traits: { Transform: { x: 7 } } });
+    expect(top.nestedOverrides).toBeUndefined();
     // A is NOT written as a standalone scene entity (it expands from the chain).
     expect(scene.entities.filter((e) => e.prefab === A)).toHaveLength(0);
   });
@@ -158,10 +166,10 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const top = scene.entities.find((e) => e.prefab === D)!;
     // Only x (the scene's own edit). y=5 belongs to prefab B and is NOT baked in,
     // so changing B.y later still propagates.
-    expect(top.nestedOverrides).toEqual({ '2.2': { 1: { Transform: { x: 7 } } } });
+    expect((top.members as any)[await deepKey()]).toEqual({ traits: { Transform: { x: 7 } } });
   });
 
-  it('round-trips: re-instantiating with the serialized nestedOverrides reproduces the value', async () => {
+  it('round-trips: re-instantiating with the serialized rows reproduces the value', async () => {
     const { instantiatePrefab, setPrefabCache, setPrefabSource } = await Promise.all([import('../../src/editor/scene/prefabCache'), import('../../src/editor/scene/prefabInstantiate')]).then(([m0, m1]) => ({ ...m0, ...m1 }));
     const { serializeScene } = await import('../../src/editor/scene/serialize');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
@@ -171,11 +179,16 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const a = aRoot();
     writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
     const scene = await serializeScene();
-    const deep = scene.entities.find((e) => e.prefab === D)!.nestedOverrides;
+    const members = scene.entities.find((e) => e.prefab === D)!.members;
 
-    // Reload into a fresh world via the editor forwarder (mirrors runtime apply).
+    // Reload into a fresh world as the scene load expands the entry: the spawner, handed the rows and the file's version.
     testWorld = createWorld(); index.clear();
-    const root2 = instantiatePrefab(dPrefab as any, 0, undefined, deep); setPrefabSource(root2, { id: D });
+    const { instantiatePrefabIntoWorld } = await import('../../src/runtime/loaders/loadSceneFile');
+    const { getCachedPrefabSync } = await import('../../src/editor/scene/prefabCache');
+    const { SCENE_FORMAT_VERSION } = await import('../../src/runtime/core/version');
+    const root2 = instantiatePrefabIntoWorld(testWorld, dPrefab as any, 0, undefined, D, undefined, { members } as any, undefined, undefined, undefined,
+      { read: (g: string) => getCachedPrefabSync(g) as any, sceneVersion: SCENE_FORMAT_VERSION });
+    expect(root2).toBeGreaterThan(0);
     expect((index.get(aRoot())!.get(Transform) as any).x).toBe(7);
   });
 });

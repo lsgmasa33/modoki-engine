@@ -67,7 +67,9 @@ describe('#2008 P2: serialize and parse are inverse over the fuzzer\'s saved sce
         expect(asData(foldInstance(read, second.record)), `${entry.name}: the same instance`).toEqual(fold);
         expect(asData(foldInstance(readV10, second.record)), `${entry.name}: the same instance from v10 documents`).toEqual(fold);
         seen.instances++;
-        if (first.record.held.pendingLegacy && 'missing' in read(entry.prefab)) seen.scenePending++;
+        // Scene v20 (#2001 S6): a missing prefab's entry holds ROWS (no legacy channel is written), so the class is the
+        // missing instance itself; the legacy `pendingLegacy` form is `instanceRecordRoundTrip.test.ts`'s.
+        if ('missing' in read(entry.prefab)) seen.scenePending++;
       }
       for (const [guid, doc] of docs) {
         for (const [lid, { list }] of parseTemplateLists(doc, guid, read).rows) {
@@ -85,7 +87,7 @@ describe('#2008 P2: serialize and parse are inverse over the fuzzer\'s saved sce
   it('reached the fuzzer\'s structure (non-vacuity, per class)', () => {
     expect(seen.instances).toBeGreaterThan(VERIFY_SEEDS.length);
     expect(seen.templateLists).toBeGreaterThan(VERIFY_SEEDS.length);
-    expect(seen.scenePending, 'a scene instance whose prefab is missing (scene pendingLegacy)').toBeGreaterThan(0);
+    expect(seen.scenePending, 'a scene instance whose prefab is missing').toBeGreaterThan(0);
     expect(seen.templatePending, 'a reference row whose nested prefab is missing (template pendingLegacy)').toBeGreaterThan(0);
     expect(seen.converted, 'a reference row the v10 fold read in converted form').toBeGreaterThan(0);
   });

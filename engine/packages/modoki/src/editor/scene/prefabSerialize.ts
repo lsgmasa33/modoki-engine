@@ -16,6 +16,9 @@ import { runtimeExcludedMessage } from './authoringScope';
 import { newGuid, getGuidForPath, isGuid } from '../../runtime/loaders/assetManifest';
 import { mapStringValues, isStoredRoot, memberStepId, type MemberPi } from '../../runtime/core/assetRefRules';
 import { PREFAB_FORMAT_VERSION } from '../../runtime/core/version';
+import { writeTemplateForm } from '../../runtime/prefab/templateFormDocument';
+import type { PrefabDoc } from '../../runtime/prefab/instanceRecord';
+import { editorPrefabReader } from '../instance/instanceSync';
 import { localIdCounter, advanceLocalIdCounter } from '../../runtime/core/localIdCounter';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { captureDoc, withLeftBehindRecorded } from './prefabBase';
@@ -604,6 +607,9 @@ function serializePrefabBody(
   // over — prefab-edit's session floor, a Replace's document, a rebuild's prior file. `commitPrefabWrites` holds the same
   // line against the file on disk; stating it here keeps the bytes a caller records before the commit the bytes written.
   advanceLocalIdCounter(file, opts?.replacing, opts?.preserveLocalIds && opts.localIdFloor ? opts.localIdFloor + 1 : 0, keptFrom);
+  // Prefab v10 (#2001 S6): a reference row states its nested instance's list as `members`, in template form. The rows
+  // above are the live capture's, in its channels; the one parser reads them and the one writer states them.
+  writeTemplateForm(file as unknown as PrefabDoc, file.id ?? '', editorPrefabReader);
   assertNoRuntimeGuids(file, 'a serialized prefab');
   opts?.onRows?.(ecsToLocal);
   writtenRows.set(file.entities, new Map(flatTree.filter((e) => e.guid).map((e) => [e.guid!, ecsToLocal.get(e.id)!])));
@@ -923,7 +929,11 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
   //
   // `fresh` contributes nothing — it is this importer's own output, from a GLB tree with no nested
   // instances, so it has neither unknown fields nor a `moved` map.
-  return mergeUnknownFields(known, collectUnknownFields(existing, Object.keys(known))) as unknown as PrefabFile;
+  const merged = mergeUnknownFields(known, collectUnknownFields(existing, Object.keys(known))) as unknown as PrefabFile;
+  // The document claims v10, so a reference row the user nested under the rig (carried verbatim above, in the form the
+  // file held) and the carried `moved` are stated in the v10 form, as every other writer states them (#2001 S6).
+  writeTemplateForm(merged as unknown as PrefabDoc, merged.id ?? '', editorPrefabReader);
+  return merged;
 }
 
 /** The rows a Replace matches identity against (#1686): each row's name, `nodeGuid` and nested `prefab`, and the

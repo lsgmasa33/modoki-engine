@@ -4,6 +4,8 @@
  *  Each check has a stable id. A failure's SIGNATURE is its id plus a detail class with the run's guids and numbers
  *  stripped, so the shrinker only keeps a smaller list that fails the SAME way, never one that slides onto another bug. */
 
+import { parseTemplateLists } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
+import { LEGACY_ROW_CHANNELS } from '../../../packages/modoki/src/runtime/prefab/templateFormDocument';
 import { getAllEntities } from '@modoki/engine/runtime';
 import { isRuntimeGuid } from '../../../packages/modoki/src/runtime/core/assetRefRules';
 import { validatePrefabData, validateSceneData } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
@@ -147,8 +149,7 @@ export function forgetHistoryOf(history: LocalIdHistory, text: string): void {
 
 /** For every file but a hand-edited one: I8 (no runtime guid in a template), I15 (a file this run wrote is at the writer's version), I16 (no template
  *  contains itself), I4 (a localId is never re-bound to another node, #1774; the mark covers every number), plus the
- *  validator. `written` names the files the run has changed, which I15 holds to the current version. */
-export function checkFiles(
+ *  validator. `written` names the files the run has changed, which I15 holds to the current version. */export function checkFiles(
   files: Map<string, string>, history: LocalIdHistory, written: ReadonlySet<string>, handEdited: ReadonlySet<string> = new Set(),
 ): Failure[] {
   const out: Failure[] = [];
@@ -176,6 +177,20 @@ export function checkFiles(
     }
     try { assertNoRuntimeGuids(doc, path); } catch (e) { out.push({ check: 'I8 runtime guid in a template', detail: String((e as Error).message).split('\n')[0] }); }
     if (written.has(path) && doc.version !== PREFAB_FORMAT_VERSION) out.push({ check: 'I15 written at an old version', detail: `${path}: v${doc.version}` });
+    // A document this build wrote states a reference row's list as `members` (prefab v10, #2001 S6): a v9 channel is on a
+    // row only as a HELD value (docs/prefabs.md § Format rule: a frame whose prefab did not resolve, a record naming a
+    // localId the frame lacks, a value no reader takes), which the one parser says. A writer that skipped the conversion
+    // leaves channels the parser holds nothing of.
+    if (written.has(path) && doc.version === PREFAB_FORMAT_VERSION && doc.id) {
+      const read = (g: string) => { const d = byId.get(g); return d ? { doc: d as never } : { missing: true as const }; };
+      const lists = parseTemplateLists(doc as never, doc.id, read as never).rows;
+      for (const r of (doc.entities ?? []) as Array<Record<string, unknown>>) {
+        if (typeof r.prefab !== 'string') continue;
+        const v9 = LEGACY_ROW_CHANNELS.filter((k) => k in r);
+        const held = lists.get(r.localId as number)?.list.held;
+        if (v9.length && !held?.pendingLegacy && !held?.unparsed) out.push({ check: 'I15 a v10 row states a v9 channel', detail: `${path}: row ${String(r.localId)} ${v9.join(', ')}` });
+      }
+    }
     const rows = doc.entities ?? [];
     const nodeGuids = new Set<string>();
     let max = 0;
@@ -481,7 +496,7 @@ export function recordKeys(sceneBytes: string): Set<string> {
   // not a record.
   const nodeWalk = (n: Record<string, unknown>, g: string) => {
     out.add(`${g} node`);
-    for (const c of CHANNELS) if (n[c] !== undefined) walk(n[c], c, g);
+    for (const c of CHANNELS) if (n[c] !== undefined) walk(c === 'members' ? withoutRootOrder(n[c]) : n[c], c, g);
     if (n.prefab === undefined && n.traits && typeof n.traits === 'object') {
       const { EntityAttributes: ea, ...rest } = n.traits as Record<string, unknown>;
       const own = ea && typeof ea === 'object' ? (({ parentId: _p, guid: _g, ...r }) => r)(ea as Record<string, unknown>) : ea;
@@ -506,5 +521,16 @@ export function recordKeys(sceneBytes: string): Set<string> {
     nodeWalk(e, guid);
   }
   return out;
+}
+/** `members` without the `"/"` row's `EntityAttributes.sortOrder` (scene v20, #2001 S6): a stored root's sibling order is
+ *  PLACEMENT, which an inline reference node states on its `"/"` row and a top-level entry on its own traits (design § 2.2).
+ *  The same node is written either way (a node shown at a Missing Prefab placeholder is an entry of its own), so the
+ *  statement moving between the two is not a record lost. */
+function withoutRootOrder(members: unknown): unknown {
+  const row = members && typeof members === 'object' ? (members as Record<string, { traits?: Record<string, unknown> }>)['/'] : undefined;
+  const ea = row?.traits?.EntityAttributes;
+  if (!ea || typeof ea !== 'object' || !('sortOrder' in ea)) return members;
+  const { sortOrder: _order, ...rest } = ea as Record<string, unknown>;
+  return { ...(members as object), '/': { ...row, traits: { ...row!.traits, EntityAttributes: rest } } };
 }
 const isRecordNode = (x: unknown): boolean => !!x && typeof x === 'object' && typeof (x as { guid?: unknown }).guid === 'string';

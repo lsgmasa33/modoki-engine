@@ -46,7 +46,7 @@ export interface UnresolvedNode {
 /** The loader's top-level skip: the pass-1 placeholder at `placeholderId` stays, named as the entry names it, and
  *  carries the entry. Only the REF form (`entry.prefab`): a trait-form root without one is a flattened carrier (the
  *  base-scene carry's snapshots), whose placeholder already IS the whole entity. */
-export function keepUnresolvedEntry(world: World, placeholderId: number, source: string, entry: { prefab?: string; name?: string; id?: unknown }): void {
+export function keepUnresolvedEntry(world: World, placeholderId: number, source: string, entry: { prefab?: string; name?: string; id?: unknown }, sceneVersion = 0): void {
   if (!entry.prefab) return;
   const e = findEntityById(placeholderId, world) as Parameters<typeof markUnresolved>[0] & { get(t: unknown): unknown; remove(t: unknown): void };
   if (!e) return;
@@ -63,15 +63,17 @@ export function keepUnresolvedEntry(world: World, placeholderId: number, source:
     // Where the ENTRY states its root's sibling position or active flag as a root override (#1850) — as a live
     // instance's save writes them — the placeholder loads with them: pass 1 read only the entry's own traits and left
     // the trait default, so the save ordered it as sortOrder 0 and a save→reload→save moved it among its siblings.
+    // A v20 entry states a root record on its `"/"` row (#2001 S6): the active flag a live instance's save recorded there.
     for (const k of PLACEHOLDER_ORDER_FIELDS) {
-      const stated = rootOverrideOf(entry, k);
+      const row = rootRowOf(entry, k);
+      const stated = row.has ? row : rootOverrideOf(entry, k);
       if (stated.has && !hasOwn(entryAttributes(entry), k)) next[k] = stated.value;
     }
     e.set(ea.trait, next);
   }
   // `id` is the loader's per-load key (the array index), never written back.
   const { id: _loadKey, ...record } = entry;
-  markUnresolved(e, source, 'entry', record);
+  markUnresolved(e, source, 'entry', record, sceneVersion);
 }
 
 const hasOwn = (o: object | undefined, k: string): boolean => !!o && Object.prototype.hasOwnProperty.call(o, k);
@@ -88,12 +90,20 @@ function rootOverrideOf(record: Record<string, unknown>, field: string): { has: 
   return hasOwn(bag, field) ? { has: true, value: bag![field] } : { has: false };
 }
 
+/** What an ENTRY record states for its root's `field` on its `"/"` row (scene v20, #2001 S6):
+ *  `members["/"].traits.EntityAttributes[field]`, where the instance model keeps a root record. */
+export function rootRowOf(record: Record<string, unknown>, field: string): { has: boolean; value?: unknown } {
+  const row = (record.members as Record<string, { traits?: Record<string, unknown> }> | undefined)?.['/'];
+  const bag = row && typeof row === 'object' ? row.traits?.EntityAttributes : undefined;
+  return bag && typeof bag === 'object' && hasOwn(bag, field) ? { has: true, value: (bag as Record<string, unknown>)[field] } : { has: false };
+}
+
 /** Spawn the placeholder for an added reference node whose prefab does not resolve, under `parentEcsId`, carrying the
  *  node. A plain entity with the marker and NO `PrefabInstance`, like the top-level one: the structural capture finds
  *  it by the marker (`captureChild`), and no instance machinery can mistake it for an instance. Shared by the loader's
  *  expansion and the editor's rebuild, so a Revert or an Apply that respawns the instance leaves the same placeholder
  *  behind. Returns the placeholder's ECS id, or 0 when the trait is not registered. */
-export function spawnUnresolvedReference(world: World, node: UnresolvedNode, parentEcsId: number): number {
+export function spawnUnresolvedReference(world: World, node: UnresolvedNode, parentEcsId: number, sceneVersion = 0): number {
   const ea = getTraitByName('EntityAttributes');
   if (!ea || !node.prefab) return 0;
   const placement = nodeSpawnPlacement(node);
@@ -103,7 +113,7 @@ export function spawnUnresolvedReference(world: World, node: UnresolvedNode, par
   );
   if (node.guid) indexEntityGuid(entity, world);
   if (node.key) setTemplateKey(entity, node.key);
-  markUnresolved(entity, node.prefab, 'node', node);
+  markUnresolved(entity, node.prefab, 'node', node, sceneVersion);
   return entity.id();
 }
 
@@ -172,6 +182,12 @@ export function asSceneEntry(
       // A field the entry states as a root OVERRIDE is written back there (#1850): the placeholder loaded with it, so
       // an unedited one writes the bytes it read, and an edit lands where the prefab's return reads it — written into
       // the traits beside the override instead, the override would win again the moment the instance re-expanded.
+      // …and one a v20 entry states on its `"/"` row (#2001 S6) is written back there, for the same reason.
+      const onRow = kind === 'entry' && !(k in ea) ? rootRowOf(record, k) : { has: false };
+      if (onRow.has) {
+        if (live.order[k] !== onRow.value) base.members = withRootRow(base.members as Record<string, unknown>, k, live.order[k]);
+        continue;
+      }
       const stated = kind === 'entry' && !(k in ea) ? rootOverrideOf(record, k) : { has: false };
       if (stated.has) {
         // Onto what an earlier field of this loop wrote, not the record: both changed, the second undid the first (close-out review).
@@ -209,6 +225,12 @@ export function placementForMissing(
     out[k] = live[k];
   }
   return out;
+}
+
+/** `members` with the `"/"` row's `EntityAttributes[field]` set to `value`, copied along the path it changes. */
+function withRootRow(members: Record<string, unknown>, field: string, value: unknown): Record<string, unknown> {
+  const row = members['/'] as { traits: Record<string, Record<string, unknown>> };
+  return { ...members, '/': { ...row, traits: { ...row.traits, EntityAttributes: { ...row.traits.EntityAttributes, [field]: value } } } };
 }
 
 /** `current` (the entry's `overrides` as written so far) with the root's `EntityAttributes[field]` set to `value`, copied

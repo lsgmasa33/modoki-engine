@@ -893,11 +893,11 @@ describe('#1789 prefab fuzz', () => {
     expect(ops.map((_, i) => `${i} ${ops[i]!.kind} ${outcomeOf(i)}`)).toEqual(ops.map((o, i) => `${i} ${o.kind} done`));
     expect(grew).toEqual(expect.arrayContaining(['I23 around playStop', 'I23 around timelinePreview', 'taint agentFileWrite']));
     // The file-direct write REACHED the editor and survived its saves: the first entry (an instance root) still states
-    // Transform.z = 8 in its legacy root channel after the final save→reload. A watcher that took the op's own Save mark
+    // Transform.z = 8 on its `"/"` row (scene v20, #2001 S6: the root's records) after the final save→reload. A watcher that took the op's own Save mark
     // for the outside write too swallowed it, and the final save wrote the scene back without it (#2009's harness fix).
     const scenePath = [...be.snapshot().keys()].find((p) => p.endsWith('/scenes/Fuzz.json'))!;
-    const entry = (JSON.parse(be.read(scenePath)!) as { entities: Array<{ overrides?: Record<string, { Transform?: { z?: number } }> }> }).entities[0]!;
-    expect(Object.values(entry.overrides ?? {}).some((o) => o.Transform?.z === 8), JSON.stringify(entry.overrides)).toBe(true);
+    const entry = (JSON.parse(be.read(scenePath)!) as { entities: Array<{ members?: Record<string, { traits?: { Transform?: { z?: number } } }> }> }).entities[0]!;
+    expect(entry.members?.['/']?.traits?.Transform?.z, JSON.stringify(entry.members?.['/'])).toBe(8);
   }, 120_000);
 
   // P1 by the fold (#2009 part 2) found a gap in the comparison itself (foldOracle.ts): a template-added REFERENCE node
@@ -1030,20 +1030,20 @@ describe('#1789 prefab fuzz', () => {
     });
   }, 60_000);
 
-  it('KNOWN_OPEN\'s P1 waivers tolerate their own shapes and nothing near them (#2013, #1931; #2015-#2018 fixed by #2007\'s close-out)', () => {
+  it('KNOWN_OPEN\'s P1 waivers tolerate their own shapes and nothing near them (#2013; #2015-#2018 fixed by #2007\'s close-out, #1931 by #2001 S6)', () => {
     const g = 'aaaaaaaa-0000-4000-8000-000000000001';
     const P1 = (lines: string[]) => ({ check: 'P1 the live instance is not the fold of its record', detail: `${g} ${lines.join(' ; ')}` });
     const who = (f: { check: string; detail: string }) => KNOWN_OPEN.filter((k) => k.tolerates?.(f)).map((k) => k.issue);
     const moved = 'parent /R/A: fold {"key":"/R"} live {"key":"/R/QR/M"}';
     // Accept: each shape, alone and repeated.
     expect(who(P1(['kept-only unused /R/A removed (applied)', 'kept-only unused /R/B removed (applied)']))).toEqual([2013]);
-    // #1931 member 1: a kept link the fold links at its template-added row, and after its node is deleted, the record's
-    // link there to exactly that guid.
+    // #1931 member 1's old shapes (a kept link the fold links at its template-added row): retired by #2001 S6 (a row a
+    // live keyed node answers to is no orphan), so nothing tolerates them and a regression goes red.
     const link = 'kept-only unused /R/a+K own (applied g1)';
-    expect(who(P1([link, 'kept-only unused /R/a+L own (applied g2)']))).toEqual([1931]);
-    expect(who(P1(['anchors /R/a+K: fold ["g1"] live []', link]))).toEqual([1931]);
-    expect(who(P1(['anchors /R/a+K: fold ["g1","g2"] live ["g2"]', link]))).toEqual([1931]);
-    expect(who(P1(['anchors /R/a+K: fold ["g1","g2"] live []', link, 'kept-only unused /R/a+K own (applied g2)']))).toEqual([1931]);
+    expect(who(P1([link, 'kept-only unused /R/a+L own (applied g2)']))).toEqual([]);
+    expect(who(P1(['anchors /R/a+K: fold ["g1"] live []', link]))).toEqual([]);
+    expect(who(P1(['anchors /R/a+K: fold ["g1","g2"] live ["g2"]', link]))).toEqual([]);
+    expect(who(P1(['anchors /R/a+K: fold ["g1","g2"] live []', link, 'kept-only unused /R/a+K own (applied g2)']))).toEqual([]);
     // Reject: nothing tolerates these — the fixed waivers' old shapes included, so a regression of #2015-#2018 goes red.
     for (const lines of [
       [moved, 'parent /A: fold {"key":"/"} live {"key":"/QR/M"}'],

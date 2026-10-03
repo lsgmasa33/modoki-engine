@@ -48,6 +48,13 @@ const PREFAB_FORMAT_VERSION = Number(mp[1]);
 const mk = versionSrc.match(/FLAT_KEYED_GUIDS_SCENE_VERSION\s*=\s*(\d+)/);
 if (!mk) { console.error('could not read FLAT_KEYED_GUIDS_SCENE_VERSION from runtime/core/version.ts'); process.exit(1); }
 const LOADER_RUNG = Number(mk[1]);
+// The second rung only the editor can take (#2001 S6): an instance entry's records move onto its member rows, which
+// needs the prefab documents, and a file that says it is at this rung has its entries read by the instance model's
+// rules (an entry's own name and its root order are not read). A scene between the two rungs is stamped to the one
+// before this.
+const mi = versionSrc.match(/INSTANCE_MODEL_SCENE_VERSION\s*=\s*(\d+)/);
+if (!mi) { console.error('could not read INSTANCE_MODEL_SCENE_VERSION from runtime/core/version.ts'); process.exit(1); }
+const MODEL_RUNG = Number(mi[1]);
 
 // ── Field transforms (mirror loadSceneFile.ts migrations) ──────────────────────────
 const RENDERABLE_TRAITS = new Set([
@@ -110,7 +117,7 @@ const prefabs = repoFiles({
 });
 const files = new Set([...scenes, ...prefabs].map(({ rel }) => rel));
 
-let rewritten = 0, bumped = 0, skippedTooNew = 0, heldForLoader = 0;
+let rewritten = 0, bumped = 0, skippedTooNew = 0, heldForLoader = 0, heldForModel = 0;
 for (const rel of [...files].sort()) {
   const abs = path.join(REPO_ROOT, rel);
   let json;
@@ -147,10 +154,14 @@ for (const rel of [...files].sort()) {
   // FORWARD. It was the whole downgrade before that guard existed. Left as one mechanism rather than
   // two — a `<` here as well would be unfalsifiable (mutating it back to `!==` leaves every test
   // green, which is exactly what a redundant guard looks like from the outside).
-  const stampTo = typeof json.version === 'number' && json.version >= LOADER_RUNG ? SCENE_FORMAT_VERSION : LOADER_RUNG - 1;
-  if (isScene && stampTo < SCENE_FORMAT_VERSION) {
+  const v = typeof json.version === 'number' ? json.version : -1;
+  const stampTo = v >= MODEL_RUNG ? SCENE_FORMAT_VERSION : v >= LOADER_RUNG ? MODEL_RUNG - 1 : LOADER_RUNG - 1;
+  if (isScene && stampTo === LOADER_RUNG - 1) {
     heldForLoader++;
     console.log(`HOLD ${rel}: stamped no further than v${stampTo} — v${LOADER_RUNG} renames keyed-node guids over the loaded world`);
+  } else if (isScene && stampTo < SCENE_FORMAT_VERSION) {
+    heldForModel++;
+    console.log(`HOLD ${rel}: stamped no further than v${stampTo} — v${MODEL_RUNG} moves each prefab instance's records onto its member rows, which needs the prefabs`);
   }
   if (isScene && json.version !== stampTo) { json.version = stampTo; didBump = true; }
 
@@ -171,5 +182,6 @@ for (const rel of [...files].sort()) {
 console.log(`\n✓ ${rewritten} file(s) ${DRY ? 'would be ' : ''}rewritten (${bumped} scene version stamps) → format v${SCENE_FORMAT_VERSION}.`);
 // Counted and reported, never silent: a skipped file still holds whatever this script exists to
 // migrate, so a run that rewrites nothing and says nothing else would read as a clean corpus.
+if (heldForModel > 0) console.log(`${heldForModel} scene(s) held at v${MODEL_RUNG - 1} — v${MODEL_RUNG} states each prefab instance on its member rows; open and save each (HOLD lines above) in the editor to finish.`);
 if (heldForLoader > 0) console.log(`${heldForLoader} scene(s) held at v${LOADER_RUNG - 1} — v${LOADER_RUNG} renames keyed-node guids over the loaded world; open and save each (HOLD lines above) in the editor to finish.`);
 if (skippedTooNew > 0) console.log(`${skippedTooNew} file(s) SKIPPED — written by a newer build; update this checkout and re-run.`);

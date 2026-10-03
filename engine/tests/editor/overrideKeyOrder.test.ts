@@ -73,7 +73,7 @@ async function load(data: SceneData): Promise<void> {
 const byName = (name: string) => getAllEntities().find((e) => e.name === name)!.id;
 /** The file's entities as text: `JSON.stringify` keeps key order, which is what the owner's git diff sees. (The scene's
  *  own `id` is left out: this harness sets no current scene, so each save mints one.) */
-const saveText = async () => JSON.stringify({ entities: (await serializeScene()).entities }, null, 2);
+const saveText = async () => { const saved = await serializeScene(); return JSON.stringify({ version: saved.version, entities: saved.entities }, null, 2); };
 const entry = (text: string) => (JSON.parse(text) as { entities: Array<Record<string, unknown>> }).entities.find((e) => e.guid === INST)!;
 
 beforeEach(async () => {
@@ -105,8 +105,9 @@ describe('an override field object is written in one key order (#1896)', () => {
   // Mutation: as above — the first save's order is the mark set's, x after rx.
   it("the root override lists its fields in the trait's schema order", async () => {
     markedThenRotated();
-    const overrides = entry(await saveText()).overrides as Record<string, Record<string, Record<string, unknown>>>;
-    expect(Object.keys(overrides['1']!.Transform!)).toEqual(['x', 'rx', 'ry', 'rz']);
+    // Scene v20 (#2001 S6): the root's records are its `"/"` row's.
+    const rows = entry(await saveText()).members as Record<string, { traits: Record<string, Record<string, unknown>> }>;
+    expect(Object.keys(rows['/']!.traits.Transform!)).toEqual(['x', 'rx', 'ry', 'rz']);
   });
 
   // The member-row channel (`moveChannelsOntoRows`) takes the same object. A marked `x` equal to its base and a changed

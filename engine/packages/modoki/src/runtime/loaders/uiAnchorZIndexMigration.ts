@@ -36,7 +36,9 @@
  *  including their `children`); `nestedOverrides[path][localId][TraitName]`; and — because it is
  *  called on every row unconditionally, not just non-nested ones — a prefab file's OWN nested
  *  rows (a `PrefabEntity.prefab` reference row carries its own `overrides`/`added`/
- *  `nestedOverrides` in the outer localId space, and those are exactly this same shape). */
+ *  `nestedOverrides` in the outer localId space, and those are exactly this same shape); and the
+ *  member rows that state all of that from scene v20 / prefab v10 (`members[key].traits`, a
+ *  per-field diff, and the subtrees under `members[key].own`, each with member rows of its own). */
 
 /** A per-field override bag, keyed by trait name — the shape found in `overrides[localId]` and
  *  `nestedOverrides[path][localId]`. Unlike a full trait bag, only the traits actually DIFFED
@@ -56,6 +58,9 @@ export interface MigratableEntry {
    *  prefab-reference node) plus a `children` tree for the non-reference case. */
   added?: MigratableEntry[];
   children?: MigratableEntry[];
+  /** The member rows of a prefab instance (scene v20, prefab v10; #2001 S6): `traits` is a per-field diff like an
+   *  override bag, and `own` (`added` in the row forms before v20) holds subtrees like `added`. */
+  members?: Record<string, { traits?: TraitFieldOverrides; own?: MigratableEntry[]; added?: MigratableEntry[] } | null>;
 }
 
 /** Entity-level trait bag migration: `traits['UIAnchor'].zIndex` → `traits['UIElement'].zIndex`.
@@ -129,4 +134,11 @@ export function migrateUIAnchorZIndexStructured(entry: MigratableEntry | null | 
   }
   if (entry.added) for (const child of entry.added) migrateUIAnchorZIndexStructured(child);
   if (entry.children) for (const child of entry.children) migrateUIAnchorZIndexStructured(child);
+  if (entry.members && typeof entry.members === 'object') {
+    for (const row of Object.values(entry.members)) {
+      if (!row || typeof row !== 'object') continue;
+      if (row.traits && typeof row.traits === 'object') migrateUIAnchorZIndexInOverrideBag(row.traits);
+      for (const nodes of [row.own, row.added]) if (Array.isArray(nodes)) for (const node of nodes) migrateUIAnchorZIndexStructured(node);
+    }
+  }
 }

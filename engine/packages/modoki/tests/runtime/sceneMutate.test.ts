@@ -176,6 +176,48 @@ describe('applyOps — setTrait on prefab instances (routes into overrides)', ()
   });
 });
 
+describe('applyOps — setTrait on a scene v20 instance entry writes its "/" row (#2001 S6)', () => {
+  // A v20 entry states its root's records on the `"/"` row: no `PrefabInstance`, no localId channel. A trait written on
+  // the entry's own `traits` would be read as the pre-model "extra root trait" form.
+  // Mutation: drop the `isInstanceModelEntry` branch of `traitWriteContainer` — the Transform lands on `traits`.
+  const v20Scene = (): MutableScene => ({
+    version: 20,
+    entities: [{
+      id: 1, name: 'R', prefab: 'p-src', guid: 'g-inst',
+      traits: { EntityAttributes: { sortOrder: 0 } },
+      members: { '/': { traits: { EntityAttributes: { name: 'R' } } } },
+    }],
+  } as unknown as MutableScene);
+  const rootRow = (scene: MutableScene) => (scene.entities[0] as unknown as { members: Record<string, { traits: Record<string, unknown> }> }).members['/']!.traits;
+
+  it('setTrait lands on the "/" row, beside the name it states, and not on the entry\'s own traits', () => {
+    const scene = v20Scene();
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'Transform', fields: { z: 8 } }], mint);
+    expect(res.errors).toEqual([]);
+    expect(rootRow(scene)).toEqual({ EntityAttributes: { name: 'R' }, Transform: { z: 8 } });
+    expect(scene.entities[0].traits.Transform).toBeUndefined();
+    expect(scene.entities[0].overrides).toBeUndefined();
+  });
+
+  it('a root\'s sortOrder and editorFolder go on the entry\'s own EntityAttributes, its name on the "/" row', () => {
+    // Placement is the entry's (design § 2.2): on the "/" row no reader takes a root's order or folder, so the write
+    // would report success and do nothing. Mutation: skip the placement split in `applyOps` — both land on the row.
+    const scene = v20Scene();
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { guid: 'g-inst' }, trait: 'EntityAttributes', fields: { sortOrder: 3, editorFolder: 'X', name: 'R2' } }], mint);
+    expect(res.errors).toEqual([]);
+    expect(scene.entities[0].traits.EntityAttributes).toEqual({ sortOrder: 3, editorFolder: 'X' });
+    expect(rootRow(scene).EntityAttributes).toEqual({ name: 'R2' });
+  });
+
+  it('removeTrait takes the record off the "/" row', () => {
+    const scene = v20Scene();
+    rootRow(scene).Rotate3D = { speed: 1 };
+    const res = applyOps(scene, [{ op: 'removeTrait', entity: { guid: 'g-inst' }, trait: 'Rotate3D' }], mint);
+    expect(res.errors).toEqual([]);
+    expect(rootRow(scene).Rotate3D).toBeUndefined();
+  });
+});
+
 describe('applyOps — removeTrait', () => {
   it('removes a (non-core) component trait the entity has', () => {
     const scene = freshScene();

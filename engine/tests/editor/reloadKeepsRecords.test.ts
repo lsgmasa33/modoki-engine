@@ -27,7 +27,7 @@ import { storedInstance } from '../../packages/modoki/src/runtime/prefab/instanc
 import { loadSceneReporting } from '../../packages/modoki/src/editor/scene/serialize';
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
-import { takeRecordBank } from '../../packages/modoki/src/runtime/prefab/recordBank';
+import { takeRecordBank, bankInstanceRecords } from '../../packages/modoki/src/runtime/prefab/recordBank';
 import { notePrefabFileChanged } from '../../packages/modoki/src/editor/scene/prefabRead';
 import { captureAuthoredSnapshot } from '../../packages/modoki/src/editor/scene/authoredSnapshot';
 
@@ -40,13 +40,16 @@ boot(be);
 /** The root guid `startRun` mints for the fixture's scene entry `k` (1 O1, 2 P1, 3 H1). */
 const rootGuid = (k: number) => authored().find((e) => e.guid?.startsWith(`ffffffff-0000-4000-8${k.toString(16).padStart(3, '0')}-`))!.guid!;
 const stored = (k: number) => storedInstance(getCurrentWorld(), rootGuid(k));
-/** Mark entry `k`'s record with a value no reader of the scene text restores, and the fold does not read. */
+/** Mark entry `k`'s record with a value no reader of the scene text restores, and the fold does not read: a property the
+ *  record's type does not have. (Not `held.unparsed`, as before #2001 S6: the save writes the list, held values too, so
+ *  that marker reached the text, and a reload from the FILE then rightly read a different entry.) */
+type Marked = { s76?: string };
 function markHeld(k: number): void {
   const s = stored(k)!;
   expect(s.stale).toBeUndefined(); // premise: a fresh record to bank
-  s.record.held.unparsed = { s76: 'banked' };
+  (s.record as unknown as Marked).s76 = 'banked';
 }
-const held = (k: number) => stored(k)?.record.held.unparsed;
+const held = (k: number) => { const m = (stored(k)?.record as unknown as Marked | undefined)?.s76; return m ? { s76: m } : undefined; };
 function under(k: number, name: string): number {
   const topId = authored().find((e) => e.guid === rootGuid(k))!.id;
   const inTree = (id: number): boolean => { for (let at = id; at; at = authored().find((e) => e.id === at)?.parentId ?? 0) if (at === topId) return true; return false; };
@@ -79,13 +82,20 @@ describe('a reload of a world the editor held takes back its exact records (#204
   });
 
   // Mutation: `adoptBankedRecords` skips the fold comparison — O1 comes back naming its root "Bogus", which it does not show.
-  it('Stop: a banked record whose fold differs from the parse is not seated — the parse stays, stale as before S7.6', async () => {
-    await startRun(be, async () => {}, 'reload-fold');
+  // The BANKED record is changed while away (the bank re-made with it): since #2001 S6 the banked text is written from
+  // the records, so a record changed before the bank is made is what the text states too, and is rightly seated.
+  it('a prefab edit\'s Exit: a banked record whose fold differs from the parse is not seated — the parse stays, stale', async () => {
+    const f = await startRun(be, async () => {}, 'reload-fold');
     const shown = stored(1)!.record.placement.name;
-    stored(1)!.record.placement.name = 'Bogus';
-    await playStop();
+    const g1 = rootGuid(1);
+    await editAndLeave(f, { whileAway: () => {
+      const bank = takeRecordBank(f.scenePath)!;
+      expect(bank, 'premise: the open banked the scene').toBeTruthy();
+      bank.stored.get(g1)!.record.placement.name = 'Bogus';
+      bankInstanceRecords(f.scenePath, bank.stored, [...bank.entries.values()].map((t) => JSON.parse(t) as never), bank.by);
+    } });
     expect(stored(1)!.record.placement.name).toBe(shown);
-    expect(stored(1)!.stale).toBe('stop');
+    expect(stored(1)!.stale).toBe('prefabLeave');
     for (const k of [2, 3]) expect(stored(k)?.stale, String(k)).toBeUndefined(); // the others are seated
   });
 
@@ -127,7 +137,8 @@ describe('a reload of a world the editor held takes back its exact records (#204
       },
     });
     expect(held(1)).toEqual({ s76: 'banked' });
-    expect(held(2)).toEqual({ templateMoved: 5 }); // the file's, not the bank's
+    expect(held(2)).toBeUndefined();
+    expect(stored(2)!.record.held.unparsed).toEqual({ templateMoved: 5 }); // the file's, not the bank's
     expect(stored(2)!.stale).toBe('prefabLeave');
   });
 
@@ -152,7 +163,7 @@ describe('a reload of a world the editor held takes back its exact records (#204
     const capture = captureAuthoredSnapshot();
     queueMicrotask(() => { stored(2)!.record.held.unparsed = { landed: 'mid-capture' }; }); // an edit landing during its awaits
     const snap = await capture;
-    expect(held(2)).toEqual({ landed: 'mid-capture' }); // premise: it landed
+    expect(stored(2)!.record.held.unparsed).toEqual({ landed: 'mid-capture' }); // premise: it landed
     expect(snap.records?.has(rootGuid(2))).toBe(false);
     expect(snap.records?.has(rootGuid(1))).toBe(true);
   });

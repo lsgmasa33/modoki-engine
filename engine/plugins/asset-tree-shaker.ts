@@ -758,7 +758,9 @@ interface OverrideCarrier {
   children?: unknown[];
   /** Member rows (scene v16). Since #1468 Phase 4 a row carries a member's overrides (`traits`, one
    *  trait bag) and the subtrees added under it (`added`) — the two channels it took over. Since v17
-   *  (#1516) also `own`, and a template-added node's NODE row carries the same two. */
+   *  (#1516) also `own`, and a template-added node's NODE row carries the same two. Since scene v20 and
+   *  prefab v10 (#2001 S6) every channel of an instance is a row here: the root's on the `"/"` row, and a
+   *  prefab reference row's nested list in template form. */
   members?: Record<string, { traits?: Record<string, unknown>; added?: unknown[]; own?: unknown[] }>;
 }
 

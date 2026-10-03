@@ -27,6 +27,8 @@ import { writeTraitFieldWithUndo, reparentEntity, deleteEntitiesWithUndo } from 
 import { rowPlaceholderOf } from '../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
 import { prefabEditRefusal, PrefabEditRefusalError } from '../../packages/modoki/src/editor/scene/prefabEditRefusal';
+import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { detachPrefabInstance } from '../../packages/modoki/src/editor/scene/prefabLink';
 
 const be = makeFuzzBackend();
 vi.stubGlobal('fetch', be.fetch);
@@ -129,9 +131,12 @@ describe('a user node at a missing nested row\'s placeholder is written once (#2
 // cannot hold is refused, I21). Its writer saves nothing from it, so a rename, a delete or a move showed live and came
 // back on reload. A delete is refused as a prefab-edit refusal (`prefabEditRefusal` 'missing-prefab-row'), asked up front
 // by every delete route: the panels toast it, the agent ops refuse before minting or naming (close-out re-review).
+// A node UNDER the placeholder deletes: one added this session, and since #2001 S6 one the kept row states (the scene's
+// save writes the record, which holds its removal; it was refused before, because the kept row wrote it back).
 // Mutations: drop the row check in `placeholderWriteRefusal` (rename red); make `missingRowDelete` answer false (both
-// delete-refused cases red); drop its roots-only skip (the ancestor case red); drop its kept-rows test, refusing any
-// node under the placeholder (the added-node case red); drop the row branch of `supplierOf` (move red).
+// delete-refused cases red, scene and prefab edit); drop its roots-only skip (the ancestor case red); refuse any node
+// under the placeholder (the two kept-node cases and the added-node case red); drop the row branch of `supplierOf`
+// (move red).
 describe('a missing nested row\'s placeholder refuses edits its save cannot keep (#2028 review F2)', () => {
   const rowPlaceholder = (f: Fixture) => getAllEntities().find((x) => under(p1(f)).has(x.id) && rowPlaceholderOf(findEntity(x.id) as never))!;
   async function missing(tag: string): Promise<{ f: Fixture; q: string }> {
@@ -185,14 +190,40 @@ describe('a missing nested row\'s placeholder refuses edits its save cannot keep
     expect(getAllEntities().filter((e) => gone.has(e.guid))).toEqual([]);
   });
 
-  it('a user node the kept row states, shown at the placeholder, refuses a delete (it came back on reload)', async () => {
+  const qrRow = (f: Fixture) => {
+    const guid = getAllEntities().find((x) => x.id === p1(f))!.guid;
+    const members = (JSON.parse(be.read(f.scenePath)!) as { entities: Array<{ guid?: string; members?: Record<string, { name?: string; own?: unknown }> }> }).entities.find((e) => e.guid === guid)!.members ?? {};
+    return Object.values(members).find((r) => r.name === 'QR');
+  };
+
+  it('a user node the kept row states, shown at the placeholder, deletes and stays deleted when the prefab returns', async () => {
     const f = await startRun(be, noNest, 'row-kept-delete');
     const q = await userNodeThenMissing(f, 'QR');
+    expect(qrRow(f)?.own, 'premise: the saved row states U').toBeDefined();
     const u = getAllEntities().find((e) => e.name === 'U')!.id;
-    expect(() => deleteEntitiesWithUndo([u])).toThrow(PrefabEditRefusalError);
-    expect(count('U')).toBe(1);
+    expect(prefabEditRefusal({ kind: 'delete', ids: [u] })).toBeNull();
+    deleteEntitiesWithUndo([u]);
+    await settle(); await save();
+    expect(qrRow(f)?.own).toBeUndefined();
+    await reload(f);
+    expect(count('U')).toBe(0);
     await save(); await restore(f, q); await save(); await reload(f);
-    expect(count('U')).toBe(1);
+    expect([count('U'), getAllEntities().filter((x) => under(p1(f)).has(x.id) && x.name === 'QR').length]).toEqual([0, 1]);
+  });
+
+  // The record goes stale (a Detach of another instance) and the next door write re-seeds it from the old capture, which
+  // must not bring the deleted node back (#2058: it does not write back a kept link whose node is gone).
+  it('that delete holds through a re-seed of the record from the capture', async () => {
+    const f = await startRun(be, noNest, 'row-kept-delete-reseed');
+    const q = await userNodeThenMissing(f, 'QR');
+    deleteEntitiesWithUndo([getAllEntities().find((e) => e.name === 'U')!.id]);
+    await settle();
+    detachPrefabInstance(getAllEntities().find((x) => x.name === 'HR')!.id); await settle();
+    writeTraitFieldWithUndo(getAllEntities().find((x) => under(p1(f)).has(x.id) && x.name === 'A')!.id, getTraitByName('EntityAttributes')!, 'name', 'A2'); await settle();
+    await save();
+    expect(qrRow(f)?.own).toBeUndefined();
+    await restore(f, q); await save(); await reload(f);
+    expect(count('U')).toBe(0);
   });
 
   it('a node added under the placeholder this session still deletes, and stays deleted', async () => {
@@ -208,5 +239,21 @@ describe('a missing nested row\'s placeholder refuses edits its save cannot keep
     expect(count('W')).toBe(0);
     await restore(f, q); await save(); await reload(f);
     expect([count('V'), count('W')]).toEqual([1, 0]);
+  });
+  // Prefab edit of O with Q missing: O's row expands P, whose row for Q is the row placeholder. That save writes the live
+  // capture, which restates the row from the file (measured with the refusal off: the delete saved, and the row and its
+  // member were back once the prefab returned).
+  it('in prefab edit a delete of the placeholder is refused too', async () => {
+    const { f, q } = await missing('pe-row-delete');
+    expect(await openPrefabForEditing({ path: f.prefabs.O.path, name: 'O' }, { confirmDiscard: async () => true })).toBeUndefined();
+    await settle();
+    const ph = getAllEntities().find((x) => rowPlaceholderOf(findEntity(x.id) as never))!;
+    expect(() => deleteEntitiesWithUndo([ph.id])).toThrow(PrefabEditRefusalError);
+    expect(prefabEditRefusal({ kind: 'delete', ids: [ph.id] })?.reason).toBe('missing-prefab-row');
+    expect(getAllEntities().some((x) => x.id === ph.id)).toBe(true);
+    expect((await savePrefabEditReport({})).saved).toBe(true);
+    await exitPrefabEditing(); await settle();
+    await restore(f, q); await reload(f);
+    expect(count('M')).toBe(2);
   });
 });

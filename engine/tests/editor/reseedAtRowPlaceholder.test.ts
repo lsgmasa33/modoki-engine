@@ -5,8 +5,8 @@
  *  and once the prefab returned with its root turned, the instance showed the prefab's axis instead of the override.
  *  Driven the way production gets there: a Detach of another instance marks every record stale, and the next door write
  *  (a rename) re-seeds the tree.
- *  Mutation: drop the placeholder `continue` in `withoutUnstatedAddedFields` AND make `baseHas` answer false for a key the
- *  fold does not reach (the first cut) — red. */
+ *  Mutation: make `baseHas` answer false for a key the fold does not reach (the first cut) — red. Until #2001 S6 a second
+ *  guard in `withoutUnstatedAddedFields` skipped a live placeholder, and this went red only with both gone. */
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'fs';
 vi.mock('../../plugins/asset-fs-ops', async (orig) => ({

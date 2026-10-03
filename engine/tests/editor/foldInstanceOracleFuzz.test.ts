@@ -192,22 +192,34 @@ describe('#2007 oracle: the fold is what today spawns (the fuzzer\'s saved scene
     // that. `foldOracleFrozen.test.ts` exercises them on the frozen pre-S5 side.
     // (The fuzzer's per-step P1 inside `runOps` still translates: a trashed prefab's frames stay live until a reload.)
     expect(translatedOnLoad).toBe(0);
-    // Both rulings are reached, as shown placeholders, so each is judged rather than merely written.
-    expect(seen.shownB).toBeGreaterThan(0);
+    // Scene v20 (#2001 S6) writes no prefab copies, so no saved scene reaches rule B (a placeholder beside the scene's own
+    // copy) any more; `foldOracleFrozen.test.ts` keeps it on the frozen pre-S5 inputs. Rule D is reached by every saved
+    // scene directly: each is the copy-less form.
+    expect(seen.shownB).toBe(0);
+    expect(seen.shownD).toBeGreaterThan(0);
     expect(preS5Forms).toBeGreaterThan(0);
-    // Rule D on the copy-less forms (#2033): never on a run that stopped early, which the seeds now fail.
-    expect(ruledDNoCopies).toBeGreaterThan(0);
+    // The "same scene without its copies" variant (#2033) has nothing to strip from a v20 file: it never runs, and rule D
+    // is judged on the saved scene itself (`shownD` above).
+    expect(ruledDNoCopies).toBe(0);
     // The defaults arm checked something: a broken schema lookup would otherwise pass, checking nothing.
     expect(seen.defaults).toBeGreaterThan(0);
     // #2021: the placement check reached an own link on a projected member, AT and INSIDE a placeholder, and list and
     // held records under one.
-    for (const k of PLACED) expect(reached[k], k).toBeGreaterThan(0);
+    // Scene v20 (#2001 S6): a record under a placeholder is a ROW in the saved form, so the held LEGACY statements are
+    // reached only through #2025's older file forms below (counted over the whole run, variants included).
+    for (const k of PLACED) if (k !== 'heldUnderPlaceholder') expect(reached[k], k).toBeGreaterThan(0);
+    expect(reached.heldUnderPlaceholder).toBe(0);
+    expect(seen.heldUnderPlaceholder, 'held legacy statements under a placeholder, through the older file forms').toBeGreaterThan(0);
     // #2030: #2025's file forms generated from a saved scene and judged. From S5 a nested rule-B placeholder shows from the
     // first reload, where before the copy's live member stood and took the node: these seeds' S5 runs save a node only at
     // a ROOT placeholder (measured), so only the root forms are reached here. Every form, the slot ones included, is
     // judged on the frozen pre-S5 saves (`foldOracleFrozen.test.ts`).
-    for (const k of ['v16RootAdded', 'v17RootOwn', 'legacyRootAdded'] as const) expect(forms[k], k).toBeGreaterThan(0);
-    expect(entryJudged).toBeGreaterThan(0);
+    for (const k of ['v16RootAdded', 'v17RootOwn'] as const) expect(forms[k], k).toBeGreaterThan(0);
+    // Scene v20 (#2001 S6): an entry states no root localId (no `PrefabInstance` trait), and the legacy entry-level `added`
+    // names its anchor by that localId (none is guessed, rule 5) — so the form cannot be derived from a v20 save. It is
+    // judged on the frozen pre-S5 saves, which state the localId (`foldOracleFrozen.test.ts` asks every form be reached).
+    expect(forms.legacyRootAdded).toBe(0);
+    expect(entryJudged, 'entry-level legacy added is judged only through that form').toBe(0);
     // A guid stated twice is left unjudged (#1937), so a regression that states links twice would turn the check off.
     expect(seen.ownDuplicate).toBe(0);
   });

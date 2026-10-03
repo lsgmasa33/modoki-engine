@@ -24,13 +24,13 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/identityParents';
 import { getOverrideMarkSet, markOverride, unmarkOverride } from '../../runtime/loaders/overrideMarks';
-import { INSTANCE_MODEL_SCENE_VERSION, SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../runtime/core/version';
 import type { ExpansionReader } from '../../runtime/loaders/loadSceneFile';
 import { recordsOf } from '../../runtime/prefab/instanceLoad';
 import { parseInstanceRecord } from '../../runtime/prefab/parseInstanceRecord';
 import { freshInstanceRecord, storedInstances } from '../../runtime/prefab/instanceStore';
 import { serializeInstanceRecord, type MemberIdentity } from '../../runtime/prefab/serializeInstanceRecord';
-import type { InstanceRecord, ParsedInstance, SceneOwnedNode } from '../../runtime/prefab/instanceRecord';
+import type { InstanceRecord, ParsedInstance, PrefabReader, SceneOwnedNode } from '../../runtime/prefab/instanceRecord';
 import type { InstanceEntry } from '../scene/instanceEntry';
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { rowAt } from '../../runtime/core/prefabRowAt';
@@ -41,7 +41,7 @@ import { memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
 import { foldInstance } from '../../runtime/prefab/foldInstance';
 
 export { projectionRootOf };
-import { capturedEntryOf, editorPrefabReader } from './instanceSync';
+import { capturedEntryOf, captureFormVersionOf, editorPrefabReader } from './instanceSync';
 
 /** The identity the writer pins for record-owning root `rootId` (§ 2.7, rule 5), by key: exactly the members the old
  *  save pins (`memberRowsToWrite`), so a reprojection states no pin today's form would not. A template-added node is
@@ -49,8 +49,13 @@ import { capturedEntryOf, editorPrefabReader } from './instanceSync';
  *  row matches no member on the load, which keeps the row as an orphan, and the next save writes it out (hunt seed
  *  7180). Nor is a member with a runtime guid (#1210), which is no identity to write down. */
 export function identityOf(rootId: number): MemberIdentity {
-  const out = new Map<string, { guid: string }>();
-  for (const [id, key] of memberRowsToWrite(rootId)) out.set(key, { guid: guidOfEntity(id) });
+  const out = new Map<string, { guid: string; name?: string }>();
+  const ea = getTraitByName('EntityAttributes');
+  for (const [id, key] of memberRowsToWrite(rootId)) {
+    // The live name beside the guid, for a readable file: what the old row writer stated (`captureInstanceMembers`).
+    const name = ea ? (findEntity(id)?.get(ea.trait) as { name?: string } | undefined)?.name : undefined;
+    out.set(key, { guid: guidOfEntity(id), ...(name ? { name } : {}) });
+  }
   return out;
 }
 
@@ -72,9 +77,9 @@ export function reprojectsExactly(top: number): boolean {
 /** {@link identityOf}, narrowed to the members the record's fold builds (#2046 S7.3): a reprojection runs over a live tree
  *  still in the OTHER shape — an Apply's undo, a template that lost a member — and a pin for a member the fold no longer
  *  has matches nothing on the load, which keeps it as an orphan row (R2) the next save writes out. */
-function identityIn(rootId: number | undefined, rec: InstanceRecord, pinned?: MemberIdentity): MemberIdentity {
-  const built = foldInstance(editorPrefabReader, rec).nodes;
-  const out = new Map<string, { guid: string }>();
+function identityIn(rootId: number | undefined, rec: InstanceRecord, pinned?: MemberIdentity, read: PrefabReader = editorPrefabReader): MemberIdentity {
+  const built = foldInstance(read, rec).nodes;
+  const out = new Map<string, { guid: string; name?: string }>();
   // A pin taken earlier first, the live one over it: a member an undo brings back is not live (#2046 S7.4).
   for (const [key, pin] of pinned ?? []) if (built.has(key as never)) out.set(key, pin);
   if (rootId !== undefined) for (const [key, pin] of identityOf(rootId)) if (built.has(key as never)) out.set(key, pin);
@@ -91,18 +96,19 @@ export function identitiesOf(rootGuids: Iterable<string>): Map<string, MemberIde
 
 /** The capture's parse of the instance tree at outermost root `top`, by root guid: what each record's scene-owned content
  *  is written from (see the header). Null when the tree cannot be captured. */
-export function ownContentOf(top: number): Map<string, ParsedInstance> | null {
+export function ownContentOf(top: number, keyed = true, consumed?: Set<number>): Map<string, ParsedInstance> | null {
   openIdentityScope();
   try {
-    const raw = capturedEntryOf(top);
+    const raw = capturedEntryOf(top, consumed);
     if (!raw) return null;
     // A node's template key travels with its content (the edit world's rows state nodes by key, #1567): one an undo
-    // brings back was not in the rebuild's teardown, so nothing else carries its key over.
-    const captured = keyedForRebuild(top, raw.guid ?? '', raw as never) as typeof raw;
+    // brings back was not in the rebuild's teardown, so nothing else carries its key over. Not for the SAVE (`keyed`
+    // false, `instanceSave.ts`): a file states a scene's node by its guid, as the capture wrote it.
+    const captured = keyed ? keyedForRebuild(top, raw.guid ?? '', raw as never) as typeof raw : raw;
     const held = new Set<string>();
     const ea = getTraitByName('EntityAttributes')!.trait;
     for (const e of getCurrentWorld().entities) { const g = (e.get(ea) as { guid?: string } | undefined)?.guid; if (g) held.add(g); }
-    const opts = { held: (g: string) => held.has(g), sceneVersion: SCENE_FORMAT_VERSION };
+    const opts = { held: (g: string) => held.has(g), sceneVersion: captureFormVersionOf(top) };
     const all = recordsOf(parseInstanceRecord(captured, editorPrefabReader, opts), editorPrefabReader, opts);
     return new Map(all.map((p) => [p.record.rootGuid, p]));
   } finally {
@@ -112,17 +118,20 @@ export function ownContentOf(top: number): Map<string, ParsedInstance> | null {
 
 /** `rec` written as a v20 entry (§ 2.2). `rootId`: its live root, for the members' identity (none: a record whose root is
  *  not live); `byGuid`: the capture's parse of the tree ({@link ownContentOf}), for the scene-owned content. A scene-added
- *  reference node in that content carries its own record's list (and order) from the store, not the capture's. */
+ *  reference node in that content carries its own record's list (and order) from the store, not the capture's —
+ *  `recordOf`: where a nested record is read from (default: the store's fresh one). `read`: the documents the members'
+ *  identity is narrowed by (default: the editor's caches). */
 export function writtenEntryOf(rec: InstanceRecord, rootId: number | undefined, byGuid: ReadonlyMap<string, ParsedInstance>,
-  pinned?: ReadonlyMap<string, MemberIdentity>): ReturnType<typeof serializeInstanceRecord>['entry'] {
+  pinned?: ReadonlyMap<string, MemberIdentity>, recordOf: (guid: string) => InstanceRecord | undefined = storedFresh,
+  read: PrefabReader = editorPrefabReader): ReturnType<typeof serializeInstanceRecord>['entry'] {
   const parsed = byGuid.get(rec.rootGuid);
   const inline = (node: SceneOwnedNode): SceneOwnedNode => {
     const children = Array.isArray(node.children) ? (node.children as SceneOwnedNode[]).map(inline) : node.children;
     if (typeof node.prefab !== 'string' || !node.prefab || typeof node.guid !== 'string') return { ...node, children } as SceneOwnedNode;
-    const st = storedInstances(getCurrentWorld()).get(node.guid);
-    if (!st || st.stale || !byGuid.has(node.guid)) return { ...node, children } as SceneOwnedNode;
+    const nested = recordOf(node.guid);
+    if (!nested || !byGuid.has(node.guid)) return { ...node, children } as SceneOwnedNode;
     const liveId = allStoredRoots().find((id) => guidOfEntity(id) === node.guid);
-    const entry = writtenEntryOf(st.record, liveId, byGuid, pinned) as Record<string, unknown>;
+    const entry = writtenEntryOf(nested, liveId, byGuid, pinned, recordOf, read) as Record<string, unknown>;
     // The row channels the old form stated the node's list in, replaced by its record's written rows.
     const { overrides: _o, added: _a, removed: _r, removedTraits: _rt, moved: _m, templateMoved: _tm, nestedOverrides: _no, nestedStructure: _ns, members: _mb, ...kept } = node as unknown as Record<string, unknown>;
     const rows = Object.fromEntries(Object.entries(entry).filter(([k]) => !['name', 'traits', 'prefab', 'guid'].includes(k)));
@@ -133,14 +142,20 @@ export function writtenEntryOf(rec: InstanceRecord, rootId: number | undefined, 
     const members = { ...(rows.members as Record<string, Record<string, unknown>> | undefined) };
     const rootRow = { ...members['/'] };
     const rootTraits = { ...(rootRow.traits as Record<string, unknown> | undefined) };
-    rootTraits.EntityAttributes = { ...(rootTraits.EntityAttributes as Record<string, unknown> | undefined), sortOrder: st.record.placement.sortOrder };
+    rootTraits.EntityAttributes = { ...(rootTraits.EntityAttributes as Record<string, unknown> | undefined), sortOrder: nested.placement.sortOrder };
     members['/'] = { ...rootRow, traits: rootTraits };
     return { ...kept, children, ...rows, members } as unknown as SceneOwnedNode;
   };
   return serializeInstanceRecord(rec, {
-    identity: identityIn(rootId, rec, pinned?.get(rec.rootGuid)),
+    identity: identityIn(rootId, rec, pinned?.get(rec.rootGuid), read),
     sceneOwned: (g) => { const n = parsed?.ownContent.get(g); return n ? inline(n) : undefined; },
   }).entry;
+}
+
+/** The store's fresh record for stored root `guid` in the current world, or undefined (none, or stale). */
+function storedFresh(guid: string): InstanceRecord | undefined {
+  const st = storedInstances(getCurrentWorld()).get(guid);
+  return st && !st.stale ? st.record : undefined;
 }
 
 /** The name document `source`'s root states, or undefined. */

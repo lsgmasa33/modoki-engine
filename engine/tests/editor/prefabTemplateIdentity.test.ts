@@ -7,6 +7,8 @@
  *  Driven through the real loader, the real editor capture, the real prefab-edit scene builder and
  *  Apply to Prefab. Each case names the mutation that must turn it red. */
 
+import { ownNodes, rowAtKey, rowsOf, statedBeyondRoot, v9Channels } from './v10Rows';
+import { preV5NodeGuid } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { createWorld } from 'koota';
 
@@ -109,9 +111,12 @@ async function load(scene: SceneData): Promise<void> {
       const world = getCurrentWorld();
       for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
     },
-    onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid, _folder, nestedStructure) => {
+    onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid, _folder, nestedStructure, expansion) => {
       const world = getCurrentWorld();
-      const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure);
+      // The load's expansion goes to the spawner, as SceneManager hands it: without it a pre-v5 member carries no derived
+      // identity, a v10 row about it reads as an orphan, and the capture then states its nodes twice (#2001 S6).
+      const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested, nestedStructure,
+        { frame: expansion?.frame, sceneVersion: expansion?.sceneVersion });
       if (!rootId) return undefined;
       for (const e of world.entities) {
         if (e.id() === rootId && rootGuid) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: rootGuid });
@@ -211,10 +216,11 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
     const root = await openInEditor(outerDoc() as PrefabFile);
     spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'Extra', parentId: innerUnderMid(), guid: DURABLE }));
     const saved = serializePrefab(root, OUTER)!;
-    const node = (midRowOf(saved).nestedStructure as Record<string, { added: AddedEntity[] }>)['3']!.added[0]!;
+    // Prefab v10 (#2001 S6): the node is the `own` of the row for MID's nested INNER root.
+    const node = rowsOf(midRowOf(saved))[`/${preV5NodeGuid(MID, 3)}`]!.own![0]!;
     expect(node.guid).toBe('');
     expect(node.key).toMatch(/^[0-9a-f-]{36}$/);
-    expect((node.traits.EntityAttributes as Record<string, unknown>).guid).toBeUndefined();
+    expect((node.traits!.EntityAttributes as Record<string, unknown>).guid).toBeUndefined();
     expect(JSON.stringify(saved)).not.toContain(DURABLE);
     // Mutation: drop `setTemplateKey` in `addedNodeIdentity` — the second save mints a new key.
     expect(bytesIgnoringNodeGuids(serializePrefab(root, OUTER))).toBe(bytesIgnoringNodeGuids(saved));
@@ -246,9 +252,11 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
     await applyToPrefabSelective(getAllEntities().find((e) => e.guid === G1)!.id, new Set([`+added.${DROPPED}`]));
     const written = writes.map((w) => JSON.parse(w.content) as PrefabFile).find((p) => p.id === OUTER)!;
     const promoted = written.entities.find((e) => e.prefab === MID && e.localId !== 3)!; // row 3 is OUTER's own
-    expect(promoted.added!.map((n) => [n.name, n.guid, !!n.key])).toEqual([['OnSlot', '', true]]);
-    const deep = (promoted.nestedStructure as Record<string, { added: AddedEntity[] }>)['3']!.added;
-    expect(deep.map((n) => [n.name, n.guid, !!n.key])).toEqual([['OnInner', '', true]]);
+    // Prefab v10 (#2001 S6): each is the `own` of the row for its anchor, MID's Slot and MID's nested INNER root.
+    const ownAt = (lid: number) => (rowsOf(promoted)[`/${preV5NodeGuid(MID, lid)}`]?.own ?? []).map((n) => [n.name, n.guid, !!n.key]);
+    expect(ownAt(2)).toEqual([['OnSlot', '', true]]);
+    expect(ownAt(3)).toEqual([['OnInner', '', true]]);
+    expect(v9Channels(promoted)).toEqual([]);
     expect(JSON.stringify(written)).not.toMatch(/eeeeeeee-0000-4000-8000-0000000002e[12]/);
     // Apply refreshed the live instance from the written file: the keyed nodes re-expanded and were
     // derived by the rebuild. Mutation: drop `deriveInstanceMemberGuids` at the end of `rebuildInstance`.
@@ -265,7 +273,7 @@ describe('a template write stores the key, never the live guid (#1387)', () => {
 
 describe('the key survives a scene-form round trip of the edit world (#1387 review)', () => {
   const editRoot = () => getAllEntities().find((e) => e.guid === PREFAB_EDIT_ROOT_GUID)!.id;
-  const rowAddedKeys = (p: PrefabFile, rowLocalId: number) => p.entities.find((e) => e.localId === rowLocalId)!.added!.map((n) => n.key);
+  const rowAddedKeys = (p: PrefabFile, rowLocalId: number) => ownNodes(p.entities.find((e) => e.localId === rowLocalId)).map((n) => n.key);
 
   // Play snapshots the edit world with `serializeScene` (scene form: guid, no key) and Stop reloads
   // it, so every marker is gone. Mutation: drop the `recoverTemplateKey` call in `addedNodeIdentity`
@@ -273,9 +281,12 @@ describe('the key survives a scene-form round trip of the edit world (#1387 revi
   it('after Play→Stop, a no-op save neither re-keys the row nor pins the inner interior', async () => {
     install(midDoc({ added: [keyed('Extra', 2)] }));
     await openInEditor(outerDoc() as PrefabFile);
-    expect(midRowOf(serializePrefab(editRoot(), OUTER)!).nestedStructure).toBeUndefined();
+    expect(statedBeyondRoot(midRowOf(serializePrefab(editRoot(), OUTER)!))).toEqual([]);
     await load(await serializeScene() as unknown as SceneData);
-    expect(midRowOf(serializePrefab(editRoot(), OUTER)!).nestedStructure).toBeUndefined();
+    // The round trip writes this frame (INNER predates v5) as the scene's own copy of the node beside a removal of the
+    // template's (#2116), and the load keeps that removal. The node is live under its key again, so the save states
+    // neither: written back alone, the removal dropped the node at the next open (`captureRowChannels`, `staleRemoval`).
+    expect(statedBeyondRoot(midRowOf(serializePrefab(editRoot(), OUTER)!))).toEqual([]);
 
     await openInEditor(midDoc({ added: [keyed('Extra', 2)] }) as PrefabFile);
     await load(await serializeScene() as unknown as SceneData);
@@ -291,8 +302,8 @@ describe('the key survives a scene-form round trip of the edit world (#1387 revi
     deleteEntitiesWithUndo([getAllEntities().find((e) => e.name === 'Extra')!.id]);
     expect(getAllEntities().some((e) => e.name === 'Kid')).toBe(false);
     await undo();
-    const node = serializePrefab(editRoot(), MID)!.entities.find((e) => e.localId === 3)!.added![0]!;
-    expect([node.key, node.children[0]!.key]).toEqual([KEY, CHILD_KEY]);
+    const node = ownNodes(serializePrefab(editRoot(), MID)!.entities.find((e) => e.localId === 3))[0]!;
+    expect([node.key, node.children![0]!.key]).toEqual([KEY, CHILD_KEY]);
   });
 
   // The population #1387 is about: a row node carrying a durable guid and no key. It migrates when
@@ -301,7 +312,7 @@ describe('the key survives a scene-form round trip of the edit world (#1387 revi
   it('a legacy guid-bearing row node is not pinned by the outer prefab\'s no-op save', async () => {
     install(midDoc({ added: [{ ...keyed('Extra', 2), key: undefined, guid: DURABLE, traits: { EntityAttributes: { name: 'Extra', guid: DURABLE } } }] }));
     await openInEditor(outerDoc() as PrefabFile);
-    expect(midRowOf(serializePrefab(editRoot(), OUTER)!).nestedStructure).toBeUndefined();
+    expect(statedBeyondRoot(midRowOf(serializePrefab(editRoot(), OUTER)!))).toEqual([]);
   });
 });
 
@@ -468,9 +479,9 @@ describe('a member token through nested prefabs (#1352)', () => {
       expect(targets).toEqual([entity('Leaf', innerRoot).guid, getAllEntities().find((e) => e.id === innerRoot.parentId)!.guid]);
     }
     const outerRoot = await openInEditor(outer as PrefabFile);
-    expect(midRowOf(serializePrefab(outerRoot, OUTER)!).nestedStructure).toBeUndefined();
+    expect(statedBeyondRoot(midRowOf(serializePrefab(outerRoot, OUTER)!))).toEqual([]);
     const midRoot = await openInEditor(midWithNode as PrefabFile);
-    expect(serializePrefab(midRoot, MID)!.entities.find((e) => e.localId === 3)!.added).toEqual([extra]);
+    expect(ownNodes(serializePrefab(midRoot, MID)!.entities.find((e) => e.localId === 3))).toEqual([{ ...extra, parentLocalId: 0 }]);
   });
 
   // The prefab editor flattens MID's own rows and expands its INNER row as a scene instance, so the
@@ -482,7 +493,8 @@ describe('a member token through nested prefabs (#1352)', () => {
     const innerRoot = getAllEntities().find((e) => e.name === 'InnerRoot')!;
     expect(targetOf(innerRoot.id)).toBe(entity('Slot', undefined).guid);
     const saved = serializePrefab(root, MID)!;
-    expect(saved.entities.find((e) => e.localId === 3)!.overrides).toEqual((mid.entities[2] as { overrides?: unknown }).overrides);
+    // Prefab v10 (#2001 S6): the nested root's override is the row's `"/"` row.
+    expect(rowAtKey(saved.entities.find((e) => e.localId === 3))?.traits?.UIAction).toEqual((mid.entities[2] as unknown as { overrides: Record<number, Record<string, unknown>> }).overrides[1]!.UIAction);
   });
 });
 
@@ -518,8 +530,8 @@ describe('a ref in a row reaching into a template reference node is a token of t
     writeTraitFieldWithUndo(leaf.id, getTraitByName('UIAction')!, 'bindings', [{ event: 'click', kind: 'call', action: 'noop', target: leaf.guid }]);
     const saved = serializePrefab(root, TOP)!;
     const hostRow = saved.entities.find((e) => e.prefab === HOST)! as { nestedStructure?: unknown; members?: Record<string, { traits?: Record<string, { bindings?: { target: string }[] }> }> };
-    expect(hostRow.nestedStructure).toBeUndefined(); // SpotRow's list is not restated
-    expect(Object.keys(hostRow.members ?? {})).toEqual([`/${ng(5)}/a+${REF_KEY}/${ng(2)}`]);
+    expect(ownNodes(hostRow)).toEqual([]); // SpotRow's list is not restated
+    expect(Object.keys(hostRow.members ?? {}).filter((k) => k !== '/')).toEqual([`/${ng(5)}/a+${REF_KEY}/${ng(2)}`]);
     expect(hostRow.members![`/${ng(5)}/a+${REF_KEY}/${ng(2)}`]!.traits?.UIAction?.bindings?.[0]?.target).toBe('@member:2');
     install(saved);
     await load(twoInstances(TOP, 'TopRoot'));
@@ -614,7 +626,7 @@ describe('close-out review findings (#1352)', () => {
     install(midDoc({ added: [{ ...keyed('Extra', 2), key: undefined, guid: DURABLE, traits: { EntityAttributes: { name: 'Extra', guid: DURABLE } } }] }));
     const root = await openInEditor(outerDoc({ overrides: { 2: { ...bind(DURABLE) } } }) as PrefabFile);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).overrides).toEqual({ 2: bind(DURABLE) });
+    expect(rowsOf(midRowOf(saved))[`/${preV5NodeGuid(MID, 2)}`]?.traits).toEqual(bind(DURABLE));
   });
 
   // A pre-key row node carrying a durable guid is left in the file as it is (its interior still counts
@@ -626,7 +638,7 @@ describe('close-out review findings (#1352)', () => {
     (doc.entities[1] as { traits: Record<string, unknown> }).traits = { ...doc.entities[1]!.traits, ...bind(DURABLE) };
     const root = await openInEditor(doc as PrefabFile);
     const saved = serializePrefab(root, OUTER)!;
-    expect(midRowOf(saved).nestedStructure).toBeUndefined();
+    expect(statedBeyondRoot(midRowOf(saved))).toEqual([]);
     expect((saved.entities.find((e) => e.name === 'Panel')!.traits.UIAction as { bindings: { target: string }[] }).bindings[0]!.target).toBe(DURABLE);
   });
 });

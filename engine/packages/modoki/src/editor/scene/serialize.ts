@@ -2,7 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { openIdentityScope, closeIdentityScope, worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
+import { openIdentityScope, closeIdentityScope, worldIdentityParents } from '../../runtime/core/ecs/identityParents';
 import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
@@ -30,18 +30,18 @@ import { beginWorldReplacement } from './authoringSettle';
 import { UNREACHABLE_STATE } from '../undo/stateToken';
 import { forgetHistory, rekeyUntitledHistory, getEditVersion, beginWorldSwitch, worldSwitchesSettled, worldStateToken, beginFreshWorldState, captureSavePoint, captureSceneSavePoint, settleSavePoint, settleSceneSavePoint, restoreWorldStateToken, type SavePoint } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './prefabCache';
-import { captureInstanceEntry, type InstanceEntry } from './instanceEntry';
+import { getPrefabSource, preloadNestedPrefabs } from './prefabCache';
+import { captureInstanceEntry } from './instanceEntry';
+import { savedEntryOf, placedAsLive, livePlacement, type SavedInstance } from '../instance/instanceSave';
 import { rebaseStaleInstances, savedFrameDoc } from './prefabRebuild';
 import { levelDoc } from './prefabBase';
 import { warnInstanceDrift } from '../instance/instanceDrift';
-import { allStoredRoots } from '../instance/instanceKeys';
+import { allStoredRoots, outermostStoredRoot } from '../instance/instanceKeys';
 // Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
 export { captureNestedSceneDelta } from './prefabCapture';
-import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
-import { collectResourceRefsFromEntities, sceneFileResourceRefs, SceneFormatRefusedError, embeddedPrefabDoc, embeddedPrefabGuids, refusedCopyFrames, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
-import { liveFrameAddresser } from '../../runtime/loaders/frameAddress';
-import { asSceneEntry, placementForMissing } from '../../runtime/loaders/unresolvedPrefabRefs';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, SceneEntityEntry, SceneMemberRow } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, sceneFileResourceRefs, SceneFormatRefusedError, type EmbeddedPrefabDoc } from '../../runtime/loaders/loadSceneFile';
+import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
@@ -50,7 +50,7 @@ import { clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty,
 import { beginFreshFileRead } from './freshFileRead';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
-import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../runtime/core/version';
 import { hasDirtyAssets, getDirtyAssetPaths, flushDirtyAssets, type FlushResult } from './dirtyAssets';
 import { hasPendingBaseScenes, getPendingBaseScenePaths, flushPendingBaseScenes, reconcileBaseScenePark } from './pendingBaseScene';
 import { hasPendingMeta, getPendingMetaPaths, flushPendingMeta, type MetaFlushResult } from './pendingMeta';
@@ -303,6 +303,9 @@ async function serializeSceneScoped(opts?: {
   const prefabChildIds = new Set<number>();
   const prefabSources = new Set<string>();
   const prefabRootInfo = new Map<number, { source: string; localId: number }>();
+  /** A stored instance hung under another instance's member: its owner's entry states it — or, when no record links it,
+   *  it is promoted to an entry of its own below (#2001 S6: never dropped). */
+  const storedUnderMember = new Map<number, { source: string; localId: number }>();
   const byId = new Map(entityInfos.map((e) => [e.id, e] as const));
   if (piMeta) {
     // Which frame a root belongs to is IDENTITY (I6, #1687), asked of the same resolver the captures below claim rows
@@ -333,6 +336,7 @@ async function serializeSceneScoped(opts?: {
           // added inside an instance is claimed by that capture's `consumedEcsIds` instead.)
           prefabChildIds.add(info.id);
           prefabSources.add(source);
+          storedUnderMember.set(info.id, { source, localId: piData['localId'] as number });
         } else {
           // Genuinely top-level instance, or one parented to a plain (non-prefab)
           // entity whose parentId round-trips normally → its own scene entry.
@@ -351,23 +355,92 @@ async function serializeSceneScoped(opts?: {
   // entities + removed traits, and fold the added entities' live ECS ids into the
   // skip set so they aren't ALSO written as standalone scene entities (which is
   // how they used to leak out and orphan on reload).
-  // Each root's ENTRY — the one writer the rebuild respawns from too (`captureInstanceEntry`, #1880 F6).
-  const entries = new Map<number, InstanceEntry>();
+  // Each root's ENTRY, written from its stored record (#2001 S6, rule 4: save writes the list — `instanceSave.ts`), and
+  // the live nodes each one states.
+  const entries = new Map<number, SavedInstance | null>();
   const unresolvedRoots = new Set<number>();
-  for (const [rootId, { source }] of prefabRootInfo) {
+  /** The entry for stored root `rootId` (a live instance's, or a Missing Prefab placeholder's), computed once. */
+  const savedFor = (rootId: number): SavedInstance | null => {
+    if (entries.has(rootId)) return entries.get(rootId)!;
+    const saved = savedEntryOf(rootId, () => legacyEntries.get(rootId)?.() ?? null, rootDocs.get(rootId));
+    entries.set(rootId, saved);
+    if (saved) {
+      for (const ecsId of saved.consumed) prefabChildIds.add(ecsId);
+      // A node no record links, under a live instance: a write that went round the door. Written as a plain entity (the
+      // load links it), and said, in dev and test builds.
+      if (saved.unstated.length && !unresolvedRefOf(findEntity(rootId)) && import.meta.env?.DEV) {
+        console.warn(`[serialize] instance ${guidForId(rootId)}: ${saved.unstated.length} node(s) under it are in no record; written as plain entities`);
+      }
+    }
+    return saved;
+  };
+  /** What the old save wrote for a root, for one with no record to write (`savedEntryOf` converts it). */
+  const legacyEntries = new Map<number, () => { entry: SceneEntityEntry; version: number } | null>();
+  /** Each live root's own document as this save resolved it (the sync cache may no longer hold it, #1738). */
+  const rootDocs = new Map<number, { source: string; doc: unknown }>();
+  const registerRoot = async (rootId: number, source: string): Promise<void> => {
     // A prefab that stopped resolving mid-session is written from the document the instance was expanded from (#1738).
     const resolved = await getPrefabSource(source);
-    const current = resolved ?? levelDoc(rootId, source).doc;
-    if (!current) continue;
-    // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
-    const prefab = savedFrameDoc(rootId, source, current);
-    // A nested row whose instance is gone is recorded as removed only when its prefab is cached
-    // (#1355), and a deleted instance's source is not among the live ones preloaded above.
-    await preloadNestedPrefabs(prefab);
-    const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guidForId(rootId));
     if (!resolved) unresolvedRoots.add(rootId);
-    for (const ecsId of consumedEcsIds) prefabChildIds.add(ecsId);
-    entries.set(rootId, entry);
+    const current = resolved ?? levelDoc(rootId, source).doc;
+    if (current) {
+      rootDocs.set(rootId, { source, doc: current });
+      // Measured against the document the instance was EXPANDED from (#1685), translated onto `current` when written.
+      const prefab = savedFrameDoc(rootId, source, current);
+      // A nested row whose instance is gone is recorded as removed only when its prefab is cached
+      // (#1355), and a deleted instance's source is not among the live ones preloaded above.
+      await preloadNestedPrefabs(prefab);
+      legacyEntries.set(rootId, () => {
+        const guid = guidForId(rootId);
+        const parentGuid = guidForId(byId.get(rootId)?.parentId ?? 0);
+        const placement: Record<string, unknown> = {};
+        if (parentGuid) placement.parentId = parentGuid;
+        if (byId.get(rootId)?.editorFolder) placement.editorFolder = byId.get(rootId)!.editorFolder;
+        const { entry, consumedEcsIds } = captureInstanceEntry(rootId, source, prefab, guid);
+        const traits = withMissingComponents(Object.keys(placement).length ? { EntityAttributes: placement } : {}, guid, rootId);
+        return { entry: { id: 0, name: byId.get(rootId)?.name ?? '', prefab: source, guid, ...entry, traits } as unknown as SceneEntityEntry, version: CAPTURE_FORM_SCENE_VERSION, consumed: consumedEcsIds };
+      });
+    }
+  };
+  for (const [rootId, { source }] of prefabRootInfo) {
+    await registerRoot(rootId, source);
+    // Only an OUTERMOST stored root is an entry of its own; one inside another instance's content is stated by that
+    // instance's entry, or, when no record links it, written by the loop below (which asks then).
+    if ((outermostStoredRoot(rootId) || rootId) === rootId) savedFor(rootId);
+  }
+  // A Missing Prefab placeholder keeps its record (rule 9), and is written from it like a live instance's.
+  for (const info of entityInfos) {
+    if (prefabChildIds.has(info.id)) continue;
+    const unresolved = unresolvedRefOf(findEntity(info.id));
+    if (!unresolved) continue;
+    legacyEntries.set(info.id, () => {
+      const placement: Record<string, unknown> = {};
+      const parentGuid = guidForId(info.parentId);
+      if (parentGuid) placement.parentId = parentGuid;
+      if (info.editorFolder) placement.editorFolder = info.editorFolder;
+      const live = eaMeta ? findEntity(info.id)?.get(eaMeta.trait) as { sortOrder?: number; isActive?: boolean } | undefined : undefined;
+      const order = { sortOrder: live?.sortOrder ?? 0, isActive: live?.isActive ?? true };
+      const entry = asSceneEntry(unresolved.kind, unresolved.record, unresolved.source, { name: info.name, guid: guidForId(info.id), placement, order });
+      return { entry: { id: 0, ...entry } as unknown as SceneEntityEntry, version: unresolved.version };
+    });
+    if ((outermostStoredRoot(info.id) || info.id) === info.id) savedFor(info.id);
+  }
+  // A stored instance under a member that NO record links (a move that went round the door) is an entry of its own,
+  // parented by guid, as a plain node no record states is a plain entity: the load links both, and the save never drops
+  // a user's instance because a record missed it. Its own tree can hold another, so this runs until none is left.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const saved of [...entries.values()]) {
+      for (const id of saved?.unstated ?? []) {
+        const nested = storedUnderMember.get(id);
+        if (!nested || prefabRootInfo.has(id)) continue;
+        prefabRootInfo.set(id, nested);
+        prefabChildIds.delete(id);
+        await registerRoot(id, nested.source);
+        savedFor(id);
+        grew = true;
+      }
+    }
   }
   // #2001 S4 (#2014): dev and test builds warn when a fresh instance record and its live tree disagree — a change made
   // outside the door, which the save will stop writing at S6 (`instanceDrift.ts`). Never writes, never throws.
@@ -411,68 +484,22 @@ async function serializeSceneScoped(opts?: {
     // would answer: a prefab restored mid-session resolves while this entity is still the empty placeholder, and a
     // capture of it would drop the record one save later. Only an expansion (a reload, a rebuild) replaces it.
     const unresolved = unresolvedRefOf(findEntity(info.id));
-    if (unresolved) {
-      const placement: Record<string, unknown> = {};
-      const parentGuid = guidForId(info.parentId);
-      if (parentGuid) placement.parentId = parentGuid;
-      if (info.editorFolder) placement.editorFolder = info.editorFolder;
-      const live = eaMeta ? findEntity(info.id)?.get(eaMeta.trait) as { guid?: string; sortOrder?: number; isActive?: boolean } | undefined : undefined;
-      const guid = durableGuid(live?.guid) || mintedGuids.get(info.id);
-      // The Hierarchy's reorder and Activate land on the placeholder, and its writer keeps them (#1818).
-      const order = { sortOrder: live?.sortOrder ?? 0, isActive: live?.isActive ?? true };
-      entities.push(asSceneEntry(unresolved.kind, unresolved.record, unresolved.source, { name: info.name, guid, placement, order }) as unknown as SerializedEntity);
+    const rootInfo = prefabRootInfo.get(info.id);
+    // A stored root — a live instance's, or a placeholder's (rule 9: it keeps its list) — is its record's entry, placed
+    // where it sits live. The Hierarchy's reorder, rename and Activate land on a placeholder, and the entry keeps them
+    // (#1818).
+    const saved = unresolved || rootInfo ? savedFor(info.id) : null;
+    if (saved) {
+      const placed = placedAsLive(saved.entry, livePlacement(info.id, guidForId(info.parentId)), { placeholder: !!unresolved, missing: unresolvedRoots.has(info.id) });
+      // A root whose guid was minted by this save (a snapshot of a never-saved one) is written under the mint.
+      entities.push({ ...placed, guid: guidForId(info.id) || placed.guid } as unknown as SerializedEntity);
       continue;
     }
 
     const entry: SerializedEntity = { name: info.name, traits: {} };
-    const rootInfo = prefabRootInfo.get(info.id);
-    // True once we've successfully captured overrides for a prefab root — then the
-    // entry stores only PrefabInstance and everything else flows through overrides.
-    // Stays false if the prefab fetch fails, so we conservatively fall back to
-    // writing the full trait snapshot rather than losing data.
-    let prefabRootCaptured = false;
-
-    // Prefab instance root: capture full per-localId overrides (field edits AND
-    // user-added traits, root or child) so the entry needs only PrefabInstance.
-    if (rootInfo) {
-      entry.prefab = rootInfo.source;
-      // Captured in the pre-pass (`captureInstanceEntry`), which skips a root no document can be read for.
-      const captured = entries.get(info.id);
-      if (captured) {
-        Object.assign(entry, captured);
-        // Persist the root's stable guid on the node. The trait loop below writes
-        // ONLY PrefabInstance for a captured root (EntityAttributes never gets
-        // written, and guid is never an override), so this is the only place the
-        // root's identity survives. The pre-pass above guaranteed a guid: on save
-        // it's live on the entity; on the snapshot path it's in mintedGuids.
-        if (eaMeta) {
-          const live = findEntity(info.id)?.get(eaMeta.trait) as { guid?: string } | undefined;
-          const rootGuid = durableGuid(live?.guid) || mintedGuids.get(info.id);
-          if (rootGuid) entry.guid = rootGuid;
-        }
-        // Persist the PLACEMENT parent for a REPARENTED instance (parent isn't the
-        // scene root). A captured prefab root otherwise writes NO EntityAttributes —
-        // name/parent come from the prefab + placement — so without this an instance
-        // dragged under another entity re-spawns at the scene ROOT on the next load,
-        // losing its parent. The loader reads ONLY parentId off a prefab root's
-        // EntityAttributes (loadSceneFile resolves it as the placement parent) and
-        // ignores the rest, so a minimal `{ parentId }` is exactly what it needs.
-        // editorFolder is the editor Hierarchy grouping tag — without persisting it
-        // here a prefab instance in a folder would pop back out to the ungrouped root
-        // level on the next load. A folder-tagged instance can sit at the SCENE ROOT
-        // (empty parentGuid), so emit EA whenever EITHER field is present.
-        const parentGuid = guidForId(info.parentId);
-        // A root whose prefab no longer resolves also states its sibling position and active flag (#1895): its next load
-        // has no template to restore them from (`placementForMissing` says why here and not as an override).
-        const minimalEa: Record<string, unknown> = unresolvedRoots.has(info.id) && eaMeta
-          ? placementForMissing(entry.overrides as Parameters<typeof placementForMissing>[0], rootInfo.localId, findEntity(info.id)?.get(eaMeta.trait) as Record<string, unknown> | undefined)
-          : {};
-        if (parentGuid) minimalEa.parentId = parentGuid;
-        if (info.editorFolder) minimalEa.editorFolder = info.editorFolder;
-        if (Object.keys(minimalEa).length) entry.traits.EntityAttributes = minimalEa;
-        prefabRootCaptured = true;
-      }
-    }
+    // A prefab root nothing could state (no record, and no document to capture it against) is written conservatively:
+    // its `prefab` ref beside a full trait snapshot, rather than losing data.
+    if (rootInfo) entry.prefab = rootInfo.source;
 
     // Save trait data on the entry itself. For non-prefab entities this is the
     // full snapshot. For prefab roots we now write ONLY the PrefabInstance trait —
@@ -485,7 +512,6 @@ async function serializeSceneScoped(opts?: {
 
     for (const meta of allTraits) {
       if (!info.traits.includes(meta.name)) continue;
-      if (prefabRootCaptured && meta.name !== 'PrefabInstance') continue;
 
       if (meta.category === 'tag') {
         entry.traits[meta.name] = true;
@@ -630,18 +656,9 @@ async function serializeSceneScoped(opts?: {
     ? targetScene.guid
     : (ownLoadedEntry && isGuid(ownLoadedEntry.guid) ? ownLoadedEntry.guid
       : (_currentScenePath ? (getGuidForPath(_currentScenePath) ?? newGuid()) : newGuid()));
-  // The copies THIS scene's load carried, keyed by the guid its file loaded with (#1934 L1; '' for a file without one). A
-  // primary its path does not name — an untitled world an undo reloaded from a snapshot, saved As — is still the content
-  // this save writes, and its copies are under the snapshot's id (`captureSceneCopies`' `primaryAs`, #1948 S2): taken
-  // when THIS world holds copies under it (the store is per world, so a primary entry another world left names none).
-  // Before ruling B its frames were live and carried the copy whatever the key (#2001 S5, #2028).
-  const primaryEntry = [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary');
-  const primaryCopies = !ownLoadedEntry && primaryEntry && isGuid(primaryEntry.guid) && embeddedPrefabGuids(getCurrentWorld(), primaryEntry.guid).length;
-  const loadedId = targetScene ? targetScene.guid : ownLoadedEntry?.guid ?? (primaryCopies ? primaryEntry!.guid : undefined);
-  const embedded = await collectEmbeddedPrefabs(entityInfos, entities, loadedId && isGuid(loadedId) ? loadedId : '');
-  const embeddedPrefabs = embedded?.docs;
-  // A copy's own asset refs are this scene's to load while it stands in for its prefab (and the build's to keep).
-  const resources = sceneFileResourceRefs(entities, embeddedPrefabs) as ResourceRef[];
+  // A scene's copies of missing prefabs (`embeddedPrefabs`, v19) are no longer written (#2001 S6, owner ruling B: the
+  // copy store is dropped, to match Unity): a missing prefab is its placeholder, which keeps its list.
+  const resources = sceneFileResourceRefs(entities, undefined) as ResourceRef[];
   const file: SceneFile = {
     id: sceneId, version: SCENE_FORMAT_VERSION,
     createdAt: ownLoadedEntry?.createdAt ?? new Date().toISOString(),
@@ -659,109 +676,9 @@ async function serializeSceneScoped(opts?: {
   } else if (_currentBaseScene) {
     file.baseScene = _currentBaseScene;
   }
-  if (embedded) { file.embeddedPrefabs = embedded.docs; file.embeddedPrefabFrames = embedded.frames; }
   return file;
 }
 
-/** The copies this save writes for prefabs that are missing (#1914 F8 = A1, #1867, top level #1935; Unity's scene backup,
- *  `MergedAsMissingWithSceneBackup`), keyed by guid, sorted — or `undefined` when none is missing.
- *
- *  A copy is the document a frame was EXPANDED from (I3): a live nested frame's own record, which a frame the load
- *  expanded from a copy holds too — or, for a prefab no live frame expands (a row left unexpanded), the copy THIS scene's
- *  load carried (`scene`, its loaded guid), written back verbatim (I18) until the prefab is back. Never another scene's:
- *  the world holds every scene of a chain, and a level's copy written into its base made the base's reload expand frames
- *  that were not live at its save (#1934 L1, R7 fork A). Only a prefab that does NOT load is copied: once it
- *  is back it wins, and the copy goes at the next save. A copy is only ever BASE (I2/I17): it is the frame's template, and
- *  the writer's own edits stay in the scene's records, measured against it, exactly as they were against the prefab.
- *
- *  A top-level instance is copied as a nested frame is (#1935: the owner's ruling covers both, and R7 had built only the
- *  nested half): its live frame's record is the copy, and the reload expands it from there. A top-level Missing Prefab
- *  PLACEHOLDER is no frame and gives none (#1699). And a copy is written only when this scene's file
- *  reaches its guid — through its entries, a prefab or copy they name, and so on — so a copy whose frames all went, or
- *  one only a top-level placeholder's record nests, is not carried. (The reach alone did not keep out another scene's copy:
- *  a base's entries reach a guid its level's copy is for. The `scene` key does.)
- *
- *  Beside each copy, the frames of its prefab LIVE at this save, by address (#1939, `frameAddress.ts`): every live frame
- *  root of this scene, top-level, nested, a template reference node's or a scene-added one's. The load expands exactly
- *  those from the copy, so a frame that was a placeholder or unexpanded at the save stays one, and a live one comes back —
- *  inside a stored root's expansion too, where the member rows the old signal read are not written. Except a node a
- *  prefab anchors AT a nested row's root, which this save restates by guid while the list names it by key (#1966). */
-async function collectEmbeddedPrefabs(
-  entityInfos: readonly ReturnType<typeof getAllEntities>[number][],
-  entities: readonly SerializedEntity[],
-  scene: string,
-): Promise<{ docs: Record<string, EmbeddedPrefabDoc>; frames: Record<string, string[]> } | undefined> {
-  const world = getCurrentWorld();
-  const piMeta = getTraitByName('PrefabInstance');
-  const candidates = new Map<string, TemplateDocLike>();
-  const live = new Map<string, Set<string>>();
-  const addressOf = liveFrameAddresser(world);
-  const missing = new Map<string, boolean>();
-  const isMissing = async (guid: string): Promise<boolean> => {
-    let m = missing.get(guid);
-    if (m === undefined) { m = !(await getPrefabSource(guid)); missing.set(guid, m); }
-    return m;
-  };
-  if (piMeta) {
-    for (const info of entityInfos) {
-      if (!info.traits.includes('PrefabInstance')) continue;
-      const pi = readTraitData(info.id, piMeta) as { source?: string; rootInstanceId?: number } | null;
-      if (!pi?.source || pi.rootInstanceId !== info.id) continue;
-      const entity = findEntity(info.id);
-      if (!entity || unresolvedRefOf(entity)) continue;
-      if (!(await isMissing(pi.source))) continue;
-      const addr = addressOf(info.id);
-      if (addr) { const set = live.get(pi.source) ?? new Set<string>(); set.add(addr); live.set(pi.source, set); }
-      const doc = frameRootDoc(world, entity)?.doc as TemplateDocLike | undefined;
-      if (doc && !candidates.has(pi.source)) candidates.set(pi.source, doc);
-    }
-  }
-  for (const guid of embeddedPrefabGuids(world, scene)) {
-    if (candidates.has(guid) || !(await isMissing(guid))) continue;
-    candidates.set(guid, embeddedPrefabDoc(world, scene, guid) as TemplateDocLike);
-  }
-  if (!candidates.size) return undefined;
-  // The reach: every guid string the file holds, then every one inside a document a reached guid names that a LOAD would
-  // expand — a prefab that loads, or a copy. Not a top-level PLACEHOLDER's record (#1738): it reloads as its
-  // placeholder (#1699) and expands no row, so a copy reached only through it is one no load reads, and the save after
-  // that reload, which cannot reach it, dropped it (hunt seed 1031, I23).
-  const reached = new Set<string>();
-  const queue: string[] = [];
-  collectStrings(entities, queue);
-  while (queue.length) {
-    const s = queue.pop()!;
-    if (reached.has(s) || !isGuid(s)) continue;
-    reached.add(s);
-    const doc = candidates.get(s) ?? getCachedPrefabSync(s);
-    if (doc) collectStrings(doc, queue);
-  }
-  const out: Record<string, EmbeddedPrefabDoc> = {};
-  const frames: Record<string, string[]> = {};
-  // What a stored address can still be anchored on: a guid this save states (the validator's test). The store is the list
-  // as a file or a swap's carry held it, never pruned, so an anchor deleted since would be written back naming nothing
-  // (#2056 review: every trash now runs a load that fills it; a save→reload or Stop after a trash reached it before).
-  // Asked at the save, not pruned from the store: an undo of the delete brings the anchor back, and the next save lists it.
-  const anchorList: string[] = [];
-  collectStrings(entities, anchorList);
-  const anchors = new Set(anchorList);
-  for (const guid of [...candidates.keys()].sort()) {
-    if (!reached.has(guid)) continue;
-    // A deep copy: the file (and a Play snapshot holding it) must not alias the live record's document.
-    out[guid] = JSON.parse(JSON.stringify(candidates.get(guid))) as EmbeddedPrefabDoc;
-    // A refused copy's list as the file held it (#1937 C-A): nothing of it expands, so nothing of it is live.
-    const stored = (refusedCopyFrames(world, scene, guid) ?? []).filter((a) => anchors.has(a.split('/')[0]!));
-    frames[guid] = [...new Set([...(live.get(guid) ?? []), ...stored])].sort();
-  }
-  return Object.keys(out).length ? { docs: out, frames } : undefined;
-}
-type TemplateDocLike = { entities: unknown[] } & Record<string, unknown>;
-
-/** Every string value anywhere in `node`, pushed onto `out`. */
-function collectStrings(node: unknown, out: string[]): void {
-  if (typeof node === 'string') { out.push(node); return; }
-  if (!node || typeof node !== 'object') return;
-  for (const v of Array.isArray(node) ? node : Object.values(node)) collectStrings(v, out);
-}
 
 /** Replace every runtime guid inside string VALUES of `node` (in place) with `resolve(guid)`, when that
  *  returns one. Keys are left alone — none is built from an entity ref on this path. */

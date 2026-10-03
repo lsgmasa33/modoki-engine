@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
-import { SCENE_FORMAT_VERSION, PREFAB_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, PREFAB_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION, INSTANCE_MODEL_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
 const REAL_REPO_ROOT = path.resolve(__dirname, '../../..');
@@ -141,6 +141,24 @@ describe('migrate-assets refuses a document a newer build wrote (#1468)', () => 
     expect(fs.readFileSync(file, 'utf8')).toBe(before); // nothing to do, so not rewritten
     expect(out).toMatch(/^1 scene\(s\) held at v\d+/m); // anchored: the filler (current) and prefab files are not held
     expect(out).toMatch(/^HOLD .*a\.scene\.json: /m); // and it is NAMED, though it was not rewritten
+  });
+
+  it('stops a scene between the two loader rungs at the version before the instance model (#2001 S6)', () => {
+    // A file that says it is at the instance model's version has its instance entries read by that model's rules (an
+    // entry's own name and its root order are not read), and only a load and a save in the editor put them in that form.
+    // Mutation (measured): stamp any scene at or above the first rung to the current version, as before S6 — the file
+    // is rewritten with the current version and this case is red.
+    expect(FLAT_KEYED_GUIDS_SCENE_VERSION).toBeLessThan(INSTANCE_MODEL_SCENE_VERSION - 1); // fixture premise, stated
+    tmp = makeRepo();
+    seedFloor(tmp);
+    const first = writeJson(tmp, SCENE, sceneDoc(FLAT_KEYED_GUIDS_SCENE_VERSION));
+    const held = writeJson(tmp, 'games/x/runtime/assets/scenes/b.scene.json', sceneDoc(INSTANCE_MODEL_SCENE_VERSION - 1));
+    const before = fs.readFileSync(held, 'utf8');
+    const out = run(tmp);
+    expect(readJson(first).version).toBe(INSTANCE_MODEL_SCENE_VERSION - 1);
+    expect(fs.readFileSync(held, 'utf8')).toBe(before);
+    expect(out).toMatch(new RegExp(`^2 scene\\(s\\) held at v${INSTANCE_MODEL_SCENE_VERSION - 1} `, 'm'));
+    expect(out).toMatch(/^HOLD .*b\.scene\.json: /m);
   });
 
   it('holds a scene whose version is not a NUMBER too — the loader reads it as below 18, so the rename still runs', () => {

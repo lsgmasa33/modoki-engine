@@ -24,7 +24,7 @@ import { markOverride, unmarkOverride, getOverrideMarkSet } from '../../runtime/
 import type { Entity } from 'koota';
 import { isStoredRoot, isOwnedRoot, type MemberPi } from '../../runtime/core/assetRefRules';
 import { templateKeyOf } from '../../runtime/core/templateIdentity';
-import { foldStructureLayers, foldPath as sharedFoldPath, type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState, referenceRowAt } from '../../runtime/loaders/prefabOverrides';
+import { foldStructureLayers, foldPath as sharedFoldPath, type OverrideMap, type StructureLayer, type FoldDoc, type ForwardState as SharedForwardState, referenceRowAt, ownRootRow } from '../../runtime/loaders/prefabOverrides';
 import type { AddedEntity, NestedOverridePaths, NestedStructurePaths, NestedStructureDelta, SceneMemberRow, KeptLegacyChannels } from '../../runtime/loaders/loadSceneFile';
 import { keptLegacyChannels, keptUnusedRows, keptMemberOrphans } from '../../runtime/loaders/loadSceneFile';
 import { restoreMalformed, malformedPaths } from '../../runtime/loaders/malformedChannels';
@@ -106,11 +106,20 @@ export type ForwardState = SharedForwardState<NestedStructureDelta, SceneMemberR
 /** The forward state a template REFERENCE node hands the expansion of its frame, whose document is `doc`: its path-keyed
  *  channels and its member rows, as the one spawner hands them (`spawnReferenceNode`). */
 export function nodeForward(node: AddedEntity, doc: PrefabFile | null): ForwardState {
-  const layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: node.nestedStructure, rows: node.members, valuePaths: node.nestedOverrides }];
+  const layers: StructureLayer<NestedStructureDelta, SceneMemberRow>[] = [{ slots: node.nestedStructure, rows: node.members, ...ownRootRow(node.members), valuePaths: node.nestedOverrides }];
   return {
     layers,
     forwardRoots: node.members && doc ? foldStructureLayers(doc, layers, 0, {}).forwardRoots : [],
   };
+}
+
+/** The VALUES a template reference node states about its own frame's members on its rows (prefab v10, #2001 S6): a member
+ *  row's `traits`, and the `"/"` row's for the root, by localId of `doc`. A v9 node stated them in `overrides`, which is
+ *  all a reader of the node's root layer looked at. A nested root's row is not here: the fold forwards it to that root's
+ *  own expansion ({@link nodeForward}'s `forwardRoots`). */
+export function nodeRowValues(node: AddedEntity, doc: PrefabFile | null): OverrideMap {
+  if (!node.members || !doc) return {};
+  return foldStructureLayers(doc, [{ rows: node.members, ...ownRootRow(node.members) }], 0, {}).channels.overrides ?? {};
 }
 
 /** The fold ITSELF (`prefabOverrides.ts` `foldPath`, #1707 — the step the validator and the UIEntries pool share): everything
@@ -214,7 +223,7 @@ export function frameBase(frame: number, depth = 0): FrameBase | null {
       // template-form rows since #1538, and its direct ones are part of what it authors on this frame. It carries no
       // `moved`, which is live scene identity, stripped on the way into a template (`toTemplateNodes`).
       const lower = { overrides: node.overrides, added: node.added, removed: node.removed, removedTraits: node.removedTraits };
-      const own = node.members && doc ? foldStructureLayers(doc, [{ rows: node.members }], 0, lower).channels : lower;
+      const own = node.members && doc ? foldStructureLayers(doc, [{ rows: node.members, ...ownRootRow(node.members) }], 0, lower).channels : lower;
       layer = {
         overrides: own.overrides ?? {},
         structure: { added: own.added ?? [], removed: own.removed ?? [], removedTraits: own.removedTraits ?? {} },

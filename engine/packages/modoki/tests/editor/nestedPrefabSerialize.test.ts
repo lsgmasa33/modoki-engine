@@ -142,8 +142,10 @@ describe('serializePrefab — nested prefabs', () => {
     const o2 = out.entities.find((e) => e.name === 'O2')!;
     expect((ref.traits.EntityAttributes as Record<string, unknown>).parentId).toBe(o2.localId);
     // Pristine instance ⇒ no overrides / structure noise.
-    expect(ref.overrides).toBeUndefined();
-    expect(ref.added).toBeUndefined();
+    // (prefab v10: the row states its instance's root on `"/"`, its name and order, and no member beyond it)
+    const rows = (ref as unknown as { members?: Record<string, { traits?: Record<string, unknown>; own?: unknown }> }).members ?? {};
+    expect(Object.keys(rows).filter((k) => k !== '/')).toEqual([]);
+    expect([Object.keys(rows['/']?.traits ?? {}).filter((t) => t !== 'EntityAttributes'), rows['/']?.own]).toEqual([[], undefined]);
   });
 
   it('round-trips: instantiate the serialized prefab and re-serialize identically', async () => {

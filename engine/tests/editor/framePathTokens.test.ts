@@ -252,5 +252,6 @@ describe('the editor\'s readers of a v8 path find the node through the respell (
     const saved = serializePrefabEditWorld(U);
     if ('error' in saved) throw new Error(saved.error);
     expect(saved.prefab.moved).toBeUndefined();
+    expect(JSON.stringify(saved.prefab.entities)).not.toContain('"parent":'); // nor as a v10 row's move
   });
 });

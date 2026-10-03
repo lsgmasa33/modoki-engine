@@ -95,6 +95,11 @@ function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids:
     // recurse `children`, so the two walks disagreed about where a reference node can live.
     for (const child of (node.added as Record<string, unknown>[] | undefined) ?? []) walkRows(child, where);
     for (const child of (node.children as Record<string, unknown>[] | undefined) ?? []) walkRows(child, where);
+    // Scene v20 (#2001 S6): the nodes the scene hangs under a member, the root included, sit in that member row's `own`,
+    // where v19 put a root's in the entry's `added`, so a reference node there is reached through its row.
+    if (members && typeof members === 'object') {
+      for (const row of Object.values(members) as { own?: Record<string, unknown>[] }[]) for (const child of row?.own ?? []) walkRows(child, where);
+    }
     const slots = node.nestedStructure as Record<string, { added?: Record<string, unknown>[] }> | undefined;
     if (slots && typeof slots === 'object') {
       for (const delta of Object.values(slots)) for (const child of delta?.added ?? []) walkRows(child, where);

@@ -23,8 +23,10 @@
 //                         engine/app/ecs/registerTraits.ts (`hidden` does NOT keep a field off
 //                         disk); the GLB-wrapper prefabs under models//rigs//ships/ are the
 //                         Animator/SkeletalAnimator carriers, so they are where to expect it.
-//   NESTED <field>        the nested-instance row's prefab ref / overrides / added / removed
-//                         changed. This is the one class the re-save can genuinely REGRESS:
+//   NESTED <field>        the nested-instance row's prefab ref / overrides / added / removed / members
+//                         changed. A row that states the SAME thing in the member-row form (prefab
+//                         v10, #2001 S6) is counted on the last line, not listed.
+//                         Otherwise: This is the one class the re-save can genuinely REGRESS:
 //                         a nested child that wasn't cached at serialize time FLATTENS
 //                         instead of round-tripping as a reference (serializePrefab warns
 //                         "not cached; flattening instead of referencing"). Treated as a
@@ -54,6 +56,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repoFiles } from './repoCorpus.mjs';
 import { parseJsonText } from './jsonFile.mjs'; // #1799: a BOM is read through
+import { rowStatement, canonicalJson } from './prefabRowStatement.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -71,9 +74,25 @@ function findPrefabs(proj) {
   }).map(({ abs }) => abs).sort();
 }
 
-const NESTED_FIELDS = ['prefab', 'overrides', 'added', 'removed', 'removedTraits', 'nestedOverrides', 'nestedStructure'];
+// `members` is where a v10 row states everything the older channels did (#2001 S6); `moved` / `templateMoved` are the
+// two older channels this list never had.
+const NESTED_FIELDS = ['prefab', 'overrides', 'added', 'removed', 'removedTraits', 'moved', 'templateMoved', 'nestedOverrides', 'nestedStructure', 'members'];
+/** The fields {@link rowStatement} folds into one statement: when the statement is the same before and after, a change
+ *  in these is the row moving to the v10 form, counted and not listed. */
+const STATEMENT_FIELDS = new Set(['overrides', 'members']);
 
-let totalPrefabs = 0, totalChanged = 0, problems = 0, regressions = 0;
+let totalPrefabs = 0, totalChanged = 0, problems = 0, regressions = 0, restated = 0;
+
+/** Every prefab document of the projects named, by id: the nested document a reference row's statement is read against
+ *  (its root localId and node identities, which a re-save does not change). Read from the working tree. */
+const nestedById = new Map();
+for (const proj of process.argv.slice(2)) {
+  if (!fs.existsSync(path.join(ROOT, proj))) continue;
+  for (const abs of findPrefabs(proj.split(path.sep).join('/'))) {
+    try { const d = parseJsonText(fs.readFileSync(abs, 'utf8')); if (typeof d?.id === 'string') nestedById.set(d.id, d); }
+    catch { /* reported as UNPARSEABLE by the main loop when it changed */ }
+  }
+}
 
 for (const proj of process.argv.slice(2)) {
   const dir = path.join(ROOT, proj);
@@ -128,6 +147,8 @@ for (const proj of process.argv.slice(2)) {
     if (a.name !== b.name) notes.push(`CHANGED name ${JSON.stringify(a.name)} -> ${JSON.stringify(b.name)}`);
     if (a.rootLocalId !== b.rootLocalId) notes.push(`CHANGED rootLocalId ${a.rootLocalId} -> ${b.rootLocalId}`);
 
+    if (JSON.stringify(a.moved) !== JSON.stringify(b.moved)) notes.push(`NESTED document moved ${JSON.stringify(a.moved) ?? 'absent'} -> ${JSON.stringify(b.moved) ?? 'absent'}`);
+
     const A = new Map((a.entities || []).map((e) => [e.localId, e]));
     const B = new Map((b.entities || []).map((e) => [e.localId, e]));
     for (const [k, ea] of A) if (!B.has(k)) notes.push(`LOST ENTITY ${ea.name} (localId ${k})`);
@@ -170,9 +191,16 @@ for (const proj of process.argv.slice(2)) {
       // Nested-instance structure. Unlike a trait bag, NOTHING here is compaction — every one
       // of these fields is authored structure, so any change is worth a human's eye, and a
       // LOST `prefab` ref means the nested child flattened into the parent template.
+      // The same statement in the other form (a v9 row's `overrides` as a v10 row's `members`) is the re-save doing
+      // its job. Compared as statements, so a row whose statement DID change is still listed, in full.
+      const nested = typeof eb.prefab === 'string' && ea.prefab === eb.prefab ? nestedById.get(eb.prefab) : undefined;
+      const sa = nested ? rowStatement(ea, nested) : null, sb = nested ? rowStatement(eb, nested) : null;
+      const sameStatement = !!sa && !!sb && canonicalJson(sa) === canonicalJson(sb);
+      if (sameStatement && [...STATEMENT_FIELDS].some((f) => JSON.stringify(ea[f]) !== JSON.stringify(eb[f]))) restated++;
       for (const f of NESTED_FIELDS) {
         const av = JSON.stringify(ea[f]), bv = JSON.stringify(eb[f]);
         if (av === bv) continue;
+        if (sameStatement && STATEMENT_FIELDS.has(f)) continue;
         if (f === 'prefab' && ea[f] !== undefined && eb[f] === undefined) {
           notes.push(`⚠️ REGRESSION: NESTED ${who}.prefab LOST (${ea[f]}) — the child prefab was not cached at serialize time and FLATTENED into this template`);
           regressions++;
@@ -187,6 +215,7 @@ for (const proj of process.argv.slice(2)) {
 }
 
 console.log(`\nprefabs: ${totalPrefabs}  rewritten: ${totalChanged}  with semantic changes: ${problems}`);
+if (restated) console.log(`reference rows restated in the member-row form with the same statement: ${restated}`);
 // Exit non-zero only for the unambiguous cases: a re-minted prefab id (every referencing scene
 // dangles) and a flattened nested instance (authored structure destroyed). Everything else
 // printed is for a human to weigh. Safe to fail — this is a hand-run review gate, nothing

@@ -23,9 +23,9 @@ import {
   descendPathKeyed, nestedPathKey, mergeNestedStructurePaths,
   referenceRowAt, rowAt, unusedRemovalsOf, noteUnusedRemovalsOf, noteUntargetedRow, isUntargetedRow, ownNode, isOwnNode, recordedFieldsOf, type OverrideMap, type ForwardState,
   type NestedOverridePaths,
-  frameKeyIndex,
+  frameKeyIndex, templateNodeRowMoves,
 } from './prefabOverrides';
-import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION, INSTANCE_MODEL_SCENE_VERSION } from '../core/version';
+import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION, INSTANCE_MODEL_SCENE_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../core/version';
 import { instanceRowKeysIn, memberRowKeysIn, memberRowsIn } from '../core/ecs/memberRows';
 import { docRows, resolveMemberChain, type MemberDoc, type MemberRowAt } from './memberTranslation';
 import { keepUnresolvedEntry, spawnUnresolvedReference } from './unresolvedPrefabRefs';
@@ -603,6 +603,14 @@ function migrateV17toV18(data: SceneData): void {
  *  unchanged and the rung only stamps. */
 function migrateV18toV19(data: SceneData): void {
   if (data.version >= 19) return;
+  data.version = 19;
+}
+
+/** v19 → v20 (#2001 S6): the prefab instance model's entry form. The rung only stamps: the conversion of an older
+ *  entry's channels needs the prefab documents, so it runs where they are at hand (`parseInstanceRecord`, driven by the
+ *  file's own version, read before this ladder), and the next save writes the v20 form. */
+function migrateV19toV20(data: SceneData): void {
+  if (data.version >= 20) return;
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -1275,7 +1283,7 @@ export function spawnReferenceNode(
   if (!child || !expandsToRoot(child, read)) {
     console.warn(`[loadSceneFile] added nested instance not cached, or expands to no root: ${node.prefab}`);
     // A placeholder carrying the node, so the next save writes it back verbatim (#1699).
-    spawnUnresolvedReference(world, node, parentEcsId);
+    spawnUnresolvedReference(world, node, parentEcsId, sceneVersion);
     return;
   }
   // A key the expansion gives two nodes across documents (#1933 L5) refuses a reference node as it refuses an entry (close-
@@ -1286,7 +1294,7 @@ export function spawnReferenceNode(
   if (repeat) {
     console.warn(`[loadSceneFile] added nested instance ${node.prefab} was not expanded: ${repeat}`);
     noteDamagedPrefab([node.prefab!, typeof child.id === 'string' ? child.id : ''], repeat);
-    spawnUnresolvedReference(world, node, parentEcsId);
+    spawnUnresolvedReference(world, node, parentEcsId, sceneVersion);
     return;
   }
   // The node's channels split as the settle reads them (#1938 C-B step 2; close-out review #2): a malformed one crashed
@@ -1316,9 +1324,12 @@ export function spawnReferenceNode(
   if (rootEcsId && node.key) setTemplateKey(findEntityById(rootEcsId, world) as EntityHandle | undefined, node.key);
   // The node's own moves are its record's (the parser converts `templateMoved`, and the fold settles them, #1543); its
   // frame record keeps them for the old capture (§ 10.1).
-  if (rootEcsId && node.templateMoved) {
+  // A v20/v10 node states them as member tokens on its own rows instead (#2001 S6), read back into that spelling; a guid
+  // parent there is the scene's own move and is not taken.
+  const nodeMoves = { ...templateNodeRowMoves(node, child, read), ...node.templateMoved };
+  if (rootEcsId && Object.keys(nodeMoves).length) {
     const root = findEntityById(rootEcsId, world);
-    if (root) noteNodeMoves(world, root as Entity, node.prefab!, child as TemplateDoc, node.templateMoved);
+    if (root) noteNodeMoves(world, root as Entity, node.prefab!, child as TemplateDoc, nodeMoves);
   }
 }
 
@@ -1952,7 +1963,9 @@ function applyStoredMemberRows(
     if (guid) { dropKeptOrphanRows(guid); setKeptUnusedRows(guid, {}); }
     return;
   }
-  const liveKeys = memberRowKeysIn(rootEcsId, world);
+  // By derived identity too (#2001 S6): a v20 entry and a v10 row key a pre-v5 frame's member that way, and a row about a
+  // live member is no orphan.
+  const liveKeys = memberRowKeysIn(rootEcsId, world, true);
   for (const [ecsId, key] of keepOnly ? [] : liveKeys) {
     const row = members[key];
     if (!row) continue;
@@ -1998,9 +2011,15 @@ function applyStoredMemberRows(
   // The walk's keys without an `a+` component are `live`'s member keys and the root (whose row no template backs, so it never
   // asks), so only a key with one asks it — built on first ask, since it walks the whole world (close-out review: once per
   // instance, on every load).
+  // A key TWO live nodes hold names neither (#1937 T6, `frameKeyIndex`): no node takes its row, so it is not a live row,
+  // and the row is kept as unused.
   let liveAll: Set<string> | undefined;
-  const liveRow = (key: string): boolean => live.has(key)
-    || (key.includes('/a+') && (liveAll ??= new Set(instanceRowKeysIn(rootEcsId, world).values())).has(key));
+  const heldOnce = (): Set<string> => {
+    const n = new Map<string, number>();
+    for (const k of instanceRowKeysIn(rootEcsId, world).values()) n.set(k, (n.get(k) ?? 0) + 1);
+    return new Set([...n].filter(([, c]) => c === 1).map(([k]) => k));
+  };
+  const liveRow = (key: string): boolean => live.has(key) || (key.includes('/a+') && (liveAll ??= heldOnce()).has(key));
   for (const [key, row] of Object.entries(members)) {
     // A NODE row (#1516) orphans when the template no longer adds its node, and is kept exactly as a member
     // row is (fork 2, owner 2026-09-24): the node vanishes with the template, and a template that brings it
@@ -2019,7 +2038,12 @@ function applyStoredMemberRows(
     // key the parse links them at (`cutRowUserLinks`), so a row's links can land on rows other than its own.
     // Asked of the CANONICAL key, as the parse reads it (`canonicalRowKey`): a hand-written alias of a live nested root is
     // never in the live keys, so it read as cut, and its nodes were kept as well as spawned (#2041 review).
-    const gone = !backed(key);
+    // …and never a row a LIVE keyed node answers to (#2001 S6): the expansion that just ran produced the node at that key,
+    // so the template declares it, whatever the document walk reads. The walk does not read every channel a frame adds
+    // nodes through (`rowBackedTest`: a member row's `own`, an owning slot), and a v20 entry states a pin row for every
+    // present member: unasked, each pin of such a node and of the members inside it was kept as an orphan, warned about
+    // as lost on every load, and stayed in the kept store after the prefab under the instance changed back (an undo).
+    const gone = !backed(key) && !liveRow(key);
     const canon = !gone && isRecord(row) && !isUntargetedRow(row) && memberRowNodes(row).length && !liveRow(key) ? canonicalOf(key) : null;
     const cut = canon !== null && (canon === key || !liveRow(canon)) ? cutRowUserLinks(source, canon, row, docReader) : null;
     if (cut) { lifted.push(...Object.entries(cut)); continue; }
@@ -2670,7 +2694,8 @@ export interface PrefabExpansion {
    *  reference node). What a rebuild's kept frames are met by. */
   frame?: string;
   /** The scene FILE's version the channels were read from (#2001 S5, § 10.4b): it picks the parser's readings
-   *  (`ParseOptions.sceneVersion`). A load passes its file's; an editor caller states the current format's (default). */
+   *  (`ParseOptions.sceneVersion`). A load passes its file's. Default: the old capture's form
+   *  (`CAPTURE_FORM_SCENE_VERSION`), which every editor caller that names no version hands its channels in until S8. */
   sceneVersion?: number;
   /** The stored root's durable guid, when the caller knows it: the parse derives a legacy added node's identity from it. */
   rootGuid?: string;
@@ -2726,7 +2751,7 @@ export function instantiatePrefabIntoWorld(
   // expands the document it was told to).
   const top = source ?? prefab.id ?? UNNAMED_SOURCE;
   const docs = prefabReaderFor(read, top, prefab);
-  const sceneVersion = expand.sceneVersion ?? SCENE_FORMAT_VERSION;
+  const sceneVersion = expand.sceneVersion ?? CAPTURE_FORM_SCENE_VERSION;
   // The parse links the owner's guid-less nodes by guids derived from the root's (rule 5). A caller that stamps the root's
   // guid only after the spawn hands none: the links are then made under a stand-in, which nothing keeps — realize spawns
   // a derived-guid node guid-less, and the load's derive names it, as before.
@@ -2745,7 +2770,7 @@ export function instantiatePrefabIntoWorld(
   if (root) {
     // The root default fields the owner STATED are its records (#1914), which the parser keeps on the placement
     // (§ 10.4), not on the "/" row: marked here, where the statement is still in hand.
-    markTraits(root, statedRootDefaults(expand.node ?? { overrides, members: structure?.members }, prefab.rootLocalId ?? 1));
+    markTraits(root, statedRootDefaults(expand.node ?? { overrides, members: structure?.members }, prefab, sceneVersion));
     // The legacy root-Transform channel (a scene entry's placement): under every field the owner's records state there,
     // never marked — as the old spawner applied it (an override on a Transform field wins over it).
     const tfMeta = getTraitByName('Transform');
@@ -2835,15 +2860,32 @@ function entryOfChannels(
 }
 
 /** The root default fields (`name`, `sortOrder`, `editorFolder`, `sourceScene`) an owner states, through its root override
- *  or its "/" row: what the old spawner marked on the root (#1914). */
-function statedRootDefaults(owner: { overrides?: Record<number, Record<string, unknown>>; members?: Record<string, SceneMemberRow> }, rootLocalId: number): RecordTraits {
+ *  or its "/" row: what the old spawner marked on the root (#1914).
+ *
+ *  From v20 the "/" row states the root's name ALWAYS (a default override, U10b): storage, not a mark. The format flip
+ *  must not move a mark (hub ruling 2026-10-02, design § 10.7), so a v20 row's name is marked only where today's form of
+ *  the same instance states it: when it differs from the template root's. Exported for its twin-fixture test. */
+export function statedRootDefaults(
+  owner: { overrides?: Record<number, Record<string, unknown>>; members?: Record<string, SceneMemberRow> },
+  prefab: { rootLocalId?: number; entities?: readonly { localId?: number; name?: unknown; traits?: Record<string, unknown> }[] },
+  sceneVersion: number,
+): RecordTraits {
   const out: Record<string, unknown> = {};
-  const take = (ea: unknown): void => {
+  const take = (ea: unknown, skipName?: (name: unknown) => boolean): void => {
     if (!ea || typeof ea !== 'object') return;
-    for (const f of ['name', 'sortOrder', 'editorFolder', 'sourceScene']) if (f in (ea as object)) out[f] = (ea as Record<string, unknown>)[f];
+    for (const f of ['name', 'sortOrder', 'editorFolder', 'sourceScene']) {
+      if (!(f in (ea as object)) || (f === 'name' && skipName?.((ea as Record<string, unknown>).name))) continue;
+      out[f] = (ea as Record<string, unknown>)[f];
+    }
   };
+  const rootLocalId = prefab.rootLocalId ?? 1;
   take((owner.overrides?.[rootLocalId] as Record<string, unknown> | undefined)?.EntityAttributes);
-  take((owner.members?.['/']?.traits as Record<string, unknown> | undefined)?.EntityAttributes);
+  const templateRoot = rowAt(prefab.entities, rootLocalId);
+  const templateEa = templateRoot?.traits?.EntityAttributes as { name?: unknown } | undefined;
+  // The template root's name as the parser reads it (`parseSceneOwner`'s `templateName`).
+  const templateName = typeof templateEa?.name === 'string' ? templateEa.name : typeof templateRoot?.name === 'string' ? templateRoot.name : '';
+  take((owner.members?.['/']?.traits as Record<string, unknown> | undefined)?.EntityAttributes,
+    sceneVersion >= INSTANCE_MODEL_SCENE_VERSION ? (name) => name === templateName : undefined);
   return Object.keys(out).length ? { EntityAttributes: out } : {};
 }
 
@@ -3472,6 +3514,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV16toV17(data);
   migrateV17toV18(data);
   migrateV18toV19(data);
+  migrateV19toV20(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
@@ -3776,7 +3819,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         console.warn(prefab ? `[loadSceneFile] Prefab "${source}" expands to no root` : `[loadSceneFile] Could not find prefab "${source}"`);
         // The placeholder stays and carries the entry, so the next save writes it back verbatim (#1699) — less the user's
         // own nodes linked AT it, which show under it (#2018, every file form) and save as its children.
-        keepUnresolvedEntry(world, newEntityId, source, showLinksAtPlaceholder(world, newEntityId, entry, sourceVersion, read));
+        keepUnresolvedEntry(world, newEntityId, source, showLinksAtPlaceholder(world, newEntityId, entry, sourceVersion, read), sourceVersion);
         continue;
       }
       // A key the expansion gives two nodes across documents (#1933 L5, hub ruling): refused as a repeat inside one
@@ -3786,7 +3829,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       if (repeat) {
         console.warn(`[loadSceneFile] Prefab "${source}" was not expanded: ${repeat}`);
         noteDamagedPrefab([source, typeof (prefab as { id?: unknown }).id === 'string' ? (prefab as { id: string }).id : ''], repeat);
-        keepUnresolvedEntry(world, newEntityId, source, showLinksAtPlaceholder(world, newEntityId, entry, sourceVersion, read));
+        keepUnresolvedEntry(world, newEntityId, source, showLinksAtPlaceholder(world, newEntityId, entry, sourceVersion, read), sourceVersion);
         continue;
       }
       // Fixed since (a nested file given its own key): the label goes. Only for a document its seat admitted — a scene
@@ -3867,12 +3910,28 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // for — the root only when the prefab lists its root row first (#1353).
         idMap.set(entry.id, rootEcsId);
         attachEntityIdRefs(refsTo, detached, rootEcsId);
+        // A v20 entry states its root's sibling order as PLACEMENT, on its own `EntityAttributes` (design § 2.2), where a
+        // plain entity keeps it: applied here, for every caller. Never marked by this write: the root's order is always
+        // recorded (F7, `recordsRootOrder`), as today's form shows it.
+        const order = rootEa?.sortOrder;
+        const eaTrait = getTraitByName('EntityAttributes')?.trait;
+        const spawned = eaTrait && sourceVersion >= INSTANCE_MODEL_SCENE_VERSION && typeof order === 'number' && Number.isFinite(order)
+          ? findEntityById(rootEcsId, world) as Entity | undefined : undefined;
+        if (spawned?.has(eaTrait!)) spawned.set(eaTrait!, { ...(spawned.get(eaTrait!) as Record<string, unknown>), sortOrder: order });
         // Deferred, not applied here: a nested instance below this one may still be expanding, and
         // the walk that finds a member's row key reads the finished ECS parent tree.
         // Every instance, rows or not: a load is what makes the kept-orphan store current for this root (R2), and
         // one whose entry states no rows keeps none — a stale set left behind would be replayed by the editor's
         // next rebuild (`settleEntryRows`, #1535 close-out review F4).
         spawnedEntries.push(entryRowsOf(rootEcsId, source, entry));
+        // A guid parent that named nothing when this entry expanded — a MEMBER of another instance, which only that
+        // instance's expansion creates and its settle pins — is asked again at the end, as a plain entity's is (#1738).
+        // #2001 S6: a stored instance no record links is saved as an entry of its own, parented to its member by guid.
+        const parentGuid = rootEa?.parentId;
+        const rootHandle = eaTrait ? findEntityById(rootEcsId, world) as Entity | undefined : undefined;
+        if (typeof parentGuid === 'string' && parentGuid && !ecsParent && rootHandle && eaTrait) {
+          guidParentMisses.push(holdFileGuid(world, { entity: rootHandle, trait: eaTrait, field: 'parentId', guid: parentGuid }, 'guid'));
+        }
       } else {
         // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a
         // later entry's numeric parent must resolve to 0 too, not to the freed id.

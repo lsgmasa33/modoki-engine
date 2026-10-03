@@ -9,7 +9,8 @@
  *  - `v16RootAdded`: the same at a missing ROOT (`/`) — shows at `/`;
  *  - `v17RootOwn` / `legacyRootAdded`: a `/` row's `own`, and the entry-level legacy `added` at the root's localId,
  *    under a missing root — each shows at `/` (the legacy form needs the entry to state that localId: none is guessed,
- *    rule 5). Today's own save writes the legacy one there, so each is generated from the other;
+ *    rule 5). A capture-form save (before scene v20) wrote the legacy one there, and a v20 save writes `own` and states
+ *    no root localId: the legacy form is generated only from a scene that states it;
  *  - `slotAtMissingNested`: a `nestedStructure` slot's `added` naming the placeholder's reference row — waits
  *    `unresolved` at the placeholder, since AT and INSIDE cannot be told apart without the document (Q4).
  *  Of the root forms, the one the saved scene states is returned as the scene itself, so every form counts as judged. */

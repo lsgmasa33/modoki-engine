@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
-import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { SCENE_FORMAT_VERSION, FLAT_KEYED_GUIDS_SCENE_VERSION, INSTANCE_MODEL_SCENE_VERSION, TEMPLATE_FORM_PREFAB_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { PREFAB_FORMAT_VERSION } from '../../packages/modoki/src/editor/scene/prefab';
 
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
@@ -160,9 +160,52 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
     expect(out).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
 
     const after = readJson(file);
-    expect(after.version).toBe(PREFAB_FORMAT_VERSION);
+    // A prefab below the template-form rung is stamped to the version before it (next case).
+    expect(after.version).toBe(TEMPLATE_FORM_PREFAB_VERSION - 1);
     expect(after.version).not.toBe(SCENE_FORMAT_VERSION); // the two are distinct on purpose
     expect(after.entities[0].traits.UIElement.zIndex).toBe(7);
+  });
+
+  // #2001 S6: the instance model's rungs (scene v20, prefab v10) move an instance's records onto its member rows, which
+  // needs the prefab documents, so only a load and a save in the editor take a file there. Stamped past one here, a file
+  // would claim a form its rows are not in (and a scene's entries would be read by rules that drop the entry's name).
+  // Mutation (measured): stamp to the target whatever the file's version, as before S6 — both 'held' rows are red.
+  it.each([
+    ['a prefab below the template-form rung', 'prefabs/p.prefab.json', TEMPLATE_FORM_PREFAB_VERSION - 1, TEMPLATE_FORM_PREFAB_VERSION - 1],
+    ['a prefab at it', 'prefabs/p.prefab.json', TEMPLATE_FORM_PREFAB_VERSION, PREFAB_FORMAT_VERSION],
+    ['a scene between the loader rung and the instance model', 'scenes/a.scene.json', FLAT_KEYED_GUIDS_SCENE_VERSION, INSTANCE_MODEL_SCENE_VERSION - 1],
+    ['a scene at the instance model', 'scenes/a.scene.json', INSTANCE_MODEL_SCENE_VERSION, SCENE_FORMAT_VERSION],
+  ])('%s is stamped no further than its own rung allows', (_what, rel, from, to) => {
+    tmp = makeRepo();
+    const file = writeJson(tmp, `games/x/runtime/assets/${rel}`, sceneWithAnchorZIndex(7, from));
+    expect(run(tmp, ['--write'])).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
+    expect(readJson(file).version).toBe(to);
+  });
+
+  it('reaches a member row and the nodes a row adds (prefab v10, scene v20)', () => {
+    // What `overrides` / `added` / `nestedOverrides` stated is on `members` from the instance model on: a row's `traits`
+    // is a per-field diff (the carrier is created, as for an override bag) and `own` holds whole nodes.
+    // Mutation (measured): drop the script's `members` loop — nothing is rewritten and this case is red.
+    tmp = makeRepo();
+    const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', {
+      version: TEMPLATE_FORM_PREFAB_VERSION, rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: {} },
+        { localId: 2, name: 'Row', prefab: 'a'.repeat(8) + '-0000-4000-8000-000000000000', traits: {},
+          members: {
+            '/': { traits: { UIAnchor: { zIndex: 4 } } },
+            '/bbbbbbbb-0000-4000-8000-000000000000': {
+              own: [{ key: 'k', guid: '', parentLocalId: 0, name: 'N', traits: { UIAnchor: { zIndex: 6 }, UIElement: {} },
+                children: [{ name: 'C', traits: { UIAnchor: { zIndex: 8 }, UIElement: {} }, children: [] }] }],
+            },
+          } },
+      ],
+    });
+    expect(run(tmp, ['--write'])).toMatch(/3 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
+    const rows = readJson(file).entities[1].members;
+    expect(rows['/'].traits).toEqual({ UIAnchor: {}, UIElement: { zIndex: 4 } });
+    const node = rows['/bbbbbbbb-0000-4000-8000-000000000000'].own[0];
+    expect([node.traits, node.children[0].traits]).toEqual([{ UIAnchor: {}, UIElement: { zIndex: 6 } }, { UIAnchor: {}, UIElement: { zIndex: 8 } }]);
   });
 
   // ⚠️ #1468 — the stamp used to be UNCONDITIONAL, so this script would rewrite a document a NEWER

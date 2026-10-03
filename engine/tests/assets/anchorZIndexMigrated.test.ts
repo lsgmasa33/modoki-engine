@@ -117,6 +117,19 @@ function visitEntity(entry: unknown, hits: Hit[]): void {
       }
     }
   }
+
+  // Member rows (scene v20, prefab v10; #2001 S6): what the channels above stated is on `members` now.
+  const members = (entry as Record<string, unknown>)['members'];
+  if (members && typeof members === 'object') {
+    for (const [key, row] of Object.entries(members)) {
+      if (!row || typeof row !== 'object') continue;
+      const anchor = anchorZIndexBag((row as Record<string, unknown>)['traits']);
+      if (anchor) hits.push({ ent, anchor, location: `members['${key}'].traits` });
+      for (const list of [(row as Record<string, unknown>)['own'], (row as Record<string, unknown>)['added']]) {
+        if (Array.isArray(list)) for (const node of list) visitEntity(node, hits);
+      }
+    }
+  }
 }
 
 function entitiesWithAnchorZIndex(file: string): Hit[] {
@@ -159,6 +172,20 @@ describe('UIAnchor.zIndex is gone from authored content (#762 follow-up)', () =>
     expect(offenders, 'UIAnchor.zIndex no longer exists on the trait, so this value is dropped on '
       + 'the next save and ignored at spawn — both silently. Author UIElement.zIndex instead:\n'
       + offenders.join('\n')).toEqual([]);
+  });
+
+  it('the walk sees a value on a member row and on a node a row adds (scene v20, prefab v10)', () => {
+    // The corpus holds none, so the case above cannot show the walk reaches a row. Mutation (measured): drop the
+    // `members` block of `visitEntity` — no hit, and this case is red.
+    const hits: Hit[] = [];
+    visitEntity({
+      name: 'Inst',
+      members: {
+        '/': { traits: { UIAnchor: { zIndex: 4 } } },
+        '/m': { own: [{ name: 'N', traits: { UIAnchor: { zIndex: 6 } }, children: [{ name: 'C', traits: { UIAnchor: { zIndex: 8 } } }] }] },
+      },
+    }, hits);
+    expect(hits.map((h) => [h.ent.name, h.location, h.anchor.zIndex])).toEqual([['Inst', "members['/'].traits", 4], ['N', 'traits', 6], ['C', 'traits', 8]]);
   });
 
   it('the deliberately-old e2e fixtures still migrate their stacking onto UIElement.zIndex', () => {

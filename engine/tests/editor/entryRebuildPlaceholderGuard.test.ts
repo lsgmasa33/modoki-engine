@@ -3,8 +3,7 @@
  *  prefabRebuild.ts).
  *
  *  Built through gestures only: a P instance placed under H1's root (a scene-added reference node), a copy of the scene's
- *  P1, P trashed, the scene saved, the node dropped from the copy's "live at the save" list (#1939) and the scene reloaded
- *  (the node inside H1 comes back a placeholder of P), then the copy pasted
+ *  P1, P trashed, the scene saved and reloaded (the node inside H1 comes back a placeholder of P), then the copy pasted
  *  under H1 (a live P frame, respawned from its record; the paste keeps a missing prefab's objects, as Unity does). H's
  *  template has no P row, so no unexpanded row of H1 blocks P's record on its own: only the placeholder does. Without
  *  that block the rebuild read P from the pasted frame's record and EXPANDED the placeholder, which a reload of the same
@@ -58,7 +57,6 @@ describe("an entry's no-op rebuild leaves a placeholder inside it a placeholder,
     const p1 = rootsOf(f.prefabs.P.guid).find((e) => e.parentId === 0)!;
     await placePrefabFromPath(f.prefabs.P.path, { tag: 'test', parentId: h1().id });
     await settle();
-    const nodeGuid = rootsOf(f.prefabs.P.guid).find((e) => isUnder(e.id, h1().id))!.guid!;
     const clip = clipEntity(p1.id, 'copy');
     const paths = deletionPathsFor(f.prefabs.P.path, 'prefab', null);
     const del = await deleteAssetFiles(paths);
@@ -66,13 +64,7 @@ describe("an entry's no-op rebuild leaves a placeholder inside it a placeholder,
     unbindDeletedAssetEditors(planDeleteOutcome(paths, [f.prefabs.P.path], del.failed).went);
     await settle();
     expect((await saveScene({ allowDialog: false })).saved).toBe(true);
-    // The node was LIVE at the save, so the scene's copy of P would bring it back expanded (#1939). Dropped from P's "live
-    // at the save" list, it reloads as the placeholder a node missing from the start is (a hand-edit; every other P frame stays listed).
-    const sc = JSON.parse(be.read(f.scenePath)!) as { embeddedPrefabFrames?: Record<string, string[]> };
-    const listed = sc.embeddedPrefabFrames?.[f.prefabs.P.guid] ?? [];
-    expect(listed, 'premise: the node under H1 is listed live').toContain(nodeGuid);
-    sc.embeddedPrefabFrames![f.prefabs.P.guid] = listed.filter((a) => a !== nodeGuid);
-    be.write(f.scenePath, `${JSON.stringify(sc, null, 2)}\n`);
+    // A reload shows every frame of a missing prefab as its placeholder (ruling B, #2028; a v20 save writes no copy).
     expect((await loadSceneReporting(f.scenePath)).outcome).toBe('loaded');
     await settle();
     const placeholders = () => authored().filter((e) => isUnder(e.id, h1().id) && unresolvedRefOf(findEntity(e.id) as never)?.source === f.prefabs.P.guid);

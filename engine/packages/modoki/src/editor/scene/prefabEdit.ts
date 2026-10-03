@@ -39,7 +39,9 @@ import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { linkOwnerBeforeMove } from '../../runtime/core/ecs/identityParents';
 import { notAuthoredAdvice, whyWorldNotAuthored } from './authoredWorld';
 import { canEdit } from '../../runtime/core/playState';
-import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
+import { CAPTURE_FORM_SCENE_VERSION } from '../../runtime/core/version';
+import { keepKeyedNodeParents, keyedNodeParents } from '../../runtime/prefab/templateFormDocument';
+import type { PrefabDoc } from '../../runtime/prefab/instanceRecord';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getGuidForPath, resolveRef } from '../../runtime/loaders/assetManifest';
 import { capturePrefabRead } from './prefabRead';
@@ -402,7 +404,8 @@ export function buildPrefabEditScene(prefab: PrefabFile): SceneData {
   }
   // collectResourceRefs takes SerializedEntity[]; SceneEntityEntry is shape-compatible.
   const resources = collectResourceRefs(entities as unknown as SerializedEntity[]);
-  return { version: SCENE_FORMAT_VERSION, resources, entities };
+  // The rows are stated as scene entries in the old capture's form (the channels above), and read as that form.
+  return { version: CAPTURE_FORM_SCENE_VERSION, resources, entities };
 }
 
 /**
@@ -1088,6 +1091,9 @@ export function serializePrefabEditWorld(guid: string): { prefab: PrefabFile; ru
     if (g && g !== PREFAB_EDIT_ROOT_GUID) rows.set(g, localId);
   }
   if (!prefab) return { error: 'serialize produced no prefab' };
+  // A v10 row's move of a keyed node, as `keptMoves` above for a v4 document's: it applies nowhere, so the live capture
+  // cannot restate it, and the save puts it back (#1883 ruling C).
+  keepKeyedNodeParents(prefab as unknown as PrefabDoc, keyedNodeParents(previous as unknown as PrefabDoc));
   // The last line under the numbering above: a document with two rows at one localId is refused, never written. Every
   // scene key naming that number would silently pick one of them.
   const seen = new Set<number>();

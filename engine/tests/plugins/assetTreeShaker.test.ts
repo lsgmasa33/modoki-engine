@@ -1638,6 +1638,37 @@ describe('asset-tree-shaker', () => {
     expect(result.kept).toContain('/games/test/assets/mats/row.mat.json');
   });
 
+  it('keeps refs held only on a prefab v10 row: the nested root`s row, a reference node a row adds, and that node`s own rows (#2001 S6)', () => {
+    // A v10 row states everything on `members`: the nested root's values on "/", and a node it adds on `own`, which
+    // can itself be a reference node (`prefab`) stating rows of its own. Mutations (each measured): no trait probe on
+    // a row (`probeTraitRefs(r.traits…)` dropped) — root.mat and deep.mat are shaken out; `own` not read for
+    // `fromRows` — added.prefab and deep.mat are.
+    const [rootMat, deepMat, outerG, nestedG, addedG] = [1, 2, 3, 4, 5].map((n) => `abab1111-2222-4333-8444-55555555553${n}`);
+    fx.writeJson('/games/test/assets/mats/root.mat.json', { id: rootMat, version: 1 });
+    fx.writeJson('/games/test/assets/mats/deep.mat.json', { id: deepMat, version: 1 });
+    const leaf = (id: string, name: string) => ({ id, version: 10, name, rootLocalId: 1, entities: [{ localId: 1, nodeGuid: `${id.slice(0, -1)}f`, name, traits: { EntityAttributes: { name, parentId: 0 } } }] });
+    fx.writeJson('/games/test/assets/prefabs/nested.prefab.json', leaf(nestedG!, 'Nested'));
+    fx.writeJson('/games/test/assets/prefabs/added.prefab.json', leaf(addedG!, 'Added'));
+    fx.writeJson('/games/test/assets/prefabs/outer.prefab.json', {
+      id: outerG, version: 10, name: 'Outer', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        { localId: 2, name: 'Row', prefab: nestedG, traits: { EntityAttributes: { name: 'Row', parentId: 1 } },
+          members: { '/': {
+            traits: { Renderable3DPrimitive: { material: rootMat } },
+            own: [{ parentLocalId: 0, guid: '', key: 'k-s6', name: 'Ref', prefab: addedG, traits: {}, children: [],
+              members: { '/': { traits: { Renderable3DPrimitive: { material: deepMat } } } } }],
+          } } },
+      ],
+    });
+    fx.writeJson('/games/test/assets/scenes/main.scene.json', { version: 20, entities: [{ prefab: outerG, guid: 'abab1111-2222-4333-8444-555555555539', traits: {} }] });
+
+    const result = computeKeptAssets(fx.projectRoot, fx.roots);
+
+    for (const f of ['mats/root.mat.json', 'mats/deep.mat.json', 'prefabs/nested.prefab.json', 'prefabs/added.prefab.json']) expect(result.kept).toContain(`/games/test/assets/${f}`);
+    expect(result.unreachableRefs).toEqual([]);
+  });
+
   it('does NOT flag a video the module toggle dropped on purpose (ordering, not luck)', () => {
     // The guard runs BEFORE the excludeVideo prune for exactly this case. `build.modules.video:false`
     // removes clips from the keep-set AFTER the walk, so a scene that legitimately references one

@@ -151,8 +151,8 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     const { template, scene } = await placedInstance();
     const entry = instanceEntry(scene);
     const members = entry.members!;
-    // One row per member — the root is the entry itself and gets none.
-    expect(Object.keys(members).length).toBe(template.entities.length - 1);
+    // One row per member, and the root's own `"/"` row (scene v20, #2001 S6: it states the root's name, always).
+    expect(Object.keys(members).sort()).toEqual(['/', ...template.entities.filter((e) => e.localId !== template.rootLocalId).map((e) => `/${e.nodeGuid}`)].sort());
     for (const name of ['Panel', 'Label', 'Badge']) {
       const key = `/${rowOf(template, name).nodeGuid}`;
       expect(members[key], `no row for ${name} under ${key}`).toBeDefined();
@@ -161,7 +161,7 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     }
     // Every key is a well-formed identity chain, so none of them is an empty or half-formed name a
     // lookup would silently miss.
-    for (const key of Object.keys(members)) expect(parseMemberRowKey(key).length).toBe(1);
+    for (const key of Object.keys(members)) if (key !== '/') expect(parseMemberRowKey(key).length).toBe(1);
   });
 
   it('keeps a member`s guid when the template frees a localId and another member INHERITS it', async () => {
@@ -356,7 +356,8 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     const scene = await serializeScene() as unknown as { entities: unknown[] };
     const entry = instanceEntry(scene);
     expect(Object.keys(entry.members ?? {})).not.toContain(`/${nestedRow.nodeGuid}/${pipNode}`);
-    const ref = (entry.added ?? []).find((n) => n.prefab === CHILD);
+    // Scene v20 (#2001 S6): a reference node is inline on its anchor's row (`own`).
+    const ref = Object.values((entry.members ?? {}) as Record<string, { own?: Array<{ prefab?: string; members?: Record<string, { guid?: string }> }> }>).flatMap((r) => r.own ?? []).find((n) => n.prefab === CHILD);
     expect(ref, 'the promoted instance is captured as a reference node').toBeDefined();
     expect(ref!.members?.[`/${pipNode}`]?.guid).toBe(before);
   });
@@ -501,7 +502,8 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
     // `removed: false`, which in a nested frame would each be a real statement
     // (`foldMemberRowChannels`). The edited cases are `sceneMemberRowWriter.test.ts`.
     const { scene } = await placedInstance();
-    const rows = Object.values(instanceEntry(scene).members!);
+    // (The `"/"` row is the root's, and states its name: scene v20, #2001 S6.)
+    const rows = Object.entries(instanceEntry(scene).members!).filter(([k]) => k !== '/').map(([, r]) => r);
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
       expect(Object.keys(row).sort()).toEqual(['guid', 'name']);
@@ -551,7 +553,8 @@ describe('a scene stores its prefab instances` member guids (#1468)', () => {
       entities: [{ id: 1, prefab: PREFAB, guid: ROOT, traits: { EntityAttributes: { name: 'Old', parentId: 0 } } }],
     } as unknown as SceneData);
     const scene = await serializeScene() as unknown as { entities: unknown[] };
-    expect(instanceEntry(scene).members).toBeUndefined();
+    // Only the root's own `"/"` row (scene v20, #2001 S6), which names no member.
+    expect(Object.keys(instanceEntry(scene).members ?? {})).toEqual(['/']);
     expect(guidOf('Leaf')).not.toBe('');   // …and the member still derives one, exactly as before
   });
 });

@@ -27,7 +27,7 @@ import { clearReservedLocalIds } from '../../../packages/modoki/src/runtime/core
 import { getOverrideMarkSet } from '../../../packages/modoki/src/runtime/loaders/overrideMarks';
 import { rowPlaceholderOf, unresolvedRefOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
 import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loaders/sceneValidation';
-import { SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
+import { CAPTURE_FORM_SCENE_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { notifyListeners } from '../../../packages/modoki/src/runtime/core/notifyListeners';
 import { frameRootDoc } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templateIdentity';
@@ -260,7 +260,8 @@ export async function startRun(be: FuzzBackend, setupNest: (f: Fixture) => Promi
   const rg = (k: number) => `ffffffff-0000-4000-8${hex(k, 3)}-${tag}`;
   const tf = { x: 0, y: 0, z: 0 };
   const scene = {
-    id: f.sceneGuid, version: SCENE_FORMAT_VERSION, name: 'Fuzz', createdAt: '2026-01-01T00:00:00.000Z', resources: [],
+    // Entries in the form before the instance model (their name and Transform on the entry's own traits): read as that.
+    id: f.sceneGuid, version: CAPTURE_FORM_SCENE_VERSION, name: 'Fuzz', createdAt: '2026-01-01T00:00:00.000Z', resources: [],
     entities: [
       { id: 1, prefab: f.prefabs.O.guid, guid: rg(1), traits: { EntityAttributes: { name: 'O1', parentId: 0 }, Transform: tf } },
       { id: 2, prefab: f.prefabs.P.guid, guid: rg(2), traits: { EntityAttributes: { name: 'P1', parentId: 0 }, Transform: { x: 3, y: 0, z: 0 } } },

@@ -27,18 +27,19 @@
  *  ── Not compared, each counted ──
  *  - The top root's parent (the scratch has none; the placement's parent is the live one by construction).
  *  - `EntityAttributes.sourceScene`, the load's stamp on a base scene's entities (§ 10.4b: not the record's).
- *  - A stored root's marks on its placement fields (name, sortOrder, editorFolder, sourceScene): they follow the FORMAT,
- *    not the list. The load marks the root fields an entry states (`statedRootDefaults`); today's entry states `sortOrder`
- *    always and the name only when renamed, where v20 states the name always (hub ruling 2026-10-02, U10b) and `sortOrder`
- *    as placement. In S5 every real spawn reads today's form, so the user sees no change. Hub ruling (2026-10-02, design
- *    § 10.7): a v20 root's marks stay exactly as today's form shows them; S6's acceptance adds the P1 check that holds
- *    that, and this exception goes with it. */
+ *
+ *  ── The root's placement marks ARE compared (S6, design § 10.7) ──
+ *  A stored root's marks on its placement fields (name, sortOrder, editorFolder, sourceScene) follow the FORMAT at the
+ *  load (`statedRootDefaults`): today's entry states `sortOrder` always and the name only when renamed, where v20 states
+ *  the name always (U10b) and `sortOrder` as placement. Hub ruling (2026-10-02): a v20 root's marks are exactly what
+ *  today's form of the same instance shows. So the projection, spawned as a v20 entry, must show the live root's marks,
+ *  and a difference is a P1 failure like any other. */
 import { getCurrentWorld, getTraitByName, getAllTraits } from '@modoki/engine/runtime';
 import { createWorld, type Entity, type World } from 'koota';
 import { storedInstances } from '../../../packages/modoki/src/runtime/prefab/instanceStore';
 import type { InstanceRecord, ParsedInstance, SceneOwnedNode } from '../../../packages/modoki/src/runtime/prefab/instanceRecord';
-import { capturedEntryOf, editorPrefabReader } from '../../../packages/modoki/src/editor/instance/instanceSync';
-import { allStoredRoots, guidOfEntity, outermostStoredRoot, storedRootsUnder } from '../../../packages/modoki/src/editor/instance/instanceKeys';
+import { capturedEntryOf, captureFormVersionOf, editorPrefabReader } from '../../../packages/modoki/src/editor/instance/instanceSync';
+import { allStoredRoots, guidOfEntity, outermostStoredRoot } from '../../../packages/modoki/src/editor/instance/instanceKeys';
 import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
 import { withFrameRecords } from '../../../packages/modoki/src/editor/scene/prefabRebuild';
 import type { ExpansionReader } from '../../../packages/modoki/src/runtime/loaders/loadSceneFile';
@@ -46,7 +47,7 @@ import type { InstanceEntry } from '../../../packages/modoki/src/editor/scene/in
 import { serializeInstanceRecord } from '../../../packages/modoki/src/runtime/prefab/serializeInstanceRecord';
 import { parseInstanceRecord } from '../../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { recordsOf } from '../../../packages/modoki/src/runtime/prefab/instanceLoad';
-import { INSTANCE_MODEL_SCENE_VERSION, SCENE_FORMAT_VERSION } from '../../../packages/modoki/src/runtime/core/version';
+import { INSTANCE_MODEL_SCENE_VERSION } from '../../../packages/modoki/src/runtime/core/version';
 import { openIdentityScope, closeIdentityScope } from '../../../packages/modoki/src/runtime/core/ecs/identityParents';
 import { s4Seams } from './s4Seams';
 import { findEntityById } from '../../../packages/modoki/src/runtime/core/ecs/world';
@@ -60,8 +61,7 @@ import { REF_FIELDS_BY_TRAIT } from '../../../packages/modoki/src/runtime/loader
 import { templateKeyOf } from '../../../packages/modoki/src/runtime/core/templateIdentity';
 
 /** What P1 reprojected, and what it left as it was and why. */
-export const s5Seen = { projected: 0, nestedWithOwner: 0, rootPlacementMarks: 0 };
-const PLACEMENT_MARKS = ['name', 'sortOrder', 'editorFolder', 'sourceScene'].map((f) => `EntityAttributes.${f}`);
+export const s5Seen = { projected: 0, nestedWithOwner: 0 };
 
 
 /** `rec` written as a v20 entry. `parsed`: the capture's parse of the same instance, for its scene-owned content;
@@ -147,12 +147,11 @@ function subtreeIds(world: World, rootId: number): number[] {
   return out;
 }
 
-/** The comparison's normalization (see the header), on both trees: `top` is the root's guid, `roots` every stored root's. */
-function normalized(tree: Record<string, unknown>, top: string, roots: ReadonlySet<string>): Record<string, unknown> {
+/** The comparison's normalization (see the header), on both trees: `top` is the root's guid. */
+function normalized(tree: Record<string, unknown>, top: string): Record<string, unknown> {
   const out = structuredClone(tree) as Record<string, { traits: Record<string, Record<string, unknown>>; marks: string[] }>;
   const root = out[top];
   if (root?.traits.EntityAttributes) root.traits.EntityAttributes.parentId = '(placement parent)';
-  for (const g of roots) if (out[g]) out[g].marks = out[g].marks.filter((m) => !PLACEMENT_MARKS.includes(m));
   return out;
 }
 
@@ -173,7 +172,7 @@ export async function projectFromStore(rec: InstanceRecord): Promise<P1Projectio
     const held = new Set<string>();
     const ea = getTraitByName('EntityAttributes')!.trait;
     for (const e of getCurrentWorld().entities) { const g = (e.get(ea) as { guid?: string } | undefined)?.guid; if (g) held.add(g); }
-    const opts = { held: (g: string) => held.has(g), sceneVersion: SCENE_FORMAT_VERSION };
+    const opts = { held: (g: string) => held.has(g), sceneVersion: captureFormVersionOf(top) };
     const all = recordsOf(parseInstanceRecord(captured, editorPrefabReader, opts), editorPrefabReader, opts);
     entry = written(rec, top, all[0], new Map(all.map((p) => [p.record.rootGuid, p]))) as unknown as InstanceEntry;
   } finally {
@@ -190,7 +189,6 @@ export async function projectFromStore(rec: InstanceRecord): Promise<P1Projectio
   });
   if (trashed) return { skip: 'a nested frame of a trashed prefab is kept live (#1862)' };
   const liveTree = treeOf(live, liveIds);
-  const roots = new Set(storedRootsUnder(top).map(guidOfEntity));
   // What the settle writes is keyed by guid (`keptOrphanRows.ts`), and every key is an entity's it settles.
   const kept = new Map(Object.keys(liveTree).map((g) => [g, keptStateOf(g)]));
   const asked = new Set<string>();
@@ -220,7 +218,5 @@ export async function projectFromStore(rec: InstanceRecord): Promise<P1Projectio
     scratch.destroy();
   }
   s5Seen.projected++;
-  const placementMarks = (t: Record<string, unknown>) => [...roots].flatMap((g) => ((t[g] as { marks?: string[] } | undefined)?.marks ?? []).filter((m) => PLACEMENT_MARKS.includes(m)).map((m) => `${g}:${m}`)).sort().join();
-  if (placementMarks(liveTree) !== placementMarks(projected)) s5Seen.rootPlacementMarks++;
-  return { live: normalized(liveTree, rec.rootGuid, roots), projected: normalized(projected, rec.rootGuid, roots) };
+  return { live: normalized(liveTree, rec.rootGuid), projected: normalized(projected, rec.rootGuid) };
 }
