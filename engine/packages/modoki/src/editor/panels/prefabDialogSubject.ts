@@ -5,14 +5,31 @@
  *  and another entity takes the index, the bare id would apply or revert THAT entity's overrides,
  *  and the checked selection — keyed by the original prefab's localIds — would land on the wrong
  *  prefab. So the dialog pins the entity it was opened for (`core/ecs/entityPin.ts`). Once that
- *  entity is gone the dialog closes with a notice; it does not retarget (owner decision on #868). */
+ *  entity is gone the dialog closes with a notice; it does not retarget (owner decision on #868).
+ *
+ *  A world REPLACED under the dialog (a scene load, an outside-change hot reload) is the same refusal with its own
+ *  sentence (#1936): the instance may still be there under the same guid, so "no longer exists" was false. The dialog
+ *  also closes on its own when that happens (`scene/worldBoundModal.ts`); this is the confirm-side half, for a press
+ *  that lands in the tick before it does. */
 
 import type { World } from 'koota';
 import { livePinnedId, type EntityLookup, type EntityPin } from '../../runtime/core/ecs/entityPin';
+import { worldReplacedNotice } from '../scene/worldBoundModal';
 
 export type PrefabDialogMode = 'apply' | 'revert';
 
-export function subjectGoneNotice(mode: PrefabDialogMode): string {
+/** Why the subject is not there: deleted in the world the dialog was opened on, or that world was replaced. */
+export type SubjectGone = 'deleted' | 'reloaded';
+
+/** Why the pinned subject is not live in `world`: a pin into another world was replaced under it, else it was deleted. */
+export function subjectGoneReason(subject: EntityPin | null, world: World): SubjectGone {
+  return subject && subject.world !== world ? 'reloaded' : 'deleted';
+}
+
+export function subjectGoneNotice(mode: PrefabDialogMode, why: SubjectGone = 'deleted'): string {
+  if (why === 'reloaded') {
+    return worldReplacedNotice(mode === 'apply' ? 'Apply Prefab' : 'Revert Prefab', 'Select the instance and open it again from the Inspector.');
+  }
   return mode === 'apply'
     ? 'The prefab instance this dialog was opened for no longer exists, so nothing was applied.'
     : 'The prefab instance this dialog was opened for no longer exists, so nothing was reverted.';
@@ -29,7 +46,10 @@ export async function runOnPinnedSubject(opts: {
   onGone: (notice: string) => void;
 }): Promise<boolean> {
   const id = livePinnedId(opts.subject, opts.lookup, opts.world);
-  if (id === null) { opts.onGone(subjectGoneNotice(opts.mode)); return false; }
+  if (id === null) {
+    opts.onGone(subjectGoneNotice(opts.mode, subjectGoneReason(opts.subject, opts.world)));
+    return false;
+  }
   await opts.act(id);
   return true;
 }

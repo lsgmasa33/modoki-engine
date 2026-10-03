@@ -68,6 +68,10 @@ export function onWorldSwap(fn: SwapListener): () => void {
   return () => { listeners.delete(fn); };
 }
 
+/** How many {@link onWorldSwap} listeners are registered — a test's check that a short-lived watcher (a world-bound
+ *  modal's, #1936) unsubscribes when it ends rather than staying in this set for the session. */
+export function worldSwapListenerCount(): number { return listeners.size; }
+
 /** Get the entity index for a given world (creates if missing). */
 export function getEntityIndex(world: World): Map<number, Entity> {
   let idx = entityIndices.get(world);

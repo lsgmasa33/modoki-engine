@@ -8,12 +8,13 @@
  *  Entities that DO have one are badged so re-using an existing Animator (which
  *  just appends to its clip bank) is the obvious choice when it exists. */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { getAllEntities, findEntity, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../../runtime/core/ecs/world';
 import { pinEntityAt, livePinnedId } from '../../../runtime/core/ecs/entityPin';
 import { useEditorStore } from '../../store/editorStore';
 import { ModalShell } from '../../components/ModalShell';
+import { reportWorldReplaced, watchWorldReplaced, worldReplacedNotice } from '../../scene/worldBoundModal';
 
 export interface BindEntityRow {
   id: number;
@@ -89,10 +90,15 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
   // Play rebuild) hands its id to the next spawn, and Bind would bind THAT. So each row is pinned to
   // the entity it listed, and a pick whose entity is gone is refused (#1221; the ApplyPrefabDialog
   // shape from #868).
-  const pins = useMemo(() => {
-    const world = getCurrentWorld();
-    return new Map(entities.map((e) => [e.id, pinEntityAt(e.id, findEntity, world)]));
-  }, [entities]);
+  const [world] = useState(getCurrentWorld);
+  const pins = useMemo(() => new Map(entities.map((e) => [e.id, pinEntityAt(e.id, findEntity, world)])), [entities, world]);
+  // #1936: the rows are this world's; a scene load or hot reload under the picker closes it, rather than leaving them up.
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => watchWorldReplaced(world, () => {
+    reportWorldReplaced(worldReplacedNotice('Bind Animator', 'Open the picker again to choose from the current scene.'));
+    closeRef.current();
+  }), [world]);
   const bind = (id: number) => {
     const live = livePinnedId(pins.get(id) ?? null, findEntity, getCurrentWorld());
     if (live === null) {

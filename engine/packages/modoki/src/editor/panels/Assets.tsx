@@ -25,7 +25,7 @@ import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
 import {
   trashAssetFile, deleteAssetFiles as deleteAssets,
   describeRefusedDeletes, planDeleteOutcome,
-  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createAssetFolder, moveAsset, createPrefabFromEntity, readWritableAssetRoot,
+  duplicateAssetFileReport as duplicateAsset, readPriorDocument, createAssetFolder, moveAsset, createPrefabFromEntity, whileCreatePrefabSubjectHeld, readWritableAssetRoot,
   reimportTargets, planImports, writeDroppedImport, refreshHandlerTypes, HANDLER_TYPES,
   deletionPathsFor, planRename, assetEditorHoldMessage, deleteConfirmText, deletionFootprint,
 } from './assetOps';
@@ -1575,7 +1575,9 @@ export default function Assets() {
     const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_');
     let folder = targetFolder;
     if (!folder) {
-      const root = await readWritableAssetRoot();
+      // Held across the read (#1936 close-out review): createPrefabFromEntity captures only once it runs.
+      const root = await whileCreatePrefabSubjectHeld(id, readWritableAssetRoot);
+      if ('refused' in root) { useEditorStore.getState().showToast(root.refused, 'warn'); return; }
       if (!root.ok) { reportGestureRefusal(`Create Prefab failed — the asset roots could not be read: ${root.error}`); return; }
       folder = root.root ? `${root.root}/prefabs` : undefined;
     }

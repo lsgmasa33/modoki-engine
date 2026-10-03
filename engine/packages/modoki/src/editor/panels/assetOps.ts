@@ -41,6 +41,8 @@ import type { UndoAction } from '../undo/undoManager';
 import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
 import { captureAdoptionGate } from '../scene/adoptionGate';
+import { askWhileWorldHolds, worldReplacedNotice } from '../scene/worldBoundModal';
+import type { ModalOptions } from '../utils/saveDialog';
 import { captureEntityIdentity, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { markStale } from '../../runtime/prefab/instanceStore';
@@ -676,6 +678,31 @@ function notAuthoredRefusal(reason: string): CreatePrefabRefusal {
   return { refused: `Create Prefab refused — ${reason}.${exit ? ` ${sentence(exit)}.` : ''}`, notAuthored: reason };
 }
 
+/** Hold the entity a Create Prefab gesture names across the CALLER's own await, before it calls
+ *  {@link createPrefabFromEntity} — the Hierarchy's and the Assets drop's read of the writable asset root, a rescan
+ *  round-trip. `createPrefabFromEntity` captures its world and its root only once it runs, so a world replaced during
+ *  that read (a hot reload, an agent's load) handed it whatever held the id by then, written under the first entity's
+ *  name (#1936 close-out review). Returns the refusal, or null while it is still the entity asked for. With no adoption
+ *  capture (a switch landing) only the identity is held: `createPrefabFromEntity` refuses that state itself. */
+function holdCreatePrefabSubject(entityId: number): () => CreatePrefabRefusal | null {
+  const adopted = captureAdoptionGate();
+  const sameRoot = captureEntityIdentity(entityId);
+  return () => (adopted && !adopted()
+    ? { refused: 'Create Prefab refused — the scene was reloaded while the asset roots were being read, so the entity it was asked for is gone. Select it and try again.' }
+    : !sameRoot()
+      ? { refused: 'Create Prefab refused — the entity it was asked for was rebuilt while the asset roots were being read. Select it and try again.' }
+      : null);
+}
+
+/** Run a Create Prefab gesture's own await (`between` — the writable-root read) with its entity held across it: the
+ *  value, or the refusal when the entity is no longer the one the gesture named. Taken HERE, before the await, so the
+ *  order cannot be got wrong at a call site. */
+export async function whileCreatePrefabSubjectHeld<T>(entityId: number, between: () => Promise<T>): Promise<T | CreatePrefabRefusal> {
+  const held = holdCreatePrefabSubject(entityId);
+  const value = await between();
+  return held() ?? value;
+}
+
 /** Create Prefab's door. An exception after its capture takes the capture's keys off, as its refusals and failed writes
  *  do (`dropOnThrow`, #1884 close-out): a throw skipped every `drop()` below and left keys on a tree nothing links. */
 export function createPrefabFromEntity(...args: CreatePrefabArgs): ReturnType<typeof createPrefab> {
@@ -696,7 +723,7 @@ async function createPrefab(
    *  fresh guid — every placed instance of it unlinked — and this function's own undo then TRASHED
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
-  confirmReplace: (path: string) => Promise<boolean>,
+  confirmReplace: (path: string, opts?: ModalOptions) => Promise<boolean>,
 ): Promise<CreatePrefabResult | 'declined' | CreatePrefabRefusal> {
   // A resource entity is a world singleton, not a node in the authored tree (#1248): as an instance, a placed copy is a
   // second singleton (#1873 L2). Asked first — nothing about the world's state changes the answer.
@@ -721,6 +748,7 @@ async function createPrefab(
   // Non-null: a landing switch made `whyWorldNotAuthored` refuse above, and nothing has awaited since. The tree's root
   // itself too: a frame rebuilt in place (a leave repair, an Apply's fan-out) re-mints ids in the same world.
   const adopted = captureAdoptionGate()!;
+  const askedIn = getCurrentWorld();
   const sameRoot = captureEntityIdentity(entityId);
   const gone = (when: string) => (!adopted()
     ? { refused: `Create Prefab refused — the scene was reloaded ${when}, so the entity it was asked for is gone. Select it and try again.` }
@@ -734,7 +762,11 @@ async function createPrefab(
   let previousContent: string | null = null;
   let replaced = false;
   if (at != null) {
-    if (!(await confirmReplace(at))) return 'declined';
+    // Closed if the world is replaced under it (#1936): the entity it names is that world's. `gone` below still refuses
+    // a replace answered in the tick before the close.
+    const replace = await askWhileWorldHolds(worldReplacedNotice('Create Prefab', 'Select the entity and try again.'),
+      (signal) => confirmReplace(at, { signal }), { world: askedIn });
+    if (!replace) return 'declined';
     // ⚠️ REFUSE rather than mint over a document that is THERE and unreadable (#1468, #896's class): the human
     // confirmed replacing the file's content, not re-identifying it, and every instance of it would unlink.
     const existing = await classifyExistingDocumentId(at);

@@ -68,12 +68,13 @@ vi.mock('../../packages/modoki/src/runtime/scene/SceneManager', () => ({
 
 const PREFAB_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-000000001692';
 const PATH = '/games/x/assets/prefabs/Badge.prefab.json';
-const route = vi.hoisted(() => ({ disk: new Map<string, string>(), writes: 0 }));
+const route = vi.hoisted(() => ({ disk: new Map<string, string>(), writes: 0, onWrite: null as null | (() => void) }));
 const sha = (t: string) => createHash('sha256').update(t.replace(/^\uFEFF/, '')).digest('hex');
 const answer = (status: number, body: object) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }) as Response;
 vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   postWriteFile: async (path: string, content: string, _enc?: string, opts?: { ifMatch?: string; createOnly?: boolean }) => {
+    route.onWrite?.();
     const cur = route.disk.get(path);
     if (opts?.ifMatch !== undefined && (cur === undefined || sha(cur) !== opts.ifMatch)) return answer(409, { reason: 'if-match' });
     route.writes++;
@@ -82,10 +83,13 @@ vi.mock('../../packages/modoki/src/editor/backend/editorBackend', async (importO
   },
 }));
 /** What the human answers the Overwrite question with, and how often it was asked. */
-const modal = vi.hoisted(() => ({ answer: false, asked: 0 }));
+const modal = vi.hoisted(() => ({ answer: false, asked: 0, during: null as null | ((signal?: AbortSignal) => Promise<boolean>) }));
 vi.mock('../../packages/modoki/src/editor/utils/saveDialog', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  confirmInEditor: async () => { modal.asked++; return modal.answer; },
+  confirmInEditor: async (_t: string, _m: string, _ok: string, opts?: { signal?: AbortSignal }) => {
+    modal.asked++;
+    return modal.during ? modal.during(opts?.signal) : modal.answer;
+  },
   alertInEditor: async () => {},
 }));
 
@@ -104,6 +108,9 @@ import { runAgentOp } from '../../app/debug/agentBridge';
 import { getCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
 import { EntityAttributes } from '../../packages/modoki/src/runtime/core/traits/EntityAttributes';
 import { PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEditGuids';
+import { EDIT_LEFT_DURING_SAVE } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { setCurrentWorld } from '../../packages/modoki/src/runtime/core/ecs/world';
+import { createWorld } from 'koota';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -134,11 +141,14 @@ beforeEach(async () => {
   setCurrentScenePath(null);
   route.disk.clear();
   route.writes = 0;
+  route.onWrite = null;
   modal.answer = false;
   modal.asked = 0;
+  modal.during = null;
   registerAsset(PREFAB_ID, PATH, 'prefab');
   route.disk.set(PATH, jsonFileBody(badge()));
   vi.stubGlobal('fetch', async (url: string) => {
+    if (String(url).endsWith(PATH)) route.onWrite?.();
     const text = route.disk.get(String(url).replace(/^.*(?=\/games\/)/, ''));
     return text === undefined ? new Response('', { status: 404 }) : new Response(text, { status: 200 });
   });
@@ -311,5 +321,88 @@ describe('a save refused in a world that is not authored says why, on the agent 
     expect(err.message).toMatch(/prefab root not found/);
     expect(err.message).not.toMatch(/Either the prefab root/);
     expect(route.writes).toBe(0);
+  });
+});
+
+// #1936: the Overwrite question is a modal, and the edit world it would write can be LEFT while it is up (an agent's
+// exit, a scene load). The snapshot taken before the question must not land over the file after all.
+// Mutations: drop the `left()` re-check after the answer in `savePrefabEditReport` — the first case writes; drop the
+// `askWhileWorldHolds` binding in `saveCommand` (or the `signal` it hands the confirm) — the second case logs no notice.
+describe('an edit left while the Overwrite question is up (#1936)', () => {
+  const changeOnDisk = () => route.disk.set(PATH, jsonFileBody(badge('Renamed elsewhere')));
+  /** Replace the edit world, as a load does; the caller restores it. */
+  const leave = () => { const before = getCurrentWorld(); const w = createWorld(); setCurrentWorld(w); return () => { setCurrentWorld(before); w.destroy(); }; };
+
+  it('a yes answered after the edit was left writes nothing, and says why', async () => {
+    changeOnDisk();
+    edit();
+    let restore = () => {};
+    try {
+      const res = await quietly(() => savePrefabEditReport({ confirmOverwrite: async () => { restore = leave(); return true; } }));
+      expect(res).toMatchObject({ saved: false, warnings: [EDIT_LEFT_DURING_SAVE] });
+      expect(onDisk().entities[0]!.name).toBe('Renamed elsewhere');
+      expect(route.writes).toBe(0);
+    } finally { restore(); }
+  });
+
+  it("Cmd+S's question closes on its own when the edit world is replaced, and nothing is written", async () => {
+    changeOnDisk();
+    edit();
+    let restore = () => {};
+    // The human never answers: only the world watcher can close it. Without the binding a late Overwrite lands instead.
+    let closedBy = '';
+    modal.during = (signal) => new Promise((resolve) => {
+      restore = leave();
+      signal?.addEventListener('abort', () => { closedBy ||= 'the world watcher'; resolve(false); }, { once: true });
+      setTimeout(() => { closedBy ||= 'a late Overwrite'; resolve(true); }, 50);
+    });
+    // Its own spy, not `quietly`'s: that one restores the same spy, and its calls with it.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const out = await runSaveAll();
+      expect(modal.asked).toBe(1);
+      expect(closedBy, 'the modal itself closed — not only the save refusing a late yes').toBe('the world watcher');
+      expect(out.prefabSaved).toBe(false);
+      expect(onDisk().entities[0]!.name).toBe('Renamed elsewhere');
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/\[Editor\] "Badge" changed on disk closed: the scene was reloaded while it was open/);
+    } finally { restore(); warn.mockRestore(); log.mockRestore(); }
+  });
+});
+
+// Close-out review F3: left while the FIRST write was refused, the save neither asks nor says "the edit is still open".
+// Mutation: drop the `left()` check after the first commit — the question is asked, and the report is the conflict's.
+describe('an edit left while its save is in flight (#1936 close-out review)', () => {
+  it('reports the leave, asks nothing, and writes nothing', async () => {
+    route.disk.set(PATH, jsonFileBody(badge('Renamed elsewhere')));
+    edit();
+    const before = getCurrentWorld();
+    const w = createWorld();
+    route.onWrite = () => { route.onWrite = null; setCurrentWorld(w); };
+    try {
+      const res = await quietly(() => runSaveAll());
+      expect(modal.asked).toBe(0);
+      expect(res.prefabSaved).toBe(false);
+      expect(res.prefabFailReason).toBe(EDIT_LEFT_DURING_SAVE);
+      expect(onDisk().entities[0]!.name).toBe('Renamed elsewhere');
+    } finally { setCurrentWorld(before); w.destroy(); }
+  });
+});
+
+// Re-review F2: a save whose FIRST write succeeds after its edit world went must not seat the old world's save point —
+// a leave's adopt has set the new world's, and this one would mark that fresh scene unsaved.
+// Mutation: call `markSceneSaved` unconditionally again — the scene reads saved.
+describe('a write that lands after the edit world went (#1936 re-review)', () => {
+  it('does not move the save point', async () => {
+    edit();
+    expect(hasUnsavedChanges(), 'premise: dirty').toBe(true);
+    const before = getCurrentWorld();
+    const w = createWorld();
+    route.onWrite = () => { route.onWrite = null; setCurrentWorld(w); };
+    try {
+      await quietly(() => savePrefabEditReport());
+      expect(route.writes, 'premise: the write landed').toBe(1);
+      expect(hasUnsavedChanges(), 'the save point stayed where the leave put it').toBe(true);
+    } finally { setCurrentWorld(before); w.destroy(); }
   });
 });

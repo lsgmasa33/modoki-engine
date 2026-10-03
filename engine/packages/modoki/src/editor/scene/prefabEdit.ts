@@ -850,7 +850,7 @@ export interface PrefabEditSaveOptions {
   /** Replace what is on disk without asking — the deliberate choice after being told (the agent's `overwrite`). */
   overwrite?: boolean;
   /** Ask whether to replace it (the human's Cmd+S and Exit's Save). Absent and not `overwrite`: refuse. */
-  confirmOverwrite?: (name: string, path: string) => Promise<boolean>;
+  confirmOverwrite?: (name: string, path: string, editWorld: World) => Promise<boolean>;
 }
 
 /** The localId mark `doc` states (and the version that claims it), for a copy that must number from it; empty when it
@@ -869,6 +869,11 @@ function markOf(doc: PrefabFile | null | undefined): { nextLocalId?: number; ver
 export async function savePrefabEdit(): Promise<boolean> {
   return (await savePrefabEditReport()).saved;
 }
+
+/** Why a save wrote nothing: the edit world it serialized was replaced (an exit, a scene load, a preview's restore)
+ *  before it could write — while the file's conflict was being read, or while the human was asked whether to overwrite
+ *  it (#1936). Named by what is certain: the world went, which may or may not have ended the edit. */
+export const EDIT_LEFT_DURING_SAVE = 'the prefab edit world was replaced while it was being saved (an exit, a scene load or a preview), so nothing was written — if the edit is still open, save it again';
 
 /** Save the in-progress prefab edit back to its `.prefab.json`. Serializes the
  *  prefab subtree (scaffold lights/HDR are excluded — they aren't descendants of
@@ -913,6 +918,9 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
       warnings: [`${notAuthored} — saving now could write a preview or Play pose into the prefab${exit ? `; ${exit}` : ''}`],
     };
   }
+  // The edit world this save serializes: the overwrite question below is a modal, and an edit LEFT while it is up (an
+  // agent's exit or scene load) must not have this snapshot written over the file after all (#1936).
+  const editWorld = getCurrentWorld();
   const serialized = serializePrefabEditWorld(editingPrefab.guid);
   if ('error' in serialized) {
     console.error(`[PrefabEdit] cannot save "${editingPrefab.name}" — ${serialized.error}`);
@@ -940,8 +948,16 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   const expected = editBaselineFor(editingPrefab.guid) ?? getCachedPrefabSync(editingPrefab.guid);
   if (!expected) return { saved: false, warnings: ['this edit has no record of the prefab it opened — re-open it and try again'] };
   let wrote = await commitPrefabWrite(editingPrefab.guid, prefab, { expected, overwrite: opts.overwrite });
+  // A conflict reported after the edit was LEFT is not "the edit is still open": nothing is, so say what happened.
+  const left = () => getCurrentWorld() !== editWorld;
+  const leftReport = (): PrefabEditSaveReport => {
+    console.warn(`[PrefabEdit] "${editingPrefab.name}" was not saved — ${EDIT_LEFT_DURING_SAVE}`);
+    return { saved: false, warnings: [EDIT_LEFT_DURING_SAVE] };
+  };
+  if (!wrote.ok && wrote.conflict && left()) return leftReport();
   if (!wrote.ok && wrote.conflict && !opts.overwrite && opts.confirmOverwrite
-    && await opts.confirmOverwrite(editingPrefab.name, editingPrefab.path)) {
+    && await opts.confirmOverwrite(editingPrefab.name, editingPrefab.path, editWorld)) {
+    if (left()) return leftReport();
     wrote = await commitPrefabWrite(editingPrefab.guid, prefab, { expected, overwrite: true });
   }
   if (!wrote.ok && wrote.conflict) {
@@ -972,7 +988,9 @@ export async function savePrefabEditReport(opts: PrefabEditSaveOptions = {}): Pr
   // was stale when it was byte-identical to the live world. Reported by the owner — "I think I
   // saved it before you said it's stale, maybe we have a bug" — and confirmed by diffing the file
   // against the world rather than by trusting the flag, which is the only way to see it.
-  markSceneSaved(savedAt);
+  // …unless the world it measures went while the write was in flight (#1936 re-review): a leave's adopt has seated the NEW
+  // world's baseline, and this save point, the old edit world's, would mark that fresh scene unsaved.
+  if (!left()) markSceneSaved(savedAt);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
   return { saved: true, warnings };
 }

@@ -361,6 +361,29 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     } finally { setCurrentWorld(before); }
   });
 
+  // #1936: the Replace question closes on its own once that world is replaced, rather than staying up over the new one.
+  // Mutation: drop the `askWhileWorldHolds` binding (or the `{ signal }` it hands `confirmReplace`) in
+  // `createPrefabFromEntity` — the late Yes below lands, and the refusal replaces the 'declined'.
+  it('a world replaced under the Replace question closes it as a No, and says so (#1936)', async () => {
+    onDisk.set(PATH, OLD_TEXT);
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const before = getCurrentWorld();
+    const swapped = createWorld();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', (_p, opts) => new Promise((resolve) => {
+        setCurrentWorld(swapped);
+        opts?.signal?.addEventListener('abort', () => resolve(false), { once: true });
+        setTimeout(() => resolve(true), 50); // the human's late Yes, which the close must beat
+      }));
+      expect(res).toBe('declined');
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[Editor\] Create Prefab closed: the scene was reloaded while it was open/));
+      expect(onDisk.get(PATH)).toBe(OLD_TEXT);
+      expect(written).toHaveLength(0);
+    } finally { setCurrentWorld(before); swapped.destroy(); warn.mockRestore(); }
+  });
+
   it('a world rebuilt while the nested prefabs were warmed refuses, and writes nothing (#1750: H1`s class)', async () => {
     const { createWorld } = await import('koota');
     const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
@@ -626,4 +649,32 @@ describe('createPrefabFromEntity — undo/redo preconditions (#1679)', () => {
 
   // The Replace's "which bytes the FILE holds" flag and its failed-undo redo case went with #1868: a Replace's undo and
   // redo write nothing, so there is no file state for a half-run step to leave behind.
+});
+
+// Close-out review F6: the Hierarchy and the Assets drop read the writable asset root (an await) BEFORE
+// createPrefabFromEntity captures anything. whileCreatePrefabSubjectHeld holds the entity across it, taken before the
+// await by construction. Mutations: drop the adoption half — the reload case gets the value; drop the identity half —
+// the rebuilt case does; take the hold AFTER `between` — both do.
+describe('whileCreatePrefabSubjectHeld (#1936 close-out review)', () => {
+  it('refuses a world replaced during the read, and an entity rebuilt in place; hands the value back otherwise', async () => {
+    const { createWorld } = await import('koota');
+    const { getCurrentWorld, setCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const { whileCreatePrefabSubjectHeld } = await import('../../src/editor/panels/assetOps');
+    const world = getCurrentWorld();
+    const e = world.spawn();
+    const id = e.id();
+    expect(await whileCreatePrefabSubjectHeld(id, async () => 'root'), 'untouched').toBe('root');
+    const swapped = createWorld();
+    try {
+      const res = await whileCreatePrefabSubjectHeld(id, async () => { setCurrentWorld(swapped); return 'root'; });
+      expect(res).toMatchObject({ refused: expect.stringMatching(/reloaded while the asset roots were being read/) });
+    } finally { setCurrentWorld(world); swapped.destroy(); }
+    // A holder, not a `let`: TypeScript narrows a closure-assigned `let` to its initializer's type at the read.
+    const spawned: { e: { destroy(): void; id(): number } | null } = { e: null };
+    try {
+      const res = await whileCreatePrefabSubjectHeld(id, async () => { e.destroy(); spawned.e = world.spawn(); return 'root'; });
+      expect(spawned.e?.id(), 'premise: the index was recycled').toBe(id);
+      expect(res).toMatchObject({ refused: expect.stringMatching(/was rebuilt while the asset roots were being read/) });
+    } finally { spawned.e?.destroy(); }
+  });
 });

@@ -247,3 +247,73 @@ describe('the prefab-edit name, as the editor binds it', () => {
     expect(shown).toEqual([['unsaved changes to prefab "Crate"'], ['unsaved changes to prefab "Crate"']]);
   });
 });
+
+// #1936: both gates list the LIVE world's unsaved work, so a world replaced under the question (an agent's scene load, an
+// outside-change hot reload) makes the list stale. Each is bound to its world: the modal's signal aborts, which closes it
+// as a Cancel. Mutations: drop the `askWhileWorldHolds` wrapper (or the `signal` it hands the modal) from DEFAULT_DEPS's
+// `ask` — the leave case goes red; from `confirmUnsavedBeforeBuild` — the Build case goes red.
+describe('the gates close when the world they list is replaced (#1936)', () => {
+  const spare: import('koota').World[] = [];
+  let home: import('koota').World;
+  /** The modal as a human who has not answered yet: it resolves only when its signal closes it. */
+  const waitForAbort = () => modal.openChoiceModal.mockImplementationOnce((async (opts: { signal?: AbortSignal; cancelValue: string }) =>
+    new Promise((resolve) => opts.signal?.addEventListener('abort', () => resolve(opts.cancelValue), { once: true }))) as never);
+  beforeEach(async () => {
+    clearEverything();
+    modal.openChoiceModal.mockClear();
+    home = (await import('../../packages/modoki/src/runtime/core/ecs/world')).getCurrentWorld();
+  });
+  afterEach(async () => {
+    (await import('../../packages/modoki/src/runtime/core/ecs/world')).setCurrentWorld(home);
+    for (const w of spare.splice(0)) w.destroy();
+    vi.restoreAllMocks();
+  });
+  const replaceWorld = async () => {
+    const { createWorld } = await import('koota');
+    const w = createWorld();
+    spare.push(w);
+    (await import('../../packages/modoki/src/runtime/core/ecs/world')).setCurrentWorld(w);
+  };
+
+  it.each([
+    ['the leave gate', () => confirmDiscardUnsaved('open scene B', 'world-swap')],
+    ['the Build gate', () => confirmUnsavedBeforeBuild('build for web')],
+  ])('%s', async (_name, ask) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    DRIVERS.sceneDirty.drive();
+    waitForAbort();
+    const answer = ask();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(modal.openChoiceModal, 'premise: asked').toHaveBeenCalledTimes(1);
+    // An agent's `load_scene {discardUnsaved}`, in a route's own order (re-review F1): the world is swapped, the load
+    // still awaits its manager inits PAST the one-tick check, and only then does the adopt clear the dirt it discarded.
+    // Mutation: ask `stillAsks` at the tick instead of once routes settle — the list still matches then, and it stays up.
+    const { withAdoption } = await import('../../packages/modoki/src/editor/scene/sceneAdoption');
+    await withAdoption('scene-load', async () => {
+      await replaceWorld();
+      await new Promise((r) => setTimeout(r, 10));
+      clearEverything();
+    });
+    expect(await answer, 'closed as a Cancel').toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[Editor\] .* closed: the scene was reloaded while it was open/));
+  });
+  // Review F1: the list is the undo history's, so a swap that leaves it alone (a game's scene load during Play) keeps
+  // the question up. Mutation: drop either gate's `stillAsks` — its case closes on the first swap.
+  it.each([
+    ['the leave gate', () => confirmDiscardUnsaved('close the editor window', 'page-unload')],
+    ['the Build gate', () => confirmUnsavedBeforeBuild('build for web')],
+  ])('%s stays up across a swap that leaves its list as it was', async (_name, ask) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    DRIVERS.sceneDirty.drive();
+    waitForAbort();
+    let settled = false;
+    const answer = ask().then((v) => { settled = true; return v; });
+    await new Promise((r) => setTimeout(r, 0));
+    await replaceWorld();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled, 'still asking').toBe(false);
+    clearEverything();
+    await replaceWorld();
+    expect(await answer, 'closed once the list changed').toBe(false);
+  });
+});

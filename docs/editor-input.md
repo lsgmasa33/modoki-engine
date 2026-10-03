@@ -18,6 +18,8 @@ Mouse is deliberately **not** focus-filtered — DOM hit-testing already routes 
   `topOverlay`, and `isModalOpen`/`subscribeOverlays` for the modal kind).
 - `editor/components/ModalShell.tsx` + `editor/components/modalBackdrop.ts` — the one full-screen
   modal shell, React and plain-DOM forms; see [Modals block the editor](#modals-block-the-editor-underneath-them-1270).
+- `editor/scene/worldBoundModal.ts` — closes a modal that asks about the world when the editor replaces
+  that world (#1936); same section.
 - `editor/input/PanelFocusHost.tsx` — click-to-focus wrapper applied by `EditorApp`'s FlexLayout
   factory, so **every** panel gets focus acquisition at one seam.
 - `editor/input/useOverlayEscape.ts` — `useOverlayEscape()` (push + bind Escape) and `useOverlay()`
@@ -164,6 +166,39 @@ System Events. Use `confirmInEditor` / `alertInEditor` (`utils/saveDialog.ts`) o
 the trap came back after #1470 and why `tests/architecture/noNativeDialogs.test.ts` now reads source
 for it. Out of its reach by design: main-process `dialog.showMessageBox` (menu/startup driven) and
 the native Save/Open panels behind `/api/save-dialog` and `/api/pick-path`.
+
+**A modal that asks about the world closes when the editor replaces that world (#1936).** An agent op
+is not gated by an open modal (below), and neither is an outside-change hot reload, so a scene load can
+land under a dialog. The prefab Apply/Revert dialog stayed up after one, listing rows for a world that
+was gone, swallowing Cmd+S, and its Confirm closed with nothing written and only a toast saying the
+instance "no longer exists" (false after a hot reload, where the same guid is still live). Every modal
+whose question is ABOUT the live world now binds to `editor/scene/worldBoundModal.ts`. When the world
+is replaced, the modal closes as its Cancel, and `[Editor] <dialog> closed: the scene was reloaded …`
+goes to the console and a toast. It does not retarget the same guid in the new world: #868's call, for
+the prefab dialog.
+- **Bound:** `prefab-apply` / `prefab-revert`, both `unsaved-gate` modals, the `save-dialog` confirms
+  for a cross-scene reparent, Move to scene, Create Prefab's Replace and the prefab-edit "changed on
+  disk" overwrite, `bind-animator-picker` and `add-property-picker`. React dialogs call
+  `watchWorldReplaced` in an effect. Plain-DOM ones go through `askWhileWorldHolds`, which hands
+  `openChoiceModal` / `confirmInEditor` an `AbortSignal`.
+- **Not bound:** asset- and disk-bound modals (Sprite/9-slice/Skin editors, asset deletes, OTA,
+  settings, layouts, progress, cleanup, Find References, which re-resolves by guid), Save Scene As
+  (writes the snapshot the human saw and skips binding the path on a world change), and `scene-conflict`
+  (#1924 closes it through its own outside-change watcher, [editor-hmr.md](editor-hmr.md)).
+- **Checked a tick after the swap.** `stepSimulation` swaps out and back within one call, and an agent's
+  sim step must not close the human's dialog (the same deferral as `editorRefLiveness`). In that one-tick
+  window a confirm can still be answered, so a caller that ACTS on the world re-checks it after its await:
+  the prefab dialog's pin, `sceneDropTarget` / `sceneReparentTargets`, Create Prefab's adoption gate, and
+  the prefab-edit save's `left()`. Not covered: `createTestWorld` holds its world until `dispose()`, so a
+  headless playtest that spans an await in the live editor replaces the world for that long, and closes
+  what is open.
+- **A swap is not always a moot question.** A game's own scene load during Play swaps the world, but the
+  unsaved gates list work the undo history tracks, which that load does not touch. They pass `stillAsks`
+  (their list, re-read), and stay up, watching the new world, while it is unchanged. ⚠️ It is asked once the
+  editor's routes have SETTLED, not at the tick: an editor load clears the dirt it discards in its adopt,
+  which lands after `SceneManager.loadScene`'s own awaits, so at the tick the stale list still matched and
+  the gate stayed up over work the load had already thrown away (close-out re-review). A Play navigation
+  registers no route, so it is asked at once. A `stillAsks` that throws closes the modal.
 
 **Agents are told.** `/api/input/key` warns when a press landed under a modal and no binding of the
 modal's own claimed it, instead of answering `ok:true` alone.

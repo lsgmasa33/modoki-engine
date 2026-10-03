@@ -3,13 +3,15 @@
  *  animatable fields; click a field to add a track. Already-tracked fields are
  *  hidden. Mirrors Unity's Add Property picker. */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { getEntityTraits, readTraitData } from '../../../runtime/core/ecs/entityUtils';
 import { relativeEntityPath, trackKey } from '../../animation/recording';
 import { getAnimEntityIndex } from '../../animation/entityIndex';
 import type { TrackValueType } from '../../../runtime/animation/types';
 import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
 import { ModalShell } from '../../components/ModalShell';
+import { getCurrentWorld } from '../../../runtime/core/ecs/world';
+import { reportWorldReplaced, watchWorldReplaced, worldReplacedNotice } from '../../scene/worldBoundModal';
 
 export interface PropertyCandidate {
   path: string;        // relative to root
@@ -180,6 +182,15 @@ export default function AddPropertyPicker({
   // Checkbox multi-selection (keys persist as the user browses across entities).
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const candidates = useMemo(() => collectCandidates(rootId), [rootId]);
+  // #1936: each candidate carries a runtime `entityId` of THIS world, which Add reads its seed value from. A scene load or
+  // hot reload under the picker re-mints those ids, so it closes rather than seed a track from whatever holds the number.
+  const [world] = useState(getCurrentWorld);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => watchWorldReplaced(world, () => {
+    reportWorldReplaced(worldReplacedNotice('Add Property', 'Open it again to choose from the current scene.'));
+    closeRef.current();
+  }), [world]);
   const byKey = useMemo(() => { const m = new Map<string, PropertyCandidate>(); for (const c of candidates) m.set(candKey(c), c); return m; }, [candidates]);
   const toggleChecked = (c: PropertyCandidate) => setChecked((prev) => { const n = new Set(prev); const k = candKey(c); if (n.has(k)) n.delete(k); else n.add(k); return n; });
   const commitChecked = () => { const cs = [...checked].map((k) => byKey.get(k)).filter((c): c is PropertyCandidate => !!c); if (cs.length) onAdd(cs); };

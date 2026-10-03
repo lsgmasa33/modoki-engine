@@ -11,13 +11,14 @@ import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { makeSortOrderRenumberAction } from '../undo/overrideMarkWrites';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, siblingsKeepingTheirPlace, stuckDropText, type EntityClipboard } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, moveEntityToScene, planReparent, sceneReparentTargets, applyReparent, planSceneDrop, sceneDropTarget, SCENE_MOVE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, pasteEntityCopy, clipEntity, cutSourceId, reportWriteRefusal, siblingDropRefusal, siblingsKeepingTheirPlace, stuckDropText, type EntityClipboard } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { placePrefabFromPath } from '../scene/prefabPlace';
 import { detachPrefabInstanceWithUndo, detachPrefabMenuItem } from '../undo/detachPrefabUndo';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
+import { askWhileWorldHolds, worldReplacedNotice } from '../scene/worldBoundModal';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { aSceneSwapIsHappening } from '../scene/playMode';
 import { assetDisplayName } from './AssetRefField';
@@ -50,7 +51,7 @@ import {
 // virtual tree nodes like "/" aren't writable. readWritableAssetRoot + root
 // matching live in assetOps/assetRoots so the flat-project "/assets" prefix
 // can't be forgotten in one copy again (#29).
-import { readWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { readWritableAssetRoot, createPrefabFromEntity, whileCreatePrefabSubjectHeld } from './assetOps';
 import { reportGestureRefusal } from '../backend/refusalChannel';
 import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { confirmReplaceAsset, confirmInEditor } from '../utils/saveDialog';
@@ -1057,16 +1058,22 @@ export default function Hierarchy() {
       // a raw id could then name an entity the person never dragged.
       const movedRef = entityRef(entityId);
       const parentRef = entityRef(newParentId);
+      // …and the world it was planned in: after a reload the same guids can name another file's entities (#1936).
+      const plannedWorld = getCurrentWorld();
       const pre = await preflightSceneMove(entityId, plan.to);
       const parentName = getAllEntities().find((e) => e.id === newParentId)?.name || `Entity ${newParentId}`;
       const sceneName = sceneOrder.labels.get(plan.to) ?? (plan.to || 'primary');
       const text = formatSceneMoveConfirm(pre, plan.to, { parentName, sceneName });
-      if (!(await confirmInEditor('Move into another scene?', text, 'Move'))) return false;
+      // Closed if the world is replaced under it (#1936) — and the guid re-check below still covers the tick before that.
+      const go = await askWhileWorldHolds(worldReplacedNotice('Move into another scene?', 'Drag it again.'),
+        (signal) => confirmInEditor('Move into another scene?', text, 'Move', { signal }), { world: plannedWorld });
+      if (!go) return false;
       // The world can change while the modal is open (an agent edit, a hot reload). Apply only the move
       // the person was shown: the same two entities, still a move into the same scene.
-      const liveId = movedRef.resolve();
-      const liveParent = parentRef.resolve();
-      const now = liveId != null && liveParent != null ? planReparent(liveId, liveParent) : null;
+      const live = sceneReparentTargets(movedRef, parentRef, plannedWorld);
+      const liveId = live?.moved;
+      const liveParent = live?.parent;
+      const now = live ? planReparent(live.moved, live.parent) : null;
       if (!now || now.kind !== 'scene-move' || now.to !== plan.to) {
         useEditorStore.getState().showToast('Not moved: the scene changed while the prompt was open. Drag it again.', 'warn');
         return false;
@@ -1125,7 +1132,9 @@ export default function Hierarchy() {
   // root's /prefabs; Assets: the drop-target folder).
   const handleCreatePrefab = useCallback(async (entity: EntityInfo) => {
     if (entity.id === 0 || entity.isResource) return;
-    const found = await readWritableAssetRoot();
+    // Held across the read (#1936 close-out review): createPrefabFromEntity captures only once it runs.
+    const found = await whileCreatePrefabSubjectHeld(entity.id, readWritableAssetRoot);
+    if ('refused' in found) { useEditorStore.getState().showToast(found.refused, 'warn'); return; }
     // Said on screen, as the Assets panel's drop already says it (#1824, ruling FA): a Create Prefab that did nothing.
     if (!found.ok) { reportGestureRefusal(`Create Prefab failed — the asset roots could not be read: ${found.error}`); return; }
     if (!found.root) { useEditorStore.getState().showToast('Create Prefab failed — this project has no writable asset root.', 'warn'); return; }
@@ -1592,7 +1601,10 @@ export default function Hierarchy() {
     if (plan.kind === 'same-scene') return;
     if (plan.kind === 'refused') { toast(SCENE_MOVE_REFUSAL_TEXT[plan.reason], 'warn'); return; }
     const pre = await preflightSceneMove(dropped, targetScene);
-    if (!(await confirmInEditor('Move to another scene?', formatSceneMoveConfirm(pre, targetScene), 'Move'))) return;
+    // Bound to the world it was planned in (#1936); `sceneDropTarget` still refuses a world that changed before it closed.
+    const go = await askWhileWorldHolds(worldReplacedNotice('Move to another scene?', 'Drag it again.'),
+      (signal) => confirmInEditor('Move to another scene?', formatSceneMoveConfirm(pre, targetScene), 'Move', { signal }), { world: plan.world });
+    if (!go) return;
     const entityId = sceneDropTarget(plan);
     if (entityId == null) { toast('Not moved: the scene changed while the prompt was open. Drag it again.', 'warn'); return; }
     const res = moveEntityToScene(entityId, targetScene);

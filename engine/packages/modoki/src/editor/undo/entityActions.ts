@@ -2652,6 +2652,17 @@ export function sceneDropTarget(plan: Extract<SceneDropPlan, { kind: 'move' }>):
   return plan.entity.resolve();
 }
 
+/** The live pair a confirmed cross-scene REPARENT may still move, or null — {@link sceneDropTarget}'s rule for the
+ *  reparent prompt (#1936): the world it was planned in was replaced while the prompt was open (the same guids can name
+ *  another file's entities there), or either entity is gone. Refuse, never re-target. The guid hold still covers a frame
+ *  rebuilt in place, which re-mints ids in the same world. */
+export function sceneReparentTargets(moved: EntityRef, parent: EntityRef, plannedIn: ReturnType<typeof getCurrentWorld>): { moved: number; parent: number } | null {
+  if (getCurrentWorld() !== plannedIn) return null;
+  const m = moved.resolve();
+  const p = parent.resolve();
+  return m != null && p != null ? { moved: m, parent: p } : null;
+}
+
 export function sceneMoveRefusal(entityId: number): SceneMoveRefusal | null {
   const piMeta = getTraitByName('PrefabInstance');
   return piMeta ? sceneMovePrefabRefusal(entityId, piMeta) : null;

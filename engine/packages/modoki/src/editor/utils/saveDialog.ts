@@ -22,20 +22,26 @@ function promptPath(title: string, message: string, initial: string): Promise<st
  *  with no dialog at all. `window.confirm` is not an option for the same reason `window.prompt` is
  *  not. Resolves true only on an explicit Replace. The wording is shared by every create, so it names
  *  no particular new content: a New X writes a default document, Create Prefab the selected entity. */
-export async function confirmReplaceAsset(path: string): Promise<boolean> {
+export async function confirmReplaceAsset(path: string, opts: ModalOptions = {}): Promise<boolean> {
   const answer = await openModal(
     'Replace existing asset?',
     `${path} already exists. Replace its contents? It keeps its GUID, so scenes and prefabs that use it keep pointing at it — at the new contents.`,
-    'Replace',
+    'Replace', undefined, false, false, opts.signal,
   );
   return answer !== null;
+}
+
+export interface ModalOptions {
+  /** Closes the modal from code as a Cancel, once its question is moot — a world-bound question whose world the editor
+   *  replaced (`scene/worldBoundModal.ts`, #1936). The same contract as `openChoiceModal`'s. */
+  signal?: AbortSignal;
 }
 
 /** A yes/no question in the editor's own modal. `window.confirm` is not an option (see
  *  `confirmReplaceAsset`). `message` keeps its line breaks. Resolves true only on an explicit OK;
  *  Cancel, Escape and a backdrop click are all no. First used by the cross-scene reparent prompt (#1429). */
-export async function confirmInEditor(title: string, message: string, okLabel: string): Promise<boolean> {
-  return (await openModal(title, message, okLabel, undefined, true)) !== null;
+export async function confirmInEditor(title: string, message: string, okLabel: string, opts: ModalOptions = {}): Promise<boolean> {
+  return (await openModal(title, message, okLabel, undefined, true, false, opts.signal)) !== null;
 }
 
 /** A notice in the editor's own modal: one OK button, resolved when it is dismissed. The in-app
@@ -58,7 +64,9 @@ export async function alertInEditor(title: string, message: string): Promise<voi
  *  (`qaCaseReferences.test.ts` `knownUiIds`) derives citable ids from source text, and a template
  *  that STARTS with an interpolation has no static prefix it can read — a case citing
  *  `save-dialog.confirm` would then fail `npm test` against an id that exists. */
-function openModal(title: string, message: string, okLabel: string, initial?: string, multiline = false, notice = false): Promise<string | null> {
+function openModal(
+  title: string, message: string, okLabel: string, initial?: string, multiline = false, notice = false, signal?: AbortSignal,
+): Promise<string | null> {
   return new Promise((resolve) => {
     // Above every React dialog (99999): Create Prefab and the New buttons can ask from inside one.
     const { root: overlay, close } = openDomModalShell('save-dialog', { zIndex: 99999, onDismiss: () => done(null) });
@@ -103,7 +111,9 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
       if (e.key === 'Enter' && input && e.target === input) { e.preventDefault(); submit(); }
       else if (e.key === 'Escape') { e.preventDefault(); done(null); }
     };
-    const done = (val: string | null) => { close(); resolve(val); };
+    // Once: an abort can land after a click already answered.
+    let settled = false;
+    const done = (val: string | null) => { if (settled) return; settled = true; close(); resolve(val); };
     const submit = () => { if (!input) { done(''); return; } const v = input.value.trim(); done(v || null); };
     ok.onclick = submit;
     cancel.onclick = () => done(null);
@@ -111,6 +121,8 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     // it (the input, or the focused button), and a global listener is what keymapOwnership forbids.
     // Removed with the overlay, so nothing outlives a closed modal.
     overlay.onkeydown = onKey;
+    if (signal?.aborted) done(null);
+    else signal?.addEventListener('abort', () => done(null), { once: true });
     setTimeout(() => { if (input) { input.focus(); input.select(); } else if (notice) { ok.focus(); } else { cancel.focus(); } }, 0);
   });
 }

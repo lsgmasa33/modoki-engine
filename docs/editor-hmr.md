@@ -167,7 +167,8 @@ and re-read described above are what a SCENE reload (and that clean-scene fallba
 **An outside change to a scene with unsaved edits is ASKED about, never applied silently** (owner ruling 2026-09-30,
 #1879 part 3, amending #1164's disk-wins for the dirty case): a focused human gets the `scene-conflict` dialog, *Reload*
 / *Keep mine*; nobody focused, it stays pending until `modoki_refresh {scene: 'reload' | 'keep'}`. A clean scene still
-reloads silently. **The dialog closes itself once its question is moot** (#1924): when the change it asks about is
+reloads silently. Other modals that ask about the world close when a reload replaces it, through one
+seam ([editor-input.md](editor-input.md#modals-block-the-editor-underneath-them-1270), #1936). **The dialog closes itself once its question is moot** (#1924): when the change it asks about is
 applied without it (a load read the file fresh, #1899; a newer change to the scene, clean by then, replaced and applied
 it, #1906), it closes and nothing is answered; when the scene was SAVED since the asked-about change arrived (the
 primary's save point, `captureWorldDirtyBaseline().savedAt`, moved, and the scene is still the open primary), the save

@@ -24,6 +24,7 @@
 
 import { unsavedChangeCauses, causeSpecs, type UnsavedCauses } from './serialize';
 import { openChoiceModal } from '../components/choiceModal';
+import { askWhileWorldHolds, worldReplacedNotice } from './worldBoundModal';
 import { useEditorStore } from '../store/editorStore';
 import { undoStepPending } from '../undo/undoManager';
 import { isPrefabEditWorld, prefabSessionWorldPath } from './prefabEditWorld';
@@ -125,11 +126,18 @@ export function editingPrefabName(): string | null {
   return isPrefabEditWorld() ? '' : null;
 }
 
+/** Does a gate still ask what it showed? Its list re-read after a world swap (#1936): the same lines, the same question. */
+export function sameLostWork(now: readonly string[], shown: readonly string[]): boolean {
+  return now.length === shown.length && now.every((line, i) => line === shown[i]);
+}
+
 const DEFAULT_DEPS: UnsavedGateDeps = {
   causes: unsavedChangeCauses,
   editingPrefab: editingPrefabName,
-  ask: (action, lost) => openChoiceModal<GateChoice>({
-    kind: 'unsaved-gate',
+  // Bound to the world it lists (#1936): a load under the question makes the list stale, so it closes as a Cancel.
+  // A game's own scene load during Play swaps the world but leaves this list as it was, so the question stays up then.
+  ask: (action, lost, scope) => askWhileWorldHolds(worldReplacedNotice('Save changes first?', `Try to ${action} again.`), (signal) => openChoiceModal<GateChoice>({
+    kind: 'unsaved-gate', signal,
     title: 'Save changes first?',
     message: `You are about to ${action}. This is not saved and will be lost:`,
     details: lost,
@@ -141,7 +149,7 @@ const DEFAULT_DEPS: UnsavedGateDeps = {
     cancelValue: 'cancel',
     // Save is the safe answer to Enter: it loses nothing, and a failed save proceeds nowhere.
     focus: 'save',
-  }),
+  }), { stillAsks: () => sameLostWork(describeLostWork(unsavedChangeCauses(), scope, editingPrefabName()), lost) }),
   save: async () => {
     // Dynamic: saveCommand imports prefabEdit, which imports this module — a static import would
     // close that cycle.
@@ -173,8 +181,9 @@ export async function decideUnsavedBeforeBuild(
 /** The human Build menu's and the OTA dialog's gate — {@link decideUnsavedBeforeBuild} with the editor's modal. `action`
  *  completes "You are about to …" (e.g. `build for ios`). */
 export function confirmUnsavedBeforeBuild(action: string): Promise<boolean> {
-  return decideUnsavedBeforeBuild(action, unsavedChangeCauses, async (act, lost) => (await openChoiceModal<'build' | 'cancel'>({
-    kind: 'unsaved-gate',
+  return decideUnsavedBeforeBuild(action, unsavedChangeCauses, async (act, lost) => (await askWhileWorldHolds(
+    worldReplacedNotice('Unsaved changes', `Try to ${act} again.`), (signal) => openChoiceModal<'build' | 'cancel'>({
+    kind: 'unsaved-gate', signal,
     title: 'Unsaved changes',
     message: `You are about to ${act}. The build reads the files on disk, so this is not saved and will not be in it:`,
     details: lost,
@@ -184,7 +193,8 @@ export function confirmUnsavedBeforeBuild(action: string): Promise<boolean> {
     ],
     cancelValue: 'cancel',
     focus: 'cancel',
-  })) === 'build', editingPrefabName());
+  }), { stillAsks: () => sameLostWork(describeLostWork(unsavedChangeCauses(), 'page-unload', editingPrefabName()), lost) })) === 'build',
+  editingPrefabName());
 }
 
 let _open: Promise<boolean> | null = null;

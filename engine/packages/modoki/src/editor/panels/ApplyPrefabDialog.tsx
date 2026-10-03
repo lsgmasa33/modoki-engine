@@ -18,7 +18,8 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { livePinnedId } from '../../runtime/core/ecs/entityPin';
-import { subjectGoneNotice, runOnPinnedSubject } from './prefabDialogSubject';
+import { subjectGoneNotice, subjectGoneReason, runOnPinnedSubject } from './prefabDialogSubject';
+import { watchWorldReplaced } from '../scene/worldBoundModal';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
@@ -139,9 +140,21 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
    *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
   const closeAsGone = (notice: string) => {
+    // Once per open: the open's own check and the world watcher can both see a world replaced before the dialog bound.
+    const now = useEditorStore.getState()[mode === 'apply' ? 'applyPrefabDialog' : 'revertPrefabDialog'];
+    if (!now.active || now.subject !== subject) return;
     closeDialog();
+    // Logged too (#1936): the toast lasts seconds and no agent reads it, so a closed dialog left no record.
+    console.warn(`[Prefab] ${notice}`);
     useEditorStore.getState().showToast(notice, 'warn');
   };
+
+  // #1936: a world replaced under the dialog (a scene load, an outside-change hot reload) closes it, rather than leaving
+  // rows for that world up over the new one — blocking Cmd+S, and with a Confirm that could only refuse.
+  useEffect(() => {
+    if (!active || !subject) return;
+    return watchWorldReplaced(subject.world, () => closeAsGone(subjectGoneNotice(mode, 'reloaded')));
+  }, [active, subject]);
 
   useEffect(() => {
     // Nothing from the last session of the dialog carries into this one, so all of it is dropped on the close as well as
@@ -155,7 +168,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     setPreview(null);
     setLoadState({ kind: 'loading' });
     if (!active || rootInstanceId === null) return;
-    if (livePinnedId(subject, findEntity, getCurrentWorld()) === null) { closeAsGone(subjectGoneNotice(mode)); return; }
+    if (livePinnedId(subject, findEntity, getCurrentWorld()) === null) {
+      closeAsGone(subjectGoneNotice(mode, subjectGoneReason(subject, getCurrentWorld())));
+      return;
+    }
     let cancelled = false;
     (async () => {
       const PrefabInstanceMeta = getTraitByName('PrefabInstance');

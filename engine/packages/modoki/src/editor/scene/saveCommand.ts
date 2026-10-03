@@ -28,6 +28,7 @@ import {
 import { getModeOwner } from './playMode';
 import { beginWorldReplacement } from './authoringSettle';
 import { runSerialisedSave } from './saveQueue';
+import { askWhileWorldHolds, worldReplacedNotice } from './worldBoundModal';
 
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
@@ -265,11 +266,15 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     // and the edit stays open and unsaved, so Exit's Save leaves nothing behind to discard.
     const prefabReport = await savePrefabEditReport({
       // Dynamic, like the unsaved gate's own import of this module: the modal is DOM, and this module is not.
-      confirmOverwrite: async (name, path) => (await import('../utils/saveDialog')).confirmInEditor(
-        `"${name}" changed on disk`,
-        `${path} changed on disk since you opened it here (a save from somewhere else, an outside edit or a git pull). Overwrite it with this edit, or cancel and keep the file as it is? Your edit stays open either way.`,
-        'Overwrite',
-      ),
+      // Bound to the edit world (#1936): an exit or a scene load under the question closes it, and nothing is written.
+      confirmOverwrite: async (name, path, editWorld) => {
+        const { confirmInEditor } = await import('../utils/saveDialog');
+        return askWhileWorldHolds(worldReplacedNotice(`"${name}" changed on disk`, 'The prefab file was left as it is.'), (signal) => confirmInEditor(
+          `"${name}" changed on disk`,
+          `${path} changed on disk since you opened it here (a save from somewhere else, an outside edit or a git pull). Overwrite it with this edit, or cancel and keep the file as it is? Your edit stays open either way.`,
+          'Overwrite', { signal },
+        ), { world: editWorld });
+      },
     });
     const prefabSaved = prefabReport.saved;
     // …and the pending base-scene refs, for the same #259 reason this branch already flushes
