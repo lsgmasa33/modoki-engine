@@ -2,18 +2,15 @@
 
 **A live edit never reaches disk on its own. `modoki_save_all` is the only thing that writes.**
 
-## High-level rules: the backend router and asset writes (DRAFT, pending the owner's approval)
+## High-level rules: the backend router and asset writes (owner, 2026-10-03, at the B3 pilot gate; amendments 1–4 hub-proposed, owner-accepted)
 
-> **DRAFT (work-ai3, 2026-10-03)** for #1656 § Per-unit procedure step 0, unit B3 (#1648). **Nothing here is
-> approved, and nothing here is yet an instruction to change code.** Until the owner approves it, the rulings it was
-> drawn from remain the authority: #1983, #1996, #1959, #1975, #2048 and #2053, this doc, and
-> [editor.md](editor.md) § "A sidecar's identity belongs to exactly one live file (#1956, #1974, #1975)".
-
-**Once approved**, these rules sit above the rest of this doc and the sidecar sections of editor.md. When those
+Drafted for #1656 § Per-unit procedure step 0, unit B3 (#1648), from the rulings #1983, #1996, #1959, #1975, #2048 and
+#2053. **These rules sit above the rest of this doc and the sidecar sections of [editor.md](editor.md).** When those
 disagree with a rule, the rule wins and the other text is a defect. A question these rules cannot answer means the
 rule set is incomplete: flag the hub, citing the rules you checked, and don't pick an answer (#1656 step 0). Modelled
 on [prefabs.md](prefabs.md) § "High-level rules (owner, 2026-10-02)". Format versions have their own rules in
-[format-versioning.md](format-versioning.md), which rule 11 defers to.
+[format-versioning.md](format-versioning.md), which rule 11 defers to. Rules 13 and 14 were added with the approval and
+are numbered last, so the rule numbers already cited in issues stay valid.
 
 1. **Copy Unity.** When a behaviour is a design choice, Unity's answer wins (its asset database and `.meta` files).
    Unity also decides whether a gap needs fixing. The one exception is silent data loss on an ordinary path, which is
@@ -25,11 +22,16 @@ on [prefabs.md](prefabs.md) § "High-level rules (owner, 2026-10-02)". Format ve
      Cmd+S writes it. Both sides have an Apply that writes at once (here, `flushPendingMetaFor` and then a reimport).
      But Unity asks Apply or Revert when you leave an inspector with unapplied import settings, and its Save does
      not write them.
+   - **Project settings write at once:** the Project Settings dialog's Apply, the Build menu's device pick
+     (`pickDeviceTarget`) and the OTA Keys dialog (rule 8). Unity has no Apply there; it writes Project Settings on
+     Save Project.
 2. **An asset's identity lives in its own file.** A binary's GUID, import settings and slices live in its
    `.meta.json`. A JSON asset's GUID lives in its `id`. The manifest, the renderer's caches and the atlas are derived
    from those files, and when one of them disagrees with the file, the file wins. **One record is not derived:**
    `~/.modoki/guid-owners` holds which file held a GUID FIRST (`since`). No file can hold that history, and it is
-   the source of truth for rule 5 only.
+   the source of truth for rule 5 only. **Identity, not path, decides move versus delete:** a path that disappears
+   while its GUID appears at another live path is a MOVE. #2054 built a looser form for the Assets panel's auto-import:
+   a new path whose GUID the last scan held is not new, whether or not the old path went.
 3. **While the editor is open, a parked edit is the content, not the disk** (#889). A dirty-asset, pending-meta or
    pending-base-scene entry beats the bytes on disk. A Node-side decision that treats a file's bytes as current asks
    the unsaved probe first. For anything not parked, the disk is the truth.
@@ -58,25 +60,33 @@ on [prefabs.md](prefabs.md) § "High-level rules (owner, 2026-10-02)". Format ve
    and gets the same validation of what is written. Its refusal is coded, and one reader reads it
    (`readBackendAnswer`, [refusal-reporting.md](refusal-reporting.md)). The surfaces may differ only in **consent**
    (a human click vs `REQUIRES_SAVE`).
-   - **One documented exception:** `rendererWrite:true` on `/api/write-meta` also skips the target checks (exists,
-     not an asset, changed since). Refusing the pendingMeta flush there strands the park forever (#1215). But the
-     flag rides on every renderer sidecar write, so the modal Saves, the postprocessor row (`writeMetaConditional`)
-     and model import skip those checks too.
+   - **One documented exception, for the pendingMeta flush ONLY:** its `rendererWrite:true` on `/api/write-meta`
+     skips the target checks (exists, not an asset, changed since), because refusing the flush there strands the park
+     forever (#1215). Every other renderer sidecar write takes the checks. Today the flag is set inside
+     `writeMetaConditional`, which the flush, the modal Saves and the postprocessor row all call, and model import sets
+     it too: a contradiction row below (#2076).
    - **The door is the route the HUMAN uses** (hub, Q1): the panel's Create menu for create, the panel drop for import.
      An MCP or agent route either calls that same handler or is the same route. A second route with its own
      validation is a contradiction row, not a second door.
-8. **A live edit reaches disk only through Save. Anything else that writes at once is named here.**
+8. **A live edit reaches disk only through Save. Anything else that writes at once is named here, and this list is
+   complete:** an immediate writer it does not name is a contradiction.
    - Edits park in four places (the dirty-asset registry, `pendingMeta`, `pendingBaseScene`, the live scene), and
      Cmd+S or `save_all` flushes them.
    - **The immediate writers are:**
-     - the explicit write tools: `write_asset`, `create_asset`, `import_file`, `reimport`;
+     - the explicit write tools: `write_asset`, `write_asset_meta`, `create_asset`, `create_registered_asset`,
+       `import_file`, `reimport`;
+     - the creates: New X in the Assets panel (`writeNewAssetDocument`) and Create Scene;
+     - the import-settings Apply (`flushPendingMetaFor`, then a reimport), as in Unity (rule 1);
      - `mutate_scene`'s file-direct path (§ "The file-direct path is NOT `auto` coming back");
      - Prefab Apply, which Unity also writes at once;
-     - the `/api/project-settings` writers: the dialog's Apply, the Build menu's device pick (`pickDeviceTarget`) and
-       the OTA Keys dialog. Unity has no Apply here; it writes Project Settings on Save Project;
+     - the project-settings writers (rule 1): `/api/project-settings` from the dialog's Apply, the Build menu's device
+       pick (`pickDeviceTarget`) and the OTA Keys dialog, and that dialog's key generation (`/api/ota/keygen`,
+       `modoki_ota_keygen`), which writes the key rule 6 names;
      - the file operations;
      - the scan's identity heals: rule 5's collision heal and rule 11's mint for a missing sidecar;
      - the static server's auto-bake (`autoBakeThenServe`), which reimports an asset whose variant is not baked;
+     - the Assets panel's auto-import on scan (`diffAutoImportScan`, #2054), which imports a file that arrived from
+       outside, as Unity's AssetDatabase does;
      - the modal sidecar Saves (hub, Q2): Sprite and 9-Slice Save, `makeTexture2D` and `ModelAssetView`'s collision
        mesh. Unity's Sprite Editor Apply also writes at once.
    - File operations change disk at once and are not undoable. A delete asks first (#1868 D2, as in Unity).
@@ -111,8 +121,21 @@ on [prefabs.md](prefabs.md) § "High-level rules (owner, 2026-10-02)". Format ve
     - Each such write is fingerprinted, so it never reads back as an outside edit.
     - A move or rename keeps the GUID, slices, settings, parked edits and every path-keyed record.
     - An outside change is held until a refresh (#1879).
+13. **A file's identity on disk is its filesystem entry, not its spelling.** Spellings that differ only in case fold
+    together as the volume folds them (#1273 is the precedent). Two questions, two helpers:
+    - **Do two existing paths name one entry now?** `sameEntry` (`asset-fs-ops.ts`): `lstat` `dev` + `ino`, read as
+      bigints, because a Windows file id above 2^53 rounds to a neighbour's as a `number` (#2068). Both files exist,
+      so an inode cannot have been reused between them.
+    - **Does a path still name the entry it named when a route decided on it?** `pathEntryId`
+      (`editorBackendRouter.ts`): `dev` + `ino` + the birth time, all bigints. Without the birth time, ext4 handing a
+      freed inode number straight back made a re-created file the probed one (#1978). NTFS file tunneling gives a
+      re-created file the old creation time, and there the file id tells them apart (`3718cb405`).
+14. **Writes queue; they do not overlap.** Two saves of one world never run at once: a save waits in `saveQueue.ts`
+    (#2069). A human Cmd+S, an agent `save_all`, Create Scene and the unsaved gate's Save do today; the two that do
+    not are contradiction rows. A queued agent op is bounded: it waits at most 30 s for the save ahead and is then
+    refused (`SAVE_ALL_QUEUE_WAIT_MS`). It never runs late against a different scene.
 
-**The hub's answers to the draft's open questions (#1656, 2026-10-03)** are folded into rules 7 and 8 above:
+**The hub's answers to the draft's two open questions (#1656, 2026-10-03)**, folded into rules 7 and 8 above:
 - **Q1 (rule 7): which route is THE door for create, and for import?** The one the human uses. So `/api/create-asset`
   (`modoki_create_asset`) against `writeNewAssetDocument` (New X, `modoki_create_registered_asset`), and the drop
   against `/api/import-file`, are contradiction rows below, not two doors.
@@ -122,12 +145,13 @@ on [prefabs.md](prefabs.md) § "High-level rules (owner, 2026-10-02)". Format ve
 | Rule | Built today? |
 |---|---|
 | 1, 3 | Yes. These rules restate existing rulings. |
-| 2, 7, 8 | Mostly. The exceptions are in the table below. |
+| 2, 7, 8, 14 | Mostly. The exceptions are in the table below. |
+| 13 | Yes where a route compares entries: `pathEntryId` in the delete probes (#1978), `/api/write-meta`'s commit-point snapshot and `/api/write-file`'s `sidecarsAheadOfFile`; `sameEntry` in move's `destinationTaken` (#2068). Not swept beyond them. |
 | 4, 5, 6, 9, 10, 11, 12 | **Partly.** Each has open contradictions below. Rule 9 holds for Project Settings, Sprite and 9-Slice, but not for the scene save, the panel parks, pendingMeta's wholesale and conflict paths, or the agent's write tools. |
 
 ### Where the code contradicts the rules today
 
-These come from two read-only sweeps (work-ai3, 2026-10-03, at `0e19309f5`). The `file:line` ledger is on #1656;
+Most rows come from two read-only sweeps (work-ai3, 2026-10-03, at `0e19309f5`); the rows for rules 2 and 14 were added with the approval. The `file:line` ledger is on #1656;
 this table names symbols instead, because line numbers go stale (#686). **The hub dispatched rows for rules 4, 5, 6,
 9, 10 and 11's reimport row** (PARK LOWS): each was reproduced or says why not, rated by user path, and filed. The
 serious ones are fixed. A row whose last column says **not validated** has not been reproduced yet and needs that
@@ -141,7 +165,7 @@ before it is filed.
 | 4 | `/api/write-file`'s `sidecars`, fed by `pairDroppedSidecars` | An OS drop of a file plus its `.meta.json` keeps the dropped GUID, with no taken check. Dropping a pair copied from the same project, or from a built-in, makes a duplicate GUID and leaves it to the heal. editor.md's built-in section puts the rule on the user: "drop the file without its `.meta.json`". | #2074, low, parked. |
 | 4 | `/api/duplicate-asset` (`duplicateAssetFile`), `/api/move-file`, `/api/delete-asset` | Any of these can act on a sidecar by itself. A duplicated `.meta.json` keeps its `sprites[].guid`. | #2075, low, parked (agent and API only). |
 | 4, 11 | `duplicateAssetFile` | When `withFreshJsonIdentity` cannot parse a JSON asset, the duplicate copies it verbatim, `id` included. | #2074, low, parked. |
-| 4, 11 | `/api/write-meta` with `rendererWrite:true` | Rule 7's exception has a cost. With the existence check skipped, a renderer sidecar write for an asset that was moved or deleted leaves an orphan carrying the live GUID. The writers are the pendingMeta flush, `writeMetaConditional` (Sprite, 9-Slice, postprocessor) and model import. | #2076, low, parked. |
+| 4, 7 | `/api/write-meta` with `rendererWrite:true` | Rule 7 allows the exception for the pendingMeta flush only, but the flag also rides on `writeMetaConditional` (Sprite, 9-Slice, the postprocessor row) and model import, which therefore skip the target checks too. With the existence check skipped, a write for an asset that was moved or deleted leaves an orphan carrying the live GUID (rule 4); for the flush that is the accepted cost of #1215. | #2076, low, parked. |
 | 11 | the `reimport-*.ts` handlers (texture, model, audio, video, font, environment) | `readMetaSidecar` returns `{}` for a corrupt sidecar, and each handler mints a fresh `id`. `writeMetaSidecar` salvages only when the caller's id is not a GUID, so the asset is re-minted. **`writeMetaSidecar`'s comment claims the caller "always wins" because it "read it before editing".** | #2071, **serious, fixed** (`3d447e3b5`; the renderer's GLB import, same mechanism, `26a8b8659`). |
 | 11 | `/api/asset-write` (`ASSET_WRITE_FORMAT_VERSION`) | It refuses an unreadable or too-new file only for types that have a format version (material, particle, atlas). For animation, spriteanim, timeline, rig2d, shader and animset, a corrupt file is overwritten whole. | **not validated** (not in this dispatch) |
 | 11 | `/api/write-file` | It checks for an unreadable or too-new file only on prefabs. It can overwrite a scene, or write a live `.meta.json` raw, which bypasses `writeMetaSidecar`'s quarantine and id salvage. | **not validated** (not in this dispatch) |
@@ -161,6 +185,10 @@ before it is filed.
 | 12 | `/api/write-file` with non-string `content` | Serialized with no trailing newline. | **not validated** (not in this dispatch) |
 | 12 | `writeEpoch`, `landedWriteEpoch`, `heldOutside` (`dirtyAssets.ts`) | Keyed by path, and not re-keyed by a move. Not driven: renaming the open scene probably leaves `_currentScenePath` on the old path, because `applyAssetPathMoves` does not update it. | **not validated** (not in this dispatch) |
 | 12 | `/api/project-settings`, `load-project-config.ts` | Uses its own serializer, and the write is not fingerprinted. | **not validated** (not in this dispatch) |
+| 2 | the prefab adopt step (outside-change handling of the open scene's prefabs) | An outside MOVE of a prefab the open scene uses is reported as "deleted outside the editor … a Missing Prefab on the next load", and the prefab is evicted and tombstoned, though its GUID resolves at the new path. Observed: the report. Not observed: whether the next load really shows a placeholder. | #2067 (open; it cites rule 12), held until S7 (#2046). |
+| 14 | entering prefab edit (`prefabEdit.ts`), from a double-click or the agent `prefab` op's edit-open | Auto-saves the open scene with `saveScene()` outside `saveQueue.ts` (editor.md documents the auto-save as intended). Unity does not save the scene on entering Prefab Mode, so it is also an immediate writer rule 8 does not name. | **not validated** |
+| 14 | the agent `prefab` op's `edit-save` (`savePrefabEditReport`) | Not queued, so it can overlap a human Cmd+S of the same prefab-edit world (which is queued). Whether an overlap corrupts a file was not driven. | **not validated** |
+| 14 | a queued agent `save_all` (`saveAllOp`) | It records no scene identity when it queues, so a scene swap during the up-to-30 s wait would be saved when its turn comes. The window is narrow: a load refuses while the world is unsaved. | **not validated** |
 
 ## What this is, and what changed
 
