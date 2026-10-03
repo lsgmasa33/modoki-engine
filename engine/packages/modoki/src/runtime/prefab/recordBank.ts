@@ -76,6 +76,16 @@ export function dropRecordBank(key: string, bank: RecordBank): void {
   if (banks.get(key) === bank) banks.delete(key);
 }
 
+/** The file a bank was made for MOVED (#2096, B3 rule 12): the bank follows it, so the load of `to` takes it. Left at
+ *  `from`, the reload of the moved scene parsed every record afresh, and the next load of a file made at `from` took a
+ *  bank of another world. */
+export function rekeyRecordBank(from: string, to: string): void {
+  const b = banks.get(from);
+  if (!b || from === to) return;
+  banks.delete(from);
+  banks.set(to, b);
+}
+
 /** The bank for `key`, taken: the load of `key` calls this once, before its entry loop, so a bank serves one load. */
 export function takeRecordBank(key: string): RecordBank | undefined {
   const b = banks.get(key);

@@ -2662,14 +2662,14 @@ of the two.
 the **parked writes** and their **`ifMatch` CAS baselines** (#259), the **flushed-record maps**,
 **`currentFolder`** (#854), the **Inspector selection** (#867) and every record of a **scene file** (#2078): the open
 scene's `_currentScenePath`, the scene manager's loaded entries (primary and bases), the undo stacks (live and parked,
-`applyMovesToHistory`), and Play's and the timeline preview's authored snapshots. Without them, a rename of the open
+`applyMovesToHistory`), Play's and the timeline preview's authored snapshots, and the scene prefab edit returns to (its
+path, the open's record bank and the persisted last scene, #2096: Exit 404'd on the old path and left no scene). Without them, a rename of the open
 scene left Cmd+S writing the old path, which brought the file back with the scene's id; the scan re-minted that copy and
 the edits went to a file nothing references. A renamed scene during Play made Stop skip its revert. The records that
 decide where a save WRITES go through ONE guarded matcher, `movedSceneFile` (`assetPaths.ts`): a `normScenePath` key
 match nominates, because the editor holds a scene under whatever spelling opened it while a move names the on-disk url,
 and the scene's GUID confirms it in the manifest, because that key folds case and decodes escapes, so two different
-files can share one. Not yet repaired: prefab edit's return scene (#2096), the records of outside changes (#2079), and a
-record held in a local across an await (#2098). Anything else keyed by asset
+files can share one. Not yet repaired: the records of outside changes (#2079), and a record held in a local across an await (#2098). Anything else keyed by asset
 path belongs here too, not at a call site — including `expanded` and `pendingFolders`, which were
 remapped by hand at three of the thirteen sites until #867's own review pointed out that they were
 never out of reach: `assetFolderState.ts` holds them at MODULE scope with exported setters (its

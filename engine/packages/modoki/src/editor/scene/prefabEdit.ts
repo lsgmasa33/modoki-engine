@@ -8,7 +8,10 @@
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
 import { staleAroundUnless } from '../../runtime/prefab/instanceStore';
-import { bankInstanceRecords, cloneInstanceStore, dropRecordBank, steadyRecords, type RecordBank } from '../../runtime/prefab/recordBank';
+import { bankInstanceRecords, cloneInstanceStore, dropRecordBank, rekeyRecordBank, steadyRecords, type RecordBank } from '../../runtime/prefab/recordBank';
+import { movedSceneFile, type PathMove } from '../utils/assetPaths';
+import { normScenePath } from '../../runtime/scene/scenePathKey';
+import { toOpenProjectScenePath } from './openProjectScenePath';
 import { rowAt } from '../../runtime/loaders/prefabOverrides';
 import { onGuidRemap, remapGuidMapKeys } from '../../runtime/core/ecs/guidRemap';
 import type { Entity, World } from 'koota';
@@ -24,6 +27,7 @@ import { commitPrefabWrite, commitPrefabChanges } from './prefabCommit';
 import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, getCurrentScenePath, saveScene, serializeScene, loadScene, prepareWorldSwitch, markSceneSaved, worldHasUnsavedEdits, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { peekDirtyAsset } from './dirtyAssets';
+import { runSerialisedSave, SaveQueueBusyError } from './saveQueue';
 import { beginFreshFileRead } from './freshFileRead';
 import { captureSavePoint } from '../undo/undoManager';
 import { sceneManager, type SceneLoadResult } from '../../runtime/scene/SceneManager';
@@ -438,6 +442,9 @@ export async function openPrefabForEditing(
      *  is skipped and the swap discards them, as `loadScene` does. Saving them wrote into the file the very work the
      *  caller said to throw away (#1745). */
     discardUnsaved?: boolean;
+    /** How long the open's save of the scene may wait for a save ahead of it in the queue (#2089) — the agent's bound,
+     *  under its relay's timeout. Past it the open is refused with nothing saved or swapped. Unset: it waits. */
+    saveQueueWaitMs?: number;
   } = {},
 ): Promise<EditOpenRefusal | undefined> {
   // Taken before the first await: a scene load, Create Scene or another edit-open requested after this one wins (#1700).
@@ -445,6 +452,7 @@ export async function openPrefabForEditing(
   // Refuses new undo steps for the whole switch, fetch included, and names the one in flight (#1579).
   const worldSwitch = prepareWorldSwitch({ takeDownEnvelope: true });
   const banked: OpenBank = {};
+  openings.add(banked);
   try {
     // The undo in flight finishes BEFORE the fetch below (#1579 close-out review): an Apply undo installs the prefab
     // file, so a fetch during its write read the applied file and `setPrefabCache` overwrote the undo's restored copy —
@@ -456,15 +464,23 @@ export async function openPrefabForEditing(
     // An open that banked the scene's records and then did not enter (refused, superseded, its load failed) leaves no
     // bank for a later load of that scene to take (#2046 S7 close-out review).
     if (banked.bank && !banked.entered) dropRecordBank(banked.key!, banked.bank);
+    openings.delete(banked);
   }
 }
 
-/** The bank an edit-open made of the scene's records (`bankSceneRecords`), and whether the open entered the edit world. */
-interface OpenBank { key?: string; bank?: RecordBank; entered?: boolean }
+/** What an edit-open in flight holds by a scene's PATH: the bank it made of the scene's records (`bankSceneRecords`, with
+ *  that scene's guid), the return scene it will offer, and whether it entered the edit world. */
+interface OpenBank {
+  key?: string; guid?: string; bank?: RecordBank; entered?: boolean;
+  returnScene?: string | null; returnSceneGuid?: string | null;
+}
+/** The edit-opens in flight, for `applyMovesToPrefabReturn` (#2096 close-out review): a rename landing while the edit
+ *  world loads must move what the open is about to offer, or the adoption seats the old path over the moved store. */
+const openings = new Set<OpenBank>();
 
 async function openPrefabForEditingSwitching(
   asset: { path: string; name: string },
-  opts: { confirmDiscard?: (action: string) => Promise<boolean>; discardUnsaved?: boolean },
+  opts: { confirmDiscard?: (action: string) => Promise<boolean>; discardUnsaved?: boolean; saveQueueWaitMs?: number },
   switchReady: () => Promise<void> | null,
   stillNewest: () => boolean,
   banked: OpenBank,
@@ -541,17 +557,38 @@ async function openPrefabForEditingSwitching(
   // ⚠️ Both decisions come BEFORE the save, which is this route's one side effect on disk (#1745). A request superseded
   // while it waited does nothing: the newer one owns the world, and one that discarded it would find this older
   // request's save had written the discarded work into the file. A caller that asked to discard gets no save at all.
-  if (!stillNewest()) {
-    console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
-    return;
-  }
-  // …and not over a world that is not savable (#1750; owner, 2026-09-28: refuse, never wait). Checked BEFORE the save:
-  // in another route's tail the save wrote the incoming world into the outgoing scene's file (#1746 A2), and a refused
-  // save used to be ignored, so the swap below then discarded the work it had failed to keep. Play armed while this
-  // fetched is the same answer (the run mode), and swapping would put this edit world inside the Play world.
-  const refused = refuseUnsavable(asset.name, opts);
-  if (refused) return refused;
-  if (getCurrentScenePath() && !opts.discardUnsaved) await saveScene();
+  const decide = (): EditOpenRefusal | 'superseded' | undefined => {
+    if (!stillNewest()) {
+      console.warn(`[PrefabEdit] "${asset.name}" was not entered: a newer scene request was made while it waited`);
+      return 'superseded';
+    }
+    // …and not over a world that is not savable (#1750; owner, 2026-09-28: refuse, never wait). Checked BEFORE the save:
+    // in another route's tail the save wrote the incoming world into the outgoing scene's file (#1746 A2), and a refused
+    // save used to be ignored, so the swap below then discarded the work it had failed to keep. Play armed while this
+    // fetched is the same answer (the run mode), and swapping would put this edit world inside the Play world.
+    return refuseUnsavable(asset.name, opts);
+  };
+  // The save takes its turn in the save queue like every other writer of the scene file (#2089, B3 rule 14): run beside
+  // a Cmd+S or an agent `save_all` already writing, the slower write could land last with the older text, and Exit reloads
+  // the scene from that file. The decisions above are made once the turn comes, so a wait for it changes neither. A
+  // caller with a deadline (`saveQueueWaitMs`, the agent) is refused past it, with nothing saved or swapped.
+  let blocked: EditOpenRefusal | 'superseded' | undefined;
+  if (getCurrentScenePath() && !opts.discardUnsaved) {
+    try {
+      blocked = await runSerialisedSave(async () => {
+        const b = decide();
+        if (!b && getCurrentScenePath()) await saveScene();
+        return b;
+      }, { maxWaitMs: opts.saveQueueWaitMs });
+    } catch (e) {
+      if (!(e instanceof SaveQueueBusyError)) throw e;
+      const refused = `${e.message} — the scene was not saved and the prefab was not opened; open it again once that save finishes`;
+      console.warn(`[PrefabEdit] "${asset.name}" was not entered: ${refused}`);
+      return { refused };
+    }
+  } else blocked = decide();
+  if (blocked === 'superseded') return;
+  if (blocked) return blocked;
   if (opts.confirmDiscard && worldHasUnsavedEdits() && !(await opts.confirmDiscard(`edit prefab ${asset.name}`))) return;
   Object.assign(banked, await bankSceneRecords());
   // The REQUEST-order check `loadScene` makes after its `ready()` (#1700), here after the last await before the swap: a
@@ -568,10 +605,18 @@ async function openPrefabForEditingSwitching(
   if (late) return late;
   if (!seeded()) return changedWhileOpening(asset.name);
 
-  const returnScene = resolveReturnScene(
-    sceneManager.getCurrent()?.path ?? null,
-    useEditorStore.getState().prefabReturnScenePath ?? null,
-  );
+  const currentPath = sceneManager.getCurrent()?.path ?? null;
+  const recorded = useEditorStore.getState();
+  const returnScene = resolveReturnScene(currentPath, recorded.prefabReturnScenePath ?? null);
+  // …and its guid, which a move of that file must match before Exit follows it (#2096): the loaded primary's when it is
+  // the scene on screen, the outer session's when this open came from inside another edit world.
+  const returnSceneGuid = returnScene === null ? null
+    : returnScene === currentPath
+      ? [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary' && normScenePath(e.path) === normScenePath(returnScene))?.guid ?? null
+      : recorded.prefabReturnSceneGuid;
+  // Held on the open's record from here to the offer, where a move landing during the load re-points them (#2096).
+  banked.returnScene = returnScene;
+  banked.returnSceneGuid = returnSceneGuid;
   const sceneData = buildPrefabEditScene(prefab);
   // One pending adoption around the swap (#1698). The owner reads the dirt still here after the save above (an untitled
   // scene, or a save that failed) — that work is discarded by this swap, and so is its undo stack (#1409) — and it
@@ -596,7 +641,7 @@ async function openPrefabForEditingSwitching(
     if (!adoption.offer({
       world: loaded.world, path: null, baseScene: 'none',
       history: { key: `${PREFAB_EDIT_SCENE_PREFIX}${guid}`, keptBaseGuids: loaded.keptBaseGuids },
-      prefabEdit: { prefab: { path: asset.path, guid, name: prefab.name }, returnScene },
+      prefabEdit: { prefab: { path: asset.path, guid, name: prefab.name }, returnScene: banked.returnScene ?? null, returnSceneGuid: banked.returnSceneGuid },
     })) {
       console.warn(`[PrefabEdit] "${prefab.name}" was not entered: another scene replaced its edit world while it loaded`);
       return;
@@ -1081,14 +1126,18 @@ export const exitPrefabEditing = staleAroundUnless('prefabLeave', exitPrefabEdit
  *  serializes to now — after the open's save, so they are the file's when that save landed. A world with no file (an
  *  untitled scene, or an edit world opening another prefab: the outer open's bank stands) banks nothing. An entry the
  *  file no longer states as banked (a save that failed or was skipped, an outside edit while away) keeps its parse. */
-async function bankSceneRecords(): Promise<{ key: string; bank: RecordBank } | undefined> {
-  const key = sceneManager.getCurrent()?.path;
-  if (!getCurrentScenePath() || !key) return undefined;
+async function bankSceneRecords(): Promise<{ key: string; guid?: string; bank: RecordBank } | undefined> {
+  if (!getCurrentScenePath() || !sceneManager.getCurrent()?.path) return undefined;
   const world = getCurrentWorld();
   const recordsAt = cloneInstanceStore(world); // before the await: see `steadyRecords`
   try {
     const { entities } = await serializeScene();
-    if (getCurrentWorld() === world) return { key, bank: bankInstanceRecords(key, steadyRecords(recordsAt, world), entities as unknown as SceneEntityEntry[], 'prefabLeave') };
+    // The key is read AFTER the await (#2096 close-out re-review): a rename landing during it moved the scene's path, and
+    // a bank made under the path read before it was left at the old key — no record of this open held a bank yet for the
+    // move to follow. A move keeps the world, so the world check below still holds.
+    const key = sceneManager.getCurrent()?.path;
+    const guid = key ? [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'primary' && normScenePath(e.path) === normScenePath(key))?.guid : undefined;
+    if (key && getCurrentWorld() === world) return { key, guid, bank: bankInstanceRecords(key, steadyRecords(recordsAt, world), entities as unknown as SceneEntityEntry[], 'prefabLeave') };
   } catch (err) {
     console.warn(`[PrefabEdit] the scene's instance records were not banked for the return (#2046 S7.6): ${(err as Error)?.message ?? err}`);
   }
@@ -1114,6 +1163,43 @@ export function returnSceneTarget(): string | null {
   // candidate carries it, so the fallback can never reintroduce the same dead end.
   return [prefabReturnScenePath, stored]
     .find((p): p is string => !!p && !p.startsWith(PREFAB_EDIT_SCENE_PREFIX)) ?? null;
+}
+
+/** A rename or move of the scene prefab edit returns to (#2096, B3 rule 12): Exit reloads it where it is now. In the edit
+ *  world the open scene's path is null, so `applyMovesToOpenScene` has nothing to move, and the return path was left on
+ *  the old file: Exit's reload 404'd and stranded the editor in the prefab world, while the scene's parked undo stack had
+ *  followed the move. The return path decides which file Exit LOADS, so it follows only a move its guid confirms
+ *  (`movedSceneFile`); the open's record bank, kept under that path, moves with it. The persisted last scene names the
+ *  same file while the edit world is up (nothing rewrites it until a scene loads) and is Exit's fallback, so it follows
+ *  too. A delete moves nothing. Called by `applyAssetPathMoves`. */
+export function applyMovesToPrefabReturn(moves: readonly PathMove[]): void {
+  const movedTo = movedSceneFile(moves);
+  /** Where the scene file `path` (guid `guid`) is now, in the editor's spelling, when `moves` moved it; else undefined. */
+  const follow = (path: string | null | undefined, guid: string | null | undefined): string | undefined => {
+    const to = path ? movedTo(path, guid ?? undefined) : undefined;
+    const key = to === undefined ? undefined : toOpenProjectScenePath(to);
+    return key === path ? undefined : key;
+  };
+  const { prefabReturnScenePath: from, prefabReturnSceneGuid: guid, remapPrefabReturnScene } = useEditorStore.getState();
+  const key = follow(from, guid);
+  if (from && key !== undefined) {
+    remapPrefabReturnScene(key);
+    rekeyRecordBank(from, key);
+  }
+  // …and every open still loading its edit world: its bank and the return scene its adoption will offer (#2096 close-out
+  // review). Left alone, a rename during the load was undone by the offer — the store seated the old path, and Exit 404'd.
+  for (const o of openings) {
+    const bankTo = o.bank ? follow(o.key, o.guid) : undefined;
+    if (bankTo !== undefined) { rekeyRecordBank(o.key!, bankTo); o.key = bankTo; }
+    const returnTo = follow(o.returnScene, o.returnSceneGuid);
+    if (returnTo !== undefined) o.returnScene = returnTo;
+  }
+  if (typeof localStorage === 'undefined') return;
+  const lastKey = lastSceneKey(getScenePersistenceProject());
+  const stored = localStorage.getItem(lastKey);
+  if (!stored || !isPrefabEditWorld()) return; // outside the edit world the open scene's own path move rewrites it
+  const storedTo = movedTo(stored, stored === from ? guid ?? undefined : undefined);
+  if (storedTo !== undefined) localStorage.setItem(lastKey, toOpenProjectScenePath(storedTo));
 }
 
 /** True when the editor is currently in prefab-edit mode.

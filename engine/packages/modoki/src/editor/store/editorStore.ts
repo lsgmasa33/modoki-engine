@@ -422,6 +422,9 @@ interface EditorState {
   /** Scene path to restore when leaving prefab-edit mode (the scene the user was
    *  in when they opened the prefab). Null ⇒ fall back to the last scene. */
   prefabReturnScenePath: string | null;
+  /** The return scene's own guid, which confirms a move of that file is a move of THIS scene (#2096): Exit's return
+   *  path follows a rename only then. Null when the scene had none (an untitled one has no return path either). */
+  prefabReturnSceneGuid: string | null;
 
   /** Current playhead position in seconds (drives scrub/preview + record insertion). */
   playheadTime: number;
@@ -638,8 +641,10 @@ interface EditorState {
 
   /** Enter isolated prefab-edit mode. `returnScenePath` is the scene to restore
    *  on exit. Pure state — the caller orchestrates the synthetic-scene swap. */
-  openPrefabEditor: (prefab: { path: string; guid: string; name: string }, returnScenePath: string | null) => void;
-  /** Leave prefab-edit mode (clears both fields). The caller reloads the return
+  openPrefabEditor: (prefab: { path: string; guid: string; name: string }, returnScenePath: string | null, returnSceneGuid?: string | null) => void;
+  /** The return scene's FILE moved (#2096): Exit reloads it from `path` now. Only the move seam calls this. */
+  remapPrefabReturnScene: (path: string) => void;
+  /** Leave prefab-edit mode (clears every session field). The caller reloads the return
    *  scene before calling this. */
   closePrefabEditor: () => void;
 }
@@ -782,6 +787,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   timelineEditNonce: 0,
   editingPrefab: null,
   prefabReturnScenePath: null,
+  prefabReturnSceneGuid: null,
   playheadTime: 0,
   isRecording: false,
   isPreviewPlaying: false, previewOwner: null,
@@ -1176,8 +1182,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
   },
   setDirectorRoot: (id) => set({ directorRootEntityId: id }),
 
-  openPrefabEditor: (prefab, returnScenePath) => set({ editingPrefab: prefab, prefabReturnScenePath: returnScenePath }),
-  closePrefabEditor: () => set({ editingPrefab: null, prefabReturnScenePath: null }),
+  openPrefabEditor: (prefab, returnScenePath, returnSceneGuid) => set({ editingPrefab: prefab, prefabReturnScenePath: returnScenePath, prefabReturnSceneGuid: returnSceneGuid ?? null }),
+  remapPrefabReturnScene: (path) => set({ prefabReturnScenePath: path }),
+  closePrefabEditor: () => set({ editingPrefab: null, prefabReturnScenePath: null, prefabReturnSceneGuid: null }),
   };
 });
 

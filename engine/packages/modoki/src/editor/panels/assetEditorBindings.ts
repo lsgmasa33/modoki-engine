@@ -50,6 +50,7 @@ import { applyMovesToOpenScene, type PathKeyedCause } from '../scene/serialize';
 import { applyMovesToHistory } from '../undo/undoManager';
 import { applyMovesToPlaySnapshot } from '../scene/playMode';
 import { applyMovesToPreviewSnapshot } from '../scene/timelinePreview';
+import { applyMovesToPrefabReturn } from '../scene/prefabEdit';
 import { applyMove, splitAssetPath, type PathMove } from '../utils/assetPaths';
 import { remapCurrentFolder, remapFolderSets } from './assetFolderState';
 import { rekeyCachedPrefab, evictDeletedPrefabs } from '../../runtime/loaders/meshTemplateCache';
@@ -466,6 +467,7 @@ export function applyAssetPathMoves(moves: Iterable<PathMove>): string[] {
   applyMovesToHistory(list, openScene.openSceneTo);
   applyMovesToPlaySnapshot(list);
   applyMovesToPreviewSnapshot(list);
+  applyMovesToPrefabReturn(list);
   // Independently of BOTH of the above: the Assets panel's own "current folder" is also
   // path-keyed state that must follow a move, and wiring it per call site is exactly the
   // mistake this module's header already names — "the first version of this fix covered

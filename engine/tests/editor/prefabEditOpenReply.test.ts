@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestWorld, type TestWorld, setPlayState } from '@modoki/engine/runtime';
 import { markSceneSaved, clearHistory, clearDirtyAssets, returnSceneTarget } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
+import { registerEditorAgentOps, SAVE_ALL_QUEUE_WAIT_MS } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
 
@@ -76,7 +76,7 @@ describe('prefab edit-open reply names the prefab it was asked for', () => {
 describe('prefab edit-open hands the caller\'s discard to the open (#1745)', () => {
   it('edit-open {discardUnsaved:true} opens with discardUnsaved, so its auto-save is skipped', async () => {
     await runAgentOp('prefab', { prefabAction: 'edit-open', path: B.path, discardUnsaved: true });
-    expect(prefab.opts).toEqual([{ discardUnsaved: true }]);
+    expect(prefab.opts).toEqual([{ discardUnsaved: true, saveQueueWaitMs: SAVE_ALL_QUEUE_WAIT_MS }]);
   });
 
   it('ACCEPT SIDE: a plain edit-open does not ask to discard', async () => {

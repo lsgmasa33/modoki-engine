@@ -3879,7 +3879,8 @@ export function registerEditorAgentOps(): void {
       // After that await, like the open's own save of the current scene, which reads the same path.
       const scenePathBefore = getCurrentScenePath();
       const name = openPath.split('/').pop()?.replace(/\.prefab\.json$/, '') ?? openPath;
-      const refusal = await openPrefabForEditing({ path: openPath, name }, discard ? { discardUnsaved: true } : {});
+      // Its save of the scene waits for a save ahead in the queue only as long as `save_all` would (#2089).
+      const refusal = await openPrefabForEditing({ path: openPath, name }, { saveQueueWaitMs: SAVE_ALL_QUEUE_WAIT_MS, ...(discard ? { discardUnsaved: true } : {}) });
       // Refused because the world was not in a state to leave (#1750): its own reason, not the generic failure below.
       if (refusal) throw new OpRefusal('REFUSED_BY_OP', `prefab edit-open refused: ${refusal.refused}. Nothing was saved or swapped.`);
       // openPrefabForEditing reports failure by console.error + early return (it is a UI path).
@@ -3909,46 +3910,68 @@ export function registerEditorAgentOps(): void {
       };
     }
     if (which === 'edit-save') {
-      if (!isEditingPrefab()) {
-        throw new Error(
-          "prefab edit-save: the editor is NOT in prefab-edit mode, so there is no prefab to write. " +
-          "Open one first: modoki_prefab {action:'edit-open', path:<the .prefab.json>}.",
-        );
+      // QUEUED behind any other save, bounded as `save-all` is (#2090, B3 rule 14). A human Cmd+S of this world holds the
+      // queue while its Overwrite question is open, with the document it serialized BEFORE the question: run beside it,
+      // this save landed first and the human's Overwrite then put the older document over it — the file lost this save's
+      // edits while the reply said saved. The whole op runs in its turn, as `save-all`'s does: the mode is asked once the
+      // turn comes (Exit may have run while this waited), and its reply is the queued body's.
+      // The session this call was made in: a turn that comes after another prefab was opened (a human double-click while
+      // this waited) is refused, not run on that prefab — the #2088 class, for the window this queue opened.
+      const notEditing = () => new Error(
+        "prefab edit-save: the editor is NOT in prefab-edit mode, so there is no prefab to write. " +
+        "Open one first: modoki_prefab {action:'edit-open', path:<the .prefab.json>}.",
+      );
+      // Not editing is answered at once, not after a wait for a save it has nothing to do with (close-out review).
+      const asked = isEditingPrefab() ? useEditorStore.getState().editingPrefab : null;
+      if (!asked) throw notEditing();
+      try {
+        return await runSerialisedSave(async () => {
+          // Exit ran while this waited.
+          if (!isEditingPrefab()) throw notEditing();
+          const editing = useEditorStore.getState().editingPrefab!;
+          if (editing.guid !== asked.guid) {
+            throw new OpRefusal('REFUSED_BY_OP',
+              `prefab edit-save refused: ${asked.path} is no longer the prefab being edited — ${editing.path} was opened while this waited for another save. NOTHING was written.`,
+              { options: [`modoki_prefab {action:'edit-save'} — saves ${editing.path}, the prefab open now`] });
+          }
+          const { saved, warnings, conflict, notAuthored } = await savePrefabEditReport({ overwrite: p.overwrite === true });
+          // A world that is not authored is a REFUSAL with its real exits, as the posed-world refusals of the other ops are
+          // (#1873 close-out review) — Play included, since this writes a file (the create op's rule).
+          if (!saved && notAuthored) {
+            throw new OpRefusal('REFUSED_BY_OP',
+              `prefab edit-save refused: ${warnings.join('; ')}. NOTHING was written, and the edit is still open and unsaved.`,
+              { options: getRunMode() === 'playing'
+                ? ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"]
+                : posedWorldExits().options });
+          }
+          if (!saved && conflict) {
+            throw new OpRefusal('REFUSED_BY_OP',
+              `prefab edit-save refused: ${editing.path} changed on disk since this edit opened it (a save elsewhere, an outside edit or a git pull), so NOTHING was written and the edit is still open and unsaved.`,
+              { options: [
+                "modoki_prefab {action:'edit-save', overwrite:true} — replace what is on disk with this edit",
+                "modoki_prefab {action:'edit-exit', discardUnsaved:true} — discard this edit and keep the file",
+              ] });
+          }
+          if (!saved) {
+            // ⚠️ `warnings` carries the backend's own REASON on a failure now (#1468) — the format gate
+            // answers 409 with why, and without this the agent got three guesses and a pointer to a
+            // console it cannot read. A produced reason nobody reads is this repo's #1 defect class, and
+            // it shipped here once already (close-out review R2).
+            // …and every failure the save makes carries one (#1873: the root-not-found branch answered the guesses below with
+            // no way to tell which). The guesses stay for a failure that somehow reports none.
+            throw new Error(warnings.length
+              ? `prefab edit-save FAILED for ${editing.path} — NOTHING was written: ${warnings.join('; ')}`
+              : `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
+                'was not found in the edit world, serialization produced no prefab, or the file write was ' +
+                'rejected. See the editor console for the [PrefabEdit] error.');
+          }
+          // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).
+          return { ok: true, path: editing.path, guid: editing.guid, saved: true, ...(warnings.length ? { warnings } : {}) };
+        }, { maxWaitMs: SAVE_ALL_QUEUE_WAIT_MS });
+      } catch (e) {
+        if (!(e instanceof SaveQueueBusyError)) throw e;
+        throw new OpRefusal('REFUSED_BY_OP', `prefab edit-save: ${e.message}. NOTHING was written, and the edit is still open and unsaved. Call edit-save again once the other save finishes.`);
       }
-      const editing = useEditorStore.getState().editingPrefab!;
-      const { saved, warnings, conflict, notAuthored } = await savePrefabEditReport({ overwrite: p.overwrite === true });
-      // A world that is not authored is a REFUSAL with its real exits, as the posed-world refusals of the other ops are
-      // (#1873 close-out review) — Play included, since this writes a file (the create op's rule).
-      if (!saved && notAuthored) {
-        throw new OpRefusal('REFUSED_BY_OP',
-          `prefab edit-save refused: ${warnings.join('; ')}. NOTHING was written, and the edit is still open and unsaved.`,
-          { options: getRunMode() === 'playing'
-            ? ["modoki_play_control {action:'stop'} — returns to the authored world, then retry"]
-            : posedWorldExits().options });
-      }
-      if (!saved && conflict) {
-        throw new OpRefusal('REFUSED_BY_OP',
-          `prefab edit-save refused: ${editing.path} changed on disk since this edit opened it (a save elsewhere, an outside edit or a git pull), so NOTHING was written and the edit is still open and unsaved.`,
-          { options: [
-            "modoki_prefab {action:'edit-save', overwrite:true} — replace what is on disk with this edit",
-            "modoki_prefab {action:'edit-exit', discardUnsaved:true} — discard this edit and keep the file",
-          ] });
-      }
-      if (!saved) {
-        // ⚠️ `warnings` carries the backend's own REASON on a failure now (#1468) — the format gate
-        // answers 409 with why, and without this the agent got three guesses and a pointer to a
-        // console it cannot read. A produced reason nobody reads is this repo's #1 defect class, and
-        // it shipped here once already (close-out review R2).
-        // …and every failure the save makes carries one (#1873: the root-not-found branch answered the guesses below with
-        // no way to tell which). The guesses stay for a failure that somehow reports none.
-        throw new Error(warnings.length
-          ? `prefab edit-save FAILED for ${editing.path} — NOTHING was written: ${warnings.join('; ')}`
-          : `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
-            'was not found in the edit world, serialization produced no prefab, or the file write was ' +
-            'rejected. See the editor console for the [PrefabEdit] error.');
-      }
-      // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).
-      return { ok: true, path: editing.path, guid: editing.guid, saved: true, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'edit-exit') {
       // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate no-op.

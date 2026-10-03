@@ -90,7 +90,7 @@ export interface AdoptionRecord {
     readonly freshIncoming?: boolean;
   };
   /** The world is the edit world of this prefab. Absent: it is not an edit world, and the flag is cleared. */
-  readonly prefabEdit?: { readonly prefab: EditedPrefab; readonly returnScene: string | null };
+  readonly prefabEdit?: { readonly prefab: EditedPrefab; readonly returnScene: string | null; readonly returnSceneGuid?: string | null };
   /** Journal `!scene-load` for this path. */
   readonly journal?: { readonly path: string };
 }
@@ -388,7 +388,7 @@ function adopt(record: AdoptionRecord, dirt: TaggedDirt, changesSeen: number): b
   // world included. Recorded from the owner's own record: the flag cannot say what was left (#1690).
   if (lastAdopted.edit) owed.add(lastAdopted.edit.path);
   // The flag BEFORE any repair runs: the refresh skips the prefab it names.
-  if (record.prefabEdit) useEditorStore.getState().openPrefabEditor(record.prefabEdit.prefab, record.prefabEdit.returnScene);
+  if (record.prefabEdit) useEditorStore.getState().openPrefabEditor(record.prefabEdit.prefab, record.prefabEdit.returnScene, record.prefabEdit.returnSceneGuid);
   else useEditorStore.getState().closePrefabEditor();
   lastAdopted = { world: record.world, edit: record.prefabEdit?.prefab ?? null };
   adoptions += 1;
