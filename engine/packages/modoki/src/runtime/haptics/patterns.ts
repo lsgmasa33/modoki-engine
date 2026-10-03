@@ -22,8 +22,9 @@
  */
 
 /** The preset vocabulary, named by FEELING rather than by platform. Each maps to one
- *  `@capacitor/haptics` call; nothing here can express amplitude or sharpness directly, because
- *  no platform in range exposes both (see docs/haptics.md § "What the tiers can render"). */
+ *  `@capacitor/haptics` call (or, on Android with `HapticSettings.platformEffects` on, to the
+ *  mapping in `platformEffects.ts`); nothing here can express amplitude or sharpness directly,
+ *  because no platform in range exposes both (see docs/haptics.md § "What the tiers can render"). */
 export type HapticPreset =
   | 'impact.light'
   | 'impact.medium'

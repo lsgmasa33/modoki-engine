@@ -18,11 +18,24 @@
 import type { World } from 'koota';
 import { HapticSettings } from '../traits/HapticSettings';
 import { configureHaptics } from './hapticsService';
+import { ANDROID_EFFECT_FIELDS } from './platformEffects';
+import type { HapticPreset } from './patterns';
+
+const PRESETS = Object.keys(ANDROID_EFFECT_FIELDS) as HapticPreset[];
 
 export function hapticsSystem(world: World): void {
   const e = world.queryFirst(HapticSettings);
   if (!e) return;
   const s = e.get(HapticSettings);
   if (!s) return;
-  configureHaptics({ enabled: s.enabled, masterIntensity: s.masterIntensity });
+  // Every preset's mapping field, by walking the table rather than naming seven fields: a field
+  // added to the table is read here with no further edit.
+  const androidEffects = {} as Record<HapticPreset, string>;
+  for (const preset of PRESETS) androidEffects[preset] = s[ANDROID_EFFECT_FIELDS[preset]];
+  configureHaptics({
+    enabled: s.enabled,
+    masterIntensity: s.masterIntensity,
+    platformEffects: s.platformEffects,
+    androidEffects,
+  });
 }

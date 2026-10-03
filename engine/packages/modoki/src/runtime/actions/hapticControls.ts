@@ -59,6 +59,24 @@ function setEnabled(next: boolean): boolean {
   return true;
 }
 
+/** Is the Android platform-effects path on (#2103)? False with no `HapticSettings` in the scene. */
+export function hapticPlatformEffectsOn(): boolean {
+  return settingsEntity()?.get(HapticSettings)?.platformEffects ?? false;
+}
+
+/**
+ * Flip `HapticSettings.platformEffects` at runtime — the A/B switch a game's debug menu drives, so
+ * the old and new Android feel can be compared back to back in one build. Writes the TRAIT, like
+ * `setEnabled` above. False when the scene has no `HapticSettings` to write.
+ */
+export function setHapticPlatformEffects(on: boolean): boolean {
+  const e = settingsEntity();
+  const s = e?.get(HapticSettings);
+  if (!e || !s) return false;
+  e.set(HapticSettings, { ...s, platformEffects: on });
+  return true;
+}
+
 const NO_SETTINGS = 'no HapticSettings entity in the scene — nothing to change (author one to make haptics switchable)';
 
 export function registerHapticControls(): void {

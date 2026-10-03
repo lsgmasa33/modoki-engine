@@ -32,6 +32,15 @@ export class ModokiSystemWeb extends WebPlugin implements ModokiSystemPlugin {
     throw this.unimplemented('kvInfo is iOS-only');
   }
 
+  // The vibrator's predefined effects are an Android API (#2103); the engine only calls these there.
+  async hapticCapabilities(): Promise<{ effects: string[]; primitives: string[] }> {
+    throw this.unimplemented('hapticCapabilities is Android-only');
+  }
+
+  async playHapticEffect(): Promise<{ played: boolean }> {
+    throw this.unimplemented('playHapticEffect is Android-only');
+  }
+
   // Presence first: outside a secure context `navigator.clipboard` is undefined, and `?.writeText`
   // would resolve undefined, which reads as a copy that never happened.
   async copyText(options: { text: string }): Promise<{ copied: boolean }> {

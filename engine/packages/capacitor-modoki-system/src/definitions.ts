@@ -77,4 +77,32 @@ export interface ModokiSystemPlugin {
    * without Play services), so a caller needs no platform branch of its own.
    */
   requestReview(): Promise<{ requested: boolean }>;
+
+  /**
+   * Android only (#2103): which predefined effects and composition primitives the default
+   * vibrator REPORTS as supported, by name (`CLICK`, `TICK`, …). Both lists are empty on a
+   * vibrator with no such capability (the Galaxy A23). iOS and the web do not implement it; the
+   * engine only calls it on Android.
+   */
+  hapticCapabilities(): Promise<{ effects: string[]; primitives: string[] }>;
+
+  /**
+   * Android only (#2103): play one predefined effect, or a composition of primitives.
+   *
+   * `delayMs` is the gap after the previous primitive ENDS. `usage` picks the vibration usage the
+   * request is sent under, so the phone's own touch-feedback setting gates it the same way it
+   * gates the waveform this replaces.
+   *
+   * Resolves `{played: false}` rather than rejecting when the vibrator does not report the effect
+   * (or any one primitive) as supported, or an unknown name was passed — Android would otherwise
+   * substitute a generic vibration and report nothing. The caller then plays its own fallback.
+   */
+  playHapticEffect(options: {
+    effect?: string;
+    primitives?: { id: string; scale: number; delayMs: number }[];
+    usage?: HapticUsage;
+  }): Promise<{ played: boolean }>;
 }
+
+/** The Android vibration usage a haptic is sent under. */
+export type HapticUsage = 'touch' | 'media';

@@ -159,7 +159,7 @@ export {
 } from './iap';
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
-export { registerHapticControls } from './actions/hapticControls';
+export { registerHapticControls, hapticPlatformEffectsOn, setHapticPlatformEffects } from './actions/hapticControls';
 export { registerQualityControls } from './actions/qualityControls';
 export { registerSystemControls, copyToClipboard } from './actions/systemControls';
 export {
@@ -173,8 +173,13 @@ export {
   type HapticPreset, type HapticStep, type HapticPattern,
 } from './haptics/patterns';
 export {
-  NoopHapticBackend, CapacitorHapticBackend, pickHapticBackend, type HapticBackend,
+  NoopHapticBackend, CapacitorHapticBackend, AndroidEffectsHapticBackend, pickHapticBackend,
+  type HapticBackend, type SystemHapticsPlugin,
 } from './haptics/backends';
+export {
+  ANDROID_EFFECT_FIELDS, DEFAULT_ANDROID_EFFECTS, parseAndroidEffect, isAndroidEffectSpecValid,
+  type PlatformHapticEffect, type PlatformHapticPrimitive, type AndroidEffectField,
+} from './haptics/platformEffects';
 export { HapticSettings } from './traits/HapticSettings';
 export {
   AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,

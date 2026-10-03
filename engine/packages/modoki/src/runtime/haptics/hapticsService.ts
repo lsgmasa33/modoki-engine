@@ -24,7 +24,10 @@ import { rawNow } from '../core/clock';
 import { getCurrentWorld } from '../core/ecs/worldRegistry';
 import { onWorldSwap } from '../core/ecs/world';
 import { pickHapticBackend, type HapticBackend } from './backends';
-import { resolveHapticPattern } from './patterns';
+import { resolveHapticPattern, type HapticPreset } from './patterns';
+import {
+  DEFAULT_ANDROID_EFFECTS, parseAndroidEffect, isAndroidEffectSpecValid, type PlatformHapticEffect,
+} from './platformEffects';
 import { createTeardownToken } from '../core/liveness';
 
 let backend: HapticBackend | null = null;
@@ -45,11 +48,57 @@ export function setHapticBackend(b: HapticBackend | null): void {
  *  these fire from inside gesture handling. */
 let enabled = true;
 let masterIntensity = 1;
+let platformEffects = false;
+let androidEffects: Readonly<Record<HapticPreset, string>> = DEFAULT_ANDROID_EFFECTS;
 
-/** Apply the live `HapticSettings`. A copy, never a play. */
-export function configureHaptics(opts: { enabled: boolean; masterIntensity: number }): void {
+/** Apply the live `HapticSettings`. A copy, never a play. The two platform fields are optional so
+ *  a caller that only knows the gates leaves them at the trait's own defaults (off). */
+export function configureHaptics(opts: {
+  enabled: boolean;
+  masterIntensity: number;
+  platformEffects?: boolean;
+  androidEffects?: Readonly<Record<HapticPreset, string>>;
+}): void {
   enabled = opts.enabled;
   masterIntensity = Math.max(0, Math.min(1, opts.masterIntensity));
+  platformEffects = opts.platformEffects ?? false;
+  androidEffects = opts.androidEffects ?? DEFAULT_ANDROID_EFFECTS;
+  // Parse (and so validate) HERE, where the authored value arrives, not at the first play: the
+  // editor's backend cannot vibrate and never reaches a play, and the editor is where the value is
+  // typed. With the switch off too — a typo should not wait for the day it is turned on.
+  for (const preset of ANDROID_PRESETS) {
+    const text = androidEffects[preset];
+    if (typeof text === 'string') parsedEffect(preset, text);
+  }
+}
+
+/** Parsed mappings, keyed by the authored string — `configureHaptics` runs every frame and a play
+ *  fires from gesture handling, so neither may parse. Bounded: typing in the Inspector mints a new
+ *  string per keystroke. */
+const parsedEffects = new Map<string, PlatformHapticEffect | null>();
+const PARSED_EFFECTS_MAX = 64;
+
+const ANDROID_PRESETS = Object.keys(DEFAULT_ANDROID_EFFECTS) as HapticPreset[];
+
+function parsedEffect(preset: HapticPreset, text: string): PlatformHapticEffect | null {
+  let parsed = parsedEffects.get(text);
+  if (parsed === undefined) {
+    parsed = parseAndroidEffect(text);
+    if (parsedEffects.size >= PARSED_EFFECTS_MAX) parsedEffects.clear();
+    parsedEffects.set(text, parsed);
+    // An authored mistake must not pass as "no mapping" in silence — the preset would quietly
+    // keep the old feel while the Inspector shows the new one. Once per distinct string.
+    if (parsed === null && !isAndroidEffectSpecValid(text)) {
+      console.warn(`[haptics] HapticSettings mapping for '${preset}' is not valid: "${text}" — this preset keeps the older call`);
+    }
+  }
+  return parsed;
+}
+
+function platformEffectFor(preset: HapticPreset): PlatformHapticEffect | undefined {
+  if (!platformEffects) return undefined;
+  const text = androidEffects[preset];
+  return typeof text === 'string' ? parsedEffect(preset, text) ?? undefined : undefined;
 }
 
 export function areHapticsEnabled(): boolean { return enabled; }
@@ -91,7 +140,7 @@ function fire(preset: Parameters<HapticBackend['play']>[0], measure: boolean): v
   // custom backend is free to reject, and a bare `.then()` would leave that as an UNHANDLED
   // rejection — which breaks the "never throws into game code" contract just as surely as a
   // synchronous throw, only later and further away. Caught by the subsystem's own test.
-  void b.play(preset).then(
+  void b.play(preset, platformEffectFor(preset)).then(
     () => {
       if (!measure) return;
       // A teardown/backend-swap landed while this beat was in flight — this sample was measured
@@ -154,5 +203,8 @@ export function disposeHaptics(): void {
   clearHapticLatency(); // already invalidates latency liveness — no separate invalidation needed here
   enabled = true;
   masterIntensity = 1;
+  platformEffects = false;
+  androidEffects = DEFAULT_ANDROID_EFFECTS;
+  parsedEffects.clear();
   backend = null;
 }

@@ -16,7 +16,23 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "kvRemove", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "kvInfo", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestReview", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "hapticCapabilities", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "playHapticEffect", returnType: CAPPluginReturnPromise),
     ]
+
+    // The vibrator's predefined effects are an Android API (#2103): iOS haptics stay on
+    // @capacitor/haptics' feedback generators and the engine never calls these here. They exist so
+    // the plugin's JS contract dispatches somewhere on every platform, and say why they fail.
+    private static let hapticsAndroidOnly =
+        "Predefined haptic effects are Android-only; iOS plays presets through @capacitor/haptics."
+
+    @objc func hapticCapabilities(_ call: CAPPluginCall) {
+        call.unavailable(ModokiSystemPlugin.hapticsAndroidOnly)
+    }
+
+    @objc func playHapticEffect(_ call: CAPPluginCall) {
+        call.unavailable(ModokiSystemPlugin.hapticsAndroidOnly)
+    }
 
     private let store = BackupExcludedStore()
 
