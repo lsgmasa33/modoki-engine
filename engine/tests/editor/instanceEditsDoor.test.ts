@@ -42,6 +42,7 @@ import { setTemplateKey } from '../../packages/modoki/src/runtime/core/templateI
 import { allStoredRoots, instanceKeyMap } from '../../packages/modoki/src/editor/instance/instanceKeys';
 import { dropInstanceRecord, markStale, setInstanceRecord, unrecordedBy } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUtils';
+import { getOverrideMarkSet } from '../../packages/modoki/src/runtime/loaders/overrideMarks';
 
 registerAllTraits();
 setActionCallback(pushAction);
@@ -273,6 +274,54 @@ describe('components (§ 2.5)', () => {
     removeTraitFromEntitiesWithUndo([byName('B')], meta('Rotate3D'));
     expect(row(key(3))).toBeUndefined();
     matchesCapture();
+  });
+});
+
+// #1829 on the re-seed (#2058, hunt seeds 8231 and 8413): a file states a component the base lacks PARTIALLY (an agent's
+// file-direct write) and the load marks only what it states. The old capture writes that component whole, so a record
+// re-seeded from it stated the rest too: its projection marked fields the live tree does not (P1), and S6's save would
+// write them. Mutation: return the re-seeded record untouched in `withoutUnstatedAddedFields` (instanceSync.ts) — the
+// first case goes red; the other two stay green.
+describe('a re-seed keeps what the file stated of an added component (#1829, #2058)', () => {
+  const withRotate = (bag: Record<string, unknown>): SceneData => {
+    const d = scene() as unknown as { entities: Record<string, unknown>[] };
+    d.entities[1]!.overrides = { 3: { Rotate3D: bag } };
+    return d as unknown as SceneData;
+  };
+  const rotateMarks = () => [...(getOverrideMarkSet(findEntity(byName('B'))! as never) ?? [])].filter((m) => m.startsWith('Rotate3D.')).sort();
+  const reseeded = () => { markStale(getCurrentWorld(), 'test'); expect(reseedFromCapture(rootId())).toBe(true); return row(key(3))?.traits?.Rotate3D; };
+  it('a field the file left out stays out, though the capture states it', async () => {
+    await load(withRotate({ speed: 2 }));
+    expect(row(key(3))?.traits?.Rotate3D).toEqual({ speed: 2 });
+    expect(rotateMarks()).toEqual(['Rotate3D.speed']);
+    // Non-vacuity: the capture the re-seed reads widens it (#1829).
+    expect(capturedRecordsOf(rootId())!.find((r) => r.rootGuid === ROOT1)!.list.rows.get(key(3))?.traits?.Rotate3D).toEqual({ axis: 'y', speed: 2 });
+    expect(reseeded()).toEqual({ speed: 2 });
+  });
+  // Accept side: a stated field at its default value is marked, so it is a statement and stays.
+  it('a field the file stated at its default stays', async () => {
+    await load(withRotate({ axis: 'y', speed: 2 }));
+    expect(rotateMarks()).toEqual(['Rotate3D.axis', 'Rotate3D.speed']);
+    expect(reseeded()).toEqual({ axis: 'y', speed: 2 });
+  });
+  // Why `baseHas` has no reachable accept case (#2058 review, finding 2): the capture states a component the base SUPPLIES
+  // by its marks alone, and a rotation stated in part is marked whole on load (one value, #1880 F5), so no unmarked field
+  // of one reaches the narrowing. This pins that premise; were it to break, `baseHas` is what keeps such a field.
+  it('a partial rotation on a component the base supplies is marked whole, so a re-seed keeps it whole', async () => {
+    const d = scene() as unknown as { entities: Record<string, unknown>[] };
+    d.entities[1]!.overrides = { 3: { Transform: { rx: 0.5 } } };
+    await load(d as unknown as SceneData);
+    const tfMarks = () => [...(getOverrideMarkSet(findEntity(byName('B'))! as never) ?? [])].filter((m) => m.startsWith('Transform.')).sort();
+    const captured = capturedRecordsOf(rootId())!.find((r) => r.rootGuid === ROOT1)!.list.rows.get(key(3))?.traits?.Transform;
+    markStale(getCurrentWorld(), 'test');
+    expect(reseedFromCapture(rootId())).toBe(true);
+    expect({ marks: tfMarks(), captured, reseeded: row(key(3))?.traits?.Transform }).toEqual({ marks: ['Transform.rx', 'Transform.ry', 'Transform.rz'], captured: { rx: 0.5, ry: 0, rz: 0 }, reseeded: { rx: 0.5, ry: 0, rz: 0 } });
+  });
+  // Accept side: a component a gesture added is recorded whole (`addComponent`), defaults included, and a re-seed keeps it so.
+  it('a component a gesture added keeps every field', () => {
+    addTraitToEntitiesWithUndo([byName('B')], meta('Rotate3D'));
+    expect(row(key(3))?.traits?.Rotate3D).toEqual({ axis: 'y', speed: 1 });
+    expect(reseeded()).toEqual({ axis: 'y', speed: 1 });
   });
 });
 

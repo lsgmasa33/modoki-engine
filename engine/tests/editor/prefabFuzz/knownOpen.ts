@@ -73,6 +73,21 @@ const partialAddedWidened = (f: StepFailure): boolean => {
 };
 
 
+/** #1829 on P1 (#2058, hunt seed 7512): the same widening, seen by the store's projection instead of a reload. A respawn
+ *  from the old capture (here Create Prefab's undo) marks every field of the partially stated added component, while the
+ *  record keeps what the file stated, so the LIVE side carries a mark the projection lacks. Marks are sorted, so at the
+ *  first differing index the live mark sorting first (or the projection ending) proves the live side has a mark the
+ *  projection lacks (not that it has only that one: a projection that also states another field would match too, which is
+ *  why its stop needs the observed route). The opposite direction, a record stating a field the live tree does not mark, is a re-seed that copied the capture's
+ *  widening into the list, which S6 would write: fixed (`instanceSync.ts` `withoutUnstatedAddedFields`), never claimed. */
+const partialAddedOvermarkedLive = (f: StepFailure): boolean => {
+  if (f.check !== 'P1 the projection of a record is not its live instance') return false;
+  const m = /^([0-9a-f-]{36}) \/([0-9a-f-]{36})\/marks\/\d+: "(\w+)\.(\w+)" vs (?:"(\w+)\.(\w+)"|undefined)$/.exec(f.detail);
+  if (!m || m[1] !== m[2] || ['Transform', 'EntityAttributes', 'PrefabInstance'].includes(m[3]!)) return false;
+  if (m[5] !== undefined && (m[5] !== m[3] || !(m[4]! < m[6]!))) return false;
+  return (f.touched?.fileDirect ?? []).includes(m[1]!);
+};
+
 /** #2013: today's load keeps a member's `removed` in its orphan store AND applies it — the fold removed that member too,
  *  which the oracle marks `(applied)`. Every divergence line of the step must be one (`foldCheck` reports them all). The
  *  `own` rows first waived here were NOT this: the fold keeps those in neither its anchors nor its unused (#2009 review). */
@@ -80,6 +95,31 @@ const orphanBookedTwice = (f: StepFailure): boolean => {
   if (f.check !== 'P1 the live instance is not the fold of its record') return false;
   const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
   return lines.every((l) => /^kept-only unused \S+ removed \(applied\)$/.test(l));
+};
+
+/** #1931's mechanism on FIELD records (#2058, hunt seed 7562): a reference node a prefab edit added (`…/a+<key>/…`), a
+ *  field edited on one of its members, then a reload. Today's settle keeps that member's field records (kept, as unused)
+ *  and the instance shows them too, where the fold of the same entry applies them and lists nothing unused: each line a
+ *  kept FIELD leaf on a row reaching into a template-added node. Unlike a link (`linkBookedTwice`), a field leaf carries no
+ *  `(applied)` mark, so this cannot tell "the fold applied it" from "the fold lost it": it is a STOP, never tolerated,
+ *  and the store's own P1 (the record projected) still judges what S6 writes. */
+const fieldsBookedTwice = (f: StepFailure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  const lines = f.detail.replace(/^\S+ /, '').split(' ; ');
+  return lines.every((l) => /^kept-only unused \S*\/a\+[^/\s]+\/\S+ [A-Z]\w*\.\w+$/.test(l));
+};
+
+/** #2099 (#2058, hunt seed 7615): a Detach unpacks an instance whose content holds a Missing Prefab ROW placeholder; the
+ *  live node stays the placeholder, the capture's inline own content writes it plain, and P1's projection (scene-owned
+ *  content taken from that capture) shows a plain node where the live tree has the placeholder. */
+const detachedRowPlaceholder = (f: StepFailure): boolean =>
+  f.check === 'P1 the projection of a record is not its live instance' && /^\S+ \/[0-9a-f-]{36}\/row: true vs undefined$/.test(f.detail);
+
+/** #2100 (#2058, hunt seed 7645): a re-add of a removed component clears the removal in the record and the capture (G1),
+ *  but the old kept-unused store still holds it: every line a kept removal the fold does not list. */
+const reAddedKeptRemoval = (f: StepFailure): boolean => {
+  if (f.check !== 'P1 the live instance is not the fold of its record') return false;
+  return f.detail.replace(/^\S+ /, '').split(' ; ').every((l) => /^kept-only unused \S+ -[A-Z]\w*$/.test(l));
 };
 
 /** #1931 member 1's P1 shape (#2023): on a TEMPLATE-ADDED row (`…/a+…`, the rows `templateFrameNodes` decides), today
@@ -157,6 +197,72 @@ export const KNOWN_OPEN: KnownOpen[] = [
     ],
     reproduces: (f) => partialAddedWidened(f),
     stops: (f, ops) => partialAddedWidened(f) && ops.slice(0, f.step).some((o) => o.kind === 'fileMutate'),
+  },
+  {
+    issue: 1829,
+    what: "#1829 seen by P1 (#2058, hunt seed 7512): a file-direct write states an added component partially (`Rotate3D: {speed: 2}`), Create Prefab turns the instance into a prefab and two undos bring it back. The undo respawns it from the old capture, which writes the component whole, so the live tree marks `axis` too, where the record keeps `speed` alone. The LIST is right (it is what the file stated); S6's save writes it, and the reload marks `speed` only. Values agree throughout. Hub ruling 2026-10-03: recorded on #1829, the old capture is not fixed",
+    repro: [
+      {kind: 'fileMutate', u: [0.4406395209953189, 0.13118481426499784, 0.531444427324459, 0.6088186670094728, 0.14829342090524733, 0.4819357134401798, 0.8098402046598494, 0.8826371389441192]},
+      {kind: 'editField', u: [0.1600618800148368, 0.12541370862163603, 0.3777471762150526, 0.8417782566975802, 0.8568708831444383, 0.2517908848822117, 0.9127532963175327, 0.2833624368067831], variant: 'toBase'},
+      {kind: 'createPrefab', u: [0.14408122119493783, 0.04904690128751099, 0.4958720800932497, 0.6683295532129705, 0.8172623903956264, 0.7895503570325673, 0.14383488637395203, 0.19527888391166925]},
+      {kind: 'undo', u: [0.19424327230080962, 0.12152680521830916, 0.4395646769553423, 0.23733717249706388, 0.051651057321578264, 0.4375051506794989, 0.49595680832862854, 0.802169177448377]},
+      {kind: 'undo', u: [0.07118040067143738, 0.4588431396987289, 0.9585348290856928, 0.08928052126429975, 0.29488438135012984, 0.1996025291737169, 0.08708830294199288, 0.12824086495675147]},
+    ],
+    reproduces: (f) => partialAddedOvermarkedLive(f),
+    // Only on the observed route: a file-direct write, a Create Prefab, then an undo (not checked to be that Create
+    // Prefab's, #2058 re-review). The first-diff line cannot exclude a projection that ALSO states a field the live tree
+    // lacks, so a bare shape would hide that (#2058 review).
+    stops: (f, ops) => {
+      if (!partialAddedOvermarkedLive(f)) return false;
+      const before = ops.slice(0, f.step + 1), file = before.findIndex((o) => o.kind === 'fileMutate');
+      const made = before.findIndex((o, i) => i > file && o.kind === 'createPrefab');
+      return file >= 0 && made > file && before.some((o, i) => i > made && o.kind === 'undo');
+    },
+  },
+  {
+    issue: 1931,
+    what: "#1931 on field records (#2058, hunt seed 7562): inside a prefab edit an agent instantiates a prefab (a template-added reference node), a field of one of its members is edited in the scene, and a reload keeps those field records as unused while the instance shows the edit (rx 1, marked) and the fold of the saved entry applies them. The save writes the row once and the store's projection matches the live tree; S8 deletes the kept stores",
+    repro: [
+      {kind: 'instantiate', u: [0.3553178678266704, 0.3202563014347106, 0.9194866034667939, 0.8210566870402545, 0.3394866450689733, 0.8027552580460906, 0.5011872530449182, 0.004331377102062106]},
+      {kind: 'prefabEdit', u: [0.2567180048208684, 0.5157781078014523, 0.9649082396645099, 0.07859208155423403, 0.9459575351793319, 0.10621962696313858, 0.5621734824962914, 0.0606699010822922], inner: [{kind: 'duplicate', u: [0.18462588964030147, 0.9115943843498826, 0.041108878795057535, 0.6311799623072147, 0.4605113093275577, 0.8888043891638517, 0.09429000783711672, 0.8082735198549926]}, {kind: 'agentInstantiate', u: [0.7334744080435485, 0.7161771552637219, 0.5013405915815383, 0.3469485710375011, 0.48510887334123254, 0.1125767242629081, 0.7655516711529344, 0.5689263942185789]}]},
+      {kind: 'editField', u: [0.3037849715910852, 0.6581992018036544, 0.5464207823388278, 0.2169429692439735, 0.6270450560841709, 0.3869077356066555, 0.7736029769293964, 0.14747512061148882]},
+    ],
+    reproduces: (f) => fieldsBookedTwice(f),
+    stops: (f) => fieldsBookedTwice(f),
+  },
+  {
+    issue: 2099,
+    what: "#2099 (#2058, hunt seed 7615): a nested prefab trashed and the scene reloaded (its row a Missing Prefab ROW placeholder inside a user-added instance), then that instance detached: the live node stays the placeholder, the save writes it as a plain node and loses the reference. Not the record (its rows are unchanged); the old capture's inline own-content writer. S6's own-content adapter must give it a form",
+    repro: [
+      {kind: 'instantiate', u: [0.26957426965236664, 0.9433535269927233, 0.43205804959870875, 0.16716787684708834, 0.2946264671627432, 0.03375298506580293, 0.2630784371867776, 0.4001484699547291]},
+      {kind: 'trashPrefab', u: [0.8420046551618725, 0.23699884046800435, 0.18811278813518584, 0.017240718007087708, 0.1533514689654112, 0.9918143444228917, 0.7034863331355155, 0.8845562189817429]},
+      {kind: 'saveReload', u: [0.821804279461503, 0.34884613868780434, 0.6294836406596005, 0.10124274692498147, 0.9881440987810493, 0.3039113983977586, 0.42803365737199783, 0.8990707388147712]},
+      {kind: 'detach', u: [0.5516347591765225, 0.5596253755502403, 0.45942430780269206, 0.1479144503828138, 0.24588677333667874, 0.22238363255746663, 0.7948488909751177, 0.8514142651110888]},
+      {kind: 'removeComponent', u: [0.09590236283838749, 0.9604742815718055, 0.20532211777754128, 0.2813355016987771, 0.48125550523400307, 0.8216665666550398, 0.5388927164021879, 0.6306644603610039]},
+    ],
+    reproduces: (f) => detachedRowPlaceholder(f),
+    // A trash, then a detach after it. The detail names the node, not the instance the detach unpacked, so this cannot
+    // prove the detach held that placeholder (#2058 review); another route writing a row placeholder plain after both
+    // would be claimed here.
+    stops: (f, ops) => {
+      if (!detachedRowPlaceholder(f)) return false;
+      const before = ops.slice(0, f.step), trash = before.findIndex((o) => o.kind === 'trashPrefab');
+      return trash >= 0 && before.some((o, i) => i > trash && o.kind === 'detach');
+    },
+  },
+  {
+    issue: 2100,
+    what: "#2100 (#2058, hunt seed 7645): a component removal the settle kept as unused (after an outside edit's rebuild), then the component re-added: the record and the save clear the removal (G1), the old kept-unused store keeps it. No save writes it; S8 deletes the store",
+    repro: [
+      {kind: 'removeComponent', u: [0.4056257554329932, 0.39117668056860566, 0.5714419099967927, 0.5315750995650887, 0.9070738325826824, 0.9020393050741404, 0.37790831131860614, 0.06581191555596888]},
+      {kind: 'instantiate', u: [0.8448484004475176, 0.6253486371133476, 0.5035986516159028, 0.8665857878513634, 0.5170961888507009, 0.7878143140114844, 0.18295332230627537, 0.7647610339336097]},
+      {kind: 'duplicate', u: [0.011624109465628862, 0.9367039608769119, 0.691789886681363, 0.7249870239757001, 0.4400071876589209, 0.8253199844621122, 0.6116923061199486, 0.45167486532591283]},
+      {kind: 'apply', u: [0.7985161130782217, 0.4567606549244374, 0.40499237342737615, 0.7974555031396449, 0.7602407394442707, 0.5543917084578425, 0.040601929649710655, 0.8694469735492021], check: 'rebuild-reload'},
+      {kind: 'outsideEdit', u: [0.9803751928266138, 0.571986474795267, 0.8921251546125859, 0.2460941793397069, 0.2755738932173699, 0.5028274613432586, 0.10348875285126269, 0.8907636271324009], check: 'rebuild-reload', variant: 'removeLeaf'},
+      {kind: 'addComponent', u: [0.33016201108694077, 0.14834991586394608, 0.16371638630516827, 0.3036507696378976, 0.5256671071983874, 0.1005841363221407, 0.04083234956488013, 0.5862007224932313]},
+    ],
+    reproduces: (f) => reAddedKeptRemoval(f),
+    stops: (f, ops) => reAddedKeptRemoval(f) && ops[f.step]?.kind === 'addComponent',
   },  {
     issue: 2013,
     what: "#2013 (hunt seed 1062; #2009's P1 by the fold): today's load keeps a member's `removed` in its orphan store AND applies it, and the fold applies it too (the oracle marks it `(applied)`). Hub ruling 2026-10-02: a record is projected or unused, never both, so today is wrong; not patched on the old model, retired by #2001 S6 (save writes the record). Its `own` rows, first waived here, are #2018",
@@ -1760,6 +1866,15 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       { kind: 'apply', u: [0.7484856233932078, 0.4808379807509482, 0.9611606618855149, 0.2707494816277176, 0.40927455946803093, 0.709763644495979, 0.4179386501200497, 0.30059280898422003] },
       { kind: 'fileMutate', u: [0.7869242636952549, 0.6841396752279252, 0.3284403537400067, 0.1518406744580716, 0.9789406408090144, 0.5383732581976801, 0.0731429778970778, 0.640561449341476] },
       { kind: 'revert', u: [0.05527145625092089, 0.7611915788147599, 0.30892440071329474, 0.49319102009758353, 0.6285661072470248, 0.34565233322791755, 0.05739857838489115, 0.7722912475001067] },
+    ],
+  },
+  {
+    issue: 2058,
+    what: "#2058 (hunt seed 7399, reduced to its mechanism): a nested prefab trashed, an instance placed under that nested row's node, the scene saved and reloaded (the row now a Missing Prefab ROW placeholder, which the load also keeps as an R2 orphan row holding the placed node), then the undo walk undoes the placement. The capture wrote the kept row's copy of the node back because it was no longer live, so the save resurrected it, and a re-seed put its link back into the record S6 would save. At a live row placeholder every node the row holds shows under it, so a node there that is not live was deleted (`prefabMembers.ts` `withoutLiveNodes`)",
+    reaches: { op: 1, outcome: 'done' },
+    repro: [
+      { kind: 'trashPrefab', u: [0.9456454908940941, 0.7325671100988984, 0.039949448546394706, 0.7432186692021787, 0.11008315393701196, 0.6760137423407286, 0.23665319220162928, 0.5889058844186366] },
+      { kind: 'instantiate', u: [0.8130684308707714, 0.8156513851135969, 0.6440570198465139, 0.29428050690330565, 0.049499645130708814, 0.6452965852804482, 0.13713953946717083, 0.883199515286833] },
     ],
   },
   {

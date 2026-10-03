@@ -297,6 +297,10 @@ describe('#1789 prefab fuzz', () => {
       // Which open issue already claims this failure, as the hunt would say it (triage; the verdict is unchanged).
       const known = r.failure ? knownStop(r.failure, ops) : undefined;
       if (known) realError(`replay: stopped at KNOWN_OPEN #${known.issue} (${known.what})`);
+      // Which checks this list reached, and which it skipped: a replay that passes because its record was never judged
+      // (stale, a trashed prefab) has not retired its finding (#2058).
+      const tally = (m: Map<string, number>) => [...m].sort().map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
+      process.stderr.write(`replay — checks run: ${tally(checksRun)}\nchecks skipped by a taint: ${tally(skippedChecks)}\n`);
       expect(r.failure, r.failure ? `${r.failure.check}: ${r.failure.detail}` : '').toBeUndefined();
     }, 600_000);
     return;

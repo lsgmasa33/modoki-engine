@@ -13,11 +13,11 @@
  * it, so each of those gets its record too (`recordsOf`).
  */
 import type { World } from 'koota';
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { durableGuid } from '../../runtime/core/assetRefRules';
-import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
+import { rowPlaceholderOf, unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { asSceneEntry } from '../../runtime/loaders/unresolvedPrefabRefs';
 import type { SceneEntityEntry } from '../../runtime/loaders/loadSceneFile';
 import { recordsOf } from '../../runtime/prefab/instanceLoad';
@@ -30,7 +30,10 @@ import { openIdentityScope, closeIdentityScope } from '../../runtime/core/ecs/id
 import { getCachedPrefabSync } from '../scene/prefabCache';
 import { captureInstanceEntry } from '../scene/instanceEntry';
 import { savedFrameDoc } from '../scene/prefabRebuild';
-import { guidOfEntity, outermostStoredRoot, projectionRootOf, storedRootsUnder } from './instanceKeys';
+import { soaSchema } from '../../runtime/core/ecs/traitSchema';
+import { getOverrideMarkSet } from '../../runtime/loaders/overrideMarks';
+import { foldInstance } from '../../runtime/prefab/foldInstance';
+import { guidOfEntity, instanceKeyMap, outermostStoredRoot, projectionRootOf, storedRootsUnder } from './instanceKeys';
 
 type Bag = Record<string, unknown>;
 
@@ -97,8 +100,56 @@ export function reseedFromCapture(rootId: number, world: World = getCurrentWorld
   const top = projectionRootOf(rootId) || outermostStoredRoot(rootId) || rootId;
   const recs = capturedRecordsOf(top);
   if (!recs) return false;
-  for (const r of recs) setInstanceRecord(world, r);
+  for (const r of recs) setInstanceRecord(world, withoutUnstatedAddedFields(r, world));
   return true;
+}
+
+/** #1829 on the re-seed (#2058, hunt seeds 8231 and 8413). The old capture writes a component the base lacks WHOLE, where
+ *  a file can state it partially (an agent's file-direct write, `{Rotate3D: {speed: 2}}`) and the load marks only what it
+ *  states. A record re-seeded from that capture would state the rest too, so its projection marks fields the live tree
+ *  does not, and S6's save would write them. Such a field is dropped when the live node does not mark it and it holds the
+ *  schema default: the fold gives an unstated field of a component the base lacks exactly that, so no value moves. A
+ *  component added by a gesture is stated and marked whole (`addComponent`), so it keeps every field. */
+function withoutUnstatedAddedFields(rec: InstanceRecord, world: World): InstanceRecord {
+  const root = findEntityByGuid(rec.rootGuid, world);
+  if (!root) return rec;
+  let byKey: Map<string, number> | undefined;
+  for (const [key, row] of rec.list.rows) {
+    for (const [t, bag] of Object.entries(row.traits ?? {})) {
+      if (!bag || bag === true || typeof bag !== 'object') continue;
+      const meta = getTraitByName(t);
+      const schema = meta ? soaSchema(meta) : null;
+      if (!schema) continue;
+      byKey ??= new Map([...instanceKeyMap(root.id())].map(([id, k]) => [k, id]));
+      const id = byKey.get(key);
+      const live = id === undefined ? undefined : findEntity(id);
+      if (!live) continue;
+      // A placeholder (a row whose prefab is missing, or a reference node's) has no marks and no base the fold can state:
+      // nothing there can be told apart from a statement, so it keeps every field (#2058 review: a rotation's default
+      // axes were dropped there, and came back wrong once the prefab returned).
+      if (unresolvedRefOf(live as never) || rowPlaceholderOf(live as never)) continue;
+      const marks = getOverrideMarkSet(live as never);
+      const dflt = (f: string) => (typeof schema[f] === 'function' ? (schema[f] as () => unknown)() : schema[f]);
+      const unstated = Object.keys(bag).filter((f) => f in schema && !marks?.has(`${t}.${f}`) && JSON.stringify((bag as Bag)[f]) === JSON.stringify(dflt(f)));
+      if (!unstated.length || baseHas(rec, key, t)) continue;
+      const kept: Bag = { ...(bag as Bag) };
+      for (const f of unstated) delete kept[f];
+      row.traits![t] = kept;
+    }
+  }
+  return rec;
+}
+
+/** Whether the base (every layer below this record's own row) supplies `trait` at `key`, or cannot be read there: a key the
+ *  fold does not reach (a placeholder, a frame it cannot expand) answers true, so the caller keeps the field. It holds the
+ *  narrowing to #1829's scope, components the base LACKS: today no capture states an unmarked field of a component the base
+ *  supplies (it writes those by their marks, and a rotation marked whole), so no reachable case turns on it (#2058 review;
+ *  `instanceEditsDoor.test.ts` pins that premise). */
+function baseHas(rec: InstanceRecord, key: string, trait: string): boolean {
+  const probe = structuredClone(rec);
+  delete probe.list.rows.get(key)!.traits![trait];
+  const node = foldInstance(editorPrefabReader, probe).nodes.get(key);
+  return !node || node.traits[trait] !== undefined;
 }
 
 /** Every record of the instance tree at outermost root `top` fresh: the tree re-seeded from its capture when ANY of them is

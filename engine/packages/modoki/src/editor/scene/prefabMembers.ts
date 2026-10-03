@@ -4,7 +4,8 @@
 
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { worldIdentityParents, frameRootDoc } from '../../runtime/core/ecs/identityParents';
-import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
+import { instanceRowKeysIn, memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
+import { rowPlaceholderOf } from '../../runtime/core/unresolvedPrefabRef';
 import { getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, readTraitData, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { filterAuthoringVisible } from './authoringScope';
@@ -295,7 +296,22 @@ export function captureInstanceMembers(rootInstanceId: number, prefab?: PrefabFi
   // rather than dropped, so an undone template edit (or a re-import that matches again) restores
   // the scene's identity for that member. A live member always wins the key, so a row that comes
   // back stops being an orphan on the next load without anything here noticing.
-  for (const [key, row] of keptOrphansWritten(rootInstanceId, out)) out[key] = withoutLiveNodes(row);
+  // …less, at a key where a Missing Prefab ROW placeholder is live, every `own` link it states that is not live (#2058,
+  // hunt seed 7399): what the user hung at that row shows under the placeholder (#2018) and is captured there, so a node
+  // there that is not live was deleted, or its placement undone, after the load, and writing the kept copy brought it back.
+  let shown: Set<string> | undefined;
+  for (const [key, row] of keptOrphansWritten(rootInstanceId, out)) {
+    shown ??= rowPlaceholderKeys(rootInstanceId);
+    out[key] = withoutLiveNodes(row, shown.has(key));
+  }
+  return out;
+}
+
+/** The row keys of the live Missing Prefab ROW placeholders in the instance at `rootInstanceId` (`instanceRowKeysIn` keys
+ *  each at its row, as the fold does). */
+function rowPlaceholderKeys(rootInstanceId: number): Set<string> {
+  const out = new Set<string>();
+  for (const [id, key] of instanceRowKeysIn(rootInstanceId)) if (rowPlaceholderOf(findEntity(id) as never)) out.add(key);
   return out;
 }
 
@@ -311,10 +327,14 @@ function keptOrphansWritten(rootInstanceId: number, written: Record<string, Scen
  *  such a node where it lives: one shown at a missing nested row's placeholder is the node the user hung AT that row
  *  (#2018), captured there with its live content; one moved elsewhere is captured where it went. Written by the row as
  *  well, both copies expanded once the prefab returned — the node twice, one guid. A node not live stays as the file
- *  held it (a member under a missing frame, which shows nothing). */
-function withoutLiveNodes(row: SceneMemberRow): SceneMemberRow {
+ *  held it (a member under a missing frame, which shows nothing). AT a live row placeholder the row's `own` links all show
+ *  (#2018), so `atPlaceholder` drops every one, the live ones captured where they are; a keyed copy in its `added` waits
+ *  unresolved, never shown (`foldInstanceOracle.test.ts` E1), and is kept as before. */
+function withoutLiveNodes(row: SceneMemberRow, atPlaceholder = false): SceneMemberRow {
   const live = (n: { guid?: unknown } | undefined) => typeof n?.guid === 'string' && !!n.guid && !!findEntityByGuid(n.guid);
-  const own = row.own?.filter((n) => !live(n)), added = row.added?.filter((n) => !live(n));
+  const added = row.added?.filter((n) => !live(n));
+  if (atPlaceholder) { const { own: _own, ...rest } = row; return { ...rest, ...(added ? { added } : {}) }; }
+  const own = row.own?.filter((n) => !live(n));
   return { ...row, ...(own ? { own } : {}), ...(added ? { added } : {}) };
 }
 
