@@ -14,6 +14,8 @@ import { previewApply, type ApplyPreview } from '../scene/prefabApply';
 import { revertRefusal } from '../scene/prefabRevert';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../undo/revertPrefabUndo';
+import { removeUnusedOverridesWithUndo } from '../undo/removeUnusedUndo';
+import { instanceRemovableUnused, instanceUnusedOverrides } from '../scene/unusedOverrides';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
@@ -136,6 +138,11 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const [pressNote, setPressNote] = useState<{ text: string; selection: string } | null>(null);
   // #1773: a world change (an edit, an undo, Play/Stop, a pose preview) re-plans the preview too.
   const worldKey = useSyncExternalStore(subscribePreviewWorld, previewWorldKey, previewWorldKey);
+  // The unused overrides, read off the record each time the world moves (#2001 S9): Remove Unused and its undo change them
+  // with no reload of the listing.
+  const unused = useMemo(() => (active && rootInstanceId !== null && loadState.kind === 'ready'
+    ? { count: instanceUnusedOverrides(rootInstanceId), removable: instanceRemovableUnused(rootInstanceId) }
+    : null), [active, rootInstanceId, loadState.kind, worldKey]);
 
   /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
    *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
@@ -328,6 +335,24 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     }
   };
 
+  /** Remove Unused (#2001 S9; Unity's Remove Unused Overrides): the removable unused records come off the list, one undo
+   *  step. The dialog stays open: nothing it lists changes. */
+  const handleRemoveUnused = async () => {
+    if (rootInstanceId === null || applying) return;
+    setApplying(true);
+    try {
+      await runOnPinnedSubject({
+        subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
+        act: (liveId) => {
+          const out = removeUnusedOverridesWithUndo(liveId);
+          if ('refused' in out) useEditorStore.getState().showToast(`Remove Unused: nothing was removed — ${out.refused}`, 'warn');
+        },
+      });
+    } finally {
+      setApplying(false);
+    }
+  };
+
   const baseRow: React.CSSProperties = { display: 'flex', alignItems: 'center', minHeight: 22, fontFamily: 'monospace', fontSize: 12 };
 
   /** A row's target (#1693): what applying it does at the chosen prefab — a picker when there is more than one — and,
@@ -382,7 +407,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
 
   if (!active) return null;
   // The root's default overrides AT their current targets (#1831): what the checkboxes, their states and the badge read.
-  const unusedLine = loadState.kind === 'ready' ? unusedOverridesLine(loadState.unusedOverrides) : null;
+  const unusedLine = unused ? unusedOverridesLine(unused.count, unused.removable) : null;
   const defaultOverrides = loadState.kind === 'ready' ? effectiveDefaults(loadState.defaultOverrides, choice, loadState.source, noResolve) : new Set<string>();
   const renderEntityNode = (fnode: ForestNode<EntityNode>): React.ReactElement => {
     const e = fnode.node;
@@ -496,9 +521,20 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             && buildOverrideForest(loadState.entities).map((fnode) => renderEntityNode(fnode))}
 
           {unusedLine !== null && (
-            // #1914 F6: read-only, as Unity's Remove is later work. Neither Apply nor Revert touches them.
-            <div data-ui-id="prefab.dialog.unused" style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px' }}>
-              {unusedLine}
+            // #1914 F6: neither Apply nor Revert touches them; Remove Unused takes the removable ones (#2001 S9).
+            <div data-ui-id="prefab.dialog.unusedRow" style={{ color: '#888', fontSize: 11, padding: '2px 4px 6px', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span data-ui-id="prefab.dialog.unused">{unusedLine}</span>
+              {unused!.removable > 0 && (
+                <button
+                  data-ui-id="prefab.dialog.removeUnused"
+                  disabled={applying}
+                  onClick={() => void handleRemoveUnused()}
+                  title="Remove the overrides whose target the prefab no longer has (a member or component it removed, or a field its component no longer declares). Undoable. Overrides on a component this build does not register stay."
+                  style={{ background: '#333', color: '#ccc', border: '1px solid #555', borderRadius: 3, fontSize: 11, padding: '1px 8px', cursor: applying ? 'default' : 'pointer' }}
+                >
+                  Remove Unused
+                </button>
+              )}
             </div>
           )}
           {loadState.kind === 'ready' && loadState.unaddressableAdded > 0 && (

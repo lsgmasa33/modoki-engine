@@ -32,7 +32,7 @@ import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
-import { rollbackOnThrow } from '../instance/instanceRollback';
+import { rollbackOnThrow, unsavableMarkOf } from '../instance/instanceRollback';
 import { movedSceneFile, type PathMove } from '../utils/assetPaths';
 import { toOpenProjectScenePath } from './openProjectScenePath';
 
@@ -335,6 +335,8 @@ export async function beginTimelinePreviewSession(): Promise<boolean> {
   if (getRunMode() === 'playing' || _closedHolds > 0) return false;
   // A failed restore left the world possibly posed: snapshotting it would launder the pose (#1548).
   if (lastRestoreFailed()) return false;
+  // Nor on a world no save may write: the Exit's restore makes a new world no mark holds (#2141 review).
+  if (unsavableMarkOf()) return false;
   if (_snap) return true;
   if (_pending && _pendingLive()) { await _pending; return _snap !== null; }
   // #1167's refusal covers ANY authored restore, not only a preview one (#1572). Stop sets 'stopped'

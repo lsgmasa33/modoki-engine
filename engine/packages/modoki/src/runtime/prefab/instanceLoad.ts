@@ -15,7 +15,7 @@ import { keyedNodeFrame, keylessNodeKey, parseInstanceRecord, parseReferenceNode
 import { ROOT_ROW_KEY } from './instanceRecord';
 import { foldInstance } from './foldInstance';
 import { serializeInstanceRecord, withWrittenList } from './serializeInstanceRecord';
-import { dropInstanceRecord, renameInRecord, setInstanceRecord, storedInstance } from './instanceStore';
+import { dropInstanceRecord, renameInRecord, renameOwnContent, setInstanceRecord, storedInstance } from './instanceStore';
 import { adoptBankedRecords, type RecordBank } from './recordBank';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { findEntityById, findEntityByGuid } from '../core/ecs/world';
@@ -249,7 +249,7 @@ export function fillInstanceStoreReporting(
       const derived = !entry.guid ? rootGuidOf?.(entry) : undefined;
       const owner = derived ? { ...entry, guid: derived } : entry;
       const parts = recordsOf(parseInstanceRecord(owner, cachedPrefabReader, opts), cachedPrefabReader, opts);
-      if (renamed.size) for (const p of parts) { renameInRecord(p.record, renamed); p.record.rootGuid = renamed.get(p.record.rootGuid) ?? p.record.rootGuid; }
+      if (renamed.size) for (const p of parts) { renameInRecord(p.record, renamed); renameOwnContent(p.ownContent, renamed); p.record.rootGuid = renamed.get(p.record.rootGuid) ?? p.record.rootGuid; }
       for (const p of parts) ownKeylessTemplateNodes(world, p.record, cachedPrefabReader);
       for (const p of parts) { setInstanceRecord(world, p.record); seeded.push(p.record.rootGuid); partsOf.set(p.record.rootGuid, parts); }
       // #2046 S7.6: a world the editor reloads from its own text takes back the exact lists it held (`recordBank.ts`).

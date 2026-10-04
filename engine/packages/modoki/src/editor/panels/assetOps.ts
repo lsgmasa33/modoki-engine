@@ -32,7 +32,7 @@ import { isResourceEntity } from '../../runtime/core/ecs/hierarchy';
 import { commitPrefabWrite, parsePrefabBytes, prefabTextIsDocument, prefabConflictReason, parkPrefabChanges } from '../scene/prefabCommit';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { entityRef, isInstanceRootCheck, type EntityRef } from '../undo/entityRef';
-import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { getTraitByName, getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { resolveRef } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
@@ -43,7 +43,7 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { captureAdoptionGate } from '../scene/adoptionGate';
 import { askWhileWorldHolds, worldReplacedNotice } from '../scene/worldBoundModal';
 import type { ModalOptions } from '../utils/saveDialog';
-import { captureEntityIdentity, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { captureEntityIdentity, findEntity, getAllEntities, cloneTraitValues } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { seatSide, takeRecordsAround, type RecordsSide } from '../instance/instanceHistory';
 import { frameRootDoc } from '../../runtime/core/ecs/identityParents';
@@ -53,6 +53,8 @@ import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPath
 import { flushPendingMetaFor } from '../scene/pendingMeta';
 import { existingAssetPath } from '../scene/createAssetDocument';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
+import { reprojectFromStore } from '../instance/instanceReproject';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -710,6 +712,55 @@ export function createPrefabFromEntity(...args: CreatePrefabArgs): ReturnType<ty
 }
 type CreatePrefabArgs = Parameters<typeof createPrefab> extends [unknown, ...infer R] ? R : never;
 
+/** Each guided entity's component values in the tree at `rootId`, by guid and trait name: what a redo's projection from the
+ *  record replaces (#2101). Its link and its place in the tree (`PrefabInstance`; `EntityAttributes`' parent and guid)
+ *  are not values: the undo puts those back through its own unlink. */
+type LiveValues = Map<string, Map<string, Record<string, unknown>>>;
+function liveValuesOf(rootId: number): LiveValues {
+  const all = getAllEntities();
+  const kids = new Map<number, number[]>();
+  for (const e of all) if (e.parentId) kids.set(e.parentId, [...(kids.get(e.parentId) ?? []), e.id]);
+  const out: LiveValues = new Map();
+  for (const stack = [rootId]; stack.length;) {
+    const id = stack.pop()!;
+    stack.push(...(kids.get(id) ?? []));
+    const e = findEntity(id);
+    const guid = all.find((x) => x.id === id)?.guid;
+    if (!e || !guid) continue;
+    const traits = new Map<string, Record<string, unknown>>();
+    for (const meta of getAllTraits()) {
+      if (meta.name === 'PrefabInstance' || !e.has(meta.trait)) continue;
+      traits.set(meta.name, cloneTraitValues(e.get(meta.trait) as Record<string, unknown>));
+    }
+    out.set(guid, traits);
+  }
+  return out;
+}
+
+/** Write `values` back onto the entities that hold their guids now (see `liveValuesOf`): only a PLAIN one, which the undo
+ *  has just unlinked. A frame the undo re-linked is its record's, seated by the undo (`seatSide`), and no raw write
+ *  reaches it here. */
+function putLiveValuesBack(values: LiveValues): void {
+  const pi = getTraitByName('PrefabInstance');
+  for (const [guid, traits] of values) {
+    const e = findEntityByGuid(guid);
+    if (!e || (pi && e.has(pi.trait))) continue;
+    // A component the projection ADDED, which the tree did not have, goes (#2101 close-out review: a component its file has
+    // and the drifted tree had lost came back, and stayed through the undo).
+    for (const meta of getAllTraits()) {
+      if (meta.name !== 'PrefabInstance' && !traits.has(meta.name) && e.has(meta.trait)) e.remove(meta.trait);
+    }
+    for (const [name, data] of traits) {
+      const meta = getTraitByName(name);
+      if (!meta) continue;
+      const keep = name === 'EntityAttributes' && e.has(meta.trait)
+        ? { parentId: (e.get(meta.trait) as { parentId?: number }).parentId, guid: (e.get(meta.trait) as { guid?: string }).guid } : {};
+      if (e.has(meta.trait)) e.set(meta.trait, { ...data, ...keep });
+      else e.add(meta.trait(data as never));
+    }
+  }
+}
+
 async function createPrefab(
   /** Takes the capture's snapshot, for `dropOnThrow`. */
   hold: (s: UnkeyedSnapshot) => UnkeyedSnapshot,
@@ -917,6 +968,8 @@ async function createPrefab(
   // to the prefab it was just unlinked from (#1264 close-out review). False when the world was replaced during the
   // write and there was no tree left to tag.
   let tagged = priorLinks !== null;
+  /** The values a redo's projection replaced (`liveValuesOf`), for its undo (#2101). */
+  let redoReplaced: LiveValues | null = null;
   // Landed, and nothing tagged (the world switched mid-write, or an adoption held the rebuild off and then failed without
   // switching): the capture's keys come off, as for a write that did not land (#1884 rider review) — and the redo, which
   // links the tree to the file, gets them to seat first (`keys`): the drop took the only copy, and its plan minted keys the
@@ -1011,6 +1064,9 @@ async function createPrefab(
           rebasedByUndo = rebaseStaleInstancesSoon({ sources: priorSources() });
           relinkedChanged = relinkedFramesCheck(priorLinks);
         }
+        // A redo that showed the tree from its record replaced the values the tree had (#2101): put back, so this undo
+        // returns the state that redo started from (#2144 close-out review).
+        if (redoReplaced) { putLiveValuesBack(redoReplaced); redoReplaced = null; }
         tagged = false;
         return;
       }
@@ -1093,12 +1149,25 @@ async function createPrefab(
           if (!getCachedPrefabSync(guid)) primeEditorPrefabCache(guid, prefab);
           // The same cold-cache flatten as the commit's rebuild below (#1284), and the same re-resolve after it.
           await preloadNestedPrefabsForSubtree(id);
+          // The values the projection below replaces, for the undo of this redo to put back (its forward state is this
+          // one). Taken BEFORE the tag: by the guids the undo's unstamp gives back (#2101 close-out review).
+          if (getTraitByName('PrefabInstance')) redoReplaced = liveValuesOf(ref.require());
           // The keys the file holds go back on first (#1830), and a tree that no longer plans to its rows refuses.
           const t = tagKeeping(ref.require(), at, prefab, { keys }); // undo reverses THIS run's rename
           if (t.refused) throw treeChangedRefusal(t.refused);
           ({ guidRemap, undoKept } = t);
           if (!tagged) priorLinks = t.priorLinks;
           tagged = true;
+          // The tag re-links the tree in place, keeping its live values, while the record it seats states none of them:
+          // a value the tree took since the create (a Detach's redo carries the source prefab's later edits, #2101) was
+          // then neither the file's nor recorded, and the next rebuild moved it. A redo restores the state the create
+          // left (hub ruling (a), 2026-10-05, as Unity's redo replays it): the instance is shown from its record, the
+          // file's values. A projection that fails throws, and the step rolls back (`rollBack`), loudly.
+          // Not in a world with no instance type (a bare one): no record to show it from.
+          const refused: { why?: string } = {};
+          if (getTraitByName('PrefabInstance') && !reprojectFromStore(ref.require(), undefined, undefined, { refused })) {
+            throw new Error(`Redo "${label}": ${at} was linked, but the instance could not be shown from its record (${refused.why ?? 'no reason given'})`);
+          }
           return;
         }
       }

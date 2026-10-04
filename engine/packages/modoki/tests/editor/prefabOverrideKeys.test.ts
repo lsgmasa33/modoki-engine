@@ -279,7 +279,7 @@ describe('the keys a caller must NOT be handed blindly (close-out review)', () =
     const { listingFor, listingKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
     const listing = {
       entities: [], addedTags: [], added: [], removedEntities: [], removedTraits: [], moved: [],
-      nested: ['3:2.Transform.x'], applyExcluded: [], defaultOverrides: [], unaddressableAdded: 0, unusedOverrides: 0,
+      nested: ['3:2.Transform.x'], applyExcluded: [], defaultOverrides: [], unaddressableAdded: 0, unusedOverrides: 0, removableUnused: 0,
     };
     expect(listingKeys(listingFor(listing, 'apply'))).toEqual(['3:2.Transform.x']);
     expect(listingKeys(listingFor(listing, 'revert'))).toEqual([]);

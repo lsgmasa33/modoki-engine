@@ -451,7 +451,7 @@ const DECLS: Record<string, Decl> = {
     minimalArgs: { action: 'instantiate', path: '/assets/prefabs/probe.prefab.json' },
     notes: 'Sends `prefabAction` on the wire: the relay STRIPS a param named `action`. '
       + "persists:'both' because action:'create' and 'apply' WRITE the .prefab.json "
-      + "(commitPrefabWrite, conditional on what was read — #1692) while instantiate/detach/overrides/revert are "
+      + "(commitPrefabWrite, conditional on what was read — #1692) while instantiate/detach/overrides/revert/remove-unused are "
       + "live-only. No undo writes a file (#1868): apply's undo restores the pre-apply document IN MEMORY and parks it, "
       + "so the file keeps the applied bytes until modoki_save_all writes the park (or modoki_discard_asset_edits drops it). "
       + "create IS the Hierarchy's Create Prefab (#1873): the same refusals, word for word, and a resource entity is refused. "

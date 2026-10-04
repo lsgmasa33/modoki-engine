@@ -1204,7 +1204,7 @@ same actions + state a person has in the editor. They relay to the renderer over
 
   | Outcome | `play` / `stop` reply |
   |---|---|
-  | Play refused: `scene-swap` (a load or an authored restore in flight), `restore-failed`, `already-starting`, `load-landed` (mid-snapshot) | `ok:false, code:'REFUSED_BY_OP', reason, error` — `error` is the same string the toolbar's console warn prints |
+  | Play refused: `scene-swap` (a load or an authored restore in flight), `restore-failed`, `unsavable` (a mark holds the world unsavable — reopen the scene, #2141), `already-starting`, `load-landed` (mid-snapshot) | `ok:false, code:'REFUSED_BY_OP', reason, error` — `error` is the same string the toolbar's console warn prints |
   | Play started, then a Stop queued during startup ended it | `ok:false, code:'REFUSED_BY_OP', reason:'stopped-during-startup', reverted` — `reverted` is that Stop's answer; its restore THROWING lands here too, as `reverted:false` |
   | Stop ran its restore | `ok:true, reverted:true` |
   | Stop skipped it (scene changed during Play or preview; no snapshot) | `ok:true, reverted:false, reason` — the snapshot was not restored, so after a Play the live world keeps what Play did (after a preview it is the scene that replaced it) |

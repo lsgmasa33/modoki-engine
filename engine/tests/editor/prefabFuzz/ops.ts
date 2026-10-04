@@ -32,6 +32,9 @@ import { applyTargetOptions } from '../../../packages/modoki/src/editor/scene/pr
 import { initialTargets, setAllTargets, toApplyTargets, applyBlocked, groupToggle, retargetChecks } from '../../../packages/modoki/src/editor/panels/applyDialogModel';
 import { applyToPrefabWithUndo } from '../../../packages/modoki/src/editor/undo/applyPrefabUndo';
 import { revertOverridesWithUndo } from '../../../packages/modoki/src/editor/undo/revertPrefabUndo';
+import { removeUnusedOverridesWithUndo } from '../../../packages/modoki/src/editor/undo/removeUnusedUndo';
+import { serializeScene } from '../../../packages/modoki/src/editor/scene/serialize';
+import { instanceRemovableUnused } from '../../../packages/modoki/src/editor/scene/unusedOverrides';
 import { undoStep, breakUndoCoalescing } from '../../../packages/modoki/src/editor/undo/undoManager';
 import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../../packages/modoki/src/editor/scene/prefabEdit';
 import { saveScene, loadSceneReporting } from '../../../packages/modoki/src/editor/scene/serialize';
@@ -81,8 +84,11 @@ export interface Op {
    *    it must survive in between as unused overrides (#1914 F5, I18);
    *  - `restorePrefab` (an `outsideEdit`): a prefab the run trashed comes back, as its last text, while the editor is open
    *    (an OS-Trash restore, a pull), and the watcher re-imports it in place (#1934 F5). That is the in-place return of a
-   *    placeholder over a world holding the scene's copies, which nothing drove before (#1934 S1 lived there). */
-  variant?: 'toBase' | 'toOverride' | 'removeLeaf' | 'restoreLeaf' | 'restorePrefab';
+   *    placeholder over a world holding the scene's copies, which nothing drove before (#1934 S1 lived there).
+   *  - `removeUnused` (a `revert`): the dialog's Remove Unused in place of its Revert (#2001 S9), on an instance that keeps a
+   *    removable unused override (which a `removeLeaf` makes), and nothing removable may be left after it.
+   */
+  variant?: 'toBase' | 'toOverride' | 'removeLeaf' | 'restoreLeaf' | 'restorePrefab' | 'removeUnused';
 }
 
 /** Relative weights. Structure-changing ops and the three that CHECK (save→reload, undo, apply) are weighted up. */
@@ -141,6 +147,7 @@ export function generate(seed: number, length: number, exclude: ReadonlySet<OpKi
       if (op.kind === 'saveReload' && op.u[1]! >= 0.65) op.save = op.u[3]! < 0.5 ? 'all-no-reload' : 'all';
       if ((op.kind === 'apply' || op.kind === 'outsideEdit') && op.u[7]! >= 0.7) op.check = 'rebuild-reload';
       if (op.kind === 'editField' && op.u[4]! >= 0.75) op.variant = 'toBase';
+      if (op.kind === 'revert' && op.u[5]! >= 0.7) op.variant = 'removeUnused';
       if (op.kind === 'outsideEdit') op.variant = op.u[4]! < 0.25 ? 'toOverride' : op.u[4]! < 0.45 ? 'removeLeaf' : op.u[4]! < 0.6 ? 'restoreLeaf' : op.u[4]! < 0.75 ? 'restorePrefab' : undefined;
       if (op.variant === undefined) delete op.variant;
       ops.push(op);
@@ -574,6 +581,28 @@ export async function execute(op: Op, st: RunState): Promise<Outcome> {
     }
     case 'apply':
     case 'revert': {
+      if (op.variant === 'removeUnused') {
+        const root = pick(u[0], ents.filter((x) => isInstanceRoot(x.id) && instanceRemovableUnused(x.id) > 0))?.id;
+        if (root == null) return 'noop';
+        // What the scene saves, its fresh id and stamp aside: the records are what changes, and nothing live does.
+        const saves = async () => { const { id: _i, createdAt: _c, ...rest } = (await serializeScene()) as unknown as Record<string, unknown>; return JSON.stringify(rest); };
+        const was = await saves();
+        const out = removeUnusedOverridesWithUndo(root);
+        if ('refused' in out) { st.note = out.refused; return 'refused'; }
+        const guid = ents.find((x) => x.id === root)?.guid;
+        const left = instanceRemovableUnused(root);
+        if (left) throw new Error(`Remove Unused left ${left} removable unused override(s) on ${guid}`);
+        // Its undo and redo, at once: a Remove changes nothing live, so no later check could tell an undo that put nothing
+        // back from one that did.
+        const is = await saves();
+        for (const [dir, want] of [['undo', was], ['redo', is]] as const) {
+          const r = await undoStep(dir);
+          if (!r.did || r.failed || r.refused) throw new Error(`Remove Unused's ${dir} did not run: ${r.refused ?? r.failed?.error ?? 'nothing on the stack'}`);
+          if ((await saves()) !== want) throw new Error(`Remove Unused's ${dir} on ${guid} does not save what ${dir === 'undo' ? 'the scene saved before it' : 'the Remove saved'}`);
+        }
+        st.note = `removed ${out.removed}`;
+        return 'done';
+      }
       const root = pick(u[0], ents.filter((x) => isInstanceRoot(x.id)))?.id;
       if (root == null) return 'noop';
       const source = piOf(root)!.source;

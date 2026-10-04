@@ -130,6 +130,9 @@ describe('Instantiate → Undo → Redo gives back the root guid, and every memb
     // …and the next undo → redo restores the guid this redo minted, not the squatter's.
     const minted = guidOf(respawned.id);
     await action.undo();
+    // That undo takes out the respawn, never the squatter that holds the recorded guid (#2061 close-out review).
+    expect(getAllEntities().filter((e) => e.name === 'Squatter')).toHaveLength(1);
+    expect(liveRoot(minted)).toBe(0);
     await action.redo();
     expect(liveRoot(minted)).toBeGreaterThan(0);
   });

@@ -31,13 +31,16 @@ import { sceneManager } from '../../packages/modoki/src/runtime/scene/SceneManag
 import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
 import { SCENE_FORMAT_VERSION, CAPTURE_FORM_SCENE_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { editorPrefabDeleted, getPrefabSource } from '../../packages/modoki/src/editor/scene/prefabCache';
-import { writeTraitFieldWithUndo, duplicateEntity, clipEntity, deleteEntityWithUndo, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
+import { writeTraitFieldWithUndo, duplicateEntity, clipEntity, pasteEntityCopy, deleteEntityWithUndo, createEntityWithUndo } from '../../packages/modoki/src/editor/undo/entityActions';
 import { emptySpecs } from '../../packages/modoki/src/runtime/scene/entityCreateSpecs';
 import { isRowPlaceholder } from '../../packages/modoki/src/editor/undo/placeholderGate';
 import { placePrefabFromPath } from '../../packages/modoki/src/editor/scene/prefabPlace';
+import { instantiatePrefabInstance } from '../../packages/modoki/src/editor/scene/prefabInstantiate';
+import { openPrefabForEditing, savePrefabEditReport, exitPrefabEditing } from '../../packages/modoki/src/editor/scene/prefabEdit';
 import { undoStep } from '../../packages/modoki/src/editor/undo/undoManager';
 import { runAsCompositeAction } from '../../packages/modoki/src/editor/undo/compositeAction';
 import { storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { reprojectFromStore } from '../../packages/modoki/src/editor/instance/instanceReproject';
 import { saveScene, loadSceneReporting, worldHasUnsavedEdits } from '../../packages/modoki/src/editor/scene/serialize';
 import { enterPlay, stopPlay } from '../../packages/modoki/src/editor/scene/playMode';
 
@@ -519,4 +522,271 @@ describe('#2067: an outside move is a move, not a delete', () => {
     await flushWatcher(be, before);
     expect(framesOf(f.prefabs.Q.guid), 'the put-back at a new path relinks them by GUID').toBe(live);
   });
+});
+
+describe('#2144: a copy taken before its prefab was trashed pastes as its Missing Prefab placeholder', () => {
+  // Hunt seeds 9443 / 8056 (copy ; trashPrefab ; paste): pasted INSIDE another instance (HR's QR > M), the copy's frame
+  // of P was kept live by HR's reprojection while its record folded to a Missing Prefab placeholder — the live tree
+  // was not what a save writes or a reload shows. Hub ruling (B), 2026-10-05, as Unity pastes it: the paste shows the
+  // placeholder at once, top-level and nested alike, through the trash's own conversion. Mutation: drop the
+  // `showDeletedPrefabsMissing` call in `spawnOnRecords` (`entityActions.ts`) → the paste lands as P's live tree, and
+  // the reload does not show what the paste showed.
+  const hrM = () => {
+    const hr = named('HR');
+    const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+    const under = (id: number) => { for (let a = id, n = 0; a && n < 64; a = parentOf.get(a) ?? 0, n++) if (a === hr.id) return true; return false; };
+    return getAllEntities().find((e) => e.name === 'M' && under(e.id))!;
+  };
+  /** The fuzzer's fixture step (`runner.ts` `setupNest`): Q dropped under H1's root, a scene-added reference node. */
+  const nestQ = async (f: Fixture) => {
+    const host = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!;
+    const q = JSON.parse((await (await fetch(f.prefabs.Q.path)).text()) as string);
+    expect(await instantiatePrefabInstance(q, f.prefabs.Q.path, host.id)).toBeTruthy();
+  };
+  const p1Of = (f: Fixture) => getAllEntities().find((e) => { const pi = piOf(e.id); return e.parentId === 0 && pi?.source === f.prefabs.P.guid && pi.rootInstanceId === e.id; })!;
+
+  it('pasted inside another instance, or at the top level, it shows as the placeholder a reload shows', async () => {
+    const f = await startRun(be, nestQ, '2144-paste');
+    const clip = clipEntity(p1Of(f).id, 'copy')!;
+    expect(clip, 'premise: the live P1 copies').not.toBeNull();
+    await trash(f, 'P');
+    const m = hrM();
+    expect(m, 'premise: HR holds QR > M').toBeDefined();
+    const before = worldTree();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const pasted: string[] = [];
+      for (const [where, parent] of [['nested', m.id], ['top level', 0]] as const) {
+        const id = pasteEntityCopy(clip, parent, () => {});
+        expect(id, where).not.toBeNull();
+        const guid = getAllEntities().find((e) => e.id === id)!.guid!;
+        await deletedPrefabsShown();
+        await settle();
+        expect(framesOf(f.prefabs.P.guid), `${where}: no frame of P is live`).toBe(0);
+        expect(placeholderGuids().has(guid), `${where}: the paste is P's placeholder`).toBe(true);
+        pasted.push(guid);
+      }
+      const shown = worldTree();
+      // Each paste is one undo step, the conversion's reload in between; a redo respawns the copy and shows it again.
+      for (const dir of ['undo', 'undo'] as const) expect((await undoStep(dir)).did, dir).toBe(true);
+      await settle();
+      expect(worldTree(), 'undo takes both pastes out').toEqual(before);
+      for (const dir of ['redo', 'redo'] as const) expect((await undoStep(dir)).did, dir).toBe(true);
+      await deletedPrefabsShown();
+      await settle();
+      expect(worldTree(), 'redo shows both placeholders again').toEqual(shown);
+      expect(await reloadTree(f), 'a save and reload shows what the pastes showed').toEqual(shown);
+      for (const g of pasted) expect(placeholderGuids().has(g)).toBe(true);
+    } finally { warn.mockRestore(); }
+  });
+
+  // Where the conversion does not run, the copy is refused (#2144 close-out review): in prefab edit it pasted P's live tree,
+  // and the prefab's save wrote a nest naming the deleted P into H. Mutation: drop the `editingPrefab` arm of the refusal in
+  // `spawnOnRecords` → the paste lands and H's file names P.
+  it('in prefab edit, where no conversion runs, it is refused and the template is untouched', async () => {
+    const f = await startRun(be, noNest, '2144-paste-prefab-edit');
+    const clip = clipEntity(p1Of(f).id, 'copy')!;
+    await trash(f, 'P');
+    expect(await openPrefabForEditing({ path: f.prefabs.H.path, name: 'H' }, { confirmDiscard: async () => true })).toBeFalsy();
+    const hr = getAllEntities().find((e) => e.name === 'HR')!;
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(pasteEntityCopy(clip, hr.id, () => {}), 'refused').toBeNull();
+      await settle();
+      expect(framesOf(f.prefabs.P.guid), 'no frame of P is live').toBe(0);
+      const said = err.mock.calls.map((c) => String(c[0])).filter((m) => /only in the open scene/.test(m));
+      expect(said, 'the refusal says why').toHaveLength(1);
+    } finally { err.mockRestore(); warn.mockRestore(); }
+    await savePrefabEditReport({});
+    await exitPrefabEditing();
+    await settle();
+    expect(be.read(f.prefabs.H.path), 'H names no P').not.toContain(f.prefabs.P.guid);
+  });
+
+  /** Paste `clip` under `parent`, expecting the refusal for a world the conversion does not run on. */
+  const pasteRefused = (clip: NonNullable<ReturnType<typeof clipEntity>>, parent = 0) => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(pasteEntityCopy(clip, parent, () => {}), 'refused').toBeNull();
+      return err.mock.calls.map((c) => String(c[0])).filter((m) => /only in the open scene/.test(m));
+    } finally { err.mockRestore(); warn.mockRestore(); }
+  };
+
+  // The other two arms (#2144 close-out review, tested on the hub's ask): inside Play the world is not the authored one, so
+  // no conversion runs and the copy is refused; Stop puts back a world with no frame of P. Mutation: drop the
+  // `!isWorldAuthored()` arm in `spawnOnRecords` → the paste lands in the Play world as P's live tree.
+  it('inside Play it is refused, and Stop shows no frame of P', async () => {
+    const f = await startRun(be, noNest, '2144-paste-play');
+    const clip = clipEntity(p1Of(f).id, 'copy')!;
+    await trash(f, 'P');
+    expect((await enterPlay()).kind).toBe('started');
+    await settle();
+    expect(pasteRefused(clip), 'the refusal says why').toHaveLength(1);
+    expect(framesOf(f.prefabs.P.guid), 'no frame of P in the Play world').toBe(0);
+    await stopPlay();
+    await settle();
+    expect(framesOf(f.prefabs.P.guid), 'nor after Stop').toBe(0);
+  });
+
+  // Pasted under a base scene's entity, the copy takes the base's `sourceScene`, and the conversion keeps a base's live
+  // tree (it reloads only the open scene's own), so the copy is refused. (At the top level it lands in the open scene and
+  // converts.) Mutation: drop the `base` arm in `spawnOnRecords` → it lands as P's live tree under the base.
+  it('a copy of a base scene\'s frame is refused', async () => {
+    const f = await startRun(be, nestQ, '2144-paste-base');
+    const lPath = f.scenePath.replace(/Fuzz\.json$/, 'Level.json');
+    const lGuid = f.sceneGuid.replace(/^.{8}/, 'abababab');
+    const level = { id: lGuid, version: SCENE_FORMAT_VERSION, name: 'Level', createdAt: '2026-01-01T00:00:00.000Z', resources: [], baseScene: f.sceneGuid, entities: [] };
+    be.write(lPath, `${JSON.stringify(level, null, 2)}\n`);
+    registerAsset(lGuid, lPath, 'scene');
+    be.marked.clear();
+    expect((await loadSceneReporting(lPath)).outcome).toBe('loaded');
+    await settle();
+    const p1 = p1Of(f);
+    expect((readTraitData(p1.id, getTraitByName('EntityAttributes')!) as { sourceScene?: string }).sourceScene, 'premise: P1 is the base\'s').toBeTruthy();
+    const clip = clipEntity(p1.id, 'copy')!;
+    await trash(f, 'P');
+    const live = framesOf(f.prefabs.P.guid);
+    expect(live, 'premise: the base keeps its live P frames').toBeGreaterThan(0);
+    const m = hrM();
+    expect((readTraitData(m.id, getTraitByName('EntityAttributes')!) as { sourceScene?: string }).sourceScene, 'premise: HR\'s M is the base\'s').toBeTruthy();
+    expect(pasteRefused(clip, m.id), 'the refusal says why').toHaveLength(1);
+    expect(framesOf(f.prefabs.P.guid), 'nothing pasted').toBe(live);
+  });
+
+  // Control: a copy of P1's placeholder (a placeholder is projected from its record, never kept) pastes inside HR as it
+  // did, and reloads as it shows.
+  it('a copy of the placeholder still pastes inside another instance', async () => {
+    const f = await startRun(be, nestQ, '2144-placeholder');
+    const root = p1Of(f);
+    await trash(f, 'P');
+    const ph = getAllEntities().find((e) => e.guid === root.guid)!;
+    expect(placeholderGuids().has(ph.guid!), 'premise: P1 is its placeholder').toBe(true);
+    const clip = clipEntity(ph.id, 'copy')!;
+    expect(clip).not.toBeNull();
+    const pasted = pasteEntityCopy(clip, hrM().id, () => {});
+    expect(pasted).not.toBeNull();
+    await settle();
+    expect(framesOf(f.prefabs.P.guid)).toBe(0);
+    const shown = worldTree();
+    expect(await reloadTree(f), 'a save and reload shows what the paste showed').toEqual(shown);
+  });
+});
+
+describe('#2146: an undone delete of a frame whose prefab was trashed since shows its Missing Prefab placeholder', () => {
+  // The sibling of #2144's ruling (B): delete a frame of P, trash P, undo the delete. The undo respawned P's live tree, which
+  // a reload then showed as the placeholder — the world on screen was not the one a reload builds. It now runs the trash's
+  // conversion too. Mutation: drop the `showDeletedPrefabsMissing` call in the delete's undo (`entityActions.ts`) → the
+  // top-level frame and a P instance the user placed under H1's root come back as P's live tree. The frame O's TEMPLATE
+  // nests (O1's N) is a CONTROL, green under that mutation: O1's records put N back, and the record of a frame whose
+  // prefab is gone already projects it as its placeholder. A scene-added nested instance has no such record to come back
+  // through (close-out review).
+  const topP1 = (f: Fixture) => getAllEntities().find((e) => { const pi = piOf(e.id); return e.parentId === 0 && pi?.source === f.prefabs.P.guid && pi.rootInstanceId === e.id; })!;
+  /** O1's N: the P frame nested in O. */
+  const nInO1 = (f: Fixture) => {
+    const o1 = getAllEntities().find((e) => e.guid === `ffffffff-0000-4000-8001-${f.prefabs.P.guid.slice(-12)}`)!;
+    const parentOf = new Map(getAllEntities().map((e) => [e.id, e.parentId] as const));
+    const under = (id: number) => { for (let a = parentOf.get(id) ?? 0, n = 0; a && n < 64; a = parentOf.get(a) ?? 0, n++) if (a === o1.id) return true; return false; };
+    return getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.P.guid && pi.rootInstanceId === e.id && under(e.id); })!;
+  };
+
+  it('placed by the user under H1\'s root: the undo shows the placeholder a reload shows', async () => {
+    const f = await startRun(be, noNest, '2146-h1');
+    const h1 = getAllEntities().find((e) => { const pi = piOf(e.id); return e.parentId === 0 && pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!;
+    expect(await placePrefabFromPath(f.prefabs.P.path, { tag: 'test', parentId: h1.id })).toBeTruthy();
+    await settle();
+    const placed = getAllEntities().find((e) => { const pi = piOf(e.id); return e.parentId === h1.id && pi?.source === f.prefabs.P.guid && pi.rootInstanceId === e.id; })!;
+    expect(placed, 'premise: a P instance under H1').toBeDefined();
+    const guid = placed.guid!;
+    deleteEntityWithUndo(placed.id);
+    await settle();
+    await trash(f, 'P');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect((await undoStep('undo')).did, 'the delete undoes').toBe(true);
+      await deletedPrefabsShown();
+      await settle();
+      expect(framesOf(f.prefabs.P.guid), 'no frame of P is live').toBe(0);
+      expect(placeholderGuids().has(guid), 'the undone instance is P\'s placeholder').toBe(true);
+      const shown = worldTree();
+      expect(await reloadTree(f), 'a save and reload shows what the undo showed').toEqual(shown);
+    } finally { warn.mockRestore(); }
+  });
+
+  for (const [where, pick] of [['top level', topP1], ['nested by O\'s template (control)', nInO1]] as const) {
+    it(`${where}: the undo shows the placeholder a reload shows; redo and undo again keep it so`, async () => {
+      const f = await startRun(be, noNest, `2146-${where}`);
+      const target = pick(f);
+      expect(target, 'premise: the frame of P').toBeDefined();
+      const guid = target.guid!;
+      deleteEntityWithUndo(target.id);
+      await settle();
+      await trash(f, 'P');
+      expect(framesOf(f.prefabs.P.guid), 'premise: the trash left no live frame of P').toBe(0);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect((await undoStep('undo')).did, 'the delete undoes').toBe(true);
+        await deletedPrefabsShown();
+        await settle();
+        expect(framesOf(f.prefabs.P.guid), 'no frame of P is live').toBe(0);
+        expect(placeholderGuids().has(guid), 'the undone frame is P\'s placeholder').toBe(true);
+        const shown = worldTree();
+        expect((await undoStep('redo')).did, 'redo').toBe(true);
+        await settle();
+        expect(getAllEntities().some((e) => e.guid === guid), 'redo deletes it again').toBe(false);
+        expect((await undoStep('undo')).did, 'undo again').toBe(true);
+        await deletedPrefabsShown();
+        await settle();
+        expect(worldTree(), 'the second undo shows the same world').toEqual(shown);
+        expect(await reloadTree(f), 'a save and reload shows what the undo showed').toEqual(shown);
+      } finally { warn.mockRestore(); }
+    });
+  }
+});
+
+// #2144 seed 8045: an instance the user placed AT the root of an instance whose prefab is then trashed shows under the
+// Missing Prefab placeholder, its own record (hub ruling Q3 on #2025: "`/` is always nameable, so a link there is
+// projected"). The seed's shape: the trashed Q instance is itself scene-added inside H1; the top-level Q is the control.
+describe('#2144 8045: an instance at a trashed instance\'s root stays, under its placeholder', () => {
+  const qDoc = async (f: Fixture) => JSON.parse((await (await fetch(f.prefabs.Q.path)).text()) as string);
+  const oDoc = async (f: Fixture) => JSON.parse((await (await fetch(f.prefabs.O.path)).text()) as string);
+  const nestQ = async (f: Fixture) => {
+    const host = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.H.guid && pi.rootInstanceId === e.id; })!;
+    expect(await instantiatePrefabInstance(await qDoc(f), f.prefabs.Q.path, host.id)).toBeTruthy();
+  };
+  const qAt = (f: Fixture, top: boolean) => getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.Q.guid && pi.rootInstanceId === e.id && (e.parentId === 0) === top && (top || getAllEntities().find((h) => h.id === e.parentId)?.name === 'HR'); })!;
+
+  for (const top of [false, true]) {
+    it(`${top ? 'top-level (control)' : 'inside H1 (the seed)'}: O at Q's root shows under Q's placeholder, and after a reload`, async () => {
+      const f = await startRun(be, top ? noNest : nestQ, `2144-8045-${top}`);
+      if (top) expect(await instantiatePrefabInstance(await qDoc(f), f.prefabs.Q.path, 0)).toBeTruthy();
+      await settle();
+      const q = qAt(f, top);
+      expect(q, 'premise: the Q instance').toBeTruthy();
+      expect(await instantiatePrefabInstance(await oDoc(f), f.prefabs.O.path, q.id)).toBeTruthy();
+      await settle();
+      const o = getAllEntities().find((e) => { const pi = piOf(e.id); return pi?.source === f.prefabs.O.guid && pi.rootInstanceId === e.id && e.parentId === q.id; })!;
+      expect(o, 'premise: O placed at Q\'s root').toBeTruthy();
+      await trash(f, 'Q');
+      expect(placeholderGuids().has(q.guid!), 'premise: Q is its placeholder').toBe(true);
+      const shown = () => getAllEntities().find((e) => e.guid === o.guid);
+      const parentGuid = () => getAllEntities().find((e) => e.id === shown()?.parentId)?.guid;
+      expect(shown(), 'O stays').toBeTruthy();
+      expect(parentGuid(), 'under the placeholder').toBe(q.guid);
+      expect(storedInstances(getCurrentWorld()).has(o.guid!), 'O is its own record').toBe(true);
+      const tree = worldTree();
+      // A rebuild from the store of the instance holding Q's placeholder (H1) projects O from the placeholder's record,
+      // not from the node the placeholder carries (the links taken out of it).
+      if (!top) {
+        const h1 = getAllEntities().find((e) => e.name === 'HR' && e.parentId === 0)!;
+        expect(reprojectFromStore(h1.id), 'premise: H1 rebuilds').toBeTruthy();
+        await settle();
+        expect(shown(), 'O stays through the rebuild').toBeTruthy();
+        expect(parentGuid()).toBe(q.guid);
+        expect(worldTree(), 'the rebuild is the identity').toEqual(tree);
+      }
+      expect(await reloadTree(f), 'a save and reload shows what the trash showed').toEqual(tree);
+    });
+  }
 });

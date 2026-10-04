@@ -67,9 +67,12 @@ export function storedInstances(world: World): ReadonlyMap<string, StoredInstanc
   return storeOf(world);
 }
 
-/** Every guid record `rec` names — a row's values, pins, links and parent, its placement parent — renamed by `remap`, in
- *  place; not its own root guid (the store keys by it: the caller re-keys). Also a load's, for the records it parses
- *  from a file whose guids the load renamed before the parse (`renameParsedRecords`). */
+/** Every guid record `rec` names — a row's values, pins, links and parent, its placement parent, and each user's node it
+ *  HOLDS (`held.heldOwn`: the node's guid and every ref in its content, #2142) — renamed by `remap`, in place; not its own
+ *  root guid (the store keys by it: the caller re-keys). A held node is the user's content, which a live node's refs would
+ *  follow; before, it kept the old guids and the save wrote them. The verbatim held channels (`unparsed`,
+ *  `pendingLegacy`, `keyedNodeHeld`) are left as the file stated them. Also a load's, for the records it parses from a
+ *  file whose guids the load renamed before the parse (`fillInstanceStoreReporting`, with {@link renameOwnContent}). */
 export function renameInRecord(rec: InstanceRecord, remap: ReadonlyMap<string, string>): void {
   const named = (v: unknown) => mapStringValues(v, (str) => remap.get(str) ?? str);
   for (const [k, row] of rec.list.rows) {
@@ -77,6 +80,21 @@ export function renameInRecord(rec: InstanceRecord, remap: ReadonlyMap<string, s
     if (next !== row) rec.list.rows.set(k, next as typeof row);
   }
   rec.placement.parent = remap.get(rec.placement.parent) ?? rec.placement.parent;
+  for (const [k, nodes] of rec.held.heldOwn ?? []) {
+    const next = named(nodes);
+    if (next !== nodes) rec.held.heldOwn!.set(k, next as typeof nodes);
+  }
+}
+
+/** A parse's own content (`ParsedInstance.ownContent`, by node guid) renamed by `remap`, as {@link renameInRecord} renames
+ *  the record that links it (#2142): each node's key and guid, and every ref in its content. Before, a load's rename
+ *  reached the links only: the hold (`holdUnspawnedOwn`) looked a renamed node up under its new guid and found nothing,
+ *  so the record held no content for it, and a held node's refs kept the file's guids. */
+export function renameOwnContent<N>(content: Map<string, N>, remap: ReadonlyMap<string, string>): void {
+  const named = (v: unknown) => mapStringValues(v, (str) => remap.get(str) ?? str);
+  const renamed = [...content].map(([g, n]) => [remap.get(g) ?? g, named(n) as N] as const);
+  content.clear();
+  for (const [g, n] of renamed) content.set(g, n);
 }
 
 /** The guids of `world`'s live stored roots, the owners a record is kept for: a root no prefab row expanded (a scene

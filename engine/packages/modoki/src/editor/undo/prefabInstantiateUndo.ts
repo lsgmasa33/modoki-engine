@@ -30,6 +30,8 @@ import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import * as instanceEdits from '../instance/instanceEdits';
+import { takeTreeRecords, restoreSide, type TreeRecords } from '../instance/instanceHistory';
+import { findEntityByGuid } from '../../runtime/core/ecs/world';
 
 /** The durable guid `rootId` carries, or undefined (#1210: a runtime guid belongs to the world it was minted in). */
 function rootGuidOf(rootId: number): string | undefined {
@@ -66,6 +68,7 @@ export function makePrefabInstantiateAction(opts: {
   let rootGuid = rootGuidOf(opts.initialId);
   // …and its place among its siblings (#1947): the redo puts the instance back where it was, not at a new end (#1941).
   let sortOrder = sortOrderOf(opts.initialId);
+  let taken: TreeRecords | null = null;
   return {
     label: opts.label,
     // The scene the new instance belongs to: a base, when it was dropped under a base entity (#1429).
@@ -78,6 +81,8 @@ export function makePrefabInstantiateAction(opts: {
     // are what they were before the placement.
     undo: () => {
       const id = currentRef.require();
+      // The tree's records as the undo finds them, for the redo to put back (rule 8; #2061).
+      taken = getTraitByName('PrefabInstance') ? takeTreeRecords(id) : null; // a bare world states no tree
       const commit = instanceEdits.beginDelete([id]);
       opts.remove(id);
       commit();
@@ -110,9 +115,22 @@ export function makePrefabInstantiateAction(opts: {
         });
         return;
       }
-      rootGuid = rootGuidOf(id);
-      sortOrder = sortOrderOf(id);
-      currentRef = entityRef(id);
+      // The respawn is a fresh instance of the CURRENT document: the list the undo found is put back and the tree shown
+      // from it, as the step left it (rule 8). A nested prefab trashed since then shows as the placeholder its record
+      // names, not one named from the template row, which a rebuild then renamed (#2061). A projection that fails throws,
+      // and the step rolls back.
+      // Only onto the instance the undo removed: a recorded root guid another live entity holds now is not taken back,
+      // the respawn mints a fresh one, and that instance is new (its records are its own, #1880 T4).
+      if (taken && rootGuid && rootGuidOf(id) === rootGuid && !restoreSide(taken.side, taken.at)) {
+        throw new Error(`Redo "${opts.label}": the instance was placed again, but could not be shown from the records its undo took`);
+      }
+      // The respawn's own root, re-read by its guid when the records were put back (the projection respawns it); never by
+      // the recorded guid when the respawn minted a fresh one: that guid names another live entity.
+      const ownGuid = rootGuidOf(id);
+      const live = (ownGuid && findEntityByGuid(ownGuid)?.id()) || id;
+      rootGuid = rootGuidOf(live);
+      sortOrder = sortOrderOf(live);
+      currentRef = entityRef(live);
     },
   };
 }

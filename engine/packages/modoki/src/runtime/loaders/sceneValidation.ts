@@ -1126,79 +1126,30 @@ export function validateSceneData(
     }
   }
 
-  warnings.push(...embeddedPrefabWarnings((data as { embeddedPrefabs?: unknown }).embeddedPrefabs, getPrefab));
-  warnings.push(...embeddedPrefabFrameWarnings(data as { embeddedPrefabs?: unknown; embeddedPrefabFrames?: unknown; entities: unknown[] }));
+  warnings.push(...embeddedPrefabWarnings((data as { embeddedPrefabs?: unknown }).embeddedPrefabs));
+  warnings.push(...embeddedPrefabFrameWarnings(data as { embeddedPrefabFrames?: unknown }));
 
   return { warnings, schemaApplied };
 }
 
-/** The scene's copies of missing prefabs (`embeddedPrefabs`, v19, #1914 F8 / #1867): an object keyed by prefab guid, each
- *  value a prefab document — checked as one ({@link validatePrefabData}). The loader drops a copy with no `entities` array
- *  rather than expand it, so that one is named here; a copy whose `id` names another prefab would stand in for the wrong
- *  one, so that is too. A copy's own nested prefabs are read as the load reads them: the project's file first, then the
- *  scene's copy. */
-function embeddedPrefabWarnings(embedded: unknown, getPrefab?: PrefabResolver): string[] {
+/** The scene's copies of missing prefabs (`embeddedPrefabs`, v19, #1914 F8 / #1867), owner ruling B (design § 5.4, #1940):
+ *  nothing reads them — a missing prefab's instance loads as its Missing Prefab placeholder, keeping its records — and no
+ *  save writes them (#2001 S6). So each is named as the backup it is, which the next save drops: if the prefab is gone
+ *  from disk, the copy may be the last record of its content. Before, these checks validated a copy as the document the
+ *  load would expand (its shape, its id, its nested reads), and an agent read a missing prefab's instance as loading from
+ *  it. */
+function embeddedPrefabWarnings(embedded: unknown): string[] {
   if (embedded === undefined) return [];
   if (!embedded || typeof embedded !== 'object' || Array.isArray(embedded)) {
-    return ['embeddedPrefabs is not an object keyed by prefab guid — the loader ignores it'];
+    return ['embeddedPrefabs: this scene holds backups of prefabs that are no longer used; they will be dropped at the next save. Restore a prefab from version control if you need it'];
   }
-  const out: string[] = [];
-  for (const [guid, doc] of Object.entries(embedded)) {
-    const label = `embeddedPrefabs['${guid}']`;
-    if (!isGuid(guid)) out.push(`${label}: the key is not a prefab guid, so no reference can name this copy`);
-    if (!doc || typeof doc !== 'object' || !Array.isArray((doc as { entities?: unknown }).entities)) {
-      out.push(`${label}: not a prefab document (no \`entities\` array) — the loader ignores it`);
-      continue;
-    }
-    const id = (doc as { id?: unknown }).id;
-    if (id !== undefined && id !== guid) out.push(`${label}: the copy's id is ${JSON.stringify(id)}, not its key`);
-    const read = (ref: string) => {
-      let real: unknown;
-      try { real = getPrefab?.(ref); } catch { real = undefined; }
-      return real ?? (embedded as Record<string, unknown>)[ref];
-    };
-    out.push(...validatePrefabData(doc, read).warnings.map((w) => `${label}: ${w}`));
-  }
-  return out;
+  return Object.keys(embedded).map((guid) => `embeddedPrefabs['${guid}']: this scene holds a backup of prefab ${guid} that is no longer used; it will be dropped at the next save. Restore the prefab from version control if you need it`);
 }
 
-/** The copies' "live at the save" lists (`embeddedPrefabFrames`, v19, #1939): an object keyed by prefab guid, each value a
- *  list of frame addresses (`frameAddress.ts`). Disclosed, never refused, and kept as written: the loader ignores a list it
- *  cannot read (that copy answers by the rows rule), a list for a guid with no copy is read by nothing and goes at the next
- *  save, and an address whose anchor names no guid this file holds matches no frame. A deeper component that names no row
- *  or key is not checked here (it needs the documents), and the load ignores it the same way. */
-function embeddedPrefabFrameWarnings(scene: { embeddedPrefabs?: unknown; embeddedPrefabFrames?: unknown; entities: unknown[] }): string[] {
-  const lists = scene.embeddedPrefabFrames;
-  if (lists === undefined) return [];
-  if (!lists || typeof lists !== 'object' || Array.isArray(lists)) {
-    return ['embeddedPrefabFrames is not an object keyed by prefab guid — the loader ignores it'];
-  }
-  const copies = scene.embeddedPrefabs && typeof scene.embeddedPrefabs === 'object' ? scene.embeddedPrefabs as Record<string, unknown> : {};
-  let held: Set<string> | undefined;
-  const holds = (guid: string): boolean => {
-    if (!held) {
-      held = new Set();
-      const walk = (n: unknown): void => {
-        if (typeof n === 'string') { if (isGuid(n)) held!.add(n); return; }
-        if (n && typeof n === 'object') for (const v of Array.isArray(n) ? n : Object.values(n)) walk(v);
-      };
-      walk(scene.entities);
-    }
-    return held.has(guid);
-  };
-  const out: string[] = [];
-  for (const [guid, list] of Object.entries(lists)) {
-    const label = `embeddedPrefabFrames['${guid}']`;
-    if (!Array.isArray(list) || list.some((a) => typeof a !== 'string')) {
-      out.push(`${label}: not a list of frame addresses — the loader ignores it, and the copy answers by the member rows`);
-      continue;
-    }
-    if (!(guid in copies)) out.push(`${label}: no copy of this prefab in embeddedPrefabs — nothing reads the list, and the next save drops it`);
-    for (const a of list as string[]) {
-      if (!holds(a.split('/')[0]!)) out.push(`${label}: the frame '${a}' is anchored on no entity of this scene — the loader matches no frame to it`);
-    }
-  }
-  return out;
+/** The copies' "live at the save" lists (`embeddedPrefabFrames`, v19, #1939): read by nothing since owner ruling B (no copy
+ *  expands a frame), and dropped by the next save, like the copies they name. */
+function embeddedPrefabFrameWarnings(scene: { embeddedPrefabFrames?: unknown }): string[] {
+  return scene.embeddedPrefabFrames === undefined ? [] : ['embeddedPrefabFrames: the frames a v19 save listed for its prefab backups are no longer read; the list will be dropped at the next save'];
 }
 
 /** The traits bag a spawned instance of `prefab` would carry on its ROOT entity, or undefined when

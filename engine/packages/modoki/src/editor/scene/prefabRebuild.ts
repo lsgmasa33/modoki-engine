@@ -809,8 +809,15 @@ function refreshInstancesUnrolled(
   /** The targets in each reprojected tree: the count reports instances, as the capture path's does, not trees. */
   const targetsIn = new Map<string, number[]>();
   const captured: number[] = [];
+  // Each root's guid and tree, read BEFORE any reprojection below respawns a tree (#2143): a respawn frees ids and koota
+  // hands them straight back (LIFO), so an id read after one can name another instance, whose own guid then passes the
+  // liveness check and the fan-out strips or rebuilds the wrong tree.
+  const guidAt = new Map<number, string>();
+  const topOf = new Map<number, number>();
   for (const root of rootIds) {
     const top = projectionRootOf(root);
+    guidAt.set(root, eaMeta ? ((readTraitData(root, eaMeta)?.guid as string) || '') : '');
+    topOf.set(root, top);
     const topGuid = top ? guidOfEntity(top) : '';
     if (!remap.size && topGuid && storedRecord(world, topGuid) && reprojectsExactly(top) && onRecords(top, topGuid)) {
       reproject.set(topGuid, top);
@@ -838,13 +845,14 @@ function refreshInstancesUnrolled(
       reprojected += mine.length - left;
       inKept += left;
     }
-    else captured.push(...rootIds.filter((r) => projectionRootOf(r) === top));
+    else captured.push(...rootIds.filter((r) => topOf.get(r) === top));
   }
   const targets: RebuildTarget[] = [];
   for (const root of captured) {
     // ⚠️ Checked by GUID, not id — an id-only check is worse than none here. See `isLiveInstanceRoot`. A root listed
-    // dead (an id `collectInstanceRoots` collected before an earlier teardown) has nothing to rebuild.
-    const guid = eaMeta ? ((readTraitData(root, eaMeta)?.guid as string) || '') : '';
+    // dead (an id `collectInstanceRoots` collected before an earlier teardown) has nothing to rebuild. The guid is the
+    // one read before the reprojections (#2143): read now, a recycled id answers with its new owner's.
+    const guid = guidAt.get(root) ?? '';
     if (!isLiveInstanceRoot(root, guid)) continue;
     if (keepsRecord(root)) {
       // Left as it was, it still shows what an Apply copied from it, so its records lose those fields as a reprojected
@@ -914,8 +922,9 @@ function keepsRecord(root: number): boolean {
  *  while the nested prefabs load, nothing is rebuilt — the ids were collected in the world that is gone, and
  *  the new world's load recorded its own documents. */
 export async function rebaseStaleInstances(
-  /** Only frames of these refs (a prefab write rebuilds what IT changed, not every other prefab's stale frames). */
-  opts: { sources?: ReadonlySet<string> } = {},
+  /** Only frames of these refs (a prefab write rebuilds what IT changed, not every other prefab's stale frames).
+   *  `pin`: pin each member the rebase built into its tree's records (`pinBuiltMembers`) — an outside edit's adopt only. */
+  opts: { sources?: ReadonlySet<string>; pin?: boolean } = {},
 ): Promise<number> {
   const world = getCurrentWorld();
   const stale = staleFrames(opts);
@@ -925,7 +934,7 @@ export async function rebaseStaleInstances(
     await preloadRebuildEntry(s.root);
   }
   if (getCurrentWorld() !== world) return 0;
-  return rebuildStaleFrames(stale);
+  return rebuildStaleFrames(stale, { pin: opts.pin });
 }
 
 /** {@link rebaseStaleInstances} with no wait when it needs none (#1820): a frame re-linked or respawned from a record — a
@@ -957,19 +966,22 @@ export function rebaseStaleInstancesSoon(opts: { sources?: ReadonlySet<string> }
 
 /** Rebuild `stale` onto the documents it names, every nested prefab those read already cached. One that throws part-way,
  *  having perhaps rebuilt some, rolls back (`instanceRollback.ts`). */
-export function rebuildStaleFrames(stale: StaleFrame[]): number {
+export function rebuildStaleFrames(stale: StaleFrame[], opts: { pin?: boolean } = {}): number {
   const taken = takeStore();
-  try { return rebuildStaleFramesUnrolled(stale); } catch (err) { rollBack(taken, 'a rebase', err); throw err; }
+  try { return rebuildStaleFramesUnrolled(stale, opts.pin ?? false); } catch (err) { rollBack(taken, 'a rebase', err); throw err; }
 }
 
-function rebuildStaleFramesUnrolled(stale: StaleFrame[]): number {
+function rebuildStaleFramesUnrolled(stale: StaleFrame[], pin: boolean): number {
   const pi = getTraitByName('PrefabInstance')!;
   const world = getCurrentWorld();
   // RE-CHECK: a frame is rebuilt only while its id is still a root of the same source holding the very document
   // collected — so a frame some rebuild since respawned (current now), or an id freed by one and handed straight back to
   // a respawn, is left alone. (Rebuilt under a recycled id, another source's frame was rebuilt as this one: #1493
-  // review 2.) ⚠️ TRACED, NOT DRIVEN: nothing rebuilds between the collection and here in any caller.
+  // review 2.) The reprojections below respawn trees between this check and the capture rebuild, so each frame's guid is
+  // read here and checked again after them (#2143).
   const pending = [...stale];
+  const eaMeta = getTraitByName('EntityAttributes');
+  const guidNow = (id: number): string => (eaMeta ? ((readTraitData(id, eaMeta)?.guid as string) || '') : '');
   const liveRoot = (s: (typeof pending)[number]): number => {
     const e = findEntity(s.root);
     if (!e) return 0;
@@ -980,6 +992,7 @@ function rebuildStaleFramesUnrolled(stale: StaleFrame[]): number {
   // expands each from the cache (`to`), counted by frame — so no order among them is needed, and a stale frame inside
   // another is not refused (#1880 F7d). An entry with no document to load it from is left, and said.
   const live = pending.filter((s) => liveRoot(s));
+  const guidAt = new Map(live.map((s) => [s, guidNow(s.root)] as const));
   // #2046 S7.3 (rule 7, § 3.2's fan-out row): a tree whose outermost projectable record is fresh is reprojected from that
   // record onto the documents now cached — its own list, unused records kept, nothing read off the live tree. Each tree
   // once, however many of its frames are stale. A tree the store cannot state is left as it was while its entry holds a
@@ -996,11 +1009,22 @@ function rebuildStaleFramesUnrolled(stale: StaleFrame[]): number {
   const whyNot = new Map<number, string>();
   for (const [top, frames] of trees) {
     const refused: { why?: string } = {};
-    if (reprojectFromStore(top, undefined, undefined, { refused })) reprojected += frames.length;
-    else {
+    const again = reprojectFromStore(top, undefined, undefined, { refused });
+    // An outside edit's adopt pins each member it brought into the tree's records, as an Apply's fan-out does (below; #2148,
+    // hunt seeds 3128/3253): the member's pin was the live tree's alone, so a later outside edit that took it out of its
+    // template dropped the pin, where a save + reload kept it. An adopt is not undoable, so no undo has to take the pins
+    // back; the rebases of undoable steps (a park, a prefab-edit save) do not pin, for the reason the Apply note gives.
+    // ⚠️ This closes ONE producer of a member with no stated pin. Others still split the same way (an older step's undo
+    // seated across the adopt, a put-back's re-expansion, a scene load of a member the file predates): see #2149.
+    if (again) { if (pin) pinBuiltMembers(again.root); reprojected += frames.length; } else {
       if (refused.why) whyNot.set(top, refused.why);
       fromCapture.push(...frames);
     }
+  }
+  // A frame a reprojection above tore down is not rebuilt again, and neither is whatever took its id since (#2143).
+  for (let i = fromCapture.length - 1; i >= 0; i--) {
+    const s = fromCapture[i]!;
+    if (!liveRoot(s) || guidNow(s.root) !== guidAt.get(s)) fromCapture.splice(i, 1);
   }
   const kept = fromCapture.filter((s) => keepsRecord(s.root));
   const rest = fromCapture.filter((s) => !kept.includes(s));

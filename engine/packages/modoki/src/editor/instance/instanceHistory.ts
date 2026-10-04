@@ -63,6 +63,24 @@ export function restoreSide(side: RecordsSide, at: string): Reprojected | null {
   return reprojectFromStore(top, side.content, side.identity);
 }
 
+/** {@link restoreSide}, all or nothing: when the tree cannot be rebuilt from `side` (its prefab not cached, a document that
+ *  expands to no root, a repeated frame), the store is put back as it stood, so a step that then REFUSES ("nothing was
+ *  changed") says what is true. `restoreSide` seats first and rebuilds second; a refusal after it left the step's records in
+ *  the store, uncounted by the undo stack and written by the next save (#2001 S9 close-out re-review 1). */
+export function restoreSideOrNothing(side: RecordsSide, at: string): Reprojected | null {
+  const world = getCurrentWorld();
+  const held = new Map([...side.records.keys()].map((g) => {
+    const v = storedInstances(world).get(g);
+    return [g, v && { ...v, record: structuredClone(v.record) }] as const;
+  }));
+  const done = restoreSide(side, at);
+  if (done) return done;
+  const all = new Map(storedInstances(world));
+  for (const [g, v] of held) { if (v) all.set(g, v); else all.delete(g); }
+  replaceStoredInstances(world, all);
+  return null;
+}
+
 /** One tree's records on one side of a step (#2046 S7.3-4): `at` is the guid of its outermost projectable root. */
 export interface TreeRecords { side: RecordsSide; at: string }
 

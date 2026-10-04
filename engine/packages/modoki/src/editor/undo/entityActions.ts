@@ -31,8 +31,9 @@ import { UndoRefusedError } from './undoFailure';
 import type { EditorJournalType } from '../editorJournal';
 import { arrive, checkRef, refsCheck, type StepCheck, type CheckPass } from './stepCheck';
 import { entityRef, ensureGuid, buildGuidIndex, requireWith, requireAll, renamesOf, requireDetachedMembers, journalRefOf, type EntityRef } from './entityRef';
-import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf, rowPlaceholderCopyRefusal } from './placeholderGate';
+import { placeholderWriteRefusal, placeholderWriteRefusalAny, entityNameOf, rowPlaceholderCopyRefusal, isMissingPrefabPlaceholder } from './placeholderGate';
 import { useEditorStore } from '../store/editorStore';
+import { isWorldAuthored } from '../scene/authoredWorld';
 import { notifyFieldEdited } from '../animation/recording';
 import { prefabEditWorldGuid } from '../scene/prefabEditWorld';
 import { nestedDeclaredKeys, type TemplateKeyDoc } from '../../runtime/loaders/templateKeyRecovery';
@@ -40,8 +41,9 @@ import { resolveAffectedScenes, rawSourceScene, adoptParentScene } from '../scen
 import { assertPrefabEditAllows, prefabEditRefusal, type PrefabEditRefusalReason } from '../scene/prefabEditRefusal';
 import { SCAFFOLD_PREFIX } from '../scene/prefabEditGuids';
 import { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, suppliedByPrefabChecker, RESTRUCTURE_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT } from '../scene/restructureRefusal';
-import { prefabNestingReader, getCachedPrefabSync } from '../scene/prefabCache';
+import { prefabNestingReader, getCachedPrefabSync, editorPrefabDeleted } from '../scene/prefabCache';
 import { rebaseStaleInstancesSoon } from '../scene/prefabRebuild';
+import { showDeletedPrefabsMissing, liveFramesOfDeletedPrefabs } from '../scene/deletedPrefabsMissing';
 import { translateLocalIds } from '../../runtime/loaders/memberTranslation';
 import * as instanceEdits from '../instance/instanceEdits';
 import { changedSince, copyRecords, seatAround, recordsSide, restoreSide, seatSide, sideReprojects, takeRecordsAround, takeTreeRecords, type RecordsSide, type TreeRecords } from '../instance/instanceHistory';
@@ -944,10 +946,12 @@ function requireRootLinks(links: readonly { guid: string; rootGuid: string }[], 
 /** The check of a step that spawns one subtree from `snap` (create, duplicate, paste; #2010): the undo deletes it, so it
  *  needs the spawned root; the redo respawns it, so it needs the parent and brings the subtree back. A null `snap`
  *  respawns nothing. */
-function spawnCheck(selfRef: EntityRef, parentRef: EntityRef | null, snap: EntitySnapshot | null): StepCheck {
+function spawnCheck(selfRef: EntityRef, parentRef: EntityRef | null, snap: EntitySnapshot | null,
+  /** The undo takes the spawn out whichever kind it shows now (`kindNow`): a copy `spawnOnRecords` placed. */
+  anyKind = false): StepCheck {
   const guids = snap ? [...snapshotGuids(snap)] : [];
   return {
-    undo: (pass) => checkRef(pass, selfRef),
+    undo: (pass) => checkRef(pass, selfRef, anyKind ? { kind: kindNow(selfRef) } : undefined),
     redo: (pass) => { if (!snap) return; if (parentRef) checkRef(pass, parentRef); arrive(pass, guids); },
   };
 }
@@ -1163,14 +1167,15 @@ export function duplicateEntity(
   _pushAction({
     label: 'Duplicate Entity',
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteCopy(selfRef.require(), true); selectEntity(null); },
+    // Of either kind, as a paste's (`spawnOnRecords` may show a frame of a deleted prefab as its placeholder, #2144).
+    undo: () => { deleteCopy(selfRef.require({ kind: kindNow(selfRef) }), true); selectEntity(null); },
     redo: () => {
       const p = parentRef ? parentRef.require() : 0;
       // The redo respawns the copy after a template change the stack does not hold (a saved prefab edit).
       currentId = liveIdOf(guid, spawnOnRecords(() => spawnCopy(p), records, remap, snapshot, true));
       selectEntity(currentId);
     },
-    check: spawnCheck(selfRef, parentRef, snapshot),
+    check: spawnCheck(selfRef, parentRef, snapshot, true),
     kind: '!duplicate',
     // Source guid from the attrData already read above — do NOT entityRef(entityId) here:
     // that mints+writes a guid to the SOURCE, dirtying authored data purely to log it.
@@ -1380,12 +1385,40 @@ function spawnOnRecords(spawn: () => number, records: ReadonlyMap<string, Instan
   snapshot: EntitySnapshot, reproject: boolean): number {
   const id = spawn();
   const guid = rootGuidOf(snapshot);
-  const refuse = (seated: boolean): never => {
+  const refuse = (seated: boolean, reason?: string): never => {
     deleteCopy(liveIdOf(guid, id), seated);
-    const why = copyRefusal(snapshotNameOf(snapshot));
+    const why = reason ?? copyRefusal(snapshotNameOf(snapshot));
     throw new UndoRefusedError(why, why);
   };
   if (!instanceEdits.seatCopy(records, remap, id)) refuse(false);
+  // A frame of the copy whose prefab was deleted since the copy was taken (#2144, hunt seeds 9443/8056; hub ruling (B),
+  // 2026-10-05, as Unity pastes it): no save writes the document it was built from, so a reload shows it as its Missing
+  // Prefab placeholder. It is shown so at once, by the conversion a trash runs (`showDeletedPrefabsMissing`, #2056: the
+  // live world put back through Stop's reload, the undo stack kept), at the top level and nested alike; before, the paste
+  // showed the deleted prefab's tree, which the next reload turned into the placeholder. Every frame in the copy.
+  const piMeta = getTraitByName('PrefabInstance');
+  const kids = new Map<number, number[]>();
+  for (const e of getAllEntities()) if (e.parentId) kids.set(e.parentId, [...(kids.get(e.parentId) ?? []), e.id]);
+  let deletedFrame = false;
+  for (const stack = [liveIdOf(guid, id)]; piMeta && stack.length && !deletedFrame;) {
+    const e = stack.pop()!;
+    const src = readTraitData(e, piMeta)?.source as string | undefined;
+    if (src && editorPrefabDeleted(src)) deletedFrame = true;
+    stack.push(...(kids.get(e) ?? []));
+  }
+  // The conversion runs only on the authored scene's own world: not in prefab edit, not inside Play or a preview, and not
+  // for a base scene's entities (`liveFramesOfDeletedPrefabs`). A copy it would not convert would stay the deleted
+  // prefab's live tree, which a save then writes (in prefab edit, into the template: a nest naming a deleted prefab), so
+  // it is refused there, as it was before the ruling (#2144 close-out review).
+  if (deletedFrame) {
+    const root = liveIdOf(guid, id);
+    const ea = getTraitByName('EntityAttributes');
+    const base = ea ? String(readTraitData(root, ea)?.sourceScene ?? '') : '';
+    if (!isWorldAuthored() || useEditorStore.getState().editingPrefab || base) {
+      refuse(true, `"${snapshotNameOf(snapshot) || 'The entity'}" was not placed: a prefab instance in it is of a prefab deleted since, and it can be shown as its Missing Prefab placeholder only in the open scene`);
+    }
+    void showDeletedPrefabsMissing();
+  }
   if (!reproject) return id;
   const tops = new Set<number>();
   for (const g of records.keys()) {
@@ -1396,9 +1429,19 @@ function spawnOnRecords(spawn: () => number, records: ReadonlyMap<string, Instan
   const topGuids = [...tops].map((t) => (getAllEntities().find((e) => e.id === t)?.guid ?? ''));
   for (const g of topGuids) {
     const top = g ? findEntityByGuid(g)?.id() : undefined;
+    // A top frame of a deleted prefab has no document to rebuild onto: the conversion above builds it, from its record,
+    // as its placeholder (the reload's), so it is not refused for that.
+    const topSource = top && piMeta ? readTraitData(top, piMeta)?.source as string | undefined : undefined;
+    if (topSource && editorPrefabDeleted(topSource)) continue;
     if (!top || !reprojectFromStore(top)) refuse(true);
   }
   return liveIdOf(guid, id);
+}
+
+/** The kind `ref`'s entity shows now (an undo that acts on it whichever it is passes this as its expected kind). */
+function kindNow(ref: EntityRef): 'placeholder' | 'entity' {
+  const id = ref.resolve();
+  return id != null && isMissingPrefabPlaceholder(id) ? 'placeholder' : 'entity';
 }
 
 /** Delete a copy: through the door's delete when the copy is on records (its records go, its link is dropped). */
@@ -1457,9 +1500,11 @@ export function pasteEntityCopy(
   _pushAction({
     label: 'Paste Entity',
     // By guid only, and a miss refuses (#1827, I19): after a world swap the raw id names whatever entity holds it now.
-    undo: () => { deleteCopy(selfRef!.require(), true); selectEntity(null); },
+    // Of either kind: a copy holding a frame of a deleted prefab is shown as its placeholder once pasted (#2144, ruling
+    // (B)), after the ref was taken, and the undo takes the copy out whole whichever it shows.
+    undo: () => { deleteCopy(selfRef!.require({ kind: kindNow(selfRef!) }), true); selectEntity(null); },
     redo: () => { currentId = spawn(parentRef ? parentRef.require() : 0); selectEntity(currentId); },
-    check: spawnCheck(selfRef!, parentRef, copy),
+    check: spawnCheck(selfRef!, parentRef, copy, true),
     affectedScenes,
   });
   return currentId;
@@ -1696,38 +1741,46 @@ export function deleteEntitiesWithUndo(
     for (const g of [...respawnedGuids, ...detached.map((d) => d.guid)]) { const e = findEntityByGuid(g); if (e) takeUnmarkedFromBase(e.id()); }
     setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
   };
+  const undoDelete = (): void => {
+    if (!viaRecords) return seatAround(changed!, 'before', undoViaSnapshot);
+    // A step since that the store does not follow left a tree it cannot reproject (a prefab trashed, a template that
+    // drops a node a record holds): the snapshot rebuilds the live trees, and each tree's records are then seated exactly
+    // as they stood before the delete (rule 8). That keeps what only a record holds — the pin of a member removed inside
+    // it, which is not live for a capture to read (#2001 S6, hunt seed 178) — and needs no re-seed (#2001 S8b). A
+    // snapshot that throws part-way rolls the step back (`undoStep`, `instanceRollback.ts`). Seated BEFORE the snapshot
+    // too, as the redo below and `seatAround` do: its frame rebase reprojects from the store, and a record still stating
+    // the delete removed the member it had just respawned (#2001 S8b review G1).
+    if (!restorable(viaRecords.map((t) => t.records.side), viaRecords)) {
+      for (const t of viaRecords) seatSide(t.records.side);
+      undoViaSnapshot();
+      for (const t of viaRecords) seatSide(t.records.side);
+      return;
+    }
+    // The refusals first, as on the snapshot path (I19).
+    const idx = buildGuidIndex();
+    const parents = snaps.map(s => (s.parentRef ? requireWith(s.parentRef, idx) : 0));
+    requireRootLinks(rootLinks, respawnedGuids);
+    survivors.prepare(idx, new Map());
+    // What lies outside every tree that stays — a deleted tree's root, a scene node — comes back from the snapshot; the
+    // trees' own nodes from their records (rule 8: the exact records, reprojected onto the CURRENT documents, #1820).
+    const liveIds = snaps.map((s, i) => (inTree[i] ? 0 : respawnFromSnapshot(s.snapshot, parents[i])));
+    restoreRootLinks(rootLinks);
+    for (const t of viaRecords) {
+      if (t.seat) { seatSide(t.records.side); continue; }
+      if (restoreSide(t.records.side, t.records.at)) continue;
+      throw new Error(`the delete's undo could not rebuild "${t.records.at}" from its records`);
+    }
+    setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
+  };
   _pushAction({
     label: snaps.length > 1 ? `Delete ${snaps.length} Entities` : 'Delete Entity',
+    // A frame the undo brings back of a prefab trashed since the delete is shown as its Missing Prefab placeholder, by the
+    // conversion the trash ran (#2146, the sibling of #2144's ruling (B) for paste): before, it came back as the deleted
+    // prefab's live tree, which the next reload turned into the placeholder. The conversion runs only where the trash's
+    // does (the open scene's own world, not prefab edit, not a base scene's entities) and waits for this step to finish.
     undo: () => {
-      if (!viaRecords) return seatAround(changed!, 'before', undoViaSnapshot);
-      // A step since that the store does not follow left a tree it cannot reproject (a prefab trashed, a template that
-      // drops a node a record holds): the snapshot rebuilds the live trees, and each tree's records are then seated exactly
-      // as they stood before the delete (rule 8). That keeps what only a record holds — the pin of a member removed inside
-      // it, which is not live for a capture to read (#2001 S6, hunt seed 178) — and needs no re-seed (#2001 S8b). A
-      // snapshot that throws part-way rolls the step back (`undoStep`, `instanceRollback.ts`). Seated BEFORE the snapshot
-      // too, as the redo below and `seatAround` do: its frame rebase reprojects from the store, and a record still stating
-      // the delete removed the member it had just respawned (#2001 S8b review G1).
-      if (!restorable(viaRecords.map((t) => t.records.side), viaRecords)) {
-        for (const t of viaRecords) seatSide(t.records.side);
-        undoViaSnapshot();
-        for (const t of viaRecords) seatSide(t.records.side);
-        return;
-      }
-      // The refusals first, as on the snapshot path (I19).
-      const idx = buildGuidIndex();
-      const parents = snaps.map(s => (s.parentRef ? requireWith(s.parentRef, idx) : 0));
-      requireRootLinks(rootLinks, respawnedGuids);
-      survivors.prepare(idx, new Map());
-      // What lies outside every tree that stays — a deleted tree's root, a scene node — comes back from the snapshot; the
-      // trees' own nodes from their records (rule 8: the exact records, reprojected onto the CURRENT documents, #1820).
-      const liveIds = snaps.map((s, i) => (inTree[i] ? 0 : respawnFromSnapshot(s.snapshot, parents[i])));
-      restoreRootLinks(rootLinks);
-      for (const t of viaRecords) {
-        if (t.seat) { seatSide(t.records.side); continue; }
-        if (restoreSide(t.records.side, t.records.at)) continue;
-        throw new Error(`the delete's undo could not rebuild "${t.records.at}" from its records`);
-      }
-      setSelection?.(snaps.map((x, i) => liveIdOf(x.guid, liveIds[i]!)));
+      undoDelete();
+      if (liveFramesOfDeletedPrefabs()) void showDeletedPrefabsMissing();
     },
     redo: () => {
       if (!viaRecords || !after) return seatAround(changed!, 'after', redoDelete);

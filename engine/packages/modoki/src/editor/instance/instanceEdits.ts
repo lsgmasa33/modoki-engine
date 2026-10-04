@@ -35,7 +35,7 @@ import { foldInstance } from '../../runtime/prefab/foldInstance';
 import { rowAt } from '../../runtime/core/prefabRowAt';
 import { dropInstanceRecord, storedRecord, setInstanceRecord, storedInstances } from '../../runtime/prefab/instanceStore';
 import { rollBack, takeStore } from './instanceRollback';
-import { ROOT_ROW_KEY, type InstanceRecord, type Placement, type RecordPart, type RowKey, type SceneTargetRecord } from '../../runtime/prefab/instanceRecord';
+import { HELD_REMAINDER, ROOT_ROW_KEY, type InstanceRecord, type Placement, type RecordPart, type RowKey, type SceneTargetRecord } from '../../runtime/prefab/instanceRecord';
 import { preV5NodeGuid } from '../../runtime/prefab/parseInstanceRecord';
 import { unresolvedRefOf } from '../../runtime/core/unresolvedPrefabRef';
 import { memberRowsIn, memberRowsToWrite } from '../../runtime/core/ecs/memberRows';
@@ -46,6 +46,7 @@ import { guidOfEntity, instanceKeyMap, instanceTargetOf, outermostStoredRoot, pr
 import { capturedRecordsOf, editorPrefabReader, recordForWrite, treeForWrite } from './instanceSync';
 import { promotedRecord } from './instancePromote';
 import { isSuppliedByPrefab } from '../scene/restructureRefusal';
+import { removableUnused } from '../scene/unusedOverrides';
 
 type Bag = Record<string, unknown>;
 
@@ -541,6 +542,19 @@ function beginDeleteImpl(entityIds: readonly number[], world: World = getCurrent
         const { rec, key, underKeys, gone } = item;
         const under = (k: RowKey) => underKeys.has(k) || [...underKeys].some((u) => k.startsWith(`${u}/`));
         rowOf(rec, key).removed = true;
+        // A keyed node that went WITH the deleted one but that its removal does not take (#2144, hunt seed 8043): a
+        // member placed INTO the deleted member's subtree from another frame (a template placing an outer frame's
+        // member under a nested frame's) is lifted by the fold to the nearest ancestor that stays (a failed move,
+        // `foldInstance`), so the record still built it while the delete took it off the screen with its parent, and a
+        // reload brought it back. Each such node is removed in its own right, topmost first; what hangs under it by the
+        // template then goes with it, so no removal is restated.
+        for (let round = 0; round < underKeys.size; round++) {
+          const built = foldInstance(editorPrefabReader, rec).nodes;
+          const left = [...underKeys].filter((k) => k !== key && !k.startsWith(`${key}/`) && built.has(k) && rec.list.rows.get(k)?.removed !== true);
+          const tops = left.filter((k) => { const pa = built.get(k)?.parent; return !(pa && 'key' in pa && left.includes(pa.key)); });
+          if (!tops.length) break;
+          for (const k of tops) rowOf(rec, k).removed = true;
+        }
         for (const [k, pin] of item.pins) {
           const row = rowOf(rec, k);
           if (row.guid === undefined) { row.guid = pin.guid; if (row.name === undefined && pin.name !== undefined) row.name = pin.name; }
@@ -1337,6 +1351,88 @@ export function revert(frame: RevertFrame, keys: ReadonlySet<string>, world: Wor
   return { touched: [...touched], top, unmatched };
 }
 
+// ── Remove Unused ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Is `v` a held container with nothing left in it: an empty list, or an object holding only its remainder marker? */
+const emptyHeld = (v: unknown): boolean =>
+  Array.isArray(v) ? v.length === 0 : !!v && typeof v === 'object' && Object.keys(v).every((k) => k === HELD_REMAINDER);
+
+/** Take the value at `path` out of `root` (an array element is spliced out), then each container on the way that it left
+ *  empty. */
+function dropHeldAt(root: Record<string, unknown>, path: readonly string[]): void {
+  for (let depth = path.length; depth > 0; depth--) {
+    let parent: unknown = root;
+    for (const step of path.slice(0, depth - 1)) parent = (parent as Record<string, unknown> | undefined)?.[step];
+    if (!parent || typeof parent !== 'object') return;
+    const last = path[depth - 1]!;
+    const here = (parent as Record<string, unknown>)[last];
+    if (depth < path.length && !emptyHeld(here)) return;
+    if (Array.isArray(parent)) parent.splice(Number(last), 1);
+    else delete (parent as Record<string, unknown>)[last];
+  }
+}
+
+/** Later array elements first, so taking one out leaves the index of every other still to be taken as it was. */
+function pathDescending(a: readonly string[], b: readonly string[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] === b[i]) continue;
+    const na = Number(a[i]), nb = Number(b[i]);
+    return Number.isInteger(na) && Number.isInteger(nb) ? nb - na : (a[i]! < b[i]! ? 1 : -1);
+  }
+  return b.length - a.length;
+}
+
+/**
+ * `removeUnused`: take instance root `rootId`'s REMOVABLE unused records off its list (#2001 S9; Unity's Remove Unused
+ * Overrides, M6; plan § 2.6, § 10.4). Exactly what `removableUnused` reports, which the dialog's count counts: a record
+ * whose target is `gone`, or a field a registered component does not persist (`unknownField`). Never a held user node
+ * (`heldNode`, rule 7), a record waiting on a missing prefab (`unresolved`), a component nothing registers (`unregistered`,
+ * plan :1087: Remove Missing's, #1944), or a value no reader takes (`held.unparsed`, written back as the file wrote it).
+ *
+ * A field taken off a component the base lacks leaves the ADDED component itself: the add applies, only its unknown field
+ * does not (§ 2.5). An unused record applies nothing, so the projection is the same without it, and nothing is rebuilt.
+ * Returns how many records it took, or null when the root holds no record (the caller refuses, loud).
+ */
+function removeUnusedImpl(rootId: number, world: World = getCurrentWorld()): number | null {
+  const rootGuid = guidOfEntity(rootId);
+  const rec = rootGuid ? recordForWrite(rootId, rootGuid, world) : null;
+  if (!rec) return null;
+  const taken = removableUnused(rec);
+  if (!taken.length) return 0;
+  const touched = new Set<RowKey>();
+  const legacy: string[][] = [];
+  for (const { key, part, cause } of taken) {
+    if (part.kind === 'legacy') { legacy.push(part.path); continue; }
+    const row = rec.list.rows.get(key);
+    if (!row) continue;
+    touched.add(key);
+    if (part.kind === 'field') {
+      const bag = row.traits?.[part.trait];
+      if (!bag || bag === true) continue;
+      delete (bag as Bag)[part.field];
+      // The last unknown field of an ADDED component leaves the add (`{}`, its schema's defaults), which applies; of an
+      // override, or on a gone target, the bag goes.
+      if (!Object.keys(bag).length && (cause === 'gone' || baseTrait(rec, key, part.trait) !== undefined)) delete row.traits![part.trait];
+    } else if (part.kind === 'trait') delete row.traits?.[part.trait];
+    else if (part.kind === 'traitRemoval') delete row.traitRemovals?.[part.trait];
+    else if (part.kind === 'removed') delete row.removed;
+    else if (part.kind === 'parent') delete row.parent;
+  }
+  // `tidy` would take an emptied bag too, which here is a kept add: only the emptied containers and rows go.
+  for (const key of touched) {
+    const row = rec.list.rows.get(key)!;
+    if (row.traits && !Object.keys(row.traits).length) delete row.traits;
+    if (row.traitRemovals && !Object.keys(row.traitRemovals).length) delete row.traitRemovals;
+    if (!Object.keys(row).length) rec.list.rows.delete(key);
+  }
+  const pending = rec.held.pendingLegacy as Record<string, unknown> | undefined;
+  if (pending && legacy.length) {
+    for (const path of legacy.sort(pathDescending)) dropHeldAt(pending, path);
+    if (emptyHeld(pending)) delete rec.held.pendingLegacy;
+  }
+  return taken.length;
+}
+
 // ── The shield ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The trees a verb writes in place, from its first argument (an entity id, or several), for a rollback's take; undefined
@@ -1384,6 +1480,7 @@ export const rowsOf = shielded('rowsOf', rowsOfImpl);
 export const priorRowsOf = shielded('priorRowsOf', priorRowsOfImpl);
 export const putRows = shielded('putRows', putRowsImpl);
 export const subtractApplied = shielded('subtractApplied', subtractAppliedImpl);
+export const removeUnused = shielded('removeUnused', removeUnusedImpl);
 /** `promoteAdded`'s check alone: could the records follow this promotion? Asked before the Apply writes a file. */
 export const canPromoteAdded = (...args: Parameters<typeof promoteAddedImpl>): boolean => !!promoteAddedImpl(...args);
 export const promoteAdded = shielded('promoteAdded', (...args: Parameters<typeof promoteAddedImpl>): boolean => {

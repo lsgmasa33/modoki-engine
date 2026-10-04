@@ -229,10 +229,14 @@ export function subscribePreviewWorld(fn: () => void): () => void {
   return () => { offUndo(); offMode(); };
 }
 
-/** The dialog's read-only line for an instance's UNUSED overrides (#1914 R5, owner ruling F6): records whose target is
- *  gone, which every save keeps and neither Apply nor Revert touches. Null when the instance keeps none, and the dialog
- *  then shows no line: the decision lives here, beside its test, not in the panel (#1933). */
-export function unusedOverridesLine(count: number): string | null {
+/** The dialog's line for an instance's UNUSED overrides (#1914 R5, owner ruling F6): records that apply nothing, which
+ *  every save keeps and neither Apply nor Revert touches. `removable` of them Remove Unused takes (#2001 S9: a target gone,
+ *  a field nothing persists); the rest stay whatever is pressed (a component nothing registers, a value no reader takes),
+ *  so a count with none removable says "(kept)". Null when the instance keeps none, and the dialog then shows no line: the
+ *  decision lives here, beside its test, not in the panel (#1933). The button shows when `removable > 0`. */
+export function unusedOverridesLine(count: number, removable = 0): string | null {
   if (!(count > 0)) return null;
-  return `${count} unused override${count === 1 ? '' : 's'} (kept)`;
+  const n = `${count} unused override${count === 1 ? '' : 's'}`;
+  if (!(removable > 0)) return `${n} (kept)`;
+  return removable >= count ? n : `${n} (${removable} removable)`;
 }

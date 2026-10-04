@@ -18,6 +18,7 @@ import { getPlayState, setPlayState, getRunMode, setRunMode, onRunModeChange } f
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { sceneLoadGeneration, isSceneLoadInFlight, registerBeforeSceneLoad, bootSceneWalkPending, captureWorldDirtyBaseline, restoreWorldDirtyBaseline, type WorldDirtyBaseline } from './serialize';
 import { captureAuthoredSnapshot, restoreAuthoredSnapshot, currentSceneKey, lastRestoreFailed, authoredRestoreInFlight, type AuthoredSnapshot } from './authoredSnapshot';
+import { unsavableMarkOf } from '../instance/instanceRollback';
 import { beginWorldReplacement } from './authoringSettle';
 import { adoptionsSettled, captureAdoption } from './sceneAdoption';
 import { markPlayBarrier, truncateUndoTo, beginWorldSwitch, getEditVersion } from '../undo/undoManager';
@@ -117,7 +118,7 @@ export type PlayOutcome =
   | { kind: 'started' }
   | { kind: 'resumed' }
   | { kind: 'already-playing' }
-  | { kind: 'refused'; reason: 'already-starting' | 'scene-swap' | 'restore-failed' | 'load-landed'; message: string }
+  | { kind: 'refused'; reason: 'already-starting' | 'scene-swap' | 'restore-failed' | 'unsavable' | 'load-landed'; message: string }
   /** Play reached 'playing', then a Stop queued during startup (#470) ended it. `reverted` is that
    *  Stop's own answer — false when it skipped the revert or its restore THREW (the throw is logged
    *  and folded in here, so the Play press that ran the Stop reports it rather than rejecting). */
@@ -126,6 +127,14 @@ export type PlayOutcome =
 function refusePlay(reason: Extract<PlayOutcome, { kind: 'refused' }>['reason'], message: string, warn = true): PlayOutcome {
   if (warn) console.warn(`[Editor] ${message}`);
   return { kind: 'refused', reason, message };
+}
+
+/** Play's refusal for a world it must not snapshot as authored — the last restore failed, or a mark holds it unsavable —
+ *  or null. Asked at entry and again after `enterPlay`'s awaits, which can replace or mark the world. */
+function whyNotPlayable(): PlayOutcome | null {
+  if (lastRestoreFailed()) return refusePlay('restore-failed', 'Play refused — the last Play/preview restore FAILED, so the live world may not be the authored one. Reload the scene first.');
+  const unsavable = unsavableMarkOf();
+  return unsavable ? refusePlay('unsavable', `Play refused — ${unsavable}.`) : null;
 }
 
 export async function enterPlay(): Promise<PlayOutcome> {
@@ -172,10 +181,11 @@ export async function enterPlay(): Promise<PlayOutcome> {
     return refusePlay('scene-swap', 'Play refused — the editor is still finishing a scene switch (repairing prefab instances after prefab edit). Try again in a moment.');
   }
   // A failed restore may have left the posed (or previous Play) world live; Play's snapshot would take
-  // it as authored, and Stop's successful restore would clear the flag that is guarding it (#1548).
-  if (lastRestoreFailed()) {
-    return refusePlay('restore-failed', 'Play refused — the last Play/preview restore FAILED, so the live world may not be the authored one. Reload the scene first.');
-  }
+  // it as authored, and Stop's successful restore would clear the flag that is guarding it (#1548). And a world no save
+  // may write (`unsavableMarkOf`): Stop restores a NEW world, which no mark holds, so Play → Stop would clear the mark and
+  // let a save write what it guards (#2141 review). Both asked again after the awaits below.
+  const notPlayable = whyNotPlayable();
+  if (notPlayable) return notPlayable;
 
   // Set synchronously, before the first await, so a Stop that arrives while we're
   // mid-startup (getPlayState() still reads 'stopped' below) can tell "Play is
@@ -212,6 +222,10 @@ export async function enterPlay(): Promise<PlayOutcome> {
     // Null: a switch still landing here (one that waited for the same undo step, or swapped during the envelope's restore).
     const adopted = captureAdoption();
     if (!adopted) return refusePlay('scene-swap', 'Play refused — a scene is still loading. Try again once it is open.');
+    // Asked again here, of the world the undo step and the takedown LEFT (#2141 close-out re-review): the takedown's own
+    // restore can refuse a base tree (NOT_RESTORED) or fail, and the gates at entry read the posed world before it.
+    const notAuthored = whyNotPlayable();
+    if (notAuthored) return notAuthored;
     // Snapshot only — NO `assignGuids` (see captureAuthoredSnapshot). Bases included (A5).
     const versionAtSnapshot = getEditVersion();
     _snapshot = await captureAuthoredSnapshot();
@@ -240,6 +254,9 @@ export async function enterPlay(): Promise<PlayOutcome> {
       _snapshot = null;
       return refusePlay('load-landed', 'Play cancelled — a scene load landed while the snapshot was being taken.');
     }
+    // A mark that landed during the awaits above (a rollback that could not finish, an Apply undo's refused reseat).
+    const markedSince = whyNotPlayable();
+    if (markedSince) { _snapshot = null; return markedSince; }
     // Mark the undo barrier at the real Play press (not the paused→playing resume
     // above) so Stop can drop only during-Play edits — taken at the snapshot, above.
     _undoBarrier = barrier;

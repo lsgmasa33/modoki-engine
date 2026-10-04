@@ -67,9 +67,11 @@ export function linksUnplacedNode(rec: InstanceRecord): boolean {
 }
 
 /** May the fan-out reproject the tree at outermost projectable root `top` from its records (#2046 S7.3)? Every record in
- *  it stored, and none linking a user's node a rebuild would lose: one the fold does not place that is not live either
- *  (a LIVE one's content is read off the tree before the rebuild, and the reprojection holds it, #2001 S8b). Such a
- *  tree is rebuilt from the capture until then. */
+ *  it stored, and none linking a user's node a rebuild would lose: one neither live nor held, placed by the fold or not
+ *  (a LIVE one's content is read off the tree before the rebuild, and the reprojection holds it, #2001 S8b). A placed
+ *  one that is not live is a record the tree disagrees with — a Stop that seats back the link to a node a preview deleted
+ *  (#2141), an op that unlinked and destroyed one and threw — and its content is nowhere: the rebuild spawns nothing for
+ *  it, and the save writes the link alone. */
 export function reprojectsExactly(top: number): boolean {
   const world = getCurrentWorld();
   for (const id of [top, ...storedRootsUnder(top)]) {
@@ -79,10 +81,13 @@ export function reprojectsExactly(top: number): boolean {
   return true;
 }
 
-/** {@link linksUnplacedNode}, less a node that is live. */
+/** Does `rec` link a user's node that is neither held nor live — unused ({@link linksUnplacedNode}, less a live one), or
+ *  placed with no live node to read its content off (#2141)? */
 function linksLostNode(rec: InstanceRecord): boolean {
   const held = new Set([...(rec.held.heldOwn?.values() ?? [])].flat().map((n) => n.guid));
-  return foldInstance(editorPrefabReader, rec).unused.some((u) => u.part.kind === 'own' && !held.has(u.part.guid) && !findEntityByGuid(u.part.guid));
+  const lost = (g: string) => !held.has(g) && !findEntityByGuid(g);
+  const fold = foldInstance(editorPrefabReader, rec);
+  return fold.unused.some((u) => u.part.kind === 'own' && lost(u.part.guid)) || [...fold.anchors.values()].some((ns) => ns.some((n) => lost(n.guid)));
 }
 
 /** {@link identityOf}, narrowed to the members the record's fold builds (#2046 S7.3): a reprojection runs over a live tree

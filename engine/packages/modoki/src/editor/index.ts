@@ -38,6 +38,7 @@ export type { PlayOutcome, StopOutcome } from './scene/playMode';
 export { isWorldAuthored, whyWorldNotAuthored, notAuthoredExit } from './scene/authoredWorld';
 export { envelopeExitOptions } from './scene/envelopeExits';
 export { lastRestoreFailed } from './scene/authoredSnapshot';
+export { unsavableMarkOf } from './instance/instanceRollback';
 export { hasTimelinePreviewSession } from './scene/timelinePreview';
 export { onAuthoringSettled, isWorldReplacementInFlight } from './scene/authoringSettle';
 // #1750: what the hot reload asks the adoption owner — through hooks the bridge installs, since the bridge cannot import it.
@@ -122,6 +123,9 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 // …and `revertOverridesWithUndo` the only way to revert them with one (#1671: the dialog and the agent op each
 // carried a copy of its closures).
 export { revertOverridesWithUndo } from './undo/revertPrefabUndo';
+// …and `removeUnusedOverridesWithUndo` the one Remove Unused (#2001 S9), for the dialog and the agent op alike.
+export { removeUnusedOverridesWithUndo, type RemoveUnusedOutcome } from './undo/removeUnusedUndo';
+export { instanceUnusedOverrides, instanceRemovableUnused } from './scene/unusedOverrides';
 export { detachPrefabInstanceWithUndo, detachRefusal, detachPrefabMenuItem } from './undo/detachPrefabUndo';
 export { restructureRefusal, reorderWriteRefusal, isSuppliedByPrefab, partOfInstanceRefusal, RESTRUCTURE_REFUSAL_TEXT, PART_OF_INSTANCE_TEXT, type RestructureGesture } from './scene/restructureRefusal';
 export {

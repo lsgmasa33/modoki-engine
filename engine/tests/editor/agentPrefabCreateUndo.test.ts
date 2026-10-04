@@ -236,22 +236,25 @@ describe('agent prefab create — undo restores the links the tree already had (
       place(hull.id()); // a held instance holds its record, as a load or a drop leaves it (#2001 S8b)
       return hull;
     };
-    const sourceOf = (e: ReturnType<typeof spawnHull>) => (e.get(PrefabInstance) as { source: string }).source;
+    // By guid: a redo shows the re-linked tree from its record, respawning it (#2101), so an entity handle taken before
+    // names nothing after it.
+    const hullNow = () => getCurrentWorld().entities.find((e) => (e.get(EntityAttributes) as { guid?: string } | undefined)?.guid === 'g-rl-ok-hull')!;
+    const sourceOf = () => (hullNow().get(PrefabInstance) as { source: string }).source;
     // Accept side: nothing rebuilt since the undo — the redo re-links Hull to the prefab it made.
-    const kept = spawnHull('rl-ok');
+    spawnHull('rl-ok');
     await runAgentOp('prefab', { action: 'create', entityGuid: 'g-rl-ok-hull', path: NEW_PATH });
-    const made = sourceOf(kept);
+    const made = sourceOf();
     expect(made, 'premise: the create relinked Hull').not.toBe(CHILD_GUID);
     await undo();
-    expect(sourceOf(kept)).toBe(CHILD_GUID);
+    expect(sourceOf()).toBe(CHILD_GUID);
     await redo();
-    expect(sourceOf(kept)).toBe(made);
+    expect(sourceOf()).toBe(made);
     await undo();
     // Hull's frame rebuilt from a changed Child, as a saved prefab edit does.
     const changed = { ...childPrefab, entities: childPrefab.entities.map((e) => (e.localId === 2 ? { ...e, traits: { ...e.traits, Transform: { x: 5 } } } : e)) };
-    noteFrameRootDoc(getCurrentWorld(), kept, { source: CHILD_GUID, doc: changed as never });
+    noteFrameRootDoc(getCurrentWorld(), hullNow(), { source: CHILD_GUID, doc: changed as never });
     await redo();
-    expect(sourceOf(kept)).toBe(CHILD_GUID);
+    expect(sourceOf()).toBe(CHILD_GUID);
   });
 
   // I9, as the human redo (close-out review 2): the redo re-seats a key an eviction left cold. Mutation: drop the agent

@@ -145,7 +145,10 @@ export function serializeInstanceRecord(rec: InstanceRecord, ctx: SerializeConte
  */
 export function serializeTemplateOwner(list: TemplateOverrideList): { fields: Record<string, unknown>; superseded: SupersededValue[] } {
   const superseded: SupersededValue[] = [];
-  const fields: Record<string, unknown> = { members: templateMembers(list.rows, ['members'], superseded) };
+  // A list with no rows states no `members` (S6's row form): an empty `{}` states nothing, yet it took the place of a held
+  // whole `members` the file had in no shape a reader takes, which was then superseded rather than written back (#2012).
+  const members = templateMembers(list.rows, ['members'], superseded);
+  const fields: Record<string, unknown> = Object.keys(members).length ? { members } : {};
   if (list.held) putHeld(fields, list.held, [], superseded);
   // A held row can add a key: rows in key order, as the scene form writes them.
   if (isPlainObject(fields.members)) fields.members = sortedByKey(fields.members);

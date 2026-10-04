@@ -13,13 +13,6 @@
 import type { Op } from './ops';
 import type { StepFailure } from './runner';
 import { type Failure } from './checks';
-import { placeholderGuids } from './harness';
-import { findEntityByGuid, getCurrentWorld } from '../../../packages/modoki/src/runtime/core/ecs/world';
-import { rowPlaceholderOf } from '../../../packages/modoki/src/runtime/core/unresolvedPrefabRef';
-import { getCachedPrefabSync } from '../../../packages/modoki/src/editor/scene/prefabCache';
-import { getAllAssets } from '../../../packages/modoki/src/runtime/loaders/assetManifest';
-import { storedRecord } from '../../../packages/modoki/src/runtime/prefab/instanceStore';
-import { getAllEntities } from '../../../packages/modoki/src/runtime/core/ecs/entityUtils';
 
 export interface KnownOpen {
   issue: number;
@@ -60,40 +53,7 @@ export interface KnownOpen {
 // world, or a loaded BASE scene's tree (the trash's reload keeps a base rather than rebuilding it). Neither repro reaches the
 // first two; the fuzz fixture has no base scene, so whether either still reproduces through one is not known (parked).
 
-/** #2061: the end walk's redo of an instantiate respawns a FRESH instance after its nested prefab was trashed, so a missing
- *  nested row's placeholder takes the template row's name, while the no-op rebuild's capture names it from the kept orphan
- *  row the earlier reload kept in the record of the same root (`"C" vs "QR"`). Only a name on a live ROW placeholder, and only
- *  that pair: the live side (`before`) is the name a template row with the placeholder's nodeGuid states, and the rebuilt
- *  side is the name a kept orphan row carrying the placeholder's guid states (in its instance's record, #2001 S8b). A rebuild that names it anything else is
- *  not this. */
-const redoFreshRowName = (f: Failure): boolean => {
-  if (f.check !== 'a no-op rebuild is not the identity') return false;
-  const m = /^\/([0-9a-f-]{36})\/traits\/EntityAttributes\/name: (".*") vs (".*")$/.exec(f.detail);
-  const handle = m ? findEntityByGuid(m[1]!) : undefined;
-  const row = handle ? rowPlaceholderOf(handle as never) : undefined;
-  if (!m || !row || !placeholderGuids().has(m[1]!)) return false;
-  const [live, rebuilt] = [JSON.parse(m[2]!) as string, JSON.parse(m[3]!) as string];
-  const templateNamed = getAllAssets().some((a) => a.type === 'prefab'
-    && !!getCachedPrefabSync(a.guid)?.entities?.some((e) => (e as { nodeGuid?: string }).nodeGuid === row.nodeGuid && e.name === live));
-  const keptNamed = getAllEntities().some((e) => !!e.guid
-    && [...(storedRecord(getCurrentWorld(), e.guid)?.list.rows.values() ?? [])].some((r) => r.guid === m[1] && r.name === rebuilt));
-  return templateNamed && keptNamed;
-};
-
-export const KNOWN_OPEN: KnownOpen[] = [
-  {
-    issue: 2061,
-    what: "#2061 (the first three ops of #2058's hunt seed 7393, reached once #2059's fix cleared the P1 that stopped them): instantiate P, trash Q. The end walk's redo of the instantiate respawns P fresh, so QR's row placeholder takes P's row name \"C\"; the no-op rebuild names it \"QR\" from the kept orphan row the walk's earlier reload stored under that root guid. Pre-existing; S7 (#2046) moves undo respawns onto records",
-    repro: [
-      {kind: 'agentInstantiate', u: [0.6674717084970325, 0.4996268576942384, 0.3815350905060768, 0.034017449244856834, 0.06155300512909889, 0.9358029635623097, 0.3157953575719148, 0.6284085356164724]},
-      {kind: 'reparent', u: [0.482875149929896, 0.8734884578734636, 0.38113589212298393, 0.2252884756308049, 0.3568096316885203, 0.5456582698971033, 0.2601598205510527, 0.007961861556395888]},
-      {kind: 'trashPrefab', u: [0.8713770764879882, 0.9898986634798348, 0.030512092169374228, 0.8338360395282507, 0.4410598403774202, 0.3584468113258481, 0.37893556780181825, 0.659620591904968]},
-    ],
-    reproduces: (f) => redoFreshRowName(f),
-    // Tolerated, not a stop: it fires in the end-of-run respawn check, which REGRESSIONS reach too (#2058's 7393 for #2059).
-    tolerates: (f) => redoFreshRowName(f),
-  },
-];
+export const KNOWN_OPEN: KnownOpen[] = [];
 
 /** Fixed bugs the fuzzer found: each repro must now PASS. A KNOWN_OPEN entry moves here when its issue is fixed, so
  *  the minimized failure stays a regression test (#1789: "every minimized failure becomes a normal regression test").
@@ -142,6 +102,54 @@ export interface Reach {
 
 /** `runTag`: an entry re-pinned by editing its draws runs under the tag it was recorded with (`RunOpts.runTag`, #1946). */
 export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: Op[]; runTag?: number }[] = [
+  {
+    issue: 2001,
+    what: "#2001 S9 Remove Unused, from hunt seed 3129 (weights revert=30,outsideEdit=20; its first 27 ops, then undo, redo and a save→reload): an outside edit takes a leaf row out of a template (op 21, removeLeaf), so an instance's records of it are unused, and the dialog's Remove Unused (op 26) takes them — 3 — off the list; the undo puts them back and the redo takes them again, under every per-op check (P1, P5, I23)",
+    // The end walk's undo stops at an outside edit (forgiven); the Remove's own undo and redo are ops 27 and 28 of the list.
+    reaches: { op: 26, outcome: 'done', skips: ['outsideEdit: undo refusal forgiven (rest of the walk not run)'] },
+    repro: [
+      {kind: 'editField', u: [0.3035158591810614, 0.7116277441382408, 0.402424925705418, 0.20384457078762352, 0.5810851845890284, 0.7280096777249128, 0.1371134091168642, 0.37769936374388635]},
+      {kind: 'apply', u: [0.7717368267476559, 0.577809504698962, 0.4341560599859804, 0.594024887541309, 0.721099057700485, 0.08627639547921717, 0.3267806190997362, 0.647860643453896]},
+      {kind: 'revert', u: [0.42139668576419353, 0.29075199691578746, 0.7291772183962166, 0.07121680490672588, 0.07300782855600119, 0.767534903716296, 0.5684820699971169, 0.1683729609940201], variant: 'removeUnused'},
+      {kind: 'outsideEdit', u: [0.1904076049104333, 0.5406739555764943, 0.014189822832122445, 0.8346755877137184, 0.10995890712365508, 0.563629518263042, 0.8939788860734552, 0.9961447019595653], check: 'rebuild-reload', variant: 'toOverride'},
+      {kind: 'redo', u: [0.6283918262924999, 0.2867057076655328, 0.5276590054854751, 0.41668609250336885, 0.13859439990483224, 0.1027744731400162, 0.5019517964683473, 0.999155247118324]},
+      {kind: 'revert', u: [0.20939309149980545, 0.07775902026332915, 0.10091539053246379, 0.17920359899289906, 0.21415725187398493, 0.9359173693228513, 0.6169902449473739, 0.7679395286832005], variant: 'removeUnused'},
+      {kind: 'outsideEdit', u: [0.9551945279818028, 0.303493769839406, 0.5735958009026945, 0.5542294662445784, 0.00792356370948255, 0.7191363296005875, 0.6026110239326954, 0.6432815636508167], variant: 'toOverride'},
+      {kind: 'revert', u: [0.8331832904368639, 0.8406533878296614, 0.46664126333780587, 0.3263815219979733, 0.5727723191957921, 0.3346611834131181, 0.3553189041558653, 0.1179835603106767]},
+      {kind: 'delete', u: [0.41033861762844026, 0.7163016144186258, 0.3415523723233491, 0.14818010129965842, 0.9111166349612176, 0.6804213519208133, 0.8351964466273785, 0.5307719055563211]},
+      {kind: 'removeComponent', u: [0.02147048176266253, 0.7151561067439616, 0.8607008580584079, 0.11230226629413664, 0.4511321890167892, 0.3313408284448087, 0.9140266706235707, 0.9119588902685791]},
+      {kind: 'apply', u: [0.8485685654450208, 0.9836542860139161, 0.5741964192129672, 0.9902399668935686, 0.8427312066778541, 0.6286248716060072, 0.4918920430354774, 0.11117773922160268]},
+      {kind: 'renamePrefab', u: [0.17239780817180872, 0.6948976798448712, 0.5382439212407917, 0.04690046329051256, 0.7328333938494325, 0.2996351211331785, 0.6222874131053686, 0.5532717516180128]},
+      {kind: 'agentSceneOps', u: [0.43145234207622707, 0.6814217045903206, 0.3907732809893787, 0.7120149694383144, 0.336688547860831, 0.8474646473769099, 0.495569835184142, 0.3891766786109656]},
+      {kind: 'timelinePreview', u: [0.846848021261394, 0.0827907903585583, 0.1654546121135354, 0.29152796952985227, 0.10304750641807914, 0.9495705089066178, 0.369556121295318, 0.8078504358418286]},
+      {kind: 'paste', u: [0.5632137297652662, 0.7733649560250342, 0.4630614153575152, 0.6203274070285261, 0.6090642202179879, 0.6801023613661528, 0.2922305748797953, 0.08084590127691627]},
+      {kind: 'revert', u: [0.8801809875294566, 0.8700147666968405, 0.6742052708286792, 0.4958315999247134, 0.5356400695163757, 0.581240793922916, 0.5168540074955672, 0.1625200300477445]},
+      {kind: 'outsideEdit', u: [0.25122492015361786, 0.7835880722850561, 0.24041904299519956, 0.6053439048118889, 0.2126886467449367, 0.673486668150872, 0.29312385246157646, 0.8337193436454982], check: 'rebuild-reload', variant: 'toOverride'},
+      {kind: 'editField', u: [0.26418816205114126, 0.9129093873780221, 0.48112353729084134, 0.6681748542468995, 0.03234542463906109, 0.11518862145021558, 0.9136989440303296, 0.6377161764539778]},
+      {kind: 'addChild', u: [0.9397688347380608, 0.05010363319888711, 0.7863381521310657, 0.26234544278122485, 0.5554997224826366, 0.6460787507239729, 0.39442661008797586, 0.04785081883892417]},
+      {kind: 'reparent', u: [0.9946357975713909, 0.9883288363926113, 0.7392175022978336, 0.661410358035937, 0.5874019649345428, 0.7478639783803374, 0.37341599934734404, 0.20987489051185548]},
+      {kind: 'reparent', u: [0.7112337676808238, 0.9749626962002367, 0.3557832627557218, 0.6904596115928143, 0.7358487991150469, 0.8603227667044848, 0.8802156844176352, 0.7951314491219819]},
+      {kind: 'outsideEdit', u: [0.37436338514089584, 0.5161408244166523, 0.027894092025235295, 0.5912952516227961, 0.3895309390500188, 0.9053564546629786, 0.6477649586740881, 0.7437669446226209], check: 'rebuild-reload', variant: 'removeLeaf'},
+      {kind: 'duplicate', u: [0.5054826305713505, 0.2458805199712515, 0.21558656124398112, 0.11938353115692735, 0.8148526235017926, 0.8918901064898819, 0.5355975485872477, 0.9143984671682119]},
+      {kind: 'editField', u: [0.4457573585677892, 0.6795877984259278, 0.04339343938045204, 0.46281080506742, 0.5721660009585321, 0.8331975161563605, 0.7593810318503529, 0.12806050875224173]},
+      {kind: 'revert', u: [0.5584808953572065, 0.5176436288747936, 0.4782022424042225, 0.7503931920509785, 0.8258186031598598, 0.08220885042101145, 0.6437000741716474, 0.8389925013761967]},
+      {kind: 'prefabEdit', u: [0.03785910177975893, 0.09588267910294235, 0.38172108167782426, 0.9568814577069134, 0.6008334720972925, 0.25263029197230935, 0.08864987711422145, 0.5415000128559768], inner: [{"kind": "addChild", "u": [0.9175962957087904, 0.9689109909813851, 0.5996483087074012, 0.7546881518792361, 0.573676708387211, 0.8454236756078899, 0.9651236662175506, 0.9537078847642988]}, {"kind": "editField", "u": [0.7717943249735981, 0.447859711246565, 0.4982935015577823, 0.3280761463101953, 0.6373435670975596, 0.43722436972893775, 0.4129731459543109, 0.22577273519709706]}, {"kind": "agentInstantiate", "u": [0.1593803868163377, 0.9374874057248235, 0.11479312577284873, 0.5003167102113366, 0.035281681222841144, 0.745583558222279, 0.8900937594007701, 0.2185531836003065]}, {"kind": "delete", "u": [0.6481614548247308, 0.016629888443276286, 0.25512216542847455, 0.5543946733232588, 0.8361423325259238, 0.23856531223282218, 0.4296248855534941, 0.17056385660544038]}]},
+      {kind: 'revert', u: [0.49784586438909173, 0.553381115430966, 0.447389965178445, 0.24448081431910396, 0.05183637700974941, 0.96884592063725, 0.9908556898590177, 0.13649138691835105], variant: 'removeUnused'},
+      {kind: 'undo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+      {kind: 'redo', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+      {kind: 'saveReload', u: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]},
+      ],
+    },
+    {
+    issue: 2061,
+    what: 'the redo of an instantiate puts back the records its undo took, so a nested prefab trashed since shows as the placeholder its record names, and a rebuild changes nothing (the first three ops of #2058\'s hunt seed 7393)',
+    reaches: { op: 2, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
+    repro: [
+      {kind: 'agentInstantiate', u: [0.6674717084970325, 0.4996268576942384, 0.3815350905060768, 0.034017449244856834, 0.06155300512909889, 0.9358029635623097, 0.3157953575719148, 0.6284085356164724]},
+      {kind: 'reparent', u: [0.482875149929896, 0.8734884578734636, 0.38113589212298393, 0.2252884756308049, 0.3568096316885203, 0.5456582698971033, 0.2601598205510527, 0.007961861556395888]},
+      {kind: 'trashPrefab', u: [0.8713770764879882, 0.9898986634798348, 0.030512092169374228, 0.8338360395282507, 0.4410598403774202, 0.3584468113258481, 0.37893556780181825, 0.659620591904968]},
+    ],
+  },
   {
     issue: 1829,
     what: "Retired from KNOWN_OPEN by #2001 S8b step 6 (Detach's and Create Prefab's undo put the marks back as they were taken, `restoreMarksOnly`, and no longer derive more from the template: `restoreMarks`' added-component rule marked every field of the partially stated component, which was the widening; the records are seated next and projected). Before: #1829 seen by P1 (#2058, hunt seed 7512): a file-direct write states an added component partially (`Rotate3D: {speed: 2}`), Create Prefab turns the instance into a prefab and two undos bring it back. The undo respawns it from the old capture, which writes the component whole, so the live tree marks `axis` too, where the record keeps `speed` alone. The LIST is right (it is what the file stated); S6's save writes it, and the reload marks `speed` only. Values agree throughout. Hub ruling 2026-10-03: recorded on #1829, the old capture is not fixed",
@@ -1166,7 +1174,9 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1850,
     what: 'a Missing Prefab placeholder of an entry that states its root\'s sortOrder as a root OVERRIDE loads with that sortOrder, so save→reload→save keeps the top-level order (prune on, after a trash)',
-    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    // The walk runs to its ends since #2144 (ruling B): a duplicate's undo takes its copy out though the trash showed it
+    // as a placeholder since, where it was refused (I20's kind change) and the walk stopped.
+    reaches: { op: 4, outcome: 'done', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
     repro: [
       { kind: 'addChild', u: [0.9957377251703292, 0.12976732291281223, 0.2103715562261641, 0.9275979360099882, 0.43928383802995086, 0.07324382080696523, 0.19927202980034053, 0.8402995807118714] },
       { kind: 'duplicate', u: [0.21626306232064962, 0.5490222787484527, 0.789051380706951, 0.16266263229772449, 0.5332405406516045, 0.12282868777401745, 0.042075154604390264, 0.1445559342391789] },
@@ -1334,7 +1344,8 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
   {
     issue: 1798,
     what: "the validator reads a compact entry's top-level guid (a child of a placeholder is not an orphan)",
-    reaches: { op: 9, outcome: 'refused', skips: ['assetDelete: undo refusal forgiven (rest of the walk not run)'] },
+    // The walk runs to its ends since #2144 (ruling B), as #1850's above.
+    reaches: { op: 9, outcome: 'refused', skips: ['assetDelete: redo to the end identity', 'assetDelete: undo to the start identity'] },
     repro: [
       { kind: 'addChild', u: [0.8400129179935902, 0.47072196402586997, 0.8546695783734322, 0.5384382756892592, 0.7912890370935202, 0.9474262788426131, 0.8190620134118944, 0.5476701280567795] },
       { kind: 'duplicate', u: [0.08395724813453853, 0.5124020783696324, 0.0963418607134372, 0.3281203443184495, 0.6479879403486848, 0.0661356458440423, 0.3539451723918319, 0.9203498638235033] },
@@ -2156,6 +2167,24 @@ export const REGRESSIONS: { issue: number; what: string; reaches: Reach; repro: 
       { kind: 'renamePrefab', u: [0.46644100616686046, 0.9491556943394244, 0.3208945142105222, 0.021118161967024207, 0.7603487404994667, 0.8564518021885306, 0.06807488715276122, 0.2669390744995326] },
       { kind: 'detach', u: [0.06688332161866128, 0.6946881860494614, 0.2665958320721984, 0.5674304543063045, 0.8620331815909594, 0.9083743314258754, 0.09638037416152656, 0.49108412442728877] },
       { kind: 'trashPrefab', u: [0.3363701975904405, 0.6394898821599782, 0.11000243900343776, 0.23431037133559585, 0.9473079708404839, 0.25993252359330654, 0.10916272760368884, 0.9273152293171734] },
+    ],
+  },
+  {
+    issue: 2148,
+    what: "#2148 (work-ai's #2001 S9 hunt, seed 3128): an outside edit added a leaf to O, and a second one took it out with no save between. The member the first adopt built had its pin only in the live tree, never in O1's record, so the removal dropped the row's guid and name (I23), where a save + reload keeps them. An adopt's rebase now pins what it builds (pinBuiltMembers, as an Apply's fan-out since seed 9457). Red before.",
+    reaches: { op: 1, outcome: 'done' },
+    repro: [
+      { kind: 'outsideEdit', u: [0.25633053854107857, 0.7614013054408133, 0.3060335121117532, 0.7454814873635769, 0.9734072538558394, 0.17486723395995796, 0.8282552191521972, 0.6439138886053115] },
+      { kind: 'outsideEdit', u: [0.37787686265073717, 0.6477342734578997, 0.6778850990813226, 0.8270476933103055, 0.2776702481787652, 0.5788618475198746, 0.9128447992261499, 0.8283137341495603], variant: 'removeLeaf', check: 'rebuild-reload' },
+    ],
+  },
+  {
+    issue: 2148,
+    what: "#2148 (work-ai's #2001 S9 hunt, seed 3253; the same shape): an outside edit added a leaf to O, and a second one took it out with no save between. The member the first adopt built had its pin only in the live tree, never in O1's record, so the removal dropped the row's guid and name (I23), where a save + reload keeps them. An adopt's rebase now pins what it builds (pinBuiltMembers, as an Apply's fan-out since seed 9457). Red before.",
+    reaches: { op: 1, outcome: 'done' },
+    repro: [
+      { kind: 'outsideEdit', u: [0.11099913599900901, 0.7731180943083018, 0.4576923851855099, 0.8874419396743178, 0.8436546346638352, 0.8233817787840962, 0.9235232514329255, 0.5584651052486151] },
+      { kind: 'outsideEdit', u: [0.12471310351975262, 0.01811424409970641, 0.8408408653922379, 0.526766344672069, 0.3748945230618119, 0.73409637901932, 0.7819212686736137, 0.754568055504933], variant: 'removeLeaf', check: 'rebuild-reload' },
     ],
   },
 ];

@@ -268,8 +268,11 @@ describe('serializeTemplateOwner: what a prefab v10 reference row states (#2008)
     expect(Object.keys(out['/'].own![1].members!)).toEqual(['/', `/${M2}`]);
   });
 
-  it('an empty row writes nothing', () => {
-    expect(tm(tmpl({ [`/${M1}`]: {} }))).toEqual({});
+  it('an empty row writes nothing, and a list of nothing states no `members` at all (#2012)', () => {
+    expect(tm(tmpl({ [`/${M1}`]: {} }))).toBeUndefined();
+    // An empty `{}` states nothing, yet it would take the place of a held whole `members`, which then was superseded
+    // rather than written back (S6's row form writes none for a row with no rows; `writeTemplateForm` already dropped it).
+    expect('members' in serializeTemplateOwner(tmpl({ [`/${M1}`]: {} })).fields).toBe(false);
   });
 
   it('a reference row\'s held values go back beside `members`, pending legacy first, a superseded one reported', () => {

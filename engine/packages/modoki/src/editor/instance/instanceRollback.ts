@@ -111,6 +111,15 @@ export function isUnsavableAfterRollback(world: World | null = peekCurrentWorld(
   return !!world && !!unsavableBy.get(UNSAVABLE)?.has(world);
 }
 
+/** The reason any mark above holds `world` (default: the current one) unsavable, or null. Play and a timeline preview
+ *  refuse to open on such a world (#2141 review): their exit restores a NEW world, which no mark holds, from a snapshot
+ *  that took the marked world as authored — one Play → Stop would clear the mark and let a save write what it guards. */
+export function unsavableMarkOf(world: World | null = peekCurrentWorld()): string | null {
+  if (!world) return null;
+  for (const [why, marked] of unsavableBy) if (marked.has(world)) return why;
+  return null;
+}
+
 /** Is `why` (a `whyWorldNotAuthored` answer) one of the marks above — a world no save may write until a load replaces it,
  *  which a retry or a Stop does not clear? The save answers it as `'unsavable'`, not as a run mode (#2001 S8b review L2). */
 export function isUnsavableMark(why: string | null | undefined): boolean {

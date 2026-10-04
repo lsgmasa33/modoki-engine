@@ -18,6 +18,7 @@ import { findEntityById } from '../../runtime/core/ecs/world';
 import { foldInstance } from '../../runtime/prefab/foldInstance';
 import { storedInstance } from '../../runtime/prefab/instanceStore';
 import { valuesEqual } from '../scene/prefab';
+import { fieldFate } from '../../runtime/loaders/overrideFate';
 import { guidOfEntity, instanceKeyMap } from './instanceKeys';
 import { editorPrefabReader } from './instanceSync';
 
@@ -52,6 +53,8 @@ export function instanceDrift(rootId: number): string[] {
       if (!lv) continue;
       for (const [f, v] of Object.entries(data)) {
         if (SKIP_FIELDS[t]?.has(f)) continue;
+        // A field the component does not persist (an `unknownField` record, kept and written back): no live entity holds it.
+        if (fieldFate(meta, f) !== 'applies') continue;
         if (!valuesEqual(v, lv[f])) out.push(`${name} (${k}): ${t}.${f} is ${JSON.stringify(lv[f])?.slice(0, 80)} live, ${JSON.stringify(v)?.slice(0, 80)} in the record`);
       }
     }

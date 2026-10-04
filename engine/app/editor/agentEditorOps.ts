@@ -57,7 +57,7 @@ import {
   preloadNestedPrefabsForSubtree,
 detachPrefabInstanceWithUndo, detachRefusal,
   restructureRefusal, reorderWriteRefusal, RESTRUCTURE_REFUSAL_TEXT, COLLAPSED_PARENT_REFUSAL_TEXT, MOVED_MEMBER_REFUSAL_TEXT,
-  applyToPrefabWithUndo, revertOverridesWithUndo, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
+  applyToPrefabWithUndo, revertOverridesWithUndo, removeUnusedOverridesWithUndo, instanceUnusedOverrides, instanceRemovableUnused, revertRefusal, missingSourceRefusal, resolveInstanceContext, previewApply, describeEffect,
   type KeyEffect,
   collectInstanceOverrideFields, collectInstanceOverrideKeys, effectiveDefaults, DEFAULT_OVERRIDES_NOTE, canonicalOverrideKey, applyTargetOptions, checkApplyTargets,
   pushAction, makePrefabInstantiateAction, placedPrefabPath, placedPrefabRefusal, entityRef, placeholderWriteRefusal, assetDocAction,
@@ -75,7 +75,7 @@ detachPrefabInstanceWithUndo, detachRefusal,
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
+  causeSpecs, flushParked, getModeOwner, envelopeExitOptions, lastRestoreFailed, unsavableMarkOf, hasTimelinePreviewSession, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceAfterDiskChange, whyWorldNotAuthored, notAuthoredExit,
   dirtyAssetEditorHolds,
   editorStateCurrent, captureAdoption, recordSceneFileChanged, setFreshFileReadObserver, beginFreshFileRead, onAdoptionsSettled, onWorldHoldsSettled, adoptionsSettled,
 UndoRefusedError, isUndoStepInFlight, isSnapshotOperationInFlight, beginForwardEdit,
@@ -512,6 +512,8 @@ type PrefabAction =
   // an agent can drive the human "Apply to Prefab" / "Revert Overrides" dialogs, which
   // previously had no agent path at all despite this contract claiming one existed. ──
   | 'overrides' | 'apply' | 'revert'
+  // Remove Unused (#2001 S9): the dialog's button — the instance's removable unused overrides come off its list.
+  | 'remove-unused'
   | 'edit-open' | 'edit-save' | 'edit-exit';
 
 interface PrefabParams {
@@ -3863,6 +3865,19 @@ export function registerEditorAgentOps(): void {
       // revert is live-only — the prefab FILE is untouched, matching instantiate/detach.
       return { ok: true, newRootId: result.newRootId, guid: ensureGuid(result.newRootId), revertedKeys: [...keySet], ...defaultsOut, saved: false };
     }
+    // Remove Unused (#2001 S9; Unity's Remove Unused Overrides): the same wrapper the dialog's button calls, one undo entry.
+    // `overrides` reports the counts (`keys.unusedOverrides`, `keys.removableUnused`); these records have no keys.
+    if (which === 'remove-unused') {
+      refuseEditOfPosedWorld('prefab remove-unused');
+      if (p.entityId == null && !p.entityGuid) throw new Error('prefab remove-unused requires { entityId | entityGuid }');
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab remove-unused');
+      const ctx = resolveInstanceContext(entityId);
+      if (!ctx) throw new Error(`prefab remove-unused: entity ${entityId} is not a prefab instance — nothing to remove.`);
+      const out = removeUnusedOverridesWithUndo(ctx.rootInstanceId);
+      if ('refused' in out) throw new Error(`prefab remove-unused refused: ${out.refused}`);
+      return { ok: true, rootInstanceId: ctx.rootInstanceId, guid: ensureGuid(ctx.rootInstanceId), removed: out.removed,
+        unusedOverrides: instanceUnusedOverrides(ctx.rootInstanceId), removableUnused: instanceRemovableUnused(ctx.rootInstanceId), saved: false };
+    }
     // ── Prefab-edit mode (#125) ──
     // The only path that re-SERIALIZES an existing .prefab.json. `create` writes a prefab FROM a
     // scene entity; these open the template itself in an isolated synthetic world, so a save
@@ -3992,7 +4007,7 @@ export function registerEditorAgentOps(): void {
     }
     throw new Error(
       `unknown prefab action '${which}' — pass prefabAction: 'instantiate' | 'create' | 'detach' ` +
-      "| 'overrides' | 'apply' | 'revert' | 'edit-open' | 'edit-save' | 'edit-exit' " +
+      "| 'overrides' | 'apply' | 'revert' | 'remove-unused' | 'edit-open' | 'edit-save' | 'edit-exit' " +
       "(the name is `prefabAction`, not `action`: /api/editor-action spends `action` on the op name).",
     );
   });
@@ -4084,6 +4099,17 @@ export function registerEditorAgentOps(): void {
     // later. Replying before that would report a pose the caller's next read cannot see — and the
     // natural next call after posing is exactly such a read.
     const { applied, openedSession, refused } = await poseClipAtTime(clip, rootId, clamped, 'animation');
+    // A world no save may write opens no preview (#2141 close-out re-review): no restore is landing, so "pose again" would
+    // retry forever. Said as the mark it is.
+    const unsavable = refused ? unsavableMarkOf() : null;
+    if (unsavable) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
+        ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+        error: `no preview opens on this world: ${unsavable}`,
+        options: ['modoki_load_scene — reopen the scene from disk, then pose again'],
+      };
+    }
     if (refused) {
       return {
         ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,

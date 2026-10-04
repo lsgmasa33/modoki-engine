@@ -4,7 +4,8 @@
  *  from the original documents and from the documents rewritten as v10. Each fixture first proves it reaches its class.
  *  The documents are the parser's own fixture shapes (`parseInstanceRecord.test.ts`). */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { writeTemplateForm } from '../../packages/modoki/src/runtime/prefab/templateFormDocument';
 import { parseTemplateLists } from '../../packages/modoki/src/runtime/prefab/parseInstanceRecord';
 import { foldInstance } from '../../packages/modoki/src/runtime/prefab/foldInstance';
 import type { ParsedInstance, PrefabDoc, PrefabReader, TemplateOverrideList } from '../../packages/modoki/src/runtime/prefab/instanceRecord';
@@ -121,6 +122,8 @@ const ownOf = (l: TemplateOverrideList) => l.rows.get('/')?.own?.[0];
 const TEMPLATE: Array<{ name: string; doc: PrefabDoc; read: PrefabReader; lid: number; reaches: (l: TemplateOverrideList) => unknown }> = [
   { name: 'a row whose nested prefab is missing (list.held.pendingLegacy)', doc: P, read: reader(P), lid: 3, reaches: (l) => l.held?.pendingLegacy },
   { name: 'a row value in no shape a reader takes (list.held.unparsed)', doc: { ...P, entities: [P.entities[0]!, P.entities[1]!, { ...P.entities[2]!, removed: 'x' as never }] }, read: ALL, lid: 3, reaches: (l) => l.held?.unparsed },
+  // #2012: a whole `members` in no shape a reader takes, on a row whose list has no rows: written back, not an empty `{}`.
+  { name: 'a whole `members` in no shape a reader takes (list.held.unparsed.members)', doc: { ...P, entities: [P.entities[0]!, P.entities[1]!, { localId: 3, nodeGuid: N3, name: 'Engine', prefab: 'Q', traits: { EntityAttributes: { name: 'Engine', parentId: 1 } }, members: 'junk' as never }] }, read: ALL, lid: 3, reaches: (l) => l.held?.unparsed?.members },
   { name: 'a template reference node whose prefab is missing (node held)', doc: R(refNode({ prefab: 'GONE', overrides: { 2: { Light: { intensity: 6 } } } })), read: reader(Q), lid: 2, reaches: (l) => ownOf(l)?.held?.pendingLegacy },
   { name: 'a template reference node: its channels → members, its templateMoved → a parent token', doc: R(refNode({ overrides: { 2: { Light: { intensity: 6 } } }, templateMoved: { 2: '@member:3' } })), read: reader(Q), lid: 2, reaches: (l) => ownOf(l)?.members?.[`/${NQ2}`]?.parent },
   { name: 'a legacy KEYED move kept as a parent on the node row (#1883 C)', doc: R(refNode({ added: [K1()], templateMoved: { '+k1': '@member:2' } })), read: reader(Q), lid: 2, reaches: (l) => ownOf(l)?.members?.['/a+k1']?.parent },
@@ -162,5 +165,30 @@ describe('a document\'s held `moved` round-trips through the writer (#2007 close
     for (const moved of ['junk', 7, ['x']]) expect(serializeTemplateDocHeld(parseTemplateLists(doc(moved), 'D', read).docHeld)).toEqual({ moved });
     expect(serializeTemplateDocHeld(parseTemplateLists(doc({ '9.9': '@member:1' }), 'D', read).docHeld)).toEqual({ moved: { '9.9': '@member:1' } });
     expect(serializeTemplateDocHeld(undefined)).toEqual({});
+  });
+});
+
+describe('the prefab document writer puts a held whole `members` back (#2012)', () => {
+  /** P with its row 3 stating `members: "junk"`, beside `extra` channels. */
+  const junk = (extra: Record<string, unknown> = {}): PrefabDoc => ({ ...P, id: 'PJ', entities: [P.entities[0]!, P.entities[1]!, { localId: 3, nodeGuid: N3, name: 'Engine', prefab: 'Q', traits: { EntityAttributes: { name: 'Engine', parentId: 1 } }, members: 'junk' as never, ...extra }] });
+
+  it('a row that states nothing else writes the held value back verbatim', () => {
+    const doc = junk();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try { writeTemplateForm(doc, 'PJ', reader(Q)); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
+    // MUTATION TARGET: state `members: {}` for a list with no rows (the old writer) and the held value is superseded by it,
+    // then the empty `{}` dropped: the row came out stating nothing, the value gone.
+    expect((doc.entities[2] as { members?: unknown }).members).toBe('junk');
+  });
+
+  it('a row whose list has rows writes them, and SAYS the held value it does not write back', () => {
+    const doc = junk({ overrides: { 2: { Light: { intensity: 6 } } } });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      writeTemplateForm(doc, 'PJ', reader(Q));
+      // MUTATION TARGET: drop the writer's report and the value is dropped unsaid (owner ruling F-CB1(a)).
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('prefab PJ, row 3') && m.includes(': members'))).toHaveLength(1);
+    } finally { warn.mockRestore(); }
+    expect(Object.keys((doc.entities[2] as { members?: object }).members ?? {}), 'the row the overrides state').toEqual([`/${NQ2}`]);
   });
 });

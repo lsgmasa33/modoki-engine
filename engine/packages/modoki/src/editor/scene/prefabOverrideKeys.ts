@@ -41,7 +41,7 @@ import { ownInstanceStructure, instanceBase, nestedFrameMoves } from './prefabCh
 import { type ApplyResult } from './prefabApply';
 import { memberRef, toLocalIdKey, nestedKeyRef } from './overrideKeyGrammar';
 import { ownedFrames, levelDoc } from './prefabBase';
-import { instanceUnusedOverrides } from './unusedOverrides';
+import { instanceRemovableUnused, instanceUnusedOverrides } from './unusedOverrides';
 
 // ── Key-format helpers — the ONE place these four string shapes are written ──
 
@@ -255,9 +255,10 @@ export interface InstanceOverrideListing {
    *  never have distinguished. A key that cannot name one thing is worse than no key. */
   unaddressableAdded: number;
   /** The UNUSED overrides the instance keeps (#1914 R5, owner ruling F6, `instanceUnusedOverrides`): records whose target
-   *  is gone, written back by every save. Counted, not keyed: neither Apply nor Revert acts on them (Unity's Remove is
-   *  later work). */
+   *  is gone, written back by every save. Counted, not keyed: neither Apply nor Revert acts on them. */
   unusedOverrides: number;
+  /** How many of them Remove Unused takes (#2001 S9, `instanceRemovableUnused`). */
+  removableUnused: number;
 }
 
 /** Unity's default overrides, as Modoki's fields (#1831). Unity: the root GameObject's name, and the root Transform's
@@ -350,7 +351,7 @@ export function collectInstanceOverrideListing(rootInstanceId: number, prefab: P
     for (const k of own) nested.push(nestedKeyRef(prefab, chain, k, getCachedPrefabSync));
   }
 
-  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, defaultOverrides, unaddressableAdded, unusedOverrides: instanceUnusedOverrides(rootInstanceId) };
+  return { entities, addedTags, added, removedEntities, removedTraits, moved, nested, applyExcluded, defaultOverrides, unaddressableAdded, unusedOverrides: instanceUnusedOverrides(rootInstanceId), removableUnused: instanceRemovableUnused(rootInstanceId) };
 }
 
 /** What a surface offering `mode` lists: Apply leaves out the fields it cannot write (#1661) — listed, they were
@@ -437,6 +438,8 @@ export interface InstanceOverrideKeys {
   unaddressableAdded: number;
   /** {@link InstanceOverrideListing.unusedOverrides}. */
   unusedOverrides: number;
+  /** {@link InstanceOverrideListing.removableUnused}. */
+  removableUnused: number;
 }
 
 export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: PrefabFile): InstanceOverrideKeys {
@@ -450,7 +453,7 @@ export function collectInstanceOverrideKeys(rootInstanceId: number, prefab: Pref
   return {
     fields, added, removedEntities, removedTraits, addedTags, moved,
     all: [...fields, ...added, ...removedEntities, ...removedTraits, ...addedTags, ...moved],
-    nested: l.nested, applyExcluded: l.applyExcluded, defaultOverrides: l.defaultOverrides, unaddressableAdded: l.unaddressableAdded, unusedOverrides: l.unusedOverrides,
+    nested: l.nested, applyExcluded: l.applyExcluded, defaultOverrides: l.defaultOverrides, unaddressableAdded: l.unaddressableAdded, unusedOverrides: l.unusedOverrides, removableUnused: l.removableUnused,
   };
 }
 

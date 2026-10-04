@@ -1254,8 +1254,9 @@ export function spawnReferenceNode(
   // One that loads but expands to no root is kept the same way (#1768).
   if (!child || !expandsToRoot(child, read)) {
     console.warn(`[loadSceneFile] added nested instance not cached, or expands to no root: ${node.prefab}`);
-    // A placeholder carrying the node, so the next save writes it back verbatim (#1699).
-    spawnUnresolvedReference(world, node, parentEcsId, sceneVersion);
+    // A placeholder carrying the node, so the next save writes it back verbatim (#1699), and showing the user's own nodes
+    // the node links AT it, as a top-level placeholder does (#2144 seed 8045).
+    spawnNodePlaceholderShowingLinks(world, node, parentEcsId, ancestors, read, sceneVersion);
     return;
   }
   // A key the expansion gives two nodes across documents (#1933 L5) refuses a reference node as it refuses an entry (close-
@@ -1266,7 +1267,7 @@ export function spawnReferenceNode(
   if (repeat) {
     console.warn(`[loadSceneFile] added nested instance ${node.prefab} was not expanded: ${repeat}`);
     noteDamagedPrefab([node.prefab!, typeof child.id === 'string' ? child.id : ''], repeat);
-    spawnUnresolvedReference(world, node, parentEcsId, sceneVersion);
+    spawnNodePlaceholderShowingLinks(world, node, parentEcsId, ancestors, read, sceneVersion);
     return;
   }
   // The node's channels split as the settle reads them (#1938 C-B step 2; close-out review #2): a malformed one crashed
@@ -2270,9 +2271,10 @@ const embeddedDocsByWorld = new WeakMap<World, Map<string, Map<string, TemplateD
 const embeddedFramesByWorld = new WeakMap<World, Map<string, Map<string, Set<string>>>>();
 
 /** A copy the load could not admit (#1937 C-A, T13): not a prefab document, or one declaring an identifier twice. Kept
- *  per world and scene, as the good copies are, for the save alone — it is written back verbatim while its prefab is
- *  missing (I18), and never handed to an expansion (Unity never repairs a file with a duplicate identifier). Before it,
- *  such a copy was dropped with a warning, and the next save lost it. */
+ *  per world and scene, as the good copies are, and never handed to an expansion (Unity never repairs a file with a
+ *  duplicate identifier). Until #2001 S6 the save wrote it back verbatim while its prefab was missing (I18); since S6
+ *  (owner ruling B) no save writes a copy, damaged or not, and the validator names each as a backup the next save drops
+ *  (#1940). S8 deletes this store with the copy carry. */
 const damagedCopiesByWorld = new WeakMap<World, Map<string, Map<string, unknown>>>();
 
 /** Record the copies `data` carries for `world`, under the scene `scene`. Each is admitted as a prefab document is at its
@@ -2661,6 +2663,43 @@ function showLinksAtPlaceholder<E extends SceneEntityEntry>(world: World, placeh
     if (Array.isArray(row.added)) row.added = keep(row.added);
   }
   return out;
+}
+
+/** `showLinksAtPlaceholder` for a scene-added REFERENCE node whose prefab is missing or damaged (#2144 seed 8045): the
+ *  placeholder `spawnUnresolvedReference` makes for it shows the user's own nodes the node links at `/` (hub ruling Q3 on
+ *  #2025, "in every file form"), spawned under it as the scene's nodes, and carries the node with those links taken out.
+ *  The store parses the same links (`recordsOf`), so an instance placed there is a record whose root is live; before, only
+ *  a top-level placeholder showed them, and one nested in another instance's content kept them hidden in its carry. A node
+ *  states no root localId, so only its `/` row's lists can link here, never the legacy `added`. */
+function spawnNodePlaceholderShowingLinks(
+  world: World, node: AddedEntity, parentEcsId: number, ancestors: ReadonlySet<string>, read: ExpansionReader, sceneVersion?: number,
+): void {
+  const shaped = splitMalformedChannels(node).clean as AddedEntity;
+  // A rebuild from the store reads the placeholder's own record, as a resolved node's projection does (rule 2): the node
+  // it is handed is the carry, the links already taken out.
+  const fromStore = (read as StoreReader).fromStore;
+  const stored = node.guid ? fromStore?.record(node.guid) : undefined;
+  const parsed = stored ? { record: stored, ownContent: fromStore!.ownContent }
+    : typeof node.guid === 'string' && node.guid
+    ? parseReferenceNode(shaped, () => ({ missing: true }), { sceneVersion: sceneVersion ?? CAPTURE_FORM_SCENE_VERSION })
+    : undefined;
+  const linked = new Set((parsed?.record.list.rows.get('/')?.own ?? []).map((r) => r.guid));
+  const added = [...linked].map((g) => parsed!.ownContent.get(g)).filter((n): n is NonNullable<typeof n> => !!n)
+    .map((n) => ({ ...(n as AddedEntity), parentLocalId: 1 }));
+  let carried = node;
+  if (added.length) {
+    const out = structuredClone(node) as AddedEntity & { members?: Record<string, SceneMemberRow> };
+    const row = out.members?.['/'] as Record<string, unknown> | undefined;
+    const keep = (nodes: unknown): unknown => (Array.isArray(nodes) ? nodes.filter((n) => !(isRecord(n) && typeof n.guid === 'string' && linked.has(n.guid))) : nodes);
+    if (row) {
+      if (Array.isArray(row.own)) { row.own = keep(row.own); if (!(row.own as unknown[]).length) delete row.own; }
+      if (Array.isArray(row.added)) row.added = keep(row.added);
+    }
+    carried = out;
+  }
+  const placeholderId = spawnUnresolvedReference(world, carried, parentEcsId, sceneVersion);
+  if (!placeholderId || !added.length) return;
+  applyStructureByLocalToEcs(world, new Map([[1, placeholderId]]), { entities: [], rootLocalId: -1 }, { added }, ancestors, read, () => undefined, sceneVersion);
 }
 
 /** The root guid a parse links guid-less nodes under when the caller knows none (`instantiatePrefabIntoWorld`). */

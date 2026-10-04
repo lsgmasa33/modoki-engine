@@ -120,6 +120,11 @@ const CENSUS: Record<string, { calls: Primitive[]; standing: Standing; why: stri
     why: '`applyEditWorldMoves` places nodes of the PREFAB-EDIT world, whose save is the template writer, not a scene '
       + 'instance\'s list; P1 does not project an edit world',
   },
+  [`${E}/panels/assetOps.ts`]: {
+    calls: ['trait.set', 'trait.add', 'trait.remove'], standing: 'notAuthored',
+    why: 'Create Prefab\'s undo puts back the values (and drops the components) a reprojecting redo replaced (#2101, `putLiveValuesBack`) on the tree '
+      + 'it has just unlinked: plain entities only, never a re-linked frame\'s member',
+  },
   [`${E}/scene/sceneDirty.ts`]: {
     calls: ['writeTraitField'], standing: 'notAuthored',
     why: 'stamps `EntityAttributes.sourceScene`, the base-scene provenance; § 10.4b keeps it out of every record, and it is '

@@ -636,7 +636,7 @@ async function landAdopts(changes: readonly PrefabChange[], opts: { rebase?: boo
   // 8. The rebase — not when the caller rebuilds its own world (the prefab-edit open, the leave repair), and not in a
   // world replaced during the reads: that load built its frames from these files itself.
   if (opts.rebase === false || !report.sources.length || getCurrentWorld() !== world) return { ok: true, paths, adopted: report };
-  const rebased = await rebaseStaleInstances({ sources: new Set(report.sources) });
+  const rebased = await rebaseStaleInstances({ sources: new Set(report.sources), pin: true });
   return { ok: true, paths, rebased, adopted: report };
 }
 

@@ -18,7 +18,7 @@ import { preloadRebuildEntry, keptEnclosingSource } from '../scene/prefabRebuild
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { revertOverridesSelective, type RevertResult } from '../scene/prefabRevert';
-import { restoreSide, type RecordsSide } from '../instance/instanceHistory';
+import { restoreSideOrNothing, type RecordsSide } from '../instance/instanceHistory';
 
 /** Revert the selected overrides on instance `rootInstanceId` AND record one undo entry. Resolves the Revert's result,
  *  or null when nothing was reverted (see `revertOverridesSelective`). Selects the rebuilt root. The caller gives a
@@ -56,7 +56,7 @@ export async function revertOverridesWithUndo(rootInstanceId: number, selectedKe
     const frame = ref.require(expect); // asked again: the await above can span a world swap
     // A frame inside a frame the rebuild keeps live (#1862) would be left as it is: the step would change nothing while
     // reporting that it did (#1880 F7d close-out review 1).
-    const done = !keptEnclosingSource(frame) ? restoreSide(side, frameGuid || topGuid) : null;
+    const done = !keptEnclosingSource(frame) ? restoreSideOrNothing(side, frameGuid || topGuid) : null;
     if (!done) {
       throw new UndoRefusedError(
         `the scene entry holding this instance of "${source}" is gone, or its prefab or one around it cannot be read ` +

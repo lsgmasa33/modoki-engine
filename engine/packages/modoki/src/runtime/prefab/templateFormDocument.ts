@@ -27,7 +27,9 @@ export function writeTemplateForm(doc: PrefabDoc, docGuid: string, read: PrefabR
   doc.entities.forEach((row, i) => {
     const parsed = typeof row?.localId === 'number' ? rows.get(row.localId) : undefined;
     if (!parsed) return;
-    const { fields } = serializeTemplateOwner(parsed.list);
+    const { fields, superseded } = serializeTemplateOwner(parsed.list);
+    // Said, never dropped unsaid (owner ruling F-CB1(a)), as the scene save says it (`instanceSave.ts`, #2012).
+    if (superseded.length) console.warn(`[save] prefab ${docGuid}, row ${row.localId}: the save states its own value where the file held one no reader took; that value is not written back: ${superseded.map((v) => v.path.join('.')).join(', ')}`);
     const members = fields.members;
     // A row that states nothing about its instance writes no `members`.
     if (members && typeof members === 'object' && !Object.keys(members).length) delete fields.members;

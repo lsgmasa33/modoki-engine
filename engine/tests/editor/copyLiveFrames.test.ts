@@ -4,7 +4,8 @@
  *  Owner ruling B (#2001 S5, #2028): no copy expands anything. Every frame of a missing prefab loads as its Missing Prefab
  *  placeholder, listed or not, keeping every record under it, and the list is written back as the file held it until
  *  S6 stops writing copies. What item 1 decided (which frames a copy restores) is retired with the expansion; what is
- *  left is the round trip, the validator's warnings, and the records under the placeholders.
+ *  left is the round trip, the validator's warnings (each copy and list named as an unread backup, #1940), and the records
+ *  under the placeholders.
  *
  *  Item 1 — the list. Before it, "live at the save" was read off the member rows the save happened to write, and the
  *  writer writes none inside a stored root's expansion (`memberRows` exclusion 2), so a frame inside a TEMPLATE reference
@@ -120,8 +121,8 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     expect(placeholderGuids().has(p1Guid), 'ruling B: listed live, still a placeholder').toBe(true);
   });
 
-  it('an address that resolves to nothing is ignored, and the validator names an unanchored one; the load completes', async () => {
-    // Mutation: drop `embeddedPrefabFrameWarnings` from `validateSceneData` → the anchor warning is not reported.
+  it('an address that resolves to nothing is ignored, and the validator names the copy and its list as unread; the load completes', async () => {
+    // Mutation: drop `embeddedPrefabFrameWarnings` from `validateSceneData` → the list's warning is not reported.
     const f = await startRun(be, noNest, 'lf-unresolved');
     const pDoc = JSON.parse(be.read(f.prefabs.P.path)!) as unknown;
     await trash(f, 'P');
@@ -134,8 +135,10 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     const ghost = 'abababab-0000-4000-8000-000000000001';
     list.push(ghost, `${list[0]}/eeeeeeee-0000-4000-8fff-000000000001`, `${list[0]}/+no-such-key`);
     write(f, sc);
+    // Ruling B (#1940): the copy and its list are named as a backup nothing reads, which the next save drops.
     expect(validateSceneData(sc).warnings).toEqual([
-      `embeddedPrefabFrames['${f.prefabs.P.guid}']: the frame '${ghost}' is anchored on no entity of this scene — the loader matches no frame to it`,
+      `embeddedPrefabs['${f.prefabs.P.guid}']: this scene holds a backup of prefab ${f.prefabs.P.guid} that is no longer used; it will be dropped at the next save. Restore the prefab from version control if you need it`,
+      'embeddedPrefabFrames: the frames a v19 save listed for its prefab backups are no longer read; the list will be dropped at the next save',
     ]);
     await reload(f);
     expect(placeholderGuids().has(topRootGuidOf(sc, f.prefabs.P.guid)), 'ruling B: P1 its placeholder').toBe(true);
@@ -153,7 +156,7 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     bad.embeddedPrefabs = { [f.prefabs.P.guid]: pDoc };
     bad.embeddedPrefabFrames = { [f.prefabs.P.guid]: 'not a list' } as never;
     write(f, bad);
-    expect(validateSceneData(bad).warnings).toContain(`embeddedPrefabFrames['${f.prefabs.P.guid}']: not a list of frame addresses — the loader ignores it, and the copy answers by the member rows`);
+    expect(validateSceneData(bad).warnings).toContain('embeddedPrefabFrames: the frames a v19 save listed for its prefab backups are no longer read; the list will be dropped at the next save');
     const warn = vi.spyOn(console, 'warn');
     await reload(f);
     expect(warn.mock.calls.some((c) => String(c[0]).includes('embeddedPrefabFrames for'))).toBe(true);
@@ -187,7 +190,7 @@ describe('#1939 item 1: a copy restores exactly the frames its scene listed live
     const Z = 'cccccccc-0000-4000-8fff-000000000009';
     sc.embeddedPrefabFrames = { [Z]: [] };
     write(f, sc);
-    expect(validateSceneData(sc).warnings).toEqual([`embeddedPrefabFrames['${Z}']: no copy of this prefab in embeddedPrefabs — nothing reads the list, and the next save drops it`]);
+    expect(validateSceneData(sc).warnings).toEqual(['embeddedPrefabFrames: the frames a v19 save listed for its prefab backups are no longer read; the list will be dropped at the next save']);
     await reload(f);
     expect(writeTraitFieldWithUndo(getAllEntities().find((e) => e.name === 'Plain')!.id, TF(), 'x', 2)).toBeFalsy();
     await settle();

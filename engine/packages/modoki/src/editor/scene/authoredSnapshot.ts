@@ -31,8 +31,8 @@ import { soaSchema, isRuntimeOnlyField } from '../../runtime/core/ecs/traitSchem
 import { registerPosedWorldSource } from './authoredWorld';
 import { registerUndoRestoreBarrier } from '../undo/undoManager';
 import { withRestore } from './sceneAdoption';
-import { setInstanceRecord, storedInstance, storedInstances, type StoredInstance } from '../../runtime/prefab/instanceStore';
-import { rollBack, rollbackOnThrow, takeStore } from '../instance/instanceRollback';
+import { replaceStoredInstances, setInstanceRecord, storedInstance, storedInstances, type StoredInstance } from '../../runtime/prefab/instanceStore';
+import { markWorldUnsavable, rollBack, rollbackOnThrow, takeStore } from '../instance/instanceRollback';
 import { bankInstanceRecords, dropRecordBank, cloneInstanceStore, steadyRecords, storedText } from '../../runtime/prefab/recordBank';
 import { guidOfEntity, projectionRootOf } from '../instance/instanceKeys';
 import { reprojectFromStore, reprojectsExactly } from '../instance/instanceReproject';
@@ -299,29 +299,63 @@ export function restoreAuthoredEntities(entries: SerializedEntity[]): void {
  *  instead, and the next write re-seeded it from the live tree: the dropped edit's structure, and every field Play or the
  *  pose moved that the entries do not state, went into the record (and the next save). A root the snapshot has no record
  *  for (made during the session, or edited while the snapshot serialized: `steadyRecords`) keeps the one it has. A tree
- *  that cannot be rebuilt exactly from its records is left as it was, its records seated, and says why (as a rebuild
- *  does, `prefabRebuild.ts`; #2001 S8b: before, it was marked stale for a re-seed from the live tree). No `records` (a
- *  snapshot built by hand): nothing to compare. An Apply's undo and redo that reload the scene seat a base's records the
- *  same way, from the store as it stood on that side (`applyPrefabUndo.ts`). True when it rebuilt any tree (by new ids). */
+ *  its seated records cannot rebuild exactly — one links a user's node that is neither placed, held nor live, or its
+ *  prefab cannot be read — is REFUSED (#2141): its records go back to the ones it had, the tree is left as it was, the
+ *  console names it, and the world is marked unsavable until a load replaces it (S8b's rule). Before, the records stayed
+ *  seated with a warning, and the save wrote them: a node the session's rebuild held (its anchor member gone from the
+ *  prefab) was linked by the seated record and held by none, so the save dropped it. A rebuild that THROWS puts the
+ *  store back as it stood before that tree's seat, marks the world and rethrows. A Missing Prefab placeholder has no tree to rebuild: its record is
+ *  seated back as it stood. No `records` (a snapshot built by
+ *  hand): nothing to compare. An Apply's undo and redo that reload the scene seat a base's records the same way, from the
+ *  store as it stood on that side (`applyPrefabUndo.ts`). True when it rebuilt any tree (by new ids). */
 export function seatBaseRecords(records: ReadonlyMap<string, StoredInstance> | undefined): boolean {
   if (!records) return false;
   const world = getCurrentWorld();
-  // By guid: a rebuild respawns its tree under new ids.
-  const tops = new Set<string>();
+  // Each tree's differing roots, by its outermost root's guid (a rebuild respawns its tree under new ids).
+  const trees = new Map<string, string[]>();
   for (const g of baseStoredRoots()) {
     const was = records.get(g);
     if (!was || storedText(was) === storedText(storedInstance(world, g))) continue;
-    setInstanceRecord(world, structuredClone(was.record));
     const top = projectionRootOf(findEntityByGuid(g, world)!.id());
-    if (top) tops.add(guidOfEntity(top));
+    // A Missing Prefab placeholder nested in a tree (no projection unit of its own; a root UNDER a placeholder is one, #2018,
+    // and takes the tree path) has nothing to project: its record is all it states, so it is seated back as it stood, with
+    // no rebuild to ask about (#2141 review: skipped, it kept the session's edit).
+    if (!top) { setInstanceRecord(world, structuredClone(was.record)); continue; }
+    const tg = guidOfEntity(top);
+    trees.set(tg, [...(trees.get(tg) ?? []), g]);
   }
-  for (const g of tops) {
-    const top = findEntityByGuid(g, world)?.id();
-    if (top === undefined || (reprojectsExactly(top) && reprojectFromStore(top))) continue;
-    console.warn(`[Prefab] restore of instance ${g} left as it was: its records cannot rebuild it — reload its scene to update it`);
+  let rebuilt = false;
+  for (const [tg, roots] of trees) {
+    const had = new Map(roots.map((g) => [g, storedInstance(world, g)!]));
+    // The whole store as it stood before this tree's seat: a rebuild that throws part-way may have changed records beyond
+    // the differing roots (a held node it seated, a record it dropped), so the throw puts all of it back (re-review H1).
+    const storeBefore = new Map(storedInstances(world));
+    const putBack = () => { for (const s of had.values()) setInstanceRecord(world, s.record); };
+    for (const g of roots) setInstanceRecord(world, structuredClone(records.get(g)!.record));
+    const top = findEntityByGuid(tg, world)?.id();
+    const refused: { why?: string } = {};
+    try {
+      if (top !== undefined && !reprojectsExactly(top)) refused.why = 'a record links a node it does not hold, which a rebuild would lose';
+      else if (top !== undefined && reprojectFromStore(top, undefined, undefined, { refused })) { rebuilt = true; continue; }
+    } catch (e) {
+      // A rebuild that threw part-way: the tree may be half-built, so no record states it — not the seated ones, not the
+      // ones before. The store goes back, the throw is said, and the world is unsavable (a rollback that cannot finish,
+      // `instanceRollback.ts` edge 4).
+      replaceStoredInstances(world, storeBefore);
+      markWorldUnsavable(world, NOT_RESTORED);
+      console.error(`[Prefab] restore of instance ${tg} threw while rebuilding (${(e as Error)?.message ?? e}) — the scene cannot be saved until it is reopened`);
+      throw e;
+    }
+    // `reprojectFromStore` refuses before it rebuilds anything, so the tree is still the one `had` states.
+    putBack();
+    console.error(`[Prefab] restore of instance ${tg} refused: ${refused.why ?? 'its root is gone'} — left as it was, and the scene cannot be saved until it is reopened`);
+    markWorldUnsavable(world, NOT_RESTORED);
   }
-  return tops.size > 0;
+  return rebuilt;
 }
+
+/** The world a restore could not put an instance back in ({@link seatBaseRecords}, #2141): no save may write it. */
+export const NOT_RESTORED = 'an instance could not be restored from its records (the console names it) — reopen the scene before saving';
 
 function baseStoredRoots(): string[] {
   return [...storedInstances(getCurrentWorld()).keys()].filter((g) => {

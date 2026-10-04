@@ -41,9 +41,13 @@ import { findEntity } from '../../packages/modoki/src/runtime/core/ecs/entityUti
 import { dropInstanceRecord, storedInstances } from '../../packages/modoki/src/runtime/prefab/instanceStore';
 import { whyWorldNotAuthored } from '../../packages/modoki/src/editor/scene/authoredWorld';
 import { instanceUnusedOverrides } from '../../packages/modoki/src/editor/scene/unusedOverrides';
+import { removeUnusedOverridesWithUndo } from '../../packages/modoki/src/editor/undo/removeUnusedUndo';
+import { undo, redo, undoDepth, undoLabel } from '../../packages/modoki/src/editor/undo/undoManager';
+import { storedRecord } from '../../packages/modoki/src/runtime/prefab/instanceStore';
+import { instanceDrift } from '../../packages/modoki/src/editor/instance/instanceDrift';
 import { validateSceneData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { collectInstanceOverrideListing } from '../../packages/modoki/src/editor/scene/prefabOverrideKeys';
-import { refreshInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
+import { refreshInstances, rebaseStaleInstances } from '../../packages/modoki/src/editor/scene/prefabRebuild';
 import type { PrefabFile } from '../../packages/modoki/src/editor/scene/prefab';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
@@ -1344,5 +1348,234 @@ describe('an unregistered component stays on its own entity (close-out review #4
   it('a prefab instance root\'s unregistered extra component is written back, byte-stable', async () => {
     const s1 = await twoSaves(scene({ traits: { EntityAttributes: { name: 'Inst', parentId: 0 }, RetiredTraitRoot: { speed: 9 } } }));
     expect((entryOf(s1).members as Record<string, { traits: Record<string, unknown> }>)['/']!.traits.RetiredTraitRoot).toEqual({ speed: 9 });
+  });
+});
+
+describe('Remove Unused takes the removable unused overrides off the list, with undo (#2001 S9; Unity\'s M6)', () => {
+  const rootId = () => getAllEntities().find((e) => e.guid === ROOT1)!.id;
+  const listing = () => collectInstanceOverrideListing(rootId(), prefabs.get(P) as PrefabFile);
+  /** The record's statements: its identity pins (a row's `guid`/`name`) aside, which a rebuild writes for every live member. */
+  const record = () => JSON.stringify(storedRecord(getCurrentWorld(), ROOT1), (k, v: unknown) => (v instanceof Map
+    ? [...v].map(([key, row]) => [key, k === 'rows' ? (({ guid: _g, name: _n, ...rest }) => rest)(row as Record<string, unknown>) : row])
+      .filter(([, row]) => Object.keys(row as object).length)
+    : v));
+  /** A save's content: its fresh `id` and `createdAt` aside. */
+  const content = async () => { const { id: _i, createdAt: _c, ...rest } = (await saved()) as unknown as Record<string, unknown>; return JSON.stringify(rest); };
+  /** B: a field no schema declares, a field of a trait nothing registers, a removal of a component B never had; an orphan
+   *  row (P declares no node 9) with its identity and one field; two legacy records of a localId P does not have. */
+  const sixKinds = () => scene({
+    members: {
+      [`/${g(3)}`]: { traits: { Transform: { x: 4, retiredField: 7 }, RetiredTrait: { speed: 2 } }, traitRemovals: { Rotate3D: true } },
+      [`/${g(9)}`]: { guid: 'ffffffff-0000-4000-8000-000000001949', name: 'Gone', traits: { Transform: { x: 1 } } },
+    },
+    removed: [9], moved: { 9: OTHER },
+  });
+
+  // Mutation: take every counted cause (drop `REMOVABLE`'s filter in `removableUnused`) — B's RetiredTrait goes too: red on
+  // the count left and on the saved row.
+  it('takes a gone target\'s records and an unknown field, and leaves an unregistered component\'s and every applied one', async () => {
+    await load(sixKinds());
+    expect(listing()).toMatchObject({ unusedOverrides: 6, removableUnused: 5 });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 5 });
+    expect(listing()).toMatchObject({ unusedOverrides: 1, removableUnused: 0 });
+    const s = await saved();
+    expect(rowOf(s, 3).traits).toEqual({ Transform: { x: 4 }, RetiredTrait: { speed: 2 } });
+    expect(rowOf(s, 3).traitRemovals).toBeUndefined();
+    // The orphan row keeps its identity pins (rule 5: never an override), and loses its field.
+    expect(rowOf(s, 9)).toEqual({ guid: 'ffffffff-0000-4000-8000-000000001949', name: 'Gone' });
+    expect(JSON.stringify(entryOf(s))).not.toContain(OTHER);
+    // Nothing it took applied, so nothing live moved.
+    expect((readTraitData(getAllEntities().find((e) => e.name === 'B')!.id, getTraitByName('Transform')!) as { x: number }).x).toBe(4);
+    await load(s);
+    expect(listing()).toMatchObject({ unusedOverrides: 1, removableUnused: 0 });
+  });
+
+  // Mutations: an undo that seats nothing (`seatBefore` dropped) — red on the first record compare; a redo that seats
+  // nothing — red on the second.
+  it('undo puts the exact records back, redo takes them again, and each save agrees', async () => {
+    await load(sixKinds());
+    const before = record();
+    const save0 = await content();
+    const depth = undoDepth();
+    removeUnusedOverridesWithUndo(rootId());
+    expect(undoDepth()).toBe(depth + 1);
+    expect(undoLabel()).toContain('Remove 5 unused overrides');
+    const after = record();
+    const save1 = await content();
+    expect(save1).not.toBe(save0);
+    await undo();
+    expect(record()).toBe(before);
+    expect(await content()).toBe(save0);
+    expect(listing().unusedOverrides).toBe(6);
+    await redo();
+    expect(record()).toBe(after);
+    expect(await content()).toBe(save1);
+  });
+
+  // Mutation: always drop an emptied bag (`cause === 'gone' ||` → `true ||`) — B loses the component the user added.
+  it('the last unknown field of a component the instance ADDED leaves the add, which applies', async () => {
+    await load(scene({ members: { [`/${g(3)}`]: { traits: { Rotate3D: { retiredField: 1 } } } } }));
+    expect(getAllEntities().find((e) => e.name === 'B')!.traits).toContain('Rotate3D');
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+    const s = await saved();
+    expect(rowOf(s, 3).traits).toEqual({ Rotate3D: {} });
+    await load(s);
+    expect(getAllEntities().find((e) => e.name === 'B')!.traits).toContain('Rotate3D');
+    expect(listing().unusedOverrides).toBe(0);
+  });
+
+  // Mutation: take the earlier element first (`pathDescending` → ascending) — the second splice names an index no longer
+  // there, and one legacy removal is left.
+  it('two held legacy records in one list both go', async () => {
+    await load(scene({ removed: [8, 9] }));
+    expect(listing().removableUnused).toBe(2);
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 2 });
+    expect(listing().unusedOverrides).toBe(0);
+    expect(entryOf(await saved()).removed).toBeUndefined();
+  });
+
+  // A user's node under an anchor the template no longer gives is scene content (rule 7): `heldNode`, never removable.
+  // Mutation: count `heldNode` (COUNTED) AND let `REMOVABLE` take it — 2 taken. Either alone stays green: the count's filter
+  // stops it before Remove's, and the door never takes an `own` link.
+  it('never takes a user\'s node held under a gone anchor', async () => {
+    const OWNED = 'dddddddd-0000-4000-8000-000000001948';
+    const leaf = { parentLocalId: 9, guid: OWNED, name: 'OwnLeaf', traits: { EntityAttributes: { name: 'OwnLeaf', parentId: 0, guid: OWNED }, Transform: { x: 0, y: 0, z: 0 } } };
+    await load(scene({ members: { [`/${g(9)}`]: { own: [leaf], traits: { Transform: { x: 1 } } } } }));
+    expect(listing().removableUnused).toBe(1);
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+    expect(JSON.stringify(entryOf(await saved()))).toContain(OWNED);
+  });
+
+  // A stale or missing record refuses loud (#2001 S8b), and pushes no undo entry. Mutation: drop the null test in the wrapper
+  // — the outcome is `{removed: null}`.
+  it('refuses, and records no step, when the instance holds no record', async () => {
+    await load(sixKinds());
+    dropInstanceRecord(getCurrentWorld(), ROOT1);
+    const depth = undoDepth();
+    expect(quietly(() => removeUnusedOverridesWithUndo(rootId()))).toEqual({ refused: expect.stringContaining('could not be read') });
+    expect(undoDepth()).toBe(depth);
+  });
+
+  // A kept unknown field is no drift: no live entity can hold it (the save-time check warned on every save of one). Mutation:
+  // drop the `fieldFate` skip in `instanceDrift` — B's line comes back.
+  it('the save\'s drift check does not report a kept unknown field', async () => {
+    await load(sixKinds());
+    expect(instanceDrift(rootId())).toEqual([]);
+  });
+
+  // Close-out review 1: the gone target comes back between the Remove and its undo/redo. P without B; the instance's row
+  // moves B to x=4.
+  const withoutB = () => pDoc((d) => { d.entities.splice(2, 1); });
+  const bX = () => (readTraitData(getAllEntities().find((e) => e.name === 'B')!.id, getTraitByName('Transform')!) as { x: number }).x;
+  // Mutation: seat the records without rebuilding (`seatSide` in place of `restoreSide`) — B shows 0, the record 4.
+  it('undo after the target came back shows the override it put back', async () => {
+    install(withoutB());
+    await load(scene({ members: { [`/${g(3)}`]: { traits: { Transform: { x: 4 } } } } }));
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+    install(pDoc());
+    await quietly(() => rebaseStaleInstances());
+    expect(bX()).toBe(0);
+    await undo();
+    expect(bX()).toBe(4);
+    expect(instanceDrift(rootId())).toEqual([]);
+  });
+
+  // The other direction: the redo takes an override that applies again by then — on screen as in the save.
+  it('redo after the target came back takes the override off the screen too', async () => {
+    install(withoutB());
+    await load(scene({ members: { [`/${g(3)}`]: { traits: { Transform: { x: 4 } } } } }));
+    removeUnusedOverridesWithUndo(rootId());
+    await undo();
+    install(pDoc());
+    await quietly(() => rebaseStaleInstances());
+    expect(bX()).toBe(4);
+    await redo();
+    expect(bX()).toBe(0);
+    expect(instanceDrift(rootId())).toEqual([]);
+  });
+
+  // Close-out review 2: the instance deleted B, then the template did. The removal names nothing now, so it and the row's
+  // other records are counted and taken. Mutation: let an unused removal hide itself again (drop `!unusedRemoval.has(k)`) —
+  // 0 counted, 0 taken.
+  it('a removal whose member the template deleted is counted and taken, with the records under it', async () => {
+    await load(scene({ members: { [`/${g(9)}`]: { removed: true, traits: { Transform: { x: 3 } } } } }));
+    expect(listing()).toMatchObject({ unusedOverrides: 2, removableUnused: 2 });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 2 });
+    expect((entryOf(await saved()).members as Record<string, unknown>)[`/${g(9)}`]).toBeUndefined();
+  });
+
+  // Close-out review 3: a nested instance holds no record of its own. Mutation: drop the nested-instance refusal — the
+  // answer is the false "could not be read".
+  it('a nested instance is refused with the root that holds its records', async () => {
+    install(oDoc({}));
+    await load(scene({ members: { [`/${g(8)}/${g(9)}`]: { traits: { Transform: { x: 3 } } } } }, O));
+    const pi = (id: number) => readTraitData(id, getTraitByName('PrefabInstance')!) as { source?: string; rootInstanceId?: number } | null;
+    const nested = getAllEntities().find((e) => pi(e.id)?.source === P && pi(e.id)?.rootInstanceId === e.id)!.id;
+    expect(quietly(() => removeUnusedOverridesWithUndo(nested))).toEqual({ refused: expect.stringContaining(ROOT1) });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+  });
+
+  // Close-out review H1: a held WHOLE list (a gone member's row `added`, no `heldRemainder`) is one statement.
+  const USER = 'dddddddd-0000-4000-8000-000000001947';
+  const copy = { key: 'k-c1', name: 'Copy', traits: { EntityAttributes: { name: 'Copy' }, Transform: { x: 0, y: 0, z: 0 } }, children: [] };
+  const userNode = { guid: USER, name: 'UserNode', traits: { EntityAttributes: { name: 'UserNode', guid: USER }, Transform: { x: 0, y: 0, z: 0 } }, children: [] };
+  // The fold calls the copy `gone` (its row's member is) and the user's node `heldNode`. Mutation: take a whole list's
+  // elements one by one (drop the whole-list test in `removableUnused`) — the copy goes alone, and the list left behind
+  // says the row's added nodes are the user's alone.
+  it('takes no element of a held whole list one of whose elements stays', async () => {
+    await load(scene({ members: { [`/${g(9)}`]: { added: [copy, userNode] } } }));
+    expect(listing()).toMatchObject({ unusedOverrides: 1, removableUnused: 0 });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 0 });
+    expect(((entryOf(await saved()).members as Record<string, { added?: unknown[] }>)[`/${g(9)}`]!.added ?? []).length).toBe(2);
+  });
+
+  it('takes a held whole list whole when every element is removable', async () => {
+    await load(scene({ members: { [`/${g(9)}`]: { added: [copy] } } }));
+    expect(listing()).toMatchObject({ unusedOverrides: 1, removableUnused: 1 });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+    expect((entryOf(await saved()).members as Record<string, unknown> | undefined)?.[`/${g(9)}`]).toBeUndefined();
+    expect(listing().unusedOverrides).toBe(0);
+  });
+
+  // Close-out re-review 1: the undo refuses when the tree cannot be rebuilt (its prefab now expands to no root) — and then
+  // nothing was changed, the record included. Mutation: `restoreSide` in place of `restoreSideOrNothing` — row 9 is back in
+  // the record, though the undo was refused and dropped.
+  it('a refused undo leaves the records as the Remove left them', async () => {
+    await load(scene({ members: { [`/${g(9)}`]: { traits: { Transform: { x: 3 } } } } }));
+    removeUnusedOverridesWithUndo(rootId());
+    const after = record();
+    install(pDoc((d) => { (d as { rootLocalId: number }).rootLocalId = 99; }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try { await undo(); } finally { warn.mockRestore(); err.mockRestore(); }
+    expect(record()).toBe(after);
+    expect(record()).not.toContain(`/${g(9)}`);
+  });
+
+  // Close-out re-review 2: a held REMAINDER converts element by element, so its elements go one by one. Mutation: treat a
+  // remainder as a whole list (drop the `HELD_REMAINDER` branch in `removableUnused`) — 0 removable.
+  it('takes the gone copy out of a held remainder and keeps the user\'s node', async () => {
+    await load(scene({ members: { [`/${g(9)}`]: { heldRemainder: true, added: [copy, userNode] } } }));
+    expect(listing()).toMatchObject({ unusedOverrides: 1, removableUnused: 1 });
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 1 });
+    const row = (entryOf(await saved()).members as Record<string, { added?: Array<{ guid?: string }>; heldRemainder?: boolean }>)[`/${g(9)}`]!;
+    expect(row.added?.map((n) => n.guid)).toEqual([USER]);
+    expect(row.heldRemainder).toBe(true);
+  });
+
+  it('nothing to take: no step', async () => {
+    await load(scene({ members: { [`/${g(3)}`]: { traits: { RetiredTrait: { speed: 2 } } } } }));
+    const depth = undoDepth();
+    expect(removeUnusedOverridesWithUndo(rootId())).toEqual({ removed: 0 });
+    expect(undoDepth()).toBe(depth);
+  });
+
+  // The dialog's line and button (ApplyPrefabDialog shows the button exactly when `removable > 0`). Mutations: say
+  // "(kept)" with removable ones — the second expect; drop the partial clause — the third.
+  it('the dialog line says how many the button takes', () => {
+    expect(unusedOverridesLine(2, 0)).toBe('2 unused overrides (kept)');
+    expect(unusedOverridesLine(2, 2)).toBe('2 unused overrides');
+    expect(unusedOverridesLine(6, 5)).toBe('6 unused overrides (5 removable)');
+    expect(unusedOverridesLine(0, 0)).toBeNull();
   });
 });
