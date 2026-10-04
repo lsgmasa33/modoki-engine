@@ -19,6 +19,12 @@ active tab's title. **Escape** backs out one level — dropdown first, then the 
 FPS/Memory/GPU stat displays are **separate floating widgets** you spawn from the Stats tab;
 they stay on screen while the modal is closed, so you can watch performance *while playing*.
 
+On a device the modal's backdrop is padded by the safe-area insets plus the band the game's UI reserves for an
+ad banner (`UIAnchor.reservesEdge`, read from the UI tree store as `reserveTop`/`reserveBottom`), and the dialog
+centres in what is left. The banner is a native view over the webview, so no `zIndex` lifts the menu above it: a
+top banner covered the header on Slime Shooter until it was padded (2026-10-04). The editor's GameView mounts it
+with `anchor="container"` and skips the padding, since that band is sized for the preview, not the window.
+
 ### Tab layout — the body does NOT scroll
 
 The modal body is a fixed-height flex column with `overflow: hidden`; **scrolling is the tab's
@@ -324,7 +330,10 @@ Written for Weaveling (#1474), promoted when Court needed it (#1501).
   `createAdDebug(lifecycle, { openMediationDebugger })` wraps a game's `createAdLifecycle` instance.
   The game routes its OWN `setBannerVisible` / `showInterstitial` / `showRewardedAd` /
   `*Ready` through it, so a withheld kind reads not-ready and its show resolves `false` without
-  reaching the SDK, and a banner mode pins the game's wish. **Show now** (`showNow`) bypasses pacing
+  reaching the SDK, and a banner mode pins the game's wish. **`bannerShown(wish)`** returns the
+  banner the override will actually request. A game sizes its banner band from it, not from its own
+  wish, so a banner forced on over No Ads gets room and one forced off frees it (Slime Shooter does;
+  Court and Weaveling still size from the wish, #2132). **Show now** (`showNow`) bypasses pacing
   and the override, but still goes through the lifecycle, so the game's own dismiss, payout and
   reload handling is what gets exercised. The defaults are "no override", so a build that never
   registers the tab behaves as if the wrapper were not there.

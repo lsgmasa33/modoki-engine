@@ -138,3 +138,18 @@ describe('adDebug — the mediation debugger (#1500)', () => {
     expect((await d.openMediationDebugger()).opened).toBe(false);
   });
 });
+
+describe('adDebug — bannerShown answers what setBannerVisible requests (the band a game reserves follows it)', () => {
+  it('auto passes the wish through; on and off pin it', () => {
+    const { life } = fakeLifecycle();
+    const d = createAdDebug(life);
+    expect([d.bannerShown(true), d.bannerShown(false)]).toEqual([true, false]);
+    d.setOverride({ banner: 'on' });
+    expect([d.bannerShown(true), d.bannerShown(false)]).toEqual([true, true]);
+    d.setOverride({ banner: 'off' });
+    expect([d.bannerShown(true), d.bannerShown(false)]).toEqual([false, false]);
+    // The same answer the SDK got.
+    d.setBannerVisible(true);
+    expect(life.setBannerVisible).toHaveBeenLastCalledWith(d.bannerShown(true));
+  });
+});

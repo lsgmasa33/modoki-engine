@@ -264,7 +264,10 @@ function textureAndSpriteGuids() {
     textures.add(guid);
     const metaPath = t.abs + '.meta.json';
     if (!fs.existsSync(metaPath)) continue;
-    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as Parameters<typeof resolveTextureType>[0] & { sprites?: { guid?: string }[] };
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as Parameters<typeof resolveTextureType>[0] & {
+      sprites?: { guid?: string }[];
+      textureCache?: { width?: number; height?: number; srcWidth?: number; srcHeight?: number };
+    };
     const slices = (meta?.sprites ?? []).filter((s) => isGuid(s.guid));
     for (const s of slices) sprites.add(s.guid!.toLowerCase());
     // A 2D/UI texture with no explicit slices exposes a derived whole-image sprite — and the
@@ -274,8 +277,14 @@ function textureAndSpriteGuids() {
     // guard used to add the derived guid unconditionally, which made it vouch for exactly the
     // dead ref it exists to catch: the SpritePicker's "whole" button committed that guid for a
     // sliced sheet (QA-INSP-0011), and a scene saved with it would have passed here.
+    // ⚠️ And the scanner needs the texture's SIZE for that sprite's rect (`texDims`, read from the sidecar's
+    // `textureCache` — vite-asset-scanner.ts), so a sidecar the import never filled in (written by hand, never
+    // converted) emits NO whole-image sprite: the build's manifest lacks it and the ref resolves to nothing on a
+    // device. This guard used to vouch for it anyway, and an icon shipped blank on the Air that way (2026-10-04).
     const ttype = resolveTextureType(meta);
-    if (slices.length === 0 && (ttype === '2d' || ttype === 'ui')) sprites.add(deriveGuid('sprite:' + guid).toLowerCase());
+    const tc = meta.textureCache;
+    const sized = !!(tc && (tc.srcWidth ?? tc.width) && (tc.srcHeight ?? tc.height));
+    if (slices.length === 0 && sized && (ttype === '2d' || ttype === 'ui')) sprites.add(deriveGuid('sprite:' + guid).toLowerCase());
   }
   return { textures, sprites };
 }

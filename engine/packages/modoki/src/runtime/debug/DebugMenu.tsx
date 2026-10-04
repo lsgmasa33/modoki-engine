@@ -31,6 +31,7 @@ import { HitRegionOverlay } from './HitRegionOverlay';
 import { ErrorToaster } from './ErrorToaster';
 import { registerPointerBlocker } from '../core/pointerBlockers';
 import { scrollRootStyle } from './tabLayout';
+import { useUITreeStore } from '../ui/uiTreeStore';
 
 export interface DebugMenuProps {
   anchor?: 'viewport' | 'container';
@@ -132,6 +133,16 @@ export function DebugMenu({ anchor = 'viewport' }: DebugMenuProps) {
   }, [tabs, activeId]);
 
   const position = anchor === 'container' ? 'absolute' : 'fixed';
+  // On a device the dialog stays clear of the notch and of the band the game reserves for its ad banner — a
+  // native view over the webview, which no zIndex can outrank (owner, on the Air, 2026-10-04: a top banner
+  // covered the menu's header). Both values are CSS lengths, the band's in the game UI's own units. The
+  // editor's container anchor has neither: its preview is not the viewport, so its band would be mis-scaled.
+  const reserveTop = useUITreeStore((s) => s.reserveTop);
+  const reserveBottom = useUITreeStore((s) => s.reserveBottom);
+  const clearance: CSSProperties = anchor === 'container' ? {} : {
+    paddingTop: `calc(var(--ui-sa-top, env(safe-area-inset-top, 0px)) + ${reserveTop})`,
+    paddingBottom: `calc(var(--ui-sa-bottom, env(safe-area-inset-bottom, 0px)) + ${reserveBottom})`,
+  };
   const activeTab = tabs.find((t) => t.id === activeId);
   const ActiveComponent = activeTab?.Component;
   const activeTitle = activeTab?.title;
@@ -164,7 +175,7 @@ export function DebugMenu({ anchor = 'viewport' }: DebugMenuProps) {
       {open && (
         <div
           ref={backdropRef}
-          style={{ ...backdropStyle, position }}
+          style={{ ...backdropStyle, ...clearance, position }}
           data-debug-menu
           onClick={(e) => {
             if (e.target === e.currentTarget) setOpen(false);
@@ -225,6 +236,7 @@ export function DebugMenu({ anchor = 'viewport' }: DebugMenuProps) {
 
 const backdropStyle: CSSProperties = {
   inset: 0,
+  boxSizing: 'border-box', // the clearance padding shrinks the box the dialog's 90% is a share of
   background: 'rgba(6,6,12,0.55)',
   backdropFilter: 'blur(2px)',
   WebkitBackdropFilter: 'blur(2px)',

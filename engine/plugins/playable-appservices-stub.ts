@@ -102,6 +102,7 @@ export const ads = {
   // The ad surface both games export (#1309, #1312; AppLovin MAX in both since #1495/#1496): the banner as per-frame desired state, a synchronous readiness
   // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
   setBannerVisible(_visible: boolean): void {},
+  bannerShown(_wanted: boolean): boolean { return false; },
   rewardedReady(): boolean { return false; },
   // #1330 — the break before an ad asks whether one is loaded; a playable has none, so no card shows.
   interstitialReady(): boolean { return false; },
@@ -112,6 +113,7 @@ export const ads = {
   // games hand to `createAdsDebugTab` at module load complete and inert.
   adsDebug: {
     setBannerVisible(_visible: boolean): void {},
+    bannerShown(_gameWants: boolean): boolean { return false; },
     async showFullscreen(_kind: string, _placement: string): Promise<boolean> { return false; },
     isReady(_kind: string): boolean { return false; },
     setOverride(_patch: Record<string, unknown>): void {},

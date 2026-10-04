@@ -67,6 +67,10 @@ export interface AdDebug {
   // ── The game's calls, with the override applied. Each game's `ads.ts` routes its own through these. ──
   /** What the game wants on screen, every frame. `auto` passes it through unchanged. */
   setBannerVisible(visible: boolean): void;
+  /** Whether a banner is REQUESTED for this wish, the override applied: the answer `setBannerVisible` gives
+   *  the SDK. A game sizes the band it reserves for the banner from this, not from its own wish, so a banner
+   *  the tab forces on (No Ads owned) gets room, and one it forces off frees it. */
+  bannerShown(gameWants: boolean): boolean;
   /** The game's show: a withheld kind resolves `false` without reaching the SDK. */
   showFullscreen(kind: FullscreenKind, placement: string): Promise<boolean>;
   /** The game's readiness: a withheld kind reads not-ready, so the game offers nothing it would refuse. */
@@ -99,6 +103,9 @@ export function createAdDebug(lifecycle: AdLifecycle, hooks: AdDebugHooks = {}):
     setBannerVisible(visible) {
       gameWantsBanner = visible;
       lifecycle.setBannerVisible(bannerWanted(visible, current.banner));
+    },
+    bannerShown(gameWants) {
+      return bannerWanted(gameWants, current.banner);
     },
     showFullscreen(kind, placement) {
       if (!current[kind]) return Promise.resolve(false);
