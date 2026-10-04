@@ -19,7 +19,7 @@ import { spriteEpoch } from '../core/textureRefs';
 import { resolveUIFontFamily, resetFontRefWarnings } from './fontFamilyRef';
 import { UISettings, UI_SETTINGS_DEFAULT_PRESS_SCALE, UI_SETTINGS_DEFAULT_PRESS_DURATION_MS } from '../traits/UISettings';
 import { resolvePress } from './pressFeedback';
-import { scrollSnapChildStyle } from './scrollViewDom';
+import { scrollSnapChildStyle, type SnapMarkerSpec } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
 import { readUILength, readUIAnchorLength } from '../traits/uiLength';
@@ -146,6 +146,10 @@ export interface UINodeData {
    *  `UIScrollView.snap` styled the container and nothing ever snapped — the repo's
    *  unreachable-mechanism defect class, found by measuring the pager's DOM. */
   snapChild?: Record<string, string>;
+  /** A pooled view's grid (`UIEntries` counts, strides and gaps), read by `stampSnapTargets` to place its markers. */
+  entriesGrid?: { countX: number; countY: number; strideX: number; strideY: number; gapX: number; gapY: number };
+  /** Set on a pooled view's CONTENT child: the snap markers `UINode` renders inside it (#2136, `snapMarkers`). */
+  snapMarkers?: SnapMarkerSpec;
   /** TextAnimation trait — whole-element CSS text animation (fade/wave/bounce/jitter/
    *  rainbow/typewriter) realized by UINode. Shared trait with the 2D/3D geometry paths. */
   textAnim?: { effect: string; speed: number; amplitude: number; frequency: number; loop: boolean; fadeIn: boolean };
@@ -262,7 +266,7 @@ const _warnedLengthUnitMismatches = new Set<string>();
 let _prevById = new Map<number, UINodeData>();
 
 // Node keys that aren't plain scalars — compared specially in nodesEqual.
-const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'press', 'scroll', 'snapChild']);
+const _nestedKeys = new Set(['children', 'binding', 'action', 'anchor', 'canvas2D', 'textAnim', 'toggle', 'touch', 'press', 'scroll', 'snapChild', 'entriesGrid', 'snapMarkers']);
 // Derived ONCE from a real node, so every scalar field is covered automatically:
 // add a field to UINodeData and it's compared without editing this file.
 let _scalarKeys: string[] | null = null;
@@ -297,6 +301,8 @@ export function nodesEqual(a: UINodeData, b: UINodeData): boolean {
   if (!shallowOptEqual(a.press as Record<string, unknown> | undefined, b.press as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.scroll as Record<string, unknown> | undefined, b.scroll as Record<string, unknown> | undefined)) return false;
   if (!shallowOptEqual(a.snapChild as Record<string, unknown> | undefined, b.snapChild as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.entriesGrid as Record<string, unknown> | undefined, b.entriesGrid as Record<string, unknown> | undefined)) return false;
+  if (!shallowOptEqual(a.snapMarkers as Record<string, unknown> | undefined, b.snapMarkers as Record<string, unknown> | undefined)) return false;
   // action.bindings is an array — ref-compare, but treat two empties as equal
   // (the builder allocates a fresh [] when the trait carries none).
   if (a.action || b.action) {
@@ -363,32 +369,36 @@ function sortChildren(n: UINodeData) {
  *  one. `loadSceneFile` fires exactly ONE markUIDirty for the whole batch, so if that is the
  *  signal that lands here too early, no UI is ever rendered: no Canvas2D node means
  *  `Canvas2DMount` never mounts, which means a 2D game draws NOTHING, with no error anywhere. */
-/** Collect the pooled entries under a scroll view, without crossing into a NESTED scroll view
- *  (its own entries are its own snap targets, not this one's). */
-function collectEntries(node: UINodeData, out: UINodeData[]): void {
-  for (const c of node.children) {
-    if (c.isEntry) out.push(c);
-    if (c.scroll) continue;
-    collectEntries(c, out);
-  }
+/** Does this subtree hold a pooled entry — without crossing into a NESTED scroll view, whose entries are its
+ *  own? Picks a pooled view's content child out of any authored siblings. */
+function holdsEntries(node: UINodeData): boolean {
+  return node.children.some((c) => c.isEntry || (!c.scroll && holdsEntries(c)));
 }
 
-/** Stamp `scroll-snap-align` onto a scroll view's snap TARGETS.
+/** Give a scroll view its snap TARGETS.
  *
- *  Targets are the pooled ENTRIES when the view has any — an entry is the unit a pager or a
- *  grid is meant to rest on, and it is two levels below the box now that the offset is carried
- *  by a content child and a row (see `entriesSystem`'s ENTRIES_ROW_NAME). A view with no
- *  entries snaps to its direct children instead, which is the plain authored-children case the
- *  trait's own doc calls out as useful on its own.
+ *  A POOLED view (`UIEntries`) snaps to MARKERS, never to its entries (#2136): its content child — the child
+ *  whose subtree holds the entries — gets `snapMarkers`, and `UINode` renders one inert box per entry at that
+ *  entry's position. A pooled entry's DOM node is re-assigned to the next entry whenever the window shifts,
+ *  and a snap container follows the ELEMENT it is snapped to, so an entry target ran a pager to its last page
+ *  (`scrollViewDom.snapMarkers` carries the measurement). Before the grid is published, or with no content
+ *  child yet, a pooled view has no targets rather than the entries.
  *
- *  Stamping an entry rather than a row serves BOTH axes at once: an entry box has an extent on
- *  each, so `both mandatory` needs no second rule. */
+ *  A view with no pool snaps to its direct children, the plain authored-children case the trait's own doc
+ *  calls out as useful on its own. */
 export function stampSnapTargets(node: UINodeData): void {
   if (node.scroll && node.scroll.snap !== 'none') {
-    const css = scrollSnapChildStyle(node.scroll);
-    const entries: UINodeData[] = [];
-    collectEntries(node, entries);
-    for (const t of (entries.length ? entries : node.children)) t.snapChild = css;
+    if (node.isEntriesView) {
+      const content = node.children.find(holdsEntries);
+      if (content && node.entriesGrid) {
+        content.snapMarkers = {
+          axis: node.scroll.axis, snap: node.scroll.snap, snapStop: node.scroll.snapStop, ...node.entriesGrid,
+        };
+      }
+    } else {
+      const css = scrollSnapChildStyle(node.scroll);
+      for (const t of node.children) t.snapChild = css;
+    }
   }
   for (const c of node.children) stampSnapTargets(c);
 }
@@ -575,6 +585,13 @@ function buildTree(world: World): UINodeData[] | null {
       node.isEntry = !!(_entryMeta && entity.has(_entryMeta.trait));
       // Same ALWAYS-written rule as `isEntry` directly above, and for the same `_scalarKeys` reason.
       node.isEntriesView = !!(_entriesMeta && entity.has(_entriesMeta.trait));
+      if (node.isEntriesView) {
+        const en = entity.get(_entriesMeta!.trait) as any;
+        node.entriesGrid = {
+          countX: en.countX ?? 0, countY: en.countY ?? 0, strideX: en.strideX ?? 0, strideY: en.strideY ?? 0,
+          gapX: en.gapX ?? 0, gapY: en.gapY ?? 0,
+        };
+      }
       if (_scrollMeta && entity.has(_scrollMeta.trait)) {
         const sv = entity.get(_scrollMeta.trait) as any;
         node.scroll = {

@@ -3074,9 +3074,11 @@ re-litigated.
 
 ⚠️ **`snapStop: 'always'` CONSTRAINS a fling; it does not cap it at one entry.** Measured on an
 A23: one hard fling advanced **11** entries at `'normal'` and **3** at `'always'`, while a slow
-drag advanced exactly 1. The cap is the POOL's extent — a browser can only stop at snap points
-that EXIST in the DOM, and recycling is what removes the further ones. So do not size a pool to
-buy a feel promise.
+drag advanced exactly 1. The cap was the POOL's extent — a browser can only stop at snap points
+that EXIST in the DOM, and recycling removed the further ones. ⚠️ **Since #2136 every entry's snap
+point exists** (the markers are not pooled), so `'always'` should now stop a fling of small entries at
+the next one; this is expected and NOT re-measured. A pager whose entry is the viewport already
+moved one page per fling (the table below), and every snapping view in the repo is one.
 
 `scrollToEntry(viewGuid, {x, y}, {behavior})` and `snapToNearest` request in **entry**
 coordinates (the system converts, since it is what resolves entry size); the declarative
@@ -3366,8 +3368,34 @@ rebuild and is never per-frame.
   Measured before the fix: asking for page 12 landed on 4 and page 23 on 6 (converging a few pages
   per attempt), and frame time at REST — no input, no pool churn — was **p50 39ms / p95 52ms**
   against 13/18. `scroll-snap-type: proximity` fixed neither.
+- ⚠️ **A pooled view snaps to MARKERS, never to its entries (#2136)** — the same element-following re-snap,
+  a third face the fix above could not reach, because it starts from a view that is AT REST and correct.
+  When a glide settles on entry 2, the pool shifts its window; data is re-assigned to the nodes in order
+  (`slotForIndex`), so the node the browser is snapped to now holds entry 3, one stride on, and Chromium
+  scrolls after it, which shifts the window again. Measured in the editor (2026-10-04): one horizontal
+  wheel tick from page 1 ran Weaveling's 70-page collection to page 69 and its 7-page level picker to the
+  end, a page per frame, with a trap on every scroll write logging none and `overflow-anchor: none`
+  changing nothing. From page 0 it moved exactly one page (the window does not shift there). So
+  `stampSnapTargets` gives a pooled view's content child a marker spec, and `UINode` renders one inert,
+  never-recycled box per entry at `i * stride` (`scrollViewDom.snapMarkers`, aligned on its own axis only,
+  so a `both` grid takes `countX + countY`). After the fix, the same ticks land one page each way, and an
+  arrow after a swipe steps on from where the swipe left. ✅ Judged on touch by the owner on the iPhone Air
+  (2026-10-04, Weaveling's collection pager) — see the verdict below; Android still owed.
+- ⚠️ **A recycled slot starts its NESTED scroll views at the top** (#2135 review). A pooled instance's DOM
+  node outlives the entry it showed, and with it any nested scroller's offset: a word list scrolled on one
+  page arrived scrolled on the next (Weaveling's collection page and dictionary card both nest a y scroller in
+  an x pager). `applySlots` writes an instant `scrollTo 0` on every `UIScrollView` inside a slot whose
+  `UIEntry.index` CHANGED; an epoch redraw of the same entry leaves the player's scroll alone.
+  ⚠️ **Known gap, unobserved:** a nested view that is ITSELF pooled (`UIEntries` inside an entry prefab)
+  gets the same raw `scrollTo 0`, but its own pool window follows the offset only on its next pass, so it
+  may draw one frame with the old window's slots. No prefab in `games/` or `demos/` nests a `UIEntries`
+  today (a search for `UIEntries` across every prefab finds none), so this was left rather than fixed;
+  the first one that does should check for the blank frame.
 ✅ **Judged good on real touch hardware** (owner, 2026-08-22): Court's level selector, the shipped
-iOS build on an iPhone Air — *"Scroll feels good on Air."* That is the verdict the CSS-motion
+iOS build on an iPhone Air — *"Scroll feels good on Air."* ⚠️ That verdict predates #2136, when the
+ENTRIES were the snap targets; every pooled view now snaps to markers (bullet above). ✅ Re-judged on the
+Air with markers (owner, 2026-10-04): Weaveling's collection pager, a Debug iOS build — *"scroll feels
+good"*. Still owed on an Android phone. That is the verdict the CSS-motion
 decision below rests on for touch, taken on a second device and a second platform after the S22
 Android run, and it is what closes out the snap question: snapping stays ON throughout, with no
 suspension. A perf number for the LOW-end target (Galaxy A23) is still owed — see #320; feel and

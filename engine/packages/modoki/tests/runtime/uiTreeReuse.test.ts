@@ -24,6 +24,9 @@ const CV2 = { id: 'Canvas2D' };
 const VID = { id: 'VideoPlayer' };
 const TGL = { id: 'UIToggle' };
 const TCH = { id: 'TouchControl' };
+const SV = { id: 'UIScrollView' };
+const ENS = { id: 'UIEntries' };
+const ENT = { id: 'UIEntry' };
 
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: 'px', heightUnit: 'px',
@@ -55,6 +58,9 @@ interface Spec {
   video?: true;
   toggle?: { value: boolean };
   touch?: { action: string; showOn: string; pressedOpacity: number };
+  scroll?: Record<string, unknown>;
+  entries?: Record<string, unknown>;
+  entry?: true;
 }
 
 /** A koota-like world whose entity set is read fresh from `getSpecs()` on every
@@ -74,6 +80,9 @@ function makeWorld(getSpecs: () => Spec[]) {
           if (s.video) data.set(VID, {});
           if (s.toggle) data.set(TGL, s.toggle);
           if (s.touch) data.set(TCH, s.touch);
+          if (s.scroll) data.set(SV, s.scroll);
+          if (s.entries) data.set(ENS, s.entries);
+          if (s.entry) data.set(ENT, { index: 0 });
           const entity = { id: () => s.id, has: (t: unknown) => data.has(t), get: (t: unknown) => data.get(t), generation: () => 0 };
           cb([data.get(UIEL)], entity);
         }
@@ -101,6 +110,9 @@ function mockDeps() {
       { name: 'VideoPlayer', trait: VID, category: 'component', fields: {} },
       { name: 'UIToggle', trait: TGL, category: 'component', fields: {} },
       { name: 'TouchControl', trait: TCH, category: 'component', fields: {} },
+      { name: 'UIScrollView', trait: SV, category: 'component', fields: {} },
+      { name: 'UIEntries', trait: ENS, category: 'component', fields: {} },
+      { name: 'UIEntry', trait: ENT, category: 'component', fields: {} },
     ],
   }));
 }
@@ -298,6 +310,41 @@ describe('uiTreeStore hasVideo', () => {
     const removed = useUITreeStore.getState().tree[0];
     expect(removed).not.toBe(added);
     expect(removed.hasVideo).toBe(false);
+  });
+});
+
+/** #2136 — a pooled view snaps to markers its CONTENT child renders; the projection is what publishes the grid
+ *  (`entriesGrid`) and stamps the spec (`snapMarkers`), and `nodesEqual` must see either change. */
+describe('uiTreeStore pooled snap markers (#2136)', () => {
+  const view = (entries: Record<string, unknown>, snap = 'start'): Spec[] => [
+    { id: 1, parentId: 0, scroll: { axis: 'x', snap, snapStop: 'always' }, entries },
+    { id: 2, parentId: 1 },
+    { id: 3, parentId: 2 },
+    { id: 4, parentId: 3, entry: true },
+  ];
+  const GRID = { countX: 5, countY: 1, strideX: 300, strideY: 0, gapX: 0, gapY: 0 };
+
+  it('the content child carries the view\'s grid as its marker spec, and a recount or a retune makes a NEW node', async () => {
+    // Mutations: drop the `entriesGrid` write in buildTree -> no markers (red); drop the `snapMarkers` or
+    // `entriesGrid` compare in nodesEqual -> the reused content node keeps the old spec (red).
+    let specs = view(GRID);
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+    uiTreeProjection(world);
+    const content = () => useUITreeStore.getState().tree[0]!.children[0]!;
+    const before = content();
+    expect(before.snapMarkers).toEqual({ axis: 'x', snap: 'start', snapStop: 'always', ...GRID });
+
+    specs = view({ ...GRID, countX: 6 });
+    markUIDirty(); uiTreeProjection(world);
+    expect(content()).not.toBe(before);
+    expect(content().snapMarkers?.countX).toBe(6);
+
+    const recounted = content();
+    specs = view({ ...GRID, countX: 6 }, 'center');
+    markUIDirty(); uiTreeProjection(world);
+    expect(content()).not.toBe(recounted);
+    expect(content().snapMarkers?.snap).toBe('center');
   });
 });
 

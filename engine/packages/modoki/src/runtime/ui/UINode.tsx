@@ -39,7 +39,7 @@ import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
 import { UI_PRESS_SCALE_ATTR, UI_PRESS_MS_ATTR } from './pressFeedback';
-import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
+import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize, snapMarkers } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
 import { driveEntriesFromScroll } from './entriesSystem';
@@ -1420,6 +1420,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
     }
   }
 
+  // A pooled view's snap targets (#2136): inert boxes at each entry's position, inside the content child,
+  // because the entries' own nodes are re-assigned as the window moves and a snap container follows its element.
+  const snapMarkerLayer = node.snapMarkers
+    ? snapMarkers(node.snapMarkers).map((m) => <div key={m.key} aria-hidden style={m.style as React.CSSProperties} />)
+    : null;
+
   const videoLayer = node.hasVideo && UIVideoMount && !uiVisualsHidden
     ? (
       <Suspense fallback={null}>
@@ -1935,6 +1941,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       {nineSliceLayer}
       {bootImageProbe}
       {videoLayer}
+      {snapMarkerLayer}
       {textContent}
       {node.children.map(child => (
         <UINode key={uiNodeKey(child)} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />

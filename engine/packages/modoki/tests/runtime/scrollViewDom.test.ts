@@ -22,7 +22,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (n: string) => (n === 'UIScrollView' ? { name: n, trait: UIScrollView } : undefined),
 }));
 
-import { scrollViewStyle, scrollSnapChildStyle, pendingScrollTo, clearScrollRequest, readScrollMeasurement, readPreciseBoxSize, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
+import { scrollViewStyle, scrollSnapChildStyle, snapMarkers, pendingScrollTo, clearScrollRequest, readScrollMeasurement, readPreciseBoxSize, type ScrollViewNodeData } from '../../src/runtime/ui/scrollViewDom';
 
 const base = (over: Partial<ScrollViewNodeData> = {}): ScrollViewNodeData => ({
   axis: 'y', snap: 'none', snapStop: 'normal', overscroll: 'auto', scrollbar: 'auto',
@@ -127,6 +127,37 @@ describe('scrollSnapChildStyle', () => {
   it('carries align and stop onto the TARGET, not the box', () => {
     expect(scrollSnapChildStyle(base({ snap: 'center', snapStop: 'always' })))
       .toEqual({ scrollSnapAlign: 'center', scrollSnapStop: 'always' });
+  });
+});
+
+describe('snapMarkers (#2136)', () => {
+  const spec = (over: Record<string, unknown> = {}) => ({
+    axis: 'x', snap: 'start', snapStop: 'always', countX: 3, countY: 1, strideX: 100, strideY: 50, gapX: 10, gapY: 4, ...over,
+  });
+
+  it('places one inert box per entry at i * stride, sized to the ENTRY, aligned on the inline axis only', () => {
+    // Mutation: drop the stride multiply, or align both axes -> red.
+    const m = snapMarkers(spec());
+    expect(m.map((x) => x.style.left)).toEqual(['0px', '100px', '200px']);
+    expect(m.every((x) => x.style.width === '90px' && x.style.scrollSnapAlign === 'none start')).toBe(true);
+    expect(m.every((x) => x.style.position === 'absolute' && x.style.pointerEvents === 'none')).toBe(true);
+    expect(m[0]!.style.scrollSnapStop).toBe('always');
+    // The whole CROSS extent, so a marker cannot leave the viewport on the other axis. Mutation: '1px' -> red.
+    expect(m.every((x) => x.style.height === '100%')).toBe(true);
+  });
+
+  it('a vertical list aligns on the block axis; a grid takes countX + countY markers, not their product', () => {
+    const y = snapMarkers(spec({ axis: 'y', countY: 2 }));
+    expect(y.map((x) => [x.style.top, x.style.height, x.style.scrollSnapAlign])).toEqual([
+      ['0px', '46px', 'start none'], ['50px', '46px', 'start none'],
+    ]);
+    expect(y.every((x) => x.style.width === '100%')).toBe(true);
+    expect(snapMarkers(spec({ axis: 'both', countX: 4, countY: 5 }))).toHaveLength(9);
+  });
+
+  it('is empty when snapping is off, or before the pool has published a stride', () => {
+    expect(snapMarkers(spec({ snap: 'none' }))).toEqual([]);
+    expect(snapMarkers(spec({ strideX: 0 }))).toEqual([]);
   });
 });
 

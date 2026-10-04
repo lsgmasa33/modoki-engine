@@ -582,22 +582,35 @@ describe('stampSnapTargets', () => {
   const SCROLL = { axis: 'x', snap: 'start', snapStop: 'always', overscroll: 'contain',
     scrollToX: -1, scrollToY: -1, scrollToBehavior: '', scrollBehavior: 'instant' };
 
-  it('stamps the ENTRIES, not the engine-owned layers between them', async () => {
+  const GRID = { countX: 70, countY: 1, strideX: 284, strideY: 300, gapX: 0, gapY: 0 };
+
+  it('a POOLED view snaps to markers on its content child — never to its entries (#2136)', async () => {
+    // A pooled entry's node is re-assigned to the next entry when the window shifts, and a snap container follows
+    // its ELEMENT: an entry target ran a 70-page pager to page 69 on one wheel tick. Mutation: stamp the entries
+    // again -> red.
     const { stampSnapTargets } = await getModule();
     // view > content > row > two entries — the shape entriesSystem actually builds.
     const e1 = node({ entityId: 4, isEntry: true });
     const e2 = node({ entityId: 5, isEntry: true });
     const row = node({ entityId: 3, children: [e1, e2] });
     const content = node({ entityId: 2, children: [row] });
-    const view = node({ entityId: 1, scroll: SCROLL, children: [content] });
+    const authored = node({ entityId: 6 });
+    const view = node({ entityId: 1, scroll: SCROLL, isEntriesView: true, entriesGrid: GRID, children: [authored, content] });
 
     stampSnapTargets(view);
-    expect(e1.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
-    expect(e2.snapChild).toEqual({ scrollSnapAlign: 'start', scrollSnapStop: 'always' });
-    // ⚠️ The row and the content child must NOT be targets: a snap area per layer would add
-    // snap points the design does not have.
-    expect(row.snapChild).toBeUndefined();
-    expect(content.snapChild).toBeUndefined();
+    expect(content.snapMarkers).toEqual({ axis: 'x', snap: 'start', snapStop: 'always', ...GRID });
+    for (const n of [e1, e2, row, content, authored]) expect(n.snapChild).toBeUndefined();
+    expect(authored.snapMarkers, 'the markers go to the child holding the entries').toBeUndefined();
+  });
+
+  it('a pooled view with no grid published yet has NO targets, rather than its entries', async () => {
+    const { stampSnapTargets } = await getModule();
+    const e1 = node({ entityId: 4, isEntry: true });
+    const content = node({ entityId: 2, children: [node({ entityId: 3, children: [e1] })] });
+    const view = node({ entityId: 1, scroll: SCROLL, isEntriesView: true, children: [content] });
+    stampSnapTargets(view);
+    expect(e1.snapChild).toBeUndefined();
+    expect(content.snapMarkers).toBeUndefined();
   });
 
   it('falls back to direct children when the view has no entries', async () => {

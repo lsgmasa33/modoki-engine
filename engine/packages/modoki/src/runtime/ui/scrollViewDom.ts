@@ -94,6 +94,63 @@ export function scrollSnapChildStyle(s: ScrollViewNodeData): Record<string, stri
   return { scrollSnapAlign: s.snap, scrollSnapStop: s.snapStop };
 }
 
+/** A pooled view's snap grid: what `stampSnapTargets` hands the view's content child (#2136). */
+export interface SnapMarkerSpec {
+  axis: string;
+  snap: string;
+  snapStop: string;
+  countX: number;
+  countY: number;
+  /** `UIEntries.strideX/Y` — one entry plus its gap, px. */
+  strideX: number;
+  strideY: number;
+  gapX: number;
+  gapY: number;
+}
+
+/** One inert marker box, positioned inside the content child (whose padding box starts where entry 0 does). */
+export interface SnapMarker { key: string; style: Record<string, string> }
+
+/**
+ * The snap targets of a POOLED view: one inert, never-recycled box per entry, at entry *i*'s own position.
+ *
+ * ⚠️ **Why the entries themselves are not the targets (#2136).** CSS scroll snap keeps a box snapped to the
+ * same ELEMENT after a layout change. The pool keeps entry *i*'s CONTENT at `i * stride` by re-assigning data
+ * to its nodes in order (`entriesLayout.slotForIndex`), so when the window shifts, the node the browser is
+ * snapped to moves one stride on with the next entry's content in it — and Chromium scrolls after it, which
+ * shifts the window again. Measured in the editor: one wheel tick from page 1 ran a 70-page pager to page 69,
+ * a page per frame, with no script writing the scroll. A marker carries no content, so it is never re-assigned
+ * and never moves.
+ *
+ * Two-value `scroll-snap-align` (block, inline): an x marker aligns on the inline axis only and a y marker on
+ * the block axis only, so a `both` grid takes `countX + countY` markers, not `countX * countY`. Each spans the
+ * content's whole CROSS extent, so a grid scrolled down still has its x markers in view (a 1px strip at the top
+ * would leave the viewport, and a snap area out of view on the other axis may not be considered). Sized to the
+ * ENTRY (stride less the gap), so `center`/`end` resolve against the entry's box as they did when it was the
+ * target.
+ */
+export function snapMarkers(m: SnapMarkerSpec): SnapMarker[] {
+  if (m.snap === 'none') return [];
+  const out: SnapMarker[] = [];
+  const base = { position: 'absolute', pointerEvents: 'none', visibility: 'hidden', scrollSnapStop: m.snapStop };
+  const along = (axis: 'x' | 'y', count: number, stride: number, gap: number) => {
+    const n = Math.max(0, Math.floor(count));
+    const size = Math.max(1, stride - gap);
+    if (!(stride > 0)) return;
+    for (let i = 0; i < n; i++) {
+      out.push({
+        key: `${axis}${i}`,
+        style: axis === 'x'
+          ? { ...base, left: `${i * stride}px`, top: '0px', width: `${size}px`, height: '100%', scrollSnapAlign: `none ${m.snap}` }
+          : { ...base, top: `${i * stride}px`, left: '0px', height: `${size}px`, width: '100%', scrollSnapAlign: `${m.snap} none` },
+      });
+    }
+  };
+  if (m.axis !== 'y') along('x', m.countX, m.strideX, m.gapX);
+  if (m.axis !== 'x') along('y', m.countY, m.strideY, m.gapY);
+  return out;
+}
+
 /** Raw trait write — NO `markUIDirty`.
  *
  *  ⚠️ This is the whole point of the design and is the opposite of every other UI write in the

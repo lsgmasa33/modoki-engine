@@ -1209,6 +1209,20 @@ function warnAuthoredOverride(
   console.warn(`[UIEntries] entity '${name}' authored UIElement.${displayField}=${String(displayValue)}, but a pooled UIEntries root owns its own box and pins ${displayField} to ${String(pinnedDisplay)} every tick — the authored value never takes effect.`);
 }
 
+/** Request a scroll to the origin on every `UIScrollView` in a pooled instance, its root included — `overflow` is
+ *  not a pinned field, so an entry prefab's root may itself scroll (`applySlots`' recycle). */
+function resetNestedScroll(rootId: number, childIndex: Map<number, { id: number; name: string }[]>, m: Metas): void {
+  const stack: { id: number }[] = [{ id: rootId }];
+  while (stack.length > 0) {
+    const c = stack.pop()!;
+    const e = findEntityById(c.id) as EntityLike | undefined;
+    if (e?.has(m.svMeta.trait)) {
+      e.set(m.svMeta.trait, { ...(e.get(m.svMeta.trait) as object), scrollToX: 0, scrollToY: 0, scrollToBehavior: 'instant' });
+    }
+    stack.push(...(childIndex.get(c.id) ?? []));
+  }
+}
+
 /** Bind each slot to its coordinate, then fill it from the game's resolver. */
 function applySlots(
   world: World, plan: ReturnType<typeof planSlots>, pool: Map<number, EntityLike>,
@@ -1256,6 +1270,10 @@ function applySlots(
     if (cur.x !== p.x || cur.y !== p.y || cur.index !== p.index || cur.live !== live || cur.kind !== kindName) {
       entity.set(m.entryMeta.trait, { x: p.x, y: p.y, index: p.index, slot, viewGuid, kind: kindName, live });
     }
+    // A slot handed a DIFFERENT entry starts its nested scroll views at the top — a recycled DOM node keeps the
+    // scroll offset the previous entry left in it, so a long word list scrolled on one page arrived scrolled on
+    // the next (#2135 review; Weaveling's collection page and dictionary card both nest a y scroller).
+    if (live && typeof cur.index === 'number' && cur.index !== p.index) resetNestedScroll(entity.id(), childIndex, m);
 
     // A parked entry is hidden AND flagged not-live. The flag is what makes it read as
     // DESTROYED to Percept/Enact; hiding is only what makes it invisible.

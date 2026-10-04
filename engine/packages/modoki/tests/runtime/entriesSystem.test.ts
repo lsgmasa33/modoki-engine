@@ -668,6 +668,43 @@ describe('entriesSystem', () => {
     expect(texts).toContain('row 100');
   });
 
+  it('a slot handed a DIFFERENT entry resets its nested scroll views; a redraw of the SAME entry does not (#2135 review)', async () => {
+    // A recycled DOM node keeps the nested scroll offset the previous entry left — a word list scrolled on one
+    // collection page arrived scrolled on the next. Mutation: drop `resetNestedScroll`'s call -> red; call it on
+    // every resolve -> the epoch half reds.
+    const { sys, src, view } = await setup({}, 12000);
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    const labels = () => {
+      const out: any[] = [];
+      testWorld.query(EntityAttributes, UIScrollView).updateEach(([a]: any[], e: any) => { if (a.name === 'Label') out.push(e); });
+      return out;
+    };
+    // The ROOT scrolls too: `overflow` is not pinned on a pooled root, so the walk must start there.
+    testWorld.query(EntityAttributes).updateEach(([a]: any[], e: any) => {
+      if (a.name === 'Label' || a.name === 'Entry') e.add(UIScrollView({ axis: 'y', scrollToX: -1, scrollToY: -1 }));
+    });
+    const roots = () => {
+      const out: any[] = [];
+      testWorld.query(EntityAttributes, UIScrollView).updateEach(([a]: any[], e: any) => { if (a.name === 'Entry') out.push(e); });
+      return out;
+    };
+    const pending = () => labels().filter((e) => (e.get(UIScrollView) as any).scrollToY === 0);
+    expect(labels().length, 'setup: every pooled instance nests a scroll view').toBeGreaterThan(2);
+
+    // The same window, redrawn: no slot changes entry, so nothing resets.
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), epoch: 1 });
+    sys.entriesSystem(testWorld);
+    expect(pending()).toHaveLength(0);
+
+    // One entry further: the window shifts, every live slot is handed a different entry.
+    settleAtEntry(sys, view, 101);
+    expect(pending().length).toBeGreaterThan(0);
+    expect(pending().every((e) => (e.get(UIScrollView) as any).scrollToBehavior === 'instant')).toBe(true);
+    expect(roots().filter((e) => (e.get(UIScrollView) as any).scrollToY === 0).length, 'the pooled root resets too')
+      .toBe(pending().length);
+  });
+
   it('stamps UIEntry with the data index, not the slot', async () => {
     const { sys, src } = await setup({}, 12000);
     src.registerEntrySource('test.rows', () => ({ members: {} }));
